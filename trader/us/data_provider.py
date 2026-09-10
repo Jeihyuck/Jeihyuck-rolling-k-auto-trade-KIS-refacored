@@ -228,8 +228,15 @@ def normalize_us_balance(raw: dict) -> dict:
     """
     result = {
         "positions": [],
+        # Backward-compatible holdings market-value alias.  This is NOT broker
+        # account equity and must never be used as an account/NAV denominator.
         "total_pvs": "0",
         "total_pvs_source": "none",
+        "total_pvs_semantics": "holdings_market_value_usd",
+        "holdings_market_value_usd": 0.0,
+        "holdings_market_value_source": "none",
+        "account_equity_usd": None,
+        "account_equity_source": "unavailable_from_current_kis_balance_contract",
         "output1": [],
         "output2": {},
         "raw_balance": raw,
@@ -432,38 +439,28 @@ def normalize_us_balance(raw: dict) -> dict:
             "raw": row,
         })
 
-    # total_pvs = 총 평가금액 (evaluation amount, not pnl)
-    # output2의 ovrs_tot_pfls, tot_evlu_pfls_amt는 손익(pnl)이므로 사용하지 않음
-    # 항상 positions의 market_value_usd 합계 사용
+    # Holdings market value only.  KIS overseas inquire-balance output2 fields
+    # available in this production contract are PnL/return aggregates, not a
+    # proven cash+securities account-equity field.  Keep the legacy total_pvs
+    # alias for compatibility but make its semantics explicit.
     if positions:
-        total_pvs_calculated = sum(p["market_value_usd"] for p in positions)
-        result["total_pvs"] = str(total_pvs_calculated)
+        holdings_market_value = sum(p["market_value_usd"] for p in positions)
+        result["total_pvs"] = str(holdings_market_value)
         result["total_pvs_source"] = "positions_market_value_sum"
+        result["holdings_market_value_usd"] = holdings_market_value
+        result["holdings_market_value_source"] = "positions_market_value_sum"
         logger.info(
-            "[US_BALANCE][SUMMARY] total_pvs_source=%s total_pvs=%.2f positions=%d",
+            "[US_BALANCE][SUMMARY] total_pvs_source=%s total_pvs=%.2f semantics=holdings_market_value_usd positions=%d",
             result["total_pvs_source"],
-            total_pvs_calculated,
+            holdings_market_value,
             len(positions),
         )
-    elif output2:
-        # positions가 없으면 buy_amount 합계 fallback (legacy)
-        buy_amount_fallback = _safe_float(output2.get("tot_apl_amt", "0"), 0.0)
-        if buy_amount_fallback > 0:
-            result["total_pvs"] = str(buy_amount_fallback)
-            result["total_pvs_source"] = "output2_buy_amount_fallback"
-            logger.warning(
-                "[US_BALANCE][SUMMARY] total_pvs_source=%s total_pvs=%.2f (no positions)",
-                result["total_pvs_source"],
-                buy_amount_fallback,
-            )
-        else:
-            result["total_pvs"] = "0"
-            result["total_pvs_source"] = "zero_no_positions"
-            logger.info("[US_BALANCE][SUMMARY] total_pvs_source=zero_no_positions")
     else:
         result["total_pvs"] = "0"
-        result["total_pvs_source"] = "zero_no_data"
-        logger.info("[US_BALANCE][SUMMARY] total_pvs_source=zero_no_data")
+        result["total_pvs_source"] = "zero_no_positions"
+        result["holdings_market_value_usd"] = 0.0
+        result["holdings_market_value_source"] = "zero_no_positions"
+        logger.info("[US_BALANCE][SUMMARY] total_pvs_source=zero_no_positions semantics=holdings_market_value_usd")
     
     # pnl_usd 별도 추출
     pnl_candidates = (

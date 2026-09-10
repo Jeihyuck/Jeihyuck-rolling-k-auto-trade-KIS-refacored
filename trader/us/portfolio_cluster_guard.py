@@ -29,8 +29,8 @@ def _qty(pos: dict) -> int:
     return int(float(pos.get("qty") or pos.get("quantity") or pos.get("holdings_qty") or 0))
 
 
-def evaluate_portfolio_cluster_guard(positions: list[dict], regime: str, equity_usd: float, current_exit_intents: list[dict] | None = None, provider: Any | None = None, now: Any | None = None) -> dict:
-    exposure = compute_cluster_exposure(positions or [], equity_usd or None)
+def evaluate_portfolio_cluster_guard(positions: list[dict], regime: str, risk_capital_usd: float, current_exit_intents: list[dict] | None = None, provider: Any | None = None, now: Any | None = None) -> dict:
+    exposure = compute_cluster_exposure(positions or [], risk_capital_usd or None)
     caps = cluster_caps_for_regime(regime)
     cap = float(caps.get("AI_TECH_COMBINED", caps.get("AI_COMBINED", 1.0)))
     ai_weight = sum((exposure.get(c) or {}).get("cluster_weight", 0.0) for c in AI_CLUSTERS)
@@ -53,7 +53,7 @@ def evaluate_portfolio_cluster_guard(positions: list[dict], regime: str, equity_
     status = "OVER_CAP" if over_cap else "OK"
     log = logger.warning if over_cap else logger.info
     log("[US_CLUSTER_GUARD][PORTFOLIO] rotation_regime=%s ai_tech_weight=%.4f cap=%.4f over_cap=%s blocked_buy_symbols=%s trim_symbols=%s trim_notional=%.2f", regime, ai_weight, cap, over_cap, sorted(blocked_clusters), [i.get("symbol") for i in trim_intents], trim_notional)
-    return {"portfolio_cluster_guard_status": status, "portfolio_ai_tech_weight": ai_weight, "portfolio_equity_usd": equity_usd, "portfolio_cluster_cap_violations": ["AI_TECH_COMBINED"] if over_cap else [], "blocked_clusters": sorted(blocked_clusters), "cluster_guard_trim_intents": trim_intents, "cluster_guard_trim_notional": trim_notional, "cluster_guard_existing_sell_symbols": sorted(existing_sell_symbols)}
+    return {"portfolio_cluster_guard_status": status, "portfolio_ai_tech_weight": ai_weight, "risk_capital_usd": risk_capital_usd, "risk_capital_semantics": "exposure_denominator", "portfolio_cluster_cap_violations": ["AI_TECH_COMBINED"] if over_cap else [], "blocked_clusters": sorted(blocked_clusters), "cluster_guard_trim_intents": trim_intents, "cluster_guard_trim_notional": trim_notional, "cluster_guard_existing_sell_symbols": sorted(existing_sell_symbols)}
 
 
 def filter_entry_intents_for_cluster_guard(entry_intents: list[dict], guard: dict) -> tuple[list[dict], list[str]]:

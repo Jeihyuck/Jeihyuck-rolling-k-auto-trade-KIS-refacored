@@ -15,9 +15,11 @@ def test_pb1_get_return_public_wrapper_calls_private():
 
 def test_pb1_account_snapshot_does_not_use_unrealized_as_intraday():
     engine = PB1Engine.__new__(PB1Engine)
-    engine._holdings_summary = {}
+    engine._holdings_summary = {"tot_evlu_amt": "1480000"}
     engine._to_float = lambda value: None if value is None else float(value)
     pos = [{"code":"005930","qty":10,"market_value_krw":980_000,"total_cost":1_000_000,"sector_cluster":"SEMICONDUCTOR"}]
     snap = PB1Engine._kr_account_snapshot_for_overlay(engine, pos, available_cash_krw=500_000)
     assert snap["account_intraday_pnl_pct"] is None
     assert snap["portfolio_unrealized_pnl_pct"] == -0.02
+    assert snap["portfolio_equity_krw"] == 1_480_000
+    assert snap["portfolio_equity_source"] == "kis_balance:tot_evlu_amt"

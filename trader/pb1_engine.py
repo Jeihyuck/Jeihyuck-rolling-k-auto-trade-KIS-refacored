@@ -15049,37 +15049,45 @@ class PB1Engine:
         return out
 
     def _kr_account_snapshot_for_overlay(self, positions: list[dict], available_cash_krw: float) -> dict[str, Any]:
+        from trader.accounting import resolve_kr_accounting
+
         invested = sum(float(p.get("market_value_krw") or p.get("total_cost") or 0.0) for p in positions or [])
         cost = sum(float(p.get("total_cost") or 0.0) for p in positions or [])
-        equity = float(available_cash_krw or 0.0) + invested
         portfolio_unrealized_pnl_pct = ((invested - cost) / cost) if cost > 0 else None
-        intraday = None
-        for key in ("KR_ACCOUNT_INTRADAY_PNL_PCT", "ACCOUNT_INTRADAY_PNL_PCT"):
-            raw = os.getenv(key)
-            if raw not in (None, ""):
-                try:
-                    intraday = float(raw)
-                    break
-                except Exception:
-                    pass
-        if intraday is None:
-            for key in ("account_intraday_pnl_pct", "intraday_pnl_pct", "day_pnl_pct", "asst_icdc_erng_rt"):
-                val = self._to_float((self._holdings_summary or {}).get(key))
-                if val is not None:
-                    intraday = val / 100.0 if abs(val) > 1.0 else val
-                    break
-        exposure = calculate_kr_sector_exposure(positions=positions or [], candidate_orders=None, equity_krw=equity)
-        return {
-            "account_intraday_pnl_pct": intraday,
-            "account_5d_pnl_pct": None,
+        accounting = resolve_kr_accounting(
+            summary=self._holdings_summary or {},
+            invested_market_value_krw=invested,
+            orderable_cash_krw=available_cash_krw,
+        )
+        equity = accounting.get("portfolio_equity_krw")
+        if equity is None or float(equity) <= 0:
+            # KIS KR balance has explicit tot_evlu_amt/nass_amt. If it is
+            # missing, do not substitute orderable cash and invent NAV.
+            raise RuntimeError("KR_ACCOUNT_EQUITY_UNAVAILABLE")
+
+        exposure = calculate_kr_sector_exposure(
+            positions=positions or [],
+            candidate_orders=None,
+            equity_krw=float(equity),
+        )
+        snapshot = {
+            **accounting,
             "portfolio_unrealized_pnl_pct": portfolio_unrealized_pnl_pct,
-            "portfolio_equity_krw": equity,
-            "invested_market_value_krw": invested,
-            "cash_krw": float(available_cash_krw or 0.0),
-            "gross_exposure_pct": (invested / equity) if equity > 0 else None,
             "sector_exposure_pct": exposure.get("sector_exposure_pct") or {},
             "high_beta_exposure_pct": exposure.get("high_beta_exposure_pct"),
         }
+        logger.info(
+            "[KR_ACCOUNTING][SNAPSHOT] equity_krw=%.0f equity_source=%s invested_krw=%.0f "
+            "orderable_cash_krw=%s gross_exposure_pct=%.6f intraday_pnl_fraction=%s intraday_pnl_source=%s",
+            float(equity),
+            snapshot.get("portfolio_equity_source"),
+            invested,
+            snapshot.get("orderable_cash_krw"),
+            float(snapshot.get("gross_exposure_pct") or 0.0),
+            snapshot.get("account_intraday_pnl_pct"),
+            snapshot.get("account_intraday_pnl_source"),
+        )
+        return snapshot
 
     def _kr_breadth_input(self, final30_rows: list[dict]) -> tuple[list[dict], str]:
         sources = (
@@ -15265,7 +15273,13 @@ class PB1Engine:
                        "exposure_multiplier": policy.budget_multiplier,
                        "max_new_positions": policy.max_new_positions,
                        "portfolio_equity_krw": account_snapshot.get("portfolio_equity_krw"),
+                       "portfolio_equity_source": account_snapshot.get("portfolio_equity_source"),
+                       "portfolio_equity_authoritative": account_snapshot.get("portfolio_equity_authoritative"),
                        "gross_exposure_pct": account_snapshot.get("gross_exposure_pct"),
+                       "account_intraday_pnl_pct": account_snapshot.get("account_intraday_pnl_pct"),
+                       "account_intraday_pnl_source": account_snapshot.get("account_intraday_pnl_source"),
+                       "account_5d_pnl_pct": account_snapshot.get("account_5d_pnl_pct"),
+                       "account_5d_pnl_source": account_snapshot.get("account_5d_pnl_source"),
                        "sector_exposure_pct": account_snapshot.get("sector_exposure_pct") or {},
                        "high_beta_exposure_pct": account_snapshot.get("high_beta_exposure_pct") or 0.0}
             overlay["account_loss_kill_switch_triggered"] = bool(evaluate_kr_account_risk(account_snapshot).get("account_loss_kill_switch_triggered"))
@@ -15287,18 +15301,26 @@ class PB1Engine:
             return blocked, 0.0
 
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
+        from trader.accounting import kis_percent_points_to_fraction
+
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
         marks = self._fetch_marks([p["code"] for p in positions], fallback)
-        totals: Dict[str, float] = {"market_value": 0.0, "cost": 0.0, "unrealized": 0.0, "realized": 0.0}
+        mark_market_value = 0.0
+        position_cost = 0.0
+        realized_snapshot = 0.0
         for pos in positions:
             qty = pos.get("qty") or 0
             mark = marks.get(pos["code"]) or self._balance_price_map.get(pos["code"]) or pos.get("avg_buy_price") or 0.0
-            market_value = float(mark) * qty
-            cost = float(pos.get("total_cost") or 0.0)
-            totals["market_value"] += market_value
-            totals["cost"] += cost
-            totals["realized"] += float(pos.get("realized_pnl") or 0.0)
-            totals["unrealized"] += market_value - cost
+            mark_market_value += float(mark) * qty
+            position_cost += float(pos.get("total_cost") or 0.0)
+            realized_snapshot += float(pos.get("realized_pnl") or 0.0)
+
+        totals: Dict[str, float] = {
+            "market_value": mark_market_value,
+            "cost": position_cost,
+            "unrealized": mark_market_value - position_cost,
+            "realized": realized_snapshot,
+        }
 
         summary_mv = None
         for key in EVAL_KEYS:
@@ -15316,74 +15338,73 @@ class PB1Engine:
         if summary_cash is not None:
             totals["cash"] = summary_cash
 
-        cost_source = "positions"
-        summary_cost = self._extract_holdings_cost([], self._holdings_summary)
-        cost_base = self._balance_cost if self._balance_cost is not None else totals["cost"] or summary_cost or summary_mv
-        if self._balance_cost is not None:
-            cost_source = "kis_balance"
-            totals["cost"] = self._balance_cost
-        elif summary_cost:
-            cost_source = "balance_summary"
-            totals["cost"] = summary_cost
-
-        balance_unrealized = None
-        for row in self._balance_snapshot.get("output1", []) if self._balance_snapshot else []:
-            for key in UNREALIZED_KEYS:
-                val = self._to_float(row.get(key))
-                if val is not None:
-                    balance_unrealized = (balance_unrealized or 0.0) + val
-        summary_unrealized = None
+        # Keep KIS cost/unrealized as explicit broker fields, but do not combine
+        # them with independently fetched marks to manufacture a return.
+        kis_cost = self._balance_cost
+        if kis_cost is None:
+            kis_cost = self._extract_holdings_cost([], self._holdings_summary)
+        kis_unrealized = None
         for key in UNREALIZED_KEYS:
-            summary_unrealized = self._to_float(self._holdings_summary.get(key))
-            if summary_unrealized is not None:
+            value = self._to_float(self._holdings_summary.get(key))
+            if value is not None:
+                kis_unrealized = value
                 break
-        unrealized_source = "positions"
-        if balance_unrealized is not None:
-            totals["unrealized"] = balance_unrealized
-            unrealized_source = "kis_balance_rows"
-        elif summary_unrealized is not None:
-            totals["unrealized"] = summary_unrealized
-            unrealized_source = "kis_balance_summary"
+        if kis_unrealized is None:
+            row_total = None
+            for row in self._balance_snapshot.get("output1", []) if self._balance_snapshot else []:
+                for key in UNREALIZED_KEYS:
+                    value = self._to_float(row.get(key))
+                    if value is not None:
+                        row_total = (row_total or 0.0) + value
+                        break
+            kis_unrealized = row_total
 
-        return_pct_source = "computed"
-        balance_return_pct = None
-        for key in RETURN_PCT_KEYS:
-            balance_return_pct = self._to_float(self._holdings_summary.get(key))
-            if balance_return_pct is not None:
-                return_pct_source = f"kis_balance:{key}"
-                break
-
-        portfolio_return_pct = balance_return_pct
-        if portfolio_return_pct is None:
-            if cost_base and cost_base > 0:
-                portfolio_return_pct = (totals["market_value"] - cost_base + totals["realized"]) / cost_base * 100
-            else:
-                self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=N/A")
-
-        invested_return_pct = None
         invested_pnl = self._to_float(self._holdings_summary.get("evlu_pfls_smtl_amt"))
         invested_cost = self._to_float(self._holdings_summary.get("pchs_amt_smtl_amt"))
+        invested_return_pct = None
         if invested_pnl is not None and invested_cost and invested_cost > 0:
-            invested_return_pct = (invested_pnl / invested_cost) * 100
+            invested_return_pct = (invested_pnl / invested_cost) * 100.0
+
+        if invested_return_pct is not None:
+            portfolio_return_pct = invested_return_pct
+            return_pct_source = "kis_balance:invested_pnl_div_invested_cost"
+        elif position_cost > 0:
+            portfolio_return_pct = (mark_market_value - position_cost) / position_cost * 100.0
+            return_pct_source = "computed_same_source_marks_and_position_cost"
+        else:
+            portfolio_return_pct = None
+            return_pct_source = "unavailable"
+            self._warn_once("pnl_zero_cost", "[PNL][SNAPSHOT][WARN] zero_or_missing_cost -> return_pct=N/A")
 
         total_asset_return_pct = self._to_float(self._holdings_summary.get("asst_icdc_erng_rt"))
+        total_asset_return_fraction = kis_percent_points_to_fraction(total_asset_return_pct)
 
-        realized_source = "ledger" if totals["realized"] != 0.0 else "none"
+        # Expose broker PnL fields separately. The position-row realized value is
+        # not a canonical cumulative realized ledger and is never added to the
+        # portfolio return above.
+        if kis_cost is not None:
+            totals["cost"] = float(kis_cost)
+        if kis_unrealized is not None:
+            totals["unrealized"] = float(kis_unrealized)
 
         logger.info(
-            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s realized=%.2f realized_source=%s return_pct=%s return_pct_source=%s invested_return_pct=%s total_asset_return_pct=%s",
+            "[PNL][SNAPSHOT] universe_as_of=%s market_value=%.2f market_value_source=marks "
+            "cost=%.2f cost_source=%s unrealized=%.2f unrealized_source=%s "
+            "realized_snapshot=%.2f realized_source=position_rows_noncanonical "
+            "return_pct=%s return_pct_source=%s invested_return_pct=%s "
+            "total_asset_return_pct=%s total_asset_return_fraction=%s",
             self._universe_as_of or "none",
             totals["market_value"],
             totals["cost"],
-            cost_source,
+            "kis_balance" if kis_cost is not None else "positions",
             totals["unrealized"],
-            unrealized_source,
-            totals["realized"],
-            realized_source,
+            "kis_balance" if kis_unrealized is not None else "computed_same_source",
+            realized_snapshot,
             f"{portfolio_return_pct:.2f}" if portfolio_return_pct is not None else "N/A",
             return_pct_source,
             f"{invested_return_pct:.2f}" if invested_return_pct is not None else "N/A",
             f"{total_asset_return_pct:.2f}" if total_asset_return_pct is not None else "N/A",
+            f"{total_asset_return_fraction:.6f}" if total_asset_return_fraction is not None else "N/A",
         )
         totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
         return totals

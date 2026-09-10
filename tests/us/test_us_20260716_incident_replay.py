@@ -43,7 +43,7 @@ def test_20260716_connected_timeout_replay_and_close_accounting(tmp_path,monkeyp
     assert blocked['status']=='ORDER_FENCED_BEFORE_BROKER_SUBMIT'
     # Actual fills remain 15; synthetic balance evidence is accounted separately.
     report=run_daily_report(env='practice',session='close',trade_date='2026-07-16',offline=True,
-        final_balance={'total_pvs':37429.49},final_positions=POSITIONS,kis_fills=ACTUAL,
+        final_balance={'total_pvs':25000.0,'total_pvs_source':'positions_market_value_sum','total_pvs_semantics':'holdings_market_value_usd','holdings_market_value_usd':25000.0,'account_equity_usd':37429.49,'account_equity_source':'kis_account_equity_authoritative'},final_positions=POSITIONS,kis_fills=ACTUAL,
         close_order_classification={'orders':[],'counts':{},'pending_order_count':1},close_run_id='close-1')['report']
     assert report['position_count']==21 and report['kis_actual_fill_execution_count']==15
     assert abs(report['account_equity_usd']-37429.49)<.01
