@@ -120,52 +120,22 @@ def _build_holding_from_kis_item(item: dict) -> dict | None:
 
 
 def fetch_kis_balance(client, env: str) -> dict:
-    """Fetch KIS US balance.
+    """Fetch KIS US holdings without inventing broker cash/equity.
 
-    Returns:
-        {
-            "status": "OK" | "ERROR" | "ERROR_PNL_PRICE_MAPPING",
-            "cash_usd": float,
-            "holdings": list[dict],
-            "error": str | None,
-            "pnl_status": "OK" | "ERROR_PNL_PRICE_MAPPING",
-        }
+    The current production overseas balance response does not expose a proven
+    cash+securities account-equity field. Missing cash is therefore None, not 0.
     """
     try:
         balance_resp = client.get_us_balance()
-
         output1 = balance_resp.get("output1") or []
         output2 = balance_resp.get("output2") or {}
+        if isinstance(output2, list):
+            output2 = output2[0] if output2 and isinstance(output2[0], dict) else {}
 
-        # Cash
-        cash_usd = safe_float(output2.get("frcr_dncl_amt_2"))  # USD 현금
+        cash_raw = output2.get("frcr_dncl_amt_2") if isinstance(output2, dict) else None
+        cash_usd = safe_float(cash_raw) if cash_raw not in (None, "") else None
+        cash_source = "kis_balance:frcr_dncl_amt_2" if cash_usd is not None else "unavailable"
 
-        # KIS balance 현재가 매핑 로그 (상세)
-        for item in output1:
-            try:
-                _sym = str(
-                    item.get("symbol") or item.get("ovrs_pdno") or item.get("pdno") or ""
-                ).strip().upper()
-                for _field in ("last_price", "current", "current_price", "market_price",
-                               "ovrs_now_pric", "ovrs_now_pric1", "now_price"):
-                    _val = item.get(_field)
-                    if _val not in (None, "", "0", 0):
-                        try:
-                            _fval = float(str(_val).replace(",", ""))
-                            if _fval > 0:
-                                logger.info(
-                                    "[US_PNL][PRICE_MAP] symbol=%s source=kis_balance field=%s last_price=%.4f",
-                                    _sym, _field, _fval,
-                                )
-                                break
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        output1_count = len(output1)
-
-        # Holdings — normalize_us_position으로 current → last_price 매핑 포함
         holdings = []
         for item in output1:
             try:
@@ -175,46 +145,37 @@ def fetch_kis_balance(client, env: str) -> dict:
             except Exception as exc:
                 logger.warning("[US_PNL][WARN] parse KIS position failed: %s", exc)
 
-        # PnL 품질 검증
         total_qty = sum(h["qty"] for h in holdings)
         total_market_value = sum(h["market_value_usd"] for h in holdings)
         price_missing_count = sum(1 for h in holdings if h.get("price_missing", False))
+        pnl_status = "ERROR_PNL_PRICE_MAPPING" if total_qty > 0 and total_market_value <= 0 else "OK"
 
         logger.info(
-            "[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d cash_usd=%.2f",
-            output1_count, len(holdings), cash_usd,
+            "[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d cash_usd=%s cash_source=%s",
+            len(output1), len(holdings), cash_usd, cash_source,
         )
-        if price_missing_count > 0:
-            logger.warning(
-                "[US_PNL][PRICE_MISSING] missing_count=%d",
-                price_missing_count,
-            )
-        else:
-            logger.info("[US_PNL][PRICE_MISSING] missing_count=0")
-
-        if total_qty > 0 and total_market_value <= 0:
-            pnl_status = "ERROR_PNL_PRICE_MAPPING"
+        if price_missing_count:
+            logger.warning("[US_PNL][PRICE_MISSING] missing_count=%d", price_missing_count)
+        if pnl_status != "OK":
             logger.error(
                 "[US_PNL][ERROR_PNL_PRICE_MAPPING] holdings=%d total_qty=%d total_market_value=%.2f",
-                len(holdings),
-                total_qty,
-                total_market_value,
+                len(holdings), total_qty, total_market_value,
             )
-        else:
-            pnl_status = "OK"
-
-        logger.info(
-            "[US_PNL][KIS_BALANCE_SUMMARY] holdings=%d pnl_status=%s price_missing=%d",
-            len(holdings),
-            pnl_status,
-            price_missing_count,
-        )
-
+        return {
+            "status": "OK",
+            "cash_usd": cash_usd,
+            "cash_source": cash_source,
+            "holdings": holdings,
+            "error": None,
+            "pnl_status": pnl_status,
+            "raw_balance": balance_resp,
+        }
     except Exception as exc:
         logger.error("[US_PNL][KIS_BALANCE][ERROR] %s", exc)
         return {
             "status": "ERROR",
-            "cash_usd": 0.0,
+            "cash_usd": None,
+            "cash_source": "unavailable",
             "holdings": [],
             "error": str(exc),
             "pnl_status": "ERROR",
@@ -499,7 +460,7 @@ def generate_pnl_report(
     # Fetch KIS balance
     if offline:
         logger.info("[US_PNL][OFFLINE] skipping KIS balance")
-        balance_result = {"status": "ERROR", "cash_usd": 0.0, "holdings": [], "error": "offline"}
+        balance_result = {"status": "ERROR", "cash_usd": None, "cash_source": "unavailable", "holdings": [], "error": "offline"}
     else:
         from trader.us.execution.kis_us_client import KisUSClient
         client = KisUSClient(env=env)
@@ -530,7 +491,7 @@ def generate_pnl_report(
         else:
             holdings = []
             pnl_source = "none"
-        cash_usd = 0.0
+        cash_usd = None
         balance_pnl_status = "UNKNOWN"
 
     # Enrich holdings with DB metadata
@@ -557,11 +518,14 @@ def generate_pnl_report(
     else:
         pnl_status = "OK"
 
-    # TODO: Calculate realized PNL from fills
-    realized_pnl_today_usd = 0.0
-
-    total_pnl_usd = realized_pnl_today_usd + unrealized_pnl_usd
-    total_equity_estimate_usd = cash_usd + market_value_usd
+    # This legacy runner does not calculate sell-fill cost basis. Missing
+    # realized PnL is unknown, not zero; a total strategy PnL cannot be stated.
+    realized_pnl_today_usd = None
+    realized_pnl_available = False
+    total_pnl_usd = None
+    total_equity_estimate_usd = (
+        cash_usd + market_value_usd if cash_usd is not None else None
+    )
 
     # Winners/losers
     winners = sum(1 for h in enriched_holdings if h.get("pnl_pct", 0) > 0)
@@ -576,16 +540,20 @@ def generate_pnl_report(
         "source": pnl_source,
         "pnl_status": pnl_status,
         "total_positions": total_positions,
-        "cash_usd": round(cash_usd, 2),
+        "cash_usd": round(cash_usd, 2) if cash_usd is not None else None,
+        "cash_source": balance_result.get("cash_source", "unavailable"),
         "market_value_usd": round(market_value_usd, 2),
         "cost_basis_usd": round(cost_basis_usd, 2),
         "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
-        "realized_pnl_today_usd": round(realized_pnl_today_usd, 2),
-        "total_pnl_usd": round(total_pnl_usd, 2),
-        "total_equity_estimate_usd": round(total_equity_estimate_usd, 2),
+        "realized_pnl_today_usd": None,
+        "realized_pnl_available": realized_pnl_available,
+        "realized_pnl_source": "unavailable_in_legacy_runner",
+        "total_pnl_usd": None,
+        "total_pnl_status": "UNAVAILABLE_REALIZED_PNL",
+        "total_equity_estimate_usd": round(total_equity_estimate_usd, 2) if total_equity_estimate_usd is not None else None,
         "market_value_krw": round(market_value_usd * fx_krw_per_usd, 0),
-        "total_pnl_krw": round(total_pnl_usd * fx_krw_per_usd, 0),
+        "total_pnl_krw": None,
         "winners": winners,
         "losers": losers,
         "best_position": best_position,
@@ -685,7 +653,7 @@ def generate_pnl_report(
     pnl_ok = not report["data_quality"]["errors"]
     pnl_final_status = "OK" if pnl_ok else "ERROR"
     logger.info(
-        "[US_PNL][OK] date=%s positions=%d total_pnl_usd=%.2f",
+        "[US_PNL][OK] date=%s positions=%d total_pnl_usd=%s realized_pnl_source=unavailable_in_legacy_runner",
         trade_date, total_positions, total_pnl_usd
     )
     logger.info(
