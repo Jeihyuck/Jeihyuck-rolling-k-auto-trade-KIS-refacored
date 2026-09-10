@@ -2205,7 +2205,7 @@ def run_trade_tick(
                     intent,
                     current_daily_notional_usd=buy_daily_notional,
                     current_position_count=position_count,
-                    total_portfolio_usd=max(float(portfolio_equity_usd or effective_budget), 1000.0),
+                    total_portfolio_usd=max(float(risk_capital_usd or effective_budget), 1000.0),
                     available_cash_usd=float(available_cash_usd or 0.0),
                     signal_only=False,
                     kis_order_allowed=kis_order_allowed,
@@ -2714,7 +2714,7 @@ def run_trade_tick(
                     _incremental_max_new = min(int(os.getenv("US_MAX_NEW_SYMBOL_BUYS_PER_TICK", os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3"))), max(0, available_new_slots), _incremental_effective_max)
                     projected_cash_start = max(effective_budget, 0.0)
                     projected_daily_notional_start = buy_daily_notional
-                    _exposure_equity_usd = float(portfolio_equity_usd or 0.0)
+                    _exposure_equity_usd = float(risk_capital_usd or 0.0)
                     projected_state = {
                         "available_cash_usd": projected_cash_start, "daily_notional_usd": buy_daily_notional,
                         "position_count": position_count, "portfolio_usd": _exposure_equity_usd,
@@ -2919,13 +2919,13 @@ def run_trade_tick(
         "available_cash_usd": projected_cash_start,
         "daily_notional_usd": projected_daily_notional_start,
         "position_count": position_count,
-        "portfolio_usd": float(portfolio_equity_usd or 0.0),
+        "portfolio_usd": float(risk_capital_usd or 0.0),
         "order_keys": set(),
         "now": now,
         "cluster_exposure": {},
         "cluster_exposure_start": {},
-        "default_cluster_cap_usd": float(portfolio_equity_usd or 0.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
-        "ai_combined_cap_usd": float(portfolio_equity_usd or 0.0) * float(market_state_overlay.get("max_ai_tech_ratio", 1.0) or 1.0),
+        "default_cluster_cap_usd": float(risk_capital_usd or 0.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
+        "ai_combined_cap_usd": float(risk_capital_usd or 0.0) * float(market_state_overlay.get("max_ai_tech_ratio", 1.0) or 1.0),
     }
     if not projected_state.get("cluster_exposure_start"):
         for _position in current_positions or []:
@@ -3022,7 +3022,7 @@ def run_trade_tick(
                 "available_cash_usd": float(_route_preflight_snapshot.get("available_cash_usd", routing_available_cash)),
                 "daily_notional_usd": float(_route_preflight_snapshot.get("daily_notional_usd", buy_daily_notional)),
                 "position_count": int(_route_preflight_snapshot.get("position_count", position_count)),
-                "portfolio_usd": float(_route_preflight_snapshot.get("portfolio_equity_usd", portfolio_equity_usd or 0.0)),
+                "portfolio_usd": float(_route_preflight_snapshot.get("portfolio_equity_usd", risk_capital_usd or 0.0)),
                 "order_keys": set(_route_preflight_snapshot.get("order_keys") or set()),
                 "cluster_exposure": dict(_route_preflight_snapshot.get("cluster_exposure", routing_cluster_exposure)),
                 "cluster_caps_usd": dict(_route_preflight_snapshot.get("cluster_caps_usd", projected_state.get("cluster_caps_usd") or {})),
@@ -3633,7 +3633,10 @@ def run_trade_tick(
         "exit_routed_after_entry_degraded": int(exit_routed_after_entry_degraded),
         "portfolio_cluster_guard_status": cluster_guard_result.get("portfolio_cluster_guard_status"),
         "portfolio_ai_tech_weight": cluster_guard_result.get("portfolio_ai_tech_weight"),
-        "portfolio_equity_usd": portfolio_equity_usd if 'portfolio_equity_usd' in locals() else 0.0,
+        "portfolio_equity_usd": portfolio_equity_usd if 'portfolio_equity_usd' in locals() and portfolio_equity_usd > 0 else None,
+        "account_equity_source": accounting.get("account_equity_source") if 'accounting' in locals() else "unknown",
+        "risk_capital_usd": risk_capital_usd if 'risk_capital_usd' in locals() else 0.0,
+        "risk_capital_source": accounting.get("risk_capital_source") if 'accounting' in locals() else "unknown",
         "portfolio_cluster_cap_violations": cluster_guard_result.get("portfolio_cluster_cap_violations", []),
         "cluster_guard_blocked_buys": cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [],
         "market_state_blocked_buys": (locals().get("market_preblocked_rows", []) + (market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [])),
