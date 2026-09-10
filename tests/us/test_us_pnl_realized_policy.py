@@ -42,4 +42,6 @@ def test_kis_raw_realized_not_used_as_strategy_realized(monkeypatch, tmp_path) -
     assert result["kis_account_realized_pnl_raw"] == -305444.85
     assert result["realized_pnl_source"] == "unavailable"
     assert result["realized_pnl_usd"] is None
-    assert result["total_pnl_usd"] is None\n    assert result["total_pnl_display_policy"] == "unavailable_cumulative_strategy_pnl"\n    assert result["total_pnl_unavailable_reason"] == "cumulative_realized_history_and_strategy_baseline_not_loaded"
+    assert result["total_pnl_usd"] is None
+    assert result["total_pnl_display_policy"] == "unavailable_cumulative_strategy_pnl"
+    assert result["total_pnl_unavailable_reason"] == "cumulative_realized_history_and_strategy_baseline_not_loaded"
