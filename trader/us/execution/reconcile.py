@@ -130,6 +130,10 @@ def reconcile_positions(provider: Any | None = None, *, trade_date: str | None =
     positions = balance.get("positions", [])
     total_pvs = balance.get("total_pvs", "0")
     total_pvs_source = balance.get("total_pvs_source", "unknown")
+    total_pvs_semantics = balance.get("total_pvs_semantics", "holdings_market_value_usd")
+    holdings_market_value_usd = balance.get("holdings_market_value_usd", total_pvs)
+    account_equity_usd = balance.get("account_equity_usd")
+    account_equity_source = balance.get("account_equity_source", "unavailable_from_current_kis_balance_contract")
     raw_output1_count = balance.get("raw_output1_count", 0)
     normalized_position_count = balance.get("normalized_position_count", 0)
     position_symbols = balance.get("position_symbols", [])
@@ -200,10 +204,12 @@ def reconcile_positions(provider: Any | None = None, *, trade_date: str | None =
         }
 
     logger.info(
-        "[US_RECONCILE][OK] position_count=%d total_pvs=%s total_pvs_source=%s",
+        "[US_RECONCILE][OK] position_count=%d total_pvs=%s total_pvs_source=%s total_pvs_semantics=%s account_equity_source=%s",
         len(positions),
         total_pvs,
         total_pvs_source,
+        total_pvs_semantics,
+        account_equity_source,
     )
 
     logger.info(
@@ -250,8 +256,13 @@ def reconcile_positions(provider: Any | None = None, *, trade_date: str | None =
     return {
         "status": "OK",
         "position_count": len(positions),
+        # total_pvs is retained only as a legacy holdings-MV alias.
         "total_pvs": total_pvs,
         "total_pvs_source": total_pvs_source,
+        "total_pvs_semantics": total_pvs_semantics,
+        "holdings_market_value_usd": holdings_market_value_usd,
+        "account_equity_usd": account_equity_usd,
+        "account_equity_source": account_equity_source,
         "positions": positions,
         "position_symbols": position_symbols,
         "balance_source": "kis_balance_authoritative",
