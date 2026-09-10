@@ -207,8 +207,14 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 "status": reconcile_result.get("status", "OK"),
                 "message": reconcile_result.get("error", ""),
                 "position_count": len(positions),
-                "total_pvs": reconcile_result.get("total_pvs_usd", 0),
-                "detail": {"env": env, "runner": "trade_close"},
+                "total_pvs": reconcile_result.get("total_pvs", 0),
+                "detail": {
+                    "env": env,
+                    "runner": "trade_close",
+                    "total_pvs_semantics": reconcile_result.get("total_pvs_semantics", "holdings_market_value_usd"),
+                    "total_pvs_source": reconcile_result.get("total_pvs_source", "unknown"),
+                    "account_equity_source": reconcile_result.get("account_equity_source", "unknown"),
+                },
             }, trade_date=trade_date)
             logger.info("[US_RECONCILE_LOG][SAVE]")
         except Exception as exc:
