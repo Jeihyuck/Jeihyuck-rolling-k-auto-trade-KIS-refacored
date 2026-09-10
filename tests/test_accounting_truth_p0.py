@@ -121,3 +121,63 @@ def test_legacy_us_pnl_balance_missing_cash_is_unknown_not_zero() -> None:
     assert result["status"] == "OK"
     assert result["cash_usd"] is None
     assert result["cash_source"] == "unavailable"
+
+
+def test_us_risk_capital_stable_with_or_without_reconcile(monkeypatch) -> None:
+    from trader.accounting import resolve_us_accounting
+
+    monkeypatch.setenv("US_EXPECTED_PRACTICE_CAPITAL_KRW", "300000000")
+    monkeypatch.setenv("US_BUDGET_FX_KRW_PER_USD", "1450")
+    monkeypatch.delenv("US_ACCOUNT_EQUITY_USD", raising=False)
+
+    with_reconcile = resolve_us_accounting(
+        reconcile={"total_pvs": "17377.87", "total_pvs_source": "positions_market_value_sum"},
+        invested_market_value_usd=17377.87,
+        broker_orderable_cash_usd=92018.63,
+    )
+    without_reconcile = resolve_us_accounting(
+        reconcile={},
+        invested_market_value_usd=17377.87,
+        broker_orderable_cash_usd=92018.63,
+    )
+    assert with_reconcile["risk_capital_usd"] == without_reconcile["risk_capital_usd"]
+    assert with_reconcile["account_equity_usd"] is None
+    assert without_reconcile["account_equity_usd"] is None
+
+
+def test_us_daily_report_does_not_label_holdings_as_account_equity(monkeypatch, tmp_path) -> None:
+    from trader.us.runner.daily_report_runner import run_daily_report
+
+    monkeypatch.setenv("US_DAILY_REPORT_BASE", str(tmp_path / "daily"))
+    monkeypatch.setenv("US_EXPECTED_PRACTICE_CAPITAL_KRW", "300000000")
+    monkeypatch.setenv("US_PAPER_MAX_CAPITAL_KRW", "300000000")
+    monkeypatch.setenv("US_BUDGET_FX_KRW_PER_USD", "1450")
+    monkeypatch.delenv("US_ACCOUNT_EQUITY_USD", raising=False)
+
+    result = run_daily_report(
+        env="practice",
+        session="close",
+        trade_date="2026-09-08",
+        offline=True,
+        final_balance={
+            "total_pvs": "13329.315",
+            "total_pvs_source": "positions_market_value_sum",
+            "total_pvs_semantics": "holdings_market_value_usd",
+            "holdings_market_value_usd": 13329.315,
+            "account_equity_usd": None,
+            "account_equity_source": "unavailable_from_current_kis_balance_contract",
+        },
+        final_positions=[{
+            "symbol": "AAPL",
+            "qty": 1,
+            "market_value_usd": 13329.315,
+            "current_price_usd": 13329.315,
+        }],
+        kis_fills=[],
+        close_order_classification={"orders": [], "counts": {}, "pending_order_count": 0},
+    )
+    report = result["report"]
+    assert report["account_equity_usd"] is None
+    assert report["account_equity_source"] == "unavailable_from_current_kis_balance_contract"
+    assert report["holdings_market_value_usd"] == 13329.315
+    assert "ACCOUNT_EQUITY_UNAVAILABLE_HOLDINGS_ONLY_BALANCE" in report["warnings"]
