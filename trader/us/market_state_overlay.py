@@ -92,8 +92,16 @@ def _entry_price(pos: dict) -> float:
 
 
 def _pnl_pct(pos: dict) -> float | None:
-    for k in ("unrealized_pnl_pct", "pnl_pct", "profit_pct", "pnl_rate", "evlu_pfls_rt", "prls_rt"):
-        v = _pct(pos.get(k))
+    from trader.accounting import explicit_fraction, kis_percent_points_to_fraction
+
+    # Internal *_pct fields are fractions by strategy contract.
+    for k in ("unrealized_pnl_pct", "pnl_pct", "profit_pct"):
+        v = explicit_fraction(pos.get(k))
+        if v is not None:
+            return v
+    # KIS balance return fields are percentage points: 0.87 means 0.87%.
+    for k in ("pnl_rate", "evlu_pfls_rt", "prls_rt"):
+        v = kis_percent_points_to_fraction(pos.get(k))
         if v is not None:
             return v
     current = _price(pos)
@@ -357,34 +365,43 @@ def regime_constraints(market_regime: str) -> dict[str, Any]:
 
 
 def _account_metrics(positions: list[dict] | None, snap: dict | None) -> dict:
+    from trader.accounting import explicit_fraction, safe_float
+
     snap = snap or {}
-    def f(key):
-        try:
-            return float(snap.get(key) or 0)
-        except Exception:
-            return 0.0
-    invested_usd = f("invested_market_value_usd") or sum(float(p.get("market_value_usd") or p.get("market_value") or _price(p) * _qty(p) or 0) for p in positions or [])
-    equity_usd = f("portfolio_equity_usd") or f("account_equity_usd") or invested_usd + f("cash_usd")
-    cash_usd = f("cash_usd")
-    gross = _pct(snap.get("gross_exposure_pct"))
+    invested_usd = safe_float(snap.get("invested_market_value_usd"), 0.0) or sum(
+        float(p.get("market_value_usd") or p.get("market_value") or _price(p) * _qty(p) or 0)
+        for p in positions or []
+    )
+    account_equity_usd = safe_float(snap.get("portfolio_equity_usd")) or safe_float(snap.get("account_equity_usd"))
+    risk_capital_usd = (
+        safe_float(snap.get("risk_capital_usd"))
+        or safe_float(snap.get("deployment_capital_usd"))
+        or account_equity_usd
+        or 0.0
+    )
+    cash_usd = safe_float(snap.get("cash_usd"))
+    gross = explicit_fraction(snap.get("gross_exposure_pct"))
     if gross is None:
-        gross = invested_usd / equity_usd if equity_usd > 0 else 0.0
+        gross = invested_usd / risk_capital_usd if risk_capital_usd > 0 else 0.0
     ai_mv = 0.0
     for p in positions or []:
         if theme_cluster_for(_symbol(p), p) in AI_TECH_CLUSTERS:
             ai_mv += float(p.get("market_value_usd") or p.get("market_value") or _price(p) * _qty(p) or 0)
-    ai_weight = _pct(snap.get("ai_tech_weight"))
+    ai_weight = explicit_fraction(snap.get("ai_tech_weight"))
     if ai_weight is None:
-        ai_weight = ai_mv / equity_usd if equity_usd > 0 else 0.0
+        ai_weight = ai_mv / risk_capital_usd if risk_capital_usd > 0 else 0.0
     return {
-        "portfolio_equity_usd": equity_usd,
+        "portfolio_equity_usd": account_equity_usd,
+        "account_equity_source": snap.get("account_equity_source") or "unknown",
+        "risk_capital_usd": risk_capital_usd,
+        "risk_capital_source": snap.get("risk_capital_source") or "unknown",
         "invested_market_value_usd": invested_usd,
         "cash_usd": cash_usd,
         "gross_exposure_pct": gross,
         "open_position_count": len(positions or []),
         "ai_tech_weight": ai_weight,
-        "account_intraday_pnl_pct": _pct(snap.get("account_intraday_pnl_pct")),
-        "account_5d_pnl_pct": _pct(snap.get("account_5d_pnl_pct")),
+        "account_intraday_pnl_pct": explicit_fraction(snap.get("account_intraday_pnl_pct")),
+        "account_5d_pnl_pct": explicit_fraction(snap.get("account_5d_pnl_pct")),
     }
 
 
