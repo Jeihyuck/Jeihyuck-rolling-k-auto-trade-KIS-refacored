@@ -1910,24 +1910,44 @@ def run_trade_tick(
             invested_market_value_usd += float(_p.get("market_value_usd") or _p.get("market_value") or _p.get("eval_amount_usd") or 0)
         except (TypeError, ValueError):
             pass
-    account_equity_usd_env = float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0)
-    portfolio_equity_usd = 0.0
-    try:
-        portfolio_equity_usd = float(recon.get("total_pvs_usd") or recon.get("total_pvs") or 0.0)
-    except (TypeError, ValueError):
-        portfolio_equity_usd = 0.0
-    if portfolio_equity_usd <= 0:
-        portfolio_equity_usd = float(invested_market_value_usd or 0.0) + float(available_cash_usd or 0.0)
-    if portfolio_equity_usd <= 0 and account_equity_usd_env > 0:
-        portfolio_equity_usd = account_equity_usd_env
+    # Accounting contract: reconcile.total_pvs is holdings market value, never
+    # broker account equity. Exposure uses explicit risk capital and broker
+    # orderable cash remains an execution-only constraint.
+    from trader.accounting import explicit_fraction, resolve_us_accounting
+    accounting = resolve_us_accounting(
+        reconcile=recon,
+        invested_market_value_usd=invested_market_value_usd,
+        broker_orderable_cash_usd=available_cash_usd,
+    )
+    portfolio_equity_usd = float(accounting.get("account_equity_usd") or 0.0)
+    risk_capital_usd = float(accounting.get("risk_capital_usd") or 0.0)
+    logger.info(
+        "[US_ACCOUNTING][SNAPSHOT] account_equity_usd=%s account_equity_source=%s "
+        "risk_capital_usd=%.2f risk_capital_source=%s holdings_market_value_usd=%.2f "
+        "broker_orderable_cash_usd=%s total_pvs_source=%s",
+        accounting.get("account_equity_usd"),
+        accounting.get("account_equity_source"),
+        risk_capital_usd,
+        accounting.get("risk_capital_source"),
+        float(accounting.get("holdings_market_value_usd") or 0.0),
+        accounting.get("broker_orderable_cash_usd"),
+        accounting.get("total_pvs_source"),
+    )
     try:
         from trader.us.capital_deployment import compute_deployment_metrics, decide_deployment_action
         deployment_metrics = compute_deployment_metrics(
-            account_equity_usd=portfolio_equity_usd or account_equity_usd_env,
+            account_equity_usd=accounting.get("account_equity_usd"),
+            risk_capital_usd=risk_capital_usd,
+            risk_capital_source=str(accounting.get("risk_capital_source") or ""),
             invested_market_value_usd=invested_market_value_usd,
             cash_usd=available_cash_usd,
         )
         capital_deployment_action = decide_deployment_action(deployment_metrics, position_count=position_count, max_positions=max_positions)
+        if risk_capital_usd <= 0:
+            allow_new_symbols = False
+            allow_add_to_existing = False
+            capital_deployment_action = "TRIM_ONLY"
+            logger.error("[US_ACCOUNTING][BUY_BLOCK] reason=RISK_CAPITAL_UNAVAILABLE")
     except Exception as _deploy_exc:
         logger.warning("[US_CAPITAL][DEPLOYMENT][WARN] error=%s", _deploy_exc)
         deployment_metrics = {}
@@ -2054,12 +2074,20 @@ def run_trade_tick(
         prep_result_for_overlay = _prep_overlay_info.get("result") if isinstance(_prep_overlay_info.get("result"), dict) else _prep_overlay_info
         from trader.us.market_state_overlay import evaluate_us_market_state, build_profit_capture_intents
         account_snapshot = {
-            "portfolio_equity_usd": portfolio_equity_usd,
+            "portfolio_equity_usd": accounting.get("account_equity_usd"),
+            "account_equity_source": accounting.get("account_equity_source"),
+            "risk_capital_usd": risk_capital_usd,
+            "risk_capital_source": accounting.get("risk_capital_source"),
+            "deployment_capital_usd": accounting.get("deployment_capital_usd"),
             "invested_market_value_usd": invested_market_value_usd,
             "cash_usd": available_cash_usd,
+            "cash_source": "broker_orderable_cash",
             "gross_exposure_pct": deployment_metrics.get("gross_exposure_pct"),
-            "account_intraday_pnl_pct": os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT"),
-            "account_5d_pnl_pct": os.getenv("US_ACCOUNT_5D_PNL_PCT"),
+            # These env contracts are fractions. Unknown remains None; no PnL is
+            # fabricated from holdings market value or orderable cash.
+            "account_intraday_pnl_pct": explicit_fraction(os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT")),
+            "account_5d_pnl_pct": explicit_fraction(os.getenv("US_ACCOUNT_5D_PNL_PCT")),
+            "account_pnl_source": "explicit_env_fraction" if os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT") not in (None, "") else "unknown",
         }
         # Re-evaluate at every tick: a prep-time completed-daily crash must be
         # able to unlock after live quotes confirm a broad rebound.
@@ -2118,7 +2146,7 @@ def run_trade_tick(
         )
         if _rotation_context.get("rotation_context_suspect"):
             _rotation_regime = "UNKNOWN"
-        cluster_guard_result = evaluate_portfolio_cluster_guard(current_positions, _rotation_regime, portfolio_equity_usd, exit_intents, provider, now)
+        cluster_guard_result = evaluate_portfolio_cluster_guard(current_positions, _rotation_regime, risk_capital_usd, exit_intents, provider, now)
         if cluster_guard_result.get("cluster_guard_trim_intents"):
             exit_intents.extend(cluster_guard_result.get("cluster_guard_trim_intents") or [])
         try:
