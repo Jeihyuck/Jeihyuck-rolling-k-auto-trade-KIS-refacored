@@ -812,15 +812,24 @@ def generate_us_pnl_report(
         else:
             realized_pnl_source = "db_fills_daily"
         realized_pnl_usd = realized_total
+    elif not has_sell_fill:
+        realized_pnl_available = True
+        realized_pnl_source = "no_sell_fills_zero_daily_realized"
+        realized_pnl_usd = 0.0
     else:
         warnings.append("realized_pnl_unavailable")
 
-    total_pnl_display_policy = "unrealized_plus_daily_realized"
-    if realized_pnl_available:
-        total_pnl_usd = unrealized_pnl_usd + (realized_pnl_usd or 0.0)
-    else:
-        total_pnl_usd = unrealized_pnl_usd if not block_normal_pnl_display else None
-        total_pnl_display_policy = "unrealized_only_due_to_realized_unavailable"
+    # Current unrealized + today's realized is a marked daily view, not
+    # cumulative strategy PnL. Historical realized fills/baseline are not loaded
+    # here, so total strategy PnL must remain explicitly unavailable.
+    marked_pnl_usd = (
+        unrealized_pnl_usd + (realized_pnl_usd or 0.0)
+        if realized_pnl_available and not block_normal_pnl_display
+        else None
+    )
+    total_pnl_usd = None
+    total_pnl_display_policy = "unavailable_cumulative_strategy_pnl"
+    total_pnl_unavailable_reason = "cumulative_realized_history_and_strategy_baseline_not_loaded"
 
     if kis_balance_status == "FAILED_ALL_EXCHANGES" and pnl_position_source == "db_snapshot":
         if status == "OK":
@@ -921,8 +930,10 @@ def generate_us_pnl_report(
         "realized_pnl_source": realized_pnl_source,
         "kis_account_realized_pnl_raw": _realized_from_kis,
         "kis_account_realized_pnl_raw_field": _realized_from_kis_field,
-        "total_pnl_usd": round(total_pnl_usd, 2) if total_pnl_usd is not None else None,
+        "marked_pnl_usd_current_plus_daily_realized": round(marked_pnl_usd, 2) if marked_pnl_usd is not None else None,
+        "total_pnl_usd": None,
         "total_pnl_display_policy": total_pnl_display_policy,
+        "total_pnl_unavailable_reason": total_pnl_unavailable_reason,
         "positions": position_list,
         "warnings": warnings,
         "generated_at": _now_ny().isoformat(),
@@ -987,7 +998,8 @@ def generate_us_pnl_report(
         f"- **Total Cost**: {_fmt_usd(total_cost_usd)}",
         f"- **Unrealized PnL**: {'N/A (missing prices)' if block_normal_pnl_display else f'{_fmt_usd(unrealized_pnl_usd)} ({_fmt_pct(unrealized_pnl_pct)})'}",
         f"- **Daily Realized PnL**: {_fmt_usd(realized_pnl_usd) if realized_pnl_available and realized_pnl_usd is not None else 'N/A (daily sell fill cost basis unavailable)'}",
-        f"- **Total Strategy PnL**: {_fmt_usd(total_pnl_usd) if total_pnl_usd is not None else 'N/A'}",
+        f"- **Marked PnL (current unrealized + today's realized; NOT cumulative)**: {_fmt_usd(marked_pnl_usd) if marked_pnl_usd is not None else 'N/A'}",
+        "- **Cumulative Strategy PnL**: N/A (historical realized history / strategy baseline not loaded)",
         f"- **KIS Account Realized Raw**: {(_fmt_usd(_realized_from_kis) if _realized_from_kis is not None else 'N/A')} (raw account field, not used in strategy PnL)",
         f"- **Schedule Expected ET**: {schedule_expected_et}",
         f"- **Actual Start ET**: {actual_start_et}",
