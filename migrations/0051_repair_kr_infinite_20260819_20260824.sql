@@ -10,7 +10,7 @@
 --  * the same afternoon KIS holdings repeatedly showed broker_qty=3 and close
 --    reconciliation showed DB=6/KIS=3, proving the SELL 3 filled.
 --
--- Exact fill prices are NOT inferred from limit prices.  This repair only
+-- Exact fill prices are NOT inferred from limit prices. This repair only
 -- terminalizes quantities that the archived broker-holding evidence proves.
 -- Scope is intentionally exact and idempotent; unrelated cycles are untouched.
 
@@ -32,6 +32,7 @@ WHERE strategy_id = 'KR_INFINITE_V1'
   AND trade_date = DATE '2026-08-19'
   AND side = 'BUY'
   AND reason = 'NEW_CYCLE_BUY'
+  AND idempotency_key = 'KR_INFINITE_V1:KRINF-20260819-1d1a9a3d:2026-08-19:BUY:1'
   AND requested_qty = 6
   AND broker_order_id IS NOT NULL
   AND status IN ('INTENT_CREATED', 'SUBMITTED', 'ACK', 'PENDING', 'PARTIALLY_FILLED', 'RECONCILE_PENDING');
@@ -55,6 +56,7 @@ WHERE strategy_id = 'KR_INFINITE_V1'
   AND trade_date = DATE '2026-08-24'
   AND side IN ('SELL_ALL', 'SELL_PARTIAL')
   AND reason = 'TAKE_PROFIT_TP1'
+  AND idempotency_key = 'KR_INFINITE_V1:KRINF-20260819-1d1a9a3d:2026-08-24:SELL_TP1'
   AND requested_qty = 3
   AND broker_order_id IS NOT NULL
   AND status IN ('INTENT_CREATED', 'SUBMITTED', 'ACK', 'PENDING', 'PARTIALLY_FILLED', 'RECONCILE_PENDING');
@@ -84,6 +86,7 @@ WHERE strategy_id = 'KR_INFINITE_V1'
         AND i.cycle_id = 'KRINF-20260819-1d1a9a3d'
         AND i.trade_date = DATE '2026-08-24'
         AND i.reason = 'TAKE_PROFIT_TP1'
+        AND i.idempotency_key = 'KR_INFINITE_V1:KRINF-20260819-1d1a9a3d:2026-08-24:SELL_TP1'
         AND i.requested_qty = 3
         AND i.status = 'FILLED'
         AND (i.metadata->>'incident_repair_version') = 'KR_INF_INCIDENT_REPAIR_V1'
