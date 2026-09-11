@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from uuid import uuid4
 
 import sqlalchemy as sa
@@ -10,10 +10,13 @@ from trader.db.schema import schema_for_engine
 from trader.kr.broker_truth_review_fixes import (
     _health_after_reconcile_fixed,
     _link_unowned_daily_fills_fixed,
+    _recover_proven_policy_positions_fixed,
+    _update_exact_open_position_fields,
 )
 from trader.kr.infinite.config import InfiniteConfig
 from trader.kr.infinite.models import Action, BrokerPosition, State, Status
 from trader.kr.infinite.strategy import evaluate
+from trader.reconcile_db import close_stale_positions_guarded
 from trader.time_utils import now_kst
 
 
@@ -24,6 +27,51 @@ def _db():
     engine = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(engine).metadata.create_all(engine)
     return engine
+
+
+def _insert_open_position(
+    engine,
+    *,
+    code: str,
+    qty: int,
+    avg: float,
+    position_id: str | None = None,
+    cycle_id: str | None = None,
+    epoch_id: str | None = None,
+    exit_policy_family: str | None = None,
+) -> dict[str, str]:
+    schema = schema_for_engine(engine)
+    ids = {
+        "position_id": position_id or str(uuid4()),
+        "cycle_id": cycle_id or str(uuid4()),
+        "epoch_id": epoch_id or str(uuid4()),
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(schema.positions).values(
+                position_id=ids["position_id"],
+                position_cycle_id=ids["cycle_id"],
+                portfolio_epoch_id=ids["epoch_id"],
+                opened_at=now_kst(),
+                position_origin="SYSTEM",
+                env="practice",
+                strategy=STRATEGY,
+                sid=1,
+                mode=1,
+                code=code,
+                market="KOSPI",
+                qty=qty,
+                avg_buy_price=avg,
+                total_cost=qty * avg,
+                realized_pnl=0.0,
+                status="OPEN",
+                exit_policy_family=exit_policy_family,
+                entry_meta_json={},
+                entry_exit_plan_json={},
+                position_meta={},
+            )
+        )
+    return ids
 
 
 def test_adaptive_add_buy_carries_immutable_broker_baseline() -> None:
@@ -160,31 +208,7 @@ def test_split_daily_ccld_buy_3_plus_2_promotes_full_five_share_position_once() 
 
 def test_health_reports_db_positive_symbol_absent_from_fresh_kis_as_zero() -> None:
     engine = _db()
-    schema = schema_for_engine(engine)
-    with engine.begin() as conn:
-        conn.execute(
-            sa.insert(schema.positions).values(
-                position_id=str(uuid4()),
-                position_cycle_id=str(uuid4()),
-                portfolio_epoch_id=str(uuid4()),
-                opened_at=now_kst(),
-                position_origin="SYSTEM",
-                env="practice",
-                strategy=STRATEGY,
-                sid=1,
-                mode=1,
-                code="005930",
-                market="KOSPI",
-                qty=5,
-                avg_buy_price=100_000.0,
-                total_cost=500_000.0,
-                realized_pnl=0.0,
-                status="OPEN",
-                entry_meta_json={},
-                entry_exit_plan_json={},
-                position_meta={},
-            )
-        )
+    _insert_open_position(engine, code="005930", qty=5, avg=100_000.0)
     health = _health_after_reconcile_fixed(
         engine=engine,
         env="practice",
@@ -193,3 +217,105 @@ def test_health_reports_db_positive_symbol_absent_from_fresh_kis_as_zero() -> No
     )
     assert health["qty_mismatch_count"] == 1
     assert health["qty_mismatches"] == [{"code": "005930", "db_qty": 5, "kis_qty": 0}]
+
+
+def test_authoritative_reconcile_refuses_multiple_open_lifecycles() -> None:
+    """One KIS aggregate must never be copied into two simultaneous OPEN rows."""
+    engine = _db()
+    schema = schema_for_engine(engine)
+    first = _insert_open_position(engine, code="122630", qty=1, avg=110_000.0)
+    second = _insert_open_position(engine, code="122630", qty=2, avg=111_000.0)
+
+    kis_balance = {
+        "output1": [
+            {"pdno": "122630", "hldg_qty": "3", "ord_psbl_qty": "3", "pchs_avg_pric": "110500"}
+        ]
+    }
+    close_stale_positions_guarded(
+        engine=engine,
+        env="practice",
+        strategy=STRATEGY,
+        reason="daily_reconcile",
+        ts=datetime(2026, 9, 11, 15, 30, 0),
+        kis_balance=kis_balance,
+        sell_fill_codes=[],
+        runtime_dir=None,
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(schema.positions.c.position_id, schema.positions.c.qty, schema.positions.c.total_cost)
+            .where(schema.positions.c.code == "122630")
+            .order_by(schema.positions.c.position_id)
+        ).mappings().all()
+    qty_by_id = {str(row["position_id"]): int(row["qty"]) for row in rows}
+    assert qty_by_id[first["position_id"]] == 1
+    assert qty_by_id[second["position_id"]] == 2
+
+    health = _health_after_reconcile_fixed(
+        engine=engine,
+        env="practice",
+        strategy=STRATEGY,
+        holdings_rows=kis_balance["output1"],
+    )
+    assert health["duplicate_open_lifecycle_count"] == 1
+    assert health["qty_mismatch_count"] == 1
+    assert health["qty_mismatches"][0]["reason"] == "MULTIPLE_OPEN_LIFECYCLES"
+    assert health["qty_mismatches"][0]["db_qty"] == 3
+    assert health["qty_mismatches"][0]["kis_qty"] == 3
+
+
+def test_exact_position_update_never_writes_sibling_open_lifecycle() -> None:
+    engine = _db()
+    schema = schema_for_engine(engine)
+    first = _insert_open_position(engine, code="067290", qty=10, avg=2_000.0, exit_policy_family="POLICY_MISSING")
+    second = _insert_open_position(engine, code="067290", qty=5, avg=2_100.0, exit_policy_family="POLICY_MISSING")
+
+    with engine.connect() as conn:
+        selected = dict(
+            conn.execute(
+                sa.select(schema.positions).where(schema.positions.c.position_id == first["position_id"])
+            ).mappings().one()
+        )
+    assert _update_exact_open_position_fields(
+        engine=engine,
+        schema=schema,
+        position=selected,
+        fields={"exit_policy_family": "SWING_STAGED_EXIT", "policy_source": "exact-row-test"},
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(schema.positions.c.position_id, schema.positions.c.exit_policy_family, schema.positions.c.policy_source)
+            .where(schema.positions.c.code == "067290")
+        ).mappings().all()
+    by_id = {str(row["position_id"]): dict(row) for row in rows}
+    assert by_id[first["position_id"]]["exit_policy_family"] == "SWING_STAGED_EXIT"
+    assert by_id[first["position_id"]]["policy_source"] == "exact-row-test"
+    assert by_id[second["position_id"]]["exit_policy_family"] == "POLICY_MISSING"
+    assert by_id[second["position_id"]]["policy_source"] is None
+
+
+def test_policy_recovery_refuses_multiple_open_lifecycles_without_cross_write() -> None:
+    engine = _db()
+    schema = schema_for_engine(engine)
+    first = _insert_open_position(engine, code="039030", qty=2, avg=500_000.0, exit_policy_family="POLICY_MISSING")
+    second = _insert_open_position(engine, code="039030", qty=2, avg=500_000.0, exit_policy_family="POLICY_MISSING")
+
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine,
+        env="practice",
+        strategy=STRATEGY,
+        holdings_rows=[{"pdno": "039030", "hldg_qty": "2", "pchs_avg_pric": "500000"}],
+    )
+    assert result == {"recovered": [], "review_required": ["039030"]}
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(schema.positions.c.position_id, schema.positions.c.exit_policy_family, schema.positions.c.policy_source)
+            .where(schema.positions.c.code == "039030")
+        ).mappings().all()
+    by_id = {str(row["position_id"]): dict(row) for row in rows}
+    for position_id in (first["position_id"], second["position_id"]):
+        assert by_id[position_id]["exit_policy_family"] == "POLICY_MISSING"
+        assert by_id[position_id]["policy_source"] is None
