@@ -69,6 +69,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.kr.broker_truth_sell_fixes import install_sell_fill_guard
     from trader.kr.broker_truth_final_review_fixes import install_final_review_guards
     from trader.kr.broker_truth_observability_compat import install_buy_observability_compat
+    from trader.kr.broker_truth_historical_buy_retry import install_historical_buy_retry
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
@@ -82,3 +83,6 @@ def install_legacy_pb1_runtime_guards() -> None:
     # Compatibility/observability repair runs after the canonical atomic guard.
     # It mirrors legacy evidence and entry_ts without controlling idempotency.
     install_buy_observability_compat()
+    # Installed last: durable order-owned BUY fills are retried across trade
+    # dates, closing the post-midnight crash/restart window.
+    install_historical_buy_retry()
