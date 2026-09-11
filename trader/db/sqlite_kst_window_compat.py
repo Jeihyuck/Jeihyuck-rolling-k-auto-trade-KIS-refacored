@@ -1,18 +1,23 @@
-"""SQLite compatibility for KST order-window queries.
+"""SQLite compatibility for KR durable-order time windows.
 
-Production PostgreSQL stores/compares timezone-aware timestamps correctly.  The
-SQLite test backend uses ``CURRENT_TIMESTAMP`` for ``orders.created_at``, which
-is UTC-naive, while KR session windows are KST wall-clock datetimes.  Between
-00:00 and 08:59 KST this can make a just-created durable order appear to belong
-to the previous day.
+Production PostgreSQL stores and compares timezone-aware timestamps correctly.
+SQLite's ``CURRENT_TIMESTAMP`` is UTC-naive, while the KR repository APIs and
+contract tests use KST wall-clock session windows.  Between 00:00 and 08:59 KST,
+a newly created SQLite intent can therefore appear to belong to the previous
+KST day.
 
-Only SQLite is affected here.  Convert the order ``created_at`` expression from
-UTC to KST before comparing it with KST session-window bounds.  PostgreSQL and
-all live database behaviour remain unchanged.
+Do not shift query expressions: some tests and repair fixtures explicitly store
+KST wall-clock ``created_at`` values.  Instead, only for SQLite, normalize the
+automatically-created durable intent timestamp to KST wall-clock time at intent
+creation.  PostgreSQL/live behaviour is unchanged.
 """
 from __future__ import annotations
 
+import functools
+
 import sqlalchemy as sa
+
+from trader.time_utils import now_kst
 
 _INSTALLED = False
 
@@ -22,23 +27,39 @@ def install_sqlite_kst_order_window_compat() -> None:
     if _INSTALLED:
         return
 
-    # Import lazily so this module can be installed by trader.db.__init__ after
-    # engine/schema modules are available without affecting production dialects.
     from .repos import OrdersRepo
 
     if getattr(OrdersRepo, "_sqlite_kst_window_compat_installed", False):
         _INSTALLED = True
         return
 
-    original = OrdersRepo._window_expr
+    original_create = OrdersRepo.create_intent_idempotent
 
-    def _kst_window_expr(self, column):
-        if self.engine.dialect.name == "sqlite":
-            # SQLite CURRENT_TIMESTAMP is UTC.  KR order-window APIs are defined
-            # in KST wall-clock time, so shift the stored UTC expression +09:00.
-            return sa.func.datetime(column, "+9 hours")
-        return original(self, column)
+    @functools.wraps(original_create)
+    def _create_intent_with_kst_created_at(self, *args, **kwargs):
+        result = original_create(self, *args, **kwargs)
+        if self.engine.dialect.name != "sqlite":
+            return result
 
-    OrdersRepo._window_expr = _kst_window_expr
+        try:
+            order_id, created = result
+        except Exception:
+            return result
+        if not created or not order_id:
+            return result
+
+        # SQLite DateTime does not preserve tz offsets.  Store the KST wall
+        # clock explicitly so the existing KST session-window comparisons are
+        # deterministic across UTC/KST midnight boundaries.
+        created_at_kst = now_kst().replace(tzinfo=None)
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.update(self._schema.orders)
+                .where(self._schema.orders.c.order_id == order_id)
+                .values(created_at=created_at_kst, updated_at=sa.func.now())
+            )
+        return result
+
+    OrdersRepo.create_intent_idempotent = _create_intent_with_kst_created_at
     OrdersRepo._sqlite_kst_window_compat_installed = True
     _INSTALLED = True
