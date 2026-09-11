@@ -13,6 +13,8 @@ def test_incident_repair_is_exactly_scoped_to_proven_122630_cycle() -> None:
     assert "2026-08-24" in SQL
     assert "NEW_CYCLE_BUY" in SQL
     assert "TAKE_PROFIT_TP1" in SQL
+    assert "KR_INFINITE_V1:KRINF-20260819-1d1a9a3d:2026-08-19:BUY:1" in SQL
+    assert "KR_INFINITE_V1:KRINF-20260819-1d1a9a3d:2026-08-24:SELL_TP1" in SQL
     assert "REQUESTED_QTY = 6" in UPPER
     assert "REQUESTED_QTY = 3" in UPPER
     assert "BROKER_ORDER_ID IS NOT NULL" in UPPER
@@ -27,6 +29,12 @@ def test_incident_repair_terminalizes_only_proven_pending_rows_and_clears_tp1_fe
     assert "'PROFIT_STAGE', 'TP1_FILLED'" in UPPER
     assert "'PENDING_PROFIT_STAGE', NULL" in UPPER
     assert "KR_INF_INCIDENT_REPAIR_V1" in SQL
+
+
+def test_incident_repair_does_not_invent_execution_prices_from_limit_prices() -> None:
+    assert "UNRESOLVED_NOT_INFERRED_FROM_LIMIT_PRICE" in SQL
+    assert "FILLED_NOTIONAL_KRW =" not in UPPER
+    assert "FILLED_AVG_PRICE =" not in UPPER
 
 
 def test_incident_repair_preserves_audit_history_and_never_blanket_deletes() -> None:
