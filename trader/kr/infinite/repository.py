@@ -41,23 +41,63 @@ class InfiniteRepository:
     def pending_intents(self) -> list[OrderIntent]:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
-                broker_order_id,status,filled_qty,filled_notional_krw FROM kr_infinite_order_intents
+                broker_order_id,status,filled_qty,filled_notional_krw,metadata FROM kr_infinite_order_intents
                 WHERE status=ANY(:statuses) ORDER BY id"""), {"statuses": list(PENDING)}).mappings().all()
-        return [OrderIntent(**dict(row)) for row in rows]
+        result: list[OrderIntent] = []
+        for row in rows:
+            payload = dict(row)
+            metadata = payload.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            payload["metadata"] = metadata if isinstance(metadata, dict) else {}
+            result.append(OrderIntent(**payload))
+        return result
+
+    @staticmethod
+    def _intent_metadata(state: State, decision: Decision) -> dict:
+        """Persist immutable broker baseline/provenance required for balance-delta reconciliation.
+
+        Existing JSONB is used deliberately: no schema migration is required.  For
+        TP decisions the strategy already supplies remaining_qty, so pre-order qty
+        is provable.  A new-cycle BUY is known to start from flat.  Broker-adopted
+        positions also carry their authoritative broker quantity/average in state.
+        """
+        metadata = dict(decision.metadata or {})
+        if metadata.get("pre_order_holding_qty") is None:
+            remaining = metadata.get("remaining_qty")
+            if decision.action.value in {"SELL_PARTIAL", "SELL_ALL"} and remaining is not None:
+                metadata["pre_order_holding_qty"] = max(0, int(remaining) + int(decision.qty or 0))
+            elif decision.reason == "NEW_CYCLE_BUY":
+                metadata["pre_order_holding_qty"] = 0
+            elif (state.metadata or {}).get("broker_qty") is not None:
+                metadata["pre_order_holding_qty"] = max(0, int((state.metadata or {}).get("broker_qty") or 0))
+        if metadata.get("pre_order_avg_price") is None:
+            if int(metadata.get("pre_order_holding_qty") or 0) == 0:
+                metadata["pre_order_avg_price"] = 0.0
+            elif (state.metadata or {}).get("broker_average_price") is not None:
+                metadata["pre_order_avg_price"] = float((state.metadata or {}).get("broker_average_price") or 0.0)
+        metadata["reconcile_contract_version"] = "KR_INF_BALANCE_DELTA_V1"
+        metadata["strategy_owner"] = "KR_INFINITE"
+        return metadata
 
     def create_intent(self, state: State, decision: Decision, trade_date: date, market_state: str) -> bool:
         """Persist first. A uniqueness loss means the caller must not submit."""
+        intent_metadata = self._intent_metadata(state, decision)
         with self.engine.begin() as conn:
             row = conn.execute(text("""INSERT INTO kr_infinite_order_intents(
                 strategy_id,symbol,cycle_id,trade_date,side,reason,unit_sequence,requested_notional_krw,
-                requested_qty,limit_price,idempotency_key,market_state)
-                VALUES('KR_INFINITE_V1','122630',:cycle,:day,:side,:reason,:seq,:notional,:qty,:price,:key,:market)
+                requested_qty,limit_price,idempotency_key,market_state,metadata)
+                VALUES('KR_INFINITE_V1','122630',:cycle,:day,:side,:reason,:seq,:notional,:qty,:price,:key,:market,CAST(:metadata AS jsonb))
                 ON CONFLICT(idempotency_key) DO NOTHING RETURNING id"""), {
                 "cycle": state.cycle_id, "day": trade_date, "side": decision.action.value,
                 "reason": decision.reason, "seq": state.units_used + 1 if decision.action.value in {"BUY", "RECOVERY"} else None,
                 "notional": decision.notional, "qty": decision.qty,
                 "price": decision.notional / decision.qty if decision.qty else None,
                 "key": decision.idempotency_key, "market": market_state,
+                "metadata": json.dumps(intent_metadata, default=str),
             }).first()
         return row is not None
 
