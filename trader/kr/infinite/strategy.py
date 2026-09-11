@@ -180,4 +180,17 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     action=Action.RECOVERY if recovery else Action.BUY
     key=idempotency_key(state.cycle_id or "NEW",trade_date,"RECOVERY" if recovery else "BUY",state.units_used+1)
     if key in existing_intent_keys: return Decision(Action.WAIT,"DUPLICATE_INTENT")
-    return Decision(action,"RECOVERY_PROBE" if recovery else ("NEW_CYCLE_BUY" if new else "ADAPTIVE_ADD_BUY"),qty,notional,key,Status.ACTIVE)
+    return Decision(
+        action,
+        "RECOVERY_PROBE" if recovery else ("NEW_CYCLE_BUY" if new else "ADAPTIVE_ADD_BUY"),
+        qty,
+        notional,
+        key,
+        Status.ACTIVE,
+        {
+            "pre_order_holding_qty": int(position.qty or 0),
+            "pre_order_avg_price": float(position.average_price or 0.0),
+            "pre_order_orderable_qty": int(position.orderable_qty or 0),
+            "reconcile_baseline_source": "KR_INFINITE_STRATEGY_BROKER_POSITION",
+        },
+    )
