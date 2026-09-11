@@ -62,7 +62,9 @@ WHERE strategy_id = 'KR_INFINITE_V1'
   AND status IN ('INTENT_CREATED', 'SUBMITTED', 'ACK', 'PENDING', 'PARTIALLY_FILLED', 'RECONCILE_PENDING');
 
 -- The TP1 SELL was a three-share partial exit from six, with three shares
--- remaining. Clear the stale submitted fence and preserve the residual cycle.
+-- remaining. Clear the stale submitted fence only if the state row is still the
+-- exact unresolved TP1 state from the incident. If an operator already repaired
+-- or advanced the cycle, do not regress state.
 UPDATE kr_infinite_state
 SET status = 'ACTIVE',
     metadata = (COALESCE(metadata, '{}'::jsonb) - 'pending_profit_stage') || jsonb_build_object(
@@ -78,6 +80,8 @@ SET status = 'ACTIVE',
 WHERE strategy_id = 'KR_INFINITE_V1'
   AND symbol = '122630'
   AND cycle_id = 'KRINF-20260819-1d1a9a3d'
+  AND status = 'EXIT_PENDING'
+  AND COALESCE(metadata->>'pending_profit_stage', '') = 'TP1_SUBMITTED'
   AND EXISTS (
       SELECT 1
       FROM kr_infinite_order_intents i
