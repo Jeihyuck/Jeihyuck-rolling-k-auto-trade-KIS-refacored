@@ -78,6 +78,21 @@ exit 0
     return root
 
 
+def _init_fixture_git(root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "fixture@example.test"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Fixture"], cwd=root, check=True)
+    (root / "tracked-revision.txt").write_text("revision=1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked-revision.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture revision 1"], cwd=root, check=True)
+
+
+def _advance_fixture_git_commit(root: Path) -> None:
+    (root / "tracked-revision.txt").write_text("revision=2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked-revision.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture revision 2"], cwd=root, check=True)
+
+
 def run_us_mail(root: Path, trade_date: str | None, *, kst_run_date: str):
     archive = root / "nullim-us-pr121.tar.gz"
     env = {
@@ -127,15 +142,18 @@ def test_us_missing_edt_prewarm_sends_degraded_mail(tmp_path):
         "code": "REQUIRED_LOG_MISSING_prep-prewarm-edt",
         "path": f"runtime/logs/us/{trade_date}/prep-prewarm-edt",
     }]
-    assert "[DEGRADED][LOG]" in (root / "smtp-args").read_text()
+    assert "[NULLIM][US][DEGRADED]" in (root / "smtp-args").read_text()
 
     with tarfile.open(archive, "r:gz") as tf:
         names = tf.getnames()
         manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
-        evidence = json.load(tf.extractfile("./MAIL_EVIDENCE_REPORT.json"))
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
     assert manifest["evidence_status"] == "DEGRADED"
     assert manifest["required_missing_count"] == 1
     assert evidence["status"] == "DEGRADED"
+    assert evidence["expected"] == 8
+    assert evidence["present"] == 7
+    assert evidence["missing"] == ["prep-prewarm-edt"]
     assert not any("prep-prewarm-edt/" in name for name in names)
     assert any("prep-prewarm-est/" in name for name in names)
 
@@ -166,6 +184,64 @@ def test_degraded_evidence_digest_is_idempotent(tmp_path):
     assert second.returncode == 0, second.stderr + second.stdout
     assert "IDEMPOTENT_SKIP" in second.stdout
     assert (root / "smtp-count").read_text().strip() == "1"
+
+
+def test_evidence_digest_ignores_repo_commit_changes(tmp_path):
+    trade_date = "2026-09-10"
+    run_date = "2026-09-11"
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+    _init_fixture_git(root)
+
+    first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+    first_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    _advance_fixture_git_commit(root)
+    second, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+
+    assert first.returncode == 0, first.stderr + first.stdout
+    assert second.returncode == 0, second.stderr + second.stdout
+    assert "IDEMPOTENT_SKIP" in second.stdout
+    assert (root / "smtp-count").read_text().strip() == "1"
+    second_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert second_marker["source_evidence_sha256"] == first_marker["source_evidence_sha256"]
+
+
+def test_same_trade_evidence_is_idempotent_across_kst_run_dates(tmp_path):
+    trade_date = "2026-09-10"
+    first_run_date = "2026-09-11"
+    second_run_date = "2026-09-12"
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+
+    first, _ = run_us_mail(root, trade_date, kst_run_date=first_run_date)
+    second, _ = run_us_mail(root, trade_date, kst_run_date=second_run_date)
+
+    assert first.returncode == 0, first.stderr + first.stdout
+    assert second.returncode == 0, second.stderr + second.stdout
+    assert "IDEMPOTENT_SKIP" in second.stdout
+    assert (root / "smtp-count").read_text().strip() == "1"
+    assert not (root / f"runtime/health/us-mail-{second_run_date}.json").exists()
+
+
+def test_newly_arrived_missing_log_changes_digest_and_allows_complete_resend(tmp_path):
+    trade_date = "2026-09-10"
+    run_date = "2026-09-11"
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"prep-prewarm-edt"})
+
+    first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+    first_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    restored = root / f"runtime/logs/us/{trade_date}/prep-prewarm-edt"
+    restored.mkdir(parents=True)
+    (restored / "attempt.log").write_text("purpose=prep-prewarm-edt\n", encoding="utf-8")
+    second, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+
+    assert first.returncode == 0, first.stderr + first.stdout
+    assert first_marker["status"] == "DEGRADED"
+    assert second.returncode == 0, second.stderr + second.stdout
+    assert "IDEMPOTENT_SKIP" not in second.stdout
+    assert (root / "smtp-count").read_text().strip() == "2"
+    second_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert second_marker["status"] == "OK"
+    assert second_marker["required_missing_count"] == 0
+    assert second_marker["source_evidence_sha256"] != first_marker["source_evidence_sha256"]
 
 
 def test_us_delayed_mail_uses_latest_completed_partition(tmp_path):
