@@ -2,7 +2,7 @@
 -- archived 2026-08-19 and 2026-08-24 runtime logs.
 --
 -- Evidence:
---  * 2026-08-19 NEW_CYCLE_BUY requested 6 @ 110500 and KIS accepted the order.
+--  * 2026-08-19 NEW_CYCLE_BUY requested 6 and KIS accepted the order.
 --  * 2026-08-24 before TP1, the KR_INFINITE decision log recorded broker_qty=6.
 --    With no intervening KR_INFINITE intent, that later broker snapshot proves
 --    the 8/19 BUY reached 6 shares.
@@ -10,23 +10,20 @@
 --  * the same afternoon KIS holdings repeatedly showed broker_qty=3 and close
 --    reconciliation showed DB=6/KIS=3, proving the SELL 3 filled.
 --
--- Scope is intentionally exact.  This is not a generic "expire stale order"
--- cleanup and it must never mutate unrelated cycles/symbols/dates.
+-- Exact fill prices are NOT inferred from limit prices.  This repair only
+-- terminalizes quantities that the archived broker-holding evidence proves.
+-- Scope is intentionally exact and idempotent; unrelated cycles are untouched.
 
 UPDATE kr_infinite_order_intents
 SET status = 'FILLED',
     filled_qty = 6,
-    filled_notional_krw = CASE
-        WHEN COALESCE(filled_notional_krw, 0) > 0 THEN filled_notional_krw
-        ELSE COALESCE(limit_price, 0) * 6
-    END,
-    filled_avg_price = COALESCE(filled_avg_price, NULLIF(limit_price, 0)),
     metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
         'strategy_owner', 'KR_INFINITE',
         'pre_order_holding_qty', 0,
         'incident_proven_post_order_holding_qty', 6,
         'incident_evidence', 'ARCHIVED_LOGS_20260819_20260824',
-        'incident_repair_version', 'KR_INF_INCIDENT_REPAIR_V1'
+        'incident_repair_version', 'KR_INF_INCIDENT_REPAIR_V1',
+        'fill_price_status', 'UNRESOLVED_NOT_INFERRED_FROM_LIMIT_PRICE'
     ),
     updated_at = NOW()
 WHERE strategy_id = 'KR_INFINITE_V1'
@@ -63,7 +60,7 @@ WHERE strategy_id = 'KR_INFINITE_V1'
   AND status IN ('INTENT_CREATED', 'SUBMITTED', 'ACK', 'PENDING', 'PARTIALLY_FILLED', 'RECONCILE_PENDING');
 
 -- The TP1 SELL was a three-share partial exit from six, with three shares
--- remaining.  Clear the stale submitted fence and preserve the residual cycle.
+-- remaining. Clear the stale submitted fence and preserve the residual cycle.
 UPDATE kr_infinite_state
 SET status = 'ACTIVE',
     metadata = (COALESCE(metadata, '{}'::jsonb) - 'pending_profit_stage') || jsonb_build_object(
