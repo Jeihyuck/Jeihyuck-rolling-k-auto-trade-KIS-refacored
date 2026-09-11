@@ -68,6 +68,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.kr.broker_truth_review_fixes import install_review_feedback_guards
     from trader.kr.broker_truth_sell_fixes import install_sell_fill_guard
     from trader.kr.broker_truth_final_review_fixes import install_final_review_guards
+    from trader.kr.broker_truth_observability_compat import install_buy_observability_compat
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
@@ -75,6 +76,9 @@ def install_legacy_pb1_runtime_guards() -> None:
     # Installed after the reviewed BUY linker so SELL execution accounting is
     # atomic with the exact lifecycle.
     install_sell_fill_guard()
-    # Installed last: preserves reconciliation watermarks and upgrades BUY
-    # attribution with retry-safe, atomic position application.
+    # Preserve reconciliation watermarks and upgrade BUY attribution with
+    # retry-safe, atomic position application.
     install_final_review_guards()
+    # Compatibility/observability repair runs after the canonical atomic guard.
+    # It mirrors legacy evidence and entry_ts without controlling idempotency.
+    install_buy_observability_compat()
