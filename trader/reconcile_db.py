@@ -183,6 +183,28 @@ def close_stale_positions_guarded(
             ).mappings().all()
         ]
 
+    # KIS exposes one aggregate holding quantity per symbol.  If DB contains
+    # multiple simultaneous OPEN lifecycles for that symbol, there is no safe
+    # way to assign the broker aggregate to one lifecycle without provenance.
+    # Never duplicate the full KIS quantity into each row; fence the symbol and
+    # let broker-truth health surface it as RED for lifecycle repair.
+    open_rows_by_code: dict[str, list[dict[str, Any]]] = {}
+    for row in open_rows:
+        code = str((row or {}).get("code") or "").zfill(6)
+        open_rows_by_code.setdefault(code, []).append(row)
+    ambiguous_open_codes = {
+        code for code, rows in open_rows_by_code.items() if len(rows) > 1
+    }
+    for code in sorted(ambiguous_open_codes):
+        rows = open_rows_by_code[code]
+        logger.error(
+            "[POSITION_RECONCILE_ADJUST][MULTIPLE_OPEN_LIFECYCLES] code=%s count=%s position_ids=%s db_qtys=%s action=NO_AUTO_ADJUST",
+            code,
+            len(rows),
+            [str(row.get("position_id") or "") for row in rows],
+            [int(row.get("qty") or 0) for row in rows],
+        )
+
     open_order_codes: set[str] = set()
     with engine.connect() as conn:
         order_rows = conn.execute(
@@ -211,6 +233,17 @@ def close_stale_positions_guarded(
         code = str((row or {}).get("code") or "").zfill(6)
         db_qty = int((row or {}).get("qty") or 0)
         db_avg = float((row or {}).get("avg_buy_price") or 0.0)
+
+        if code in ambiguous_open_codes:
+            rows_kept += 1
+            logger.error(
+                "[STALE_DB][CHECK] code=%s position_id=%s db_qty=%s action=KEEP reason=MULTIPLE_OPEN_LIFECYCLES",
+                code,
+                position_id,
+                db_qty,
+            )
+            continue
+
         kis_state = holdings_by_code.get(code) or {}
         kis_qty = int(kis_state.get("hldg_qty") or 0)
         ord_psbl_qty = int(kis_state.get("ord_psbl_qty") or 0)
