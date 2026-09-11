@@ -66,7 +66,11 @@ def install_legacy_pb1_runtime_guards() -> None:
     # importing any Korean execution code into the US-only process path.
     from trader.kr.broker_truth_hardening import install_kr_broker_truth_runtime_guards
     from trader.kr.broker_truth_review_fixes import install_review_feedback_guards
+    from trader.kr.broker_truth_sell_fixes import install_sell_fill_guard
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
     install_review_feedback_guards()
+    # Installed last so the SELL atomic guard wraps the fully reviewed BUY
+    # linker while preserving exact lifecycle/policy protections above.
+    install_sell_fill_guard()
