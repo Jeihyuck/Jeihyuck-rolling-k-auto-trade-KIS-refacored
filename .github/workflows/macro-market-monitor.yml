@@ -36,13 +36,23 @@ jobs:
     timeout-minutes: 12
     env:
       PYTHONUNBUFFERED: "1"
+      # Map every alias already understood by the repo's Naver mail tooling.
       NAVER_MAIL_TO: ${{ secrets.NAVER_MAIL_TO }}
       NAVER_SMTP_USER: ${{ secrets.NAVER_SMTP_USER }}
       NAVER_SMTP_PASS: ${{ secrets.NAVER_SMTP_PASS }}
+      REPORT_MAIL_TO: ${{ secrets.REPORT_MAIL_TO }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_USER: ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      MAIL_USER: ${{ secrets.MAIL_USER }}
+      MAIL_PASS: ${{ secrets.MAIL_PASS }}
       MAIL_TO: ${{ secrets.MAIL_TO }}
       MAIL_FROM: ${{ secrets.MAIL_FROM }}
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      SMTP_FROM: ${{ secrets.SMTP_FROM }}
       SMTP_HOST: smtp.naver.com
       SMTP_PORT: "587"
 
@@ -81,6 +91,12 @@ jobs:
           set -euo pipefail
           args=(--state-file runtime/macro_monitor/state.json --report-dir reports/macro_monitor)
 
+          # Normalize legacy aliases exactly as scripts/wsl/with-venv.sh does.
+          export MAIL_TO="${MAIL_TO:-${EMAIL_TO:-${NAVER_MAIL_TO:-${REPORT_MAIL_TO:-}}}}"
+          export MAIL_FROM="${MAIL_FROM:-${EMAIL_FROM:-${SMTP_FROM:-${EMAIL_USER:-${SMTP_USER:-${NAVER_SMTP_USER:-}}}}}}"
+          export SMTP_USER="${SMTP_USER:-${EMAIL_USER:-${MAIL_USER:-${NAVER_SMTP_USER:-${MAIL_FROM:-}}}}}"
+          export SMTP_PASS="${SMTP_PASS:-${EMAIL_PASS:-${EMAIL_PASSWORD:-${MAIL_PASS:-${NAVER_SMTP_PASS:-}}}}}"
+
           # 07:17 KST is the one guaranteed daily report. Other slots only alert on state/signal change.
           if [[ "${SCHEDULE_EXPR:-}" == "17 22 * * *" ]]; then
             args+=(--daily-summary)
@@ -90,10 +106,7 @@ jobs:
           fi
 
           # PR validation never sends mail. Scheduled/manual runs reuse the repo's existing Naver SMTP sender.
-          effective_user="${SMTP_USER:-${NAVER_SMTP_USER:-}}"
-          effective_pass="${SMTP_PASS:-${NAVER_SMTP_PASS:-}}"
-          effective_to="${MAIL_TO:-${NAVER_MAIL_TO:-}}"
-          if [[ "${EVENT_NAME:-}" != "pull_request" && -n "$effective_user" && -n "$effective_pass" && -n "$effective_to" ]]; then
+          if [[ "${EVENT_NAME:-}" != "pull_request" && -n "${SMTP_USER:-}" && -n "${SMTP_PASS:-}" && -n "${MAIL_TO:-}" ]]; then
             args+=(--send-mail)
           else
             echo "[MACRO_MONITOR][MAIL_SKIP] PR validation or Naver SMTP secrets/recipient unavailable."
