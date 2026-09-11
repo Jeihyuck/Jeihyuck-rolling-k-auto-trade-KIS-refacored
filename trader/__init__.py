@@ -28,3 +28,10 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.pb1_runtime_guards import _install_pb1_engine_runtime_guards
 
     _install_pb1_engine_runtime_guards()
+
+    # Broker truth hardening is intentionally installed from the same KR-only
+    # entry point.  It closes ACK->FILL->POSITION lifecycle gaps without
+    # importing any Korean execution code into the US-only process path.
+    from trader.kr.broker_truth_hardening import install_kr_broker_truth_runtime_guards
+
+    install_kr_broker_truth_runtime_guards()
