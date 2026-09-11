@@ -15,12 +15,19 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - "macro_monitor/**"
+      - "scripts/run_macro_market_monitor.py"
+      - "tests/test_macro_market_monitor.py"
+      - ".github/workflows/macro-market-monitor.yml"
+      - "scripts/notify/send_mail_attachment.py"
 
 permissions:
   contents: read
 
 concurrency:
-  group: macro-market-monitor
+  group: macro-market-monitor-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -40,10 +47,8 @@ jobs:
       SMTP_PORT: "587"
 
     steps:
-      - name: Checkout dual-agent
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: dual-agent
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -58,6 +63,7 @@ jobs:
         run: pytest -q tests/test_macro_market_monitor.py
 
       - name: Restore previous monitor state
+        if: github.event_name != 'pull_request'
         uses: actions/cache/restore@v4
         with:
           path: runtime/macro_monitor/state.json
@@ -68,6 +74,7 @@ jobs:
       - name: Run monitor and conditionally send Naver mail
         shell: bash
         env:
+          EVENT_NAME: ${{ github.event_name }}
           SCHEDULE_EXPR: ${{ github.event.schedule }}
           FORCE_MAIL: ${{ inputs.force_mail }}
         run: |
@@ -82,20 +89,20 @@ jobs:
             args+=(--force-mail)
           fi
 
-          # Reuse the repository's existing Naver SMTP sender only when credentials/recipient exist.
+          # PR validation never sends mail. Scheduled/manual runs reuse the repo's existing Naver SMTP sender.
           effective_user="${SMTP_USER:-${NAVER_SMTP_USER:-}}"
           effective_pass="${SMTP_PASS:-${NAVER_SMTP_PASS:-}}"
           effective_to="${MAIL_TO:-${NAVER_MAIL_TO:-}}"
-          if [[ -n "$effective_user" && -n "$effective_pass" && -n "$effective_to" ]]; then
+          if [[ "${EVENT_NAME:-}" != "pull_request" && -n "$effective_user" && -n "$effective_pass" && -n "$effective_to" ]]; then
             args+=(--send-mail)
           else
-            echo "[MACRO_MONITOR][MAIL_SKIP] Naver SMTP secrets/recipient not available; report still generated."
+            echo "[MACRO_MONITOR][MAIL_SKIP] PR validation or Naver SMTP secrets/recipient unavailable."
           fi
 
           python scripts/run_macro_market_monitor.py "${args[@]}"
 
       - name: Save monitor state
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: runtime/macro_monitor/state.json
