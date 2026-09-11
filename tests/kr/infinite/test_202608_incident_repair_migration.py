@@ -31,6 +31,12 @@ def test_incident_repair_terminalizes_only_proven_pending_rows_and_clears_tp1_fe
     assert "KR_INF_INCIDENT_REPAIR_V1" in SQL
 
 
+def test_state_repair_cannot_regress_an_already_advanced_cycle() -> None:
+    assert "AND STATUS = 'EXIT_PENDING'" in UPPER
+    assert "COALESCE(METADATA->>'PENDING_PROFIT_STAGE', '') = 'TP1_SUBMITTED'" in UPPER
+    assert "IF AN OPERATOR ALREADY REPAIRED" in UPPER
+
+
 def test_incident_repair_does_not_invent_execution_prices_from_limit_prices() -> None:
     assert "UNRESOLVED_NOT_INFERRED_FROM_LIMIT_PRICE" in SQL
     assert "FILLED_NOTIONAL_KRW =" not in UPPER
