@@ -28,6 +28,34 @@ def _ids():
     return str(uuid4()), str(uuid4()), str(uuid4())
 
 
+def test_post_tick_runtime_binding_resolves_db_engine_from_orders_repo(monkeypatch) -> None:
+    """The live PB1 object need not expose .engine directly; its repository does."""
+    import trader
+    import trader.kr.broker_truth_hardening as broker_truth
+
+    marker = object()
+    seen = {}
+
+    def fake_post_tick(engine_obj):
+        seen["engine"] = getattr(engine_obj, "engine", None)
+
+    monkeypatch.setattr(broker_truth, "_repo_engine_binding_installed", False, raising=False)
+    monkeypatch.setattr(broker_truth, "_post_pb1_tick_reconcile", fake_post_tick)
+    trader._install_broker_truth_repo_engine_binding()
+
+    class Repo:
+        engine = marker
+
+    class EngineObj:
+        orders_repo = Repo()
+
+    obj = EngineObj()
+    broker_truth._post_pb1_tick_reconcile(obj)
+
+    assert getattr(obj, "engine", None) is marker
+    assert seen["engine"] is marker
+
+
 def test_daily_ccld_fill_links_exact_order_and_creates_system_position_with_entry_policy() -> None:
     """2026-09-11 class: broker fill must not remain order_id=NULL / fills=0."""
     engine = _db()
