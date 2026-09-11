@@ -65,6 +65,8 @@ def install_legacy_pb1_runtime_guards() -> None:
     # entry point.  It closes ACK->FILL->POSITION lifecycle gaps without
     # importing any Korean execution code into the US-only process path.
     from trader.kr.broker_truth_hardening import install_kr_broker_truth_runtime_guards
+    from trader.kr.broker_truth_review_fixes import install_review_feedback_guards
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
+    install_review_feedback_guards()
