@@ -44,6 +44,7 @@ class OrderIntent:
     filled_qty: int = 0
     filled_notional_krw: float = 0
     unit_sequence: int|None = None
+    metadata: dict[str, Any]=field(default_factory=dict)
 
 @dataclass(frozen=True)
 class BrokerOrderState:
