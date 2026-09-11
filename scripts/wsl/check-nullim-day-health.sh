@@ -33,7 +33,7 @@ except Exception:
  installed={}; current='unknown'; owner_ok=False; sha_ok=False
 ok=policy=='OK' and forbidden==0 and owner_ok and sha_ok
 reason=None if ok else ('SCHEDULER_POLICY_VIOLATION' if forbidden or policy!='OK' or not owner_ok else 'FAILED_SCHEDULER_DRIFT')
-result={'market':market.upper(),'date':day,'trade_date':trade,'status':'SKIPPED_NON_TRADING_DAY','mail_ok':True,'mail_required':False,'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_policy_status':policy,'forbidden_wsl_scheduler_sources':forbidden,'scheduler_sha_matches':sha_ok,'scheduler_owner_matches':owner_ok,'installed_commit_sha':installed.get('installed_commit_sha'),'current_commit_sha':current,'ok':ok}
+result={'market':market.upper(),'date':day,'trade_date':trade,'status':'SKIPPED_NON_TRADING_DAY','mail_ok':True,'mail_delivered':True,'mail_complete':True,'mail_required':False,'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_policy_status':policy,'forbidden_wsl_scheduler_sources':forbidden,'scheduler_sha_matches':sha_ok,'scheduler_owner_matches':owner_ok,'installed_commit_sha':installed.get('installed_commit_sha'),'current_commit_sha':current,'ok':ok}
 if reason: result['failure_reason']=reason
 out=root/'runtime/health'/f'{market}-{day}.json'; summary=root/'runtime/health'/f'{market}-{day}.summary.txt'
 out.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n'); summary.write_text(f'NULLIM {market.upper()} health {day}\n- status: SKIPPED_NON_TRADING_DAY\n- ok: {ok}\n')
@@ -82,7 +82,7 @@ for log_path in logs:
     if (re.search(r'\[TRADE\]\[ORDER\]\[SELL\].*result=ACCEPTED', session_blob, re.I)
             and re.search(r'\[RUN_SUMMARY\]\[RESULT\].*orders_ack=0', session_blob, re.I)):
         execution_truth_mismatch += 1
-result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'active_same_session_count':active_same_session, 'stale_lock_detected_count':stale_detected, 'stale_lock_removed_count':stale_removed, 'lock_warning_count':lock_warnings, 'order_idempotency_skips':order_idempotency, 'advisory_lock_unavailable_count':advisory_unavailable, 'advisory_lock_failure_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs],
+result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'active_same_session_count':active_same_session, 'stale_lock_detected_count':stale_detected, 'stale_lock_removed_count':stale_removed, 'lock_warning_count':lock_warnings, 'order_idempotency_skips':order_idempotency, 'advisory_lock_unavailable_count':advisory_unavailable, 'advisory_lock_failure_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'mail_delivered': False, 'mail_complete': False, 'logs_checked': [str(p) for p in logs],
           'kr_inf_stale_pending_count': kr_inf_stale_pending,
           'policy_missing_exit_starvation_count': policy_missing_starvation,
           'policy_authority_conflict_count': policy_authority_conflicts,
@@ -91,7 +91,15 @@ result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'auto
 if mail_marker.exists():
     try:
         marker=json.loads(mail_marker.read_text())
-        result['mail_ok'] = (marker.get('status') == 'OK' and marker.get('mail_sent') is True and marker.get('market') == market and marker.get('required_missing_count') == 0 and bool(marker.get('archive_sha256')) and marker.get('trade_date') == trade_date)
+        identity_ok = marker.get('market') == market and marker.get('trade_date') == trade_date and bool(marker.get('archive_sha256'))
+        delivered = bool(identity_ok and marker.get('status') in {'OK','DEGRADED'} and marker.get('mail_sent') is True)
+        complete = bool(delivered and marker.get('status') == 'OK' and int(marker.get('required_missing_count') or 0) == 0)
+        result['mail_status'] = marker.get('status')
+        result['mail_delivered'] = delivered
+        result['mail_complete'] = complete
+        result['mail_ok'] = complete
+        result['mail_required_missing_count'] = int(marker.get('required_missing_count') or 0)
+        result['mail_missing_evidence'] = marker.get('missing_evidence') or []
     except Exception: pass
 
 install_marker=root/'runtime/health/windows-scheduler-install.json'
@@ -124,7 +132,7 @@ if not result.get('scheduler_sha_matches'):
     result.setdefault('failure_reason','FAILED_SCHEDULER_DRIFT')
 if not result['mail_ok']:
     result['ok']=False
-    result.setdefault('failure_reason','FAILED_MAIL_VALIDATION')
+    result.setdefault('failure_reason','DEGRADED_MAIL_EVIDENCE' if result.get('mail_delivered') else 'FAILED_MAIL_VALIDATION')
 if forbidden or advisory_unavailable:
     result['ok']=False
     result['failure_reason']='SCHEDULER_POLICY_VIOLATION' if forbidden else 'PB1_ADVISORY_LOCK_UNAVAILABLE'

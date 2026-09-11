@@ -127,7 +127,8 @@ def test_wrappers_gate_before_runner_and_snapshot_lock_contract():
         assert text.index('nullim_require_trading_day') < text.index('deploy_preflight')
     init=(ROOT/'scripts/wsl/init-session-log.sh').read_text(); mail=(ROOT/'scripts/wsl/send-market-log-mail.sh').read_text()
     assert 'flock -s "$NULLIM_SNAPSHOT_FD"' in init
-    assert 'flock -x "$SNAPSHOT_FD"' in mail
+    assert 'flock -w "${NULLIM_MAIL_SNAPSHOT_LOCK_TIMEOUT_SEC:-30}" -x "$SNAPSHOT_FD"' in mail
+    assert 'SNAPSHOT_LOCK_TIMEOUT' in mail
 
 
 def test_closed_session_wrapper_records_attempt_without_reaching_preflight(tmp_path):
