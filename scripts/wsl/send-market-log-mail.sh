@@ -421,7 +421,7 @@ fi || fail INVALID_JSON_BEFORE_TAR
 if ! tar -C "$STAGE" -czf "$OUT" . 2>"$WARN"; then fail TAR_FAILED; fi
 [[ ! -s "$WARN" ]] || fail TAR_WARNING
 tar -tzf "$OUT" >/dev/null || fail TAR_VERIFY_FAILED
-tar -tzf "$OUT" | grep -q 'NULLIM_LOG_ARCHIVE_MANIFEST.json' || fail ARCHIVE_MANIFEST_MISSING
+if ! tar -tzf "$OUT" | grep -F 'NULLIM_LOG_ARCHIVE_MANIFEST.json' >/dev/null; then fail ARCHIVE_MANIFEST_MISSING; fi
 SIZE="$(stat -c%s "$OUT")"
 MAX=$(( ${NULLIM_MAIL_MAX_ATTACHMENT_MB:-15} * 1024 * 1024 ))
 (( SIZE <= MAX )) || fail ARCHIVE_TOO_LARGE
