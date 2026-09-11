@@ -279,6 +279,9 @@ for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "
 MISSING_COUNT="$(wc -l < "$MISSING_LIST" | tr -d ' ')"
 INCLUDED_COUNT="$(wc -l < "$INCLUDED_LIST" | tr -d ' ')"
 EXPECTED_COUNT="$(wc -l < "$EXPECTED_LIST" | tr -d ' ')"
+SESSION_EXPECTED_COUNT="${#purposes[@]}"
+SESSION_MISSING_COUNT="$(awk -F '\t' '$1 ~ /^REQUIRED_LOG_MISSING_/ {count++} END {print count+0}' "$MISSING_LIST")"
+SESSION_PRESENT_COUNT=$((SESSION_EXPECTED_COUNT - SESSION_MISSING_COUNT))
 EVIDENCE_STATUS=OK
 (( MISSING_COUNT == 0 )) || EVIDENCE_STATUS=DEGRADED
 
@@ -310,11 +313,11 @@ done < "$INCLUDED_LIST"
 mkdir -p "$STAGE/$(dirname "$READINESS")"
 cp -a "$READINESS" "$STAGE/$READINESS" || fail STAGING_COPY_FAILED 1 "$READINESS"
 
-# Deterministic evidence report is part of the source digest and archive.
-python3 - "$STAGE/MAIL_EVIDENCE_REPORT.json" "$MARKET" "$TRADE_DATE" "$EVIDENCE_STATUS" "$EXPECTED_LIST" "$INCLUDED_LIST" "$MISSING_LIST" <<'PY'
+# Deterministic evidence report is part of the evidence digest and archive.
+python3 - "$STAGE/mail_evidence_report.json" "$MARKET" "$TRADE_DATE" "$EVIDENCE_STATUS" "$EXPECTED_LIST" "$INCLUDED_LIST" "$MISSING_LIST" "$SESSION_EXPECTED_COUNT" "$SESSION_PRESENT_COUNT" <<'PY'
 import json,sys
 from pathlib import Path
-out,market,trade,status,expected_path,included_path,missing_path=sys.argv[1:]
+out,market,trade,status,expected_path,included_path,missing_path,session_expected,session_present=sys.argv[1:]
 def lines(path):
     q=Path(path)
     return q.read_text().splitlines() if q.is_file() else []
@@ -326,7 +329,23 @@ def parse_expected(path):
     return out
 def parse_missing(path): return parse_expected(path)
 expected=parse_expected(expected_path); included=lines(included_path); missing=parse_missing(missing_path)
-data={'status':status,'market':market,'trade_date':trade,'expected_evidence':expected,'included_evidence':included,'missing_evidence':missing,'required_missing_count':len(missing),'mail_delivery_policy':'SEND_DEGRADED_WHEN_EVIDENCE_IS_INCOMPLETE'}
+missing_sessions=[item['code'].removeprefix('REQUIRED_LOG_MISSING_') for item in missing if item['code'].startswith('REQUIRED_LOG_MISSING_')]
+data={
+    'status':status,
+    'market':market,
+    'trade_date':trade,
+    'expected':int(session_expected),
+    'present':int(session_present),
+    'missing':missing_sessions,
+    'expected_session_log_count':int(session_expected),
+    'present_session_log_count':int(session_present),
+    'missing_session_purposes':missing_sessions,
+    'expected_evidence':expected,
+    'included_evidence':included,
+    'missing_evidence':missing,
+    'required_missing_count':len(missing),
+    'mail_delivery_policy':'SEND_DEGRADED_WHEN_EVIDENCE_IS_INCOMPLETE',
+}
 Path(out).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 
@@ -364,30 +383,43 @@ fi
 
 COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 RECIPIENT="${MAIL_TO:-${NAVER_MAIL_TO:-${REPORT_MAIL_TO:-dry-run}}}"
-SOURCE_SHA="$(python3 - "$STAGE" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$COMMIT" "$READINESS" <<'PY'
+SOURCE_SHA="$(python3 - "$STAGE" "$READINESS" <<'PY'
 import hashlib,sys
 from pathlib import Path
-stage,market,trade,recipient,commit,readiness=sys.argv[1:]
+stage,readiness=sys.argv[1:]
 root=Path(stage); h=hashlib.sha256()
-for value in (market,trade,recipient,commit): h.update(value.encode()+b'\0')
 for p in sorted(x for x in root.rglob('*') if x.is_file() and str(x.relative_to(root)) != readiness):
     h.update(str(p.relative_to(root)).encode()+b'\0'); h.update(p.read_bytes())
 print(h.hexdigest())
 PY
 )"
 
-if [[ "${NULLIM_MAIL_DRY_RUN:-0}" != 1 && -f "$PROD_MARKER" && "${NULLIM_FORCE_RESEND:-0}" != 1 ]] && python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$SOURCE_SHA" <<'PY'
+if [[ "${NULLIM_MAIL_DRY_RUN:-0}" != 1 && "${NULLIM_FORCE_RESEND:-0}" != 1 ]]; then
+  IDEMPOTENT_MATCH="$(python3 - "runtime/health" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$SOURCE_SHA" <<'PY'
 import json,sys
-try:
-    d=json.load(open(sys.argv[1]))
-    ok=(d.get('status') in {'OK','DEGRADED'} and d.get('mail_sent') is True and d.get('market')==sys.argv[2] and d.get('trade_date')==sys.argv[3] and d.get('recipient')==sys.argv[4] and d.get('source_evidence_sha256')==sys.argv[5])
-    raise SystemExit(0 if ok else 1)
-except Exception:
-    raise SystemExit(1)
+from pathlib import Path
+root=Path(sys.argv[1]); market,trade,recipient,evidence_sha=sys.argv[2:]
+for path in sorted(root.glob(f'{market}-mail-*.json')):
+    try:
+        data=json.loads(path.read_text())
+    except Exception:
+        continue
+    if (
+        data.get('status') in {'OK','DEGRADED'}
+        and data.get('mail_sent') is True
+        and data.get('market') == market
+        and data.get('trade_date') == trade
+        and data.get('recipient') == recipient
+        and data.get('source_evidence_sha256') == evidence_sha
+    ):
+        print(path)
+        break
 PY
-then
-  echo "[LOG_MAIL][IDEMPOTENT_SKIP] status=$EVIDENCE_STATUS source_evidence_sha256=$SOURCE_SHA"
-  exit 0
+)"
+  if [[ -n "$IDEMPOTENT_MATCH" ]]; then
+    echo "[LOG_MAIL][IDEMPOTENT_SKIP] status=$EVIDENCE_STATUS source_evidence_sha256=$SOURCE_SHA prior_marker=$IDEMPOTENT_MATCH"
+    exit 0
+  fi
 fi
 
 python3 - "$STAGE" "$MARKET" "$KST_RUN_DATE" "$TRADE_DATE" "$BRANCH" "$COMMIT" "$ATTEMPT_GROUP" "$SOURCE_SHA" "$EVIDENCE_STATUS" "$EXPECTED_LIST" "$INCLUDED_LIST" "$MISSING_LIST" <<'PY'
@@ -444,11 +476,11 @@ PY
 fi
 
 if [[ "$EVIDENCE_STATUS" == DEGRADED ]]; then
-  SUBJECT="[NULLIM][$BRANCH][${MARKET^^}][DEGRADED][LOG] $TRADE_DATE"
+  SUBJECT="[NULLIM][${MARKET^^}][DEGRADED] $TRADE_DATE trading logs"
   MISSING_SUMMARY="$(awk -F '\t' '{printf "%s%s:%s", (NR>1?", ":""), $1, $2}' "$MISSING_LIST")"
   BODY="NULLIM ${MARKET^^} redacted log archive (DEGRADED). Missing evidence: ${MISSING_SUMMARY}"
 else
-  SUBJECT="[NULLIM][$BRANCH][${MARKET^^}][LOG] $TRADE_DATE"
+  SUBJECT="[NULLIM][${MARKET^^}] $TRADE_DATE trading logs"
   BODY="NULLIM ${MARKET^^} verified redacted log archive"
 fi
 
