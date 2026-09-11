@@ -213,10 +213,30 @@ def close_stale_positions_guarded(
                 canonical_kis_qty,
             )
             continue
+
+        # A non-zero quantity in a fresh KIS balance is positive broker evidence.
+        # Never let a stale/open DB order freeze an already-observed broker fill.
+        # This fixes cases such as 122630 6 -> 3 where the SELL execution changed
+        # broker holdings but the execution-detail endpoint temporarily failed.
+        if canonical_kis_qty > 0:
+            adjustable_rows.append((code, db_qty, canonical_kis_qty, float(kis_state.get("avg_buy_price") or 0.0)))
+            logger.warning(
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=ADJUST reason=KIS_POSITIVE_QTY_AUTHORITATIVE qty_diff=%s open_order=%s",
+                code,
+                db_qty,
+                canonical_kis_qty,
+                qty_diff,
+                int(code in open_order_codes),
+            )
+            continue
+
+        # Zero is more dangerous because a transient/partial KIS response could
+        # look like liquidation.  Keep the existing multi-snapshot confirmation
+        # before zeroing/closing a position.
         if code in open_order_codes:
             rows_kept += 1
             logger.warning(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s",
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_ZERO_PENDING_ORDER qty_diff=%s",
                 code,
                 db_qty,
                 canonical_kis_qty,
@@ -226,7 +246,7 @@ def close_stale_positions_guarded(
         if stale_confirmed:
             adjustable_rows.append((code, db_qty, canonical_kis_qty, float(kis_state.get("avg_buy_price") or 0.0)))
             logger.warning(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=ADJUST reason=POSITION_QTY_MISMATCH qty_diff=%s",
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=ADJUST reason=POSITION_QTY_ZERO_CONFIRMED qty_diff=%s",
                 code,
                 db_qty,
                 canonical_kis_qty,
@@ -235,13 +255,12 @@ def close_stale_positions_guarded(
             continue
         rows_kept += 1
         logger.warning(
-            "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s",
+            "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_ZERO_AWAIT_CONFIRMATION qty_diff=%s",
             code,
             db_qty,
             canonical_kis_qty,
             qty_diff,
         )
-        continue
 
     if adjustable_rows:
         with engine.begin() as conn:
