@@ -264,11 +264,9 @@ if [[ "$MARKET" == kr ]]; then
     record_expected REQUIRED_EVIDENCE_MISSING "$final30_evidence"
     record_included "$final30_evidence"
   elif [[ "$resolver_rc" == 2 ]]; then
-    record_expected KRX_PREV_TRADING_DAY_RESOLVE_FAILED "$TRADE_DATE"
-    record_missing KRX_PREV_TRADING_DAY_RESOLVE_FAILED "$TRADE_DATE"
+    fail KRX_PREV_TRADING_DAY_RESOLVE_FAILED 1 "$TRADE_DATE" "$final30_search_file"
   else
-    record_expected REQUIRED_EVIDENCE_MISSING "$expected_final30"
-    record_missing REQUIRED_EVIDENCE_MISSING "$expected_final30"
+    fail REQUIRED_EVIDENCE_MISSING 1 "$expected_final30" "$final30_search_file"
   fi
 else
   purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
