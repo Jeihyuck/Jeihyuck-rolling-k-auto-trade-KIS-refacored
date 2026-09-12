@@ -181,3 +181,26 @@ def test_routed_order_truth_counts_broker_submission_and_ack_flags():
     assert ack == 3
     assert rejected == 1
     assert blocked == 1
+
+
+
+def test_routed_order_notional_uses_same_broker_submission_truth():
+    from trader.us.runner.trade_tick_runner import _routed_order_notional
+
+    orders = [
+        {"status": "ACK_DB_FAILED", "broker_submit": True, "kis_ack": True,
+         "intent": {"notional_usd": 100.0}},
+        {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "broker_submit": True, "kis_ack": True,
+         "intent": {"notional_usd": 200.0}},
+        {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "broker_submit": True, "kis_ack": True,
+         "intent": {"notional_usd": 300.0}},
+        {"status": "REJECT", "broker_submit": True, "kis_ack": False,
+         "intent": {"notional_usd": 400.0}},
+        {"status": "REJECT", "broker_submit": False, "kis_ack": False,
+         "intent": {"notional_usd": 500.0}},
+        {"status": "BLOCKED", "broker_submit": False, "kis_ack": False,
+         "intent": {"notional_usd": 600.0}},
+    ]
+    # The first four were actually submitted to the broker.  A local/non-submitted
+    # reject and a blocked order must not inflate routed SELL notional.
+    assert _routed_order_notional(orders) == 1000.0

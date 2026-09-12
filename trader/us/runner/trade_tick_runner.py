@@ -1111,18 +1111,34 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     return passthrough + merged
 
 
+_ROUTED_SUBMISSION_STATUSES = {
+    "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+    "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+    "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "SUBMITTED", "SENT",
+    "DRY_RUN", "SIGNAL_ONLY",
+}
+_ROUTED_ACK_STATUSES = {
+    "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+    "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+    "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "FILLED",
+}
+
+
+def _order_has_routed_submission_truth(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    status = str(order.get("status") or "").upper()
+    return bool(order.get("broker_submit")) or status in _ROUTED_SUBMISSION_STATUSES
+
+
+def _order_has_ack_truth(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    status = str(order.get("status") or "").upper()
+    return bool(order.get("kis_ack")) or status in _ROUTED_ACK_STATUSES
+
+
 def _routed_order_truth_counts(orders: list[dict]) -> tuple[int, int, int, int]:
-    submitted_statuses = {
-        "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
-        "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
-        "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "REJECT", "REJECTED",
-        "SUBMITTED", "SENT", "DRY_RUN", "SIGNAL_ONLY",
-    }
-    ack_statuses = {
-        "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
-        "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
-        "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "FILLED",
-    }
     rejected_statuses = {"REJECT", "REJECTED"}
     blocked_statuses = {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}
 
@@ -1131,15 +1147,28 @@ def _routed_order_truth_counts(orders: list[dict]) -> tuple[int, int, int, int]:
         if not isinstance(order, dict):
             continue
         status = str(order.get("status") or "").upper()
-        if bool(order.get("broker_submit")) or status in submitted_statuses:
+        if _order_has_routed_submission_truth(order):
             sent += 1
-        if bool(order.get("kis_ack")) or status in ack_statuses:
+        if _order_has_ack_truth(order):
             ack += 1
         if status in rejected_statuses:
             rejected += 1
         if status in blocked_statuses:
             blocked += 1
     return sent, ack, rejected, blocked
+
+
+def _routed_order_notional(orders: list[dict]) -> float:
+    total = 0.0
+    for order in orders or []:
+        if not _order_has_routed_submission_truth(order):
+            continue
+        intent = order.get("intent") if isinstance(order.get("intent"), dict) else {}
+        try:
+            total += float(intent.get("notional_usd", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def route_exit_orders_immediately(
@@ -1210,15 +1239,8 @@ def route_exit_orders_immediately(
         except Exception as exc:
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
-    ack = sum(1 for o in orders if o.get("status") == "ACK")
-    sent = sum(1 for o in orders if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"})
-    rejected = sum(1 for o in orders if o.get("status") == "REJECT")
-    blocked = sum(1 for o in orders if o.get("status") in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
-    sell_notional_routed = sum(
-        float((o.get("intent") or {}).get("notional_usd", 0) or 0)
-        for o in orders
-        if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"}
-    )
+    sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
+    sell_notional_routed = _routed_order_notional(orders)
     logger.info(
         "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d sell_notional=%.2f",
         len(sell_intents), sent, ack, rejected, blocked, sell_notional_routed,
