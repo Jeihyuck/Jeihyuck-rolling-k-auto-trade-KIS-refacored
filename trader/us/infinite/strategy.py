@@ -189,9 +189,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
+    # TQQQ bypasses only the general PB1 intraday overlay. Structural TQQQ
+    # regime permission is strategy-owned and must be identical in production
+    # and replay. A crash/unknown regime therefore blocks BUY/ADD here while
+    # exits above remain routable.
     if not entry_allowed:
-        if config.symbol != "TQQQ":
-            return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
+        return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if position.qty > 0 and not config.allow_sell:
         return Decision(Action.BLOCK, "sell_permission_disabled")
     if not config.allow_buy:
@@ -200,8 +203,10 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "daily_buy_limit")
     overlay = dict(overlay or {})
     infinite_overlay_bypass = config.symbol == "TQQQ"
-    explicit_intraday_bypass = bool(overlay.get("intraday_market_overlay") or
-                                    overlay.get("intraday_rotation_overlay"))
+    # This flag describes ownership, not data presence. PB1 intraday fields are
+    # always present in production (often as "NORMAL"), so truthiness must never
+    # determine TQQQ structural risk or sizing.
+    pb1_overlay_bypass = infinite_overlay_bypass
     metadata = state.metadata or {}
     recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
                               and not metadata.get("last_buy_fill_price"))
@@ -242,7 +247,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         if last_fill is not None and position.price <= last_fill * 0.99 and days_since >= 1:
             fast_dip_add_eligible = True
     if (fast_dip_add_eligible and position.qty > 0 and not pending_buy and
-            (explicit_intraday_bypass or overlay.get("force_entry_block") is True or
+            (pb1_overlay_bypass or overlay.get("force_entry_block") is True or
              overlay.get("allow_new_buy") is False)):
         budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
                      config.max_total_capital_usd - state.total_filled_notional)
@@ -255,9 +260,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
-    if overlay.get("force_entry_block") is True and not fast_dip_add_eligible and not explicit_intraday_bypass:
+    if overlay.get("force_entry_block") is True and not fast_dip_add_eligible and not pb1_overlay_bypass:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
-    if position.qty <= 0 and overlay.get("allow_new_buy") is False and not explicit_intraday_bypass:
+    if position.qty <= 0 and overlay.get("allow_new_buy") is False and not pb1_overlay_bypass:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
         # Standard gross/cluster overlays do not own this sleeve. Only an
@@ -385,7 +390,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
-    effective_buy_multiplier = 1.0 if explicit_intraday_bypass else buy_multiplier
+    # Structural TQQQ regime sizing always wins. PB1 intraday overlays remain
+    # ignored without being allowed to inflate the TQQQ-owned multiplier.
+    effective_buy_multiplier = buy_multiplier
     budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)
     notional = qty * position.price
