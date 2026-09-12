@@ -21,6 +21,7 @@ from typing import Any
 import sqlalchemy as sa
 
 from trader.db.schema import schema_for_engine
+from trader.kr.broker_truth_cross_date_unowned_retry import _kst_date, _order_trade_date
 import trader.reconcile_db as reconcile_db
 
 logger = logging.getLogger(__name__)
@@ -60,13 +61,18 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
     pending: set[str] = set()
 
     with engine.connect() as conn:
-        # Unowned executions fence this strategy only when a matching durable
-        # strategy order exists.  An unrelated old fill cannot freeze PB1.
+        # Unowned executions fence this strategy only when a durable order with
+        # the same symbol/side/ODNO exists on the same KST trade date.  KIS order
+        # numbers may be reused across dates, so ODNO alone is not sufficient.
         unowned = [
             dict(row)
             for row in conn.execute(
-                sa.select(schema.fills.c.code, schema.fills.c.side, schema.fills.c.kis_odno)
-                .where(
+                sa.select(
+                    schema.fills.c.code,
+                    schema.fills.c.side,
+                    schema.fills.c.kis_odno,
+                    schema.fills.c.filled_at,
+                ).where(
                     sa.and_(
                         schema.fills.c.env == env,
                         schema.fills.c.order_id.is_(None),
@@ -81,30 +87,32 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
             code = str(fill.get("code") or "").lstrip("A").zfill(6)
             side = str(fill.get("side") or "").upper()
             odno = str(fill.get("kis_odno") or "").strip()
-            if not code or side not in {"BUY", "SELL"} or not odno:
+            fill_day = _kst_date(fill.get("filled_at"))
+            if not code or side not in {"BUY", "SELL"} or not odno or fill_day is None:
                 continue
-            candidate = conn.execute(
-                sa.select(schema.orders.c.order_id)
-                .where(
-                    sa.and_(
-                        schema.orders.c.env == env,
-                        schema.orders.c.strategy == strategy,
-                        schema.orders.c.code == code,
-                        schema.orders.c.side == side,
-                        sa.or_(
-                            schema.orders.c.kis_odno == odno,
-                            schema.orders.c.broker_order_id == odno,
-                        ),
+            candidates = [
+                dict(row)
+                for row in conn.execute(
+                    sa.select(schema.orders).where(
+                        sa.and_(
+                            schema.orders.c.env == env,
+                            schema.orders.c.strategy == strategy,
+                            schema.orders.c.code == code,
+                            schema.orders.c.side == side,
+                            sa.or_(
+                                schema.orders.c.kis_odno == odno,
+                                schema.orders.c.broker_order_id == odno,
+                            ),
+                        )
                     )
-                )
-                .limit(1)
-            ).scalar()
-            if candidate is not None:
+                ).mappings().all()
+            ]
+            if any(_order_trade_date(order) == fill_day for order in candidates):
                 pending.add(code)
 
-        # Only BUY orders that are attached to a currently OPEN exact lifecycle
-        # can be overwritten by close_stale_positions, so avoid scanning the
-        # historical order table.  This keeps the safety check cheap in live DBs.
+        # Only BUY orders attached to a currently OPEN exact lifecycle can be
+        # overwritten by close_stale_positions.  Avoid scanning historical
+        # closed orders so the safety check stays cheap on the live database.
         active_buy_order_ids = [
             str(value)
             for value in conn.execute(
