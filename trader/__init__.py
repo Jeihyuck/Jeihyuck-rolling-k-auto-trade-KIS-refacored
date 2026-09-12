@@ -15,6 +15,38 @@ def _kr_imports_disabled_for_us() -> bool:
     return scope == "us" and disabled
 
 
+def _install_broker_truth_repo_engine_binding() -> None:
+    """Ensure the KR post-tick broker-truth guard can reach the PB1 DB engine.
+
+    PB1Engine owns repository objects, while the SQLAlchemy engine normally lives
+    on those repositories rather than on PB1Engine itself.  The hardening guard
+    intentionally accepts an engine-like PB1 object, so bind the repository
+    engine onto the live instance immediately before the post-tick guard runs.
+    This is KR-only and does not alter strategy or order decisions.
+    """
+    import trader.kr.broker_truth_hardening as broker_truth
+
+    if getattr(broker_truth, "_repo_engine_binding_installed", False):
+        return
+    original = broker_truth._post_pb1_tick_reconcile
+
+    def _with_repo_engine(engine_obj):
+        if getattr(engine_obj, "engine", None) is None:
+            for repo_name in ("orders_repo", "positions_repo", "fills_repo", "ledger_repo"):
+                repo = getattr(engine_obj, repo_name, None)
+                repo_engine = getattr(repo, "engine", None)
+                if repo_engine is not None:
+                    try:
+                        setattr(engine_obj, "engine", repo_engine)
+                    except Exception:
+                        pass
+                    break
+        return original(engine_obj)
+
+    broker_truth._post_pb1_tick_reconcile = _with_repo_engine
+    broker_truth._repo_engine_binding_installed = True
+
+
 def install_legacy_pb1_runtime_guards() -> None:
     """Install legacy PB1 guards from a KR execution entry point only.
 
@@ -28,3 +60,42 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.pb1_runtime_guards import _install_pb1_engine_runtime_guards
 
     _install_pb1_engine_runtime_guards()
+
+    # Broker truth hardening is intentionally installed from the same KR-only
+    # entry point.  It closes ACK->FILL->POSITION lifecycle gaps without
+    # importing any Korean execution code into the US-only process path.
+    from trader.kr.broker_truth_hardening import install_kr_broker_truth_runtime_guards
+    from trader.kr.broker_truth_review_fixes import install_review_feedback_guards
+    from trader.kr.broker_truth_sell_fixes import install_sell_fill_guard
+    from trader.kr.broker_truth_final_review_fixes import install_final_review_guards
+    from trader.kr.broker_truth_observability_compat import install_buy_observability_compat
+    from trader.kr.broker_truth_historical_buy_retry import install_historical_buy_retry
+    from trader.kr.broker_truth_historical_retry_safety import install_historical_retry_safety
+    from trader.kr.broker_truth_cross_date_unowned_retry import install_cross_date_unowned_retry
+    from trader.kr.broker_truth_pending_fill_fence import install_pending_fill_application_fence
+
+    _install_broker_truth_repo_engine_binding()
+    install_kr_broker_truth_runtime_guards()
+    install_review_feedback_guards()
+    # Installed after the reviewed BUY linker so SELL execution accounting is
+    # atomic with the exact lifecycle.
+    install_sell_fill_guard()
+    # Preserve reconciliation watermarks and upgrade BUY attribution with
+    # retry-safe, atomic position application.
+    install_final_review_guards()
+    # Compatibility/observability repair runs after the canonical atomic guard.
+    # It mirrors legacy evidence and entry_ts without controlling idempotency.
+    install_buy_observability_compat()
+    # Durable order-owned BUY fills are retried across trade dates, closing the
+    # post-midnight crash/restart window.  Install its safety selector after the
+    # wrapper so CLOSED/superseded lifecycles can never be resurrected.
+    install_historical_buy_retry()
+    install_historical_retry_safety()
+    # Recover prior-day fills that were durably persisted by daily-ccld but
+    # crashed before order attribution. Exact trade-date + ODNO matching is
+    # required; BUYs flow into the owned-BUY retry and SELLs are applied atomically.
+    install_cross_date_unowned_retry()
+    # A confirmed fill must reach its exact lifecycle before stale-position
+    # quantity reconciliation is allowed to overwrite the DB quantity.  This is
+    # a narrow fill-application fence, not a blanket open-order block.
+    install_pending_fill_application_fence()
