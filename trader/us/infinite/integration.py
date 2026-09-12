@@ -22,46 +22,104 @@ _TQQQ_TTL_TERMINAL_STATUSES = {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
 def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: int,
                                 cancel_order: Callable[..., dict],
                                 query_order: Callable[..., dict]) -> dict[str, int]:
-    """Cancel only elapsed Infinite BUYs, retaining pending state until re-query confirms it.
+    """Reconcile elapsed Infinite BUYs from broker truth before attempting cancel.
 
-    The original order number and client key are passed unchanged to both broker
-    operations.  A cancel transport acknowledgement is deliberately not broker
-    terminal evidence.
+    A stale DB row is not proof that a broker order is still open. Query the
+    original order first, terminalize only broker-confirmed terminal evidence,
+    and isolate cancel/query failures to the one stale BUY. Unresolved evidence
+    remains pending/fail-closed for another BUY, but must not raise through the
+    whole TQQQ sleeve.
     """
     expired = repository.load_expired_open_buy_orders(
         now=now, ttl_seconds=ttl_seconds, symbol="TQQQ"
     )
     result = {"expired": len(expired), "cancel_requested": 0, "terminal": 0, "pending": 0}
+
+    def terminal_observation(order: dict, observation: dict | None) -> bool:
+        if not isinstance(observation, dict):
+            return False
+        order_no = str(order.get("order_no") or "")
+        observed_order_no = str(observation.get("order_no") or order_no)
+        observed_symbol = str(observation.get("symbol") or "TQQQ").upper()
+        observed_side = str(observation.get("side") or "BUY").upper()
+        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        return bool(
+            observed_order_no == order_no
+            and observed_symbol == "TQQQ"
+            and observed_side == "BUY"
+            and status in _TQQQ_TTL_TERMINAL_STATUSES
+        )
+
     for order in expired:
         order_no = str(order.get("order_no") or "")
         client_order_key = str(order.get("client_order_key") or "")
         if not order_no or not client_order_key:
             result["pending"] += 1
             continue
+        identity = {
+            "order_no": order_no,
+            "client_order_key": client_order_key,
+            "symbol": "TQQQ",
+            "side": "BUY",
+        }
         metadata = order.get("meta") if isinstance(order.get("meta"), dict) else {}
-        if not metadata.get("tqqq_ttl_cancel_requested_at"):
-            cancel_result = cancel_order(
-                order_no=order_no, client_order_key=client_order_key,
-                symbol="TQQQ", side="BUY",
-            ) or {}
-            repository.mark_ttl_cancel_requested(
-                order, requested_at=now, cancel_result=cancel_result
+
+        try:
+            observation = query_order(**identity) or {}
+        except Exception as exc:
+            logger.warning(
+                "[TQQQ_INF][TTL_RECONCILE][QUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
+                order_no, client_order_key, exc,
             )
-            result["cancel_requested"] += 1
-        observation = query_order(
-            order_no=order_no, client_order_key=client_order_key,
-            symbol="TQQQ", side="BUY",
-        ) or {}
-        observed_order_no = str(observation.get("order_no") or order_no)
-        observed_symbol = str(observation.get("symbol") or "TQQQ").upper()
-        observed_side = str(observation.get("side") or "BUY").upper()
-        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
-        if (observed_order_no != order_no or observed_symbol != "TQQQ" or observed_side != "BUY"
-                or status not in _TQQQ_TTL_TERMINAL_STATUSES):
             result["pending"] += 1
             continue
-        repository.apply_ttl_terminal_observation(order, observation)
-        result["terminal"] += 1
+
+        if terminal_observation(order, observation):
+            repository.apply_ttl_terminal_observation(order, observation)
+            result["terminal"] += 1
+            continue
+
+        # A prior cancel request is never replayed blindly. The next tick
+        # re-queries broker truth and keeps BUY fenced until terminal evidence.
+        if metadata.get("tqqq_ttl_cancel_requested_at"):
+            result["pending"] += 1
+            continue
+
+        try:
+            cancel_result = cancel_order(**identity) or {}
+        except Exception as exc:
+            error_text = str(exc)
+            logger.warning(
+                "[TQQQ_INF][TTL_RECONCILE][CANCEL_WARN] order_no=%s key=%s error=%s action=requery_original_order",
+                order_no, client_order_key, error_text,
+            )
+            # KIS paper frequently returns "원주문번호가 존재하지 않습니다"
+            # for an already-terminal prior-day order. That message is not
+            # itself fill/cancel evidence; re-query the original trade-date
+            # order history and terminalize only if that query proves it.
+            try:
+                retry_observation = query_order(**identity) or {}
+            except Exception as retry_exc:
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][REQUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
+                    order_no, client_order_key, retry_exc,
+                )
+                result["pending"] += 1
+                continue
+            if terminal_observation(order, retry_observation):
+                repository.apply_ttl_terminal_observation(order, retry_observation)
+                result["terminal"] += 1
+            else:
+                result["pending"] += 1
+            continue
+
+        repository.mark_ttl_cancel_requested(
+            order, requested_at=now, cancel_result=cancel_result
+        )
+        result["cancel_requested"] += 1
+        # Cancel ACK != CANCELLED. Leave pending until a later broker query
+        # proves the terminal state.
+        result["pending"] += 1
     return result
 
 
@@ -178,11 +236,20 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         repository = repository or InfiniteRepository()
         repository.ensure_schema()
         if cancel_order is not None and query_order is not None:
-            reconcile_tqqq_open_buy_ttl(
-                repository=repository, now=datetime.now(timezone.utc),
-                ttl_seconds=config.open_buy_ttl_seconds,
-                cancel_order=cancel_order, query_order=query_order,
-            )
+            try:
+                ttl_result = reconcile_tqqq_open_buy_ttl(
+                    repository=repository, now=datetime.now(timezone.utc),
+                    ttl_seconds=config.open_buy_ttl_seconds,
+                    cancel_order=cancel_order, query_order=query_order,
+                )
+                logger.info("[TQQQ_INF][TTL_RECONCILE] result=%s", ttl_result)
+            except Exception as ttl_exc:
+                # Reconciliation failure may keep another BUY fail-closed, but it must
+                # not suppress position/exit evaluation for the dedicated sleeve.
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][WARN] error=%s action=continue_sleeve_with_pending_buy_fence",
+                    ttl_exc,
+                )
         raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
         broker = _position(raw, price)
         logger.info("[TQQQ_INF][OWNERSHIP] symbol=TQQQ owner=TQQQ_INFINITE holding_qty=%s orderable_qty=%s",

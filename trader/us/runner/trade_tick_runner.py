@@ -39,6 +39,14 @@ def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float
     accounted = min(total, sum(max(0.0, float(stage_metrics.get(key, 0.0)))
                                for key in _ACCOUNTED_TOP_LEVEL_STAGES))
     return round(accounted, 3), round(total - accounted, 3)
+def _audit_gate_value(intent: dict, *keys: str):
+    """Return 1/0 only for explicit evidence; missing audit fields stay NA."""
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    for source in (intent, meta):
+        for key in keys:
+            if key in source and source.get(key) is not None:
+                return int(bool(source.get(key)))
+    return "NA"
 
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
@@ -116,10 +124,17 @@ def _build_tqqq_ttl_callbacks(provider: Any, kis_client: Any, *, trade_date: str
         )
 
     def query_order(**identity):
+        client_key = str(identity.get("client_order_key") or "")
+        key_trade_date = next(
+            (token for token in client_key.split(":")
+             if len(token) == 10 and token[4:5] == "-" and token[7:8] == "-"),
+            "",
+        )
+        lookup_trade_date = key_trade_date or trade_date
         detail = provider.get_fills_by_order_no(
             order_no=str(identity.get("order_no") or ""),
             symbol=symbol,
-            trade_date=trade_date,
+            trade_date=lookup_trade_date,
         )
         return detail or {}
 
@@ -3012,10 +3027,10 @@ def run_trade_tick(
                     "[US_PB1][BUY][WHY] symbol=%s entry_style=%s setup_ok=%s risk_ok=%s sized_ok=%s "
                     "buyable_ok=%s planned_qty=%s order_price=%s reason=US_PB1_ENTRY_AFTER_OPENING_BLOCK",
                     intent.get("symbol"), intent.get("entry_style") or intent.get("entry_book") or "unknown",
-                    int(bool(intent.get("setup_ok") or intent.get("setup_passed"))),
-                    int(bool(intent.get("risk_ok") or intent.get("risk_passed"))),
-                    int(bool(intent.get("sizing_ok") or intent.get("sizing_passed"))),
-                    int(bool(intent.get("buyable_ok") or intent.get("buyable_passed"))),
+                    _audit_gate_value(intent, "setup_ok", "setup_passed"),
+                    _audit_gate_value(intent, "risk_ok", "risk_passed"),
+                    _audit_gate_value(intent, "sizing_ok", "sizing_passed"),
+                    _audit_gate_value(intent, "buyable_ok", "buyable_passed"),
                     intent.get("qty") or intent.get("quantity") or 0,
                     intent.get("limit_price") or intent.get("price") or 0,
                 )

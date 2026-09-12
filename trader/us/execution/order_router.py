@@ -567,6 +567,85 @@ def same_day_semantic_sell_exists(intent: dict) -> bool:
         logger.warning("[US_ORDER][SEMANTIC_FENCE][WARN] symbol=%s err=%s", wanted[0], exc)
     return False
 
+def _validate_take_profit_with_fresh_broker_position(
+    intent: dict, broker_position: dict | None, *, now: Any | None = None,
+) -> dict:
+    """Revalidate a TAKE_PROFIT SELL against one fresh KIS balance snapshot."""
+    from datetime import datetime, timezone
+    from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
+
+    meta = dict(intent.get("meta") or {})
+    symbol = str(intent.get("symbol") or "").upper().strip()
+    reason = str(intent.get("reason") or meta.get("reason") or "")
+    if not reason.startswith("TAKE_PROFIT"):
+        return {"ok": True, "reason": "not_take_profit"}
+    if not broker_position:
+        return {"ok": False, "reason": "fresh_broker_position_unavailable"}
+
+    now_value = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    if now_value.tzinfo is None:
+        now_value = now_value.replace(tzinfo=timezone.utc)
+    now_utc = now_value.astimezone(timezone.utc)
+    broker_avg_raw = next(
+        (broker_position.get(key) for key in (
+            "broker_avg_price", "avg_price_usd", "avg_price", "avg_cost", "entry_price", "pchs_avg_pric"
+        ) if broker_position.get(key) not in (None, "", 0, "0")),
+        None,
+    )
+    fresh_qty = int(broker_position.get("qty") or broker_position.get("holding_qty") or 0)
+    fresh_orderable = broker_position.get("orderable_qty")
+    if fresh_orderable is None:
+        fresh_orderable = broker_position.get("sellable_qty")
+    if fresh_orderable is None:
+        fresh_orderable = fresh_qty
+    fresh_position = {
+        **meta,
+        **broker_position,
+        "symbol": symbol,
+        "qty": fresh_qty,
+        "orderable_qty": int(fresh_orderable or 0),
+        "position_lifecycle_id": (
+            intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id")
+        ),
+        "broker_avg_price": broker_avg_raw,
+        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_currency": "USD",
+        "broker_avg_price_asof": now_utc.isoformat(),
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+    }
+    try:
+        broker_avg, provenance = authoritative_broker_avg(fresh_position, now=now_utc)
+        executable = as_decimal(intent.get("limit_price"), name="executable_price")
+        threshold = as_decimal(meta.get("tp_threshold_fraction"), name="tp_threshold")
+        actual_return = calc_return_rate(executable, broker_avg)
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
+    if actual_return <= 0:
+        return {"ok": False, "reason": "non_positive_return", "return_rate": float(actual_return)}
+    if actual_return < threshold:
+        return {"ok": False, "reason": "threshold_not_met_after_refresh", "return_rate": float(actual_return)}
+
+    meta.update(provenance)
+    meta.update({
+        "broker_avg_price": float(broker_avg),
+        "return_rate_at_submit": float(actual_return),
+        "take_profit_guard_source": "fresh_kis_balance",
+        "take_profit_guard_refreshed": True,
+    })
+    intent["meta"] = meta
+    intent["broker_avg_price"] = float(broker_avg)
+    intent["broker_avg_price_source"] = provenance.get("broker_avg_price_source")
+    intent["broker_avg_price_asof"] = provenance.get("broker_avg_price_asof")
+    return {
+        "ok": True,
+        "reason": "ok",
+        "broker_avg_price": float(broker_avg),
+        "return_rate": float(actual_return),
+        "provenance": provenance,
+    }
+
+
 def route_order(
     intent: dict,
     *,
@@ -711,18 +790,6 @@ def route_order(
     intent["submit_attempt_id"] = str(intent.get("submit_attempt_id") or uuid.uuid4())
     meta["submit_attempt_id"] = intent["submit_attempt_id"]
     intent["meta"] = meta
-    if side == "SELL" and str(intent.get("reason") or meta.get("reason") or "").startswith("TAKE_PROFIT"):
-        from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
-        try:
-            broker_avg, _ = authoritative_broker_avg({**meta, "qty": qty, "orderable_qty": intent.get("available_qty", qty), "position_lifecycle_id": intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id")})
-            executable = as_decimal(intent.get("limit_price"), name="executable_price")
-            threshold = as_decimal(meta.get("tp_threshold_fraction"), name="tp_threshold")
-            actual_return = calc_return_rate(executable, broker_avg)
-            if actual_return <= 0 or actual_return < threshold:
-                raise ValueError("threshold_not_met" if actual_return > 0 else "non_positive_return")
-        except ValueError as exc:
-            logger.warning("[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=%s", symbol_upper, exc)
-            return {"status": "BLOCKED", "reason": "take_profit_pre_submit_guard_failed", "guard_reason": str(exc), "broker_submit": False, "intent": intent}
     hard_block_reasons = {
         "FORBIDDEN_HEDGE_OR_INVERSE_ETF",
         "DEFENSE_CRASH_ENTRY_BLOCK",
@@ -1088,6 +1155,28 @@ def route_order(
         broker_pos = _get_broker_position(kis_client, symbol)
         broker_holding_qty = int(broker_pos.get("qty") or broker_pos.get("holding_qty") or 0) if broker_pos else 0
         broker_orderable_qty = int(broker_pos.get("orderable_qty") or 0) if broker_pos else 0
+        if str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT"):
+            tp_guard = _validate_take_profit_with_fresh_broker_position(intent, broker_pos, now=now)
+            if not tp_guard.get("ok"):
+                guard_reason = str(tp_guard.get("reason") or "take_profit_guard_failed")
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason=f"take_profit_pre_submit_guard_failed:{guard_reason}")
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=%s source=fresh_kis_balance",
+                    symbol_upper, guard_reason,
+                )
+                return {
+                    "status": "BLOCKED",
+                    "reason": "take_profit_pre_submit_guard_failed",
+                    "guard_reason": guard_reason,
+                    "broker_submit": False,
+                    "intent": intent,
+                    "broker_position": broker_pos,
+                }
+            logger.info(
+                "[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=ALLOW source=fresh_kis_balance avg=%s return_rate=%s",
+                symbol_upper, tp_guard.get("broker_avg_price"), tp_guard.get("return_rate"),
+            )
         if broker_pos is None:
             logger.warning("[US_ORDER][BROKER_QTY_CHECK][SKIP] env=%s symbol=%s reason=broker_balance_method_missing", account_env, symbol)
             if is_tqqq_infinite:

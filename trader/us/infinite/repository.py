@@ -179,7 +179,7 @@ class InfiniteRepository:
             filled_qty=filled,
             remaining_qty=max(0, requested - filled),
             broker_status=status,
-            evidence_type="TQQQ_TTL_BROKER_REQUERY",
+            evidence_type=str(observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"),
             observed_at=observation.get("observed_at"),
             raw_row=observation,
         )
