@@ -403,16 +403,26 @@ def _get_broker_orderable_cash(kis_client: Any, symbol: str, exchange: str, pric
     return None
 
 
-def _get_broker_position(kis_client: Any, symbol: str) -> dict | None:
-    method = _client_method(kis_client, "get_balance")
-    if method is not None:
-        bal = method(force_refresh=True)
-    else:
-        raw_method = _client_method(kis_client, "get_us_balance")
-        if raw_method is None:
-            return None
-        from trader.us.data_provider import normalize_us_balance
-        bal = normalize_us_balance(raw_method(force_refresh=True))
+def _get_broker_position(kis_client: Any, symbol: str, context: Any | None = None) -> dict | None:
+    # The first SELL in a tick performs the required fresh broker balance read.
+    # Remaining SELLs reuse that same immutable pre-routing snapshot, avoiding
+    # N symbols x NASD/NYSE/AMEX sequential balance sweeps while preserving the
+    # fresh pre-submit broker-truth contract.
+    bal = getattr(context, "sell_balance_snapshot", None) if context is not None else None
+    if not isinstance(bal, dict):
+        method = _client_method(kis_client, "get_balance")
+        if method is not None:
+            bal = method(force_refresh=True)
+        else:
+            raw_method = _client_method(kis_client, "get_us_balance")
+            if raw_method is None:
+                return None
+            from trader.us.data_provider import normalize_us_balance
+            bal = normalize_us_balance(raw_method(force_refresh=True))
+        if context is not None and isinstance(bal, dict):
+            context.sell_balance_snapshot = bal
+            if hasattr(context, "count"):
+                context.count("sell_balance_fresh_snapshots")
     for pos in bal.get("positions", []) if isinstance(bal, dict) else []:
         if str(pos.get("symbol") or "").upper().strip() == str(symbol or "").upper().strip():
             return pos
@@ -1152,7 +1162,7 @@ def route_order(
 
     # SELL 직전 broker balance hard guard: DB/cache가 아닌 KIS 최신 잔고 기준
     if side == "SELL":
-        broker_pos = _get_broker_position(kis_client, symbol)
+        broker_pos = _get_broker_position(kis_client, symbol, context=context)
         broker_holding_qty = int(broker_pos.get("qty") or broker_pos.get("holding_qty") or 0) if broker_pos else 0
         broker_orderable_qty = int(broker_pos.get("orderable_qty") or 0) if broker_pos else 0
         if str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT"):

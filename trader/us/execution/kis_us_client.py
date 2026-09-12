@@ -327,19 +327,46 @@ class KisUSClient:
         now_ts = time.time()
         cached = self._response_cache.get(cache_key)
         if cached and now_ts - cached[0] <= ttl:
+            age_sec = max(0.0, now_ts - float(cached[0]))
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_price symbol=%s ttl=%.1f", symbol, ttl)
-            return cached[1]
+            cached_payload = dict(cached[1]) if isinstance(cached[1], dict) else cached[1]
+            if isinstance(cached_payload, dict):
+                cached_payload.update({
+                    "_quote_quality": "FRESH_CACHE",
+                    "_quote_source": "KIS_CACHE",
+                    "_quote_asof_epoch": float(cached[0]),
+                    "_quote_age_sec": age_sec,
+                })
+            return cached_payload
         try:
+            fetched_at = time.time()
             data = self._get(tr["path"], headers=headers, params=params)
-            self._response_cache[cache_key] = (time.time(), data)
+            if isinstance(data, dict):
+                data = dict(data)
+                data.update({
+                    "_quote_quality": "FRESH",
+                    "_quote_source": "KIS_LIVE",
+                    "_quote_asof_epoch": fetched_at,
+                    "_quote_age_sec": 0.0,
+                })
+            self._response_cache[cache_key] = (fetched_at, data)
             self._temporary_error_streak[cache_key] = 0
             return data
         except KisUSTemporaryError:
             self._temporary_error_streak[cache_key] = self._temporary_error_streak.get(cache_key, 0) + 1
             if cached and self._temporary_error_streak[cache_key] >= 2:
                 self.stats["stale_price_fallback_count"] += 1
-                logger.warning("[US_KIS][STALE_PRICE_FALLBACK] endpoint=GET_price symbol=%s streak=%d", symbol, self._temporary_error_streak[cache_key])
-                return cached[1]
+                age_sec = max(0.0, time.time() - float(cached[0]))
+                logger.warning("[US_KIS][STALE_PRICE_FALLBACK] endpoint=GET_price symbol=%s streak=%d age_sec=%.3f", symbol, self._temporary_error_streak[cache_key], age_sec)
+                stale_payload = dict(cached[1]) if isinstance(cached[1], dict) else cached[1]
+                if isinstance(stale_payload, dict):
+                    stale_payload.update({
+                        "_quote_quality": "STALE",
+                        "_quote_source": "KIS_STALE_CACHE",
+                        "_quote_asof_epoch": float(cached[0]),
+                        "_quote_age_sec": age_sec,
+                    })
+                return stale_payload
             raise
 
     def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:

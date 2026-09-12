@@ -20,6 +20,7 @@ class TickExecutionContext:
     prep_run_id: str = ""
     run_source: str = ""
     balance_snapshot: dict = field(default_factory=dict)
+    sell_balance_snapshot: dict | None = None
     positions_by_symbol: dict[str, dict] = field(default_factory=dict)
     exchange_by_symbol: dict[str, str] = field(default_factory=dict)
     fills_snapshot: list[dict] = field(default_factory=list)

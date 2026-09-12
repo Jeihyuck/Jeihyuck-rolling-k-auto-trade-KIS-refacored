@@ -754,13 +754,13 @@ def run_trade_session(
         "[US_SESSION][START] session=%s env=%s offline=%s max_minutes=%d interval_sec=%d",
         session, env, offline, max_minutes, interval_sec,
     )
-    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "270"))
-    if interval_sec >= 300 and tick_timeout_sec < 240:
-        logger.warning(
-            "[US_SESSION][CONFIG][TICK_TIMEOUT_RAISED] interval_sec=%d requested_timeout_sec=%d effective_timeout_sec=240",
-            interval_sec, tick_timeout_sec,
-        )
-        tick_timeout_sec = 240
+    requested_tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "240"))
+    tick_timeout_min_sec = int(os.getenv("US_TICK_TIMEOUT_MIN_SEC", "240"))
+    tick_timeout_sec = max(requested_tick_timeout_sec, tick_timeout_min_sec) if interval_sec >= 300 else requested_tick_timeout_sec
+    logger.info(
+        "[US_SESSION][CONFIG][TICK_TIMEOUT_CONTRACT] interval_sec=%d requested_timeout_sec=%d minimum_timeout_sec=%d effective_timeout_sec=%d",
+        interval_sec, requested_tick_timeout_sec, tick_timeout_min_sec, tick_timeout_sec,
+    )
     if tick_timeout_sec < max(60, int(interval_sec * 0.8)):
         logger.warning(
             "[US_SESSION][CONFIG][TICK_TIMEOUT_LOW] interval_sec=%d timeout_sec=%d recommendation=>=80%%_interval",

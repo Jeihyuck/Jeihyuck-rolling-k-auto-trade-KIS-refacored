@@ -158,6 +158,25 @@ class InfiniteRepository:
                 WHERE trade_date=:trade_date AND client_order_key=:key
             """), {"patch": patch, "trade_date": trade_date, "key": key})
 
+    def mark_ttl_unresolved_escalated(self, order: dict, *, escalated_at: datetime, unresolved_age_sec: float) -> None:
+        """Persist a manual-reconcile RED marker without changing broker/order status."""
+        key = str(order.get("client_order_key") or "")
+        trade_date = str(order.get("trade_date") or "")
+        if not key or not trade_date:
+            raise ValueError("TTL unresolved escalation requires original order identity")
+        patch = json.dumps({
+            "tqqq_ttl_unresolved_escalated_at": escalated_at.isoformat(),
+            "tqqq_ttl_unresolved_age_sec": float(unresolved_age_sec),
+            "manual_reconcile_required": True,
+            "manual_reconcile_reason": "TQQQ_TTL_UNRESOLVED_AFTER_CANCEL",
+        }, default=str)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE us_orders
+                SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
+                WHERE trade_date=:trade_date AND client_order_key=:key
+            """), {"patch": patch, "trade_date": trade_date, "key": key})
+
     def apply_ttl_terminal_observation(self, order: dict, observation: dict) -> dict:
         """Persist only broker-confirmed terminal truth for the original order."""
         from trader.us.db.repos import apply_broker_order_observation

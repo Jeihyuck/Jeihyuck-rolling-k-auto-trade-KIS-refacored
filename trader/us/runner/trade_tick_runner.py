@@ -1111,6 +1111,77 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     return passthrough + merged
 
 
+_ROUTED_SUBMISSION_STATUSES = {
+    "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+    "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+    "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "SUBMITTED", "SENT",
+    "DRY_RUN", "SIGNAL_ONLY",
+}
+_ROUTED_ACK_STATUSES = {
+    "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+    "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+    "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "FILLED",
+}
+
+
+def _order_has_routed_submission_truth(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    status = str(order.get("status") or "").upper()
+    return bool(order.get("broker_submit")) or status in _ROUTED_SUBMISSION_STATUSES
+
+
+def _order_has_ack_truth(order: dict) -> bool:
+    if not isinstance(order, dict):
+        return False
+    status = str(order.get("status") or "").upper()
+    return bool(order.get("kis_ack")) or status in _ROUTED_ACK_STATUSES
+
+
+def _routed_order_truth_counts(orders: list[dict]) -> tuple[int, int, int, int]:
+    rejected_statuses = {"REJECT", "REJECTED"}
+    blocked_statuses = {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}
+
+    sent = ack = rejected = blocked = 0
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        status = str(order.get("status") or "").upper()
+        if _order_has_routed_submission_truth(order):
+            sent += 1
+        if _order_has_ack_truth(order):
+            ack += 1
+        if status in rejected_statuses:
+            rejected += 1
+        if status in blocked_statuses:
+            blocked += 1
+    return sent, ack, rejected, blocked
+
+
+def _routed_order_notional(orders: list[dict]) -> float:
+    total = 0.0
+    for order in orders or []:
+        if not _order_has_routed_submission_truth(order):
+            continue
+        intent = order.get("intent") if isinstance(order.get("intent"), dict) else {}
+        try:
+            total += float(intent.get("notional_usd", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _routed_sell_notional(orders: list[dict]) -> float:
+    sell_orders: list[dict] = []
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        intent = order.get("intent") if isinstance(order.get("intent"), dict) else {}
+        if str(intent.get("side") or "").upper() == "SELL":
+            sell_orders.append(order)
+    return _routed_order_notional(sell_orders)
+
+
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
@@ -1179,15 +1250,8 @@ def route_exit_orders_immediately(
         except Exception as exc:
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
-    ack = sum(1 for o in orders if o.get("status") == "ACK")
-    sent = sum(1 for o in orders if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"})
-    rejected = sum(1 for o in orders if o.get("status") == "REJECT")
-    blocked = sum(1 for o in orders if o.get("status") in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
-    sell_notional_routed = sum(
-        float((o.get("intent") or {}).get("notional_usd", 0) or 0)
-        for o in orders
-        if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"}
-    )
+    sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
+    sell_notional_routed = _routed_sell_notional(orders)
     logger.info(
         "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d sell_notional=%.2f",
         len(sell_intents), sent, ack, rejected, blocked, sell_notional_routed,
@@ -2285,8 +2349,11 @@ def run_trade_tick(
         kis_client=routing_kis_client,
     )
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
-    sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
+    # Aggregate broker-routed SELL truth across both TQQQ Infinite and PB1 exits.
+    # BUY orders from the Infinite sleeve are explicitly excluded.
+    sell_notional_routed = _routed_sell_notional(orders)
     exit_routed_before_entry = 1
+    routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
 
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
@@ -2316,10 +2383,10 @@ def run_trade_tick(
             "status": "DEGRADED_FILLS_UNAVAILABLE",
             "reason": "TEMP_FILLS_UNAVAILABLE",
             "session": session,
-            "orders": [],
-            "ack": 0,
+            "orders": list(orders),
+            "ack": routed_ack,
             "dry_run": 0,
-            "blocked": 0,
+            "blocked": routed_blocked,
             "signal_only": 0,
             "errors": 1,
             "budget": budget,
@@ -2334,7 +2401,11 @@ def run_trade_tick(
             "entry_error_type": "TEMP_FILLS_UNAVAILABLE",
             "entry_error_message": "temporary fills unavailable; duplicate-sensitive buys blocked",
             "entry_intents": 0,
-            "orders_sent": 0,
+            "orders_sent": routed_sent,
+            "orders_ack": routed_ack,
+            "orders_rejected": routed_rejected,
+            "sell_notional_routed": sell_notional_routed,
+            "exit_intents": len(exit_intents),
             "fills": len(fills_today),
             "positions": position_count if 'position_count' in locals() else 0,
             "temp_error_count": temp_error_count,
@@ -2348,10 +2419,10 @@ def run_trade_tick(
             "status": "DEGRADED_FILLS_UNAVAILABLE",
             "reason": "TEMP_FILLS_UNAVAILABLE",
             "session": session,
-            "orders": [],
-            "ack": 0,
+            "orders": list(orders),
+            "ack": routed_ack,
             "dry_run": 0,
-            "blocked": 0,
+            "blocked": routed_blocked,
             "signal_only": 0,
             "errors": 1,
             "budget": budget,
@@ -2366,7 +2437,11 @@ def run_trade_tick(
             "entry_error_type": "TEMP_FILLS_UNAVAILABLE",
             "entry_error_message": "temporary fills unavailable; duplicate-sensitive buys blocked",
             "entry_intents": 0,
-            "orders_sent": 0,
+            "orders_sent": routed_sent,
+            "orders_ack": routed_ack,
+            "orders_rejected": routed_rejected,
+            "sell_notional_routed": sell_notional_routed,
+            "exit_intents": len(exit_intents),
             "fills": len(fills_today),
             "positions": position_count if 'position_count' in locals() else 0,
             "temp_error_count": temp_error_count,
@@ -3189,17 +3264,16 @@ def run_trade_tick(
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
     tick_context.metrics["order_route_ms"] = (time.monotonic() - _order_route_started) * 1000.0 if all_intents else 0.0
 
-    ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
+    # Normal completion must use the same broker-truth contract as degraded returns.
+    routed_sent_total, ack_cnt, reject_cnt, blocked_cnt = _routed_order_truth_counts(orders)
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
     exit_closed_cnt = sum(1 for o in orders if o["status"] == "OK_EXIT_POSITION_CLOSED")
     sell_reconcile_pending_cnt = sum(1 for o in orders if o["status"] == "WARN_SELL_REJECT_RECONCILE_PENDING")
-    blocked_cnt = sum(1 for o in orders if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
-    reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
     ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
 
-    if not offline and (ack_cnt > 0 or ack_db_failed_cnt > 0):
+    if not offline and ack_cnt > 0:
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon_after_route = reconcile_ack_orders_with_balance(
@@ -3218,7 +3292,7 @@ def run_trade_tick(
             )
         except Exception as exc:
             logger.warning("[US_TICK][WARN] post-route reconcile_ack_orders_with_balance failed: %s", exc)
-            ack_recon_after_route = {"status": "ACK_PENDING_RECONCILE", "error": str(exc), "pending_count": ack_cnt + ack_db_failed_cnt, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": ack_cnt + ack_db_failed_cnt, "symbols_by_status": {"ack_pending_reconcile": []}}
+            ack_recon_after_route = {"status": "ACK_PENDING_RECONCILE", "error": str(exc), "pending_count": ack_cnt, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": ack_cnt, "symbols_by_status": {"ack_pending_reconcile": []}}
             ack_recon = dict(ack_recon_after_route)
     else:
         ack_recon_after_route = dict(ack_recon_before_route)
@@ -3316,8 +3390,8 @@ def run_trade_tick(
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
     total_warnings = fills_warnings_count
-    # ACK_DB_FAILED still means the broker accepted a real submission.
-    orders_sent = ack_cnt + dry_cnt + ack_db_failed_cnt
+    # Broker submission truth is authoritative across normal and degraded paths.
+    orders_sent = routed_sent_total
     orders_failed = reject_cnt + err_cnt
     exit_intents_count = len(exit_intents)
     entry_intents_count = len(entry_intents)

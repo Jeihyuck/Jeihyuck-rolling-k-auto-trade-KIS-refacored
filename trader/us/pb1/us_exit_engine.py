@@ -686,6 +686,20 @@ def prepare_exit_position_snapshots(
             if hasattr(provider, "get_current_price"):
                 price_data = provider.get_current_price(symbol, exchange)
                 if isinstance(price_data, dict):
+                    quote_quality = str(price_data.get("quality") or "").lower()
+                    quote_stale = bool(
+                        price_data.get("stale")
+                        or price_data.get("suspect")
+                        or price_data.get("_stale_date")
+                        or quote_quality in {"stale", "suspect", "degraded"}
+                    )
+                    if quote_stale:
+                        logger.warning(
+                            "[US_EXIT][QUOTE_STALE_BLOCK] symbol=%s exchange=%s source=%s quality=%s asof=%s action=skip_exit_state_mutation",
+                            symbol, exchange, price_data.get("source") or "unknown",
+                            quote_quality or "unknown", price_data.get("asof") or price_data.get("_stale_date") or price_data.get("asof_epoch"),
+                        )
+                        continue
                     current_price = float(price_data.get("last") or price_data.get("price") or 0)
                 else:
                     current_price = float(price_data or 0)
