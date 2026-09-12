@@ -7,10 +7,10 @@ can lose the immutable pre-fill basis needed for BUY metadata or SELL realized
 P&L accounting.
 
 This is deliberately narrower than the old open-order fence.  It protects only
-symbols with durable fill evidence still awaiting lifecycle application.  The
-real KIS snapshot is never modified; only the private balance view supplied to
-stale-position reconciliation is neutralized for those symbols, so broker-truth
-health can continue to report the real mismatch as RED.
+symbols with durable fill evidence still awaiting application to the *current
+exact OPEN lifecycle*.  The real KIS snapshot is never modified; only the private
+balance view supplied to stale-position reconciliation is neutralized for those
+symbols, so broker-truth health can continue to report the real mismatch as RED.
 """
 from __future__ import annotations
 
@@ -61,9 +61,10 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
     pending: set[str] = set()
 
     with engine.connect() as conn:
-        # Unowned executions fence this strategy only when a durable order with
-        # the same symbol/side/ODNO exists on the same KST trade date.  KIS order
-        # numbers may be reused across dates, so ODNO alone is not sufficient.
+        # Unowned executions fence this strategy only when an order matches the
+        # same symbol/side/ODNO/KST date AND that order owns the current exact
+        # OPEN lifecycle.  This prevents an old CLOSED lifecycle's unresolved
+        # fill from freezing a later position in the same symbol.
         unowned = [
             dict(row)
             for row in conn.execute(
@@ -107,7 +108,33 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
                     )
                 ).mappings().all()
             ]
-            if any(_order_trade_date(order) == fill_day for order in candidates):
+            exact_active = False
+            for order in candidates:
+                if _order_trade_date(order) != fill_day:
+                    continue
+                cycle = order.get("position_cycle_id")
+                epoch = order.get("portfolio_epoch_id")
+                if not cycle or not epoch:
+                    continue
+                active_row = conn.execute(
+                    sa.select(schema.positions.c.position_id)
+                    .where(
+                        sa.and_(
+                            schema.positions.c.env == env,
+                            schema.positions.c.strategy == strategy,
+                            schema.positions.c.code == code,
+                            schema.positions.c.position_cycle_id == cycle,
+                            schema.positions.c.portfolio_epoch_id == epoch,
+                            schema.positions.c.status == "OPEN",
+                            schema.positions.c.qty > 0,
+                        )
+                    )
+                    .limit(1)
+                ).scalar()
+                if active_row is not None:
+                    exact_active = True
+                    break
+            if exact_active:
                 pending.add(code)
 
         # Only BUY orders attached to a currently OPEN exact lifecycle can be
