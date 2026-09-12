@@ -182,3 +182,29 @@ def test_buy_audit_missing_is_na_not_false_zero():
     assert _audit_gate_value({}, "setup_ok", "setup_passed") == "NA"
     assert _audit_gate_value({"risk_ok": False}, "risk_ok", "risk_passed") == 0
     assert _audit_gate_value({"meta": {"sizing_ok": True}}, "sizing_ok", "sizing_passed") == 1
+
+
+def test_take_profit_refresh_preserves_buy_amount_div_qty_provenance():
+    intent = {
+        "symbol": "AAPL", "side": "SELL", "qty": 2,
+        "limit_price": 104.0, "reason": "TAKE_PROFIT_TP1",
+        "position_lifecycle_id": "lc-aapl-derived",
+        "meta": {
+            "reason": "TAKE_PROFIT_TP1",
+            "tp_threshold_fraction": 0.03,
+            "position_lifecycle_id": "lc-aapl-derived",
+        },
+    }
+    broker = {
+        "symbol": "AAPL",
+        "qty": 10,
+        "orderable_qty": 10,
+        "broker_avg_price": 100.0,
+        "broker_avg_price_source": "kis_buy_amount_div_qty",
+        "broker_avg_price_currency": "USD",
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+    }
+    result = _validate_take_profit_with_fresh_broker_position(intent, broker, now=NOW)
+    assert result["ok"] is True
+    assert intent["meta"]["broker_avg_price_source"] == "kis_buy_amount_div_qty"

@@ -608,7 +608,7 @@ def _validate_take_profit_with_fresh_broker_position(
             intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id")
         ),
         "broker_avg_price": broker_avg_raw,
-        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_source": str(broker_position.get("broker_avg_price_source") or "kis_pchs_avg_pric"),
         "broker_avg_price_currency": "USD",
         "broker_avg_price_asof": now_utc.isoformat(),
         "balance_source": "kis_balance_authoritative",
