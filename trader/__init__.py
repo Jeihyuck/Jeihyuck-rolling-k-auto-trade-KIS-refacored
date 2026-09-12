@@ -71,6 +71,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.kr.broker_truth_observability_compat import install_buy_observability_compat
     from trader.kr.broker_truth_historical_buy_retry import install_historical_buy_retry
     from trader.kr.broker_truth_historical_retry_safety import install_historical_retry_safety
+    from trader.kr.broker_truth_cross_date_unowned_retry import install_cross_date_unowned_retry
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
@@ -89,3 +90,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     # wrapper so CLOSED/superseded lifecycles can never be resurrected.
     install_historical_buy_retry()
     install_historical_retry_safety()
+    # Finally recover prior-day fills that were durably persisted by daily-ccld
+    # but crashed before order attribution. Exact trade-date + ODNO matching is
+    # required; BUYs flow into the owned-BUY retry and SELLs are applied atomically.
+    install_cross_date_unowned_retry()
