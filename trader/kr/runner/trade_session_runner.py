@@ -683,7 +683,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     logger.info("[KR_SESSION][START] session=%s env=%s", session, env)
     if session == "close":
         os.environ["FORCE_MARKET_WINDOW"] = "close"
-        os.environ["FORCE_PB1_PHASE"] = "close"
+        os.environ["FORCE_PB1_PHASE"] = "exit"
         os.environ["PB1_ENTRY_ENABLED"] = "0"
         os.environ["PB1_EXIT_ENABLED"] = "1"
         os.environ["PB1_CLOSE_ENABLED"] = "1"
@@ -701,7 +701,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
                     "entry_enabled": False,
                     "exit_enabled": True,
                     "close_enabled": True,
-                    "close_liquidation_enabled": False,
+                    "close_liquidation_enabled": str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", "0")).strip() == "1",
                     "created_at_kst": _now_kst().isoformat(),
                 },
                 ensure_ascii=False,
@@ -709,7 +709,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             ),
             encoding="utf-8",
         )
-        logger.info("[KR_CLOSE][PHASE] phase=close entry_enabled=0 exit_enabled=1 close_enabled=1 close_liquidation_enabled=0")
+        logger.info("[KR_CLOSE][PHASE] phase=close engine_phase=exit entry_enabled=0 exit_enabled=1 close_enabled=1 close_liquidation_enabled=0")
 
     # KR PR #61 권한 모델: entry block must not kill exit/close liveness.
     kr_entry_can_proceed = str(os.getenv("PB1_ENTRY_ENABLED", "1")).strip() == "1"
@@ -792,9 +792,10 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = 2
     else:
         status = "OK" if exit_code == 0 else "FAIL"
-    if session == "close" and status == "OK" and str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper() == "SKIP_PHASE_WINDOW":
+    if session == "close" and pb1_last == "SKIP_PHASE_WINDOW":
         status = "FAIL"
-        exit_code = 2
+        exit_code = max(exit_code, 2)
+        summary_reason = "CLOSE_PHASE_NOT_EXECUTED"
         logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
     if not summary_reason:
         summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
@@ -861,19 +862,31 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s ack_without_fill=%s unresolved_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, ack_without_fill, pb1_result.get("unresolved_acks", 0), blocked)
     else:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s ack_without_fill=%s unresolved_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, ack_without_fill, pb1_result.get("unresolved_acks", 0), blocked)
-    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_submitted": orders_submitted, "orders_ack": orders_ack, "fills_confirmed": filled_confirmed, "ack_without_confirmed_fill": ack_without_fill, "unresolved_ack": int(pb1_result.get("unresolved_acks", 0) or 0), **count_reconcile}
+    reconciliation_fields = {k: v for k, v in count_reconcile.items() if k not in {"status", "reason"}}
+    result = {
+        **reconciliation_fields,
+        "reconciliation_status": count_reconcile.get("status"),
+        "reconciliation_reason": count_reconcile.get("reason"),
+        "status": status, "final_status": status, "reason": summary_reason,
+        "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable),
+        "engine_started": bool(pb1_result_present and not lock_unavailable),
+        "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent,
+        "orders_submitted": orders_submitted, "orders_ack": orders_ack,
+        "fills_confirmed": filled_confirmed, "ack_without_confirmed_fill": ack_without_fill,
+        "unresolved_ack": int(pb1_result.get("unresolved_acks", 0) or 0),
+    }
     if lock_unavailable:
         result.update(lock_unavailable_result_fields())
     if session == "close":
         result.update({
             "phase": "close",
-            "phase_executed": status != "FAIL",
+            "phase_executed": status not in {"FAIL", "FAILED"},
             "force_phase": True,
             "skip_phase_window": status == "FAIL" and exit_code == 2,
             "entry_enabled": False,
             "exit_enabled": True,
             "close_enabled": True,
-            "close_liquidation_enabled": True,
+            "close_liquidation_enabled": str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", "0")).strip() == "1",
         })
     if balance_state is not None and balance_state.get("status") == "WARN":
         result["balance_fail_soft"] = balance_state

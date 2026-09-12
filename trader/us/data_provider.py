@@ -673,6 +673,10 @@ class USDataProvider:
                     "tvol": str(row[5]) if row[5] else "0",
                     "symbol": symbol,
                     "_stale_date": row[0].strftime("%Y-%m-%d"),
+                    "stale": True,
+                    "quality": "stale",
+                    "source": "DB_STALE",
+                    "asof": row[0].strftime("%Y-%m-%d"),
                 }
         except Exception as exc:
             logger.warning(
@@ -717,6 +721,7 @@ class USDataProvider:
                 ctx.count("quote_http_calls")
             result = self._get_client().get_us_price(symbol, exchange)
             output = result.get("output", {})
+            quote_quality = str(result.get("_quote_quality") or "FRESH").upper()
             data = {
                 "last": output.get("last", "0"),
                 "open": output.get("open", "0"),
@@ -724,6 +729,11 @@ class USDataProvider:
                 "low": output.get("low", "0"),
                 "tvol": output.get("tvol", "0"),
                 "symbol": symbol,
+                "stale": quote_quality in {"STALE", "DEGRADED", "SUSPECT"},
+                "quality": quote_quality.lower(),
+                "source": str(result.get("_quote_source") or "KIS_LIVE"),
+                "asof_epoch": result.get("_quote_asof_epoch"),
+                "age_sec": result.get("_quote_age_sec"),
             }
             if self._cache_enabled:
                 self._price_cache[cache_key] = data

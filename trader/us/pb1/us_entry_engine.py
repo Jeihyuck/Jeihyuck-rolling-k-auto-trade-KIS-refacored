@@ -473,6 +473,18 @@ def _can_reenter_after_soft_exit(symbol: str, entry_meta: dict, now: datetime | 
     return allowed
 
 
+def _quote_is_stale(current: Any) -> bool:
+    if not isinstance(current, dict):
+        return False
+    quality = str(current.get("quality") or "").strip().lower()
+    return bool(
+        current.get("stale")
+        or current.get("suspect")
+        or current.get("_stale_date")
+        or quality in {"stale", "suspect", "degraded"}
+    )
+
+
 def generate_entry_intents(
     tickers: list[str] | list[dict] | None,
     provider: Any,
@@ -740,6 +752,19 @@ def generate_entry_intents(
                     continue
                 price_lookup_count += 1
                 current = provider.get_current_price(symbol, exchange)
+                if _quote_is_stale(current):
+                    track_skip(symbol, "stale_current_price", {
+                        "source": current.get("source") if isinstance(current, dict) else None,
+                        "quality": current.get("quality") if isinstance(current, dict) else None,
+                        "asof": (current.get("asof") or current.get("_stale_date") or current.get("asof_epoch")) if isinstance(current, dict) else None,
+                    })
+                    logger.warning(
+                        "[US_ENTRY][QUOTE_STALE_BLOCK] symbol=%s exchange=%s source=%s quality=%s action=skip_buy",
+                        symbol, exchange,
+                        current.get("source") if isinstance(current, dict) else "unknown",
+                        current.get("quality") if isinstance(current, dict) else "unknown",
+                    )
+                    continue
             except Exception as exc:
                 track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})
                 logger.info("[US_ENTRY][SKIP] symbol=%s reason=daily_price_unavailable error=%s", symbol, exc)
@@ -858,6 +883,19 @@ def generate_entry_intents(
             price_lookup_count += 1
             try:
                 current = provider.get_current_price(symbol, exchange)
+                if _quote_is_stale(current):
+                    track_skip(symbol, "stale_current_price", {
+                        "source": current.get("source") if isinstance(current, dict) else None,
+                        "quality": current.get("quality") if isinstance(current, dict) else None,
+                        "asof": (current.get("asof") or current.get("_stale_date") or current.get("asof_epoch")) if isinstance(current, dict) else None,
+                    })
+                    logger.warning(
+                        "[US_ENTRY][QUOTE_STALE_BLOCK] symbol=%s exchange=%s source=%s quality=%s action=skip_buy",
+                        symbol, exchange,
+                        current.get("source") if isinstance(current, dict) else "unknown",
+                        current.get("quality") if isinstance(current, dict) else "unknown",
+                    )
+                    continue
             except Exception as exc:
                 track_skip(symbol, "current_price_unavailable", {"error": str(exc)})
                 logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable error=%s", symbol, exc)

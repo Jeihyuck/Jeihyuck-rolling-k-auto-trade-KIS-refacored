@@ -2287,6 +2287,10 @@ def run_trade_tick(
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1
+    routed_sent = sum(1 for order in orders if str(order.get("status") or "").upper() in {"ACK", "DRY_RUN", "SIGNAL_ONLY", "SUBMITTED", "SENT"})
+    routed_ack = sum(1 for order in orders if str(order.get("status") or "").upper() in {"ACK", "FILLED"})
+    routed_rejected = sum(1 for order in orders if str(order.get("status") or "").upper() in {"REJECT", "REJECTED"})
+    routed_blocked = sum(1 for order in orders if str(order.get("status") or "").upper() in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
 
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
@@ -2316,10 +2320,10 @@ def run_trade_tick(
             "status": "DEGRADED_FILLS_UNAVAILABLE",
             "reason": "TEMP_FILLS_UNAVAILABLE",
             "session": session,
-            "orders": [],
-            "ack": 0,
+            "orders": list(orders),
+            "ack": routed_ack,
             "dry_run": 0,
-            "blocked": 0,
+            "blocked": routed_blocked,
             "signal_only": 0,
             "errors": 1,
             "budget": budget,
@@ -2334,7 +2338,11 @@ def run_trade_tick(
             "entry_error_type": "TEMP_FILLS_UNAVAILABLE",
             "entry_error_message": "temporary fills unavailable; duplicate-sensitive buys blocked",
             "entry_intents": 0,
-            "orders_sent": 0,
+            "orders_sent": routed_sent,
+            "orders_ack": routed_ack,
+            "orders_rejected": routed_rejected,
+            "sell_notional_routed": sell_notional_routed,
+            "exit_intents": len(exit_intents),
             "fills": len(fills_today),
             "positions": position_count if 'position_count' in locals() else 0,
             "temp_error_count": temp_error_count,
@@ -2348,10 +2356,10 @@ def run_trade_tick(
             "status": "DEGRADED_FILLS_UNAVAILABLE",
             "reason": "TEMP_FILLS_UNAVAILABLE",
             "session": session,
-            "orders": [],
-            "ack": 0,
+            "orders": list(orders),
+            "ack": routed_ack,
             "dry_run": 0,
-            "blocked": 0,
+            "blocked": routed_blocked,
             "signal_only": 0,
             "errors": 1,
             "budget": budget,
@@ -2366,7 +2374,11 @@ def run_trade_tick(
             "entry_error_type": "TEMP_FILLS_UNAVAILABLE",
             "entry_error_message": "temporary fills unavailable; duplicate-sensitive buys blocked",
             "entry_intents": 0,
-            "orders_sent": 0,
+            "orders_sent": routed_sent,
+            "orders_ack": routed_ack,
+            "orders_rejected": routed_rejected,
+            "sell_notional_routed": sell_notional_routed,
+            "exit_intents": len(exit_intents),
             "fills": len(fills_today),
             "positions": position_count if 'position_count' in locals() else 0,
             "temp_error_count": temp_error_count,
