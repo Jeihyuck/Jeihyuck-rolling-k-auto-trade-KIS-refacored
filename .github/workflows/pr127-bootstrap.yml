@@ -30,7 +30,9 @@ jobs:
           python -m pip install psycopg2-binary
 
       - name: Apply PR127 fixes
-        run: python scripts/pr127_apply.py
+        run: |
+          python scripts/pr127_apply.py
+          python scripts/pr127_fixup.py
 
       - name: Byte compile changed production modules
         run: |
@@ -60,7 +62,7 @@ jobs:
 
       - name: Remove one-shot bootstrap files and commit final patch
         run: |
-          git rm -f scripts/pr127_apply.py .github/workflows/pr127-bootstrap.yml
+          git rm -f scripts/pr127_apply.py scripts/pr127_fixup.py .github/workflows/pr127-bootstrap.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
