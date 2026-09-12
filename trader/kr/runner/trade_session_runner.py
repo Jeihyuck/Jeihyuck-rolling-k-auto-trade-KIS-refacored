@@ -840,10 +840,17 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             raw_balance=raw_balance if isinstance(raw_balance, dict) else {},
         )
         if guard.status == "WARN_BALANCE_INCONSISTENT":
-            status = guard.status
-            summary_reason = guard.reason
-            completed = guard.completed
-            retryable = guard.retryable
+            if close_phase_not_executed:
+                logger.error(
+                    "[KR_CLOSE][FAIL_PRESERVED] reason=CLOSE_PHASE_NOT_EXECUTED "
+                    "post_balance_guard=%s guard_reason=%s",
+                    guard.status, guard.reason,
+                )
+            else:
+                status = guard.status
+                summary_reason = guard.reason
+                completed = guard.completed
+                retryable = guard.retryable
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
     orders_intent = int(pb1_result.get("order_intents_created", pb1_result.get("order_candidates", 0)) or 0)
     orders_submitted = int(pb1_result.get("broker_submitted", pb1_result.get("api_submitted", 0)) or 0)

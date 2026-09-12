@@ -211,3 +211,18 @@ def test_normal_completion_reuses_broker_truth_counts():
     assert "routed_sent_total, ack_cnt, reject_cnt, blocked_cnt = _routed_order_truth_counts(orders)" in source
     assert "orders_sent = routed_sent_total" in source
     assert '"pending_count": ack_cnt + ack_db_failed_cnt' not in source
+
+
+def test_routed_sell_notional_includes_infinite_sell_and_excludes_infinite_buy():
+    from trader.us.runner.trade_tick_runner import _routed_sell_notional
+
+    orders = [
+        {"status": "ACK", "broker_submit": True, "intent": {"side": "SELL", "notional_usd": 700.0}},
+        {"status": "ACK_DB_FAILED", "broker_submit": True, "intent": {"side": "SELL", "notional_usd": 300.0}},
+        {"status": "ACK", "broker_submit": True, "intent": {"side": "BUY", "notional_usd": 900.0}},
+        {"status": "BLOCKED", "broker_submit": False, "intent": {"side": "SELL", "notional_usd": 500.0}},
+    ]
+    assert _routed_sell_notional(orders) == 1000.0
+
+    source = Path("trader/us/runner/trade_tick_runner.py").read_text(encoding="utf-8")
+    assert "sell_notional_routed = _routed_sell_notional(orders)" in source

@@ -33,3 +33,12 @@ def test_close_phase_failure_precedes_balance_warning():
     assert 'if close_phase_not_executed:' in section
     assert '[KR_CLOSE][FAIL_PRESERVED]' in section
     assert section.index('if close_phase_not_executed:') < section.index('status = "WARN"')
+
+
+def test_close_phase_failure_precedes_post_balance_guard():
+    source = Path("trader/kr/runner/trade_session_runner.py").read_text(encoding="utf-8")
+    guard_pos = source.index('if guard.status == "WARN_BALANCE_INCONSISTENT":')
+    section = source[guard_pos:guard_pos + 650]
+    assert 'if close_phase_not_executed:' in section
+    assert 'post_balance_guard=%s' in section
+    assert section.index('if close_phase_not_executed:') < section.index('status = guard.status')

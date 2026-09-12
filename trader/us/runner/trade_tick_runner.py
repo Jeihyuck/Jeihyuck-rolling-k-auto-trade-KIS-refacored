@@ -1171,6 +1171,17 @@ def _routed_order_notional(orders: list[dict]) -> float:
     return total
 
 
+def _routed_sell_notional(orders: list[dict]) -> float:
+    sell_orders: list[dict] = []
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        intent = order.get("intent") if isinstance(order.get("intent"), dict) else {}
+        if str(intent.get("side") or "").upper() == "SELL":
+            sell_orders.append(order)
+    return _routed_order_notional(sell_orders)
+
+
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
@@ -1240,7 +1251,7 @@ def route_exit_orders_immediately(
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
     sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
-    sell_notional_routed = _routed_order_notional(orders)
+    sell_notional_routed = _routed_sell_notional(orders)
     logger.info(
         "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d sell_notional=%.2f",
         len(sell_intents), sent, ack, rejected, blocked, sell_notional_routed,
@@ -2338,7 +2349,9 @@ def run_trade_tick(
         kis_client=routing_kis_client,
     )
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
-    sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
+    # Aggregate broker-routed SELL truth across both TQQQ Infinite and PB1 exits.
+    # BUY orders from the Infinite sleeve are explicitly excluded.
+    sell_notional_routed = _routed_sell_notional(orders)
     exit_routed_before_entry = 1
     routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
 
