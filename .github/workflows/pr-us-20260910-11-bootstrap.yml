@@ -21,6 +21,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Prepare incident patcher
+        run: python scripts/dev/prepatch_us_incident_20260912.py
       - name: Apply incident patches
         run: python scripts/dev/apply_us_incident_fix_20260912.py
       - name: Compile changed Python
