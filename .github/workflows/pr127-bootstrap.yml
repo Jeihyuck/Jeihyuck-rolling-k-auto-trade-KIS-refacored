@@ -33,12 +33,14 @@ jobs:
         run: |
           python scripts/pr127_apply.py
           python scripts/pr127_fixup.py
+          python scripts/pr127_testfix.py
 
       - name: Byte compile changed production modules
         run: |
           python -m py_compile \
             trader/us/execution/kis_us_client.py \
             trader/us/data_provider.py \
+            trader/us/pb1/us_entry_engine.py \
             trader/us/pb1/us_exit_engine.py \
             trader/us/runner/trade_tick_runner.py \
             trader/us/runner/trade_session_runner.py \
@@ -62,7 +64,7 @@ jobs:
 
       - name: Remove one-shot bootstrap files and commit final patch
         run: |
-          git rm -f scripts/pr127_apply.py scripts/pr127_fixup.py .github/workflows/pr127-bootstrap.yml
+          git rm -f scripts/pr127_apply.py scripts/pr127_fixup.py scripts/pr127_testfix.py .github/workflows/pr127-bootstrap.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
