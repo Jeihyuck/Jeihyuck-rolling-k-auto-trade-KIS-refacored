@@ -792,7 +792,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = 2
     else:
         status = "OK" if exit_code == 0 else "FAIL"
-    if session == "close" and pb1_last == "SKIP_PHASE_WINDOW":
+    close_phase_not_executed = session == "close" and pb1_last == "SKIP_PHASE_WINDOW"
+    if close_phase_not_executed:
         status = "FAIL"
         exit_code = max(exit_code, 2)
         summary_reason = "CLOSE_PHASE_NOT_EXECUTED"
@@ -801,10 +802,13 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
     blocked = 0
     if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":
-        status = "WARN"
-        summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
         blocked = 1
-        logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
+        if close_phase_not_executed:
+            logger.error("[KR_CLOSE][FAIL_PRESERVED] reason=CLOSE_PHASE_NOT_EXECUTED balance_warning=BALANCE_UNCONFIRMED close_orders_blocked=1")
+        else:
+            status = "WARN"
+            summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
+            logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
     entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR", "SKIP_LOCKED"} or not pb1_result_present else "DONE"
     entry_reason = (pb1_reason or summary_reason) if entry_status == "ABORT" else None
     sell_orders_ack = extract_sell_orders_ack(pb1_result)

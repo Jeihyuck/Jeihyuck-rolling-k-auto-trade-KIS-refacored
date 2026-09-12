@@ -3251,17 +3251,16 @@ def run_trade_tick(
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
     tick_context.metrics["order_route_ms"] = (time.monotonic() - _order_route_started) * 1000.0 if all_intents else 0.0
 
-    ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
+    # Normal completion must use the same broker-truth contract as degraded returns.
+    routed_sent_total, ack_cnt, reject_cnt, blocked_cnt = _routed_order_truth_counts(orders)
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
     exit_closed_cnt = sum(1 for o in orders if o["status"] == "OK_EXIT_POSITION_CLOSED")
     sell_reconcile_pending_cnt = sum(1 for o in orders if o["status"] == "WARN_SELL_REJECT_RECONCILE_PENDING")
-    blocked_cnt = sum(1 for o in orders if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
-    reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
     ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
 
-    if not offline and (ack_cnt > 0 or ack_db_failed_cnt > 0):
+    if not offline and ack_cnt > 0:
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon_after_route = reconcile_ack_orders_with_balance(
@@ -3280,7 +3279,7 @@ def run_trade_tick(
             )
         except Exception as exc:
             logger.warning("[US_TICK][WARN] post-route reconcile_ack_orders_with_balance failed: %s", exc)
-            ack_recon_after_route = {"status": "ACK_PENDING_RECONCILE", "error": str(exc), "pending_count": ack_cnt + ack_db_failed_cnt, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": ack_cnt + ack_db_failed_cnt, "symbols_by_status": {"ack_pending_reconcile": []}}
+            ack_recon_after_route = {"status": "ACK_PENDING_RECONCILE", "error": str(exc), "pending_count": ack_cnt, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": ack_cnt, "symbols_by_status": {"ack_pending_reconcile": []}}
             ack_recon = dict(ack_recon_after_route)
     else:
         ack_recon_after_route = dict(ack_recon_before_route)
@@ -3378,8 +3377,8 @@ def run_trade_tick(
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
     total_warnings = fills_warnings_count
-    # ACK_DB_FAILED still means the broker accepted a real submission.
-    orders_sent = ack_cnt + dry_cnt + ack_db_failed_cnt
+    # Broker submission truth is authoritative across normal and degraded paths.
+    orders_sent = routed_sent_total
     orders_failed = reject_cnt + err_cnt
     exit_intents_count = len(exit_intents)
     entry_intents_count = len(entry_intents)

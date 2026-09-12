@@ -22,3 +22,14 @@ def test_reconciliation_status_is_namespaced_and_cannot_overwrite_session_status
     assert '"reconciliation_status": count_reconcile.get("status")' in source
     assert '"reconciliation_reason": count_reconcile.get("reason")' in source
     assert '**count_reconcile}' not in source
+
+
+def test_close_phase_failure_precedes_balance_warning():
+    source = Path("trader/kr/runner/trade_session_runner.py").read_text(encoding="utf-8")
+    assert 'close_phase_not_executed = session == "close" and pb1_last == "SKIP_PHASE_WINDOW"' in source
+    close_guard = source.index('close_phase_not_executed = session == "close" and pb1_last == "SKIP_PHASE_WINDOW"')
+    balance_guard = source.index('if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":', close_guard)
+    section = source[balance_guard:balance_guard + 750]
+    assert 'if close_phase_not_executed:' in section
+    assert '[KR_CLOSE][FAIL_PRESERVED]' in section
+    assert section.index('if close_phase_not_executed:') < section.index('status = "WARN"')

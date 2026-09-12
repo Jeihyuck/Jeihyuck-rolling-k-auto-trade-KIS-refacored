@@ -204,3 +204,10 @@ def test_routed_order_notional_uses_same_broker_submission_truth():
     # The first four were actually submitted to the broker.  A local/non-submitted
     # reject and a blocked order must not inflate routed SELL notional.
     assert _routed_order_notional(orders) == 1000.0
+
+
+def test_normal_completion_reuses_broker_truth_counts():
+    source = Path("trader/us/runner/trade_tick_runner.py").read_text(encoding="utf-8")
+    assert "routed_sent_total, ack_cnt, reject_cnt, blocked_cnt = _routed_order_truth_counts(orders)" in source
+    assert "orders_sent = routed_sent_total" in source
+    assert '"pending_count": ack_cnt + ack_db_failed_cnt' not in source
