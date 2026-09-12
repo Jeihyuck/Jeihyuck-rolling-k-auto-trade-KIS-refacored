@@ -33,15 +33,20 @@ def test_tqqq_entry_intent_bypasses_pb1_intraday_overlay_without_qty_change():
     assert kept[0]["meta"]["overlay_bypass"] is True
 
 
-def test_tqqq_strategy_ignores_pb1_overlay_but_preserves_structural_multiplier():
+def test_tqqq_strategy_ignores_intraday_labels_but_preserves_structural_multiplier():
     from trader.us.infinite.config import InfiniteConfig
     from trader.us.infinite.models import InfiniteState, PositionSnapshot, Action
     from trader.us.infinite.strategy import evaluate
 
+    strategy_overlay = _overlay()
+    # General production gates are a separate contract. Isolate only the PB1
+    # intraday label presence/absence in this structural-sizing test.
+    strategy_overlay["allow_new_buy"] = True
+    strategy_overlay["force_entry_block"] = False
     decision = evaluate(
         config=InfiniteConfig(), state=InfiniteState(),
         position=PositionSnapshot(price=80.0), trading_date=date(2026, 8, 19),
-        overlay=_overlay(), entry_allowed=True, buy_multiplier=0.5,
+        overlay=strategy_overlay, entry_allowed=True, buy_multiplier=0.5,
         effective_regime_name="NEUTRAL",
     )
 
