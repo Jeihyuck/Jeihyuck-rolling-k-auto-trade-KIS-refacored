@@ -189,10 +189,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
-    # TQQQ bypasses only the general PB1 intraday overlay. Structural TQQQ
-    # regime permission is strategy-owned and must be identical in production
-    # and replay. A crash/unknown regime therefore blocks BUY/ADD here while
-    # exits above remain routable.
+    # Structural TQQQ regime permission is strategy-owned and must be identical
+    # in production and replay. Exits above remain routable even when BUY/ADD is
+    # blocked by crash/unknown regime policy.
     if not entry_allowed:
         return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if position.qty > 0 and not config.allow_sell:
@@ -203,10 +202,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "daily_buy_limit")
     overlay = dict(overlay or {})
     infinite_overlay_bypass = config.symbol == "TQQQ"
-    # This flag describes ownership, not data presence. PB1 intraday fields are
-    # always present in production (often as "NORMAL"), so truthiness must never
-    # determine TQQQ structural risk or sizing.
-    pb1_overlay_bypass = infinite_overlay_bypass
+    # PB1 intraday labels are deliberately not used as strategy conditions here.
+    # Presence/absence of intraday keys must not change TQQQ runway decisions.
     metadata = state.metadata or {}
     recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
                               and not metadata.get("last_buy_fill_price"))
@@ -246,8 +243,10 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             last_fill = None
         if last_fill is not None and position.price <= last_fill * 0.99 and days_since >= 1:
             fast_dip_add_eligible = True
+    # Fast-dip is only an exception to an explicit production entry block. It
+    # must not jump ahead of TQQQ-owned CHOP/BEAR/capital-preservation runway.
     if (fast_dip_add_eligible and position.qty > 0 and not pending_buy and
-            (pb1_overlay_bypass or overlay.get("force_entry_block") is True or
+            (overlay.get("force_entry_block") is True or
              overlay.get("allow_new_buy") is False)):
         budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
                      config.max_total_capital_usd - state.total_filled_notional)
@@ -260,9 +259,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
-    if overlay.get("force_entry_block") is True and not fast_dip_add_eligible and not pb1_overlay_bypass:
+    if overlay.get("force_entry_block") is True and not fast_dip_add_eligible:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
-    if position.qty <= 0 and overlay.get("allow_new_buy") is False and not pb1_overlay_bypass:
+    if position.qty <= 0 and overlay.get("allow_new_buy") is False:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
         # Standard gross/cluster overlays do not own this sleeve. Only an
