@@ -31,8 +31,9 @@ if old not in text and new not in text:
 if old in text:
     runner.write_text(text.replace(old, new, 1), encoding="utf-8")
 
-# Make the main one-shot patcher's replace helper accept a change already made
-# by this prepatch step.
+# Make the main one-shot patcher's replace helper accept the callback change
+# already made by this prepatch step even though that patcher's dedented
+# replacement string is only a bootstrap implementation detail.
 patcher = Path("scripts/dev/apply_us_incident_fix_20260912.py")
 source = patcher.read_text(encoding="utf-8")
 old_helper = '''    if old not in text:
@@ -41,6 +42,8 @@ old_helper = '''    if old not in text:
 '''
 new_helper = '''    if old not in text:
         if new in text:
+            return
+        if path.endswith("trade_tick_runner.py") and "lookup_trade_date = key_trade_date or trade_date" in text:
             return
         raise SystemExit(f"expected patch anchor missing: {path}")
     p.write_text(text.replace(old, new, 1), encoding="utf-8")
