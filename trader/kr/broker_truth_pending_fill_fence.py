@@ -1,26 +1,16 @@
 """Prevent broker-quantity reconciliation from pre-empting durable fill application.
 
-PR125 deliberately treats fresh positive KIS holdings as canonical position
-quantity.  That is correct only after every already-confirmed broker fill has
-been attributed/applied to its exact lifecycle.  Otherwise a fail-soft linker
-error can let ``close_stale_positions`` change DB quantity first, after which the
-retry-safe BUY/SELL applier can no longer prove the original baseline and may
-leave metadata or realized P&L stranded.
+Fresh KIS holdings are canonical position truth only after every already-confirmed
+broker fill has reached its exact lifecycle.  If a fill linker/apply step fails
+softly and stale-position reconciliation changes DB quantity first, a later retry
+can lose the immutable pre-fill basis needed for BUY metadata or SELL realized
+P&L accounting.
 
-This guard does *not* restore the old blanket "open order blocks reconcile"
-policy.  It fences only symbols with durable broker-fill evidence that is still
-waiting for position application:
-
-* an unowned BUY/SELL fill that has a matching durable order for this strategy,
-* an owned BUY whose cumulative fill quantity is ahead of its canonical
-  application watermark, or whose immutable baseline still equals the current
-  exact position quantity.
-
-For those symbols only, the balance view passed to stale-position reconciliation
-is replaced with the current DB quantity/average.  The real KIS snapshot is not
-modified and remains available to broker-truth health, so the mismatch stays RED
-until fill application succeeds.  On the next successful retry the fence clears
-and normal KIS-canonical reconciliation resumes.
+This is deliberately narrower than the old open-order fence.  It protects only
+symbols with durable fill evidence still awaiting lifecycle application.  The
+real KIS snapshot is never modified; only the private balance view supplied to
+stale-position reconciliation is neutralized for those symbols, so broker-truth
+health can continue to report the real mismatch as RED.
 """
 from __future__ import annotations
 
@@ -70,17 +60,13 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
     pending: set[str] = set()
 
     with engine.connect() as conn:
-        # An unowned durable execution fences this strategy only if a durable
-        # strategy order can actually own it.  This prevents an unrelated old
-        # fill from another sleeve from freezing PB1 reconciliation forever.
+        # Unowned executions fence this strategy only when a matching durable
+        # strategy order exists.  An unrelated old fill cannot freeze PB1.
         unowned = [
             dict(row)
             for row in conn.execute(
-                sa.select(
-                    schema.fills.c.code,
-                    schema.fills.c.side,
-                    schema.fills.c.kis_odno,
-                ).where(
+                sa.select(schema.fills.c.code, schema.fills.c.side, schema.fills.c.kis_odno)
+                .where(
                     sa.and_(
                         schema.fills.c.env == env,
                         schema.fills.c.order_id.is_(None),
@@ -116,23 +102,53 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
             if candidate is not None:
                 pending.add(code)
 
-        # For owned BUY fills, compare cumulative broker execution to the atomic
-        # position application watermark on the exact lifecycle.  Missing marker
-        # is considered pending only when an immutable baseline proves the
-        # current position is still at the pre-order quantity; this avoids
-        # fencing unrelated legacy fills forever.
-        orders = [
-            dict(row)
-            for row in conn.execute(
-                sa.select(schema.orders).where(
+        # Only BUY orders that are attached to a currently OPEN exact lifecycle
+        # can be overwritten by close_stale_positions, so avoid scanning the
+        # historical order table.  This keeps the safety check cheap in live DBs.
+        active_buy_order_ids = [
+            str(value)
+            for value in conn.execute(
+                sa.select(schema.orders.c.order_id)
+                .select_from(
+                    schema.orders.join(
+                        schema.fills,
+                        schema.fills.c.order_id == schema.orders.c.order_id,
+                    ).join(
+                        schema.positions,
+                        sa.and_(
+                            schema.positions.c.env == schema.orders.c.env,
+                            schema.positions.c.strategy == schema.orders.c.strategy,
+                            schema.positions.c.code == schema.orders.c.code,
+                            schema.positions.c.position_cycle_id == schema.orders.c.position_cycle_id,
+                            schema.positions.c.portfolio_epoch_id == schema.orders.c.portfolio_epoch_id,
+                        ),
+                    )
+                )
+                .where(
                     sa.and_(
                         schema.orders.c.env == env,
                         schema.orders.c.strategy == strategy,
                         schema.orders.c.side == "BUY",
+                        schema.fills.c.env == env,
+                        schema.fills.c.side == "BUY",
+                        schema.positions.c.status == "OPEN",
+                        schema.positions.c.qty > 0,
                     )
                 )
-            ).mappings().all()
+                .distinct()
+            ).scalars().all()
+            if value is not None
         ]
+        if active_buy_order_ids:
+            orders = [
+                dict(row)
+                for row in conn.execute(
+                    sa.select(schema.orders).where(schema.orders.c.order_id.in_(active_buy_order_ids))
+                ).mappings().all()
+            ]
+        else:
+            orders = []
+
         for order in orders:
             order_id = order.get("order_id")
             cycle = order.get("position_cycle_id")
@@ -173,8 +189,6 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
                 pending.add(code)
                 continue
             if not positions:
-                if _baseline_qty(order) == 0:
-                    pending.add(code)
                 continue
             position = positions[0]
             entry_meta = _json_dict(position.get("entry_meta_json"))
@@ -189,8 +203,7 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
                     pending.add(code)
                 continue
             baseline = _baseline_qty(order)
-            current_qty = _qty(position.get("qty"))
-            if baseline is not None and current_qty == baseline:
+            if baseline is not None and _qty(position.get("qty")) == baseline:
                 pending.add(code)
 
     return pending
@@ -274,11 +287,7 @@ def _close_stale_positions_guarded_with_fill_fence(*args: Any, **kwargs: Any):
     if engine is None or not env or not strategy:
         return _ORIGINAL_CLOSE_STALE_GUARDED(*args, **kwargs)
     try:
-        pending = _pending_fill_application_codes(
-            engine=engine,
-            env=env,
-            strategy=strategy,
-        )
+        pending = _pending_fill_application_codes(engine=engine, env=env, strategy=strategy)
         if pending:
             kwargs = dict(kwargs)
             kwargs["kis_balance"] = _fenced_balance_for_pending(
@@ -289,9 +298,8 @@ def _close_stale_positions_guarded_with_fill_fence(*args: Any, **kwargs: Any):
                 pending_codes=pending,
             )
     except Exception as exc:
-        # If the fence itself cannot determine durable fill state, skip this
-        # reconciliation pass entirely.  Treating the failure as an empty KIS
-        # balance could incorrectly satisfy an old destructive-close streak.
+        # Never reinterpret a fence failure as KIS=0.  Skip this quantity pass;
+        # the next tick can retry after durable-fill inspection recovers.
         logger.exception(
             "[POSITION_RECONCILE_ADJUST][PENDING_FILL_FENCE_FAIL] err_type=%s err=%s action=SKIP_RECONCILE_PASS",
             type(exc).__name__,
