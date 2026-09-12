@@ -1111,6 +1111,37 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     return passthrough + merged
 
 
+def _routed_order_truth_counts(orders: list[dict]) -> tuple[int, int, int, int]:
+    submitted_statuses = {
+        "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+        "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+        "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "REJECT", "REJECTED",
+        "SUBMITTED", "SENT", "DRY_RUN", "SIGNAL_ONLY",
+    }
+    ack_statuses = {
+        "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+        "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+        "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "FILLED",
+    }
+    rejected_statuses = {"REJECT", "REJECTED"}
+    blocked_statuses = {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}
+
+    sent = ack = rejected = blocked = 0
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        status = str(order.get("status") or "").upper()
+        if bool(order.get("broker_submit")) or status in submitted_statuses:
+            sent += 1
+        if bool(order.get("kis_ack")) or status in ack_statuses:
+            ack += 1
+        if status in rejected_statuses:
+            rejected += 1
+        if status in blocked_statuses:
+            blocked += 1
+    return sent, ack, rejected, blocked
+
+
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
@@ -2287,10 +2318,7 @@ def run_trade_tick(
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1
-    routed_sent = sum(1 for order in orders if str(order.get("status") or "").upper() in {"ACK", "DRY_RUN", "SIGNAL_ONLY", "SUBMITTED", "SENT"})
-    routed_ack = sum(1 for order in orders if str(order.get("status") or "").upper() in {"ACK", "FILLED"})
-    routed_rejected = sum(1 for order in orders if str(order.get("status") or "").upper() in {"REJECT", "REJECTED"})
-    routed_blocked = sum(1 for order in orders if str(order.get("status") or "").upper() in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
+    routed_sent, routed_ack, routed_rejected, routed_blocked = _routed_order_truth_counts(orders)
 
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)

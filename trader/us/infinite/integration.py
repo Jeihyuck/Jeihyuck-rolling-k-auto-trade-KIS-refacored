@@ -72,6 +72,38 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][QUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                 order_no, client_order_key, exc,
             )
+            # A sustained broker-query outage must not bypass the liveness
+            # escalation added for prior cancel requests.  Keep the order
+            # non-terminal/fail-closed, but persist RED/manual reconciliation
+            # once the unresolved cancel has exceeded its escalation age.
+            cancel_requested_at = metadata.get("tqqq_ttl_cancel_requested_at")
+            if cancel_requested_at:
+                unresolved_age_sec = 0.0
+                try:
+                    requested_dt = datetime.fromisoformat(str(cancel_requested_at).replace("Z", "+00:00"))
+                    if requested_dt.tzinfo is None:
+                        requested_dt = requested_dt.replace(tzinfo=timezone.utc)
+                    unresolved_age_sec = max(
+                        0.0,
+                        (now.astimezone(timezone.utc) - requested_dt.astimezone(timezone.utc)).total_seconds(),
+                    )
+                except Exception:
+                    unresolved_age_sec = 0.0
+                escalate_after_sec = max(
+                    int(ttl_seconds),
+                    int(os.getenv("US_TQQQ_TTL_UNRESOLVED_ESCALATE_SEC", "900") or 900),
+                )
+                if unresolved_age_sec >= escalate_after_sec:
+                    result["escalated"] = int(result.get("escalated", 0)) + 1
+                    if not metadata.get("tqqq_ttl_unresolved_escalated_at"):
+                        logger.error(
+                            "[TQQQ_INF][TTL_RECONCILE][ESCALATED] order_no=%s key=%s unresolved_age_sec=%.1f action=manual_reconcile_required buy_fence=keep trigger=query_error",
+                            order_no, client_order_key, unresolved_age_sec,
+                        )
+                        if hasattr(repository, "mark_ttl_unresolved_escalated"):
+                            repository.mark_ttl_unresolved_escalated(
+                                order, escalated_at=now, unresolved_age_sec=unresolved_age_sec,
+                            )
             result["pending"] += 1
             continue
 

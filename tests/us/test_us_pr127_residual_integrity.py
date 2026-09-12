@@ -130,3 +130,54 @@ def test_pb1_entry_has_stale_quote_fail_closed_on_both_lookup_paths():
     source = Path("trader/us/pb1/us_entry_engine.py").read_text(encoding="utf-8")
     assert source.count('if _quote_is_stale(current):') == 2
     assert source.count('[US_ENTRY][QUOTE_STALE_BLOCK]') == 2
+
+
+
+def test_tqqq_query_exception_still_escalates_prior_cancel(monkeypatch):
+    from trader.us.infinite.integration import reconcile_tqqq_open_buy_ttl
+
+    now = datetime(2026, 9, 12, 2, 0, tzinfo=timezone.utc)
+    order = {
+        "trade_date": "2026-09-10",
+        "order_no": "123",
+        "client_order_key": "TQQQ_INF_V3:cycle:2026-09-10:BUY:1",
+        "symbol": "TQQQ", "side": "BUY", "status": "ACK", "qty": 3,
+        "meta": {"tqqq_ttl_cancel_requested_at": (now - timedelta(hours=1)).isoformat()},
+    }
+
+    class Repo:
+        def __init__(self):
+            self.escalations = []
+        def load_expired_open_buy_orders(self, **kwargs):
+            return [order]
+        def mark_ttl_unresolved_escalated(self, order, **kwargs):
+            self.escalations.append(kwargs)
+
+    repo = Repo()
+    monkeypatch.setenv("US_TQQQ_TTL_UNRESOLVED_ESCALATE_SEC", "900")
+    result = reconcile_tqqq_open_buy_ttl(
+        repository=repo, now=now, ttl_seconds=120,
+        cancel_order=lambda **kwargs: (_ for _ in ()).throw(AssertionError("cancel must not replay")),
+        query_order=lambda **kwargs: (_ for _ in ()).throw(TimeoutError("sustained KIS query timeout")),
+    )
+    assert result["pending"] == 1
+    assert result["terminal"] == 0
+    assert result.get("escalated") == 1
+    assert len(repo.escalations) == 1
+
+
+def test_routed_order_truth_counts_broker_submission_and_ack_flags():
+    from trader.us.runner.trade_tick_runner import _routed_order_truth_counts
+
+    orders = [
+        {"status": "ACK_DB_FAILED", "broker_submit": True, "kis_ack": True},
+        {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "broker_submit": True, "kis_ack": True},
+        {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "broker_submit": True, "kis_ack": True},
+        {"status": "REJECT", "broker_submit": True, "kis_ack": False},
+        {"status": "BLOCKED", "broker_submit": False, "kis_ack": False},
+    ]
+    sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
+    assert sent == 4
+    assert ack == 3
+    assert rejected == 1
+    assert blocked == 1
