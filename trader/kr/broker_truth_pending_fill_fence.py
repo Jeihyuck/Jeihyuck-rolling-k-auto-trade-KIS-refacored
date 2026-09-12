@@ -11,7 +11,7 @@ This guard does *not* restore the old blanket "open order blocks reconcile"
 policy.  It fences only symbols with durable broker-fill evidence that is still
 waiting for position application:
 
-* an unowned BUY/SELL fill (``fills.order_id IS NULL``), or
+* an unowned BUY/SELL fill that has a matching durable order for this strategy,
 * an owned BUY whose cumulative fill quantity is ahead of its canonical
   application watermark, or whose immutable baseline still equals the current
   exact position quantity.
@@ -25,7 +25,6 @@ and normal KIS-canonical reconciliation resumes.
 from __future__ import annotations
 
 import copy
-import functools
 import logging
 from typing import Any
 
@@ -71,21 +70,51 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
     pending: set[str] = set()
 
     with engine.connect() as conn:
-        # Any unowned durable execution is by definition waiting for attribution.
-        for code in conn.execute(
-            sa.select(schema.fills.c.code)
-            .where(
-                sa.and_(
-                    schema.fills.c.env == env,
-                    schema.fills.c.order_id.is_(None),
-                    schema.fills.c.side.in_(["BUY", "SELL"]),
-                    schema.fills.c.qty > 0,
+        # An unowned durable execution fences this strategy only if a durable
+        # strategy order can actually own it.  This prevents an unrelated old
+        # fill from another sleeve from freezing PB1 reconciliation forever.
+        unowned = [
+            dict(row)
+            for row in conn.execute(
+                sa.select(
+                    schema.fills.c.code,
+                    schema.fills.c.side,
+                    schema.fills.c.kis_odno,
+                ).where(
+                    sa.and_(
+                        schema.fills.c.env == env,
+                        schema.fills.c.order_id.is_(None),
+                        schema.fills.c.kis_odno.is_not(None),
+                        schema.fills.c.side.in_(["BUY", "SELL"]),
+                        schema.fills.c.qty > 0,
+                    )
                 )
-            )
-            .distinct()
-        ).scalars().all():
-            if code:
-                pending.add(str(code).lstrip("A").zfill(6))
+            ).mappings().all()
+        ]
+        for fill in unowned:
+            code = str(fill.get("code") or "").lstrip("A").zfill(6)
+            side = str(fill.get("side") or "").upper()
+            odno = str(fill.get("kis_odno") or "").strip()
+            if not code or side not in {"BUY", "SELL"} or not odno:
+                continue
+            candidate = conn.execute(
+                sa.select(schema.orders.c.order_id)
+                .where(
+                    sa.and_(
+                        schema.orders.c.env == env,
+                        schema.orders.c.strategy == strategy,
+                        schema.orders.c.code == code,
+                        schema.orders.c.side == side,
+                        sa.or_(
+                            schema.orders.c.kis_odno == odno,
+                            schema.orders.c.broker_order_id == odno,
+                        ),
+                    )
+                )
+                .limit(1)
+            ).scalar()
+            if candidate is not None:
+                pending.add(code)
 
         # For owned BUY fills, compare cumulative broker execution to the atomic
         # position application watermark on the exact lifecycle.  Missing marker
@@ -141,8 +170,6 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
                 ).mappings().all()
             ]
             if len(positions) > 1:
-                # Duplicate exact lifecycles are already fail-closed elsewhere;
-                # keep KIS canonical adjustment out until they are repaired.
                 pending.add(code)
                 continue
             if not positions:
@@ -214,8 +241,6 @@ def _fenced_balance_for_pending(
     for code in sorted(pending_codes):
         positions = by_code.get(code) or []
         if len(positions) != 1:
-            # Multiple/no OPEN rows are already protected by lifecycle guards;
-            # do not invent an aggregate quantity here.
             continue
         position = positions[0]
         db_qty = _qty(position.get("qty"))
@@ -264,16 +289,15 @@ def _close_stale_positions_guarded_with_fill_fence(*args: Any, **kwargs: Any):
                 pending_codes=pending,
             )
     except Exception as exc:
-        # Detection failure must fail closed for canonical quantity adjustment.
-        # Supplying no broker balance makes the existing zero path await its
-        # multi-snapshot guard rather than applying a possibly destructive value.
+        # If the fence itself cannot determine durable fill state, skip this
+        # reconciliation pass entirely.  Treating the failure as an empty KIS
+        # balance could incorrectly satisfy an old destructive-close streak.
         logger.exception(
-            "[POSITION_RECONCILE_ADJUST][PENDING_FILL_FENCE_FAIL] err_type=%s err=%s action=NO_CANONICAL_ADJUST",
+            "[POSITION_RECONCILE_ADJUST][PENDING_FILL_FENCE_FAIL] err_type=%s err=%s action=SKIP_RECONCILE_PASS",
             type(exc).__name__,
             exc,
         )
-        kwargs = dict(kwargs)
-        kwargs["kis_balance"] = None
+        return 0
     return _ORIGINAL_CLOSE_STALE_GUARDED(*args, **kwargs)
 
 
