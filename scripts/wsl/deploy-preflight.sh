@@ -99,7 +99,14 @@ deploy_preflight() {
   [[ -z "$dirty_generated" ]] || echo "[DEPLOY][DIRTY_GENERATED][WARN] files=$(tr '\n' ',' <<<"$dirty_generated")"
   if [[ -n "$dirty_code" ]]; then
     diff_status="$(git diff --name-status 2>/dev/null | tr '\n' ',' || true)"
-    echo "[DEPLOY][DIRTY_CODE][WARN] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head origin_dual_agent=$origin_head files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=NON_BLOCKING"
+    if [[ "${ALLOW_DIRTY_TRADING_CODE:-0}" == "1" ]]; then
+      echo "[DEPLOY][DIRTY_CODE][WARN] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head origin_dual_agent=$origin_head files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=EXPLICIT_EMERGENCY_OVERRIDE"
+    else
+      result=FAIL; reason=dirty_trading_code
+      echo "[DEPLOY][DIRTY_CODE][FAIL] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head pinned=${pinned_sha:-unknown} files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=BLOCK_TRADING required=clean_worktree_or_ALLOW_DIRTY_TRADING_CODE_1"
+      _preflight_log
+      return 1
+    fi
   fi
   echo "[DEPLOY][OK]"; _preflight_log
 }
