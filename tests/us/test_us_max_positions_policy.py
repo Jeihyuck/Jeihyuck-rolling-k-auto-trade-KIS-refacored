@@ -87,6 +87,78 @@ def test_us_max_positions_zero_means_unlimited(monkeypatch):
     assert result["reason"] != "max_positions_reached"
 
 
+def test_execution_risk_gate_zero_means_unlimited(monkeypatch):
+    from trader.us.execution.risk_gate import check_position_count
+
+    monkeypatch.setenv("US_MAX_POSITIONS", "0")
+    check_position_count(999, symbol="AAPL")
+
+
+def test_execution_risk_gate_positive_under_cap_passes(monkeypatch):
+    from trader.us.execution.risk_gate import check_position_count
+
+    monkeypatch.setenv("US_MAX_POSITIONS", "3")
+    check_position_count(2, symbol="AAPL")
+
+
+def test_execution_risk_gate_positive_reached_blocks(monkeypatch):
+    from trader.us.execution.risk_gate import RiskGateBlocked, check_position_count
+
+    monkeypatch.setenv("US_MAX_POSITIONS", "3")
+    with pytest.raises(RiskGateBlocked, match="max_positions_reached"):
+        check_position_count(3, symbol="AAPL")
+
+
+def test_execution_risk_gate_negative_fails_closed(monkeypatch):
+    from trader.us.execution.risk_gate import RiskGateBlocked, check_position_count
+
+    monkeypatch.setenv("US_MAX_POSITIONS", "-1")
+    with pytest.raises(RiskGateBlocked, match="invalid_max_positions_config"):
+        check_position_count(0, symbol="AAPL")
+
+
+def test_execution_risk_gate_malformed_fails_closed(monkeypatch):
+    from trader.us.execution.risk_gate import RiskGateBlocked, check_position_count
+
+    monkeypatch.setenv("US_MAX_POSITIONS", "abc")
+    with pytest.raises(RiskGateBlocked, match="invalid_max_positions_config"):
+        check_position_count(0, symbol="AAPL")
+
+
+def test_pb1_negative_max_positions_fails_closed(monkeypatch):
+    monkeypatch.setenv("US_MAX_POSITIONS", "-1")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
+
+    from trader.us.pb1.us_position_sizing import calc_position_size
+
+    result = calc_position_size(
+        price=100.0,
+        available_cash_usd=100000.0,
+        capital_usd_cap=100000.0,
+        position_count=0,
+        score=0.5,
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == "invalid_max_positions_config"
+
+
+def test_pb1_malformed_max_positions_fails_closed(monkeypatch):
+    monkeypatch.setenv("US_MAX_POSITIONS", "abc")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
+
+    from trader.us.pb1.us_position_sizing import calc_position_size
+
+    result = calc_position_size(
+        price=100.0,
+        available_cash_usd=100000.0,
+        capital_usd_cap=100000.0,
+        position_count=0,
+        score=0.5,
+    )
+    assert result["blocked"] is True
+    assert result["reason"] == "invalid_max_positions_config"
+
+
 def test_us_max_positions_30_blocks_at_30(monkeypatch):
     """US_MAX_POSITIONS=30이면 30개 도달 시 차단."""
     monkeypatch.setenv("US_MAX_POSITIONS", "30")

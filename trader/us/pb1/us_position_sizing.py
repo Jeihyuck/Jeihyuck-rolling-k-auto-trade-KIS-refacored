@@ -46,13 +46,23 @@ def calc_position_size(
             "order_cap_usd": float,
         }
     """
-    # 한국장 PB1 기준 반영: 기본값 30, 0이면 무제한
-    max_positions = int(os.getenv("US_MAX_POSITIONS", "30"))
     max_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
     cash_buffer_usd = float(os.getenv("US_MIN_CASH_BUFFER_USD", "200"))
     order_cap_usd = float(os.getenv("US_MAX_ORDER_USD", "2500"))
 
-    # US_MAX_POSITIONS=0이면 포지션 수 제한 비활성화
+    raw_max_positions = os.getenv("US_MAX_POSITIONS", "30")
+    try:
+        max_positions = int(raw_max_positions)
+    except (TypeError, ValueError):
+        logger.error("[US_SIZING][BLOCK] invalid US_MAX_POSITIONS=%r", raw_max_positions)
+        return {"qty": 0, "notional_usd": 0.0, "position_weight": 0.0,
+                "blocked": True, "reason": "invalid_max_positions_config", "order_cap_usd": order_cap_usd}
+    if max_positions < 0:
+        logger.error("[US_SIZING][BLOCK] negative US_MAX_POSITIONS=%d", max_positions)
+        return {"qty": 0, "notional_usd": 0.0, "position_weight": 0.0,
+                "blocked": True, "reason": "invalid_max_positions_config", "order_cap_usd": order_cap_usd}
+
+    # Contract: exactly 0 means unlimited; positive values enforce the cap.
     if max_positions > 0 and position_count >= max_positions:
         logger.info(
             "[US_SIZING][BLOCK] position_count=%d >= max_positions=%d",
@@ -80,11 +90,11 @@ def calc_position_size(
 
     # 실제 잔고 초과 방지
     alloc_usd = min(alloc_usd, effective_cash)
-    
+
     # US_MAX_ORDER_USD 상한 반영: 핵심 수정 사항
     # 최종 주문 금액은 반드시 order_cap_usd 이하여야 한다
     alloc_usd = min(alloc_usd, order_cap_usd)
-    
+
     # 가격이 order_cap_usd보다 높아서 1주도 못 사는 경우
     if price > order_cap_usd:
         logger.warning(
@@ -106,7 +116,7 @@ def calc_position_size(
                 "blocked": True, "reason": "qty_zero", "order_cap_usd": order_cap_usd}
 
     notional = qty * price
-    
+
     # 최종 검증: notional이 order_cap_usd 초과하지 않도록 재확인
     if notional > order_cap_usd:
         # qty를 다시 조정 (안전망)
@@ -121,7 +131,7 @@ def calc_position_size(
                 "qty": 0, "notional_usd": 0.0, "position_weight": 0.0,
                 "blocked": True, "reason": "notional_exceeds_order_cap_after_resize", "order_cap_usd": order_cap_usd
             }
-    
+
     position_weight = notional / reference_budget if reference_budget > 0 else 0.0
 
     logger.debug(

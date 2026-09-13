@@ -42,13 +42,18 @@ ACNT_PRDT_CD: str = os.getenv("ACNT_PRDT_CD_US") or os.getenv("ACNT_PRDT_CD", "0
 # ---------------------------------------------------------------------------
 US_MAX_ORDER_USD: float = float(os.getenv("US_MAX_ORDER_USD", "100"))
 US_MAX_DAILY_NOTIONAL_USD: float = float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", "500"))
-# 한국장 PB1 기준 반영: 기본값 30 (10에서 변경), 0이면 무제한
+# 한국장 PB1 기준 반영: 기본값 30, 0이면 무제한
 US_MAX_POSITIONS: int = int(os.getenv("US_MAX_POSITIONS", "30"))
-US_MAX_POSITION_WEIGHT: float = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10"))
+# Canonical default matches the production PB1 entry/risk contract. Session
+# wrappers may explicitly override it for a deployment profile.
+US_MAX_POSITION_WEIGHT: float = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
 US_MIN_CASH_BUFFER_USD: float = float(os.getenv("US_MIN_CASH_BUFFER_USD", "50"))
 US_ALLOW_FRACTIONAL_SHARES: bool = env_bool("US_ALLOW_FRACTIONAL_SHARES", default=False)
 US_ORDER_TYPE_DEFAULT: str = os.getenv("US_ORDER_TYPE_DEFAULT", "LIMIT")
-US_LIMIT_PRICE_BAND_PCT: float = float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.30"))
+# 0.5% is the canonical PB1 executable-price band. The previous 30% module
+# default contradicted the entry engine and could become dangerous when a
+# wrapper omitted the variable.
+US_LIMIT_PRICE_BAND_PCT: float = float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))
 
 # ---------------------------------------------------------------------------
 # HTTP policy

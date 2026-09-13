@@ -38,7 +38,23 @@ deploy_preflight() {
   # PREP is normally the first entry, but recovery or AM can safely bootstrap
   # a missed cycle too. PREFLIGHT_ONLY is intentionally read-only for schedule
   # verification and CI; every real wrapper invocation takes this path.
+  status="$({ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; } | sed '/^$/d' | sort -u)"
+  dirty_generated="$(printf '%s\n' "$status" | awk '/^(runtime|logs|reports|\.pytest_cache|__pycache__)/ {print}')"
+  dirty_code="$(printf '%s\n' "$status" | awk '!/^(runtime|logs|reports|\.pytest_cache|__pycache__)/ && NF {print}')"
+  [[ -z "$dirty_generated" ]] || echo "[DEPLOY][DIRTY_GENERATED][WARN] files=$(tr '\n' ',' <<<"$dirty_generated")"
   if [[ ! -s "$pin_file" && "${NULLIM_PREFLIGHT_ONLY:-0}" != "1" ]]; then
+    if [[ -n "$dirty_code" ]]; then
+      diff_status="$(git diff --name-status 2>/dev/null | tr '\n' ',' || true)"
+      if [[ "${ALLOW_DIRTY_TRADING_CODE:-0}" == "1" ]]; then
+        echo "[DEPLOY][DIRTY_CODE][WARN] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head origin_dual_agent=$origin_head files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=EXPLICIT_EMERGENCY_OVERRIDE"
+        export SYNC_MARKET_PRESERVE_DIRTY=1
+      else
+        result=FAIL; reason=dirty_trading_code
+        echo "[DEPLOY][DIRTY_CODE][FAIL] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head pinned=${pinned_sha:-unknown} files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=BLOCK_TRADING required=clean_worktree_or_ALLOW_DIRTY_TRADING_CODE_1"
+        _preflight_log
+        return 1
+      fi
+    fi
     pre_sync_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "[DEPLOY][SYNC][AUTO] market=${market^^} session=$session trade_date=$trade_date source=existing_scheduler_chain"
     set +e
@@ -93,13 +109,16 @@ deploy_preflight() {
     echo "[DEPLOY][STALE_CODE][${severity}] head=${head} origin_dual_agent=${origin_head}"
     if [[ "$severity" == FAIL ]]; then result=FAIL; reason=origin_ancestry; _preflight_log; return 1; fi
   fi
-  status="$(git status --porcelain 2>/dev/null || true)"
-  dirty_generated="$(printf '%s\n' "$status" | awk '$2 ~ /^(runtime|logs|reports|\.pytest_cache|__pycache__)/ {print $2}')"
-  dirty_code="$(printf '%s\n' "$status" | awk '$2 !~ /^(runtime|logs|reports|\.pytest_cache|__pycache__)/ && NF {print $2}')"
-  [[ -z "$dirty_generated" ]] || echo "[DEPLOY][DIRTY_GENERATED][WARN] files=$(tr '\n' ',' <<<"$dirty_generated")"
   if [[ -n "$dirty_code" ]]; then
     diff_status="$(git diff --name-status 2>/dev/null | tr '\n' ',' || true)"
-    echo "[DEPLOY][DIRTY_CODE][WARN] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head origin_dual_agent=$origin_head files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=NON_BLOCKING"
+    if [[ "${ALLOW_DIRTY_TRADING_CODE:-0}" == "1" ]]; then
+      echo "[DEPLOY][DIRTY_CODE][WARN] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head origin_dual_agent=$origin_head files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=EXPLICIT_EMERGENCY_OVERRIDE"
+    else
+      result=FAIL; reason=dirty_trading_code
+      echo "[DEPLOY][DIRTY_CODE][FAIL] market=${market^^} session=$session trade_date=$trade_date branch=$branch HEAD=$head pinned=${pinned_sha:-unknown} files=$(tr '\n' ',' <<<"$dirty_code") diff_name_status=${diff_status:-none} action=BLOCK_TRADING required=clean_worktree_or_ALLOW_DIRTY_TRADING_CODE_1"
+      _preflight_log
+      return 1
+    fi
   fi
   echo "[DEPLOY][OK]"; _preflight_log
 }
