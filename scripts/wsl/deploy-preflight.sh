@@ -38,9 +38,9 @@ deploy_preflight() {
   # PREP is normally the first entry, but recovery or AM can safely bootstrap
   # a missed cycle too. PREFLIGHT_ONLY is intentionally read-only for schedule
   # verification and CI; every real wrapper invocation takes this path.
-  status="$(git status --porcelain 2>/dev/null || true)"
-  dirty_generated="$(printf '%s\n' "$status" | awk '$2 ~ /^(runtime|logs|reports|\.pytest_cache|__pycache__)/ {print $2}')"
-  dirty_code="$(printf '%s\n' "$status" | awk '$2 !~ /^(runtime|logs|reports|\.pytest_cache|__pycache__)/ && NF {print $2}')"
+  status="$({ git diff --name-only 2>/dev/null; git diff --cached --name-only 2>/dev/null; } | sed '/^$/d' | sort -u)"
+  dirty_generated="$(printf '%s\n' "$status" | awk '/^(runtime|logs|reports|\.pytest_cache|__pycache__)/ {print}')"
+  dirty_code="$(printf '%s\n' "$status" | awk '!/^(runtime|logs|reports|\.pytest_cache|__pycache__)/ && NF {print}')"
   [[ -z "$dirty_generated" ]] || echo "[DEPLOY][DIRTY_GENERATED][WARN] files=$(tr '\n' ',' <<<"$dirty_generated")"
   if [[ ! -s "$pin_file" && "${NULLIM_PREFLIGHT_ONLY:-0}" != "1" ]]; then
     if [[ -n "$dirty_code" ]]; then
