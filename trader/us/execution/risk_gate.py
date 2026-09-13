@@ -95,7 +95,7 @@ def check_qty(qty: int) -> None:
 
 
 def check_notional(notional_usd: float, symbol: str = "") -> None:
-    limit = float(os.getenv("US_MAX_ORDER_USD", "100"))
+    limit = float(os.getenv("US_MAX_ORDER_USD", str(us_cfg.US_MAX_ORDER_USD)))
     if notional_usd > limit:
         _block(
             "notional_exceeds_order_limit",
@@ -126,7 +126,7 @@ def check_daily_notional(
         else max(current_daily_notional_usd, filled + pending + reserved)
     )
     total = risk_total + new_notional_usd
-    limit = float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", "500"))
+    limit = float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", str(us_cfg.US_MAX_DAILY_NOTIONAL_USD)))
     if total > limit:
         _block(
             "daily_notional_exceeded",
@@ -148,7 +148,16 @@ def check_position_count(
     *,
     reason: str = "max_positions_reached",
 ) -> None:
-    limit = int(os.getenv("US_MAX_POSITIONS", "10"))
+    raw_limit = os.getenv("US_MAX_POSITIONS", str(us_cfg.US_MAX_POSITIONS))
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        _block("invalid_max_positions_config", symbol=symbol, configured=raw_limit)
+    # Contract: exactly 0 means unlimited.
+    if limit == 0:
+        return
+    if limit < 0:
+        _block("invalid_max_positions_config", symbol=symbol, configured=raw_limit)
     if current_count >= limit:
         _block(reason, symbol=symbol, count=current_count, limit=limit)
 
@@ -163,8 +172,8 @@ def check_position_weight(
         return
     # Router/unit-test callers may omit account equity and leave the historical
     # 1000 USD default. Use configured US_ACCOUNT_EQUITY_USD as the reference
-    # when available so the 5% limit is applied to account equity, not a tiny
-    # placeholder.
+    # when available so the configured position limit is applied to account
+    # equity/risk capital, not a tiny placeholder.
     try:
         env_equity = float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0)
     except (TypeError, ValueError):
@@ -178,7 +187,7 @@ def check_position_weight(
     reference_portfolio_usd = max(float(total_portfolio_usd), env_equity)
     projected_position_value = max(0.0, current_position_market_value_usd) + notional_usd
     weight = projected_position_value / reference_portfolio_usd
-    limit = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
+    limit = float(os.getenv("US_MAX_POSITION_WEIGHT", str(us_cfg.US_MAX_POSITION_WEIGHT)))
     if weight > limit:
         _block(
             "position_weight_exceeded",
@@ -194,7 +203,7 @@ def check_cash_buffer(
     order_notional_usd: float,
     symbol: str = "",
 ) -> None:
-    buffer = float(os.getenv("US_MIN_CASH_BUFFER_USD", "50"))
+    buffer = float(os.getenv("US_MIN_CASH_BUFFER_USD", str(us_cfg.US_MIN_CASH_BUFFER_USD)))
     remaining = available_cash_usd - order_notional_usd
     if remaining < buffer:
         _block(
@@ -217,11 +226,7 @@ def check_us_capital_budget(
     available_cash_usd: float,
     symbol: str = "",
 ) -> None:
-    """미국장 5천만원 환산 예산 한도 초과 여부 검증.
-
-    [US_RISK][BUDGET] 로그 출력 후
-    effective_order_budget_usd 를 초과하면 us_capital_budget_exceeded 차단.
-    """
+    """Configured US deployment-cap and broker-cash budget gate."""
     from trader.us.budget import resolve_us_order_budget
 
     budget = resolve_us_order_budget(available_cash_usd)
@@ -254,37 +259,46 @@ def check_same_day_rebuy(symbol: str, side: str) -> None:
         return
 
     try:
-        from trader.us.db.repos import load_today_symbols_sold
-        sold_today = load_today_symbols_sold()
+        from trader.us.db.strict_order_state import load_today_symbols_sold_strict
+        sold_today = load_today_symbols_sold_strict()
         if symbol in sold_today:
             _block("same_day_rebuy_block", symbol=symbol)
     except RiskGateBlocked:
         raise
     except Exception as exc:
-        logger.warning("[US_RISK][WARN] same_day_rebuy check failed: %s", exc)
+        logger.error("[US_RISK][STATE_UNKNOWN] same_day_rebuy symbol=%s error=%s", symbol, exc)
+        _block("same_day_rebuy_state_unknown", symbol=symbol)
 
 
 def check_pending_order(symbol: str, side: str, trade_date: str | None = None) -> None:
     """미체결 주문 존재 시 추가 주문 차단.
 
-    US_ORDER_ACCEPTED_IS_NOT_FILLED=1 일 때만 활성화.
+    US_ORDER_ACCEPTED_IS_NOT_FILLED=1 일 때만 활성화. This helper is used on
+    BUY paths; an unavailable pending-order state therefore fails closed rather
+    than being treated as proof that no prior order exists.
     """
     from trader.utils.env import env_bool
     if not env_bool("US_ORDER_ACCEPTED_IS_NOT_FILLED", default=False):
         return
 
     try:
-        from trader.us.db.repos import has_pending_order_for_symbol_side
-        if has_pending_order_for_symbol_side(symbol=symbol, side=side, trade_date=trade_date):
+        from trader.us.db.strict_order_state import has_pending_order_for_symbol_side_strict
+        if has_pending_order_for_symbol_side_strict(symbol=symbol, side=side, trade_date=trade_date):
             _block("pending_order_exists", symbol=symbol, side=side)
     except RiskGateBlocked:
         raise
     except Exception as exc:
-        logger.warning("[US_RISK][WARN] pending_order check failed: %s", exc)
+        logger.error("[US_RISK][STATE_UNKNOWN] pending_order symbol=%s side=%s error=%s", symbol, side, exc)
+        _block("pending_order_state_unknown", symbol=symbol, side=side)
 
 
 def check_pending_sell_order_hard(symbol: str, trade_date: str | None = None) -> None:
-    """SELL idempotency hard gate independent of US_ORDER_ACCEPTED_IS_NOT_FILLED."""
+    """SELL idempotency hard gate independent of US_ORDER_ACCEPTED_IS_NOT_FILLED.
+
+    A DB lookup failure remains non-fatal here because protective exits must stay
+    routable during DB degradation; durable client keys, journal/reconciliation,
+    and broker quantity guards remain the downstream duplicate fences.
+    """
     try:
         from trader.us.db.repos import has_pending_order_for_symbol_side
         if has_pending_order_for_symbol_side(
@@ -300,7 +314,7 @@ def check_pending_sell_order_hard(symbol: str, trade_date: str | None = None) ->
     except RiskGateBlocked:
         raise
     except Exception as exc:
-        logger.warning("[US_RISK][WARN] pending_sell_order_hard check failed: %s", exc)
+        logger.warning("[US_RISK][DEGRADED] pending_sell_order_hard lookup failed symbol=%s error=%s action=preserve_exit_liveness", symbol, exc)
 
 
 def check_entry_cutoff(side: str, now: Any = None) -> None:
@@ -455,7 +469,6 @@ def assert_order_allowed(
         check_pending_sell_order_hard(symbol, trade_date=trade_date)
     else:
         # BUY 전용 체크
-        # 예산 기반 차단 (US_PAPER_MAX_CAPITAL_KRW 기준 5천만원 환산)
         check_us_capital_budget(notional_usd, available_cash_usd, symbol=symbol)
 
         check_notional(notional_usd, symbol=symbol)
@@ -474,7 +487,7 @@ def assert_order_allowed(
                 "[US_RISK][POSITION_COUNT_SKIP] symbol=%s reason=existing_position_add_buy count=%s limit=%s",
                 symbol,
                 current_position_count,
-                os.getenv("US_MAX_POSITIONS", "30"),
+                os.getenv("US_MAX_POSITIONS", str(us_cfg.US_MAX_POSITIONS)),
             )
         else:
             check_position_count(
@@ -502,7 +515,7 @@ def assert_order_allowed(
         if projected_weight is not None:
             try:
                 projected_weight_f = float(projected_weight)
-                limit = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
+                limit = float(os.getenv("US_MAX_POSITION_WEIGHT", str(us_cfg.US_MAX_POSITION_WEIGHT)))
                 if projected_weight_f > limit:
                     _block(
                         "position_weight_exceeded",

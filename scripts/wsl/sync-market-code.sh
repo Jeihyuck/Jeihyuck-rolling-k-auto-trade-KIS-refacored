@@ -25,9 +25,13 @@ if [[ -s "$pin" ]]; then
   exit 0
 fi
 git fetch origin dual-agent
-# Tracked local residue is deliberately discarded here: GitHub is the source
-# of truth. -f never removes untracked runtime data (unlike forbidden clean).
-git checkout -f -B dual-agent origin/dual-agent
-git reset --hard origin/dual-agent
+if [[ "${SYNC_MARKET_PRESERVE_DIRTY:-0}" == "1" ]]; then
+  echo "[DEPLOY][SYNC][WARN] reason=DIRTY_CODE_OVERRIDE action=PRESERVE_DIRTY_WORKTREE"
+else
+  # Tracked local residue is deliberately discarded here: GitHub is the source
+  # of truth. -f never removes untracked runtime data (unlike forbidden clean).
+  git checkout -f -B dual-agent origin/dual-agent
+  git reset --hard origin/dual-agent
+fi
 sha="$(git rev-parse HEAD)"; printf '%s\n' "$sha" > "$pin"
 echo "[SESSION][CODE_VERSION] market=$market trade_date=$trade_date branch=dual-agent commit=$sha"
