@@ -148,10 +148,16 @@ def check_position_count(
     *,
     reason: str = "max_positions_reached",
 ) -> None:
-    limit = int(os.getenv("US_MAX_POSITIONS", str(us_cfg.US_MAX_POSITIONS)))
-    # Contract: 0 means unlimited, not "block every position".
-    if limit <= 0:
+    raw_limit = os.getenv("US_MAX_POSITIONS", str(us_cfg.US_MAX_POSITIONS))
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        _block("invalid_max_positions_config", symbol=symbol, configured=raw_limit)
+    # Contract: exactly 0 means unlimited.
+    if limit == 0:
         return
+    if limit < 0:
+        _block("invalid_max_positions_config", symbol=symbol, configured=raw_limit)
     if current_count >= limit:
         _block(reason, symbol=symbol, count=current_count, limit=limit)
 
@@ -253,8 +259,8 @@ def check_same_day_rebuy(symbol: str, side: str) -> None:
         return
 
     try:
-        from trader.us.db.repos import load_today_symbols_sold
-        sold_today = load_today_symbols_sold()
+        from trader.us.db.strict_order_state import load_today_symbols_sold_strict
+        sold_today = load_today_symbols_sold_strict()
         if symbol in sold_today:
             _block("same_day_rebuy_block", symbol=symbol)
     except RiskGateBlocked:
@@ -276,8 +282,8 @@ def check_pending_order(symbol: str, side: str, trade_date: str | None = None) -
         return
 
     try:
-        from trader.us.db.repos import has_pending_order_for_symbol_side
-        if has_pending_order_for_symbol_side(symbol=symbol, side=side, trade_date=trade_date):
+        from trader.us.db.strict_order_state import has_pending_order_for_symbol_side_strict
+        if has_pending_order_for_symbol_side_strict(symbol=symbol, side=side, trade_date=trade_date):
             _block("pending_order_exists", symbol=symbol, side=side)
     except RiskGateBlocked:
         raise
