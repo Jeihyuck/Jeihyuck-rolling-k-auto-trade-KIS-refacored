@@ -231,7 +231,11 @@ from trader.time_utils import now_kst, week_monday, prev_business_day
 from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst_date
 from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
-from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
+from trader.kr.market_state_overlay import (filter_kr_entry_intent, calculate_kr_sector_exposure,
+                                            generate_kr_profit_capture_intents, generate_kr_defense_trim_intents,
+                                            build_kr_policy_missing_adoption,
+                                            has_kr_policy_missing_adoption_claim,
+                                            is_verified_kr_policy_missing_adoption)
 from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
                                      normalize_sell_reason_family, same_day_semantic_sell_exists)
 
@@ -10609,6 +10613,7 @@ class PB1Engine:
         baseline = (OrderBaseline.capture(self._authoritative_balance, cf.code, qty)
                     if self._authoritative_balance else None)
         request_payload = {
+            "enforce_entry_contract": True,
             "entry_plan": plan,
             "features": cf.features,
             "reasons": cf.reasons,
@@ -11506,6 +11511,7 @@ class PB1Engine:
                 stage="PB1-CLOSE",
                 client_order_key=effective_client_order_key,
                 request_json={
+                    "enforce_entry_contract": True,
                     "features": cf.features,
                     "reasons": reasons,
                     "base_from": base_from,
@@ -11889,6 +11895,72 @@ class PB1Engine:
             or resolved_exit_family
         )
         _policy_missing_contract = _position_policy_missing_contract(pos)
+        _policy_adoption_active = is_verified_kr_policy_missing_adoption(pos)
+        _policy_adoption_claimed = has_kr_policy_missing_adoption_claim(pos)
+        if _policy_adoption_claimed and not _policy_adoption_active:
+            _policy_missing_contract = True
+            logger.error(
+                "[KR_POLICY_ADOPTION][INVALID_CONTRACT] code=%s action=preserve_policy_missing_hard_stop_only",
+                display_code,
+            )
+        if _policy_missing_contract and env_bool("KR_POLICY_MISSING_TP_ADOPTION_ENABLE", True):
+            adoption = build_kr_policy_missing_adoption(pos, current_price=float(mark or 0.0))
+            if adoption:
+                adoption_fields = dict(adoption.get("position_fields") or {})
+                adoption_verified = False
+                try:
+                    self.positions_repo.update_position_fields(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=sid,
+                        mode=mode,
+                        code=code,
+                        fields=adoption_fields,
+                        position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                    )
+                    persisted = self.positions_repo.get_position(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=sid,
+                        mode=mode,
+                        code=code,
+                        position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                    )
+                    adoption_verified = bool(
+                        persisted
+                        and is_verified_kr_policy_missing_adoption(persisted)
+                        and (
+                            not pos.get("position_id")
+                            or str(persisted.get("position_id") or "") == str(pos.get("position_id"))
+                        )
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "[KR_POLICY_ADOPTION][PERSIST_FAIL] code=%s action=preserve_policy_missing err=%s",
+                        display_code, exc,
+                    )
+                if adoption_verified:
+                    pos.update(adoption_fields)
+                    _pos_meta = dict(adoption_fields.get("position_meta") or {})
+                    entry_reason_value = adoption_fields.get("entry_reason")
+                    entry_style_selected = adoption_fields.get("entry_style_selected")
+                    entry_reason_normalized = str(entry_reason_value or "")
+                    resolved_exit_family = "SWING_STAGED_EXIT"
+                    exit_policy_family = "SWING_STAGED_EXIT"
+                    _policy_missing_contract = False
+                    _policy_adoption_active = True
+                    logger.warning(
+                        "[KR_POLICY_ADOPTION][VERIFIED] code=%s pnl_pct=%.2f policy_version=%s "
+                        "action=enable_sequential_tp1_tp2_tp3",
+                        display_code, ret_pct, adoption_fields.get("policy_version"),
+                    )
+                else:
+                    logger.error(
+                        "[KR_POLICY_ADOPTION][VERIFY_BLOCK] code=%s action=preserve_policy_missing_hard_stop_only",
+                        display_code,
+                    )
         if _policy_missing_contract:
             if str(exit_policy_family or "").upper() not in {"", "POLICY_MISSING"}:
                 logger.error(
@@ -12283,7 +12355,7 @@ class PB1Engine:
         _router_full_exit = False
         _router_sell_pct = None
         _router_reason = final_reason
-        if exit_policy_family in {
+        if not _policy_missing_contract and not _policy_adoption_active and (exit_policy_family in {
             "INTRADAY_PROFIT_PROTECT",
             "SWING_STAGED_EXIT",
             "CORE_TREND_FOLLOW",
@@ -12291,7 +12363,7 @@ class PB1Engine:
             "INTRADAY_PROFIT_PROTECT",
             "SWING_STAGED_EXIT",
             "CORE_TREND_FOLLOW",
-        }:
+        }):
             _active_family = exit_policy_family if exit_policy_family in {
                 "INTRADAY_PROFIT_PROTECT", "SWING_STAGED_EXIT", "CORE_TREND_FOLLOW"
             } else horizon_exit_family
@@ -12444,7 +12516,7 @@ class PB1Engine:
         # PR49 overlay exits: hard stops/close liquidation keep priority; defense trim and profit capture can create partial SELLs when no stronger exit is active.
         overlay = getattr(self, "_kr_market_state_overlay", None) or {}
         if (not _policy_missing_contract and self._is_kr_equity_context()
-                and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True)
+                and (_policy_adoption_active or env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True))
                 and str(window_tag).lower() != "close"):
             pos_for_overlay = {**pos, "code": code, "qty": qty, "orderable_qty": int(pos.get("orderable_qty") or qty), "unrealized_pnl_pct": ret_pct / 100.0, "market_value_krw": float(mark or 0.0) * qty}
             strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP"}
@@ -12453,7 +12525,8 @@ class PB1Engine:
                 trimmed_this_tick = getattr(self, "_kr_defense_trim_symbols_this_tick", set())
                 max_trim_symbols = int(os.getenv("KR_DEFENSE_MAX_TRIM_SYMBOLS_PER_TICK", "3"))
                 kr_trim = []
-                if snapshot is not None and len(trimmed_this_tick) < max_trim_symbols:
+                if (not _policy_adoption_active
+                        and snapshot is not None and len(trimmed_this_tick) < max_trim_symbols):
                     kr_trim = generate_kr_defense_trim_intents(
                         [pos_for_overlay], snapshot,
                         account_kill_switch=bool(overlay.get("account_loss_kill_switch_triggered")),
@@ -12983,6 +13056,11 @@ class PB1Engine:
             "position_eod_action": pos.get("eod_action") or exit_eval_payload.get("eod_action"),
             "policy_version": pos.get("policy_version") or (exit_eval_payload.get("entry_exit_plan") or {}).get("policy_version"),
         }
+        profit_capture_stage = {
+            "KR_TAKE_PROFIT_TP1": "tp1",
+            "KR_TAKE_PROFIT_TP2": "tp2",
+            "KR_TAKE_PROFIT_TP3": "tp3",
+        }.get(str(exit_reason or "").upper())
         sell_baseline = (OrderBaseline.capture(self._authoritative_balance, code, orderable_qty)
                          if self._authoritative_balance else None)
         try:
@@ -13003,6 +13081,7 @@ class PB1Engine:
                 request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
                               "exit_reason": exit_reason,
                               "reason_family": reason_family, "position_lifecycle_id": lifecycle_id,
+                              "profit_capture_stage": profit_capture_stage,
                               "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
                               "exit_stage": stage,
                               "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
@@ -13032,6 +13111,20 @@ class PB1Engine:
                     display_code,
                 )
                 return exit_eval_payload
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=sid,
+                    mode=mode,
+                    code=code,
+                    fields={"position_meta": {
+                        f"kr_{profit_capture_stage}_pending": True,
+                        f"kr_{profit_capture_stage}_order_key": client_key,
+                    }},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
         except Exception:
             logger.exception("[PB1][EXIT][DB_FAIL] code=%s", display_code)
             if not self.dry_run:
@@ -13063,10 +13156,24 @@ class PB1Engine:
         )
         if self.dry_run:
             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, orderable_qty, client_key, order_id)
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
+                    fields={"position_meta": {f"kr_{profit_capture_stage}_pending": False}},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
             return exit_eval_payload
 
         if not self.kis:
             logger.warning("[PB1][EXIT][SKIP] kis missing code=%s", display_code)
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
+                    fields={"position_meta": {f"kr_{profit_capture_stage}_pending": False}},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
             return exit_eval_payload
         if not self._pretrade_check(
             code=code,
@@ -13078,6 +13185,13 @@ class PB1Engine:
             client_order_key=client_key,
             stage=stage,
         ):
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
+                    fields={"position_meta": {f"kr_{profit_capture_stage}_pending": False}},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
             if not exit_eval_payload.get("order_skip_reasons"):
                 exit_eval_payload["order_skip_reasons"] = ["pretrade_blocked"]
                 logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
@@ -13191,6 +13305,13 @@ class PB1Engine:
                     fields={"cooldown_until": cooldown_until},
                 )
         else:
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
+                    fields={"position_meta": {f"kr_{profit_capture_stage}_pending": False}},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
             reject_reason = str(self._format_order_result_reason(resp if isinstance(resp, dict) else None) or "")
             msg_cd_norm = str(msg_cd or "").upper()
             msg1_norm = str(msg1 or "").lower()

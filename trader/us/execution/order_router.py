@@ -706,7 +706,7 @@ def route_order(
         save_order_intent, save_dry_run_order, save_order_ack, save_order_reject,
         mark_order_intent_sent, mark_order_intent_blocked, mark_order_intent_rejected,
         mark_order_intent_dry_run,
-        load_today_order_keys,
+        load_today_order_keys, _ensure_us_entry_policy_contract,
     )
     from trader.utils.env import env_bool
 
@@ -729,6 +729,15 @@ def route_order(
     intent["meta"] = meta
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
+    if side == "BUY" and str(intent.get("strategy_owner") or "US_STANDARD").upper() != TQQQ_OWNER:
+        policy_contract = _ensure_us_entry_policy_contract(meta, intent)
+        meta.update(policy_contract)
+        intent.update({
+            field: policy_contract[field]
+            for field in ("book", "horizon", "exit_policy", "entry_strategy", "entry_signal_type", "partial_exit_allowed")
+            if policy_contract.get(field) is not None
+        })
+        intent["meta"] = meta
     if same_day_semantic_sell_exists(intent):
         logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
         return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",

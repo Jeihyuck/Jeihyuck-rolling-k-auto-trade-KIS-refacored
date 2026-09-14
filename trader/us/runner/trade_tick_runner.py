@@ -1249,6 +1249,41 @@ def route_exit_orders_immediately(
             logger.info("[US_EXIT_INTENT][ROUTE_DECISION] symbol=%s side=SELL action=%s qty=%s reason=%s skip_reason=%s route_cap_reason=%s order_no=%s", decision["symbol"], action, decision["qty"], decision["reason"], decision["skip_reason"], decision["route_cap_reason"], decision["order_no"])
         except Exception as exc:
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
+            meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+            stage = str(meta.get("profit_capture_stage") or "")
+            if stage:
+                # A route exception before the durable broker boundary is safe
+                # to retry. Once BROKER_SUBMIT_STARTED exists, keep the stage
+                # pending/ambiguous until reconciliation proves a terminal
+                # outcome; releasing it here could submit the same TP twice.
+                submit_may_have_happened = True
+                try:
+                    from trader.us.execution.order_journal import load_order_events
+                    td = str(intent.get("trade_date") or getattr(context, "trade_date", ""))
+                    key = str(intent.get("client_order_key") or "")
+                    events = load_order_events(td)
+                    submit_may_have_happened = any(
+                        str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
+                        and str(event.get("client_order_key") or "") == key
+                        for event in events
+                    )
+                except Exception as journal_exc:
+                    logger.error(
+                        "[US_PROFIT_CAPTURE][EXCEPTION_CLASSIFY_WARN] symbol=%s action=keep_ambiguous err=%s",
+                        intent.get("symbol"), journal_exc,
+                    )
+                from trader.us.profit_capture import sync_profit_capture_stage_from_order
+                sync_profit_capture_stage_from_order(
+                    trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
+                    symbol=str(intent.get("symbol") or ""),
+                    position_lifecycle_id=str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+                    client_order_key=str(intent.get("client_order_key") or ""),
+                    profit_capture_stage=stage,
+                    order_status="AMBIGUOUS_ACK" if submit_may_have_happened else "FAILED",
+                    evidence_type=None,
+                    filled_qty=0,
+                    requested_qty=int(intent.get("qty") or 0),
+                )
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
     sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
     sell_notional_routed = _routed_sell_notional(orders)

@@ -1,6 +1,6 @@
 """PR49 Korean market-state overlay: index breadth, sector rotation, account risk, caps."""
 from __future__ import annotations
-import logging, os
+import hashlib, json, logging, os
 from typing import Any
 
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON
@@ -8,6 +8,9 @@ from trader.kr.sector_classifier import classify_kr_sector
 from trader.kr.regime import KRRegimeSnapshot, normalize_kr_market
 
 logger = logging.getLogger(__name__)
+
+KR_POLICY_MISSING_ADOPTION_VERSION = "kr_policy_missing_tp_adoption_v1"
+KR_POLICY_MISSING_ADOPTION_SOURCE = "kr_policy_missing_profit_capture_adoption"
 
 def _f(k,d):
     try: return float(os.getenv(k, str(d)))
@@ -105,17 +108,202 @@ def filter_kr_entry_intent(intent: dict, overlay: dict, *, positions: list[dict]
     logger.info("[KR_MARKET_STATE][ENTRY_BLOCK] symbol=%s name=%s cluster=%s reason=%s market_state=%s sector_exposure_pct=%.4f high_beta_exposure_pct=%.4f", out.get("code") or out.get("symbol"), out.get("name"), cluster, reason, overlay.get("market_state"), sector_after, high_beta_after)
     return out
 
+def _kr_policy_missing_adoption_sha256(contract: dict) -> str:
+    payload = {key: value for key, value in dict(contract or {}).items() if key != "sha256"}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def has_kr_policy_missing_adoption_claim(position: dict) -> bool:
+    """Return whether a row claims this adoption, even if its proof is invalid."""
+    p = dict(position or {})
+    meta = p.get("position_meta") or {}
+    plan = p.get("entry_exit_plan_json") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    if not isinstance(plan, dict):
+        plan = {}
+    return bool(
+        str(p.get("policy_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+        or str(p.get("policy_source") or "") == KR_POLICY_MISSING_ADOPTION_SOURCE
+        or str(plan.get("policy_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+        or str(plan.get("policy_source") or "") == KR_POLICY_MISSING_ADOPTION_SOURCE
+        or meta.get("policy_adopted") is True
+        or str(meta.get("policy_adoption_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+    )
+
+
+def is_verified_kr_policy_missing_adoption(position: dict) -> bool:
+    """Validate the durable, lifecycle-bound adoption contract on a DB row."""
+    p = dict(position or {})
+    plan = p.get("entry_exit_plan_json") or {}
+    meta = p.get("position_meta") or {}
+    if not isinstance(plan, dict) or not isinstance(meta, dict):
+        return False
+    contract = plan.get("policy_adoption_contract") or {}
+    if not isinstance(contract, dict):
+        return False
+    cycle_id = str(p.get("position_cycle_id") or "")
+    epoch_id = str(p.get("portfolio_epoch_id") or "")
+    digest = str(contract.get("sha256") or "")
+    code = str(p.get("code") or p.get("symbol") or "").zfill(6)
+    try:
+        entry_price_matches = float(contract.get("entry_price") or 0.0) == float(
+            p.get("avg_buy_price") or p.get("avg") or p.get("entry_price") or 0.0
+        )
+    except (TypeError, ValueError):
+        entry_price_matches = False
+    return bool(
+        cycle_id
+        and epoch_id
+        and str(p.get("policy_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+        and str(p.get("policy_source") or "") == KR_POLICY_MISSING_ADOPTION_SOURCE
+        and str(p.get("exit_policy_family") or "") == "SWING_STAGED_EXIT"
+        and str(plan.get("policy_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+        and str(plan.get("policy_source") or "") == KR_POLICY_MISSING_ADOPTION_SOURCE
+        and str(plan.get("exit_policy_family") or "") == "SWING_STAGED_EXIT"
+        and str(contract.get("version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+        and str(contract.get("code") or "").zfill(6) == code
+        and str(contract.get("position_cycle_id") or "") == cycle_id
+        and str(contract.get("portfolio_epoch_id") or "") == epoch_id
+        and entry_price_matches
+        and contract.get("risk_plan") == plan.get("risk_plan")
+        and contract.get("profit_plan") == plan.get("profit_plan")
+        and digest
+        and digest == _kr_policy_missing_adoption_sha256(contract)
+        and meta.get("policy_adopted") is True
+        and str(meta.get("policy_adoption_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
+        and str(meta.get("policy_adoption_sha256") or "") == digest
+    )
+
+
+def build_kr_policy_missing_adoption(position: dict, *, current_price: float | None = None) -> dict | None:
+    """Build an explicit PB1 adoption contract for a profitable legacy holding.
+
+    This is deliberately separate from the POLICY_MISSING exit router.  The
+    caller must durably persist and read back this contract before any SELL is
+    allowed.  KR Infinite/leveraged ownership is never eligible.
+    """
+    p = dict(position or {})
+    meta = p.get("position_meta") or p.get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    code = str(p.get("code") or p.get("symbol") or "").zfill(6)
+    owner = str(p.get("owner_strategy") or meta.get("owner_strategy") or "KR_STANDARD").upper()
+    cycle_id = str(p.get("position_cycle_id") or "")
+    epoch_id = str(p.get("portfolio_epoch_id") or "")
+    missing = any(str(v or "").upper() == "POLICY_MISSING" for v in (
+        p.get("entry_thesis"), p.get("exit_policy_family"),
+        (p.get("entry_exit_plan_json") or {}).get("exit_policy_family")
+        if isinstance(p.get("entry_exit_plan_json"), dict) else None,
+    ))
+    if not missing or not cycle_id or not epoch_id or code == "122630" or "INFINITE" in owner:
+        return None
+    try:
+        qty = int(p.get("orderable_qty") or p.get("qty") or 0)
+        avg = float(p.get("avg_buy_price") or p.get("avg") or p.get("entry_price") or 0.0)
+        mark = float(current_price or p.get("last_price") or p.get("current_price") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0 or avg <= 0 or mark <= 0:
+        return None
+    return_fraction = (mark - avg) / avg
+    tp1 = _f("KR_TP1_PCT", 0.03)
+    if return_fraction < tp1:
+        return None
+    tp2, tp3 = _f("KR_TP2_PCT", 0.05), _f("KR_TP3_PCT", 0.08)
+    stop_fraction = _f("KR_POLICY_MISSING_ADOPTION_STOP_PCT", 0.08)
+    initial_stop = round(avg * (1.0 - stop_fraction), 2)
+    plan = {
+        "entry_thesis": "ADOPTED_LEGACY_HOLDING",
+        "entry_style_selected": "LEGACY_POLICY_ADOPTION",
+        "entry_reason": "POLICY_MISSING_PROFIT_CAPTURE_ADOPTION",
+        "trade_horizon": "SWING",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+        "eod_action": "CARRY",
+        "force_eod_close": False,
+        "risk_plan": {"initial_stop": initial_stop, "risk_R": round(avg - initial_stop, 2)},
+        "profit_plan": {
+            "tp1": {"return_fraction": tp1, "sell_fraction": _f("KR_TP1_SELL_PCT", 0.25)},
+            "tp2": {"return_fraction": tp2, "sell_fraction": _f("KR_TP2_SELL_PCT", 0.25)},
+            "tp3": {"return_fraction": tp3, "sell_fraction": _f("KR_TP3_SELL_PCT", 0.20)},
+        },
+        "policy_source": KR_POLICY_MISSING_ADOPTION_SOURCE,
+        "policy_version": KR_POLICY_MISSING_ADOPTION_VERSION,
+    }
+    adoption_contract = {
+        "version": KR_POLICY_MISSING_ADOPTION_VERSION,
+        "code": code,
+        "position_cycle_id": cycle_id,
+        "portfolio_epoch_id": epoch_id,
+        "entry_price": avg,
+        "risk_plan": plan["risk_plan"],
+        "profit_plan": plan["profit_plan"],
+    }
+    adoption_contract["sha256"] = _kr_policy_missing_adoption_sha256(adoption_contract)
+    plan["policy_adoption_contract"] = adoption_contract
+    adopted_meta = {
+        **meta,
+        "book": "SWING_BOOK",
+        "trade_horizon": "SWING_CARRY",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+        "policy_adopted": True,
+        "policy_adopted_from": "POLICY_MISSING",
+        "policy_adoption_version": KR_POLICY_MISSING_ADOPTION_VERSION,
+        "policy_adoption_sha256": adoption_contract["sha256"],
+        "policy_adoption_entry_price": avg,
+        "policy_adoption_return_fraction": return_fraction,
+        "entry_exit_plan": plan,
+        "kr_tp1_done": bool(meta.get("kr_tp1_done")),
+        "kr_tp2_done": bool(meta.get("kr_tp2_done")),
+        "kr_tp3_done": bool(meta.get("kr_tp3_done")),
+    }
+    return {
+        "plan": plan,
+        "position_fields": {
+            "entry_thesis": plan["entry_thesis"],
+            "entry_style_selected": plan["entry_style_selected"],
+            "entry_reason": plan["entry_reason"],
+            "trade_horizon": plan["trade_horizon"],
+            "exit_policy_family": plan["exit_policy_family"],
+            "eod_action": plan["eod_action"],
+            "force_eod_close": False,
+            "initial_stop_price": initial_stop,
+            "initial_risk_r": round(avg - initial_stop, 2),
+            "entry_exit_plan_json": plan,
+            "entry_meta_json": {
+                "book": "SWING_BOOK",
+                "trade_horizon": "SWING_CARRY",
+                "exit_policy_family": "SWING_STAGED_EXIT",
+                "entry_reason": plan["entry_reason"],
+                "entry_style_selected": plan["entry_style_selected"],
+                "policy_source": plan["policy_source"],
+                "policy_version": plan["policy_version"],
+            },
+            "policy_source": plan["policy_source"],
+            "policy_version": plan["policy_version"],
+            "position_meta": adopted_meta,
+        },
+    }
+
+
 def generate_kr_profit_capture_intents(positions: list[dict], overlay: dict) -> list[dict]:
     if os.getenv("KR_PROFIT_CAPTURE_ENABLE","1") == "0": return []
     result=[]
-    levels=[("kr_tp3_done","KR_TAKE_PROFIT_TP3",_f("KR_TP3_PCT",0.08),_f("KR_TP3_SELL_PCT",0.20)),("kr_tp2_done","KR_TAKE_PROFIT_TP2",_f("KR_TP2_PCT",0.05),_f("KR_TP2_SELL_PCT",0.25)),("kr_tp1_done","KR_TAKE_PROFIT_TP1",_f("KR_TP1_PCT",0.03),_f("KR_TP1_SELL_PCT",0.25))]
+    # Stages are fill-driven and sequential. A position above TP3 still starts
+    # at TP1; the next stage is unlocked only after the previous fill is saved.
+    levels=[("kr_tp1_done","KR_TAKE_PROFIT_TP1",_f("KR_TP1_PCT",0.03),_f("KR_TP1_SELL_PCT",0.25)),("kr_tp2_done","KR_TAKE_PROFIT_TP2",_f("KR_TP2_PCT",0.05),_f("KR_TP2_SELL_PCT",0.25)),("kr_tp3_done","KR_TAKE_PROFIT_TP3",_f("KR_TP3_PCT",0.08),_f("KR_TP3_SELL_PCT",0.20))]
     for p in positions or []:
         pnl=float(p.get("unrealized_pnl_pct") or p.get("return_pct") or 0); qty=int(p.get("orderable_qty") or p.get("qty") or 0); meta=p.get("meta") or p.get("position_meta") or {}
-        for flag,reason,thr,sell_pct in levels:
-            if pnl >= thr and not meta.get(flag) and qty>0:
+        for index,(flag,reason,thr,sell_pct) in enumerate(levels):
+            pending_flag=flag.replace("_done","_pending")
+            prior_done=index == 0 or bool(meta.get(levels[index-1][0]))
+            if not prior_done:
+                break
+            if pnl >= thr and not meta.get(flag) and not meta.get(pending_flag) and qty>0:
                 sell_qty=max(1,int(qty*sell_pct)); runner_min=int(qty*_f("KR_RUNNER_MIN_REMAIN_PCT",0.40))
                 if overlay.get("market_state") not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CRASH"}: sell_qty=min(sell_qty, max(1, qty-runner_min))
-                result.append({"side":"SELL","code":p.get("code") or p.get("symbol"),"qty":sell_qty,"reason":reason,"market_state":overlay.get("market_state")})
+                result.append({"side":"SELL","code":p.get("code") or p.get("symbol"),"qty":sell_qty,"reason":reason,"profit_capture_stage":flag.replace("kr_","").replace("_done",""),"market_state":overlay.get("market_state")})
                 logger.info("[KR_PROFIT_CAPTURE][%s] symbol=%s qty=%s pnl_pct=%.4f market_state=%s", reason.rsplit("_", 1)[-1], p.get("code") or p.get("symbol"), sell_qty, pnl, overlay.get("market_state"))
                 break
     return result

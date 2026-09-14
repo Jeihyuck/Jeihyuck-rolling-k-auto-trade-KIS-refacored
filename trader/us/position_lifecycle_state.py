@@ -16,6 +16,20 @@ from trader.us.db.repos import (
 
 logger = logging.getLogger(__name__)
 
+_ENTRY_POLICY_FIELDS = (
+    "book", "horizon", "exit_policy", "entry_strategy",
+    "entry_signal_type", "partial_exit_allowed",
+)
+
+
+def _entry_policy(pos: dict) -> dict:
+    meta = pos.get("meta") if isinstance(pos.get("meta"), dict) else {}
+    return {
+        field: pos.get(field) if pos.get(field) is not None else meta.get(field)
+        for field in _ENTRY_POLICY_FIELDS
+        if (pos.get(field) if pos.get(field) is not None else meta.get(field)) is not None
+    }
+
 
 def _iso(now: datetime) -> str:
     return (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
@@ -74,6 +88,7 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
     for symbol, pos in current.items():
         qty = _i(pos.get("qty"))
         entry = _position_entry_price(pos)
+        position_policy = _entry_policy(pos)
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
         if not lifecycle or lifecycle.get("is_open") is False:
@@ -93,6 +108,7 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
                 "high_watermark": max(entry, _f(pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px"))),
                 "high_watermark_at": now_iso,
                 "high_watermark_source": "us_position_risk_state",
+                "entry_policy": position_policy,
             }
         else:
             lifecycle["last_seen_qty"] = qty
@@ -100,13 +116,20 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
             if lifecycle.get("last_holding_day_counted") != trade_date:
                 lifecycle["holding_trade_days"] = _i(lifecycle.get("holding_trade_days"), 1) + 1
                 lifecycle["last_holding_day_counted"] = trade_date
+            if not lifecycle.get("entry_policy") and position_policy:
+                lifecycle["entry_policy"] = position_policy
+        carried_policy = dict(lifecycle.get("entry_policy") or {})
         _save_lifecycle(symbol, trade_date, lifecycle)
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
             "opened_trade_date": lifecycle.get("opened_trade_date"),
             "holding_trade_days": lifecycle.get("holding_trade_days"),
             "lifecycle_state_source": "us_position_risk_state",
+            **carried_policy,
         })
+        pos_meta = dict(pos.get("meta") or {})
+        pos_meta.update(carried_policy)
+        pos["meta"] = pos_meta
         out[symbol] = lifecycle
         logger.info("[US_POSITION][LIFECYCLE] symbol=%s lifecycle_id=%s is_open=%d opened_trade_date=%s holding_trade_days=%s", symbol, lifecycle.get("lifecycle_id"), 1, lifecycle.get("opened_trade_date"), lifecycle.get("holding_trade_days"))
 
