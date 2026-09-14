@@ -1,0 +1,103 @@
+name: PR129 hotfix helper
+
+on:
+  push:
+    branches:
+      - fix/p0-kr-us-policy-tp-integrity
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[pr129-hotfix-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/p0-kr-us-policy-tp-integrity
+          fetch-depth: 0
+
+      - name: Apply reviewed PR129 fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, got {count}")
+              return text.replace(old, new, 1)
+
+          # 1) KR: keep broker-evidence states visible; expire only pre-broker rows.
+          path = Path("trader/db/repos.py")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''        # Only intents with no evidence of a broker submission may expire by\n        # age. ACK/SUBMITTED/PARTIAL rows require broker reconciliation; aging\n        # them to EXPIRED can hide a real fill and orphan its position policy.\n        open_statuses = ["CREATED", "INTENT"]\n''',
+              '''        # Open broker-tracked states must stay observable to reconciliation and\n        # health checks. Age-based expiry is deliberately scoped separately in\n        # expire_stale_open_orders() to pre-broker states only.\n        open_statuses = [\n            "CREATED", "INTENT", "SUBMITTED", "ACKED", "ACCEPTED",\n            "PARTIAL_FILLED", "UNRESOLVED_ACK",\n        ]\n''',
+              "kr get_open_orders states",
+          )
+          text = replace_once(
+              text,
+              '''        open_statuses = ["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]\n        \n        logger.info("[ORDERS][STALE_REPAIR][START] env=%s before=%s reason=%s", env, before_dt.isoformat(), reason)\n''',
+              '''        # Only rows with no broker-submission evidence are safe to expire by\n        # age. Once submitted/acked/partially-filled, broker reconciliation owns\n        # the terminal decision so a real fill cannot be hidden by cleanup.\n        open_statuses = ["CREATED", "INTENT"]\n        \n        logger.info("[ORDERS][STALE_REPAIR][START] env=%s before=%s reason=%s", env, before_dt.isoformat(), reason)\n''',
+              "kr stale expiry states",
+          )
+          path.write_text(text, encoding="utf-8")
+
+          # 2) KR: TP stage completion follows full quantity evidence even if fill price is unresolved.
+          path = Path("trader/reconcile_kis.py")
+          text = path.read_text(encoding="utf-8")
+          text = replace_once(
+              text,
+              '''        if side == "SELL" and confirmed_fill_qty > 0 and broker_fill_price is None:\n            next_status = "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"\n''',
+              '''        if (\n            side == "SELL"\n            and confirmed_fill_qty > 0\n            and broker_fill_price is None\n            and confirmed_fill_qty >= int(submitted_qty or 0)\n        ):\n            next_status = "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"\n''',
+              "kr unresolved price full/partial status",
+          )
+          text = replace_once(
+              text,
+              '''        promoted_orders += 1\n\n        if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:\n''',
+              '''        promoted_orders += 1\n\n        # TP lifecycle is driven by confirmed cumulative quantity, not price\n        # accounting. A fully sold TP slice may have its execution price delayed\n        # by KIS; that must not leave the durable stage pending forever.\n        profit_capture_stage = str((request_json or {}).get("profit_capture_stage") or "").lower()\n        if (\n            side == "SELL"\n            and positions_repo is not None\n            and profit_capture_stage in {"tp1", "tp2", "tp3"}\n            and int(submitted_qty or 0) > 0\n            and confirmed_fill_qty >= int(submitted_qty or 0)\n            and next_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}\n        ):\n            positions_repo.mark_profit_capture_fill(\n                env=env,\n                strategy=strategy,\n                sid=int(order.get("sid") or 1),\n                mode=int(order.get("mode") or 1),\n                code=code,\n                position_cycle_id=str(order.get("position_cycle_id") or ""),\n                stage=profit_capture_stage,\n                client_order_key=client_order_key,\n                filled_qty=confirmed_fill_qty,\n            )\n\n        if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:\n''',
+              "kr tp quantity stage insertion",
+          )
+          text = replace_once(
+              text,
+              '''            profit_capture_stage = str((request_json or {}).get("profit_capture_stage") or "").lower()\n            if (\n                side == "SELL"\n                and positions_repo is not None\n                and profit_capture_stage in {"tp1", "tp2", "tp3"}\n                and confirmed_fill_qty >= int(submitted_qty or 0)\n            ):\n                positions_repo.mark_profit_capture_fill(\n                    env=env,\n                    strategy=strategy,\n                    sid=int(order.get("sid") or 1),\n                    mode=int(order.get("mode") or 1),\n                    code=code,\n                    position_cycle_id=str(order.get("position_cycle_id") or ""),\n                    stage=profit_capture_stage,\n                    client_order_key=client_order_key,\n                    filled_qty=confirmed_fill_qty,\n                )\n''',
+              '''''',
+              "kr old price-gated tp stage block",
+          )
+          path.write_text(text, encoding="utf-8")
+
+          # 3) US: lifecycle-safe policy recovery + mock Result compatibility.
+          path = Path("trader/us/db/repos.py")
+          text = path.read_text(encoding="utf-8")
+          old_helper = '''def _load_us_entry_policy_for_position(conn: Any, *, symbol: str, trade_date: str) -> dict[str, Any]:\n    prior_positions = conn.execute(text("""\n        SELECT meta FROM us_positions\n        WHERE UPPER(symbol)=:symbol AND as_of<=:td AND qty>0\n        ORDER BY as_of DESC LIMIT 20\n    """), {"symbol": symbol, "td": trade_date}).mappings().all()\n    for row in prior_positions:\n        policy = _us_entry_policy_from(row.get("meta"))\n        if policy:\n            policy["entry_policy_source"] = "prior_position_snapshot"\n            return policy\n    buy_orders = conn.execute(text("""\n        SELECT meta FROM us_orders\n        WHERE UPPER(symbol)=:symbol AND trade_date<=:td AND side='BUY' AND dry_run=FALSE\n          AND status IN ('SENT','ACK','OPEN','PARTIALLY_FILLED','FILLED')\n        ORDER BY trade_date DESC,created_at DESC LIMIT 20\n    """), {"symbol": symbol, "td": trade_date}).mappings().all()\n    for row in buy_orders:\n        policy = _us_entry_policy_from(row.get("meta"))\n        if policy:\n            policy["entry_policy_source"] = "confirmed_buy_order"\n            return policy\n    return {}\n'''
+          new_helper = '''def _mapping_rows_from_result(result: Any) -> list[dict[str, Any]]:\n    """Return mapping rows when a real SQLAlchemy Result is available.\n\n    Statement-capture tests intentionally return None from execute(); that is\n    not a database failure and must not break snapshot SQL generation. Genuine\n    execute() exceptions are deliberately left to the caller.\n    """\n    mappings = getattr(result, "mappings", None)\n    if not callable(mappings):\n        return []\n    mapped = mappings()\n    all_rows = getattr(mapped, "all", None)\n    rows = all_rows() if callable(all_rows) else list(mapped)\n    return [dict(row) for row in rows]\n\n\ndef _load_us_entry_policy_for_position(\n    conn: Any,\n    *,\n    symbol: str,\n    trade_date: str,\n    position_lifecycle_id: str | None = None,\n) -> dict[str, Any]:\n    # Inspect the latest snapshot regardless of qty. A qty=0 row is an explicit\n    # lifecycle boundary; skipping it (the old qty>0 query) could resurrect a\n    # fully closed cycle's policy on a later repurchase.\n    latest_result = conn.execute(text("""\n        SELECT meta, qty, as_of FROM us_positions\n        WHERE UPPER(symbol)=:symbol AND as_of<=:td\n        ORDER BY as_of DESC LIMIT 1\n    """), {"symbol": symbol, "td": trade_date})\n    latest_rows = _mapping_rows_from_result(latest_result)\n    latest = latest_rows[0] if latest_rows else {}\n    latest_meta = _parse_json_meta(latest.get("meta"))\n    latest_qty = int(latest.get("qty") or 0) if latest else 0\n    latest_as_of = str(latest.get("as_of") or "")[:10]\n    latest_lifecycle = str(latest_meta.get("position_lifecycle_id") or "").strip()\n    current_lifecycle = str(position_lifecycle_id or "").strip()\n\n    # Prefer a durable confirmed BUY contract. When the caller knows the\n    # lifecycle, require an exact lifecycle match. Without that identity, a\n    # recorded qty=0 snapshot is a hard boundary and only a later BUY may seed\n    # policy for a repurchase.\n    buy_result = conn.execute(text("""\n        SELECT meta, trade_date, created_at FROM us_orders\n        WHERE UPPER(symbol)=:symbol AND trade_date<=:td AND side='BUY' AND dry_run=FALSE\n          AND status IN ('SENT','ACK','OPEN','PARTIALLY_FILLED','FILLED')\n        ORDER BY trade_date DESC,created_at DESC LIMIT 20\n    """), {"symbol": symbol, "td": trade_date})\n    buy_orders = _mapping_rows_from_result(buy_result)\n    for row in buy_orders:\n        order_meta = _parse_json_meta(row.get("meta"))\n        order_lifecycle = str(order_meta.get("position_lifecycle_id") or "").strip()\n        if current_lifecycle and order_lifecycle != current_lifecycle:\n            continue\n        order_date = str(row.get("trade_date") or "")[:10]\n        if latest and latest_qty <= 0 and latest_as_of and order_date <= latest_as_of:\n            continue\n        policy = _us_entry_policy_from(order_meta)\n        if policy:\n            policy["entry_policy_source"] = "confirmed_buy_order"\n            return policy\n\n    # Snapshot fallback is allowed only when the latest recorded state is still\n    # open and, if a lifecycle identity is known, it matches that identity.\n    continuity_proven = bool(latest and latest_qty > 0)\n    if current_lifecycle:\n        continuity_proven = continuity_proven and latest_lifecycle == current_lifecycle\n    if continuity_proven:\n        policy = _us_entry_policy_from(latest_meta)\n        if policy:\n            policy["entry_policy_source"] = "prior_position_snapshot"\n            return policy\n    return {}\n'''
+          text = replace_once(text, old_helper, new_helper, "us lifecycle policy helper")
+          text = replace_once(
+              text,
+              '''                    policy = _load_us_entry_policy_for_position(\n                        conn,\n                        symbol=str(p.get("symbol") or "").upper(),\n                        trade_date=str(td),\n                    )\n''',
+              '''                    policy = _load_us_entry_policy_for_position(\n                        conn,\n                        symbol=str(p.get("symbol") or "").upper(),\n                        trade_date=str(td),\n                        position_lifecycle_id=str(\n                            p.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""\n                        ).strip() or None,\n                    )\n''',
+              "us snapshot lifecycle argument",
+          )
+          # Memory fallback: do not skip a qty=0 lifecycle boundary when reusing policy.
+          text = replace_once(
+              text,
+              '''            prior_policy = {}\n            for old in reversed(_MEM_POSITIONS):\n                if str(old.get("symbol") or "").upper() == str(p.get("symbol") or "").upper() and int(old.get("qty") or 0) > 0:\n                    prior_policy = _us_entry_policy_from(old.get("meta"), old)\n                    if prior_policy:\n                        prior_policy["entry_policy_source"] = "prior_position_snapshot"\n                        break\n            policy = _us_entry_policy_from(meta, p) or prior_policy\n''',
+              '''            prior_policy = {}\n            current_symbol = str(p.get("symbol") or "").upper()\n            current_lifecycle = str(\n                p.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""\n            ).strip()\n            latest_old = next(\n                (old for old in reversed(_MEM_POSITIONS)\n                 if str(old.get("symbol") or "").upper() == current_symbol),\n                None,\n            )\n            if latest_old is not None and int(latest_old.get("qty") or 0) > 0:\n                latest_old_meta = _parse_json_meta(latest_old.get("meta"))\n                latest_old_lifecycle = str(\n                    latest_old.get("position_lifecycle_id")\n                    or latest_old_meta.get("position_lifecycle_id")\n                    or ""\n                ).strip()\n                if not current_lifecycle or latest_old_lifecycle == current_lifecycle:\n                    prior_policy = _us_entry_policy_from(latest_old_meta, latest_old)\n                    if prior_policy:\n                        prior_policy["entry_policy_source"] = "prior_position_snapshot"\n            policy = _us_entry_policy_from(meta, p) or prior_policy\n''',
+              "us memory lifecycle boundary",
+          )
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Commit hotfix
+        shell: bash
+        run: |
+          git config user.name "chatgpt-pr129-hotfix"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add trader/db/repos.py trader/reconcile_kis.py trader/us/db/repos.py
+          git diff --cached --check
+          git commit -m "[pr129-hotfix-applied] Fix lifecycle-safe reconciliation regressions"
+          git push origin HEAD:fix/p0-kr-us-policy-tp-integrity
