@@ -241,7 +241,12 @@ def _promote_open_buy_orders_from_holdings(
             broker_fill_price or _to_float(order.get("limit_price"))
             or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0)
         )
-        if side == "SELL" and confirmed_fill_qty > 0 and broker_fill_price is None:
+        if (
+            side == "SELL"
+            and confirmed_fill_qty > 0
+            and broker_fill_price is None
+            and confirmed_fill_qty >= int(submitted_qty or 0)
+        ):
             next_status = "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"
         kis_odno = str(order.get("kis_odno") or order.get("broker_order_id") or "").strip() or None
         client_order_key = str(order.get("client_order_key") or f"{env}:{strategy}:{code}:promote").strip()
@@ -283,6 +288,30 @@ def _promote_open_buy_orders_from_holdings(
         )
         promoted_orders += 1
 
+        # TP lifecycle is driven by confirmed cumulative quantity, not price
+        # accounting. A fully sold TP slice may have its execution price delayed
+        # by KIS; that must not leave the durable stage pending forever.
+        profit_capture_stage = str((request_json or {}).get("profit_capture_stage") or "").lower()
+        if (
+            side == "SELL"
+            and positions_repo is not None
+            and profit_capture_stage in {"tp1", "tp2", "tp3"}
+            and int(submitted_qty or 0) > 0
+            and confirmed_fill_qty >= int(submitted_qty or 0)
+            and next_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}
+        ):
+            positions_repo.mark_profit_capture_fill(
+                env=env,
+                strategy=strategy,
+                sid=int(order.get("sid") or 1),
+                mode=int(order.get("mode") or 1),
+                code=code,
+                position_cycle_id=str(order.get("position_cycle_id") or ""),
+                stage=profit_capture_stage,
+                client_order_key=client_order_key,
+                filled_qty=confirmed_fill_qty,
+            )
+
         if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
             fills_repo.upsert_fill(
                 env=env,
@@ -322,24 +351,6 @@ def _promote_open_buy_orders_from_holdings(
             )
             promoted_fills += 1
             promoted_codes.append(code)
-            profit_capture_stage = str((request_json or {}).get("profit_capture_stage") or "").lower()
-            if (
-                side == "SELL"
-                and positions_repo is not None
-                and profit_capture_stage in {"tp1", "tp2", "tp3"}
-                and confirmed_fill_qty >= int(submitted_qty or 0)
-            ):
-                positions_repo.mark_profit_capture_fill(
-                    env=env,
-                    strategy=strategy,
-                    sid=int(order.get("sid") or 1),
-                    mode=int(order.get("mode") or 1),
-                    code=code,
-                    position_cycle_id=str(order.get("position_cycle_id") or ""),
-                    stage=profit_capture_stage,
-                    client_order_key=client_order_key,
-                    filled_qty=confirmed_fill_qty,
-                )
             logger.warning(
                 "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=%s qty=%s holding_qty=%s delta=%s submitted_qty=%s",
                 env,

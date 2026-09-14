@@ -1693,27 +1693,78 @@ def _ensure_us_entry_policy_contract(*sources: Any) -> dict[str, Any]:
     return policy
 
 
-def _load_us_entry_policy_for_position(conn: Any, *, symbol: str, trade_date: str) -> dict[str, Any]:
-    prior_positions = conn.execute(text("""
-        SELECT meta FROM us_positions
-        WHERE UPPER(symbol)=:symbol AND as_of<=:td AND qty>0
-        ORDER BY as_of DESC LIMIT 20
-    """), {"symbol": symbol, "td": trade_date}).mappings().all()
-    for row in prior_positions:
-        policy = _us_entry_policy_from(row.get("meta"))
-        if policy:
-            policy["entry_policy_source"] = "prior_position_snapshot"
-            return policy
-    buy_orders = conn.execute(text("""
-        SELECT meta FROM us_orders
+def _mapping_rows_from_result(result: Any) -> list[dict[str, Any]]:
+    """Return mapping rows when a real SQLAlchemy Result is available.
+
+    Statement-capture tests intentionally return None from execute(); that is
+    not a database failure and must not break snapshot SQL generation. Genuine
+    execute() exceptions are deliberately left to the caller.
+    """
+    mappings = getattr(result, "mappings", None)
+    if not callable(mappings):
+        return []
+    mapped = mappings()
+    all_rows = getattr(mapped, "all", None)
+    rows = all_rows() if callable(all_rows) else list(mapped)
+    return [dict(row) for row in rows]
+
+
+def _load_us_entry_policy_for_position(
+    conn: Any,
+    *,
+    symbol: str,
+    trade_date: str,
+    position_lifecycle_id: str | None = None,
+) -> dict[str, Any]:
+    # Inspect the latest snapshot regardless of qty. A qty=0 row is an explicit
+    # lifecycle boundary; skipping it (the old qty>0 query) could resurrect a
+    # fully closed cycle's policy on a later repurchase.
+    latest_result = conn.execute(text("""
+        SELECT meta, qty, as_of FROM us_positions
+        WHERE UPPER(symbol)=:symbol AND as_of<=:td
+        ORDER BY as_of DESC LIMIT 1
+    """), {"symbol": symbol, "td": trade_date})
+    latest_rows = _mapping_rows_from_result(latest_result)
+    latest = latest_rows[0] if latest_rows else {}
+    latest_meta = _parse_json_meta(latest.get("meta"))
+    latest_qty = int(latest.get("qty") or 0) if latest else 0
+    latest_as_of = str(latest.get("as_of") or "")[:10]
+    latest_lifecycle = str(latest_meta.get("position_lifecycle_id") or "").strip()
+    current_lifecycle = str(position_lifecycle_id or "").strip()
+
+    # Prefer a durable confirmed BUY contract. When the caller knows the
+    # lifecycle, require an exact lifecycle match. Without that identity, a
+    # recorded qty=0 snapshot is a hard boundary and only a later BUY may seed
+    # policy for a repurchase.
+    buy_result = conn.execute(text("""
+        SELECT meta, trade_date, created_at FROM us_orders
         WHERE UPPER(symbol)=:symbol AND trade_date<=:td AND side='BUY' AND dry_run=FALSE
           AND status IN ('SENT','ACK','OPEN','PARTIALLY_FILLED','FILLED')
         ORDER BY trade_date DESC,created_at DESC LIMIT 20
-    """), {"symbol": symbol, "td": trade_date}).mappings().all()
+    """), {"symbol": symbol, "td": trade_date})
+    buy_orders = _mapping_rows_from_result(buy_result)
     for row in buy_orders:
-        policy = _us_entry_policy_from(row.get("meta"))
+        order_meta = _parse_json_meta(row.get("meta"))
+        order_lifecycle = str(order_meta.get("position_lifecycle_id") or "").strip()
+        if current_lifecycle and order_lifecycle != current_lifecycle:
+            continue
+        order_date = str(row.get("trade_date") or "")[:10]
+        if latest and latest_qty <= 0 and latest_as_of and order_date <= latest_as_of:
+            continue
+        policy = _us_entry_policy_from(order_meta)
         if policy:
             policy["entry_policy_source"] = "confirmed_buy_order"
+            return policy
+
+    # Snapshot fallback is allowed only when the latest recorded state is still
+    # open and, if a lifecycle identity is known, it matches that identity.
+    continuity_proven = bool(latest and latest_qty > 0)
+    if current_lifecycle:
+        continuity_proven = continuity_proven and latest_lifecycle == current_lifecycle
+    if continuity_proven:
+        policy = _us_entry_policy_from(latest_meta)
+        if policy:
+            policy["entry_policy_source"] = "prior_position_snapshot"
             return policy
     return {}
 
@@ -1754,12 +1805,26 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
         for p in positions:
             meta = dict(p.get("meta") or {})
             prior_policy = {}
-            for old in reversed(_MEM_POSITIONS):
-                if str(old.get("symbol") or "").upper() == str(p.get("symbol") or "").upper() and int(old.get("qty") or 0) > 0:
-                    prior_policy = _us_entry_policy_from(old.get("meta"), old)
+            current_symbol = str(p.get("symbol") or "").upper()
+            current_lifecycle = str(
+                p.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""
+            ).strip()
+            latest_old = next(
+                (old for old in reversed(_MEM_POSITIONS)
+                 if str(old.get("symbol") or "").upper() == current_symbol),
+                None,
+            )
+            if latest_old is not None and int(latest_old.get("qty") or 0) > 0:
+                latest_old_meta = _parse_json_meta(latest_old.get("meta"))
+                latest_old_lifecycle = str(
+                    latest_old.get("position_lifecycle_id")
+                    or latest_old_meta.get("position_lifecycle_id")
+                    or ""
+                ).strip()
+                if not current_lifecycle or latest_old_lifecycle == current_lifecycle:
+                    prior_policy = _us_entry_policy_from(latest_old_meta, latest_old)
                     if prior_policy:
                         prior_policy["entry_policy_source"] = "prior_position_snapshot"
-                        break
             policy = _us_entry_policy_from(meta, p) or prior_policy
             meta.update(policy)
             meta.update({
@@ -1801,6 +1866,9 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         conn,
                         symbol=str(p.get("symbol") or "").upper(),
                         trade_date=str(td),
+                        position_lifecycle_id=str(
+                            p.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""
+                        ).strip() or None,
                     )
                 meta.update(policy)
                 meta.update({

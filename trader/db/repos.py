@@ -3111,10 +3111,13 @@ class OrdersRepo:
         Returns:
             Open order 리스트
         """
-        # Only intents with no evidence of a broker submission may expire by
-        # age. ACK/SUBMITTED/PARTIAL rows require broker reconciliation; aging
-        # them to EXPIRED can hide a real fill and orphan its position policy.
-        open_statuses = ["CREATED", "INTENT"]
+        # Open broker-tracked states must stay observable to reconciliation and
+        # health checks. Age-based expiry is deliberately scoped separately in
+        # expire_stale_open_orders() to pre-broker states only.
+        open_statuses = [
+            "CREATED", "INTENT", "SUBMITTED", "ACKED", "ACCEPTED",
+            "PARTIAL_FILLED", "UNRESOLVED_ACK",
+        ]
         conditions = [
             self._schema.orders.c.env == env,
             self._schema.orders.c.status.in_(open_statuses),
@@ -3205,7 +3208,10 @@ class OrdersRepo:
         import logging
         logger = logging.getLogger(__name__)
         
-        open_statuses = ["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]
+        # Only rows with no broker-submission evidence are safe to expire by
+        # age. Once submitted/acked/partially-filled, broker reconciliation owns
+        # the terminal decision so a real fill cannot be hidden by cleanup.
+        open_statuses = ["CREATED", "INTENT"]
         
         logger.info("[ORDERS][STALE_REPAIR][START] env=%s before=%s reason=%s", env, before_dt.isoformat(), reason)
         
