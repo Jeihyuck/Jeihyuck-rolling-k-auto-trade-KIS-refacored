@@ -350,11 +350,26 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
     if not valid_identity(intent.get("client_order_key")):
         logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_order_intents")
         return False
+    intent = dict(intent)
+    intent_meta = _parse_json_meta(intent.get("meta"))
+    standard_buy = bool(
+        str(intent.get("side") or "BUY").upper() == "BUY"
+        and str(intent.get("strategy_owner") or intent_meta.get("strategy_owner") or "US_STANDARD").upper() != "TQQQ_INFINITE"
+    )
+    if standard_buy:
+        policy_contract = _ensure_us_entry_policy_contract(intent_meta, intent)
+        intent_meta.update(policy_contract)
+        intent["meta"] = intent_meta
     engine = _get_engine_or_none()
     if engine is None:
         for existing in _MEM_INTENTS:
             if existing.get("client_order_key") == intent.get("client_order_key"):
                 assert_same_identity(existing, {**intent, "trade_date": td})
+                if standard_buy:
+                    existing_meta = _parse_json_meta(existing.get("meta"))
+                    if existing_meta.get("entry_policy_contract_sha256") != intent_meta.get("entry_policy_contract_sha256"):
+                        logger.critical("[US_INTEGRITY][BUY_POLICY_CONTRACT_MISMATCH] key=%s", intent.get("client_order_key"))
+                        return False
                 return True
         _MEM_INTENTS.append({**intent, "trade_date": td, "status": "PENDING"})
         return True
@@ -382,7 +397,7 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "strategy": intent.get("strategy", "us_pb1"),
                     "status": "PENDING",
                     "meta": _json_param({
-                        **_parse_json_meta(intent.get("meta")),
+                        **intent_meta,
                         **{field: intent.get(field) for field in (
                             "strategy_owner", "strategy_name", "strategy_version", "sleeve_id"
                         ) if intent.get(field) is not None},
@@ -390,6 +405,14 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     }),
                 },
             )
+            if standard_buy:
+                persisted = conn.execute(
+                    text("SELECT meta FROM us_order_intents WHERE client_order_key=:cok"),
+                    {"cok": intent.get("client_order_key")},
+                ).mappings().first()
+                persisted_meta = _parse_json_meta((persisted or {}).get("meta"))
+                if persisted_meta.get("entry_policy_contract_sha256") != intent_meta.get("entry_policy_contract_sha256"):
+                    raise ValueError("US_BUY_POLICY_CONTRACT_PERSISTENCE_MISMATCH")
         return True
     except Exception as exc:
         logger.error("[US_INTENT][SAVE][ERROR] %s", exc)
@@ -1055,11 +1078,11 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
 
 def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                                  lifecycle_by_symbol: dict[str, str] | None = None) -> dict[str, dict]:
-    """Load TP1/TP2/TP3 state for same-day duplicate prevention.
+    """Load TP1/TP2/TP3 state for the current position lifecycle.
 
-    Uses us_position_risk_state.state.profit_capture when DB is available and an
-    in-memory fallback when DB is unavailable, so tests/offline ticks remain
-    idempotent.
+    TP completion belongs to a position lifecycle, not to a trading date. Rows
+    remain date-stamped for audit, while the latest state for each stage is
+    carried forward across restarts and following sessions.
     """
     out: dict[str, dict] = {}
     engine = _get_engine_or_none()
@@ -1071,13 +1094,35 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
         if lifecycle == "LEGACY":
             out[sym] = _normalize_profit_capture_state(trade_date, sym, {}, lifecycle)
             continue
-        mem = _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym, lifecycle)) or {}
-        state = mem
+        mem_rows = sorted(
+            (
+                (td, value) for (td, stored_sym, stored_lifecycle), value in _MEM_PROFIT_CAPTURE_STATE.items()
+                if stored_sym == sym and stored_lifecycle == lifecycle and str(td) <= str(trade_date)
+            ),
+            key=lambda item: item[0],
+        )
+        state: dict[str, Any] = {"position_lifecycle_id": lifecycle, "meta": {}}
+        for _, value in mem_rows:
+            candidate = dict(value or {})
+            state["meta"].update(dict(candidate.get("meta") or {}))
+            for stage_name in ("tp1", "tp2", "tp3"):
+                if candidate.get(f"{stage_name}_done"):
+                    state[f"{stage_name}_done"] = True
+                    state[f"{stage_name}_pending"] = False
+                elif not state.get(f"{stage_name}_done") and f"{stage_name}_pending" in candidate:
+                    state[f"{stage_name}_pending"] = bool(candidate.get(f"{stage_name}_pending"))
+                for suffix in ("order_key", "at", "broker_order_no"):
+                    key = f"{stage_name}_{suffix}"
+                    if candidate.get(key):
+                        state[key] = candidate[key]
         if engine is not None:
             with engine.connect() as conn:
-                rows = conn.execute(text("""SELECT stage,stage_status,client_order_key,raw_broker_order_no,
-                    cumulative_filled_qty,state,updated_at FROM us_profit_capture_lifecycle
-                    WHERE trade_date=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle"""),
+                rows = conn.execute(text("""SELECT DISTINCT ON (stage)
+                    stage,stage_status,client_order_key,raw_broker_order_no,
+                    cumulative_filled_qty,state,updated_at,trade_date
+                    FROM us_profit_capture_lifecycle
+                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle
+                    ORDER BY stage,trade_date DESC,updated_at DESC"""),
                     {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}).mappings().all()
             state={"position_lifecycle_id":lifecycle,"meta":{}}
             for row in rows:
@@ -1611,6 +1656,67 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
 #                      unrealized_pnl_usd, meta
 # ---------------------------------------------------------------------------
 
+_US_ENTRY_POLICY_FIELDS = (
+    "book", "horizon", "exit_policy", "entry_strategy",
+    "entry_signal_type", "partial_exit_allowed",
+)
+
+US_ENTRY_POLICY_CONTRACT_VERSION = "us_entry_policy_contract_v1"
+
+
+def _us_entry_policy_from(*sources: Any) -> dict[str, Any]:
+    for source in sources:
+        parsed = _parse_json_meta(source)
+        policy = {field: parsed.get(field) for field in _US_ENTRY_POLICY_FIELDS if parsed.get(field) is not None}
+        if all(policy.get(field) for field in ("book", "horizon", "exit_policy")):
+            canonical = json.dumps(policy, sort_keys=True, separators=(",", ":"), default=str)
+            policy["entry_policy_contract_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            return policy
+    return {}
+
+
+def _ensure_us_entry_policy_contract(*sources: Any) -> dict[str, Any]:
+    policy: dict[str, Any] = {}
+    for source in sources:
+        parsed = _parse_json_meta(source)
+        for field in _US_ENTRY_POLICY_FIELDS:
+            if field not in policy and parsed.get(field) is not None:
+                policy[field] = parsed[field]
+    policy.setdefault("book", os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK"))
+    policy.setdefault("horizon", os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY"))
+    policy.setdefault("exit_policy", os.getenv("US_DEFAULT_EXIT_POLICY", "US_SWING_DEFAULT"))
+    policy.setdefault("entry_strategy", "us_pb1")
+    canonical_fields = {field: policy.get(field) for field in _US_ENTRY_POLICY_FIELDS if policy.get(field) is not None}
+    canonical = json.dumps(canonical_fields, sort_keys=True, separators=(",", ":"), default=str)
+    policy["entry_policy_contract_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    policy["entry_policy_contract_version"] = US_ENTRY_POLICY_CONTRACT_VERSION
+    return policy
+
+
+def _load_us_entry_policy_for_position(conn: Any, *, symbol: str, trade_date: str) -> dict[str, Any]:
+    prior_positions = conn.execute(text("""
+        SELECT meta FROM us_positions
+        WHERE UPPER(symbol)=:symbol AND as_of<=:td AND qty>0
+        ORDER BY as_of DESC LIMIT 20
+    """), {"symbol": symbol, "td": trade_date}).mappings().all()
+    for row in prior_positions:
+        policy = _us_entry_policy_from(row.get("meta"))
+        if policy:
+            policy["entry_policy_source"] = "prior_position_snapshot"
+            return policy
+    buy_orders = conn.execute(text("""
+        SELECT meta FROM us_orders
+        WHERE UPPER(symbol)=:symbol AND trade_date<=:td AND side='BUY' AND dry_run=FALSE
+          AND status IN ('SENT','ACK','OPEN','PARTIALLY_FILLED','FILLED')
+        ORDER BY trade_date DESC,created_at DESC LIMIT 20
+    """), {"symbol": symbol, "td": trade_date}).mappings().all()
+    for row in buy_orders:
+        policy = _us_entry_policy_from(row.get("meta"))
+        if policy:
+            policy["entry_policy_source"] = "confirmed_buy_order"
+            return policy
+    return {}
+
 def save_position_snapshot(positions: list[dict], trade_date: str | None = None, *,
                            balance_fetch_status: str = "UNKNOWN", balance_parse_status: str = "UNKNOWN",
                            authoritative_positions: bool = False, preserve_previous_positions: bool = True,
@@ -1647,6 +1753,15 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             _MEM_POSITIONS.clear()
         for p in positions:
             meta = dict(p.get("meta") or {})
+            prior_policy = {}
+            for old in reversed(_MEM_POSITIONS):
+                if str(old.get("symbol") or "").upper() == str(p.get("symbol") or "").upper() and int(old.get("qty") or 0) > 0:
+                    prior_policy = _us_entry_policy_from(old.get("meta"), old)
+                    if prior_policy:
+                        prior_policy["entry_policy_source"] = "prior_position_snapshot"
+                        break
+            policy = _us_entry_policy_from(meta, p) or prior_policy
+            meta.update(policy)
             meta.update({
                 "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                 "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
@@ -1663,6 +1778,8 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 "high_watermark_source": p.get("high_watermark_source"),
                 "trend_state": p.get("trend_state"),
             })
+            p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
+            p["meta"] = meta
             _MEM_POSITIONS.append({
                 **p, "as_of": td,
                 "avg_cost": p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd", 0),
@@ -1678,6 +1795,14 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
                 # meta에 orderable_qty 등 보존
                 meta = dict(p.get("meta") or {})
+                policy = _us_entry_policy_from(meta, p)
+                if not policy:
+                    policy = _load_us_entry_policy_for_position(
+                        conn,
+                        symbol=str(p.get("symbol") or "").upper(),
+                        trade_date=str(td),
+                    )
+                meta.update(policy)
                 meta.update({
                     "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                     "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
@@ -1694,6 +1819,8 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     "high_watermark_source": p.get("high_watermark_source"),
                     "trend_state": p.get("trend_state"),
                 })
+                p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
+                p["meta"] = meta
                 conn.execute(
                     text("""
                         INSERT INTO us_positions
@@ -1706,7 +1833,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 avg_cost          =EXCLUDED.avg_cost,
                                 current_px        =EXCLUDED.current_px,
                                 unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
-                                meta              =EXCLUDED.meta
+                                meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
                     """),
                     {
                         "as_of": td,
@@ -1777,6 +1904,11 @@ def load_positions(as_of: str | None = None) -> list[dict]:
         r["current_price_usd"] = r.get("current_px") or 0
         r["entry_price_source"] = meta.get("entry_price_source") or "us_positions_avg_cost"
         r["balance_source"] = meta.get("balance_source") or "us_positions_db"
+        for field in _US_ENTRY_POLICY_FIELDS:
+            if meta.get(field) is not None:
+                r[field] = meta[field]
+        r["entry_policy_contract_sha256"] = meta.get("entry_policy_contract_sha256")
+        r["entry_policy_source"] = meta.get("entry_policy_source")
         enriched.append(r)
     return enriched
 

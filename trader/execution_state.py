@@ -60,12 +60,14 @@ def exit_stage_for_reason(reason: str | None, *, requested_sell_qty: int | None 
     partial = ((sell_pct is not None and 0 < float(sell_pct) < 1)
                or (requested_sell_qty is not None and broker_qty_before is not None
                    and 0 < int(requested_sell_qty) < int(broker_qty_before)))
-    if value in {"TP1", "TAKE_PROFIT_1", "ABS_TP1", "ABS_TP1_10PCT",
+    if value in {"TP1", "TAKE_PROFIT_1", "KR_TAKE_PROFIT_TP1", "ABS_TP1", "ABS_TP1_10PCT",
                  "SWING_TP1_R", "SWING_TP1_PCT", "CORE_TP1_R"}:
         return "TP1"
-    if value in {"TP2", "TAKE_PROFIT_2", "ABS_TP2", "SWING_TP2_R",
+    if value in {"TP2", "TAKE_PROFIT_2", "KR_TAKE_PROFIT_TP2", "ABS_TP2", "SWING_TP2_R",
                  "SWING_TP2_PCT", "CORE_TP2_R"}:
         return "TP2"
+    if value in {"TP3", "TAKE_PROFIT_3", "KR_TAKE_PROFIT_TP3"}:
+        return "TP3"
     if value in {"PROFIT_PROTECT_8PCT", "SWING_PROFIT_PROTECT_GIVEBACK",
                  "MOMENTUM_PROFIT_PROTECT_GIVEBACK"} or value.startswith("PROFIT_PROTECT_PARTIAL_1"):
         return "PROFIT_PROTECT_PARTIAL_1" if partial or requested_sell_qty is None else "FULL_EXIT"
@@ -78,7 +80,9 @@ def legal_next_exit_stage(previous: str, current: str) -> bool:
     return (str(previous).upper(), str(current).upper()) in {
         ("TP1", "TP2"),
         ("TP1", "FULL_EXIT"),
+        ("TP2", "TP3"),
         ("TP2", "FULL_EXIT"),
+        ("TP3", "FULL_EXIT"),
         ("PROFIT_PROTECT_PARTIAL_1", "FULL_EXIT"),
         ("DEFENSE_TRIM_1", "FULL_EXIT"),
     }

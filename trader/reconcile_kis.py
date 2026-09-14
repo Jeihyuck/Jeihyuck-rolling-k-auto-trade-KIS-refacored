@@ -9,7 +9,8 @@ from pathlib import Path
 from trader.config import MARKET_MAP
 from trader.account_state import account_reset_mode, env_flag, get_account_key, get_masked_account_key
 from trader.runtime_paths import runtime_root
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
+from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
+                             ReconcileLogRepo, _assert_kr_buy_entry_contract)
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -138,6 +139,7 @@ def _promote_open_buy_orders_from_holdings(
     holdings_rows: list[dict],
     orders_repo: OrdersRepo,
     fills_repo: FillsRepo,
+    positions_repo: PositionsRepo | None = None,
 ) -> dict[str, int]:
     qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
     promoted_orders = 0
@@ -157,6 +159,15 @@ def _promote_open_buy_orders_from_holdings(
 
         request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
         response_json = order.get("response_json") if isinstance(order.get("response_json"), dict) else {}
+        if side == "BUY" and request_json.get("enforce_entry_contract") is True:
+            try:
+                _assert_kr_buy_entry_contract(request_json)
+            except RuntimeError as exc:
+                logger.error(
+                    "[RECONCILE][PROMOTE_BLOCK] env=%s code=%s reason=BUY_ENTRY_CONTRACT_INVALID detail=%s",
+                    env, code, exc,
+                )
+                continue
         execution_meta = response_json.get("_order_execution") if isinstance(response_json.get("_order_execution"), dict) else {}
         order_qty = _to_int(order.get("qty")) or 0
         submitted_qty = _to_int(execution_meta.get("submitted_qty")) or _to_int(response_json.get("submitted_qty")) or _to_int(request_json.get("submitted_qty")) or order_qty
@@ -311,6 +322,24 @@ def _promote_open_buy_orders_from_holdings(
             )
             promoted_fills += 1
             promoted_codes.append(code)
+            profit_capture_stage = str((request_json or {}).get("profit_capture_stage") or "").lower()
+            if (
+                side == "SELL"
+                and positions_repo is not None
+                and profit_capture_stage in {"tp1", "tp2", "tp3"}
+                and confirmed_fill_qty >= int(submitted_qty or 0)
+            ):
+                positions_repo.mark_profit_capture_fill(
+                    env=env,
+                    strategy=strategy,
+                    sid=int(order.get("sid") or 1),
+                    mode=int(order.get("mode") or 1),
+                    code=code,
+                    position_cycle_id=str(order.get("position_cycle_id") or ""),
+                    stage=profit_capture_stage,
+                    client_order_key=client_order_key,
+                    filled_qty=confirmed_fill_qty,
+                )
             logger.warning(
                 "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=%s qty=%s holding_qty=%s delta=%s submitted_qty=%s",
                 env,
@@ -586,6 +615,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         rows = [rows]
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
+    positions_repo = PositionsRepo(engine)
     ledger_repo = LedgerEventsRepo(engine)
     reconcile_repo = ReconcileLogRepo(engine)
 
@@ -606,6 +636,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         plan_record = None
         request_json = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        source_order = None
+        if side == "SELL" and kis_odno:
+            try:
+                source_order = orders_repo.get_order_by_kis_odno(env, kis_odno)
+            except Exception as exc:
+                logger.warning("[RECONCILE][SELL_SOURCE_LOOKUP_FAIL] code=%s kis_odno=%s err=%s", code, kis_odno, exc)
+            if source_order:
+                source_request = source_order.get("request_json") if isinstance(source_order.get("request_json"), dict) else {}
+                request_json = {**source_request, "kis_row": request_json}
+                client_order_key = str(source_order.get("client_order_key") or client_order_key)
         if side == "BUY":
             try:
                 plan_record = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code)
@@ -677,6 +717,29 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             )
             fill_count += 1
             filled_codes.append(code)
+            profit_capture_stage = str(request_json.get("profit_capture_stage") or "").lower()
+            requested_sell_qty = int((source_order or {}).get("qty") or qty or 0)
+            cumulative_filled_qty = (
+                _to_int(_first_value(row, ["tot_ccld_qty", "filled_qty", "cumulative_filled_qty"]))
+                or int(filled_qty or 0)
+            )
+            if (
+                side == "SELL"
+                and source_order
+                and profit_capture_stage in {"tp1", "tp2", "tp3"}
+                and cumulative_filled_qty >= requested_sell_qty > 0
+            ):
+                positions_repo.mark_profit_capture_fill(
+                    env=env,
+                    strategy=strategy,
+                    sid=int(source_order.get("sid") or 1),
+                    mode=int(source_order.get("mode") or 1),
+                    code=code,
+                    position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                    stage=profit_capture_stage,
+                    client_order_key=client_order_key,
+                    filled_qty=cumulative_filled_qty,
+                )
 
     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
     if degraded_reason:
@@ -765,6 +828,7 @@ def reconcile_kis(
         holdings_rows=holdings_rows,
         orders_repo=orders_repo,
         fills_repo=fills_repo,
+        positions_repo=positions_repo,
     )
     orders_count += int(promoted.get("orders") or 0)
     fills_count += int(promoted.get("fills") or 0)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import hashlib
+import json
 import logging, os
 import time
 from typing import Any, Dict, Iterable, List, Optional
@@ -49,6 +51,61 @@ from trader.utils.ids import assert_uuid
 from trader.account_state import get_account_key
 
 logger = logging.getLogger(__name__)
+
+
+KR_BUY_ENTRY_CONTRACT_VERSION = "kr_buy_entry_contract_v1"
+
+
+def _kr_buy_entry_contract_payload(request_json: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable fields reconciliation needs to promote a BUY fill."""
+    plan = request_json.get("entry_exit_plan")
+    return {
+        "entry_exit_plan": json_sanitize(plan) if isinstance(plan, dict) else {},
+        "pre_order_holding_qty": request_json.get("pre_order_holding_qty"),
+        "requested_qty": request_json.get("requested_qty"),
+        "submitted_qty": request_json.get("submitted_qty"),
+        "balance_snapshot_id": request_json.get("balance_snapshot_id"),
+        "client_order_key": request_json.get("client_order_key"),
+        "position_cycle_id": request_json.get("position_cycle_id"),
+        "portfolio_epoch_id": request_json.get("portfolio_epoch_id"),
+    }
+
+
+def _kr_buy_entry_contract_hash(request_json: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        _kr_buy_entry_contract_payload(request_json),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _assert_kr_buy_entry_contract(request_json: Any) -> None:
+    """Fail closed when a persisted KR BUY cannot be reconciled after restart."""
+    if not isinstance(request_json, dict):
+        raise RuntimeError("KR_BUY_ENTRY_CONTRACT_NOT_JSON")
+    payload = _kr_buy_entry_contract_payload(request_json)
+    missing = []
+    if not payload["entry_exit_plan"]:
+        missing.append("entry_exit_plan")
+    if payload["pre_order_holding_qty"] is None:
+        missing.append("pre_order_holding_qty")
+    if int(payload["requested_qty"] or 0) <= 0:
+        missing.append("requested_qty")
+    if int(payload["submitted_qty"] or 0) <= 0:
+        missing.append("submitted_qty")
+    for field in ("client_order_key", "position_cycle_id", "portfolio_epoch_id"):
+        if not str(payload[field] or "").strip():
+            missing.append(field)
+    expected_hash = _kr_buy_entry_contract_hash(request_json)
+    if request_json.get("entry_contract_version") != KR_BUY_ENTRY_CONTRACT_VERSION:
+        missing.append("entry_contract_version")
+    if request_json.get("entry_contract_sha256") != expected_hash:
+        missing.append("entry_contract_sha256")
+    if missing:
+        raise RuntimeError(f"KR_BUY_ENTRY_CONTRACT_INVALID:{','.join(missing)}")
 
 
 def _is_transient_db_connection_exception(exc: BaseException) -> bool:
@@ -2797,8 +2854,23 @@ class OrdersRepo:
                     ))
                 ).scalar()
         position_cycle_id = str(position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url))
+        order_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+        safe_request_json = json_sanitize(request_json or {})
+        enforce_buy_contract = bool(
+            str(side or "").upper() == "BUY"
+            and safe_request_json.get("enforce_entry_contract") is True
+        )
+        if enforce_buy_contract:
+            safe_request_json.update({
+                "client_order_key": client_order_key,
+                "position_cycle_id": str(position_cycle_id),
+                "portfolio_epoch_id": str(portfolio_epoch_id),
+                "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
+            })
+            safe_request_json["entry_contract_sha256"] = _kr_buy_entry_contract_hash(safe_request_json)
+            _assert_kr_buy_entry_contract(safe_request_json)
         payload = {
-            "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+            "order_id": order_id,
             "env": env,
             "position_cycle_id": position_cycle_id,
             "portfolio_epoch_id": portfolio_epoch_id,
@@ -2815,12 +2887,10 @@ class OrdersRepo:
             "stage": stage,
             "client_order_key": client_order_key,
             "status": status,
-            "request_json": request_json or {},
+            "request_json": safe_request_json,
             **_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"),
         }
         payload = dict(payload)
-        if "request_json" in payload:
-            payload["request_json"] = json_sanitize(payload["request_json"])
         with self.engine.begin() as conn:
             existing = conn.execute(
                 select(self._schema.orders.c.order_id).where(
@@ -2836,9 +2906,10 @@ class OrdersRepo:
                     )
                 return str(existing), False
             stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
+            inserted_id = str(order_id)
             try:
                 res = execute_with_retry(conn, stmt)
-                return str(res.scalar()), True
+                inserted_id = str(res.scalar() or order_id)
             except StatementError as exc:
                 if original_request_json is not None:
                     type_paths = _collect_json_type_paths(original_request_json)
@@ -2851,7 +2922,16 @@ class OrdersRepo:
                 raise exc
             except Exception:
                 execute_with_retry(conn, sa.insert(self._schema.orders).values(**payload))
-                return str(payload["order_id"]), True
+            if enforce_buy_contract:
+                persisted = conn.execute(
+                    select(self._schema.orders.c.request_json).where(
+                        and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+                    )
+                ).scalar()
+                _assert_kr_buy_entry_contract(persisted)
+                if _kr_buy_entry_contract_hash(persisted) != _kr_buy_entry_contract_hash(safe_request_json):
+                    raise RuntimeError("KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH")
+            return inserted_id, True
 
     def mark_submitted(
         self,
@@ -3031,7 +3111,10 @@ class OrdersRepo:
         Returns:
             Open order 리스트
         """
-        open_statuses = ["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]
+        # Only intents with no evidence of a broker submission may expire by
+        # age. ACK/SUBMITTED/PARTIAL rows require broker reconciliation; aging
+        # them to EXPIRED can hide a real fill and orphan its position policy.
+        open_statuses = ["CREATED", "INTENT"]
         conditions = [
             self._schema.orders.c.env == env,
             self._schema.orders.c.status.in_(open_statuses),
@@ -3169,6 +3252,27 @@ class OrdersRepo:
         )
         if not rows:
             self._last_read_fail_open_op = "orders.get_order_by_client_order_key" if not rows else None
+        return rows[0] if rows else None
+
+    def get_order_by_kis_odno(self, env: str, kis_odno: str) -> dict | None:
+        broker_id = str(kis_odno or "").strip()
+        if not broker_id:
+            return None
+        stmt = select(self._schema.orders).where(
+            and_(
+                self._schema.orders.c.env == env,
+                or_(
+                    self._schema.orders.c.kis_odno == broker_id,
+                    self._schema.orders.c.broker_order_id == broker_id,
+                ),
+            )
+        ).order_by(self._schema.orders.c.created_at.desc())
+        rows = _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="orders.get_order_by_kis_odno",
+            fail_open=_resolve_lookup_fail_open(),
+        )
         return rows[0] if rows else None
 
     def has_blocking_order_today(
@@ -3820,6 +3924,15 @@ class OrdersRepo:
                 except Exception:
                     request_json = {}
             request_json = dict(request_json or {})
+            if request_json.get("enforce_entry_contract") is True:
+                try:
+                    _assert_kr_buy_entry_contract(request_json)
+                except RuntimeError as exc:
+                    logger.error(
+                        "[KR_BUY_ENTRY_CONTRACT][RECOVERY_BLOCK] env=%s code=%s reason=%s",
+                        env, code, exc,
+                    )
+                    continue
             plan = request_json.get("entry_exit_plan")
             if isinstance(plan, dict) and plan:
                 return {"entry_exit_plan": plan, "entry_meta": request_json.get("entry_meta") or {}}
@@ -5181,16 +5294,24 @@ class PositionsRepo:
             fail_open=_resolve_position_fail_open(),
         )
 
-    def get_position(self, *, env: str, strategy: str, sid: int, mode: int, code: str) -> dict | None:
-        stmt = select(self._schema.positions).where(
-            and_(
-                self._schema.positions.c.env == env,
-                self._schema.positions.c.strategy == strategy,
-                self._schema.positions.c.sid == sid,
-                self._schema.positions.c.mode == mode,
-                self._schema.positions.c.code == code,
-                self._schema.positions.c.status == "OPEN",
-            )
+    def get_position(
+        self, *, env: str, strategy: str, sid: int, mode: int, code: str,
+        position_cycle_id: str | None = None, portfolio_epoch_id: str | None = None,
+    ) -> dict | None:
+        conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.sid == sid,
+            self._schema.positions.c.mode == mode,
+            self._schema.positions.c.code == code,
+            self._schema.positions.c.status == "OPEN",
+        ]
+        if position_cycle_id:
+            conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
+        if portfolio_epoch_id:
+            conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
+        stmt = select(self._schema.positions).where(and_(*conditions)).order_by(
+            self._schema.positions.c.updated_at.desc()
         )
         rows = _safe_repo_read(
             self.engine,
@@ -5327,6 +5448,8 @@ class PositionsRepo:
         mode: int,
         code: str,
         fields: dict,
+        position_cycle_id: str | None = None,
+        portfolio_epoch_id: str | None = None,
     ) -> None:
         if not fields:
             return
@@ -5334,17 +5457,20 @@ class PositionsRepo:
         fail_soft = set(values).isdisjoint({"qty", "avg_buy_price", "total_cost", "realized_pnl"})
         try:
             with self.engine.begin() as conn:
+                conditions = [
+                    self._schema.positions.c.env == env,
+                    self._schema.positions.c.strategy == strategy,
+                    self._schema.positions.c.sid == sid,
+                    self._schema.positions.c.mode == mode,
+                    self._schema.positions.c.code == code,
+                    self._schema.positions.c.status == "OPEN",
+                ]
+                if position_cycle_id:
+                    conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
+                if portfolio_epoch_id:
+                    conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
                 existing = conn.execute(
-                    select(self._schema.positions).where(
-                        and_(
-                            self._schema.positions.c.env == env,
-                            self._schema.positions.c.strategy == strategy,
-                            self._schema.positions.c.sid == sid,
-                            self._schema.positions.c.mode == mode,
-                            self._schema.positions.c.code == code,
-                            self._schema.positions.c.status == "OPEN",
-                        )
-                    )
+                    select(self._schema.positions).where(and_(*conditions))
                 ).mappings().first()
                 existing_row = dict(existing) if existing else {}
                 if "entry_meta_json" in values:
@@ -5355,16 +5481,7 @@ class PositionsRepo:
                     values["position_meta"] = _merge_json_dict(existing_row.get("position_meta"), values.get("position_meta"))
                 stmt = (
                     sa.update(self._schema.positions)
-                    .where(
-                        and_(
-                            self._schema.positions.c.env == env,
-                            self._schema.positions.c.strategy == strategy,
-                            self._schema.positions.c.sid == sid,
-                            self._schema.positions.c.mode == mode,
-                            self._schema.positions.c.code == code,
-                            self._schema.positions.c.status == "OPEN",
-                        )
-                    )
+                    .where(and_(*conditions))
                     .values(**values, updated_at=func.now())
                 )
                 conn.execute(stmt)
@@ -5380,6 +5497,60 @@ class PositionsRepo:
                 )
                 return
             raise
+
+    def mark_profit_capture_fill(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        sid: int,
+        mode: int,
+        code: str,
+        position_cycle_id: str,
+        stage: str,
+        client_order_key: str,
+        filled_qty: int,
+    ) -> bool:
+        """Complete one KR TP stage only from a confirmed full SELL fill."""
+        stage_name = str(stage or "").lower()
+        if stage_name not in {"tp1", "tp2", "tp3"} or int(filled_qty or 0) <= 0:
+            return False
+        conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.sid == sid,
+            self._schema.positions.c.mode == mode,
+            self._schema.positions.c.code == str(code).zfill(6),
+            self._schema.positions.c.status == "OPEN",
+        ]
+        if position_cycle_id:
+            conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
+        with self.engine.begin() as conn:
+            row = conn.execute(select(self._schema.positions).where(and_(*conditions))).mappings().first()
+            if not row:
+                logger.error(
+                    "[KR_PROFIT_CAPTURE][FILL_SYNC_BLOCK] code=%s stage=%s cycle=%s reason=open_cycle_not_found",
+                    code, stage_name, position_cycle_id,
+                )
+                return False
+            meta = _merge_json_dict(row.get("position_meta"), {
+                f"kr_{stage_name}_pending": False,
+                f"kr_{stage_name}_done": True,
+                f"kr_{stage_name}_order_key": client_order_key,
+                f"kr_{stage_name}_filled_qty": int(filled_qty),
+                "kr_profit_capture_last_filled_stage": stage_name,
+            })
+            values: dict[str, Any] = {"position_meta": meta, "updated_at": func.now()}
+            if stage_name in {"tp1", "tp2"}:
+                values[f"{stage_name}_done"] = True
+            result = conn.execute(
+                sa.update(self._schema.positions).where(and_(*conditions)).values(**values)
+            )
+        logger.info(
+            "[KR_PROFIT_CAPTURE][FILL_SYNC] code=%s stage=%s cycle=%s filled_qty=%s updated=%s",
+            code, stage_name, position_cycle_id, filled_qty, int(result.rowcount or 0),
+        )
+        return bool(result.rowcount)
 
     def apply_fill(
         self,
