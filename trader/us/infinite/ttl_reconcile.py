@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -56,7 +56,7 @@ def _patch_order_meta(repository: Any, order: dict, patch: dict) -> None:
 def mark_first_unresolved(repository: Any, order: dict, *, when: datetime, reason: str) -> str:
     """Start the liveness clock independently of cancel acknowledgement.
 
-    PR127 rows may already have only ``tqqq_ttl_cancel_requested_at``.  When
+    PR127 rows may already have only ``tqqq_ttl_cancel_requested_at``. When
     backfilling the new first-unresolved field, preserve that older timestamp
     instead of resetting the clock to ``when``.
     """
@@ -117,8 +117,6 @@ def mark_manual_reconcile(repository: Any, order: dict, *, when: datetime,
         repository.mark_ttl_unresolved_escalated(
             order, escalated_at=when, unresolved_age_sec=unresolved_age_sec,
         )
-        # Existing repository method uses the legacy AFTER_CANCEL reason. Add
-        # the accurate generic reason without altering terminal status.
         _patch_order_meta(repository, order, {
             "manual_reconcile_reason": reason,
             "tqqq_ttl_unresolved_trigger": reason,
@@ -131,6 +129,96 @@ def mark_manual_reconcile(repository: Any, order: dict, *, when: datetime,
         "manual_reconcile_reason": reason,
         "tqqq_ttl_unresolved_trigger": reason,
     })
+
+
+def _normalized_order_no(value: Any) -> str:
+    from trader.us.utils.order_no import normalize_us_order_no
+    return normalize_us_order_no(str(value or ""))
+
+
+def _exact_zero_fill_observation(order: dict, observation: dict | None) -> bool:
+    """Require exact immutable identity and an untouched requested quantity."""
+    if not isinstance(observation, dict):
+        return False
+    requested = int(order.get("qty_requested") or order.get("qty") or 0)
+    if requested <= 0:
+        return False
+    observed_requested = int(
+        observation.get("requested_qty") or observation.get("qty_requested")
+        or observation.get("qty") or 0
+    )
+    observed_filled = int(
+        observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0
+    )
+    observed_remaining = int(
+        observation.get("remaining_qty")
+        if observation.get("remaining_qty") not in (None, "")
+        else max(0, observed_requested - observed_filled)
+    )
+    return bool(
+        _normalized_order_no(observation.get("order_no")) == _normalized_order_no(order.get("order_no"))
+        and str(observation.get("symbol") or "").upper() == "TQQQ"
+        and str(observation.get("side") or "").upper() == "BUY"
+        and observed_requested == requested
+        and observed_filled == 0
+        and observed_remaining == requested
+    )
+
+
+def historical_zero_fill_not_live_expiry(
+    order: dict,
+    *,
+    first_observation: dict | None,
+    cancel_error: BaseException | str,
+    retry_observation: dict | None,
+    now: datetime,
+) -> dict | None:
+    """Prove a historical zero-fill order is no longer live without guessing.
+
+    Evidence is intentionally conjunctive: both original-trade-date broker
+    queries must show the exact TQQQ BUY as untouched zero-fill, and the cancel
+    endpoint must explicitly say that the original order does not exist. Generic
+    HTTP/transport errors never qualify. This closes the Sep-02 stale-order
+    incident while preserving PR126's rule that cancel error text alone is not
+    terminal evidence.
+    """
+    try:
+        original_date = date.fromisoformat(str(order.get("trade_date") or ""))
+    except ValueError:
+        return None
+    if original_date >= now.astimezone(timezone.utc).date():
+        return None
+    error_text = str(cancel_error or "").lower()
+    not_live_tokens = (
+        "원주문번호가 존재하지 않습니다",
+        "original order number does not exist",
+        "original order does not exist",
+    )
+    if not any(token.lower() in error_text for token in not_live_tokens):
+        return None
+    if not _exact_zero_fill_observation(order, first_observation):
+        return None
+    if not _exact_zero_fill_observation(order, retry_observation):
+        return None
+    requested = int(order.get("qty_requested") or order.get("qty") or 0)
+    return {
+        "order_no": str(order.get("order_no") or ""),
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "EXPIRED",
+        "requested_qty": requested,
+        "filled_qty": 0,
+        "cumulative_filled_qty": 0,
+        "remaining_qty": requested,
+        "evidence_type": "TQQQ_TTL_HISTORICAL_ZERO_FILL_NOT_LIVE",
+        "observed_at": now.astimezone(timezone.utc).isoformat(),
+        "broker_proof": {
+            "original_trade_date": str(order.get("trade_date") or ""),
+            "first_query_zero_fill": True,
+            "cancel_original_order_not_found": True,
+            "retry_query_zero_fill": True,
+        },
+    }
 
 
 def immutable_kis_baseline(order: dict) -> tuple[int, int | None, float] | None:
@@ -149,6 +237,64 @@ def immutable_kis_baseline(order: dict) -> tuple[int, int | None, float] | None:
     except (TypeError, ValueError):
         return None
     return qty, orderable, avg
+
+
+def fetch_fresh_tqqq_preorder_position() -> dict:
+    """Fetch a dedicated fresh KIS balance snapshot immediately before TQQQ BUY.
+
+    A zero TQQQ holding is authoritative only when the *whole* fresh balance
+    contract is proven authoritative. This deliberately uses a new provider
+    without tick cache so balance-reconcile skip ticks cannot reuse DB/cached
+    positions as the immutable BUY baseline.
+    """
+    observed_at = datetime.now(timezone.utc).isoformat()
+    try:
+        from trader.us.data_provider import USDataProvider
+        balance = USDataProvider(offline=False).get_balance(force_refresh=True)
+    except Exception as exc:
+        return {"authoritative": False, "reason": "fresh_kis_balance_fetch_failed", "error": str(exc)}
+    if not isinstance(balance, dict):
+        return {"authoritative": False, "reason": "fresh_kis_balance_not_dict"}
+    if str(balance.get("balance_parse_status") or "").upper() != "OK":
+        return {"authoritative": False, "reason": "fresh_kis_balance_parse_not_ok"}
+    # Require explicit authority/completeness. Offline stubs and partial broker
+    # snapshots intentionally fail this contract rather than becoming fake zero.
+    if balance.get("balance_authoritative") is not True or balance.get("balance_complete") is not True:
+        return {"authoritative": False, "reason": "fresh_kis_balance_not_authoritative"}
+    positions = balance.get("positions") or []
+    if not isinstance(positions, list):
+        return {"authoritative": False, "reason": "fresh_kis_positions_not_list"}
+    row = next(
+        (p for p in positions if isinstance(p, dict) and str(p.get("symbol") or "").upper() == "TQQQ"),
+        None,
+    )
+    if row is None:
+        position = PositionSnapshot(
+            qty=0, orderable_qty=0, average_price=0.0, price=0.0, exchange="NASDAQ"
+        )
+    else:
+        try:
+            qty = int(float(row.get("qty") or row.get("holding_qty") or 0))
+            orderable_raw = row.get("orderable_qty")
+            if orderable_raw is None:
+                orderable_raw = row.get("sellable_qty")
+            orderable = int(float(orderable_raw)) if orderable_raw not in (None, "") else qty
+            avg = float(row.get("avg_price_usd") or row.get("broker_avg_price") or row.get("avg_cost") or 0.0)
+        except (TypeError, ValueError) as exc:
+            return {"authoritative": False, "reason": "fresh_kis_tqqq_position_parse_failed", "error": str(exc)}
+        position = PositionSnapshot(
+            qty=max(0, qty), orderable_qty=max(0, orderable), average_price=max(0.0, avg),
+            price=float(row.get("current_price_usd") or row.get("current_px") or 0.0),
+            exchange=str(row.get("exchange") or "NASDAQ"),
+        )
+        observed_at = str(row.get("broker_avg_price_asof") or row.get("balance_asof") or observed_at)
+    return {
+        "authoritative": True,
+        "reason": "ok",
+        "position": position,
+        "observed_at": observed_at,
+        "source": "kis_balance_authoritative",
+    }
 
 
 def _derived_incremental_avg(*, pre_qty: int, pre_avg: float,
