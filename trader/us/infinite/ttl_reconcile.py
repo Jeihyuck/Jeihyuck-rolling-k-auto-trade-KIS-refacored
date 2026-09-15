@@ -54,15 +54,24 @@ def _patch_order_meta(repository: Any, order: dict, patch: dict) -> None:
 
 
 def mark_first_unresolved(repository: Any, order: dict, *, when: datetime, reason: str) -> str:
-    """Start the liveness clock independently of cancel acknowledgement."""
+    """Start the liveness clock independently of cancel acknowledgement.
+
+    PR127 rows may already have only ``tqqq_ttl_cancel_requested_at``.  When
+    backfilling the new first-unresolved field, preserve that older timestamp
+    instead of resetting the clock to ``when``.
+    """
     meta = order_meta(order)
-    first = str(meta.get("tqqq_ttl_first_unresolved_at") or "")
+    explicit_first = str(meta.get("tqqq_ttl_first_unresolved_at") or "")
+    legacy_cancel = str(meta.get("tqqq_ttl_cancel_requested_at") or "")
+    first = explicit_first or legacy_cancel
     patch = {
         "tqqq_ttl_last_unresolved_at": when.astimezone(timezone.utc).isoformat(),
         "tqqq_ttl_last_unresolved_reason": str(reason or "UNKNOWN"),
     }
     if not first:
         first = when.astimezone(timezone.utc).isoformat()
+        patch["tqqq_ttl_first_unresolved_at"] = first
+    elif not explicit_first:
         patch["tqqq_ttl_first_unresolved_at"] = first
     _patch_order_meta(repository, order, patch)
     return first
@@ -72,8 +81,8 @@ def mark_cancel_attempt(repository: Any, order: dict, *, when: datetime,
                         result: dict | None = None) -> None:
     """Persist a cancel attempt even when the broker call raised.
 
-    `tqqq_ttl_cancel_requested_at` means the cancel API was attempted, not that
-    KIS acknowledged cancellation. Cancel ACK is still non-terminal.
+    ``tqqq_ttl_cancel_requested_at`` means the cancel API was attempted, not
+    that KIS acknowledged cancellation. Cancel ACK is still non-terminal.
     """
     meta = order_meta(order)
     first = str(meta.get("tqqq_ttl_cancel_requested_at") or when.astimezone(timezone.utc).isoformat())
