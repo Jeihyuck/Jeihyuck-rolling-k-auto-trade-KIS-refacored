@@ -16,13 +16,18 @@ class KISMarketcapTopProvider:
         "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
         "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
     }
+    # KIS [국내주식-091] requires every field below to be present.  Blank price
+    # and volume filters deliberately mean "no extra filter" so fixing the API
+    # contract does not silently change the universe-selection policy.
     DEFAULT_PARAMS = {
-        # 조건 스크린 코드/정렬 기준은 KIS 포털의 "국내주식 시가총액 상위" 기본값을 사용한다.
-        # 필요 시 환경 변수 혹은 코드 한 곳만 수정하면 되도록 상수로 모아둔다.
-        "FID_RANK_SORT_CLS_CODE": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
-        "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
+        "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20174"),
+        "FID_DIV_CLS_CODE": os.getenv("KIS_MKTCAP_DIV_CLS_CODE", "0"),
         "FID_INPUT_ISCD": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
-        "FID_PRC_CLS_CODE": os.getenv("KIS_MKTCAP_PRC_CLS_CODE", "0"),
+        "FID_TRGT_CLS_CODE": os.getenv("KIS_MKTCAP_TARGET_CLS_CODE", "0"),
+        "FID_TRGT_EXLS_CLS_CODE": os.getenv("KIS_MKTCAP_TARGET_EXCLUDE_CLS_CODE", "0"),
+        "FID_INPUT_PRICE_1": os.getenv("KIS_MKTCAP_INPUT_PRICE_1", ""),
+        "FID_INPUT_PRICE_2": os.getenv("KIS_MKTCAP_INPUT_PRICE_2", ""),
+        "FID_VOL_CNT": os.getenv("KIS_MKTCAP_VOL_CNT", ""),
     }
     MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
 
@@ -47,10 +52,11 @@ class KISMarketcapTopProvider:
         return self.MARKET_CODE_MAP.get(market.upper(), "J")
 
     def _build_params(self, market: str, n: int) -> dict:
+        # The market-cap ranking API has no FID_INPUT_CNT_1 field.  The provider
+        # limits the normalized response locally after the broker request.
         return {
             **self.params,
             "FID_COND_MRKT_DIV_CODE": self._market_code(market),
-            "FID_INPUT_CNT_1": str(n),
         }
 
     def validate_params(self, market: str, n: int) -> None:

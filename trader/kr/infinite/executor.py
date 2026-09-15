@@ -100,6 +100,40 @@ class KISExecutor:
                 fill_notional = float(fill_avg) * delta
         return BrokerOrderState(status, delta, fill_notional, fill_avg)
 
+    def _historical_unchanged_balance_expiry(
+        self, intent: OrderIntent, *, lookup_date: date, trade_date: date
+    ) -> BrokerOrderState | None:
+        """Prove an old domestic day order is no longer a live pending fence.
+
+        KRX cash orders are day orders.  When the original trade date is over,
+        daily-ccld is temporarily unavailable, and a fresh authoritative broker
+        balance still equals the immutable pre-order quantity, a zero-fill order
+        cannot remain live.  This proof is deliberately unavailable without a
+        broker order id/baseline and never applies to a current-day order.
+        """
+        if lookup_date >= trade_date:
+            return None
+        if not str(intent.broker_order_id or "").strip():
+            return None
+        if int(intent.filled_qty or 0) != 0:
+            return None
+        metadata = dict(intent.metadata or {})
+        if metadata.get("pre_order_holding_qty") is None:
+            return None
+        try:
+            pre_qty = int(float(metadata.get("pre_order_holding_qty")))
+            requested = int(intent.requested_qty or 0)
+            if pre_qty < 0 or requested <= 0:
+                return None
+            raw = self._balance()
+            row = self._position_row(raw, "122630")
+            post_qty = int(float(row.get("hldg_qty") or row.get("qty") or 0))
+        except Exception:
+            return None
+        if post_qty != pre_qty:
+            return None
+        return BrokerOrderState("EXPIRED")
+
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
         # Reconcile against the order's original trading day, not the current
         # session day. Domestic day orders do not migrate to a later trade date;
@@ -131,6 +165,11 @@ class KISExecutor:
             balance_proof = self._balance_delta_state(intent)
             if balance_proof is not None:
                 return balance_proof
+            historical_expiry = self._historical_unchanged_balance_expiry(
+                intent, lookup_date=lookup_date, trade_date=trade_date
+            )
+            if historical_expiry is not None:
+                return historical_expiry
             # A successful historical inquiry with no matching row can only
             # close a zero-fill day order. Durable partial-fill evidence stays
             # fenced because re-sizing a replacement from current holdings
