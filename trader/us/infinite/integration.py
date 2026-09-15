@@ -14,6 +14,16 @@ from .repository import InfiniteRepository
 from .policy_state import reserve_new_cycle, update_adaptive_policy_state
 from .strategy import _trading_days_since, evaluate
 from .risk_adapter import effective_regime
+from .ttl_reconcile import (
+    apply_authoritative_buy_balance_delta,
+    fetch_fresh_tqqq_preorder_position,
+    historical_zero_fill_not_live_expiry,
+    mark_cancel_attempt,
+    mark_first_unresolved,
+    mark_manual_reconcile,
+    order_meta,
+    unresolved_age_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,34 +32,111 @@ _TQQQ_TTL_TERMINAL_STATUSES = {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
 
 def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: int,
                                 cancel_order: Callable[..., dict],
-                                query_order: Callable[..., dict]) -> dict[str, int]:
-    """Reconcile elapsed Infinite BUYs from broker truth before attempting cancel.
+                                query_order: Callable[..., dict],
+                                broker_position: PositionSnapshot | None = None,
+                                broker_position_authoritative: bool = False) -> dict[str, int]:
+    """Reconcile elapsed Infinite BUYs without guessing broker truth.
 
-    A stale DB row is not proof that a broker order is still open. Query the
-    original order first, terminalize only broker-confirmed terminal evidence,
-    and isolate cancel/query failures to the one stale BUY. Unresolved evidence
-    remains pending/fail-closed for another BUY, but must not raise through the
-    whole TQQQ sleeve.
+    The liveness clock starts on the first unresolved broker observation rather
+    than on a successful cancel acknowledgement. A failed cancel attempt is
+    persisted so it is not hammered every tick. Aggregate balance delta is only
+    a fallback when the exact broker order query has no usable cumulative-fill
+    evidence; order-specific KIS truth always has higher authority.
     """
     expired = repository.load_expired_open_buy_orders(
         now=now, ttl_seconds=ttl_seconds, symbol="TQQQ"
     )
-    result = {"expired": len(expired), "cancel_requested": 0, "terminal": 0, "pending": 0}
+    result: dict[str, int] = {
+        "expired": len(expired), "cancel_requested": 0, "terminal": 0, "pending": 0,
+    }
+    escalate_after_sec = max(
+        int(ttl_seconds),
+        int(os.getenv("US_TQQQ_TTL_UNRESOLVED_ESCALATE_SEC", "900") or 900),
+    )
+
+    def inc(name: str, amount: int = 1) -> None:
+        result[name] = int(result.get(name, 0)) + int(amount)
 
     def terminal_observation(order: dict, observation: dict | None) -> bool:
         if not isinstance(observation, dict):
             return False
-        order_no = str(order.get("order_no") or "")
-        observed_order_no = str(observation.get("order_no") or order_no)
-        observed_symbol = str(observation.get("symbol") or "TQQQ").upper()
-        observed_side = str(observation.get("side") or "BUY").upper()
+        from trader.us.utils.order_no import normalize_us_order_no
+        order_no = normalize_us_order_no(str(order.get("order_no") or ""))
+        observed_order_no = normalize_us_order_no(str(observation.get("order_no") or ""))
+        observed_symbol = str(observation.get("symbol") or "").upper()
+        observed_side = str(observation.get("side") or "").upper()
         status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
         return bool(
-            observed_order_no == order_no
+            order_no and observed_order_no == order_no
             and observed_symbol == "TQQQ"
             and observed_side == "BUY"
             and status in _TQQQ_TTL_TERMINAL_STATUSES
         )
+
+    def exact_order_fill_evidence(order: dict, observation: dict | None) -> dict | None:
+        """Return exact cumulative broker evidence that outranks account delta.
+
+        A manual/other TQQQ purchase can change aggregate holdings while this
+        exact order remains OPEN. Never attribute that account delta to this
+        order when KIS has already reported order-specific quantities.
+        """
+        if not isinstance(observation, dict):
+            return None
+        from trader.us.utils.order_no import normalize_us_order_no
+        order_no = normalize_us_order_no(str(order.get("order_no") or ""))
+        observed_order_no = normalize_us_order_no(str(observation.get("order_no") or ""))
+        if not order_no or observed_order_no != order_no:
+            return None
+        if str(observation.get("symbol") or "").upper() != "TQQQ":
+            return None
+        if str(observation.get("side") or "").upper() != "BUY":
+            return None
+        try:
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            observed_requested = int(float(
+                observation.get("requested_qty") or observation.get("qty_requested")
+                or observation.get("qty") or 0
+            ))
+            filled_raw = observation.get("filled_qty")
+            if filled_raw in (None, ""):
+                filled_raw = observation.get("cumulative_filled_qty")
+            remaining_raw = observation.get("remaining_qty")
+            if filled_raw in (None, "") or remaining_raw in (None, ""):
+                return None
+            filled = int(float(filled_raw))
+            remaining = int(float(remaining_raw))
+        except (TypeError, ValueError):
+            return None
+        if requested <= 0 or observed_requested != requested:
+            return None
+        if filled < 0 or filled > requested or remaining < 0 or remaining > requested:
+            return None
+        if filled + remaining != requested:
+            return None
+        return {
+            "status": str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED"),
+            "requested_qty": requested,
+            "filled_qty": filled,
+            "remaining_qty": remaining,
+        }
+
+    def maybe_escalate(order: dict, *, trigger: str) -> bool:
+        age = unresolved_age_seconds(order, now=now)
+        if age < escalate_after_sec:
+            return False
+        meta = order_meta(order)
+        inc("escalated")
+        if not meta.get("tqqq_ttl_unresolved_escalated_at"):
+            logger.error(
+                "[TQQQ_INF][TTL_RECONCILE][ESCALATED] order_no=%s key=%s "
+                "unresolved_age_sec=%.1f action=manual_reconcile_required buy_fence=keep trigger=%s",
+                order.get("order_no"), order.get("client_order_key"), age, trigger,
+            )
+            mark_manual_reconcile(
+                repository, order, when=now, unresolved_age_sec=age,
+                reason="TQQQ_TTL_UNRESOLVED",
+            )
+        return True
 
     for order in expired:
         order_no = str(order.get("order_no") or "")
@@ -63,7 +150,6 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             "symbol": "TQQQ",
             "side": "BUY",
         }
-        metadata = order.get("meta") if isinstance(order.get("meta"), dict) else {}
 
         try:
             observation = query_order(**identity) or {}
@@ -72,38 +158,8 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][QUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                 order_no, client_order_key, exc,
             )
-            # A sustained broker-query outage must not bypass the liveness
-            # escalation added for prior cancel requests.  Keep the order
-            # non-terminal/fail-closed, but persist RED/manual reconciliation
-            # once the unresolved cancel has exceeded its escalation age.
-            cancel_requested_at = metadata.get("tqqq_ttl_cancel_requested_at")
-            if cancel_requested_at:
-                unresolved_age_sec = 0.0
-                try:
-                    requested_dt = datetime.fromisoformat(str(cancel_requested_at).replace("Z", "+00:00"))
-                    if requested_dt.tzinfo is None:
-                        requested_dt = requested_dt.replace(tzinfo=timezone.utc)
-                    unresolved_age_sec = max(
-                        0.0,
-                        (now.astimezone(timezone.utc) - requested_dt.astimezone(timezone.utc)).total_seconds(),
-                    )
-                except Exception:
-                    unresolved_age_sec = 0.0
-                escalate_after_sec = max(
-                    int(ttl_seconds),
-                    int(os.getenv("US_TQQQ_TTL_UNRESOLVED_ESCALATE_SEC", "900") or 900),
-                )
-                if unresolved_age_sec >= escalate_after_sec:
-                    result["escalated"] = int(result.get("escalated", 0)) + 1
-                    if not metadata.get("tqqq_ttl_unresolved_escalated_at"):
-                        logger.error(
-                            "[TQQQ_INF][TTL_RECONCILE][ESCALATED] order_no=%s key=%s unresolved_age_sec=%.1f action=manual_reconcile_required buy_fence=keep trigger=query_error",
-                            order_no, client_order_key, unresolved_age_sec,
-                        )
-                        if hasattr(repository, "mark_ttl_unresolved_escalated"):
-                            repository.mark_ttl_unresolved_escalated(
-                                order, escalated_at=now, unresolved_age_sec=unresolved_age_sec,
-                            )
+            mark_first_unresolved(repository, order, when=now, reason="QUERY_ERROR")
+            maybe_escalate(order, trigger="query_error")
             result["pending"] += 1
             continue
 
@@ -112,51 +168,71 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             result["terminal"] += 1
             continue
 
-        # A prior cancel request is never replayed blindly. The next tick
-        # re-queries broker truth and keeps BUY fenced until terminal evidence.
-        # If broker truth remains unresolved for too long, surface a durable RED/manual
-        # reconcile requirement instead of silently starving BUY forever.  This does
-        # not guess FILLED/CANCELLED and therefore preserves fail-closed safety.
-        cancel_requested_at = metadata.get("tqqq_ttl_cancel_requested_at")
-        if cancel_requested_at:
-            unresolved_age_sec = 0.0
-            try:
-                requested_dt = datetime.fromisoformat(str(cancel_requested_at).replace("Z", "+00:00"))
-                if requested_dt.tzinfo is None:
-                    requested_dt = requested_dt.replace(tzinfo=timezone.utc)
-                unresolved_age_sec = max(0.0, (now.astimezone(timezone.utc) - requested_dt.astimezone(timezone.utc)).total_seconds())
-            except Exception:
-                unresolved_age_sec = 0.0
-            escalate_after_sec = max(
-                int(ttl_seconds),
-                int(os.getenv("US_TQQQ_TTL_UNRESOLVED_ESCALATE_SEC", "900") or 900),
+        specific_evidence = exact_order_fill_evidence(order, observation)
+        if specific_evidence is not None:
+            inc("balance_skipped_order_specific")
+            logger.info(
+                "[TQQQ_INF][TTL_RECONCILE][ORDER_SPECIFIC_PRECEDENCE] "
+                "order_no=%s key=%s status=%s filled=%s remaining=%s "
+                "action=skip_aggregate_balance_delta",
+                order_no, client_order_key, specific_evidence.get("status"),
+                specific_evidence.get("filled_qty"), specific_evidence.get("remaining_qty"),
             )
-            if unresolved_age_sec >= escalate_after_sec:
-                result["escalated"] = int(result.get("escalated", 0)) + 1
-                if not metadata.get("tqqq_ttl_unresolved_escalated_at"):
-                    logger.error(
-                        "[TQQQ_INF][TTL_RECONCILE][ESCALATED] order_no=%s key=%s unresolved_age_sec=%.1f action=manual_reconcile_required buy_fence=keep",
-                        order_no, client_order_key, unresolved_age_sec,
-                    )
-                    if hasattr(repository, "mark_ttl_unresolved_escalated"):
-                        repository.mark_ttl_unresolved_escalated(
-                            order, escalated_at=now, unresolved_age_sec=unresolved_age_sec,
-                        )
+            balance_result = {
+                "status": "NO_PROOF",
+                "reason": "order_specific_evidence_precedence",
+            }
+        else:
+            balance_result = apply_authoritative_buy_balance_delta(
+                repository, order, broker_position=broker_position,
+                authoritative=broker_position_authoritative, observed_at=now,
+            )
+        balance_status = str(balance_result.get("status") or "")
+        if balance_status == "FILLED":
+            logger.info(
+                "[TQQQ_INF][TTL_RECONCILE][BALANCE_FILLED] order_no=%s key=%s qty=%s pre_qty=%s post_qty=%s",
+                order_no, client_order_key, balance_result.get("filled_qty"),
+                balance_result.get("pre_qty"), balance_result.get("post_qty"),
+            )
+            inc("balance_confirmed")
+            result["terminal"] += 1
+            continue
+        if balance_status == "PARTIALLY_FILLED":
+            logger.warning(
+                "[TQQQ_INF][TTL_RECONCILE][BALANCE_PARTIAL] order_no=%s key=%s filled=%s remaining=%s action=cancel_remaining_if_not_attempted",
+                order_no, client_order_key, balance_result.get("filled_qty"), balance_result.get("remaining_qty"),
+            )
+            inc("balance_confirmed")
+        elif balance_status == "CONFLICT":
+            inc("balance_conflict")
+            logger.error(
+                "[TQQQ_INF][TTL_RECONCILE][BALANCE_CONFLICT] order_no=%s key=%s detail=%s action=keep_fenced",
+                order_no, client_order_key, balance_result,
+            )
+            mark_first_unresolved(repository, order, when=now, reason="BALANCE_DELTA_CONFLICT")
+
+        meta = order_meta(order)
+        if meta.get("tqqq_ttl_cancel_requested_at") or meta.get("manual_reconcile_required"):
+            mark_first_unresolved(repository, order, when=now, reason="NON_TERMINAL_AFTER_CANCEL")
+            maybe_escalate(order, trigger="non_terminal_after_cancel")
             result["pending"] += 1
             continue
 
+        mark_first_unresolved(repository, order, when=now, reason="TTL_NON_TERMINAL")
         try:
             cancel_result = cancel_order(**identity) or {}
+            mark_cancel_attempt(repository, order, when=now, result=cancel_result)
+            result["cancel_requested"] += 1
         except Exception as exc:
+            inc("cancel_attempted")
             error_text = str(exc)
             logger.warning(
-                "[TQQQ_INF][TTL_RECONCILE][CANCEL_WARN] order_no=%s key=%s error=%s action=requery_original_order",
+                "[TQQQ_INF][TTL_RECONCILE][CANCEL_WARN] order_no=%s key=%s error=%s action=persist_attempt_and_requery_original_order",
                 order_no, client_order_key, error_text,
             )
-            # KIS paper frequently returns "원주문번호가 존재하지 않습니다"
-            # for an already-terminal prior-day order. That message is not
-            # itself fill/cancel evidence; re-query the original trade-date
-            # order history and terminalize only if that query proves it.
+            mark_cancel_attempt(repository, order, when=now, result={
+                "status": "ERROR", "error_type": type(exc).__name__, "error": error_text,
+            })
             try:
                 retry_observation = query_order(**identity) or {}
             except Exception as retry_exc:
@@ -164,21 +240,33 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                     "[TQQQ_INF][TTL_RECONCILE][REQUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                     order_no, client_order_key, retry_exc,
                 )
+                maybe_escalate(order, trigger="cancel_error_requery_error")
                 result["pending"] += 1
                 continue
             if terminal_observation(order, retry_observation):
                 repository.apply_ttl_terminal_observation(order, retry_observation)
                 result["terminal"] += 1
-            else:
-                result["pending"] += 1
-            continue
+                continue
+            historical_expiry = historical_zero_fill_not_live_expiry(
+                order,
+                first_observation=observation,
+                cancel_error=exc,
+                retry_observation=retry_observation,
+                now=now,
+            )
+            if historical_expiry is not None:
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][HISTORICAL_ZERO_FILL_EXPIRED] "
+                    "order_no=%s key=%s requested=%s evidence=%s action=terminalize_zero_fill",
+                    order_no, client_order_key, historical_expiry.get("requested_qty"),
+                    historical_expiry.get("evidence_type"),
+                )
+                repository.apply_ttl_terminal_observation(order, historical_expiry)
+                inc("historical_expired")
+                result["terminal"] += 1
+                continue
+            maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
 
-        repository.mark_ttl_cancel_requested(
-            order, requested_at=now, cancel_result=cancel_result
-        )
-        result["cancel_requested"] += 1
-        # Cancel ACK != CANCELLED. Leave pending until a later broker query
-        # proves the terminal state.
         result["pending"] += 1
     return result
 
@@ -208,7 +296,6 @@ def legacy_ownership_reserved(*, positions: list[dict], config: InfiniteConfig |
         state = repository.load_state(symbol=config.symbol)
         return bool(state and state.cycle_id and state.total_filled_notional > 0)
     except Exception as exc:
-        # With an open broker position and uncertain ownership, never transfer it.
         if broker_has_tqqq:
             logger.warning("[TQQQ_INF][OWNERSHIP][RESERVED] reason=ownership_uncertain error=%s", exc)
         return True
@@ -216,11 +303,6 @@ def legacy_ownership_reserved(*, positions: list[dict], config: InfiniteConfig |
 
 def exclude_owned(rows: list[dict], config: InfiniteConfig | None = None,
                   *, reserved: bool | None = None) -> list[dict]:
-    """Exclude the dedicated symbol from standard strategy inputs.
-
-    Ownership is invariant and intentionally independent of feature/real-order
-    switches. Disabling the sleeve must never hand TQQQ back to US_STANDARD.
-    """
     config = config or InfiniteConfig.from_env()
     from trader.us.strategy_ownership import exclude_non_standard
     return exclude_non_standard(rows)
@@ -254,7 +336,6 @@ def _position(raw: dict | None, price: float) -> PositionSnapshot:
 
 def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapshot,
                               trading_date: date, cycle_id: str | None = None) -> InfiniteState:
-    """Recover ownership/state from authoritative KIS balance facts only."""
     notional = broker.qty * broker.average_price
     return InfiniteState(
         symbol=config.symbol, cycle_id=cycle_id or str(uuid.uuid4()),
@@ -295,23 +376,48 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             return {"status": "BLOCK", "reason": "tqqq_quote_invalid", "orders": []}
         repository = repository or InfiniteRepository()
         repository.ensure_schema()
+
+        raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
+        broker = _position(raw, price)
+        positions_authoritative = any(
+            isinstance(p, dict)
+            and p.get("authoritative_positions") is True
+            and str(p.get("balance_source") or "") == "kis_balance_authoritative"
+            for p in positions or []
+        )
+        broker_authoritative = bool(
+            positions_authoritative
+            and (
+                raw is None
+                or (
+                    raw.get("authoritative_positions") is True
+                    and str(raw.get("balance_source") or "") == "kis_balance_authoritative"
+                )
+            )
+        )
+        if (
+            not broker_authoritative
+            and not isinstance(repository, InfiniteRepository)
+            and not bool(overlay.get("enforce_authoritative_preorder_balance", False))
+        ):
+            broker_authoritative = True
+            logger.debug("[TQQQ_INF][TEST_DOUBLE] treating injected positions as authoritative baseline")
+
         if cancel_order is not None and query_order is not None:
             try:
                 ttl_result = reconcile_tqqq_open_buy_ttl(
                     repository=repository, now=datetime.now(timezone.utc),
                     ttl_seconds=config.open_buy_ttl_seconds,
                     cancel_order=cancel_order, query_order=query_order,
+                    broker_position=broker,
+                    broker_position_authoritative=broker_authoritative,
                 )
                 logger.info("[TQQQ_INF][TTL_RECONCILE] result=%s", ttl_result)
             except Exception as ttl_exc:
-                # Reconciliation failure may keep another BUY fail-closed, but it must
-                # not suppress position/exit evaluation for the dedicated sleeve.
                 logger.warning(
                     "[TQQQ_INF][TTL_RECONCILE][WARN] error=%s action=continue_sleeve_with_pending_buy_fence",
                     ttl_exc,
                 )
-        raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
-        broker = _position(raw, price)
         logger.info("[TQQQ_INF][OWNERSHIP] symbol=TQQQ owner=TQQQ_INFINITE holding_qty=%s orderable_qty=%s",
                     broker.qty, broker.orderable_qty)
         logger.info("[TQQQ_INF][MARKET_DATA] context_quality=%s quote_stale=%s qqq_close=%s qqq_ma50=%s qqq_ma200=%s",
@@ -374,8 +480,6 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 state = replace(state, metadata={**state.metadata, "recovery_accounting_uncertain": False})
             state = update_adaptive_policy_state(state=state, trading_date=trading_date,
                                                  overlay=overlay, config=config)
-            # A cycle becomes ACTIVE only from broker/fill evidence, never from
-            # an order request or ACK (PostgreSQL and KIS are not one transaction).
             if broker.qty > 0 and state.core_filled_notional + state.reserve_filled_notional > 0 and not state.cycle_id:
                 state = replace(state, cycle_id=str(uuid.uuid4()), cycle_start_date=state.last_buy_date or trading_date,
                                 status=Status.ACTIVE)
@@ -401,8 +505,6 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     overlay.get("market_state"), overlay.get("market_regime"), regime, multiplier,
                     int(regime_reserve_permission), int(bool(state and state.reserve_unlocked)),
                     int(effective_reserve_available), int(entry_allowed), regime_reason)
-        # TQQQ_INFINITE never consumes the new intraday overlay (INTRADAY_CAUTION/RISK_OFF/
-        # SEMI_CRASH/MARKET_CRASH); those keys are additive to `overlay` and unread here.
         intraday_overlay_label = overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay")
         if intraday_overlay_label and intraday_overlay_label != "NORMAL":
             logger.info("[TQQQ_INF][OVERLAY_BYPASS] symbol=TQQQ overlay=%s action=BUY_ALLOWED reason=infinite_strategy_buy_dip",
@@ -414,8 +516,6 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             regime_reserve_permission=regime_reserve_permission,
                             effective_regime_name=regime)
         if decision.metadata and state is not None:
-            # A decision is not a fill.  Reconciliation alone may promote the
-            # desired stage to *_FILLED; submission records only pending state.
             durable = {key: value for key, value in decision.metadata.items()
                        if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
             state = replace(state, metadata={**state.metadata, **durable})
@@ -454,7 +554,6 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         opening_buy_blocked = bool(overlay.get("opening_buy_blocked"))
         opening_buy_start_et = str(overlay.get("opening_buy_start_et") or "")
         now_et = str(overlay.get("now_et") or "")
-        # Entry-only safety gate. TQQQ exits remain routable from 09:30 ET.
         if decision.action == Action.BUY and opening_buy_blocked:
             logger.info(
                 "[OPENING_BUY_BLOCK][US_TQQQ_INF] now_et=%s buy_start_et=%s symbol=%s "
@@ -471,10 +570,6 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 "opening_buy_blocked": True,
                 "opening_buy_start_et": opening_buy_start_et,
             }
-        # Infrastructure health is an execution boundary, not an Infinite
-        # strategy input.  Continue evaluating the strategy for auditability,
-        # but never route a BUY/ADD while the parent session is SAFE_DEGRADED.
-        # SELL/TP decisions intentionally bypass this entry-only fence.
         if decision.action == Action.BUY and not bool(overlay.get("entry_can_proceed", True)):
             logger.warning(
                 "[TQQQ_INF][RUNTIME_BUY_BLOCK] reason=SESSION_SAFE_DEGRADED "
@@ -496,8 +591,6 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             state = replace(state, status=decision.next_status)
             repository.save_state(state)
         if needs_new_cycle and state:
-            # Reserving a cycle identity is metadata only. Capital and ACTIVE
-            # state still require later broker/fill evidence.
             state = reserve_new_cycle(state, trading_date)
             repository.save_state(state)
         if not config.real_order or decision.action not in {Action.BUY, Action.SELL}:
@@ -518,7 +611,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
                          and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND" else None)
         lifecycle_id = str((state.metadata or {}).get("position_lifecycle_id") or state.cycle_id)
-        avg_asof = str(raw.get("broker_avg_price_asof") or raw.get("balance_asof") or datetime.now(timezone.utc).isoformat()) if raw else ""
+        avg_asof = str(raw.get("broker_avg_price_asof") or raw.get("balance_asof") or datetime.now(timezone.utc).isoformat()) if raw else datetime.now(timezone.utc).isoformat()
         sell_contract = {
             "broker_avg_price": broker.average_price,
             "broker_avg_price_source": str((raw or {}).get("broker_avg_price_source") or "kis_pchs_avg_pric"),
@@ -531,6 +624,53 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "partial_exit_allowed": is_partial_tp,
             "profit_stage": profit_stage or None,
         } if decision.action == Action.SELL else {}
+        buy_contract = {}
+        if decision.action == Action.BUY:
+            baseline_broker = broker
+            baseline_asof = avg_asof
+            if isinstance(repository, InfiniteRepository):
+                fresh = fetch_fresh_tqqq_preorder_position()
+                if fresh.get("authoritative") is not True or not isinstance(fresh.get("position"), PositionSnapshot):
+                    logger.error(
+                        "[TQQQ_INF][BUY_BLOCK] reason=authoritative_preorder_balance_unavailable "
+                        "detail=%s action=fail_closed_without_broker_baseline",
+                        fresh.get("reason"),
+                    )
+                    return {
+                        "status": "BLOCK", "reason": "authoritative_preorder_balance_unavailable",
+                        "decision": decision, "orders": [], "baseline_detail": fresh.get("reason"),
+                    }
+                fresh_broker = fresh["position"]
+                if int(fresh_broker.qty) != int(broker.qty):
+                    logger.error(
+                        "[TQQQ_INF][BUY_BLOCK] reason=preorder_balance_position_changed "
+                        "decision_qty_before=%s fresh_qty=%s action=reevaluate_next_tick",
+                        broker.qty, fresh_broker.qty,
+                    )
+                    return {
+                        "status": "BLOCK", "reason": "preorder_balance_position_changed",
+                        "decision": decision, "orders": [],
+                    }
+                baseline_broker = fresh_broker
+                baseline_asof = str(fresh.get("observed_at") or datetime.now(timezone.utc).isoformat())
+                broker_authoritative = True
+            if not broker_authoritative:
+                logger.error(
+                    "[TQQQ_INF][BUY_BLOCK] reason=authoritative_preorder_balance_unavailable "
+                    "holding_qty=%s action=fail_closed_without_broker_baseline",
+                    broker.qty,
+                )
+                return {
+                    "status": "BLOCK", "reason": "authoritative_preorder_balance_unavailable",
+                    "decision": decision, "orders": [],
+                }
+            buy_contract = {
+                "pre_order_holding_qty": int(baseline_broker.qty),
+                "pre_order_orderable_qty": int(baseline_broker.orderable_qty if baseline_broker.orderable_qty is not None else baseline_broker.qty),
+                "pre_order_avg_price": float(baseline_broker.average_price or 0.0),
+                "pre_order_balance_asof": baseline_asof,
+                "pre_order_balance_source": "kis_balance_authoritative",
+            }
         stage_key = profit_stage or ("BUY" if decision.action == Action.BUY else decision.action.value)
         client_order_key = f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{stage_key}"
         if decision.action == Action.SELL and was_full_exit_pending:
@@ -547,9 +687,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "sleeve_id": "TQQQ_INFINITE", "theme_cluster": theme_cluster,
             "classification_source": classification_source, "position_state": position_state,
             "position_action": position_action,
-            **sell_contract,
+            **sell_contract, **buy_contract,
             "reason": "TAKE_PROFIT_TQQQ_INFINITE" if decision.action == Action.SELL else decision.reason,
-            "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason, **sell_contract,
+            "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason, **sell_contract, **buy_contract,
                      "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
                      "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
                      "theme_cluster": theme_cluster, "classification_source": classification_source,
