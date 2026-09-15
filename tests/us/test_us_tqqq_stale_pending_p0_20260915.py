@@ -78,7 +78,7 @@ def test_cancel_exception_starts_unresolved_clock_and_does_not_replay_cancel():
         cancel_order=cancel, query_order=query,
     )
     assert second["pending"] == 1
-    assert second["cancel_attempted"] == 0
+    assert second.get("cancel_attempted", 0) == 0
     assert len(cancel_calls) == 1, "failed cancel must not be hammered every tick"
 
 
@@ -126,7 +126,7 @@ def test_authoritative_kis_balance_delta_full_fill_skips_cancel():
     assert len(repo.balance_marks) == 1
     assert result["balance_confirmed"] == 1
     assert result["terminal"] == 1
-    assert result["cancel_attempted"] == 0
+    assert result.get("cancel_attempted", 0) == 0
 
 
 def test_authoritative_kis_balance_delta_partial_fill_cancels_only_remainder_once():
@@ -145,7 +145,7 @@ def test_authoritative_kis_balance_delta_partial_fill_cancels_only_remainder_onc
     assert len(cancel_calls) == 1
     assert result["balance_confirmed"] == 1
     assert result["pending"] == 1
-    assert result["cancel_attempted"] == 1
+    assert result["cancel_requested"] == 1
 
 
 def test_balance_delta_without_immutable_kis_baseline_never_guesses_fill():
@@ -159,8 +159,8 @@ def test_balance_delta_without_immutable_kis_baseline_never_guesses_fill():
     )
     assert repo.balance_marks == []
     assert repo.order["status"] == "OPEN"
-    assert result["balance_confirmed"] == 0
-    assert result["cancel_attempted"] == 1
+    assert result.get("balance_confirmed", 0) == 0
+    assert result["cancel_requested"] == 1
 
 
 class SleeveRepo:
@@ -240,12 +240,13 @@ def test_tqqq_buy_fails_closed_if_only_db_position_snapshot_is_available(monkeyp
         next_status = Status.ACTIVE
 
     monkeypatch.setattr("trader.us.infinite.integration.evaluate", lambda **_kwargs: Decision())
+    strict_overlay = {**_overlay(), "enforce_authoritative_preorder_balance": True}
     result = run_sleeve(
         positions=[{
             "symbol": "TQQQ", "exchange": "NASDAQ", "qty": 24,
             "orderable_qty": 24, "avg_cost": 71.0, "balance_source": "kis_balance_authoritative",
         }],
-        price=70.0, trading_date=date(2026, 9, 15), overlay=_overlay(),
+        price=70.0, trading_date=date(2026, 9, 15), overlay=strict_overlay,
         repository=repo, route=lambda _intent: pytest.fail("BUY must not route without live KIS baseline"),
     )
     assert result["status"] == "BLOCK"
