@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
@@ -136,23 +137,32 @@ def _normalized_order_no(value: Any) -> str:
     return normalize_us_order_no(str(value or ""))
 
 
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
+        return default
+
+
 def _exact_zero_fill_observation(order: dict, observation: dict | None) -> bool:
     """Require exact immutable identity and an untouched requested quantity."""
     if not isinstance(observation, dict):
         return False
-    requested = int(order.get("qty_requested") or order.get("qty") or 0)
+    requested = _int_value(order.get("qty_requested") or order.get("qty"), 0)
     if requested <= 0:
         return False
-    observed_requested = int(
-        observation.get("requested_qty") or observation.get("qty_requested")
-        or observation.get("qty") or 0
+    observed_requested = _int_value(
+        observation.get("requested_qty") or observation.get("qty_requested") or observation.get("qty"), 0
     )
-    observed_filled = int(
-        observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0
+    observed_filled = _int_value(
+        observation.get("filled_qty") or observation.get("cumulative_filled_qty"), 0
     )
-    observed_remaining = int(
-        observation.get("remaining_qty")
-        if observation.get("remaining_qty") not in (None, "")
+    remaining_raw = observation.get("remaining_qty")
+    observed_remaining = (
+        _int_value(remaining_raw, 0)
+        if remaining_raw not in (None, "")
         else max(0, observed_requested - observed_filled)
     )
     return bool(
@@ -178,15 +188,16 @@ def historical_zero_fill_not_live_expiry(
     Evidence is intentionally conjunctive: both original-trade-date broker
     queries must show the exact TQQQ BUY as untouched zero-fill, and the cancel
     endpoint must explicitly say that the original order does not exist. Generic
-    HTTP/transport errors never qualify. This closes the Sep-02 stale-order
-    incident while preserving PR126's rule that cancel error text alone is not
-    terminal evidence.
+    HTTP/transport errors never qualify. The historical boundary is the US
+    trading calendar date (America/New_York), not UTC date; otherwise an order
+    from the still-active US session could be misclassified after UTC midnight.
     """
     try:
         original_date = date.fromisoformat(str(order.get("trade_date") or ""))
     except ValueError:
         return None
-    if original_date >= now.astimezone(timezone.utc).date():
+    current_us_trade_date = now.astimezone(ZoneInfo("America/New_York")).date()
+    if original_date >= current_us_trade_date:
         return None
     error_text = str(cancel_error or "").lower()
     not_live_tokens = (
@@ -200,7 +211,7 @@ def historical_zero_fill_not_live_expiry(
         return None
     if not _exact_zero_fill_observation(order, retry_observation):
         return None
-    requested = int(order.get("qty_requested") or order.get("qty") or 0)
+    requested = _int_value(order.get("qty_requested") or order.get("qty"), 0)
     return {
         "order_no": str(order.get("order_no") or ""),
         "symbol": "TQQQ",
@@ -214,6 +225,7 @@ def historical_zero_fill_not_live_expiry(
         "observed_at": now.astimezone(timezone.utc).isoformat(),
         "broker_proof": {
             "original_trade_date": str(order.get("trade_date") or ""),
+            "current_us_trade_date": current_us_trade_date.isoformat(),
             "first_query_zero_fill": True,
             "cancel_original_order_not_found": True,
             "retry_query_zero_fill": True,
@@ -257,8 +269,6 @@ def fetch_fresh_tqqq_preorder_position() -> dict:
         return {"authoritative": False, "reason": "fresh_kis_balance_not_dict"}
     if str(balance.get("balance_parse_status") or "").upper() != "OK":
         return {"authoritative": False, "reason": "fresh_kis_balance_parse_not_ok"}
-    # Require explicit authority/completeness. Offline stubs and partial broker
-    # snapshots intentionally fail this contract rather than becoming fake zero.
     if balance.get("balance_authoritative") is not True or balance.get("balance_complete") is not True:
         return {"authoritative": False, "reason": "fresh_kis_balance_not_authoritative"}
     positions = balance.get("positions") or []
