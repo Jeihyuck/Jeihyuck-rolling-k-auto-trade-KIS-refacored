@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from trader.us.infinite.integration import reconcile_tqqq_open_buy_ttl, run_sleeve
-from trader.us.infinite.models import InfiniteState, PositionSnapshot, Status
+from trader.us.infinite.models import Action, InfiniteState, PositionSnapshot, Status
 
 
 NOW = datetime(2026, 9, 15, 2, 0, tzinfo=timezone.utc)
@@ -30,20 +30,9 @@ class TTLRepo:
         self.cancel_marks = []
         self.escalations = []
         self.balance_marks = []
-        self.first_unresolved = []
 
     def load_expired_open_buy_orders(self, **_kwargs):
         return [self.order]
-
-    def mark_ttl_cancel_requested(self, order, *, requested_at, cancel_result=None):
-        order.setdefault("meta", {})["tqqq_ttl_cancel_requested_at"] = requested_at.isoformat()
-        order["meta"]["tqqq_ttl_cancel_result"] = cancel_result or {}
-        self.cancel_marks.append((requested_at, cancel_result or {}))
-
-    def mark_ttl_first_unresolved(self, order, *, first_unresolved_at, reason):
-        order.setdefault("meta", {}).setdefault("tqqq_ttl_first_unresolved_at", first_unresolved_at.isoformat())
-        order["meta"]["tqqq_ttl_last_unresolved_reason"] = reason
-        self.first_unresolved.append((first_unresolved_at, reason))
 
     def mark_ttl_unresolved_escalated(self, order, *, escalated_at, unresolved_age_sec):
         order.setdefault("meta", {})["tqqq_ttl_unresolved_escalated_at"] = escalated_at.isoformat()
@@ -64,7 +53,7 @@ class TTLRepo:
         return {"status": "OK", "order_status": order["status"], "qty_filled": filled}
 
 
-def test_cancel_exception_starts_unresolved_clock_and_does_not_replay_cancel(monkeypatch):
+def test_cancel_exception_starts_unresolved_clock_and_does_not_replay_cancel():
     repo = TTLRepo(_order())
     cancel_calls = []
 
@@ -78,6 +67,7 @@ def test_cancel_exception_starts_unresolved_clock_and_does_not_replay_cancel(mon
         repository=repo, now=NOW, ttl_seconds=120, cancel_order=cancel, query_order=query,
     )
     assert first["pending"] == 1
+    assert first["cancel_attempted"] == 1
     assert len(cancel_calls) == 1
     assert repo.order["meta"].get("tqqq_ttl_first_unresolved_at")
     assert repo.order["meta"].get("tqqq_ttl_cancel_requested_at")
@@ -88,10 +78,11 @@ def test_cancel_exception_starts_unresolved_clock_and_does_not_replay_cancel(mon
         cancel_order=cancel, query_order=query,
     )
     assert second["pending"] == 1
+    assert second["cancel_attempted"] == 0
     assert len(cancel_calls) == 1, "failed cancel must not be hammered every tick"
 
 
-def test_query_failure_starts_clock_and_escalates_without_inventing_terminal(monkeypatch):
+def test_query_failure_starts_clock_and_escalates_without_inventing_terminal():
     first_unresolved = NOW - timedelta(minutes=16)
     repo = TTLRepo(_order(meta={"tqqq_ttl_first_unresolved_at": first_unresolved.isoformat()}))
 
@@ -108,31 +99,53 @@ def test_query_failure_starts_clock_and_escalates_without_inventing_terminal(mon
     assert result["escalated"] == 1
     assert repo.order["status"] == "OPEN"
     assert repo.order["meta"]["manual_reconcile_required"] is True
+    assert repo.order["meta"]["manual_reconcile_reason"] == "TQQQ_TTL_UNRESOLVED"
 
 
-@pytest.mark.parametrize(
-    "post_qty,expected_status,expected_filled",
-    [(27, "FILLED", 3), (26, "PARTIALLY_FILLED", 2)],
-)
-def test_authoritative_kis_balance_delta_resolves_full_or_partial(post_qty, expected_status, expected_filled):
-    repo = TTLRepo(_order(meta={
+def _baseline_order():
+    return _order(meta={
         "pre_order_holding_qty": 24,
         "pre_order_orderable_qty": 24,
         "pre_order_avg_price": 71.0,
         "pre_order_balance_source": "kis_balance_authoritative",
         "pre_order_balance_asof": "2026-09-02T13:30:00+00:00",
-    }))
+    })
+
+
+def test_authoritative_kis_balance_delta_full_fill_skips_cancel():
+    repo = TTLRepo(_baseline_order())
     result = reconcile_tqqq_open_buy_ttl(
         repository=repo, now=NOW, ttl_seconds=120,
-        cancel_order=lambda **_kwargs: pytest.fail("balance truth should resolve before cancel"),
+        cancel_order=lambda **_kwargs: pytest.fail("full balance proof must resolve before cancel"),
         query_order=lambda **_kwargs: {},
-        broker_position=PositionSnapshot(qty=post_qty, orderable_qty=post_qty, average_price=72.0, price=72.0),
+        broker_position=PositionSnapshot(qty=27, orderable_qty=27, average_price=72.0, price=72.0),
         broker_position_authoritative=True,
     )
-    assert repo.order["status"] == expected_status
-    assert repo.order["qty_filled"] == expected_filled
+    assert repo.order["status"] == "FILLED"
+    assert repo.order["qty_filled"] == 3
     assert len(repo.balance_marks) == 1
     assert result["balance_confirmed"] == 1
+    assert result["terminal"] == 1
+    assert result["cancel_attempted"] == 0
+
+
+def test_authoritative_kis_balance_delta_partial_fill_cancels_only_remainder_once():
+    repo = TTLRepo(_baseline_order())
+    cancel_calls = []
+    result = reconcile_tqqq_open_buy_ttl(
+        repository=repo, now=NOW, ttl_seconds=120,
+        cancel_order=lambda **kwargs: cancel_calls.append(kwargs) or {"status": "ACK"},
+        query_order=lambda **_kwargs: {},
+        broker_position=PositionSnapshot(qty=26, orderable_qty=26, average_price=72.0, price=72.0),
+        broker_position_authoritative=True,
+    )
+    assert repo.order["status"] == "PARTIALLY_FILLED"
+    assert repo.order["qty_filled"] == 2
+    assert len(repo.balance_marks) == 1
+    assert len(cancel_calls) == 1
+    assert result["balance_confirmed"] == 1
+    assert result["pending"] == 1
+    assert result["cancel_attempted"] == 1
 
 
 def test_balance_delta_without_immutable_kis_baseline_never_guesses_fill():
@@ -147,6 +160,7 @@ def test_balance_delta_without_immutable_kis_baseline_never_guesses_fill():
     assert repo.balance_marks == []
     assert repo.order["status"] == "OPEN"
     assert result["balance_confirmed"] == 0
+    assert result["cancel_attempted"] == 1
 
 
 class SleeveRepo:
@@ -184,7 +198,7 @@ def test_tqqq_buy_intent_persists_authoritative_preorder_kis_baseline(monkeypatc
     captured = []
 
     class Decision:
-        action = type("A", (), {"value": "BUY"})()
+        action = Action.BUY
         qty = 3
         notional = 210.0
         reason = "BUY_DIP_CORE"
@@ -210,3 +224,29 @@ def test_tqqq_buy_intent_persists_authoritative_preorder_kis_baseline(monkeypatc
     assert intent["pre_order_balance_source"] == "kis_balance_authoritative"
     assert intent["meta"]["pre_order_holding_qty"] == 24
     assert intent["meta"]["pre_order_balance_source"] == "kis_balance_authoritative"
+
+
+def test_tqqq_buy_fails_closed_if_only_db_position_snapshot_is_available(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    repo = SleeveRepo()
+
+    class Decision:
+        action = Action.BUY
+        qty = 3
+        notional = 210.0
+        reason = "BUY_DIP_CORE"
+        metadata = {}
+        next_status = Status.ACTIVE
+
+    monkeypatch.setattr("trader.us.infinite.integration.evaluate", lambda **_kwargs: Decision())
+    result = run_sleeve(
+        positions=[{
+            "symbol": "TQQQ", "exchange": "NASDAQ", "qty": 24,
+            "orderable_qty": 24, "avg_cost": 71.0, "balance_source": "kis_balance_authoritative",
+        }],
+        price=70.0, trading_date=date(2026, 9, 15), overlay=_overlay(),
+        repository=repo, route=lambda _intent: pytest.fail("BUY must not route without live KIS baseline"),
+    )
+    assert result["status"] == "BLOCK"
+    assert result["reason"] == "authoritative_preorder_balance_unavailable"
