@@ -16,6 +16,8 @@ from .strategy import _trading_days_since, evaluate
 from .risk_adapter import effective_regime
 from .ttl_reconcile import (
     apply_authoritative_buy_balance_delta,
+    fetch_fresh_tqqq_preorder_position,
+    historical_zero_fill_not_live_expiry,
     mark_cancel_attempt,
     mark_first_unresolved,
     mark_manual_reconcile,
@@ -174,8 +176,8 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             mark_cancel_attempt(repository, order, when=now, result={
                 "status": "ERROR", "error_type": type(exc).__name__, "error": error_text,
             })
-            # "원주문번호가 존재하지 않습니다" is not terminal evidence. Re-query
-            # the original trade-date order and terminalize only broker truth.
+            # The KIS "original order does not exist" message alone is not
+            # terminal evidence. Re-query the original trade-date order first.
             try:
                 retry_observation = query_order(**identity) or {}
             except Exception as retry_exc:
@@ -188,6 +190,24 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 continue
             if terminal_observation(order, retry_observation):
                 repository.apply_ttl_terminal_observation(order, retry_observation)
+                result["terminal"] += 1
+                continue
+            historical_expiry = historical_zero_fill_not_live_expiry(
+                order,
+                first_observation=observation,
+                cancel_error=exc,
+                retry_observation=retry_observation,
+                now=now,
+            )
+            if historical_expiry is not None:
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][HISTORICAL_ZERO_FILL_EXPIRED] "
+                    "order_no=%s key=%s requested=%s evidence=%s action=terminalize_zero_fill",
+                    order_no, client_order_key, historical_expiry.get("requested_qty"),
+                    historical_expiry.get("evidence_type"),
+                )
+                repository.apply_ttl_terminal_observation(order, historical_expiry)
+                inc("historical_expired")
                 result["terminal"] += 1
                 continue
             maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
@@ -582,6 +602,34 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         } if decision.action == Action.SELL else {}
         buy_contract = {}
         if decision.action == Action.BUY:
+            baseline_broker = broker
+            baseline_asof = avg_asof
+            if isinstance(repository, InfiniteRepository):
+                fresh = fetch_fresh_tqqq_preorder_position()
+                if fresh.get("authoritative") is not True or not isinstance(fresh.get("position"), PositionSnapshot):
+                    logger.error(
+                        "[TQQQ_INF][BUY_BLOCK] reason=authoritative_preorder_balance_unavailable "
+                        "detail=%s action=fail_closed_without_broker_baseline",
+                        fresh.get("reason"),
+                    )
+                    return {
+                        "status": "BLOCK", "reason": "authoritative_preorder_balance_unavailable",
+                        "decision": decision, "orders": [], "baseline_detail": fresh.get("reason"),
+                    }
+                fresh_broker = fresh["position"]
+                if int(fresh_broker.qty) != int(broker.qty):
+                    logger.error(
+                        "[TQQQ_INF][BUY_BLOCK] reason=preorder_balance_position_changed "
+                        "decision_qty_before=%s fresh_qty=%s action=reevaluate_next_tick",
+                        broker.qty, fresh_broker.qty,
+                    )
+                    return {
+                        "status": "BLOCK", "reason": "preorder_balance_position_changed",
+                        "decision": decision, "orders": [],
+                    }
+                baseline_broker = fresh_broker
+                baseline_asof = str(fresh.get("observed_at") or datetime.now(timezone.utc).isoformat())
+                broker_authoritative = True
             if not broker_authoritative:
                 logger.error(
                     "[TQQQ_INF][BUY_BLOCK] reason=authoritative_preorder_balance_unavailable "
@@ -593,10 +641,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     "decision": decision, "orders": [],
                 }
             buy_contract = {
-                "pre_order_holding_qty": int(broker.qty),
-                "pre_order_orderable_qty": int(broker.orderable_qty if broker.orderable_qty is not None else broker.qty),
-                "pre_order_avg_price": float(broker.average_price or 0.0),
-                "pre_order_balance_asof": avg_asof,
+                "pre_order_holding_qty": int(baseline_broker.qty),
+                "pre_order_orderable_qty": int(baseline_broker.orderable_qty if baseline_broker.orderable_qty is not None else baseline_broker.qty),
+                "pre_order_avg_price": float(baseline_broker.average_price or 0.0),
+                "pre_order_balance_asof": baseline_asof,
                 "pre_order_balance_source": "kis_balance_authoritative",
             }
         stage_key = profit_stage or ("BUY" if decision.action == Action.BUY else decision.action.value)
