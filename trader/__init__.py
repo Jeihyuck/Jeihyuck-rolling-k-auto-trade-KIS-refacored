@@ -73,6 +73,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.kr.broker_truth_historical_retry_safety import install_historical_retry_safety
     from trader.kr.broker_truth_cross_date_unowned_retry import install_cross_date_unowned_retry
     from trader.kr.broker_truth_pending_fill_fence import install_pending_fill_application_fence
+    from trader.kr.runtime_integrity_20260915 import install_kr_20260915_runtime_integrity
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
@@ -83,6 +84,9 @@ def install_legacy_pb1_runtime_guards() -> None:
     # Preserve reconciliation watermarks and upgrade BUY attribution with
     # retry-safe, atomic position application.
     install_final_review_guards()
+    # Close the Sep-15 production gaps only after the canonical broker-truth
+    # guards are installed.  This adds no strategy-policy changes.
+    install_kr_20260915_runtime_integrity()
     # Compatibility/observability repair runs after the canonical atomic guard.
     # It mirrors legacy evidence and entry_ts without controlling idempotency.
     install_buy_observability_compat()
