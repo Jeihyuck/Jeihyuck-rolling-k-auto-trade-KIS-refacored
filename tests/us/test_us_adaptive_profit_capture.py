@@ -39,7 +39,7 @@ def test_us_fast_dip_add_buy_ignores_overlay():
     decision = evaluate(config=InfiniteConfig(), state=state,
                         position=PositionSnapshot(qty=10, orderable_qty=10, average_price=100, price=99),
                         trading_date=date(2026, 8, 20), overlay={**_overlay(), "market_state": "RISK_OFF", "force_entry_block": True, "allow_new_buy": False},
-                        daily_filled_buy_notional=0)
+                        daily_filled_buy_notional=0, effective_regime_name="RISK_OFF")
     assert decision.action == Action.BUY
     assert decision.reason == "FAST_DIP_ADD_BUY"
     assert decision.qty == 2
