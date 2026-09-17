@@ -148,8 +148,10 @@ def test_replay_reports_open_cycle_and_risk_off_audit_metrics():
     assert result["incomplete_cycle_count"] == 1
     assert result["final_qty"] > 0
     assert result["maximum_cycle_duration_sessions"] == 2
-    assert result["risk_off_buy_count"] == 0
-    assert result["regime_buy_counts"] == {"NEUTRAL": 1}
+    # Held TQQQ fast-dip is intentionally active in RISK_OFF after PR132;
+    # these are adds to an existing Infinite cycle, not new-cycle risk-off entries.
+    assert result["risk_off_buy_count"] == 2
+    assert result["regime_buy_counts"] == {"NEUTRAL": 1, "RISK_OFF": 2}
     assert result["maximum_deployed_notional"] <= 10_000
     assert result["daily_cap_violation_count"] == 0
     assert result["final_evaluation_amount"] == result["lowest_cash"] + result["final_qty"] * 44

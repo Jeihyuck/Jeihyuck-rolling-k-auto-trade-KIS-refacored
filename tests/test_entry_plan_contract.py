@@ -11,7 +11,11 @@ from trader.trade_plan import build_entry_exit_plan, seed_plan_fields_for_entry_
 
 
 class FakeKis:
+    def __init__(self):
+        self.buy_calls: list[tuple[str, int, float]] = []
+
     def buy_stock_limit(self, code: str, qty: int, price: float) -> dict:
+        self.buy_calls.append((code, qty, price))
         return {"rt_cd": "0", "msg_cd": "0", "msg1": "accepted", "output": {"ODNO": f"O-{code}-{qty}"}}
 
 
@@ -39,6 +43,9 @@ def make_engine():
 
 
 def test_entry_plan_survives_from_orderable_to_submit(monkeypatch):
+    from trader.kr.runtime_integrity_20260917 import install_kr_20260917_runtime_integrity
+
+    install_kr_20260917_runtime_integrity()
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     engine = make_engine()
     cf = CandidateFeature(
@@ -89,6 +96,14 @@ def test_entry_plan_survives_from_orderable_to_submit(monkeypatch):
     status = engine._place_entry(cf)
     assert status["api_submitted"] == 1
     assert status["submit_attempted"] == 1
+    assert engine.kis.buy_calls, "durable BUY contract must reach broker API submit"
+
+    persisted = engine.orders_repo.get_order_by_client_order_key("practice", "test-key")
+    assert persisted is not None
+    request = persisted["request_json"]
+    assert request["entry_contract_version"] == "kr_buy_entry_contract_v1"
+    assert request["entry_contract_sha256"]
+    assert request["entry_exit_plan"]
 
 
 def test_build_entry_exit_plan_accepts_raw_and_entry_styles():

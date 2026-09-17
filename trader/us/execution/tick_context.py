@@ -45,6 +45,25 @@ class TickExecutionContext:
     metrics: dict[str, float | int] = field(default_factory=dict)
     post_order_balance_refreshes: int = 0
 
+    @staticmethod
+    def _authoritative_balance(snapshot: Any) -> bool:
+        if not isinstance(snapshot, dict) or not snapshot:
+            return False
+        if snapshot.get("balance_authoritative") is True:
+            return True
+        return bool(
+            snapshot.get("balance_complete") is True
+            and str(snapshot.get("balance_parse_status") or "OK").upper() == "OK"
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        # trade_tick_runner assigns the reconciled KIS snapshot after context
+        # construction.  Prime the SELL pre-submit snapshot at that exact point
+        # so order_router does not perform another NASD->NYSE->AMEX sweep.
+        if name == "balance_snapshot" and self._authoritative_balance(value):
+            object.__setattr__(self, "sell_balance_snapshot", value)
+
     def __post_init__(self) -> None:
         self.active_tick_id = self.active_tick_id or self.tick_id
         self.active_session_run_id = self.active_session_run_id or self.session_run_id
@@ -52,6 +71,8 @@ class TickExecutionContext:
             self.active_session_generation = self.session_generation
         if self.balance_snapshot and self.balance_snapshot_at is None:
             self.balance_snapshot_at = time.monotonic()
+        if self._authoritative_balance(self.balance_snapshot) and not self.sell_balance_snapshot:
+            self.sell_balance_snapshot = self.balance_snapshot
         if self.fills_snapshot and self.fills_snapshot_at is None:
             self.fills_snapshot_at = time.monotonic()
 

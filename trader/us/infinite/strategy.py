@@ -144,7 +144,6 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                 sell_qty = min(orderable, max(1, int(orderable * fraction)))
                 if fraction >= 0.99:
                     sell_qty = orderable
-                key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
                 return Decision(Action.SELL, f"TAKE_PROFIT_{next_stage}", sell_qty,
                                 sell_qty * position.price, Status.EXIT_PENDING,
                                 {"profit_stage": next_stage, "tp1_sold_qty": sell_qty if next_stage != "TP2" else state_metadata.get("tp1_sold_qty", 0),
@@ -168,7 +167,6 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                 sell_qty = min(orderable, max(1, int(orderable * fraction)))
                 if fraction >= 0.99:
                     sell_qty = orderable
-                key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
                 return Decision(Action.SELL, f"TAKE_PROFIT_{next_stage}", sell_qty,
                                 sell_qty * position.price, Status.EXIT_PENDING,
                                 {"profit_stage": next_stage, "desired_profit_stage": next_stage,
@@ -189,24 +187,81 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
-    # Structural TQQQ regime permission is strategy-owned and must be identical
-    # in production and replay. Exits above remain routable even when BUY/ADD is
-    # blocked by crash/unknown regime policy.
-    if not entry_allowed:
-        return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if position.qty > 0 and not config.allow_sell:
         return Decision(Action.BLOCK, "sell_permission_disabled")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
         return Decision(Action.BLOCK, "daily_buy_limit")
+
+    metadata = state.metadata or {}
     overlay = dict(overlay or {})
+    recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
+                              and not metadata.get("last_buy_fill_price"))
+    days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
+                  if state.last_buy_date else 10_000)
+    last_fill = state_metadata.get("last_buy_fill_price")
+    try:
+        last_fill = float(last_fill) if last_fill is not None else None
+    except (TypeError, ValueError):
+        last_fill = None
+    fast_policy_regime = str(
+        effective_regime_name or overlay.get("market_regime") or overlay.get("market_state") or ""
+    ).upper()
+    fast_overlay_state = str(overlay.get("market_state") or "").upper()
+    fast_long_trend = str(metadata.get("long_trend") or classify_long_trend(
+        overlay, bool(metadata.get("structural_bear_seen"))
+    )).upper()
+    fast_dip_regime_override = bool(
+        fast_policy_regime in {"DEFENSIVE", "RISK_OFF", "DEFENSE_RISK_OFF"}
+        and (
+            fast_long_trend == "BULL"
+            or fast_overlay_state in {"RISK_OFF", "DEFENSE_RISK_OFF"}
+        )
+    )
+
+    # Held TQQQ fast-dip is strategy-owned. It bypasses the ordinary
+    # DEFENSIVE/RISK_OFF wait that blocked Sep-16 and preserves the pre-existing
+    # explicit RISK_OFF overlay exception, while CHOP/capital-preservation and
+    # unrelated BEAR runway contracts stay intact.
+    fast_dip_add_eligible = bool(
+        position.qty > 0
+        and not recovery_uncertain
+        and last_fill is not None
+        and days_since >= 1
+        and position.price <= last_fill * 0.99
+        and fast_dip_regime_override
+    )
+    if fast_dip_add_eligible:
+        budget = min(
+            config.unit_usd,
+            config.max_daily_buy_usd - daily_filled_buy_notional,
+            config.max_total_capital_usd - state.total_filled_notional,
+        )
+        qty = math.floor(max(0.0, budget) / position.price)
+        if qty > 0:
+            return Decision(
+                Action.BUY, "FAST_DIP_ADD_BUY", qty=qty,
+                notional=qty * position.price, next_status=Status.ACTIVE,
+                metadata={
+                    "fast_dip": True,
+                    "overlay_bypass": True,
+                    "last_buy_fill_price": last_fill,
+                    "fast_dip_threshold_price": last_fill * 0.99,
+                    "fast_dip_policy": "HELD_TQQQ_LAST_FILL_MINUS_1PCT",
+                    "fast_dip_regime": fast_policy_regime,
+                    "fast_dip_long_trend": fast_long_trend,
+                },
+            )
+
+    # Structural regime permission still governs new cycles and routine adds,
+    # but the held defensive/risk-off fast-dip exception is evaluated first.
+    if not entry_allowed:
+        return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
+
     infinite_overlay_bypass = config.symbol == "TQQQ"
     # PB1 intraday labels are deliberately not used as strategy conditions here.
     # Presence/absence of intraday keys must not change TQQQ runway decisions.
-    metadata = state.metadata or {}
-    recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
-                              and not metadata.get("last_buy_fill_price"))
     if infinite_overlay_bypass:
         overlay["strategy_owner"] = "TQQQ_INFINITE"
     risk = assess_market_risk(overlay)
@@ -232,40 +287,17 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             valid_context = False
     if not valid_context:
         return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
-    days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
-                  if state.last_buy_date else 10_000)
-    fast_dip_add_eligible = False
-    if position.qty > 0 and "last_buy_fill_price" in state_metadata and not recovery_uncertain:
-        last_fill = state_metadata.get("last_buy_fill_price")
-        try:
-            last_fill = float(last_fill) if last_fill is not None else None
-        except (TypeError, ValueError):
-            last_fill = None
-        if last_fill is not None and position.price <= last_fill * 0.99 and days_since >= 1:
-            fast_dip_add_eligible = True
-    # Fast-dip is only an exception to an explicit production entry block. It
-    # must not jump ahead of TQQQ-owned CHOP/BEAR/capital-preservation runway.
-    if (fast_dip_add_eligible and position.qty > 0 and not pending_buy and
-            (overlay.get("force_entry_block") is True or
-             overlay.get("allow_new_buy") is False)):
-        budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
-                     config.max_total_capital_usd - state.total_filled_notional)
-        qty = math.floor(budget / position.price)
-        if qty > 0:
-            return Decision(Action.BUY, "FAST_DIP_ADD_BUY", qty=qty,
-                            notional=qty * position.price, next_status=Status.ACTIVE,
-                            metadata={"fast_dip": True, "overlay_bypass": True})
     if position.qty <= 0 and effective_regime_name in {
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
-    if overlay.get("force_entry_block") is True and not fast_dip_add_eligible:
+    if overlay.get("force_entry_block") is True:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
     if position.qty <= 0 and overlay.get("allow_new_buy") is False:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
         # Standard gross/cluster overlays do not own this sleeve. Only an
-        # explicitly TQQQ-scoped capital flag may pause its adds.
+        # explicitly TQQQ-scoped capital flag may pause its routine adds.
         if overlay.get("tqqq_capital_preservation"):
             return Decision(Action.BLOCK, "tqqq_capital_preservation")
 
@@ -309,11 +341,6 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
                   if state.last_buy_date else 10_000)
 
-    last_fill = state_metadata.get("last_buy_fill_price")
-    try:
-        last_fill = float(last_fill) if last_fill is not None else None
-    except (TypeError, ValueError):
-        last_fill = None
     if policy_regime == "DEFENSE_CRASH_REBOUND":
         probe_date = metadata.get("rebound_probe_date")
         try:
@@ -374,23 +401,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         )
         if not deep_bear:
             return Decision(Action.BLOCK, "deep_bear_core_locked")
-    if (position.qty > 0 and overlay.get("allow_add_to_existing") is not False and days_since >= 1
-            and last_fill and position.price <= last_fill * 0.99 and not pending_buy
-            and daily_filled_buy_notional < config.max_daily_buy_usd - 1e-6):
-        budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
-                     config.max_total_capital_usd - state.total_filled_notional)
-        qty = math.floor(budget / position.price)
-        if qty > 0:
-            return Decision(Action.BUY, "FAST_DIP_ADD_BUY", qty=qty,
-                            notional=qty * position.price, next_status=Status.ACTIVE,
-                            metadata={"fast_dip": True, "overlay_bypass": True})
     if core_left <= 0 and not effective_reserve_available:
         return Decision(Action.BLOCK, "reserve_locked")
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
-    # Structural TQQQ regime sizing always wins. PB1 intraday overlays remain
-    # ignored without being allowed to inflate the TQQQ-owned multiplier.
+    # Structural TQQQ regime sizing always wins for routine/non-fast-dip adds.
     effective_buy_multiplier = buy_multiplier
     budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)

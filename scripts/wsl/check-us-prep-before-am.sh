@@ -38,24 +38,30 @@ else
 fi
 check() {
 python - "$trade_date" <<'PY'
-import json, sys
-from pathlib import Path
+import sys
 trade_date=sys.argv[1]
-base=Path('runtime/us/watchlist')/trade_date
-contract=base/'prep_contract.json'
-final30=base/'final30_scored.json'
-count=0
-if final30.exists():
-    data=json.loads(final30.read_text() or '[]')
-    count=len(data.get('rows', data) if isinstance(data, dict) else data)
-if contract.exists() and count >= 10:
-    print('OK artifact final30_scored_count=%d' % count); raise SystemExit(0)
+try:
+    # Canonical loader resolves runtime/us/watchlist/<date>/final30_scored.json.
+    from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
+    contract = load_us_prep_contract(trade_date) or {}
+    rows = load_us_final30_scored(trade_date) or []
+    status = str(contract.get('status') or '').upper()
+    if status in {'OK', 'OK_WITH_WARNINGS'} and len(rows) >= 10:
+        print('OK artifact final30_scored_count=%d prep_status=%s' % (len(rows), status))
+        raise SystemExit(0)
+except SystemExit:
+    raise
+except Exception as exc:
+    print('ARTIFACT_CHECK_WARN %s' % exc)
 try:
     from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
     prep=load_latest_us_prep_status(trade_date) or {}
     rows=load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
-    if (prep.get('status') in {'OK','OK_WITH_WARNINGS'} and len(rows) >= 10) or len(rows) >= 10:
-        print('OK db locked_watchlist_count=%d' % len(rows)); raise SystemExit(0)
+    if prep.get('status') in {'OK','OK_WITH_WARNINGS'} and len(rows) >= 10:
+        print('OK db locked_watchlist_count=%d prep_status=%s' % (len(rows), prep.get('status')))
+        raise SystemExit(0)
+except SystemExit:
+    raise
 except Exception as exc:
     print('DB_CHECK_WARN %s' % exc)
 raise SystemExit(1)
