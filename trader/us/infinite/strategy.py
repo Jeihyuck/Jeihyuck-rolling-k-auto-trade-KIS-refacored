@@ -208,24 +208,29 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     fast_policy_regime = str(
         effective_regime_name or overlay.get("market_regime") or overlay.get("market_state") or ""
     ).upper()
+    fast_overlay_state = str(overlay.get("market_state") or "").upper()
     fast_long_trend = str(metadata.get("long_trend") or classify_long_trend(
         overlay, bool(metadata.get("structural_bear_seen"))
     )).upper()
+    fast_dip_regime_override = bool(
+        fast_policy_regime in {"DEFENSIVE", "RISK_OFF", "DEFENSE_RISK_OFF"}
+        and (
+            fast_long_trend == "BULL"
+            or fast_overlay_state in {"RISK_OFF", "DEFENSE_RISK_OFF"}
+        )
+    )
 
-    # Sep-16 exposed a policy inversion: a held TQQQ position had an attributed
-    # last BUY fill, traded more than 1% below it, and was still blocked only
-    # because the structural regime was DEFENSIVE while the long trend was BULL.
-    # Restore the intended Infinite dip-add for that exact defensive-bull case,
-    # without bypassing CHOP, capital-preservation, BEAR runway, pending-order,
-    # daily-cap, total-cap, or broker/runtime safety contracts.
+    # Held TQQQ fast-dip is strategy-owned. It bypasses the ordinary
+    # DEFENSIVE/RISK_OFF wait that blocked Sep-16 and preserves the pre-existing
+    # explicit RISK_OFF overlay exception, while CHOP/capital-preservation and
+    # unrelated BEAR runway contracts stay intact.
     fast_dip_add_eligible = bool(
         position.qty > 0
         and not recovery_uncertain
         and last_fill is not None
         and days_since >= 1
         and position.price <= last_fill * 0.99
-        and fast_policy_regime in {"DEFENSIVE", "RISK_OFF", "DEFENSE_RISK_OFF"}
-        and fast_long_trend == "BULL"
+        and fast_dip_regime_override
     )
     if fast_dip_add_eligible:
         budget = min(
@@ -250,7 +255,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             )
 
     # Structural regime permission still governs new cycles and routine adds,
-    # but the held DEFENSIVE/RISK_OFF BULL fast-dip exception is evaluated first.
+    # but the held defensive/risk-off fast-dip exception is evaluated first.
     if not entry_allowed:
         return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
 
