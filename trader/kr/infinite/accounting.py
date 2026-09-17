@@ -1,31 +1,49 @@
 import math
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from dataclasses import replace
 from datetime import date
 from .models import BrokerOrderState, OrderIntent, State, Status
+
+
+def _money(value) -> Decimal:
+    """Canonical KRW arithmetic across DB/broker float/Decimal round trips."""
+    if value in (None, ""):
+        return Decimal("0")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+    return result if result.is_finite() else Decimal("0")
+
 
 def validate_invariants(state: State, broker_qty: int) -> None:
     if broker_qty < 0: raise ValueError("KR_INF_BROKER_QTY_INVALID")
     if not (0 <= state.units_used <= 40 and 0 <= state.core_units_used <= 30 and 0 <= state.reserve_units_used <= 10):
         raise ValueError("KR_INF_UNIT_INVARIANT")
     if state.core_units_used + state.reserve_units_used != state.units_used: raise ValueError("KR_INF_UNIT_SUM_INVARIANT")
-    filled = Decimal(str(state.filled_notional))
-    allocated = Decimal(str(state.allocated_capital_krw))
-    if min(Decimal(str(state.core_filled_notional)), Decimal(str(state.reserve_filled_notional))) < 0 or filled > allocated + Decimal("0.01"):
+    filled = _money(state.filled_notional)
+    allocated = _money(state.allocated_capital_krw)
+    if min(_money(state.core_filled_notional), _money(state.reserve_filled_notional)) < 0 or filled > allocated + Decimal("0.01"):
         raise ValueError("KR_INF_CAPITAL_INVARIANT")
 
+
 def buy_quantity(state: State, orderable_cash: float, price: float) -> tuple[int,float]:
-    available=max(Decimal("0"), min(Decimal(str(orderable_cash)), Decimal(str(state.allocated_capital_krw))-Decimal(str(state.filled_notional))))
-    budget=min(Decimal(str(state.unit_krw)),available)
-    price_decimal = Decimal(str(price))
+    available=max(Decimal("0"), min(_money(orderable_cash), _money(state.allocated_capital_krw)-_money(state.filled_notional)))
+    budget=min(_money(state.unit_krw),available)
+    price_decimal = _money(price)
     qty=int(budget / price_decimal) if price_decimal > 0 else 0
     return qty, qty*price
+
 
 def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderState,
                          trade_date: date) -> tuple[State, int, float]:
     """Apply only the newly confirmed portion of a broker fill."""
-    delta_qty = max(0, broker.filled_qty - intent.filled_qty)
-    delta_notional = max(0.0, broker.filled_notional_krw - intent.filled_notional_krw)
+    delta_qty = max(0, int(broker.filled_qty or 0) - int(intent.filled_qty or 0))
+    delta_notional_decimal = max(
+        Decimal("0"),
+        _money(broker.filled_notional_krw) - _money(intent.filled_notional_krw),
+    )
+    delta_notional = float(delta_notional_decimal)
     if delta_qty > 0 and intent.side in {"SELL_PARTIAL", "SELL_ALL"}:
         pending = str((state.metadata or {}).get("pending_profit_stage") or "").upper()
         fully_filled = broker.filled_qty >= intent.requested_qty > 0
@@ -41,7 +59,7 @@ def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderS
             # is diagnostic only and cannot unlock TP2.
             metadata["partial_profit_stage"] = pending.removesuffix("_SUBMITTED") + "_PARTIAL" if pending else "PARTIAL"
         return replace(state, metadata=metadata), delta_qty, delta_notional
-    if delta_qty <= 0 or delta_notional <= 0 or intent.side not in {"BUY", "RECOVERY"}:
+    if delta_qty <= 0 or delta_notional_decimal <= 0 or intent.side not in {"BUY", "RECOVERY"}:
         return state, 0, 0.0
     new_unit = intent.filled_qty == 0
     sequence = intent.unit_sequence or (state.units_used + (1 if new_unit else 0))
