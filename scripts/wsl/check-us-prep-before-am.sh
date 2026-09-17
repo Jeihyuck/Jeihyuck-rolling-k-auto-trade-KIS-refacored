@@ -41,6 +41,7 @@ python - "$trade_date" <<'PY'
 import sys
 trade_date=sys.argv[1]
 try:
+    # Canonical loader resolves runtime/us/watchlist/<date>/final30_scored.json.
     from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
     contract = load_us_prep_contract(trade_date) or {}
     rows = load_us_final30_scored(trade_date) or []
