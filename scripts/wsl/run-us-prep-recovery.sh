@@ -48,8 +48,5 @@ export US_PREP_RECOVERY_RUN="${US_PREP_RECOVERY_RUN:-1}"
 export US_ALLOW_DEGRADED_IN_TRADE="${US_ALLOW_DEGRADED_IN_TRADE:-1}"
 export US_WSL_RECOVERY_SOURCE="scheduler-pre-am-recovery"
 
-set +e
-bash scripts/wsl/run-us-prep.sh
-rc=$?
-set -e
-exit "$rc"
+# Preserve the existing single-owner/shared-lock handoff contract.
+exec bash scripts/wsl/run-us-prep.sh
