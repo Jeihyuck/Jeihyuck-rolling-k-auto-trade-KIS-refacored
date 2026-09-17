@@ -1,10 +1,10 @@
 """Process-safe KIS practice REST rate governor.
 
 KIS practice REST traffic is account-wide, while KisUSClient historically
-throttled per endpoint and per client instance.  Multiple USDataProvider /
+throttled per endpoint and per client instance. Multiple USDataProvider /
 KisUSClient instances can therefore burst different endpoints at the same
-practice account.  This module installs one narrow requests hook that only
-serializes requests to the KIS VTS host.  It is process-safe through a file
+practice account. This module installs one narrow requests hook that only
+serializes requests to the KIS VTS host. It is process-safe through a file
 lock so separate US worker processes share the same request-start clock.
 """
 from __future__ import annotations
@@ -22,6 +22,8 @@ _INSTALLED = False
 
 
 def _enabled() -> bool:
+    if os.getenv("PYTEST_CURRENT_TEST") and str(os.getenv("US_KIS_GLOBAL_RATE_GOVERNOR_TEST", "0")) != "1":
+        return False
     return str(os.getenv("US_KIS_GLOBAL_RATE_GOVERNOR", "1")).strip().lower() not in {
         "0", "false", "no", "off"
     }
@@ -68,8 +70,6 @@ def _wait_for_global_slot(method: str, url: str) -> float:
                 last = float(state_path.read_text(encoding="utf-8").strip() or 0.0)
             except Exception:
                 last = 0.0
-            # A stale/future timestamp (clock correction or copied runtime file)
-            # must never create an unbounded sleep.
             elapsed = now - last
             if last > 0 and 0.0 <= elapsed < interval:
                 waited = interval - elapsed
