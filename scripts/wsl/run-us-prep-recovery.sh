@@ -25,8 +25,31 @@ deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 mkdir -p runtime runtime/locks runtime/health
 
+# A completed same-day PREP is the effective contract. Never create a newer
+# STARTED recovery row over an already valid contract merely because a caller
+# asks recovery to run again.
+if python - "$NULLIM_TRADE_DATE" <<'PY'
+import sys
+trade_date = sys.argv[1]
+from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
+contract = load_us_prep_contract(trade_date) or {}
+rows = load_us_final30_scored(trade_date) or []
+status = str(contract.get("status") or "").upper()
+if status in {"OK", "OK_WITH_WARNINGS"} and len(rows) >= 10:
+    print(f"[US_PREP_RECOVERY][SKIP_EFFECTIVE_PREP] trade_date={trade_date} status={status} final30={len(rows)}")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+then
+  exit 0
+fi
+
 export US_PREP_RECOVERY_RUN="${US_PREP_RECOVERY_RUN:-1}"
 export US_ALLOW_DEGRADED_IN_TRADE="${US_ALLOW_DEGRADED_IN_TRADE:-1}"
 export US_WSL_RECOVERY_SOURCE="scheduler-pre-am-recovery"
 
-exec bash scripts/wsl/run-us-prep.sh
+set +e
+bash scripts/wsl/run-us-prep.sh
+rc=$?
+set -e
+exit "$rc"
