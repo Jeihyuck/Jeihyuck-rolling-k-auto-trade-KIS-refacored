@@ -195,6 +195,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "daily_buy_limit")
 
     metadata = state.metadata or {}
+    overlay = dict(overlay or {})
     recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
                               and not metadata.get("last_buy_fill_price"))
     days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
@@ -204,18 +205,27 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         last_fill = float(last_fill) if last_fill is not None else None
     except (TypeError, ValueError):
         last_fill = None
+    fast_policy_regime = str(
+        effective_regime_name or overlay.get("market_regime") or overlay.get("market_state") or ""
+    ).upper()
+    fast_long_trend = str(metadata.get("long_trend") or classify_long_trend(
+        overlay, bool(metadata.get("structural_bear_seen"))
+    )).upper()
 
-    # TQQQ Infinite core contract: once TQQQ is already held, a verified 1%
-    # decline from the last actual BUY fill is an add signal. Structural market
-    # labels (DEFENSIVE/RISK_OFF/long-trend runway) do not own this sleeve and
-    # must not suppress the dip-add. Runtime/broker safety gates still execute
-    # in integration/order routing after this pure strategy decision.
+    # Sep-16 exposed a policy inversion: a held TQQQ position had an attributed
+    # last BUY fill, traded more than 1% below it, and was still blocked only
+    # because the structural regime was DEFENSIVE while the long trend was BULL.
+    # Restore the intended Infinite dip-add for that exact defensive-bull case,
+    # without bypassing CHOP, capital-preservation, BEAR runway, pending-order,
+    # daily-cap, total-cap, or broker/runtime safety contracts.
     fast_dip_add_eligible = bool(
         position.qty > 0
         and not recovery_uncertain
         and last_fill is not None
         and days_since >= 1
         and position.price <= last_fill * 0.99
+        and fast_policy_regime in {"DEFENSIVE", "RISK_OFF", "DEFENSE_RISK_OFF"}
+        and fast_long_trend == "BULL"
     )
     if fast_dip_add_eligible:
         budget = min(
@@ -234,15 +244,16 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                     "last_buy_fill_price": last_fill,
                     "fast_dip_threshold_price": last_fill * 0.99,
                     "fast_dip_policy": "HELD_TQQQ_LAST_FILL_MINUS_1PCT",
+                    "fast_dip_regime": fast_policy_regime,
+                    "fast_dip_long_trend": fast_long_trend,
                 },
             )
 
     # Structural regime permission still governs new cycles and routine adds,
-    # but it is deliberately evaluated after the held-position fast-dip rule.
+    # but the held DEFENSIVE/RISK_OFF BULL fast-dip exception is evaluated first.
     if not entry_allowed:
         return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
 
-    overlay = dict(overlay or {})
     infinite_overlay_bypass = config.symbol == "TQQQ"
     # PB1 intraday labels are deliberately not used as strategy conditions here.
     # Presence/absence of intraday keys must not change TQQQ runway decisions.
