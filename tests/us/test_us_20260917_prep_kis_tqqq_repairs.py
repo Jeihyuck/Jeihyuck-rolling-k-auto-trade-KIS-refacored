@@ -49,14 +49,15 @@ def test_tqqq_fast_dip_still_respects_pending_and_daily_safety_fences():
         status=Status.ACTIVE,
         core_filled_notional=2000.0,
         last_buy_date=date(2026, 9, 15),
-        metadata={"last_buy_fill_price": 69.41},
+        metadata={"last_buy_fill_price": 69.41, "long_trend": "BULL"},
     )
     position = PositionSnapshot(qty=27, orderable_qty=27, average_price=71.973, price=66.60)
 
     pending = evaluate(
         config=InfiniteConfig(), state=state, position=position,
         trading_date=date(2026, 9, 16), pending_buy=True,
-        overlay={}, entry_allowed=False, effective_regime_name="DEFENSIVE",
+        overlay={"market_state": "DEFENSE_RISK_OFF", "market_regime": "DEFENSIVE"},
+        entry_allowed=False, effective_regime_name="DEFENSIVE",
     )
     assert pending.action == Action.BLOCK
     assert pending.reason == "tqqq_pending_order_exists"
@@ -64,7 +65,8 @@ def test_tqqq_fast_dip_still_respects_pending_and_daily_safety_fences():
     capped = evaluate(
         config=InfiniteConfig(), state=state, position=position,
         trading_date=date(2026, 9, 16), daily_filled_buy_notional=250.0,
-        overlay={}, entry_allowed=False, effective_regime_name="DEFENSIVE",
+        overlay={"market_state": "DEFENSE_RISK_OFF", "market_regime": "DEFENSIVE"},
+        entry_allowed=False, effective_regime_name="DEFENSIVE",
     )
     assert capped.action == Action.BLOCK
     assert capped.reason == "daily_buy_limit"
@@ -114,6 +116,7 @@ def test_preflight_uses_canonical_final30_loader_and_recovery_protects_completed
 
     assert "load_us_final30_scored" in preflight
     assert "load_us_prep_contract" in preflight
+    assert "final30_scored.json" in preflight
     assert "data.get('rows', data)" not in preflight
     assert "SKIP_EFFECTIVE_PREP" in recovery
-    assert "exec bash scripts/wsl/run-us-prep.sh" not in recovery
+    assert "exec bash scripts/wsl/run-us-prep.sh" in recovery
