@@ -855,6 +855,7 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
         stages = default_stages
         local_runner_min = runner_min
         contract_sha = None
+        contract_partial_exit_allowed = None
         try:
             from trader.us.entry_exit_contract import (
                 extract_us_entry_exit_contract,
@@ -872,6 +873,9 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             pc = contract_profit_capture(p)
             if entry_contract and pc:
                 contract_sha = entry_contract.get("sha256")
+                contract_partial_exit_allowed = bool(
+                    (entry_contract.get("management") or {}).get("partial_exit_allowed", False)
+                )
                 if not pc.get("enabled", True):
                     continue
                 local_runner_min = float(pc.get("runner_min_remain_pct", runner_min))
@@ -907,7 +911,7 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 if qty > 0:
                     lifecycle = str(p.get("position_lifecycle_id"))
                     order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2" if contract_sha else "LEGACY_GLOBAL_TP"}})
+                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {})}})
                     if trade_date:
                         try:
                             from trader.us.db.repos import mark_us_profit_capture_stage
