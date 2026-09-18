@@ -1,14 +1,23 @@
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import copy
+import json
 
+import pandas as pd
 import pytest
 import sqlalchemy as sa
 
-from trader.db.repos import OrdersRepo, PositionsRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.exit_policy.router import resolve_exit_policy_for_position
-from trader.kr.market_state_overlay import generate_kr_profit_capture_intents
+from trader.kr.market_state_overlay import (
+    build_kr_policy_missing_adoption,
+    generate_kr_profit_capture_intents,
+    is_verified_kr_policy_missing_adoption,
+)
+from trader.pb1_engine import PB1Engine
 from trader.trade_plan import build_entry_exit_plan
+from trader.window_router import WindowDecision
 
 
 def _plan(style: str = "ENTRY_PULLBACK"):
@@ -273,3 +282,116 @@ def test_kr_pyramid_add_is_bound_to_authoritative_parent_contract(monkeypatch):
             portfolio_epoch_id=str(parent["portfolio_epoch_id"]),
             position_cycle_id=str(parent["position_cycle_id"]),
         )
+
+
+
+def _kr_engine_for_exit(now_kst: datetime):
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(engine).metadata.create_all(engine)
+    pb1 = PB1Engine(
+        universe_repo=object(),
+        orders_repo=OrdersRepo(engine),
+        fills_repo=FillsRepo(engine),
+        positions_repo=PositionsRepo(engine),
+        ledger_repo=LedgerEventsRepo(engine),
+        kis=None,
+        window=WindowDecision(name="close", phase="exit"),
+        window_label="close",
+        phase="exit",
+        dry_run=True,
+        env="practice",
+        run_id="kr-p0-exit",
+        intended_live=False,
+        now_kst_value=now_kst,
+        compute_only_full_run=True,
+        trading_day=True,
+        order_allowed=False,
+    )
+    pb1._kr_market_state_overlay = {"market_state": "KR_NORMAL"}
+    return pb1
+
+
+def test_jw_pharma_fractional_average_and_json_roundtrip_verify_in_core():
+    original = {
+        "code": "067290",
+        "symbol": "067290",
+        "qty": 593,
+        "orderable_qty": 593,
+        "avg_buy_price": 2358.671,
+        "entry_thesis": "POLICY_MISSING",
+        "exit_policy_family": "POLICY_MISSING",
+        "position_cycle_id": "jw-cycle",
+        "portfolio_epoch_id": "jw-epoch",
+        "position_meta": {"position_origin": "IMPORTED"},
+    }
+    adoption = build_kr_policy_missing_adoption(original, current_price=3600.0)
+    assert adoption is not None
+    persisted = {**original, **adoption["position_fields"]}
+    persisted["avg_buy_price"] = 2358.6709999999998
+    persisted["entry_exit_plan_json"] = json.dumps(
+        persisted["entry_exit_plan_json"], ensure_ascii=False
+    )
+    persisted["position_meta"] = json.dumps(
+        persisted["position_meta"], ensure_ascii=False
+    )
+    assert is_verified_kr_policy_missing_adoption(persisted) is True
+
+
+def test_eotech_legacy_unknown_entry_date_close_generates_tp1(monkeypatch, caplog):
+    now = datetime(2026, 9, 18, 15, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    pb1 = _kr_engine_for_exit(now)
+    monkeypatch.setenv("KR_PROFIT_CAPTURE_ENABLE", "1")
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "1")
+    monkeypatch.setattr(
+        pb1, "_resolve_price_with_fallback",
+        lambda code, ohlcv_close=None: (471000.0, "test"),
+    )
+
+    base = {
+        "code": "039030",
+        "symbol": "039030",
+        "market": "KOSDAQ",
+        "sid": 1,
+        "mode": 1,
+        "qty": 1,
+        "orderable_qty": 1,
+        "kis_qty": 1,
+        "holding_source": "kis_balance",
+        "avg_buy_price": 412500.0,
+        "last_price": 471000.0,
+        "entry_date": None,
+        "entry_ts": None,
+        "last_fill_at": None,
+        "holding_days": 0,
+        "trading_days_held": 0,
+        "calendar_days_held": 0,
+        "holding_bars": 0,
+        "entry_thesis": "POLICY_MISSING",
+        "exit_policy_family": "POLICY_MISSING",
+        "position_cycle_id": "eotech-cycle",
+        "portfolio_epoch_id": "eotech-epoch",
+        "position_meta": {
+            "position_origin": "IMPORTED",
+            "holding_age_unknown": True,
+        },
+    }
+    adoption = build_kr_policy_missing_adoption(base, current_price=471000.0)
+    assert adoption is not None
+    pos = {**base, **adoption["position_fields"]}
+    assert is_verified_kr_policy_missing_adoption(pos)
+
+    features = {
+        "close": 471000.0,
+        "ma20": 450000.0,
+        "ma50": 430000.0,
+        "_exit_ohlcv_source": "test",
+    }
+    caplog.set_level("INFO")
+    payload = pb1._plan_exit_event(pos, features, pd.DataFrame(), "close")
+    assert payload is not None
+    assert payload["decision_reason"] == "KR_TAKE_PROFIT_TP1"
+    assert payload["router_qty"] == 1
+    assert payload["exit_ok"] is True
+    assert "[KR_POSITION_AGE][UNKNOWN_ENTRY_NOT_SAME_DAY] code=039030" in caplog.text
+    assert "[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=039030" in caplog.text
+    assert "window=close" in caplog.text
