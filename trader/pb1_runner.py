@@ -3427,6 +3427,16 @@ def _resolve_session_exit_grace_sec() -> int:
         return 15
 
 
+def _resolve_kr_shared_tick_budget(
+    *, remaining_to_session_end: float, base_tick_timeout: float, grace_sec: float
+) -> float:
+    """US-parity budget: reserve graceful-exit time before the session boundary."""
+    return min(
+        max(0.0, float(base_tick_timeout)),
+        max(0.0, float(remaining_to_session_end) - max(0.0, float(grace_sec))),
+    )
+
+
 class TickTimeoutError(TimeoutError):
     pass
 
@@ -7632,9 +7642,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             # US-parity: one authoritative tick deadline is shared by the
             # watchdog and every KR KIS request/retry.  The grace is reserved
             # *before* session end so Python exits before the outer shell kill.
-            shared_tick_budget_sec = min(
-                float(base_tick_timeout),
-                max(0.0, remaining_to_session_end - float(grace_sec)),
+            shared_tick_budget_sec = _resolve_kr_shared_tick_budget(
+                remaining_to_session_end=remaining_to_session_end,
+                base_tick_timeout=base_tick_timeout,
+                grace_sec=grace_sec,
             )
             if shared_tick_budget_sec < 5.0:
                 logger.info(
