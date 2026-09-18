@@ -43,11 +43,29 @@ def save_trend_state(symbol: str, trade_date: str, trend: dict) -> dict:
     return trend
 
 
-def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetime, current_price: float | None, holding_trade_days: int = 0, final30: dict | None = None, daily: dict | None = None, lifecycle_id: str | None = None) -> dict:
+def update_us_position_trend_state(
+    *,
+    symbol: str,
+    trade_date: str,
+    now: datetime,
+    current_price: float | None,
+    holding_trade_days: int = 0,
+    final30: dict | None = None,
+    daily: dict | None = None,
+    lifecycle_id: str | None = None,
+    warning_threshold: float | None = None,
+    severe_threshold: float | None = None,
+) -> dict:
     prev = load_trend_state(symbol, trade_date)
     once = prev.get("last_daily_update_trade_date") != trade_date
-    warning_thr = float(os.getenv("US_TREND_SCORE_WARNING_THRESHOLD", "0.45"))
-    severe_thr = float(os.getenv("US_TREND_SCORE_SEVERE_THRESHOLD", "0.35"))
+    warning_thr = float(
+        warning_threshold if warning_threshold is not None
+        else os.getenv("US_TREND_SCORE_WARNING_THRESHOLD", "0.45")
+    )
+    severe_thr = float(
+        severe_threshold if severe_threshold is not None
+        else os.getenv("US_TREND_SCORE_SEVERE_THRESHOLD", "0.35")
+    )
     final30 = final30 or {}
     daily = daily or {}
     cp = _f(current_price)
