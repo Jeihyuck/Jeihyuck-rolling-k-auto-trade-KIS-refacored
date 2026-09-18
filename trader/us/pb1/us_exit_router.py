@@ -320,17 +320,6 @@ def evaluate_day_exit(
         base_intent["book"] = "DAY_BOOK"
         return base_intent
 
-    try:
-        from trader.us.entry_exit_contract import us_entry_exit_contract_integrity_state
-        if us_entry_exit_contract_integrity_state(position, position.get("meta")) == "INVALID":
-            logger.error(
-                "[US_EXIT][DAY][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=hard_stop_only",
-                position.get("symbol"),
-            )
-            return None
-    except Exception as exc:
-        logger.warning("[US_EXIT][DAY][ENTRY_CONTRACT_INTEGRITY_WARN] symbol=%s err=%s", position.get("symbol"), exc)
-
     symbol = position.get("symbol", "")
     exchange = position.get("exchange", "NASDAQ")
     entry_price = _get_entry_price(position)
@@ -356,6 +345,19 @@ def evaluate_day_exit(
             f"pnl_pct={pnl_pct:.4f} <= -{day_hard_stop}",
             pnl_pct,
         )
+
+    # A corrupted claimed v2 contract may never fall through to normal
+    # profit/trailing/time exits, but the tighter DAY safety stop above remains active.
+    try:
+        from trader.us.entry_exit_contract import us_entry_exit_contract_integrity_state
+        if us_entry_exit_contract_integrity_state(position, position.get("meta")) == "INVALID":
+            logger.error(
+                "[US_EXIT][DAY][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=hard_stop_only",
+                symbol,
+            )
+            return None
+    except Exception as exc:
+        logger.warning("[US_EXIT][DAY][ENTRY_CONTRACT_INTEGRITY_WARN] symbol=%s err=%s", symbol, exc)
 
     # day_profit_take: 당일 익절
     day_profit_take = float(day_cfg.get("profit_take", os.getenv("US_DAY_PROFIT_TAKE_PCT", "0.025")))
