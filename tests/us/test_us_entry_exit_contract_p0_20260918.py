@@ -288,7 +288,7 @@ def test_us_corrupted_v2_contract_blocks_normal_profit_trend_and_global_tp(monke
     from trader.us.market_state_overlay import build_profit_capture_intents
     from trader.us.position_trend_state import choose_trend_time_exit
 
-    contract = _us_contract(monkeypatch)
+    contract = _contract()
     tampered = copy.deepcopy(contract)
     tampered["management"]["swing"]["trailing_stop"] = 0.99
     position = {
