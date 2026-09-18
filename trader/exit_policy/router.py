@@ -106,12 +106,10 @@ def _policy_from_stored_entry_exit_plan(
     partial: list[dict[str, Any]] = []
     full: list[dict[str, Any]] = []
 
-    # Historical CORE v1 plans were persisted with two fields inverted
-    # relative to the production CORE router. Preserve the established CORE
-    # strategy instead of turning this integrity repair into a policy change.
-    core_family = family == "CORE_TREND_FOLLOW"
-    profit_protect_enabled = False if core_family else bool(protect.get("profit_protect_enabled", True))
-    ma20_break_exit = True if core_family else bool(protect.get("ma20_break_exit"))
+    # Do not reinterpret policy at SELL time. The BUY-time contract is the
+    # source of truth; policy review belongs in a later versioned entry plan.
+    profit_protect_enabled = bool(protect.get("profit_protect_enabled", True))
+    ma20_break_exit = bool(protect.get("ma20_break_exit"))
 
     if profit_protect_enabled:
         partial.append({
@@ -178,7 +176,7 @@ def _policy_from_stored_entry_exit_plan(
         "trade_horizon": horizon,
         "router_enabled": True,
         "time_stop_basis": "trading_days",
-        "policy_source": "ENTRY_EXIT_PLAN_COMPAT_CORE_V1" if core_family and str(plan.get("policy_version") or "") == "pb1_entry_exit_plan_v1" else "ENTRY_EXIT_PLAN",
+        "policy_source": "ENTRY_EXIT_PLAN",
         "policy_version": plan.get("policy_version"),
     }
 
