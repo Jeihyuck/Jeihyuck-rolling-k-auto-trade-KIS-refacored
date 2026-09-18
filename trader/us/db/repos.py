@@ -137,6 +137,12 @@ _US_DAILY_METRIC_FIELDS = (
     "ma20", "ma50", "ma150", "ma200", "ma200_slope",
     "rs_20d", "rs_60d", "rs_120d", "trend_score",
     "daily_bar_count", "daily_metrics_as_of", "daily_metrics_source", "daily_history_quality",
+    # Entry-decision provenance must survive Final30 -> locked DB -> live BUY.
+    "entry_style_selected", "entry_style", "entry_component",
+    "breakout_score", "pullback_score", "momentum_score", "vcp_score",
+    "agent_a_score", "agent_b_score", "rank_final30", "score_final",
+    "reason_json", "reasons", "filters_passed", "score_breakdown",
+    "explanation_quality", "theme_cluster", "rotation_regime", "market_regime",
 )
 
 def _merge_us_daily_metrics_meta(row: dict) -> dict:
@@ -1665,17 +1671,27 @@ US_ENTRY_POLICY_CONTRACT_VERSION = "us_entry_policy_contract_v1"
 
 
 def _us_entry_policy_from(*sources: Any) -> dict[str, Any]:
+    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
     for source in sources:
         parsed = _parse_json_meta(source)
         policy = {field: parsed.get(field) for field in _US_ENTRY_POLICY_FIELDS if parsed.get(field) is not None}
         if all(policy.get(field) for field in ("book", "horizon", "exit_policy")):
             canonical = json.dumps(policy, sort_keys=True, separators=(",", ":"), default=str)
             policy["entry_policy_contract_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            contract = extract_us_entry_exit_contract(parsed, source)
+            if contract:
+                policy["entry_exit_contract"] = contract
+                policy["entry_exit_contract_sha256"] = contract["sha256"]
+                policy["entry_exit_contract_version"] = contract["version"]
+                provenance = contract.get("entry_provenance") or {}
+                for key in ("entry_reason","entry_style_selected","entry_component","reasons","filters_passed","score_breakdown","explanation_quality"):
+                    if provenance.get(key) is not None:
+                        policy[key] = provenance[key]
             return policy
     return {}
 
-
 def _ensure_us_entry_policy_contract(*sources: Any) -> dict[str, Any]:
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
     policy: dict[str, Any] = {}
     for source in sources:
         parsed = _parse_json_meta(source)
@@ -1690,8 +1706,17 @@ def _ensure_us_entry_policy_contract(*sources: Any) -> dict[str, Any]:
     canonical = json.dumps(canonical_fields, sort_keys=True, separators=(",", ":"), default=str)
     policy["entry_policy_contract_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     policy["entry_policy_contract_version"] = US_ENTRY_POLICY_CONTRACT_VERSION
-    return policy
 
+    contract = build_us_entry_exit_contract(*sources, policy)
+    if contract:
+        policy["entry_exit_contract"] = contract
+        policy["entry_exit_contract_sha256"] = contract["sha256"]
+        policy["entry_exit_contract_version"] = contract["version"]
+        provenance = contract.get("entry_provenance") or {}
+        for key in ("entry_reason","entry_style_selected","entry_component","reasons","filters_passed","score_breakdown","explanation_quality"):
+            if provenance.get(key) is not None:
+                policy[key] = provenance[key]
+    return policy
 
 def _mapping_rows_from_result(result: Any) -> list[dict[str, Any]]:
     """Return mapping rows when a real SQLAlchemy Result is available.
