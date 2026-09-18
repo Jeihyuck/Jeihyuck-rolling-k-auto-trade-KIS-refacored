@@ -137,8 +137,13 @@ def evaluate_exit(
         청산 intent dict 또는 None (청산 불필요)
     """
     cfg = _reload_env()
+    contract_integrity_state = "NONE"
     try:
-        from trader.us.entry_exit_contract import contract_exit_config
+        from trader.us.entry_exit_contract import (
+            contract_exit_config,
+            us_entry_exit_contract_integrity_state,
+        )
+        contract_integrity_state = us_entry_exit_contract_integrity_state(position, position.get("meta"))
         frozen_cfg = contract_exit_config(position)
         if frozen_cfg:
             cfg = {**cfg, **frozen_cfg}
@@ -304,6 +309,13 @@ def evaluate_exit(
             now=now,
             trail_high_price=max_price,
         )
+
+    if contract_integrity_state == "INVALID":
+        logger.error(
+            "[US_EXIT][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=hard_stop_only",
+            symbol,
+        )
+        return None
 
     # ── persistent soft stop: first partial 이후에도 -5%가 지속되면 전량 청산 ─────────
     if pnl_pct <= -cfg["soft_stop"]:
