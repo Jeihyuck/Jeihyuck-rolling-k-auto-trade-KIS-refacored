@@ -394,7 +394,7 @@ def test_actual_pb1_intents_pass_actual_preflight_with_projected_state(monkeypat
         "source_tags": ["final30"], "sector": "TECHNOLOGY", "industry": "SOFTWARE",
         "theme_cluster": "AI_SOFTWARE", "classification_source": "watchlist",
         "trend_score": .8, "score_final": .9 - i * .01, "rank_final30": i + 1,
-        "market_state": "NORMAL", "market_regime": "RISK_ON",
+        "market_state": "NORMAL", "market_regime": "RISK_ON", "entry_style_selected": "ENTRY_PULLBACK",
     } for i, s in enumerate(("AAPL", "MSFT", "NVDA", "AMZN"))]
     class Provider:
         def get_current_price(self, symbol, exchange): return {"last": 100}
