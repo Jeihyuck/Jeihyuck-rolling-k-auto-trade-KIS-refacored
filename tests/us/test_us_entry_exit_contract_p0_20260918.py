@@ -346,3 +346,72 @@ def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monk
         assert sells[0]["source_entry_reason"] == "ENTRY_PULLBACK"
     finally:
         engine.dispose()
+
+
+
+def test_us_lifecycle_uses_confirmed_buy_fill_time_and_preserves_it_after_restart(monkeypatch):
+    from datetime import datetime, timezone
+    import trader.us.position_lifecycle_state as lifecycle
+    from trader.us.pb1.us_exit_router import _min_hold_elapsed
+
+    state_by_symbol = {}
+
+    def _latest(symbol, trade_date):
+        return state_by_symbol.get(str(symbol).upper(), {})
+
+    def _load(symbol, trade_date):
+        return state_by_symbol.get(str(symbol).upper(), {})
+
+    def _save(symbol, trade_date, risk):
+        state_by_symbol[str(symbol).upper()] = copy.deepcopy(risk)
+        return True
+
+    monkeypatch.setattr(lifecycle, "load_latest_open_us_position_lifecycles", lambda trade_date: {})
+    monkeypatch.setattr(lifecycle, "load_latest_us_position_risk_state", _latest)
+    monkeypatch.setattr(lifecycle, "load_us_position_risk_state", _load)
+    monkeypatch.setattr(lifecycle, "save_us_position_risk_state", _save)
+
+    contract = _contract()
+    fill_time = "2026-09-18T13:35:00+00:00"
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=timezone.utc)
+    positions = [{
+        "symbol": "AAPL", "qty": 10, "entry_price": 100.0, "current_price_usd": 101.0,
+        "meta": {
+            "entry_exit_contract": contract,
+            "entry_exit_contract_sha256": contract["sha256"],
+            "entry_exit_contract_version": contract["version"],
+        },
+    }]
+    out = lifecycle.reconcile_us_position_lifecycles(
+        positions=positions, trade_date="2026-09-18", now=now, authoritative=True,
+        fills=[{
+            "symbol": "AAPL", "side": "BUY", "qty": 10, "price_usd": 100.0,
+            "filled_at": fill_time,
+        }],
+    )
+    assert out["AAPL"]["opened_at"] == fill_time
+    assert out["AAPL"]["opened_at_source"] == "confirmed_buy_fill"
+    assert positions[0]["opened_at"] == fill_time
+    assert positions[0]["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+
+    elapsed, held_minutes, required = _min_hold_elapsed(positions[0], now)
+    assert elapsed is False
+    assert held_minutes == 25
+    assert required == 390
+
+    # A later process/tick with no fills must carry exactly the original open time.
+    later = datetime(2026, 9, 18, 20, 10, tzinfo=timezone.utc)
+    restarted_positions = [{
+        "symbol": "AAPL", "qty": 10, "entry_price": 100.0, "current_price_usd": 101.0,
+        "meta": {},
+    }]
+    out2 = lifecycle.reconcile_us_position_lifecycles(
+        positions=restarted_positions, trade_date="2026-09-18", now=later,
+        authoritative=True, fills=[],
+    )
+    assert out2["AAPL"]["opened_at"] == fill_time
+    assert restarted_positions[0]["opened_at"] == fill_time
+    elapsed2, held_minutes2, required2 = _min_hold_elapsed(restarted_positions[0], later)
+    assert elapsed2 is True
+    assert held_minutes2 == 395
+    assert required2 == 390
