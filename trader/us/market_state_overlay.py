@@ -856,7 +856,18 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
         local_runner_min = runner_min
         contract_sha = None
         try:
-            from trader.us.entry_exit_contract import extract_us_entry_exit_contract, contract_profit_capture
+            from trader.us.entry_exit_contract import (
+                extract_us_entry_exit_contract,
+                contract_profit_capture,
+                us_entry_exit_contract_integrity_state,
+            )
+            integrity = us_entry_exit_contract_integrity_state(p, meta_state)
+            if integrity == "INVALID":
+                logger.error(
+                    "[US_PROFIT_CAPTURE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s decision=BLOCK",
+                    sym,
+                )
+                continue
             entry_contract = extract_us_entry_exit_contract(p, meta_state)
             pc = contract_profit_capture(p)
             if entry_contract and pc:
