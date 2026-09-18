@@ -332,7 +332,7 @@ def evaluate_exit(
         and current_price <= max_price * (1 - cfg["trailing_stop"])
     ):
         trail_pct = (max_price - current_price) / max_price
-        sell_qty = _apply_sell_ratio(qty, float(os.getenv("US_PROFIT_TRAILING_SELL_RATIO", "0.5")))
+        sell_qty = _apply_sell_ratio(qty, float(cfg.get("profit_trailing_sell_ratio", os.getenv("US_PROFIT_TRAILING_SELL_RATIO", "0.5"))))
         return _emit_exit(
             symbol=symbol, exchange=exchange, qty=sell_qty,
             current_price=current_price, entry_price=entry_price,
@@ -369,7 +369,7 @@ def evaluate_exit(
                 required_ticks=required_ticks,
                 now=now,
             )
-        sell_qty = _apply_sell_ratio(qty, float(os.getenv("US_SOFT_STOP_SELL_RATIO", "0.5")))
+        sell_qty = _apply_sell_ratio(qty, float(cfg.get("soft_stop_sell_ratio", os.getenv("US_SOFT_STOP_SELL_RATIO", "0.5"))))
         return _emit_exit(
             symbol=symbol, exchange=exchange, qty=sell_qty,
             current_price=current_price, entry_price=entry_price,
