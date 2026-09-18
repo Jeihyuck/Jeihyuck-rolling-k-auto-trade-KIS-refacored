@@ -85,6 +85,31 @@ def test_kr_core_stored_plan_is_executed_without_rewriting_policy():
     assert "risk_off_bear" in triggers
 
 
+def test_kr_runtime_stop_cap_does_not_reprice_buy_time_r_multiple(monkeypatch):
+    from trader.pb1_engine import _resolve_swing_staged_exit
+
+    plan = _plan()
+    # BUY contract risk_R = 5 (100 entry / 95 stop). A runtime safety cap may
+    # tighten the stop to 98, but TP R-multiples must still use risk_R=5.
+    monkeypatch.setenv("PB1_EFFECTIVE_STOP_CAP_ENABLED", "1")
+    monkeypatch.setenv("PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT", "2")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    position = {
+        "code": "005930", "market": "KOSPI", "avg_buy_price": 100.0,
+        "qty": 10, "orderable_qty": 10,
+        "entry_exit_plan_json": plan,
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "exit_policy_family": "SWING_STAGED_EXIT", "trade_horizon": "SWING",
+        "position_meta": {"initial_stop_price": 95.0},
+    }
+    result = _resolve_swing_staged_exit(
+        position, 106.0, 100.0,
+        ret_pct=6.0, days_held=1, stop_hit=False,
+        highest_ret_pct=6.0,
+    )
+    assert result["exit_ok"] is False
+
+
 def test_kr_global_tp_cannot_front_run_standard_entry_plan():
     position = {
         "code": "005930", "qty": 20, "orderable_qty": 20,
