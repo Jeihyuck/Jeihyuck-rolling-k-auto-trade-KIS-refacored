@@ -61,6 +61,26 @@ def verify_us_entry_exit_contract(contract: Any) -> bool:
     )
 
 
+def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
+    """Return NONE, VALID, or INVALID for an explicitly claimed v2 contract."""
+    claimed = False
+    for source in sources:
+        data = _dict(source)
+        meta = _dict(data.get("meta"))
+        for container in (data, meta):
+            candidate = container.get("entry_exit_contract")
+            version = str(container.get("entry_exit_contract_version") or "")
+            digest = str(container.get("entry_exit_contract_sha256") or "")
+            if candidate is not None or version == US_ENTRY_EXIT_CONTRACT_VERSION or digest:
+                claimed = True
+                parsed = _dict(candidate)
+                if parsed and verify_us_entry_exit_contract(parsed):
+                    if digest and digest != parsed.get("sha256"):
+                        continue
+                    return "VALID"
+    return "INVALID" if claimed else "NONE"
+
+
 def extract_us_entry_exit_contract(*sources: Any) -> dict:
     for source in sources:
         data = _dict(source)
