@@ -168,7 +168,13 @@ def _merge_baseline_into_response(response: Any, request: Any, *, row: Any = Non
         execution = _json_dict(out.get("_order_execution"))
         for key, value in evidence.items():
             execution.setdefault(key, value)
-        execution.setdefault("baseline_contract", "KR_ORDER_BASELINE_V1")
+        row_dict = dict(row or {}) if isinstance(row, dict) else {}
+        baseline_contract = (
+            "KR_SELL_BASELINE_V1"
+            if str(row_dict.get("side") or "").upper() == "SELL"
+            else "KR_ORDER_BASELINE_V1"
+        )
+        execution.setdefault("baseline_contract", baseline_contract)
         out["_order_execution"] = execution
 
     if request_dict.get("enforce_entry_contract") is True:
