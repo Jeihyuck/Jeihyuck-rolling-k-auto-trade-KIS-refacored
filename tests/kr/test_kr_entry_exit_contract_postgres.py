@@ -40,7 +40,10 @@ def pg_contract_engine():
         future=True,
         connect_args={"options": f"-csearch_path={_SCHEMA},public"},
     )
-    schema_for_engine(engine).metadata.create_all(engine)
+    # The KR CI runs legacy-migration tests against public.* first.  Force
+    # creation in this isolated search_path schema instead of letting
+    # checkfirst=True mistake public legacy tables for our E2E tables.
+    schema_for_engine(engine).metadata.create_all(engine, checkfirst=False)
     try:
         yield engine
     finally:
