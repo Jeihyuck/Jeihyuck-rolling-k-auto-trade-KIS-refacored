@@ -376,6 +376,11 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     if existing_meta.get("entry_policy_contract_sha256") != intent_meta.get("entry_policy_contract_sha256"):
                         logger.critical("[US_INTEGRITY][BUY_POLICY_CONTRACT_MISMATCH] key=%s", intent.get("client_order_key"))
                         return False
+                    if intent_meta.get("entry_exit_contract_sha256") and (
+                        existing_meta.get("entry_exit_contract_sha256") != intent_meta.get("entry_exit_contract_sha256")
+                    ):
+                        logger.critical("[US_INTEGRITY][BUY_ENTRY_EXIT_CONTRACT_MISMATCH] key=%s", intent.get("client_order_key"))
+                        return False
                 return True
         _MEM_INTENTS.append({**intent, "trade_date": td, "status": "PENDING"})
         return True
@@ -419,6 +424,10 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                 persisted_meta = _parse_json_meta((persisted or {}).get("meta"))
                 if persisted_meta.get("entry_policy_contract_sha256") != intent_meta.get("entry_policy_contract_sha256"):
                     raise ValueError("US_BUY_POLICY_CONTRACT_PERSISTENCE_MISMATCH")
+                if intent_meta.get("entry_exit_contract_sha256") and (
+                    persisted_meta.get("entry_exit_contract_sha256") != intent_meta.get("entry_exit_contract_sha256")
+                ):
+                    raise ValueError("US_BUY_ENTRY_EXIT_CONTRACT_PERSISTENCE_MISMATCH")
         return True
     except Exception as exc:
         logger.error("[US_INTENT][SAVE][ERROR] %s", exc)
