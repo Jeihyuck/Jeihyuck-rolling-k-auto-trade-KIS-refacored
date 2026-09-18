@@ -55,37 +55,31 @@ def test_kr_day_plan_preserves_buy_time_50pct_tp1():
 
 
 
-def test_kr_core_stored_plan_preserves_existing_core_exit_semantics():
-    from trader.trade_plan import build_entry_exit_plan
-
+def test_kr_core_stored_plan_is_executed_without_rewriting_policy():
     plan = build_entry_exit_plan(
         code="005930", market="KOSPI", entry_style_selected="ENTRY_CORE",
         entry_reason="ENTRY_CORE", entry_price=100.0, features={"stop_price": 95.0},
     ).to_dict()
-    # New plans themselves are now faithful to the established CORE policy.
-    assert plan["protection_plan"]["profit_protect_enabled"] is False
-    assert plan["protection_plan"]["ma20_break_exit"] is True
 
-    # Historical v1 CORE rows may contain the old inverted flags. The executor
-    # must preserve production CORE behavior rather than treating those flags
-    # as a strategy change.
-    legacy = copy = dict(plan)
-    legacy["protection_plan"] = dict(plan["protection_plan"])
-    legacy["protection_plan"]["profit_protect_enabled"] = True
-    legacy["protection_plan"]["ma20_break_exit"] = False
+    # This PR is an integrity fix, not a strategy-policy rewrite: whatever was
+    # frozen into the BUY contract must be what the SELL router consumes.
+    assert plan["protection_plan"]["profit_protect_enabled"] is True
+    assert plan["protection_plan"]["ma20_break_exit"] is False
+
     policy = resolve_exit_policy_for_position(
         {
-            "code": "005930", "entry_exit_plan_json": legacy,
+            "code": "005930", "entry_exit_plan_json": plan,
             "entry_style_selected": "ENTRY_CORE",
             "exit_policy_family": "CORE_TREND_FOLLOW", "trade_horizon": "CORE",
         },
         {}, {"current_return_pct": 0.22, "trading_days_held": 5, "mark": 122},
         {"ma20": 115, "ma50": 105, "regime": "NORMAL"},
     )
-    assert policy["profit_protect_enabled"] is False
-    assert not any(r["trigger"] == "giveback" for r in policy["partial_sell_rules"])
+    assert policy["policy_source"] == "ENTRY_EXIT_PLAN"
+    assert policy["profit_protect_enabled"] is True
+    assert any(r["trigger"] == "giveback" for r in policy["partial_sell_rules"])
     triggers = {r["trigger"] for r in policy["full_exit_rules"]}
-    assert "ma20_break_after_tp1" in triggers
+    assert "ma20_break_after_tp1" not in triggers
     assert "ma50_break" in triggers
     assert "risk_off_bear" in triggers
 
