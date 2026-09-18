@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import copy
 
 import pytest
 import sqlalchemy as sa
@@ -163,6 +164,18 @@ def test_kr_buy_contract_survives_order_fill_restart_and_drives_exit(monkeypatch
                if r["trigger"] == "percent" and r.get("meta_flag") == "tp1_done")
     assert tp1["profit_pct"] == 12.0
     assert tp1["sell_pct"] == pytest.approx(0.33)
+    assert reloaded["entry_meta_json"]["entry_exit_plan_sha256"]
+
+    tampered = copy.deepcopy(reloaded)
+    tampered["entry_exit_plan_json"]["profit_plan"]["tp1_profit_pct"] = 99.0
+    blocked = resolve_exit_policy_for_position(
+        tampered, {}, {"current_return_pct": 0.20, "trading_days_held": 2, "mark": 120},
+        {"ma20": 100, "ma50": 95, "regime": "NORMAL"},
+    )
+    assert blocked["entry_contract_integrity_failed"] is True
+    assert blocked["hard_stop_enabled"] is True
+    assert blocked["partial_sell_rules"] == []
+    assert blocked["full_exit_rules"] == []
 
 
 
