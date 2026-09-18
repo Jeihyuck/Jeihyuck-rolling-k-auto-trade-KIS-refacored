@@ -72,13 +72,36 @@ def _position_entry_price(pos: dict) -> float:
     return buy_amount / qty if qty > 0 and buy_amount > 0 else 0.0
 
 
-def _confirmed_buy_opened_at(fills: list[dict] | None, symbol: str) -> str | None:
-    """Return the earliest confirmed BUY fill timestamp for a newly-opened symbol."""
+def _confirmed_buy_opened_at(
+    fills: list[dict] | None,
+    symbol: str,
+    *,
+    after: str | datetime | None = None,
+) -> str | None:
+    """Return earliest confirmed BUY fill for the new lifecycle.
+
+    When a prior lifecycle closed on the same trade date, ignore fills from the
+    old cycle by requiring the BUY timestamp to be strictly after closed_at.
+    """
+    lower_bound: datetime | None = None
+    if after:
+        try:
+            if isinstance(after, datetime):
+                lower_bound = after if after.tzinfo else after.replace(tzinfo=timezone.utc)
+            else:
+                lower_bound = datetime.fromisoformat(str(after).replace("Z", "+00:00"))
+                if lower_bound.tzinfo is None:
+                    lower_bound = lower_bound.replace(tzinfo=timezone.utc)
+            lower_bound = lower_bound.astimezone(timezone.utc)
+        except Exception:
+            lower_bound = None
+
     candidates: list[tuple[datetime, str]] = []
     for fill in fills or []:
         if _sym(fill.get("symbol")) != _sym(symbol) or str(fill.get("side") or "").upper() != "BUY":
             continue
-        raw = fill.get("filled_at") or fill.get("execution_timestamp") or (fill.get("meta") or {}).get("observed_at")
+        meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
+        raw = fill.get("filled_at") or fill.get("execution_timestamp") or meta.get("observed_at")
         if not raw:
             continue
         try:
@@ -90,7 +113,10 @@ def _confirmed_buy_opened_at(fills: list[dict] | None, symbol: str) -> str | Non
                 dt = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-            candidates.append((dt.astimezone(timezone.utc), text_value))
+            dt_utc = dt.astimezone(timezone.utc)
+            if lower_bound is not None and dt_utc <= lower_bound:
+                continue
+            candidates.append((dt_utc, text_value))
         except Exception:
             continue
     if not candidates:
@@ -122,7 +148,9 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
         if not lifecycle or lifecycle.get("is_open") is False:
-            confirmed_opened_at = _confirmed_buy_opened_at(fills, symbol)
+            confirmed_opened_at = _confirmed_buy_opened_at(
+                fills, symbol, after=lifecycle.get("closed_at") if lifecycle else None,
+            )
             opened_at = confirmed_opened_at or now_iso
             lifecycle = {
                 "lifecycle_id": _new_lifecycle_id(symbol, trade_date, opened_at, entry, qty),
