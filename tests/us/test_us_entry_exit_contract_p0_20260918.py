@@ -164,8 +164,16 @@ def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monk
             },
         }
         assert repos.save_order_intent(intent, trade_date="2026-09-18")
-        contract = intent["meta"]["entry_exit_contract"]
+        # Verify the real PostgreSQL persistence boundary instead of relying on
+        # caller-dict mutation.
+        with engine.connect() as conn:
+            persisted_intent_meta = conn.execute(
+                text("SELECT meta FROM us_order_intents WHERE client_order_key=:key"),
+                {"key": intent["client_order_key"]},
+            ).scalar_one()
+        contract = persisted_intent_meta["entry_exit_contract"]
         root_sha = contract["sha256"]
+        assert persisted_intent_meta["entry_exit_contract_sha256"] == root_sha
 
         assert repos.save_order_ack({
             **intent,
@@ -174,7 +182,7 @@ def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monk
             "order_no": "AAPL-CONTRACT-E2E",
             "status": "ACK",
             "env": "practice",
-            "meta": intent["meta"],
+            "meta": persisted_intent_meta,
         }, trade_date="2026-09-18")
 
         balance_row = {
