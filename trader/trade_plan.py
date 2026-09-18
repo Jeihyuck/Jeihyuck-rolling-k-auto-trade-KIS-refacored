@@ -241,7 +241,19 @@ def build_entry_exit_plan(*, code: str, market: str | None = None, entry_style_s
         force_eod_close=bool(base["force_eod_close"]),
         risk_plan=RiskPlan(initial_stop=float(stop), stop_type=stop_source, risk_per_share=float(risk_r), risk_R=float(risk_r), atr_pct=atr_pct, invalidation_reason=f"break below {stop_source}"),
         profit_plan=ProfitPlan(tp1_trigger_type="R" if tp1_r is not None else "PCT", tp1_r=tp1_r, tp1_profit_pct=tp1_profit, tp1_sell_pct=tp1_sell, tp2_trigger_type="R" if tp2_r is not None else "PCT", tp2_r=tp2_r, tp2_profit_pct=tp2_profit, tp2_sell_pct=tp2_sell, runner_enabled=True),
-        protection_plan=ProtectionPlan(hard_stop_enabled=True, trail_enabled=horizon != "DAY_TRADE", profit_protect_enabled=True, activate_profit_pct=activate, giveback_pct=giveback, floor_profit_pct=floor, ma20_break_exit=horizon != "CORE", ma50_break_exit=True, risk_off_exit=True),
+        protection_plan=ProtectionPlan(
+            hard_stop_enabled=True,
+            trail_enabled=horizon != "DAY_TRADE",
+            # CORE has always been trend-following: no short-term giveback
+            # protection, but MA20-after-TP1 / MA50 deterioration exits remain.
+            profit_protect_enabled=horizon != "CORE",
+            activate_profit_pct=activate,
+            giveback_pct=giveback,
+            floor_profit_pct=floor,
+            ma20_break_exit=True,
+            ma50_break_exit=True,
+            risk_off_exit=True,
+        ),
         time_plan=TimePlan(max_trading_days=max(1, int(max_days)), time_stop_min_r=0.0, same_day_eod_check=horizon == "DAY_TRADE"),
         policy_source="explicit_features" if explicit_any else "style_mapping",
     )
