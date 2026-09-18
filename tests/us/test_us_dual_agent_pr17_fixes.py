@@ -39,7 +39,7 @@ def _run_entry(monkeypatch, pos, price=110.0):
         available_cash_usd=10000.0,
         position_count=len(pos),
         capital_usd_cap=100000.0,
-        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9}],
+        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9, "entry_style_selected": "ENTRY_PULLBACK"}],
         current_position_symbols={"AMD"},
     )
 
