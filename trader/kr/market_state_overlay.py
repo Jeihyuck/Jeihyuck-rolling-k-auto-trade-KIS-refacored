@@ -288,23 +288,81 @@ def build_kr_policy_missing_adoption(position: dict, *, current_price: float | N
 
 
 def generate_kr_profit_capture_intents(positions: list[dict], overlay: dict) -> list[dict]:
-    if os.getenv("KR_PROFIT_CAPTURE_ENABLE","1") == "0": return []
+    if os.getenv("KR_PROFIT_CAPTURE_ENABLE","1") == "0":
+        return []
     result=[]
-    # Stages are fill-driven and sequential. A position above TP3 still starts
-    # at TP1; the next stage is unlocked only after the previous fill is saved.
-    levels=[("kr_tp1_done","KR_TAKE_PROFIT_TP1",_f("KR_TP1_PCT",0.03),_f("KR_TP1_SELL_PCT",0.25)),("kr_tp2_done","KR_TAKE_PROFIT_TP2",_f("KR_TP2_PCT",0.05),_f("KR_TP2_SELL_PCT",0.25)),("kr_tp3_done","KR_TAKE_PROFIT_TP3",_f("KR_TP3_PCT",0.08),_f("KR_TP3_SELL_PCT",0.20))]
+    default_levels=[
+        ("kr_tp1_done","KR_TAKE_PROFIT_TP1",_f("KR_TP1_PCT",0.03),_f("KR_TP1_SELL_PCT",0.25)),
+        ("kr_tp2_done","KR_TAKE_PROFIT_TP2",_f("KR_TP2_PCT",0.05),_f("KR_TP2_SELL_PCT",0.25)),
+        ("kr_tp3_done","KR_TAKE_PROFIT_TP3",_f("KR_TP3_PCT",0.08),_f("KR_TP3_SELL_PCT",0.20)),
+    ]
     for p in positions or []:
-        pnl=float(p.get("unrealized_pnl_pct") or p.get("return_pct") or 0); qty=int(p.get("orderable_qty") or p.get("qty") or 0); meta=p.get("meta") or p.get("position_meta") or {}
+        code=str(p.get("code") or p.get("symbol") or "")
+        raw_meta=p.get("meta") or p.get("position_meta") or {}
+        if isinstance(raw_meta,str):
+            try:
+                raw_meta=json.loads(raw_meta)
+            except Exception:
+                raw_meta={}
+        meta=raw_meta if isinstance(raw_meta,dict) else {}
+        owner=str(p.get("owner_strategy") or meta.get("owner_strategy") or "KR_STANDARD").upper()
+        if code.zfill(6) == "122630" or "INFINITE" in owner:
+            continue
+
+        raw_plan=p.get("entry_exit_plan_json") or meta.get("entry_exit_plan_json") or meta.get("entry_exit_plan")
+        if isinstance(raw_plan,str):
+            try:
+                raw_plan=json.loads(raw_plan)
+            except Exception:
+                raw_plan={}
+        plan=raw_plan if isinstance(raw_plan,dict) else {}
+
+        adoption_verified=is_verified_kr_policy_missing_adoption(p)
+        if plan and isinstance(plan.get("profit_plan"),dict) and "tp1_sell_pct" in plan["profit_plan"] and not adoption_verified:
+            logger.info("[KR_PROFIT_CAPTURE][SKIP] symbol=%s reason=entry_exit_plan_authoritative",code)
+            continue
+        if has_kr_policy_missing_adoption_claim(p) and not adoption_verified:
+            logger.warning("[KR_PROFIT_CAPTURE][BLOCK] symbol=%s reason=adoption_contract_unverified",code)
+            continue
+
+        levels=default_levels
+        if adoption_verified:
+            pp=plan.get("profit_plan") or {}
+            adopted=[]
+            for idx,(flag,reason,_,__) in enumerate(default_levels,start=1):
+                stage=pp.get(f"tp{idx}") or {}
+                if not isinstance(stage,dict):
+                    adopted=[]
+                    break
+                adopted.append((flag,reason,float(stage.get("return_fraction") or 0.0),float(stage.get("sell_fraction") or 0.0)))
+            if adopted:
+                levels=adopted
+
+        pnl=float(p.get("unrealized_pnl_pct") or p.get("return_pct") or 0)
+        qty=int(p.get("orderable_qty") or p.get("qty") or 0)
         for index,(flag,reason,thr,sell_pct) in enumerate(levels):
             pending_flag=flag.replace("_done","_pending")
             prior_done=index == 0 or bool(meta.get(levels[index-1][0]))
             if not prior_done:
                 break
             if pnl >= thr and not meta.get(flag) and not meta.get(pending_flag) and qty>0:
-                sell_qty=max(1,int(qty*sell_pct)); runner_min=int(qty*_f("KR_RUNNER_MIN_REMAIN_PCT",0.40))
-                if overlay.get("market_state") not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CRASH"}: sell_qty=min(sell_qty, max(1, qty-runner_min))
-                result.append({"side":"SELL","code":p.get("code") or p.get("symbol"),"qty":sell_qty,"reason":reason,"profit_capture_stage":flag.replace("kr_","").replace("_done",""),"market_state":overlay.get("market_state")})
-                logger.info("[KR_PROFIT_CAPTURE][%s] symbol=%s qty=%s pnl_pct=%.4f market_state=%s", reason.rsplit("_", 1)[-1], p.get("code") or p.get("symbol"), sell_qty, pnl, overlay.get("market_state"))
+                sell_qty=max(1,int(qty*sell_pct))
+                runner_min=int(qty*_f("KR_RUNNER_MIN_REMAIN_PCT",0.40))
+                if overlay.get("market_state") not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CRASH"}:
+                    sell_qty=min(sell_qty,max(1,qty-runner_min))
+                result.append({
+                    "side":"SELL","code":code,"qty":sell_qty,"reason":reason,
+                    "profit_capture_stage":flag.replace("kr_","").replace("_done",""),
+                    "market_state":overlay.get("market_state"),
+                    "source_entry_contract_sha256":meta.get("entry_contract_sha256") or meta.get("policy_adoption_sha256"),
+                    "exit_rule_source":"POLICY_ADOPTION_CONTRACT" if adoption_verified else "LEGACY_GLOBAL_TP",
+                })
+                logger.info(
+                    "[KR_PROFIT_CAPTURE][%s] symbol=%s qty=%s pnl_pct=%.4f threshold=%.4f source=%s market_state=%s",
+                    reason.rsplit("_",1)[-1],code,sell_qty,pnl,thr,
+                    "POLICY_ADOPTION_CONTRACT" if adoption_verified else "LEGACY_GLOBAL_TP",
+                    overlay.get("market_state"),
+                )
                 break
     return result
 
