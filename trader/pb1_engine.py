@@ -11075,6 +11075,54 @@ class PB1Engine:
         client_key = self._client_order_key(code, mode, "BUY", f"add{pyramid_level + 1}", "PB1")
         limit_price = round_to_tick(price * 1.003) if price > 0 else price
         fill_price = float(limit_price or price or 0.0)
+
+        parent_plan = pos.get("entry_exit_plan_json") or pos.get("entry_exit_plan") or {}
+        if isinstance(parent_plan, str):
+            try:
+                parent_plan = json.loads(parent_plan)
+            except Exception:
+                parent_plan = {}
+        parent_meta = pos.get("entry_meta_json") or pos.get("position_meta") or {}
+        if isinstance(parent_meta, str):
+            try:
+                parent_meta = json.loads(parent_meta)
+            except Exception:
+                parent_meta = {}
+        parent_cycle = pos.get("position_cycle_id")
+        parent_epoch = pos.get("portfolio_epoch_id")
+        parent_contract_sha = (
+            (parent_meta or {}).get("entry_contract_sha256")
+            or (pos.get("position_meta") or {}).get("entry_contract_sha256")
+            if isinstance(pos.get("position_meta"), dict) else None
+        )
+        if not isinstance(parent_plan, dict) or not parent_plan or not parent_cycle or not parent_epoch or not parent_contract_sha:
+            logger.error(
+                "[PB1][ADD][BLOCK] code=%s reason=KR_ADD_PARENT_CONTRACT_MISSING cycle=%s epoch=%s sha=%s",
+                display_code, parent_cycle, parent_epoch, parent_contract_sha,
+            )
+            return
+
+        add_request = {
+            "enforce_entry_contract": True,
+            "reasons": ["pyramid_add"],
+            "entry_reason": "ENTRY_PYRAMID",
+            "entry_exit_plan": parent_plan,
+            "pre_order_holding_qty": int(pos.get("orderable_qty") or pos.get("qty") or 0),
+            "requested_qty": int(qty),
+            "submitted_qty": int(qty),
+            "balance_snapshot_id": pos.get("balance_snapshot_id"),
+            "price": price,
+            "level": pyramid_level + 1,
+            "parent_entry_contract_sha256": str(parent_contract_sha),
+            "parent_position_cycle_id": str(parent_cycle),
+            "parent_portfolio_epoch_id": str(parent_epoch),
+        }
+        add_entry_meta = {
+            **(parent_meta if isinstance(parent_meta, dict) else {}),
+            "entry_reason": "ENTRY_PYRAMID",
+            "parent_entry_contract_sha256": str(parent_contract_sha),
+            "pyramid_level_requested": pyramid_level + 1,
+        }
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -11090,7 +11138,10 @@ class PB1Engine:
                 limit_price=limit_price,
                 stage="PB1-ADD",
                 client_order_key=client_key,
-                request_json={"reasons": ["pyramid_add"], "price": price, "level": pyramid_level + 1},
+                request_json=add_request,
+                entry_meta_json=add_entry_meta,
+                portfolio_epoch_id=str(parent_epoch),
+                position_cycle_id=str(parent_cycle),
                 status="CREATED",
             )
         except Exception:
