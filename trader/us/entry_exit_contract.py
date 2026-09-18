@@ -138,6 +138,11 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
             "time_stop_grace_days": int(os.getenv("US_TIME_STOP_GRACE_DAYS", "5")),
             "time_stop_min_profit_pct": float(os.getenv("US_TIME_STOP_MIN_PROFIT_PCT", "0.03")),
             "time_stop_first_sell_ratio": float(os.getenv("US_TIME_STOP_FIRST_SELL_RATIO", "0.50")),
+            "soft_stop_confirm_ticks": int(os.getenv("US_SOFT_STOP_CONFIRM_TICKS", "2")),
+            "persistent_soft_stop_ticks": int(os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3")),
+            "block_same_day_soft_exit": os.getenv("US_SWING_BLOCK_SAME_DAY_SOFT_EXIT", "1") in {"1", "true", "True", "yes"},
+            "trend_score_warning_threshold": float(os.getenv("US_TREND_SCORE_WARNING_THRESHOLD", "0.45")),
+            "trend_score_severe_threshold": float(os.getenv("US_TREND_SCORE_SEVERE_THRESHOLD", "0.35")),
         },
         "day": {
             "hard_stop": float(os.getenv("US_DAY_HARD_STOP_PCT", "0.03")),
