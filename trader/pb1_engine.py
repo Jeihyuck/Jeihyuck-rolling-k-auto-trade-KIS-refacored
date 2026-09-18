@@ -3066,8 +3066,12 @@ class PB1Engine:
         return (
             env in {"practice", "real", "live"}
             and session_kind in {"am", "pm", "afternoon", "close", ""}
-            and window_name in {"morning", "afternoon", "close", "am", "pm", "day", ""}
-            and market_window in {"morning", "afternoon", "close", "am", "pm", "day", ""}
+            # _resolve_session_window_name() normalizes close/preopen to
+            # "intraday" and after-hours to "after".  These normalized values
+            # must remain inside the KR context fence or CLOSE profit-capture
+            # / adoption exits are silently skipped.
+            and window_name in {"morning", "afternoon", "close", "am", "pm", "day", "intraday", "after", ""}
+            and market_window in {"morning", "afternoon", "close", "am", "pm", "day", "intraday", "after", ""}
             and (
                 "pb1_watchlist_final_scored" in final30_source
                 or "final30" in final30_source
