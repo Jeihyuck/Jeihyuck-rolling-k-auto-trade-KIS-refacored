@@ -104,8 +104,16 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
     Returns:
         (elapsed: bool, held_minutes: int, required_minutes: int)
     """
+    frozen_min_hold = None
+    try:
+        from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+        contract = extract_us_entry_exit_contract(position, position.get("meta"))
+        frozen_min_hold = ((contract.get("management") or {}).get("min_hold_minutes") if contract else None)
+    except Exception:
+        frozen_min_hold = None
     required = int(
         position.get("min_hold_minutes")
+        or frozen_min_hold
         or os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")
     )
     # 차단 기능 꺼져 있으면 바로 허용
@@ -313,9 +321,15 @@ def evaluate_day_exit(
         return None
 
     pnl_pct = (current_price - entry_price) / entry_price
+    day_cfg = {}
+    try:
+        from trader.us.entry_exit_contract import contract_day_config
+        day_cfg = contract_day_config(position)
+    except Exception as exc:
+        logger.warning("[US_EXIT][DAY][ENTRY_CONTRACT_WARN] symbol=%s err=%s", symbol, exc)
 
-    # day_hard_stop: 데이 전용 타이트 스탑
-    day_hard_stop = float(os.getenv("US_DAY_HARD_STOP_PCT", "0.03"))
+    # day_hard_stop: BUY-time contract first; ENV only for legacy positions.
+    day_hard_stop = float(day_cfg.get("hard_stop", os.getenv("US_DAY_HARD_STOP_PCT", "0.03")))
     if pnl_pct <= -day_hard_stop:
         return _make_day_exit_intent(
             symbol, exchange, qty, current_price, entry_price,
@@ -325,7 +339,7 @@ def evaluate_day_exit(
         )
 
     # day_profit_take: 당일 익절
-    day_profit_take = float(os.getenv("US_DAY_PROFIT_TAKE_PCT", "0.025"))
+    day_profit_take = float(day_cfg.get("profit_take", os.getenv("US_DAY_PROFIT_TAKE_PCT", "0.025")))
     if pnl_pct >= day_profit_take:
         return _make_day_exit_intent(
             symbol, exchange, qty, current_price, entry_price,
@@ -336,7 +350,7 @@ def evaluate_day_exit(
 
     # day_trailing: 당일 고점 대비 하락
     max_price = float(position.get("max_price") or current_price)
-    day_trailing = float(os.getenv("US_DAY_TRAILING_STOP_PCT", "0.025"))
+    day_trailing = float(day_cfg.get("trailing_stop", os.getenv("US_DAY_TRAILING_STOP_PCT", "0.025")))
     if max_price > 0 and current_price < max_price * (1 - day_trailing):
         trail = (max_price - current_price) / max_price
         return _make_day_exit_intent(
@@ -348,7 +362,7 @@ def evaluate_day_exit(
 
     # day_close_flatten: 장마감 전 강제 청산
     if now is not None:
-        flatten_after_et = os.getenv("US_DAY_CLOSE_FLATTEN_AFTER_ET", "15:45")
+        flatten_after_et = str(day_cfg.get("close_flatten_after_et", os.getenv("US_DAY_CLOSE_FLATTEN_AFTER_ET", "15:45")))
         try:
             from zoneinfo import ZoneInfo
             ny = ZoneInfo("America/New_York")
