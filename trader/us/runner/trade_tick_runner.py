@@ -1970,12 +1970,15 @@ def run_trade_tick(
                 and not recon.get("preserve_previous_positions")
                 and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
             ),
+            fills=fills_today,
         )
         for _p in current_positions:
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
             if _lc:
                 _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
                 _p["opened_trade_date"] = _lc.get("opened_trade_date")
+                _p["opened_at"] = _lc.get("opened_at")
+                _p["opened_at_source"] = _lc.get("opened_at_source")
                 _p["holding_trade_days"] = _lc.get("holding_trade_days")
                 _p["lifecycle_state_source"] = "us_position_risk_state"
                 _p["high_watermark"] = _lc.get("high_watermark")
