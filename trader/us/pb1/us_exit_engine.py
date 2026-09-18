@@ -146,7 +146,7 @@ def evaluate_exit(
         logger.warning("[US_EXIT][ENTRY_CONTRACT][WARN] symbol=%s err=%s", position.get("symbol"), exc)
 
     def _emit_exit(**kwargs):
-        return _emit_exit(policy_cfg=cfg, **kwargs)
+        return _make_exit_intent(policy_cfg=cfg, **kwargs)
 
     symbol = position.get("symbol", "")
     exchange = position.get("exchange", "NASDAQ")
