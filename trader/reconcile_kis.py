@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime
@@ -101,6 +102,89 @@ def _as_dict(row: Any) -> dict:
         return {}
 
 
+def _json_dict(value: Any) -> dict[str, Any]:
+    """Normalize PostgreSQL JSONB / driver text / bytes consistently."""
+    if isinstance(value, dict):
+        return dict(value)
+    raw = value
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except Exception:
+            return {}
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            decoded = json.loads(text)
+        except Exception:
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _recover_kr_buy_request_from_response(
+    *, order: dict[str, Any], request_json: Any, response_json: Any
+) -> dict[str, Any]:
+    """Recover only a previously validated BUY contract mirrored at broker ACK.
+
+    This never invents policy.  The redundant response snapshot must pass the
+    same hash/lifecycle validator and must match the durable order identity.
+    """
+    current = _json_dict(request_json)
+    response = _json_dict(response_json)
+    if current.get("enforce_entry_contract") is True:
+        try:
+            _assert_kr_buy_entry_contract(current)
+            return current
+        except RuntimeError:
+            pass
+
+    envelope = _json_dict(response.get("_kr_buy_entry_contract"))
+    candidate = _json_dict(envelope.get("request"))
+    if not candidate:
+        return current
+    try:
+        _assert_kr_buy_entry_contract(candidate)
+    except RuntimeError as exc:
+        logger.error(
+            "[RECONCILE][BUY_CONTRACT_RECOVERY_BLOCK] code=%s reason=INVALID_RESPONSE_SNAPSHOT detail=%s",
+            _normalize_code(order.get("code")), exc,
+        )
+        return current
+
+    code = _normalize_code(order.get("code"))
+    envelope_code = _normalize_code(envelope.get("code"))
+    expected_key = str(order.get("client_order_key") or "")
+    expected_cycle = str(order.get("position_cycle_id") or "")
+    expected_epoch = str(order.get("portfolio_epoch_id") or "")
+    identity_errors = []
+    if envelope_code and envelope_code != code:
+        identity_errors.append("code")
+    if expected_key and str(candidate.get("client_order_key") or "") != expected_key:
+        identity_errors.append("client_order_key")
+    if expected_cycle and str(candidate.get("position_cycle_id") or "") != expected_cycle:
+        identity_errors.append("position_cycle_id")
+    if expected_epoch and str(candidate.get("portfolio_epoch_id") or "") != expected_epoch:
+        identity_errors.append("portfolio_epoch_id")
+    if identity_errors:
+        logger.error(
+            "[RECONCILE][BUY_CONTRACT_RECOVERY_BLOCK] code=%s reason=IDENTITY_MISMATCH fields=%s",
+            code, identity_errors,
+        )
+        return current
+
+    candidate["recovered_request_source"] = "BROKER_ACK_CONTRACT_REDUNDANCY"
+    logger.warning(
+        "[RECONCILE][BUY_CONTRACT_RECOVERED] code=%s key=%s cycle=%s epoch=%s",
+        code, expected_key, expected_cycle, expected_epoch,
+    )
+    return candidate
+
+
 def _holdings_index(rows: list[dict]) -> tuple[dict[str, int], dict[str, float]]:
     qty_by_code: dict[str, int] = {}
     avg_price_by_code: dict[str, float] = {}
@@ -157,8 +241,18 @@ def _promote_open_buy_orders_from_holdings(
         if side == "BUY" and holding_qty <= 0:
             continue
 
-        request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
-        response_json = order.get("response_json") if isinstance(order.get("response_json"), dict) else {}
+        request_json = _json_dict(order.get("request_json"))
+        response_json = _json_dict(order.get("response_json"))
+        if side == "BUY":
+            request_json = _recover_kr_buy_request_from_response(
+                order=order, request_json=request_json, response_json=response_json
+            )
+            if response_json.get("_kr_buy_entry_contract") and request_json.get("enforce_entry_contract") is not True:
+                logger.error(
+                    "[RECONCILE][PROMOTE_BLOCK] env=%s code=%s reason=BUY_ENTRY_CONTRACT_RECOVERY_FAILED",
+                    env, code,
+                )
+                continue
         if side == "BUY" and request_json.get("enforce_entry_contract") is True:
             try:
                 _assert_kr_buy_entry_contract(request_json)
@@ -168,7 +262,7 @@ def _promote_open_buy_orders_from_holdings(
                     env, code, exc,
                 )
                 continue
-        execution_meta = response_json.get("_order_execution") if isinstance(response_json.get("_order_execution"), dict) else {}
+        execution_meta = _json_dict(response_json.get("_order_execution"))
         order_qty = _to_int(order.get("qty")) or 0
         submitted_qty = _to_int(execution_meta.get("submitted_qty")) or _to_int(response_json.get("submitted_qty")) or _to_int(request_json.get("submitted_qty")) or order_qty
         requested_qty = _to_int(execution_meta.get("requested_qty")) or _to_int(response_json.get("requested_qty")) or _to_int(request_json.get("requested_qty")) or submitted_qty
