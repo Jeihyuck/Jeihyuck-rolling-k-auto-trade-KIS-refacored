@@ -247,6 +247,50 @@ def test_tqqq_infinite_never_receives_standard_us_contract():
 
 
 
+def test_us_corrupted_v2_contract_blocks_normal_profit_trend_and_global_tp(monkeypatch):
+    from trader.us.pb1.us_exit_engine import evaluate_exit
+    from trader.us.market_state_overlay import build_profit_capture_intents
+    from trader.us.position_trend_state import choose_trend_time_exit
+
+    contract = _us_contract(monkeypatch)
+    tampered = copy.deepcopy(contract)
+    tampered["management"]["swing"]["trailing_stop"] = 0.99
+    position = {
+        "symbol": "AAPL", "exchange": "NASDAQ", "qty": 20, "orderable_qty": 20,
+        "entry_price": 100.0, "current_price_usd": 104.0, "max_price": 110.0,
+        "position_lifecycle_id": "life-bad-contract",
+        "holding_trade_days": 30,
+        "broker_avg_price": 100.0,
+        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_asof": datetime.now(timezone.utc).isoformat(),
+        "broker_avg_price_currency": "USD",
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+        "meta": {
+            "entry_exit_contract": tampered,
+            "entry_exit_contract_sha256": contract["sha256"],
+            "entry_exit_contract_version": contract["version"],
+        },
+    }
+
+    # +4% / large giveback would normally be eligible for profit logic, but a
+    # claimed-and-corrupted v2 contract must not fall back to today's ENV.
+    assert evaluate_exit(
+        position, 104.0, now=datetime.now(timezone.utc), include_trend_time=False
+    ) is None
+    assert build_profit_capture_intents(
+        [position], {"profit_capture_enabled": True, "market_state": "NORMAL"},
+        now=datetime.now(timezone.utc), trade_date="2026-09-18",
+        profit_capture_state={},
+    ) == []
+    assert choose_trend_time_exit(
+        position,
+        {"trend_state": "EXIT", "holding_trade_days": 30},
+        pnl_pct=0.04,
+        orderable_qty=20,
+    ) is None
+
+
 @pytest.mark.skipif(not __import__("os").getenv("PBCORE_TEST_POSTGRES_URL"), reason="real PostgreSQL integration URL not configured")
 def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monkeypatch):
     import os
@@ -310,6 +354,34 @@ def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monk
             "env": "practice",
             "meta": persisted_intent_meta,
         }, trade_date="2026-09-18")
+
+        actual_fill = {
+            "symbol": "AAPL", "exchange": "NASDAQ", "side": "BUY",
+            "qty": 10, "price_usd": 100.0,
+            "order_no": "AAPL-CONTRACT-E2E",
+            "client_order_key": intent["client_order_key"],
+            "filled_at": "2026-09-18T13:35:00+00:00",
+            "cumulative_filled_qty": 10,
+            "requested_qty": 10,
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "meta": {
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "cumulative_filled_qty": 10,
+                "requested_qty": 10,
+                "entry_exit_contract": contract,
+                "entry_exit_contract_sha256": root_sha,
+                "entry_exit_contract_version": contract["version"],
+            },
+        }
+        fill_result = repos.save_fills_with_result([actual_fill], trade_date="2026-09-18")
+        assert fill_result["status"] == "OK"
+        with engine.connect() as conn:
+            fill_meta = conn.execute(
+                text("SELECT meta FROM us_fills WHERE client_order_key=:key"),
+                {"key": intent["client_order_key"]},
+            ).scalar_one()
+        assert fill_meta["entry_exit_contract_sha256"] == root_sha
+        assert fill_meta["entry_exit_contract"]["sha256"] == root_sha
 
         balance_row = {
             "symbol": "AAPL", "exchange": "NASDAQ", "qty": 10,
