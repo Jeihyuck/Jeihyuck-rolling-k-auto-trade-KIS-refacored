@@ -1102,7 +1102,12 @@ def generate_entry_intents(
             )
 
         if position_action == "NEW_POSITION_BUY":
-            entry_style_for_contract = str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum")
+            entry_style_for_contract = str(
+                (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or _resolve_entry_signal_type(entry_meta)
+                or ""
+            )
             ok_contract, contract_reason = _validate_new_buy_explain_contract(symbol, entry_meta, entry_style_for_contract, signal_score=score)
             if not ok_contract:
                 track_skip(symbol, contract_reason, {"entry_style": entry_style_for_contract})
@@ -1158,7 +1163,12 @@ def generate_entry_intents(
             "block_stage": None,
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
-            "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
+            "entry_style": str(
+                (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or _resolve_entry_signal_type(entry_meta)
+                or ""
+            ).lower(),
             "projected_weight": sizing.get("projected_weight"),
             "max_symbol_weight": sizing.get("max_symbol_weight"),
             "allowed_notional": sizing.get("allowed_notional"),
@@ -1194,7 +1204,12 @@ def generate_entry_intents(
                 "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
                 "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
                 "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
-                "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
+                "entry_style": str(
+                (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or _resolve_entry_signal_type(entry_meta)
+                or ""
+            ).lower(),
                 "market_state": (entry_meta or {}).get("market_state"),
                 "market_regime": (entry_meta or {}).get("market_regime"),
                 "blocked_reason": None,
