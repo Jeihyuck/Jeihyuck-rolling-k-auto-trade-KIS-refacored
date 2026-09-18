@@ -12077,8 +12077,8 @@ class PB1Engine:
                 entry_ts = None
 
         # A missing entry timestamp is NOT evidence that a broker holding was
-        # bought today. Legacy/imported POLICY_MISSING positions such as
-        # 039030 were repeatedly misclassified as same-day because days_held=0.
+        # bought today. Legacy/imported POLICY_MISSING positions can otherwise
+        # be misclassified as same-day merely because days_held=0.
         # A real same-day BUY must carry durable fill/entry timestamp evidence.
         if entry_ts is None and qty > 0:
             meta_for_age = pos.get("position_meta") or {}
