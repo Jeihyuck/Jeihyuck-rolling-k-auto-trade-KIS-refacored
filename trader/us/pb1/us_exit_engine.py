@@ -375,7 +375,10 @@ def evaluate_exit(
 
     # ── soft stop: 단일 -5% 틱 전량매도 금지, 확인 후 부분매도 ──────────────
     if pnl_pct <= -cfg["soft_stop"]:
-        confirmed, breach_count, required_ticks = _soft_stop_confirmed(position)
+        confirmed, breach_count, required_ticks = _soft_stop_confirmed(
+            position,
+            required_override=int(cfg.get("soft_stop_confirm_ticks", 2)),
+        )
         if is_open_vol_guard_window(now):
             return _make_hold_intent(
                 symbol=symbol,
