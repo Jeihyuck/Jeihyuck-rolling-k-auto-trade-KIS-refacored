@@ -67,6 +67,115 @@ def _parse_meta(pos: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+def _parse_entry_exit_plan(pos: dict[str, Any]) -> dict[str, Any]:
+    """Return the durable per-position EntryExitPlan, if present and parseable."""
+    raw = pos.get("entry_exit_plan_json") or pos.get("entry_exit_plan")
+    if raw is None:
+        meta = _parse_meta(pos)
+        raw = meta.get("entry_exit_plan_json") or meta.get("entry_exit_plan")
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            raw = _json.loads(raw)
+        except Exception:
+            return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _policy_from_stored_entry_exit_plan(
+    plan: dict[str, Any],
+    *,
+    entry_style: str,
+    trend_ok: bool,
+    trend_strong: bool,
+) -> dict[str, Any] | None:
+    """Compile a standard BUY-time EntryExitPlan without reading ENV."""
+    profit = plan.get("profit_plan")
+    protect = plan.get("protection_plan")
+    time_plan = plan.get("time_plan")
+    if not all(isinstance(x, dict) for x in (profit, protect, time_plan)):
+        return None
+    # Adoption/legacy contracts have a deliberately different schema.
+    if "tp1_sell_pct" not in profit or "tp2_sell_pct" not in profit:
+        return None
+
+    family = str(plan.get("exit_policy_family") or "").upper()
+    horizon = str(plan.get("trade_horizon") or "").upper()
+    tp1_sell = float(profit.get("tp1_sell_pct") or 0.0)
+    tp2_sell = float(profit.get("tp2_sell_pct") or 0.0)
+    partial: list[dict[str, Any]] = []
+    full: list[dict[str, Any]] = []
+
+    if bool(protect.get("profit_protect_enabled", True)):
+        partial.append({
+            "trigger": "giveback",
+            "activate_pct": float(protect.get("activate_profit_pct") or 0.0),
+            "giveback_pct": float(protect.get("giveback_pct") or 0.0),
+            "floor_pct": float(protect.get("floor_profit_pct") or 0.0),
+            "sell_pct": tp1_sell,
+            "meta_flag": "giveback_protect_done",
+        })
+
+    tp1_profit, tp1_r = profit.get("tp1_profit_pct"), profit.get("tp1_r")
+    tp2_profit, tp2_r = profit.get("tp2_profit_pct"), profit.get("tp2_r")
+    if tp1_profit is not None:
+        partial.append({"trigger": "percent", "profit_pct": float(tp1_profit), "sell_pct": tp1_sell, "meta_flag": "tp1_done"})
+    if tp1_r is not None:
+        partial.append({
+            "trigger": "r_hybrid", "r": float(tp1_r), "sell_pct": tp1_sell,
+            "meta_flag": "tp1_done", "block_if_trend_strong": family == "SWING_STAGED_EXIT",
+        })
+
+    if family == "INTRADAY_PROFIT_PROTECT":
+        full.append({"trigger": "pivot_break"})
+        if tp2_r is not None:
+            full.append({
+                "trigger": "r_hybrid", "r": float(tp2_r), "sell_pct": None,
+                "meta_flag": "tp2_done", "block_if_trend_strong": False,
+            })
+        elif tp2_profit is not None:
+            full.append({"trigger": "percent", "profit_pct": float(tp2_profit), "sell_pct": None, "meta_flag": "tp2_done"})
+    else:
+        if tp2_profit is not None:
+            partial.append({"trigger": "percent", "profit_pct": float(tp2_profit), "sell_pct": tp2_sell, "meta_flag": "tp2_done"})
+        if tp2_r is not None:
+            partial.append({
+                "trigger": "r_hybrid", "r": float(tp2_r), "sell_pct": tp2_sell,
+                "meta_flag": "tp2_done", "block_if_trend_strong": family == "SWING_STAGED_EXIT",
+            })
+        if bool(protect.get("ma20_break_exit")):
+            full.append({"trigger": "ma20_break_after_tp1"})
+        if bool(protect.get("ma50_break_exit")):
+            full.append({"trigger": "ma50_break"})
+        if bool(protect.get("risk_off_exit")):
+            full.append({"trigger": "risk_off_bear"})
+
+    max_days = max(1, int(time_plan.get("max_trading_days") or 1))
+    if family != "INTRADAY_PROFIT_PROTECT":
+        full.append({"trigger": "time_stop", "min_r": float(time_plan.get("time_stop_min_r") or 0.0)})
+
+    return {
+        "hard_stop_enabled": bool(protect.get("hard_stop_enabled", True)),
+        "r_take_profit_enabled": tp1_r is not None or tp2_r is not None,
+        "percent_take_profit_enabled": tp1_profit is not None or tp2_profit is not None,
+        "profit_protect_enabled": bool(protect.get("profit_protect_enabled", True)),
+        "trend_follow_enabled": family in {"SWING_STAGED_EXIT", "CORE_TREND_FOLLOW"},
+        "time_stop_enabled": True,
+        "max_hold_days": max_days,
+        "trend_strong": trend_strong,
+        "trend_ok": trend_ok,
+        "partial_sell_rules": partial,
+        "full_exit_rules": full,
+        "exit_family": family,
+        "entry_style": entry_style,
+        "trade_horizon": horizon,
+        "router_enabled": True,
+        "time_stop_basis": "trading_days",
+        "policy_source": "ENTRY_EXIT_PLAN",
+        "policy_version": plan.get("policy_version"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 공개 API 1: Policy 결정
 # ─────────────────────────────────────────────────────────────────────
@@ -246,6 +355,19 @@ def resolve_exit_policy_for_position(
             "trend_strong": trend_strong,
             "router_enabled": False,
         }
+
+    stored_plan = _parse_entry_exit_plan(pos)
+    if stored_plan:
+        stored_policy = _policy_from_stored_entry_exit_plan(
+            stored_plan, entry_style=entry_style, trend_ok=trend_ok, trend_strong=trend_strong,
+        )
+        if stored_policy is not None:
+            logger.info(
+                "[EXIT][ROUTER][ENTRY_CONTRACT] code=%s source=ENTRY_EXIT_PLAN version=%s family=%s tp_rules=%d full_rules=%d",
+                code_for_log, stored_policy.get("policy_version"), stored_policy.get("exit_family"),
+                len(stored_policy.get("partial_sell_rules") or []), len(stored_policy.get("full_exit_rules") or []),
+            )
+            return stored_policy
 
     # ── family별 policy ──────────────────────────────────────────────
     if exit_family == "INTRADAY_PROFIT_PROTECT":
