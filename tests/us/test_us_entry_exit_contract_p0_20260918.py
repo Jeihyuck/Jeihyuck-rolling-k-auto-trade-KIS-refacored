@@ -85,6 +85,132 @@ def test_us_profit_capture_uses_frozen_buy_contract_after_env_change(monkeypatch
     assert intents[0]["meta"]["tp_threshold_fraction"] == "0.03"
 
 
+
+
+
+def test_us_soft_stop_sell_ratio_is_frozen_at_buy(monkeypatch):
+    monkeypatch.setenv("US_SOFT_STOP_SELL_RATIO", "0.40")
+    contract = _contract()
+    monkeypatch.setenv("US_SOFT_STOP_SELL_RATIO", "0.90")
+    position = {
+        "symbol": "AAPL", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10,
+        "entry_price": 100.0, "max_price": 100.0,
+        "soft_stop_breach_count": 2, "soft_stop_confirm_ticks": 2,
+        "meta": {"entry_exit_contract": contract},
+    }
+    intent = evaluate_exit(
+        position, 94.0, now=datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert intent is not None
+    assert intent["exit_type"] in {"soft_stop_loss", "soft_stop"}
+    assert intent["qty"] == 4
+
+
+def test_us_profit_trailing_sell_ratio_is_frozen_at_buy(monkeypatch):
+    monkeypatch.setenv("US_PROFIT_TRAILING_SELL_RATIO", "0.40")
+    contract = _contract()
+    monkeypatch.setenv("US_PROFIT_TRAILING_SELL_RATIO", "0.90")
+    position = {
+        "symbol": "AAPL", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10,
+        "entry_price": 100.0, "max_price": 110.0,
+        "meta": {"entry_exit_contract": contract},
+    }
+    intent = evaluate_exit(
+        position, 104.0, now=datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert intent is not None
+    assert intent["exit_type"] in {"profit_trailing_stop", "trailing_stop"}
+    assert intent["qty"] == 4
+
+
+def test_us_trend_time_exit_uses_buy_time_days_and_ratio(monkeypatch):
+    from trader.us.position_trend_state import choose_trend_time_exit
+
+    monkeypatch.setenv("US_TIME_STOP_DAYS", "2")
+    monkeypatch.setenv("US_TIME_STOP_FIRST_SELL_RATIO", "0.25")
+    monkeypatch.setenv("US_TREND_EXIT_MIN_HOLD_DAYS", "1")
+    contract = _contract()
+    monkeypatch.setenv("US_TIME_STOP_DAYS", "99")
+    monkeypatch.setenv("US_TIME_STOP_FIRST_SELL_RATIO", "0.90")
+
+    position = {
+        "symbol": "AAPL", "qty": 20, "orderable_qty": 20,
+        "holding_trade_days": 2,
+        "meta": {"entry_exit_contract": contract},
+    }
+    trend = {
+        "trend_state": "WARNING", "holding_trade_days": 2,
+        "final30_absent_streak": 2, "current_price": 99.0, "ma20": 100.0,
+        "trend_trim_done": False, "time_stop_trim_done": False,
+        "time_stop_trim_pending": False,
+    }
+    choice = choose_trend_time_exit(position, trend, pnl_pct=0.0, orderable_qty=20)
+    assert choice is not None
+    exit_type, qty, stage = choice
+    assert exit_type == "time_stop_trim"
+    assert stage == "time_stop_trim"
+    assert qty == 5
+
+
+def test_us_add_to_existing_blocks_without_parent_contract(monkeypatch):
+    from trader.us.execution.order_router import route_order
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "load_us_positions_by_symbols", lambda *a, **k: {})
+    intent = {
+        "trade_date": "2026-09-18", "client_order_key": "AAPL-ADD-NO-PARENT",
+        "symbol": "AAPL", "exchange": "NASDAQ", "side": "BUY",
+        "qty": 1, "limit_price": 100.0, "notional_usd": 100.0,
+        "strategy": "us_pb1", "position_action": "ADD_TO_EXISTING_BUY",
+    }
+    result = route_order(
+        intent, signal_only=True, current_position_symbols={"AAPL"},
+        allowed_symbols={"AAPL"},
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "US_ADD_PARENT_CONTRACT_MISSING"
+
+
+def test_us_add_to_existing_inherits_exact_parent_contract(monkeypatch):
+    from trader.us.execution.order_router import route_order
+    import trader.us.db.repos as repos
+
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
+    parent = _contract()
+    parent_position = {
+        "symbol": "AAPL", "qty": 10, "position_lifecycle_id": "life-parent",
+        "meta": {
+            "position_lifecycle_id": "life-parent",
+            "entry_exit_contract": parent,
+            "entry_exit_contract_sha256": parent["sha256"],
+        },
+    }
+    monkeypatch.setattr(
+        repos, "load_us_positions_by_symbols",
+        lambda *a, **k: {"AAPL": parent_position},
+    )
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.20")
+    intent = {
+        "trade_date": "2026-09-18", "client_order_key": "AAPL-ADD-PARENT",
+        "symbol": "AAPL", "exchange": "NASDAQ", "side": "BUY",
+        "qty": 1, "limit_price": 100.0, "notional_usd": 100.0,
+        "strategy": "us_pb1", "position_action": "ADD_TO_EXISTING_BUY",
+        "reasons": ["pyramid_add"],
+    }
+    result = route_order(
+        intent, signal_only=True, current_position_symbols={"AAPL"},
+        allowed_symbols={"AAPL"},
+    )
+    assert result["status"] == "SIGNAL_ONLY"
+    routed = result["intent"]
+    assert routed["meta"]["parent_entry_contract_sha256"] == parent["sha256"]
+    assert routed["meta"]["entry_exit_contract"]["sha256"] == parent["sha256"]
+    assert routed["meta"]["position_lifecycle_id"] == "life-parent"
+    assert routed["meta"]["entry_exit_contract"]["management"]["swing"]["hard_stop"] == pytest.approx(0.08)
+
+
 def test_us_locked_watchlist_meta_keeps_entry_provenance():
     from trader.us.db.repos import _merge_us_daily_metrics_meta
     row = {
