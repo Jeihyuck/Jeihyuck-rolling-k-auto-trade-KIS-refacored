@@ -137,6 +137,13 @@ def evaluate_exit(
         청산 intent dict 또는 None (청산 불필요)
     """
     cfg = _reload_env()
+    try:
+        from trader.us.entry_exit_contract import contract_exit_config
+        frozen_cfg = contract_exit_config(position)
+        if frozen_cfg:
+            cfg = {**cfg, **frozen_cfg}
+    except Exception as exc:
+        logger.warning("[US_EXIT][ENTRY_CONTRACT][WARN] symbol=%s err=%s", position.get("symbol"), exc)
 
     symbol = position.get("symbol", "")
     exchange = position.get("exchange", "NASDAQ")
@@ -826,7 +833,23 @@ def _evaluate_exit_intents_from_snapshots(
             intent["exit_style"] = exit_explanation.get("exit_style", "unknown")
             intent["exit_trigger"] = exit_explanation.get("exit_trigger")
             intent["explanation_quality"] = exit_explanation.get("explanation_quality", "FULL")
-            
+            try:
+                from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+                contract = extract_us_entry_exit_contract(pos, pos.get("meta"))
+                if contract:
+                    provenance = contract.get("entry_provenance") or {}
+                    intent["source_entry_contract_sha256"] = contract.get("sha256")
+                    intent["source_entry_reason"] = provenance.get("entry_reason")
+                    intent["exit_rule_source"] = "ENTRY_EXIT_CONTRACT_V2"
+                    intent.setdefault("meta", {}).update({
+                        "source_entry_contract_sha256": contract.get("sha256"),
+                        "source_entry_contract_version": contract.get("version"),
+                        "source_entry_reason": provenance.get("entry_reason"),
+                        "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2",
+                    })
+            except Exception as exc:
+                logger.warning("[US_EXIT][ENTRY_CONTRACT][AUDIT_WARN] symbol=%s err=%s", symbol, exc)
+
             intents.append(intent)
         elif intent is not None and intent.get("side") == "HOLD":
             hold_explanation = build_us_exit_explanation(
