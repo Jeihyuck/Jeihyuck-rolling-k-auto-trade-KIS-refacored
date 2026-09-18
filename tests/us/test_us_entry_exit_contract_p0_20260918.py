@@ -523,3 +523,137 @@ def test_us_lifecycle_uses_confirmed_buy_fill_time_and_preserves_it_after_restar
     assert elapsed2 is True
     assert held_minutes2 == 395
     assert required2 == 390
+
+
+
+def test_us_profit_capture_carries_frozen_partial_exit_allowed_into_sell_guard(monkeypatch):
+    from trader.us.execution.us_sell_qty_guard import resolve_sell_qty
+
+    monkeypatch.setenv("US_SELL_PARTIAL_ALLOWED", "1")
+    monkeypatch.setenv("US_TP1_PCT", "0.03")
+    contract = _contract()
+    monkeypatch.setenv("US_SELL_PARTIAL_ALLOWED", "0")
+
+    now = datetime.now(timezone.utc)
+    position = {
+        "symbol": "AAPL", "qty": 20, "orderable_qty": 20, "current_price_usd": 104.0,
+        "position_lifecycle_id": "life-partial-contract",
+        "broker_avg_price": 100.0,
+        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_asof": now.isoformat(),
+        "broker_avg_price_currency": "USD",
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+        "meta": {"entry_exit_contract": contract},
+    }
+    intents = build_profit_capture_intents(
+        [position], {"profit_capture_enabled": True, "market_state": "NORMAL"},
+        now=now, trade_date="2026-09-18", profit_capture_state={},
+    )
+    assert intents and intents[0]["qty"] == 5
+    assert intents[0]["partial_exit_allowed"] is True
+    assert intents[0]["meta"]["partial_exit_allowed"] is True
+
+    sell_qty, guard = resolve_sell_qty(
+        intents[0], {"holding_qty": 20, "orderable_qty": 20}
+    )
+    assert sell_qty == 5
+    assert guard["strategic_partial"] is True
+
+
+def test_us_profit_capture_respects_frozen_partial_exit_disallow_after_env_change(monkeypatch):
+    from trader.us.execution.us_sell_qty_guard import resolve_sell_qty
+
+    monkeypatch.setenv("US_SELL_PARTIAL_ALLOWED", "0")
+    monkeypatch.setenv("US_TP1_PCT", "0.03")
+    contract = _contract()
+    monkeypatch.setenv("US_SELL_PARTIAL_ALLOWED", "1")
+
+    now = datetime.now(timezone.utc)
+    position = {
+        "symbol": "AAPL", "qty": 20, "orderable_qty": 20, "current_price_usd": 104.0,
+        "position_lifecycle_id": "life-no-partial-contract",
+        "broker_avg_price": 100.0,
+        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_asof": now.isoformat(),
+        "broker_avg_price_currency": "USD",
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+        "meta": {"entry_exit_contract": contract},
+    }
+    intents = build_profit_capture_intents(
+        [position], {"profit_capture_enabled": True, "market_state": "NORMAL"},
+        now=now, trade_date="2026-09-18", profit_capture_state={},
+    )
+    assert intents and intents[0]["partial_exit_allowed"] is False
+    sell_qty, guard = resolve_sell_qty(
+        intents[0], {"holding_qty": 20, "orderable_qty": 20}
+    )
+    assert sell_qty == 20
+    assert guard["strategic_partial"] is False
+
+
+def test_us_corrupted_day_contract_still_honors_day_hard_stop(monkeypatch):
+    monkeypatch.setenv("US_DAY_HARD_STOP_PCT", "0.03")
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
+    contract = _contract(
+        symbol="MSFT",
+        book="DAY_BOOK",
+        horizon="DAY_TRADE",
+        exit_policy="DAY_BOOK",
+        signal="breakout",
+    )
+    tampered = copy.deepcopy(contract)
+    tampered["management"]["day"]["trailing_stop"] = 0.99
+
+    position = {
+        "symbol": "MSFT", "exchange": "NASDAQ", "qty": 5, "holding_qty": 5,
+        "entry_price": 100.0,
+        "meta": {
+            "entry_exit_contract": tampered,
+            "entry_exit_contract_sha256": contract["sha256"],
+            "entry_exit_contract_version": contract["version"],
+        },
+    }
+    intent = evaluate_day_exit(
+        position, 96.0,
+        now=datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert intent is not None
+    assert intent["exit_type"] == "day_hard_stop"
+    assert intent["qty"] == 5
+
+
+def test_us_soft_stop_confirmation_ticks_are_frozen_at_buy(monkeypatch):
+    monkeypatch.setenv("US_SOFT_STOP_CONFIRM_TICKS", "5")
+    monkeypatch.setenv("US_SOFT_STOP_LOSS_PCT", "0.05")
+    contract = _contract()
+    monkeypatch.setenv("US_SOFT_STOP_CONFIRM_TICKS", "1")
+
+    position = {
+        "symbol": "AAPL", "exchange": "NASDAQ",
+        "qty": 10, "orderable_qty": 10,
+        "entry_price": 100.0, "max_price": 100.0,
+        "soft_stop_breach_count": 1,
+        "meta": {"entry_exit_contract": contract},
+    }
+    hold = evaluate_exit(
+        position, 94.0,
+        now=datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert hold is not None
+    assert hold["side"] == "HOLD"
+    assert hold["reason"] == "soft_stop_wait_confirm"
+    assert hold["meta"]["required_ticks"] == 5
+
+    position["soft_stop_breach_count"] = 5
+    sell = evaluate_exit(
+        position, 94.0,
+        now=datetime(2026, 9, 18, 18, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert sell is not None
+    assert sell["side"] == "SELL"
+    assert sell["exit_type"] in {"soft_stop_loss", "soft_stop"}
