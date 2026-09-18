@@ -3742,6 +3742,66 @@ class OrdersRepo:
         broker_order_id = kis_odno or client_order_key
         safe_request_json = json_sanitize(request_json or {})
         safe_response_json = json_sanitize(response_json or {})
+
+        # Reconciliation is an observation of an already-created broker order,
+        # not permission to rewrite the immutable order intent.  If an exact
+        # broker/client identity already exists, preserve its request_json and
+        # keep the incoming broker row only as diagnostic evidence.  This blocks
+        # BUY EntryExitPlan / OrderBaseline loss and the analogous SELL baseline
+        # loss without inventing or cross-binding policy.
+        existing_row = None
+        with self.engine.connect() as _read_conn:
+            if broker_order_id:
+                existing_row = _read_conn.execute(
+                    select(self._schema.orders).where(
+                        and_(
+                            self._schema.orders.c.env == env,
+                            self._schema.orders.c.broker_order_id == broker_order_id,
+                        )
+                    )
+                ).mappings().first()
+            if existing_row is None and client_order_key:
+                existing_row = _read_conn.execute(
+                    select(self._schema.orders).where(
+                        and_(
+                            self._schema.orders.c.env == env,
+                            self._schema.orders.c.client_order_key == client_order_key,
+                        )
+                    )
+                ).mappings().first()
+        if existing_row is not None:
+            same_identity = (
+                str(existing_row.get("code") or "").zfill(6) == str(code or "").zfill(6)
+                and str(existing_row.get("side") or "").upper() == str(side or "").upper()
+            )
+            if same_identity:
+                existing_request = existing_row.get("request_json")
+                if isinstance(existing_request, str):
+                    try:
+                        existing_request = json.loads(existing_request)
+                    except Exception:
+                        existing_request = {}
+                if isinstance(existing_request, dict) and existing_request:
+                    observed_request = safe_request_json
+                    safe_request_json = json_sanitize(dict(existing_request))
+                    if observed_request and observed_request != safe_request_json:
+                        safe_request_json["_reconcile_observation"] = observed_request
+                    logger.info(
+                        "[RECONCILE][ORDER_INTENT_PRESERVED] env=%s code=%s side=%s key=%s broker_order_id=%s",
+                        env, code, side, client_order_key, broker_order_id,
+                    )
+            else:
+                logger.error(
+                    "[RECONCILE][ORDER_IDENTITY_MISMATCH] env=%s broker_order_id=%s "
+                    "existing_code=%s existing_side=%s incoming_code=%s incoming_side=%s",
+                    env,
+                    broker_order_id,
+                    existing_row.get("code"),
+                    existing_row.get("side"),
+                    code,
+                    side,
+                )
+
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
