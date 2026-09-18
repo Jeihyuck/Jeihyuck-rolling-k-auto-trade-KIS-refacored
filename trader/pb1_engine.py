@@ -12071,6 +12071,34 @@ class PB1Engine:
                 holding_bars = max(holding_bars, int(pos_age.holding_bars or 0))
             except Exception:
                 entry_ts = None
+
+        # A missing entry timestamp is NOT evidence that a broker holding was
+        # bought today. Legacy/imported POLICY_MISSING positions such as
+        # 039030 were repeatedly misclassified as same-day because days_held=0.
+        # A real same-day BUY must carry durable fill/entry timestamp evidence.
+        if entry_ts is None and qty > 0:
+            meta_for_age = pos.get("position_meta") or {}
+            if isinstance(meta_for_age, str):
+                try:
+                    meta_for_age = json.loads(meta_for_age)
+                except Exception:
+                    meta_for_age = {}
+            current_day_buy_proven = bool(
+                meta_for_age.get("same_day_entry_proven")
+                or str(meta_for_age.get("same_day_entry_provenance") or "").upper() in {
+                    "CURRENT_DAY_BUY_FILL", "ORDER_FILL_CURRENT_DAY"
+                }
+            )
+            if not current_day_buy_proven:
+                trading_days_held = max(1, int(trading_days_held or 0))
+                days_held = max(1, int(days_held or 0))
+                calendar_days_held = max(1, int(calendar_days_held or 0))
+                holding_bars = max(1, int(holding_bars or 0))
+                logger.warning(
+                    "[KR_POSITION_AGE][UNKNOWN_ENTRY_NOT_SAME_DAY] code=%s "
+                    "action=min_age_one_day reason=no_current_day_buy_fill_proof",
+                    display_code,
+                )
         logger.info(
             "[EXIT][HOLDING_META] code=%s entry_date=%s calendar_days_held=%s trading_days_held=%s holding_bars=%s last_fill_at=%s",
             display_code,
