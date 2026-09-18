@@ -395,3 +395,135 @@ def test_eotech_legacy_unknown_entry_date_close_generates_tp1(monkeypatch, caplo
     assert "[KR_POSITION_AGE][UNKNOWN_ENTRY_NOT_SAME_DAY] code=039030" in caplog.text
     assert "[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=039030" in caplog.text
     assert "window=close" in caplog.text
+
+
+
+@pytest.mark.parametrize(
+    "code,market,avg,roundtripped_avg,mark,qty",
+    [
+        ("005930", "KOSPI", 60123.456, 60123.45599999999, 90000.0, 10),
+        ("000660", "KOSPI", 173903.846, 173903.84599999996, 230000.0, 7),
+        ("035420", "KOSPI", 201234.567, 201234.56699999998, 260000.0, 4),
+    ],
+)
+def test_any_profitable_policy_missing_standard_holding_adopts_and_starts_tp1(
+    code, market, avg, roundtripped_avg, mark, qty,
+):
+    """Regression guard: legacy-profit recovery is a class fix, never a symbol allowlist."""
+    original = {
+        "code": code,
+        "symbol": code,
+        "market": market,
+        "qty": qty,
+        "orderable_qty": qty,
+        "avg_buy_price": avg,
+        "entry_date": None,
+        "entry_ts": None,
+        "last_fill_at": None,
+        "holding_days": 0,
+        "trading_days_held": 0,
+        "calendar_days_held": 0,
+        "holding_bars": 0,
+        "entry_thesis": "POLICY_MISSING",
+        "exit_policy_family": "POLICY_MISSING",
+        "position_cycle_id": f"{code}-cycle",
+        "portfolio_epoch_id": f"{code}-epoch",
+        "position_meta": {
+            "position_origin": "IMPORTED",
+            "holding_age_unknown": True,
+            "owner_strategy": "KR_STANDARD",
+        },
+    }
+    adoption = build_kr_policy_missing_adoption(original, current_price=mark)
+    assert adoption is not None
+
+    # Simulate the real PostgreSQL/JSON/float round-trip that previously broke
+    # profitable legacy holdings.
+    persisted = {**original, **adoption["position_fields"]}
+    persisted["avg_buy_price"] = roundtripped_avg
+    persisted["entry_exit_plan_json"] = json.dumps(
+        persisted["entry_exit_plan_json"], ensure_ascii=False
+    )
+    persisted["position_meta"] = json.dumps(
+        persisted["position_meta"], ensure_ascii=False
+    )
+    assert is_verified_kr_policy_missing_adoption(persisted) is True
+
+    persisted["unrealized_pnl_pct"] = (mark - roundtripped_avg) / roundtripped_avg
+    intents = generate_kr_profit_capture_intents(
+        [persisted], {"market_state": "KR_NORMAL"}
+    )
+    assert intents
+    assert intents[0]["code"] == code
+    assert intents[0]["reason"] == "KR_TAKE_PROFIT_TP1"
+    assert intents[0]["qty"] >= 1
+    assert intents[0]["exit_rule_source"] == "POLICY_ADOPTION_CONTRACT"
+
+
+@pytest.mark.parametrize(
+    "code,market,avg,mark,qty",
+    [
+        ("005930", "KOSPI", 60000.0, 69000.0, 8),
+        ("000660", "KOSPI", 170000.0, 200000.0, 5),
+    ],
+)
+def test_any_imported_unknown_age_profitable_holding_reaches_close_tp1(
+    monkeypatch, caplog, code, market, avg, mark, qty,
+):
+    """Unknown historical entry date must not be fabricated as a same-day BUY."""
+    now = datetime(2026, 9, 18, 15, 20, tzinfo=ZoneInfo("Asia/Seoul"))
+    pb1 = _kr_engine_for_exit(now)
+    monkeypatch.setenv("KR_PROFIT_CAPTURE_ENABLE", "1")
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "1")
+    monkeypatch.setattr(
+        pb1, "_resolve_price_with_fallback",
+        lambda requested_code, ohlcv_close=None: (mark, "test"),
+    )
+
+    base = {
+        "code": code,
+        "symbol": code,
+        "market": market,
+        "sid": 1,
+        "mode": 1,
+        "qty": qty,
+        "orderable_qty": qty,
+        "kis_qty": qty,
+        "holding_source": "kis_balance",
+        "avg_buy_price": avg,
+        "last_price": mark,
+        "entry_date": None,
+        "entry_ts": None,
+        "last_fill_at": None,
+        "holding_days": 0,
+        "trading_days_held": 0,
+        "calendar_days_held": 0,
+        "holding_bars": 0,
+        "entry_thesis": "POLICY_MISSING",
+        "exit_policy_family": "POLICY_MISSING",
+        "position_cycle_id": f"{code}-unknown-age-cycle",
+        "portfolio_epoch_id": f"{code}-unknown-age-epoch",
+        "position_meta": {
+            "position_origin": "IMPORTED",
+            "holding_age_unknown": True,
+            "owner_strategy": "KR_STANDARD",
+        },
+    }
+    adoption = build_kr_policy_missing_adoption(base, current_price=mark)
+    assert adoption is not None
+    pos = {**base, **adoption["position_fields"]}
+    assert is_verified_kr_policy_missing_adoption(pos)
+
+    features = {
+        "close": mark,
+        "ma20": avg * 1.05,
+        "ma50": avg,
+        "_exit_ohlcv_source": "test",
+    }
+    caplog.set_level("INFO")
+    payload = pb1._plan_exit_event(pos, features, pd.DataFrame(), "close")
+    assert payload is not None
+    assert payload["decision_reason"] == "KR_TAKE_PROFIT_TP1"
+    assert payload["router_qty"] >= 1
+    assert payload["exit_ok"] is True
+    assert f"[KR_POSITION_AGE][UNKNOWN_ENTRY_NOT_SAME_DAY] code={code}" in caplog.text
