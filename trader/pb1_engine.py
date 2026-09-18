@@ -1789,15 +1789,34 @@ def _resolve_swing_staged_exit(
         effective_r = avg - raw_stop if avg > raw_stop > 0 else 0.0
         effective_stop = raw_stop
 
-    risk_per_share = float(effective_r) if effective_r and effective_r > 0 else 0.0
+    # Safety stop tightening and profit-R accounting are different concerns.
+    # The current effective stop may become tighter through a runtime risk
+    # overlay, but R-based TP must remain anchored to the BUY-time risk_R.
+    plan_for_r = pos.get("entry_exit_plan_json") or pos.get("entry_exit_plan") or {}
+    if isinstance(plan_for_r, str):
+        try:
+            import json as _json
+            plan_for_r = _json.loads(plan_for_r)
+        except Exception:
+            plan_for_r = {}
+    contract_risk_r = 0.0
+    if isinstance(plan_for_r, dict):
+        try:
+            contract_risk_r = float((plan_for_r.get("risk_plan") or {}).get("risk_R") or 0.0)
+        except (TypeError, ValueError):
+            contract_risk_r = 0.0
+    risk_per_share = contract_risk_r if contract_risk_r > 0 else (
+        float(effective_r) if effective_r and effective_r > 0 else 0.0
+    )
     current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
     _highest_ret = float(highest_ret_pct) if highest_ret_pct is not None else ret_pct
 
     logger.info(
         "[EXIT][SWING][R_CTX] code=%s avg=%.2f stop=%.2f mark=%.2f risk_per_share=%.2f "
-        "current_r=%.3f highest_ret=%.2f days_held=%s effective_applied=%s",
+        "current_r=%.3f highest_ret=%.2f days_held=%s effective_applied=%s r_basis=%s",
         code_for_log, avg, effective_stop, mark, risk_per_share, current_r,
         _highest_ret, days_held, int(risk_ctx.get("effective_applied", False)),
+        "ENTRY_EXIT_PLAN" if contract_risk_r > 0 else "EFFECTIVE_R_LEGACY",
     )
 
     calendar_days_held = int(pos.get("calendar_days_held") or days_held)
