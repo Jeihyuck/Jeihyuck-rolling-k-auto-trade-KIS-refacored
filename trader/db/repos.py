@@ -5609,9 +5609,16 @@ class PositionsRepo:
                         _assert_kr_buy_entry_contract(request_json)
                         if not entry_exit_plan:
                             entry_exit_plan = json_sanitize(request_json.get("entry_exit_plan") or {})
+                        root_contract_sha = (
+                            request_json.get("parent_entry_contract_sha256")
+                            or request_json.get("entry_contract_sha256")
+                        )
                         entry_meta_json = _merge_json_dict(entry_meta_json, {
-                            "entry_contract_sha256": request_json.get("entry_contract_sha256"),
+                            # Keep the lifecycle/root contract immutable across pyramid adds.
+                            "entry_contract_sha256": root_contract_sha,
                             "entry_contract_version": request_json.get("entry_contract_version"),
+                            "last_buy_order_contract_sha256": request_json.get("entry_contract_sha256"),
+                            "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
                             "source_buy_order_id": str(order_id),
                             "source_buy_client_order_key": request_json.get("client_order_key"),
                         })
