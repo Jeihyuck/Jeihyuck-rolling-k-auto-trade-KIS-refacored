@@ -7056,7 +7056,7 @@ class PB1Engine:
         features = cf.features or {}
         is_kr = str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
         is_practice = str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice"
-        fail_open = os.getenv("PB1_ENTRY_PLAN_FAIL_OPEN", "1") == "1" if allow_fail_open is None else bool(allow_fail_open)
+        fail_open = os.getenv("PB1_ENTRY_PLAN_FAIL_OPEN", "0") == "1" if allow_fail_open is None else bool(allow_fail_open)
 
         ep = getattr(cf, "entry_plan", None) or features.get("entry_plan")
         if not isinstance(ep, dict):
