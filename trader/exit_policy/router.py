@@ -106,7 +106,14 @@ def _policy_from_stored_entry_exit_plan(
     partial: list[dict[str, Any]] = []
     full: list[dict[str, Any]] = []
 
-    if bool(protect.get("profit_protect_enabled", True)):
+    # Historical CORE v1 plans were persisted with two fields inverted
+    # relative to the production CORE router. Preserve the established CORE
+    # strategy instead of turning this integrity repair into a policy change.
+    core_family = family == "CORE_TREND_FOLLOW"
+    profit_protect_enabled = False if core_family else bool(protect.get("profit_protect_enabled", True))
+    ma20_break_exit = True if core_family else bool(protect.get("ma20_break_exit"))
+
+    if profit_protect_enabled:
         partial.append({
             "trigger": "giveback",
             "activate_pct": float(protect.get("activate_profit_pct") or 0.0),
@@ -143,7 +150,7 @@ def _policy_from_stored_entry_exit_plan(
                 "trigger": "r_hybrid", "r": float(tp2_r), "sell_pct": tp2_sell,
                 "meta_flag": "tp2_done", "block_if_trend_strong": family == "SWING_STAGED_EXIT",
             })
-        if bool(protect.get("ma20_break_exit")):
+        if ma20_break_exit:
             full.append({"trigger": "ma20_break_after_tp1"})
         if bool(protect.get("ma50_break_exit")):
             full.append({"trigger": "ma50_break"})
@@ -158,7 +165,7 @@ def _policy_from_stored_entry_exit_plan(
         "hard_stop_enabled": bool(protect.get("hard_stop_enabled", True)),
         "r_take_profit_enabled": tp1_r is not None or tp2_r is not None,
         "percent_take_profit_enabled": tp1_profit is not None or tp2_profit is not None,
-        "profit_protect_enabled": bool(protect.get("profit_protect_enabled", True)),
+        "profit_protect_enabled": profit_protect_enabled,
         "trend_follow_enabled": family in {"SWING_STAGED_EXIT", "CORE_TREND_FOLLOW"},
         "time_stop_enabled": True,
         "max_hold_days": max_days,
@@ -171,7 +178,7 @@ def _policy_from_stored_entry_exit_plan(
         "trade_horizon": horizon,
         "router_enabled": True,
         "time_stop_basis": "trading_days",
-        "policy_source": "ENTRY_EXIT_PLAN",
+        "policy_source": "ENTRY_EXIT_PLAN_COMPAT_CORE_V1" if core_family and str(plan.get("policy_version") or "") == "pb1_entry_exit_plan_v1" else "ENTRY_EXIT_PLAN",
         "policy_version": plan.get("policy_version"),
     }
 
