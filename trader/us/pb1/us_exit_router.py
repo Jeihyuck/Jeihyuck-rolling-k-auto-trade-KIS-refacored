@@ -105,19 +105,27 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
         (elapsed: bool, held_minutes: int, required_minutes: int)
     """
     frozen_min_hold = None
+    frozen_block_same_day = None
     try:
         from trader.us.entry_exit_contract import extract_us_entry_exit_contract
         contract = extract_us_entry_exit_contract(position, position.get("meta"))
-        frozen_min_hold = ((contract.get("management") or {}).get("min_hold_minutes") if contract else None)
+        management = (contract.get("management") or {}) if contract else {}
+        frozen_min_hold = management.get("min_hold_minutes")
+        frozen_block_same_day = (management.get("swing") or {}).get("block_same_day_soft_exit")
     except Exception:
         frozen_min_hold = None
+        frozen_block_same_day = None
     required = int(
         position.get("min_hold_minutes")
         or frozen_min_hold
         or os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")
     )
-    # 차단 기능 꺼져 있으면 바로 허용
-    if os.getenv("US_SWING_BLOCK_SAME_DAY_SOFT_EXIT", "1") not in {"1", "true", "True", "yes"}:
+    block_same_day = (
+        bool(frozen_block_same_day)
+        if frozen_block_same_day is not None
+        else os.getenv("US_SWING_BLOCK_SAME_DAY_SOFT_EXIT", "1") in {"1", "true", "True", "yes"}
+    )
+    if not block_same_day:
         return True, 0, required
 
     entry_time_raw = (
