@@ -280,6 +280,8 @@ def _enrich_single_position(
             enriched["high_watermark_source"] = "us_position_risk_state"
             enriched["position_lifecycle_id"] = lifecycle.get("lifecycle_id") or enriched.get("position_lifecycle_id")
             enriched["opened_trade_date"] = lifecycle.get("opened_trade_date") or enriched.get("opened_trade_date")
+            enriched["opened_at"] = lifecycle.get("opened_at") or enriched.get("opened_at")
+            enriched["opened_at_source"] = lifecycle.get("opened_at_source") or enriched.get("opened_at_source")
             enriched["holding_trade_days"] = lifecycle.get("holding_trade_days") or enriched.get("holding_trade_days")
     except Exception as exc:
         logger.debug("[US_EXIT_RESOLVER][HWM_FAIL] symbol=%s err=%s", symbol, exc)
