@@ -18,6 +18,8 @@ Exit Family:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from typing import Any
@@ -65,6 +67,23 @@ def _parse_meta(pos: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             meta = {}
     return meta
+
+
+def _parse_entry_meta(pos: dict[str, Any]) -> dict[str, Any]:
+    raw = pos.get("entry_meta_json") or pos.get("position_meta") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _entry_exit_plan_sha256(plan: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        plan or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _parse_entry_exit_plan(pos: dict[str, Any]) -> dict[str, Any]:
@@ -363,6 +382,38 @@ def resolve_exit_policy_for_position(
 
     stored_plan = _parse_entry_exit_plan(pos)
     if stored_plan:
+        entry_meta = _parse_entry_meta(pos)
+        expected_plan_sha = str(entry_meta.get("entry_exit_plan_sha256") or "").strip()
+        if expected_plan_sha:
+            actual_plan_sha = _entry_exit_plan_sha256(stored_plan)
+            if actual_plan_sha != expected_plan_sha:
+                logger.error(
+                    "[EXIT][ROUTER][ENTRY_CONTRACT_INTEGRITY_FAIL] code=%s expected_plan_sha=%s actual_plan_sha=%s action=hard_stop_only",
+                    code_for_log, expected_plan_sha, actual_plan_sha,
+                )
+                return {
+                    "exit_family": "POLICY_MISSING",
+                    "policy_missing": True,
+                    "entry_contract_integrity_failed": True,
+                    "entry_style": entry_style,
+                    "trade_horizon": trade_horizon,
+                    "hard_stop_enabled": True,
+                    "r_take_profit_enabled": False,
+                    "percent_take_profit_enabled": False,
+                    "profit_protect_enabled": False,
+                    "trend_follow_enabled": False,
+                    "time_stop_enabled": False,
+                    "max_hold_days": 0,
+                    "partial_sell_rules": [],
+                    "full_exit_rules": [],
+                    "router_enabled": enabled,
+                    "policy_source": "ENTRY_EXIT_PLAN_SHA_MISMATCH",
+                }
+        elif str(pos.get("position_cycle_id") or "").strip():
+            logger.warning(
+                "[EXIT][ROUTER][ENTRY_CONTRACT_LEGACY_NO_PLAN_SHA] code=%s cycle=%s action=execute_legacy_persisted_plan",
+                code_for_log, pos.get("position_cycle_id"),
+            )
         stored_policy = _policy_from_stored_entry_exit_plan(
             stored_plan, entry_style=entry_style, trend_ok=trend_ok, trend_strong=trend_strong,
         )
