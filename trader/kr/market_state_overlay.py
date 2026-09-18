@@ -1,5 +1,6 @@
 """PR49 Korean market-state overlay: index breadth, sector rotation, account risk, caps."""
 from __future__ import annotations
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib, json, logging, os
 from typing import Any
 
@@ -11,6 +12,52 @@ logger = logging.getLogger(__name__)
 
 KR_POLICY_MISSING_ADOPTION_VERSION = "kr_policy_missing_tp_adoption_v1"
 KR_POLICY_MISSING_ADOPTION_SOURCE = "kr_policy_missing_profit_capture_adoption"
+
+
+_ADOPTION_PRICE_QUANT = Decimal("0.000001")
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    raw = value
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except Exception:
+            return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _canonical_adoption_price(value: Any) -> Decimal | None:
+    try:
+        out = Decimal(str(value)).quantize(_ADOPTION_PRICE_QUANT, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return out if out.is_finite() else None
+
+
+def _normalize_adoption_position(position: dict) -> dict:
+    p = dict(position or {})
+    for field in ("entry_exit_plan_json", "position_meta", "entry_meta_json"):
+        p[field] = _json_object(p.get(field))
+    plan = dict(p.get("entry_exit_plan_json") or {})
+    for field in ("risk_plan", "profit_plan", "policy_adoption_contract"):
+        plan[field] = _json_object(plan.get(field))
+    contract = dict(plan.get("policy_adoption_contract") or {})
+    for field in ("risk_plan", "profit_plan"):
+        contract[field] = _json_object(contract.get(field))
+    plan["policy_adoption_contract"] = contract
+    p["entry_exit_plan_json"] = plan
+    return p
 
 def _f(k,d):
     try: return float(os.getenv(k, str(d)))
@@ -116,13 +163,9 @@ def _kr_policy_missing_adoption_sha256(contract: dict) -> str:
 
 def has_kr_policy_missing_adoption_claim(position: dict) -> bool:
     """Return whether a row claims this adoption, even if its proof is invalid."""
-    p = dict(position or {})
+    p = _normalize_adoption_position(position)
     meta = p.get("position_meta") or {}
     plan = p.get("entry_exit_plan_json") or {}
-    if not isinstance(meta, dict):
-        meta = {}
-    if not isinstance(plan, dict):
-        plan = {}
     return bool(
         str(p.get("policy_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
         or str(p.get("policy_source") or "") == KR_POLICY_MISSING_ADOPTION_SOURCE
@@ -134,26 +177,27 @@ def has_kr_policy_missing_adoption_claim(position: dict) -> bool:
 
 
 def is_verified_kr_policy_missing_adoption(position: dict) -> bool:
-    """Validate the durable, lifecycle-bound adoption contract on a DB row."""
-    p = dict(position or {})
-    plan = p.get("entry_exit_plan_json") or {}
-    meta = p.get("position_meta") or {}
-    if not isinstance(plan, dict) or not isinstance(meta, dict):
-        return False
-    contract = plan.get("policy_adoption_contract") or {}
-    if not isinstance(contract, dict):
-        return False
+    """Validate a durable adoption contract after real DB JSON/float round-trip."""
+    p = _normalize_adoption_position(position)
+    plan = dict(p.get("entry_exit_plan_json") or {})
+    meta = dict(p.get("position_meta") or {})
+    contract = dict(plan.get("policy_adoption_contract") or {})
     cycle_id = str(p.get("position_cycle_id") or "")
     epoch_id = str(p.get("portfolio_epoch_id") or "")
     digest = str(contract.get("sha256") or "")
     code = str(p.get("code") or p.get("symbol") or "").zfill(6)
-    try:
-        entry_price_matches = float(contract.get("entry_price") or 0.0) == float(
-            p.get("avg_buy_price") or p.get("avg") or p.get("entry_price") or 0.0
-        )
-    except (TypeError, ValueError):
-        entry_price_matches = False
-    return bool(
+
+    contract_price = _canonical_adoption_price(contract.get("entry_price"))
+    row_price = _canonical_adoption_price(
+        p.get("avg_buy_price") if p.get("avg_buy_price") not in (None, "")
+        else p.get("avg") if p.get("avg") not in (None, "")
+        else p.get("entry_price")
+    )
+    entry_price_matches = (
+        contract_price is not None and row_price is not None and contract_price == row_price
+    )
+
+    ok = bool(
         cycle_id
         and epoch_id
         and str(p.get("policy_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
@@ -175,6 +219,15 @@ def is_verified_kr_policy_missing_adoption(position: dict) -> bool:
         and str(meta.get("policy_adoption_version") or "") == KR_POLICY_MISSING_ADOPTION_VERSION
         and str(meta.get("policy_adoption_sha256") or "") == digest
     )
+    if not ok:
+        logger.error(
+            "[KR_POLICY_ADOPTION][VERIFY_CORE] code=%s result=BLOCK cycle=%s epoch=%s "
+            "contract_price=%s row_price=%s plan_type=%s meta_type=%s",
+            code, cycle_id, epoch_id, contract_price, row_price,
+            type((position or {}).get("entry_exit_plan_json")).__name__,
+            type((position or {}).get("position_meta")).__name__,
+        )
+    return ok
 
 
 def build_kr_policy_missing_adoption(position: dict, *, current_price: float | None = None) -> dict | None:
@@ -184,10 +237,8 @@ def build_kr_policy_missing_adoption(position: dict, *, current_price: float | N
     caller must durably persist and read back this contract before any SELL is
     allowed.  KR Infinite/leveraged ownership is never eligible.
     """
-    p = dict(position or {})
-    meta = p.get("position_meta") or p.get("meta") or {}
-    if not isinstance(meta, dict):
-        meta = {}
+    p = _normalize_adoption_position(position)
+    meta = p.get("position_meta") or _json_object(p.get("meta")) or {}
     code = str(p.get("code") or p.get("symbol") or "").zfill(6)
     owner = str(p.get("owner_strategy") or meta.get("owner_strategy") or "KR_STANDARD").upper()
     cycle_id = str(p.get("position_cycle_id") or "")
