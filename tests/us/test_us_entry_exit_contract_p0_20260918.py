@@ -25,6 +25,42 @@ def _contract(*, symbol="AAPL", book="SWING_BOOK", horizon="SWING_CARRY",
     })
 
 
+
+
+
+def test_us_new_buy_never_fabricates_momentum_when_style_is_missing():
+    from trader.us.pb1.us_entry_engine import _validate_new_buy_explain_contract
+
+    ok, reason = _validate_new_buy_explain_contract(
+        "AAPL",
+        {"score_final": 0.9, "breakout_score": 0.2, "pullback_score": 0.3, "momentum_score": 0.4},
+        "",
+        signal_score=0.9,
+    )
+    assert ok is False
+    assert reason == "ENTRY_EXPLAIN_CONTRACT_ERROR"
+
+
+def test_us_explanation_accepts_entry_style_as_authoritative_source():
+    from trader.us.pb1.us_explain import build_us_entry_explanation
+
+    explanation = build_us_entry_explanation(
+        "AAPL",
+        {
+            "entry_style": "pullback",
+            "pullback_score": 0.8,
+            "score_final": 0.9,
+            "close": 100.0,
+            "ma20": 95.0,
+            "ma50": 90.0,
+        },
+        decision="BUY",
+    )
+    assert explanation["entry_style_selected"] == "ENTRY_PULLBACK"
+    assert "entry_condition_met" not in explanation["reasons"]
+    assert explanation["reasons"]
+
+
 def test_us_contract_freezes_swing_exit_after_env_change(monkeypatch):
     monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
     contract = _contract()
