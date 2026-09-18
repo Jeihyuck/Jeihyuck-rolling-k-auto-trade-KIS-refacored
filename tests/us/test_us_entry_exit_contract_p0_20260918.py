@@ -118,3 +118,97 @@ def test_tqqq_infinite_never_receives_standard_us_contract():
     assert build_us_entry_exit_contract({
         "symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE", "sleeve_id": "TQQQ_INFINITE",
     }) == {}
+
+
+
+@pytest.mark.skipif(not __import__("os").getenv("PBCORE_TEST_POSTGRES_URL"), reason="real PostgreSQL integration URL not configured")
+def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monkeypatch):
+    import os
+    from sqlalchemy import create_engine, text
+    import trader.us.db.repos as repos
+    from trader.us.pb1.us_exit_engine import generate_exit_intents
+
+    engine = create_engine(os.environ["PBCORE_TEST_POSTGRES_URL"], future=True)
+    try:
+        with engine.begin() as conn:
+            for table in (
+                "us_fills", "us_orders", "us_order_intents", "us_order_events",
+                "us_profit_capture_lifecycle", "us_positions", "us_watchlist",
+            ):
+                conn.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+            conn.exec_driver_sql(open("migrations/0038_us_agent_tables.sql", encoding="utf-8").read())
+            conn.exec_driver_sql(open("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql", encoding="utf-8").read())
+            conn.exec_driver_sql(open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read())
+            conn.exec_driver_sql(open("migrations/0047_us_order_events_profit_lifecycle.sql", encoding="utf-8").read())
+
+        monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+        monkeypatch.setenv("KIS_ENV", "practice")
+        monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
+
+        intent = {
+            "trade_date": "2026-09-18",
+            "client_order_key": "US-20260918-AAPL-BUY-CONTRACT-E2E",
+            "symbol": "AAPL", "exchange": "NASDAQ", "side": "BUY",
+            "qty": 10, "limit_price": 100.0, "notional_usd": 1000.0,
+            "strategy": "us_pb1", "strategy_owner": "US_STANDARD",
+            "sleeve_id": "US_STANDARD",
+            "meta": {
+                "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+                "exit_policy": "US_SWING_DEFAULT", "entry_strategy": "us_pb1",
+                "entry_signal_type": "pullback",
+                "entry_style_selected": "ENTRY_PULLBACK",
+                "entry_reason": "ENTRY_PULLBACK",
+                "reasons": ["ENTRY_PULLBACK"],
+                "score_breakdown": {"pullback": 0.81},
+                "filters_passed": ["score", "risk"],
+            },
+        }
+        assert repos.save_order_intent(intent, trade_date="2026-09-18")
+        contract = intent["meta"]["entry_exit_contract"]
+        root_sha = contract["sha256"]
+
+        assert repos.save_order_ack({
+            **intent,
+            "qty_requested": 10,
+            "qty_filled": 0,
+            "order_no": "AAPL-CONTRACT-E2E",
+            "status": "ACK",
+            "env": "practice",
+            "meta": intent["meta"],
+        }, trade_date="2026-09-18")
+
+        balance_row = {
+            "symbol": "AAPL", "exchange": "NASDAQ", "qty": 10,
+            "avg_price_usd": 100.0, "current_price_usd": 91.0,
+            "balance_source": "kis_balance_authoritative",
+            "meta": {"balance_source": "kis_balance_authoritative"},
+        }
+        assert repos.save_position_snapshot([balance_row], trade_date="2026-09-18") == 1
+
+        with engine.connect() as conn:
+            stored_meta = conn.execute(
+                text("SELECT meta FROM us_positions WHERE symbol='AAPL' AND as_of='2026-09-18'")
+            ).scalar_one()
+        assert stored_meta["entry_exit_contract_sha256"] == root_sha
+        assert stored_meta["entry_exit_contract"]["sha256"] == root_sha
+
+        # Fresh DB load simulates the next process/tick.
+        reloaded = repos.load_us_positions_by_symbols(["AAPL"], as_of="2026-09-18")["AAPL"]
+        assert reloaded["meta"]["entry_exit_contract_sha256"] == root_sha
+
+        # Mutating today's ENV must not alter the already-filled lifecycle.
+        monkeypatch.setenv("US_HARD_STOP_PCT", "0.20")
+        reloaded["resolved_current_price"] = 91.0
+        reloaded["entry_price"] = 100.0
+        reloaded["max_price"] = 100.0
+        sells = generate_exit_intents(
+            [reloaded], prepared_snapshots=[reloaded],
+            now=datetime.now(timezone.utc), include_trend_time=False,
+        )
+        assert sells and sells[0]["side"] == "SELL"
+        assert sells[0]["meta"]["hard_stop_threshold_pct"] == pytest.approx(0.08)
+        assert sells[0]["source_entry_contract_sha256"] == root_sha
+        assert sells[0]["meta"]["source_entry_contract_sha256"] == root_sha
+        assert sells[0]["source_entry_reason"] == "ENTRY_PULLBACK"
+    finally:
+        engine.dispose()
