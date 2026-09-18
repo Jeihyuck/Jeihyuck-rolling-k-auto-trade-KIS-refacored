@@ -2890,6 +2890,41 @@ class OrdersRepo:
             str(side or "").upper() == "BUY"
             and safe_request_json.get("enforce_entry_contract") is True
         )
+        if enforce_buy_contract and safe_request_json.get("parent_entry_contract_sha256"):
+            # ADD/PYRAMID claims must match the authoritative open position,
+            # not only the caller's in-memory snapshot.
+            with self.engine.begin() as conn:
+                parent_row = conn.execute(
+                    select(
+                        self._schema.positions.c.position_cycle_id,
+                        self._schema.positions.c.portfolio_epoch_id,
+                        self._schema.positions.c.entry_meta_json,
+                    ).where(and_(
+                        self._schema.positions.c.env == env,
+                        self._schema.positions.c.strategy == strategy,
+                        self._schema.positions.c.sid == sid,
+                        self._schema.positions.c.mode == mode,
+                        self._schema.positions.c.code == code,
+                        self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
+                        self._schema.positions.c.status == "OPEN",
+                    ))
+                ).mappings().first()
+            if not parent_row:
+                raise RuntimeError("KR_ADD_PARENT_POSITION_MISSING")
+            parent_meta = parent_row.get("entry_meta_json") or {}
+            if isinstance(parent_meta, str):
+                try:
+                    parent_meta = json.loads(parent_meta)
+                except Exception:
+                    parent_meta = {}
+            authoritative_parent_sha = str((parent_meta or {}).get("entry_contract_sha256") or "").strip()
+            claimed_parent_sha = str(safe_request_json.get("parent_entry_contract_sha256") or "").strip()
+            if not authoritative_parent_sha or claimed_parent_sha != authoritative_parent_sha:
+                raise RuntimeError("KR_ADD_PARENT_CONTRACT_SHA_MISMATCH")
+            if str(parent_row.get("position_cycle_id") or "") != str(position_cycle_id or ""):
+                raise RuntimeError("KR_ADD_PARENT_POSITION_CYCLE_MISMATCH")
+            if str(parent_row.get("portfolio_epoch_id") or "") != str(portfolio_epoch_id or ""):
+                raise RuntimeError("KR_ADD_PARENT_PORTFOLIO_EPOCH_MISMATCH")
         if enforce_buy_contract:
             safe_request_json.update({
                 "client_order_key": client_order_key,
