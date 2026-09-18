@@ -163,3 +163,75 @@ def test_kr_buy_contract_survives_order_fill_restart_and_drives_exit(monkeypatch
                if r["trigger"] == "percent" and r.get("meta_flag") == "tp1_done")
     assert tp1["profit_pct"] == 12.0
     assert tp1["sell_pct"] == pytest.approx(0.33)
+
+
+
+def test_kr_pyramid_add_is_bound_to_authoritative_parent_contract(monkeypatch):
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    orders = OrdersRepo(engine)
+    positions = PositionsRepo(engine)
+
+    plan = _plan()
+    root_order_id, _ = orders.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="005930", market="KOSPI", side="BUY", ord_type="LIMIT", qty=10,
+        limit_price=100.0, stage="PB1-ENTRY", client_order_key="kr-parent-buy",
+        request_json={
+            "enforce_entry_contract": True, "entry_exit_plan": plan,
+            "pre_order_holding_qty": 0, "requested_qty": 10, "submitted_qty": 10,
+            "balance_snapshot_id": "root-balance",
+        },
+        entry_meta_json={"entry_reason": "ENTRY_PULLBACK", "entry_style_selected": "ENTRY_PULLBACK"},
+        status="ACKED", account_id="acct",
+    )
+    root_order = orders.get_order_by_client_order_key("practice", "kr-parent-buy")
+    root_sha = root_order["request_json"]["entry_contract_sha256"]
+    positions.apply_fill(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="005930", market="KOSPI", side="BUY", qty=10, price=100.0,
+        fee=0.0, tax=0.0, filled_at=datetime.now(timezone.utc),
+        order_id=root_order_id, account_id="acct",
+    )
+    with engine.connect() as conn:
+        parent = dict(conn.execute(sa.select(schema.positions)).mappings().one())
+
+    add_request = {
+        "enforce_entry_contract": True,
+        "entry_exit_plan": plan,
+        "pre_order_holding_qty": 10,
+        "requested_qty": 2,
+        "submitted_qty": 2,
+        "balance_snapshot_id": "add-balance",
+        "parent_entry_contract_sha256": root_sha,
+        "parent_position_cycle_id": str(parent["position_cycle_id"]),
+        "parent_portfolio_epoch_id": str(parent["portfolio_epoch_id"]),
+    }
+    _, created = orders.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="005930", market="KOSPI", side="BUY", ord_type="LIMIT", qty=2,
+        limit_price=101.0, stage="PB1-ADD", client_order_key="kr-valid-add",
+        request_json=add_request,
+        entry_meta_json={"entry_reason": "ENTRY_PYRAMID", "parent_entry_contract_sha256": root_sha},
+        status="CREATED", account_id="acct",
+        portfolio_epoch_id=str(parent["portfolio_epoch_id"]),
+        position_cycle_id=str(parent["position_cycle_id"]),
+    )
+    assert created
+    add_order = orders.get_order_by_client_order_key("practice", "kr-valid-add")
+    assert add_order["request_json"]["parent_entry_contract_sha256"] == root_sha
+    assert add_order["request_json"]["parent_contract_binding_sha256"]
+
+    bad_request = {**add_request, "parent_entry_contract_sha256": "0" * 64}
+    with pytest.raises(RuntimeError, match="KR_ADD_PARENT_CONTRACT_SHA_MISMATCH"):
+        orders.create_intent_idempotent(
+            env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+            code="005930", market="KOSPI", side="BUY", ord_type="LIMIT", qty=1,
+            limit_price=102.0, stage="PB1-ADD", client_order_key="kr-tampered-add",
+            request_json=bad_request,
+            entry_meta_json={"entry_reason": "ENTRY_PYRAMID"},
+            status="CREATED", account_id="acct",
+            portfolio_epoch_id=str(parent["portfolio_epoch_id"]),
+            position_cycle_id=str(parent["position_cycle_id"]),
+        )
