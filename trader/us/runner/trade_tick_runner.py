@@ -736,6 +736,12 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
             logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=insufficient_history state=UNKNOWN", symbol)
         try:
             from trader.us.position_trend_state import update_us_position_trend_state
+            frozen_trend_cfg = {}
+            try:
+                from trader.us.entry_exit_contract import contract_exit_config
+                frozen_trend_cfg = contract_exit_config(pos)
+            except Exception:
+                frozen_trend_cfg = {}
             trend = update_us_position_trend_state(
                 symbol=symbol,
                 trade_date=trade_date,
@@ -745,6 +751,8 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
                 final30=final30_payload,
                 daily=daily,
                 lifecycle_id=pos.get("position_lifecycle_id"),
+                warning_threshold=frozen_trend_cfg.get("trend_score_warning_threshold"),
+                severe_threshold=frozen_trend_cfg.get("trend_score_severe_threshold"),
             )
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STATE][WARN] symbol=%s err=%s", symbol, exc)
