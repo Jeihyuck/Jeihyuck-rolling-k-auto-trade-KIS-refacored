@@ -82,6 +82,20 @@ def _kr_buy_entry_contract_hash(request_json: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _kr_parent_contract_binding_hash(request_json: dict[str, Any]) -> str:
+    """Bind a pyramid/add BUY to the already-open lifecycle without changing v1 root hashes."""
+    payload = {
+        "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
+        "parent_position_cycle_id": request_json.get("parent_position_cycle_id"),
+        "parent_portfolio_epoch_id": request_json.get("parent_portfolio_epoch_id"),
+        "entry_contract_sha256": request_json.get("entry_contract_sha256"),
+        "position_cycle_id": request_json.get("position_cycle_id"),
+        "portfolio_epoch_id": request_json.get("portfolio_epoch_id"),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _assert_kr_buy_entry_contract(request_json: Any) -> None:
     """Fail closed when a persisted KR BUY cannot be reconciled after restart."""
     if not isinstance(request_json, dict):
@@ -104,6 +118,22 @@ def _assert_kr_buy_entry_contract(request_json: Any) -> None:
         missing.append("entry_contract_version")
     if request_json.get("entry_contract_sha256") != expected_hash:
         missing.append("entry_contract_sha256")
+
+    parent_sha = str(request_json.get("parent_entry_contract_sha256") or "").strip()
+    if parent_sha:
+        parent_cycle = str(request_json.get("parent_position_cycle_id") or "").strip()
+        parent_epoch = str(request_json.get("parent_portfolio_epoch_id") or "").strip()
+        if not parent_cycle:
+            missing.append("parent_position_cycle_id")
+        if not parent_epoch:
+            missing.append("parent_portfolio_epoch_id")
+        if parent_cycle and parent_cycle != str(payload.get("position_cycle_id") or ""):
+            missing.append("parent_position_cycle_id_mismatch")
+        if parent_epoch and parent_epoch != str(payload.get("portfolio_epoch_id") or ""):
+            missing.append("parent_portfolio_epoch_id_mismatch")
+        if request_json.get("parent_contract_binding_sha256") != _kr_parent_contract_binding_hash(request_json):
+            missing.append("parent_contract_binding_sha256")
+
     if missing:
         raise RuntimeError(f"KR_BUY_ENTRY_CONTRACT_INVALID:{','.join(missing)}")
 
@@ -2868,6 +2898,8 @@ class OrdersRepo:
                 "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
             })
             safe_request_json["entry_contract_sha256"] = _kr_buy_entry_contract_hash(safe_request_json)
+            if safe_request_json.get("parent_entry_contract_sha256"):
+                safe_request_json["parent_contract_binding_sha256"] = _kr_parent_contract_binding_hash(safe_request_json)
             _assert_kr_buy_entry_contract(safe_request_json)
         payload = {
             "order_id": order_id,
