@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import functools
+import json
 import logging
 import os
 from typing import Any
@@ -41,8 +42,26 @@ _BASELINE_FIELDS = (
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
+    """Normalize JSON/JSONB read-back without discarding durable evidence."""
     if isinstance(value, dict):
         return dict(value)
+    raw = value
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except Exception:
+            return {}
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            decoded = json.loads(text)
+        except Exception:
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
     return {}
 
 
@@ -134,18 +153,37 @@ def _assert_sell_baseline(request: Any, *, key: str) -> None:
         raise RuntimeError(f"KR_SELL_BASELINE_INVALID:{key}:{','.join(sorted(set(missing)))}")
 
 
-def _merge_baseline_into_response(response: Any, request: Any) -> dict[str, Any]:
+def _merge_baseline_into_response(response: Any, request: Any, *, row: Any = None) -> dict[str, Any]:
+    """Mirror immutable order evidence into broker response for restart recovery.
+
+    The response copy is redundancy only: request_json remains authoritative.
+    BUY contracts are hashed/validated by OrdersRepo before broker submission.
+    """
     out = _json_dict(response)
-    evidence = _baseline_evidence(request)
-    if not evidence or evidence.get("pre_order_holding_qty") is None:
-        return out
-    for key, value in evidence.items():
-        out.setdefault(key, value)
-    execution = _json_dict(out.get("_order_execution"))
-    for key, value in evidence.items():
-        execution.setdefault(key, value)
-    execution.setdefault("baseline_contract", "KR_SELL_BASELINE_V1")
-    out["_order_execution"] = execution
+    request_dict = _json_dict(request)
+    evidence = _baseline_evidence(request_dict)
+    if evidence and evidence.get("pre_order_holding_qty") is not None:
+        for key, value in evidence.items():
+            out.setdefault(key, value)
+        execution = _json_dict(out.get("_order_execution"))
+        for key, value in evidence.items():
+            execution.setdefault(key, value)
+        execution.setdefault("baseline_contract", "KR_ORDER_BASELINE_V1")
+        out["_order_execution"] = execution
+
+    if request_dict.get("enforce_entry_contract") is True:
+        row_dict = dict(row or {}) if isinstance(row, dict) else {}
+        out["_kr_buy_entry_contract"] = {
+            "version": "KR_BUY_ENTRY_CONTRACT_RESPONSE_V1",
+            "code": str(row_dict.get("code") or "").zfill(6),
+            "side": str(row_dict.get("side") or "BUY").upper(),
+            "order_id": str(row_dict.get("order_id") or ""),
+            "client_order_key": str(request_dict.get("client_order_key") or row_dict.get("client_order_key") or ""),
+            "position_cycle_id": str(request_dict.get("position_cycle_id") or row_dict.get("position_cycle_id") or ""),
+            "portfolio_epoch_id": str(request_dict.get("portfolio_epoch_id") or row_dict.get("portfolio_epoch_id") or ""),
+            "entry_contract_sha256": str(request_dict.get("entry_contract_sha256") or ""),
+            "request": json_sanitize(request_dict),
+        }
     return json_sanitize(out)
 
 
@@ -287,7 +325,7 @@ def _install_sell_baseline_guard() -> None:
     def _submitted(self, env, client_order_key, kis_odno, response_json, *, entry_meta_json=None, submitted_qty=None):
         row = self.get_order_by_client_order_key(env, client_order_key) or {}
         request = _json_dict(row.get("request_json"))
-        response_json = _merge_baseline_into_response(response_json, request)
+        response_json = _merge_baseline_into_response(response_json, request, row=row)
         return original_submitted(
             self, env, client_order_key, kis_odno, response_json,
             entry_meta_json=entry_meta_json, submitted_qty=submitted_qty,
@@ -297,7 +335,7 @@ def _install_sell_baseline_guard() -> None:
     def _acked(self, env, kis_odno, response_json, *, entry_meta_json=None):
         row = self.get_order_by_kis_odno(env, str(kis_odno or "")) or {}
         request = _json_dict(row.get("request_json"))
-        response_json = _merge_baseline_into_response(response_json, request)
+        response_json = _merge_baseline_into_response(response_json, request, row=row)
         return original_acked(self, env, kis_odno, response_json, entry_meta_json=entry_meta_json)
 
     @functools.wraps(original_get_open)
