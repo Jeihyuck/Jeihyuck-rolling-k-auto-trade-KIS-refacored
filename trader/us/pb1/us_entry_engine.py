@@ -1259,9 +1259,9 @@ def generate_entry_intents(
             "filters_passed": intent.get("filters_passed") or [],
             "explanation_quality": intent.get("explanation_quality"),
             "entry_reason": (
-                (intent.get("reasons") or [None])[0]
-                or intent.get("entry_style_selected")
+                intent.get("entry_style_selected")
                 or intent.get("entry_signal_type")
+                or (intent.get("reasons") or [None])[0]
             ),
             "rank_final30": intent.get("rank_final30"),
             "score_final": intent.get("score_final"),
