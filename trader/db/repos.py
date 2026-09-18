@@ -82,6 +82,14 @@ def _kr_buy_entry_contract_hash(request_json: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _kr_entry_exit_plan_sha256(plan: Any) -> str:
+    payload = json_sanitize(plan) if isinstance(plan, dict) else {}
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _kr_parent_contract_binding_hash(request_json: dict[str, Any]) -> str:
     """Bind a pyramid/add BUY to the already-open lifecycle without changing v1 root hashes."""
     payload = {
@@ -5696,6 +5704,9 @@ class PositionsRepo:
                         )
 
             if entry_exit_plan:
+                entry_meta_json = _merge_json_dict(entry_meta_json, {
+                    "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(entry_exit_plan),
+                })
                 plan_meta = {
                     "entry_thesis": entry_exit_plan.get("entry_thesis"),
                     "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
