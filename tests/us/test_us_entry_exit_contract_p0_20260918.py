@@ -646,7 +646,7 @@ def test_us_soft_stop_confirmation_ticks_are_frozen_at_buy(monkeypatch):
     assert hold is not None
     assert hold["side"] == "HOLD"
     assert hold["reason"] == "soft_stop_wait_confirm"
-    assert hold["meta"]["required_ticks"] == 5
+    assert hold["meta"]["soft_stop_required_ticks"] == 5
 
     position["soft_stop_breach_count"] = 5
     sell = evaluate_exit(
