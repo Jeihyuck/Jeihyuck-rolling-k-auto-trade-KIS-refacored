@@ -116,7 +116,16 @@ def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetim
 def choose_trend_time_exit(position: dict, trend: dict, *, pnl_pct: float, orderable_qty: int) -> tuple[str, int, str] | None:
     frozen = {}
     try:
-        from trader.us.entry_exit_contract import contract_exit_config
+        from trader.us.entry_exit_contract import (
+            contract_exit_config,
+            us_entry_exit_contract_integrity_state,
+        )
+        if us_entry_exit_contract_integrity_state(position, position.get("meta")) == "INVALID":
+            logger.error(
+                "[US_POSITION][TREND_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=BLOCK_NORMAL_EXIT",
+                position.get("symbol"),
+            )
+            return None
         frozen = contract_exit_config(position)
     except Exception:
         frozen = {}
