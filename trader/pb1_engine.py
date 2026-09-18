@@ -12611,19 +12611,28 @@ class PB1Engine:
                 ordered_reasons = [close_reason]
                 eval_reason = close_reason if _policy_missing_contract else "NO_EXIT_SIGNAL"
 
-        # PR49 overlay exits: hard stops/close liquidation keep priority; defense trim and profit capture can create partial SELLs when no stronger exit is active.
+        # Overlay exits: hard stops / explicit close liquidation keep priority.
+        # Verified legacy adoption is also allowed to catch up TP1/2/3 at Close;
+        # trade-close enables KR_PROFIT_CAPTURE, so silently skipping it here was
+        # an execution bug that starved profitable legacy positions.
         overlay = getattr(self, "_kr_market_state_overlay", None) or {}
+        _is_close_window = str(window_tag).lower() == "close"
+        _allow_overlay_window = (not _is_close_window) or (
+            _policy_adoption_active and str(close_action or "").upper() == "CARRY"
+        )
         if (not _policy_missing_contract and self._is_kr_equity_context()
                 and (_policy_adoption_active or env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True))
-                and str(window_tag).lower() != "close"):
+                and _allow_overlay_window):
             pos_for_overlay = {**pos, "code": code, "qty": qty, "orderable_qty": int(pos.get("orderable_qty") or qty), "unrealized_pnl_pct": ret_pct / 100.0, "market_value_krw": float(mark or 0.0) * qty}
-            strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP"}
+            strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP", "EXIT_FORCE_EOD"}
             if not strong_exit_active:
                 snapshot = getattr(self, "_kr_regime_snapshot", None)
                 trimmed_this_tick = getattr(self, "_kr_defense_trim_symbols_this_tick", set())
                 max_trim_symbols = int(os.getenv("KR_DEFENSE_MAX_TRIM_SYMBOLS_PER_TICK", "3"))
                 kr_trim = []
-                if (not _policy_adoption_active
+                # Defense trims stay intraday-only; close catch-up is limited to
+                # the verified adoption TP contract.
+                if (not _is_close_window and not _policy_adoption_active
                         and snapshot is not None and len(trimmed_this_tick) < max_trim_symbols):
                     kr_trim = generate_kr_defense_trim_intents(
                         [pos_for_overlay], snapshot,
@@ -12645,7 +12654,11 @@ class PB1Engine:
                     _router_reason = final_reason
                     signal_hit = True
                     eval_reason = final_reason
-                    logger.info("[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=%s reason=%s qty=%s market_state=%s", display_code, final_reason, _router_qty, overlay.get("market_state"))
+                    logger.info(
+                        "[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=%s reason=%s qty=%s market_state=%s window=%s source=%s",
+                        display_code, final_reason, _router_qty, overlay.get("market_state"),
+                        window_tag, kr_intent.get("exit_rule_source") or "legacy",
+                    )
 
         exit_eval = ExitEvaluation(
             code=code,
