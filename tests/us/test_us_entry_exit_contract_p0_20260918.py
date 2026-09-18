@@ -276,7 +276,7 @@ def test_us_order_policy_contract_contains_full_v2_provenance():
     assert contract["entry_provenance"]["score_breakdown"]["pullback"] == pytest.approx(0.81)
 
 
-def test_tqqq_infinite_never_receives_standard_us_contract():
+def test_tqqq_infinite_never_receives_standard_contract():
     assert build_us_entry_exit_contract({
         "symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE", "sleeve_id": "TQQQ_INFINITE",
     }) == {}
