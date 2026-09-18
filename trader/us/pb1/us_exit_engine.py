@@ -145,6 +145,9 @@ def evaluate_exit(
     except Exception as exc:
         logger.warning("[US_EXIT][ENTRY_CONTRACT][WARN] symbol=%s err=%s", position.get("symbol"), exc)
 
+    def _emit_exit(**kwargs):
+        return _emit_exit(policy_cfg=cfg, **kwargs)
+
     symbol = position.get("symbol", "")
     exchange = position.get("exchange", "NASDAQ")
     qty = int(position.get("qty", 0))
@@ -242,7 +245,7 @@ def evaluate_exit(
             "0", "false", "False", "NO", "no",
         }
         if fail_closed:
-            return _make_exit_intent(
+            return _emit_exit(
                 symbol=symbol,
                 exchange=exchange,
                 qty=qty,
@@ -289,7 +292,7 @@ def evaluate_exit(
 
     # ── hard stop ─────────────────────────────────────────────────────────────
     if pnl_pct <= -cfg["hard_stop"]:
-        return _make_exit_intent(
+        return _emit_exit(
             symbol=symbol, exchange=exchange, qty=qty,
             current_price=current_price, entry_price=entry_price,
             exit_type=EXIT_HARD_STOP_LOSS,
@@ -308,7 +311,7 @@ def evaluate_exit(
         persistent_required = max(required_ticks + 1, int(os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3") or 3))
         already_reduced = bool(position.get("soft_stop_partial_done") or position.get("partial_soft_stop_done") or position.get("last_exit_type") == EXIT_SOFT_STOP_LOSS)
         if already_reduced and breach_count >= persistent_required:
-            return _make_exit_intent(
+            return _emit_exit(
                 symbol=symbol, exchange=exchange, qty=qty,
                 current_price=current_price, entry_price=entry_price,
                 exit_type="persistent_soft_stop_full_exit",
@@ -330,7 +333,7 @@ def evaluate_exit(
     ):
         trail_pct = (max_price - current_price) / max_price
         sell_qty = _apply_sell_ratio(qty, float(os.getenv("US_PROFIT_TRAILING_SELL_RATIO", "0.5")))
-        return _make_exit_intent(
+        return _emit_exit(
             symbol=symbol, exchange=exchange, qty=sell_qty,
             current_price=current_price, entry_price=entry_price,
             exit_type=EXIT_PROFIT_TRAILING_STOP,
@@ -367,7 +370,7 @@ def evaluate_exit(
                 now=now,
             )
         sell_qty = _apply_sell_ratio(qty, float(os.getenv("US_SOFT_STOP_SELL_RATIO", "0.5")))
-        return _make_exit_intent(
+        return _emit_exit(
             symbol=symbol, exchange=exchange, qty=sell_qty,
             current_price=current_price, entry_price=entry_price,
             exit_type=EXIT_SOFT_STOP_LOSS,
@@ -385,7 +388,7 @@ def evaluate_exit(
         # 수익 보호: 고점 대비 X% 빠지면 청산
         protect_trail = 0.03
         if max_price > 0 and current_price < max_price * (1 - protect_trail):
-            return _make_exit_intent(
+            return _emit_exit(
                 symbol=symbol, exchange=exchange, qty=qty,
                 current_price=current_price, entry_price=entry_price,
                 exit_type="profit_protect",
@@ -404,7 +407,7 @@ def evaluate_exit(
         if max_gain > 0.05:  # 최소 5% 수익 있을 때만 giveback 적용
             giveback_ratio = (max_gain - current_gain) / max_gain
             if giveback_ratio >= cfg["giveback"]:
-                return _make_exit_intent(
+                return _emit_exit(
                     symbol=symbol, exchange=exchange, qty=qty,
                     current_price=current_price, entry_price=entry_price,
                     exit_type="giveback",
@@ -433,7 +436,7 @@ def evaluate_exit(
         exit_type, sell_qty, stage = choice
         if stage.startswith("time_stop"):
             logger.info("[US_POSITION][TIME_STOP] symbol=%s holding_trade_days=%s pnl_pct=%.4f trend_state=%s action=%s", symbol, position.get("holding_trade_days") or trend.get("holding_trade_days"), pnl_pct, trend.get("trend_state"), "SELL_50PCT" if exit_type == "time_stop_trim" else "SELL_FULL")
-        intent = _make_exit_intent(
+        intent = _emit_exit(
             symbol=symbol, exchange=exchange, qty=sell_qty, current_price=current_price, entry_price=entry_price,
             exit_type=exit_type, reason=f"{stage} trend_state={trend.get('trend_state')} signals={','.join(trend.get('weakness_signals') or [])}",
             unrealized_pnl_usd=(current_price - entry_price) * sell_qty, pnl_pct=pnl_pct,
@@ -504,6 +507,7 @@ def _make_exit_intent(
     now: datetime | None = None,
     trail_high_price: float | None = None,
     meta_extra: dict | None = None,
+    policy_cfg: dict | None = None,
 ) -> dict | None:
     """Exit order intent 생성."""
     import hashlib
@@ -536,7 +540,7 @@ def _make_exit_intent(
     partial_allowed = False if is_hard_stop else (exit_type not in {"persistent_soft_stop_full_exit", "trend_deterioration_exit", "time_stop_exit"})
     trail_high = float(trail_high_price or current_price or 0.0)
     trail_drawdown_pct = ((trail_high - current_price) / trail_high) if trail_high > 0 else 0.0
-    cfg = _reload_env()
+    cfg = dict(policy_cfg or _reload_env())
     stop_type = _canonical_exit_reason(exit_type)[0]
     threshold = cfg["hard_stop"] if is_hard_stop else cfg["soft_stop"] if exit_type == EXIT_SOFT_STOP_LOSS else cfg["trailing_stop"] if exit_type in {"trailing_stop", EXIT_PROFIT_TRAILING_STOP, "profit_protect"} else cfg.get("giveback", 0.0)
     try:
