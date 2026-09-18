@@ -212,9 +212,10 @@ def build_us_entry_reasons(entry_data: dict[str, Any], entry_style: str) -> list
         if vcp_score >= 60:
             reasons.append("vcp_contraction_pattern")
     
-    # Fallback if no reasons found
-    if not reasons:
-        reasons.append("entry_condition_met")
+    # Never collapse a proven BUY style to a generic reason. Detailed
+    # indicators remain in the list, while the style is the minimum durable WHY.
+    if not reasons and entry_style not in {"", "SKIP"}:
+        reasons.append(entry_style)
     
     return reasons
 
@@ -358,7 +359,12 @@ def build_us_entry_explanation(
         }
     """
     # Entry style 정규화
-    raw_style = entry_data.get("entry_style_selected") or entry_data.get("entry_signal") or ""
+    raw_style = (
+        entry_data.get("entry_style_selected")
+        or entry_data.get("entry_style")
+        or entry_data.get("entry_signal")
+        or ""
+    )
     entry_style = normalize_us_entry_style(raw_style)
     
     # Score breakdown 추출
