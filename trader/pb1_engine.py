@@ -11090,10 +11090,10 @@ class PB1Engine:
                 parent_meta = {}
         parent_cycle = pos.get("position_cycle_id")
         parent_epoch = pos.get("portfolio_epoch_id")
+        position_meta_for_add = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         parent_contract_sha = (
             (parent_meta or {}).get("entry_contract_sha256")
-            or (pos.get("position_meta") or {}).get("entry_contract_sha256")
-            if isinstance(pos.get("position_meta"), dict) else None
+            or position_meta_for_add.get("entry_contract_sha256")
         )
         if not isinstance(parent_plan, dict) or not parent_plan or not parent_cycle or not parent_epoch or not parent_contract_sha:
             logger.error(
