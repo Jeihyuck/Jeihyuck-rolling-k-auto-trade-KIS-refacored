@@ -5584,31 +5584,58 @@ class PositionsRepo:
         if entry_meta and not entry_meta_json:
             entry_meta_json = entry_meta
         entry_exit_plan = json_sanitize(entry_exit_plan or {})
-        if entry_exit_plan:
-            plan_meta = {
-                "entry_thesis": entry_exit_plan.get("entry_thesis"),
-                "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
-                "entry_reason": entry_exit_plan.get("entry_reason"),
-                "trade_horizon": entry_exit_plan.get("trade_horizon"),
-                "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
-                "eod_action": entry_exit_plan.get("eod_action"),
-                "force_eod_close": entry_exit_plan.get("force_eod_close"),
-                "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
-                "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
-                "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
-                "policy_source": entry_exit_plan.get("policy_source"),
-                "policy_version": entry_exit_plan.get("policy_version"),
-            }
-            entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
         with self.engine.begin() as conn:
-            if order_id and (position_cycle_id is None or portfolio_epoch_id is None):
+            provenance = None
+            if order_id:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
+                    self._schema.orders.c.request_json,
                 ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
                 if provenance:
                     position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                     portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
+                    request_json = provenance.get("request_json")
+                    if isinstance(request_json, str):
+                        try:
+                            request_json = json.loads(request_json)
+                        except Exception:
+                            request_json = {}
+                    if (
+                        side.upper() == "BUY"
+                        and isinstance(request_json, dict)
+                        and (request_json.get("enforce_entry_contract") or request_json.get("entry_contract_version"))
+                    ):
+                        _assert_kr_buy_entry_contract(request_json)
+                        if not entry_exit_plan:
+                            entry_exit_plan = json_sanitize(request_json.get("entry_exit_plan") or {})
+                        entry_meta_json = _merge_json_dict(entry_meta_json, {
+                            "entry_contract_sha256": request_json.get("entry_contract_sha256"),
+                            "entry_contract_version": request_json.get("entry_contract_version"),
+                            "source_buy_order_id": str(order_id),
+                            "source_buy_client_order_key": request_json.get("client_order_key"),
+                        })
+                        logger.info(
+                            "[KR_POSITION][ENTRY_CONTRACT_BOUND] code=%s order_id=%s cycle=%s contract_sha=%s",
+                            code, order_id, position_cycle_id, request_json.get("entry_contract_sha256"),
+                        )
+
+            if entry_exit_plan:
+                plan_meta = {
+                    "entry_thesis": entry_exit_plan.get("entry_thesis"),
+                    "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
+                    "entry_reason": entry_exit_plan.get("entry_reason"),
+                    "trade_horizon": entry_exit_plan.get("trade_horizon"),
+                    "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
+                    "eod_action": entry_exit_plan.get("eod_action"),
+                    "force_eod_close": entry_exit_plan.get("force_eod_close"),
+                    "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
+                    "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
+                    "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
+                    "policy_source": entry_exit_plan.get("policy_source"),
+                    "policy_version": entry_exit_plan.get("policy_version"),
+                }
+                entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
             account_id = account_id or get_account_key(env=env)
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
