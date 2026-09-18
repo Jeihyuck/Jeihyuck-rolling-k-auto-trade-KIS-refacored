@@ -73,8 +73,17 @@ def is_open_vol_guard_window(now: datetime | None) -> bool:
     return time(9, 30) <= dt.time() < time(10, 0)
 
 
-def _soft_stop_confirmed(position: dict, default_required: int = 2) -> tuple[bool, int, int]:
-    raw_required = position.get("soft_stop_confirm_ticks") or os.getenv("US_SOFT_STOP_CONFIRM_TICKS", str(default_required))
+def _soft_stop_confirmed(
+    position: dict,
+    default_required: int = 2,
+    required_override: int | None = None,
+) -> tuple[bool, int, int]:
+    raw_required = (
+        required_override
+        if required_override is not None
+        else position.get("soft_stop_confirm_ticks")
+        or os.getenv("US_SOFT_STOP_CONFIRM_TICKS", str(default_required))
+    )
     required = max(1, int(raw_required))
     count = int(position.get("soft_stop_breach_count") or position.get("risk_state", {}).get("soft_stop_breach_count") or 0)
     return count >= required, count, required
@@ -319,8 +328,14 @@ def evaluate_exit(
 
     # ── persistent soft stop: first partial 이후에도 -5%가 지속되면 전량 청산 ─────────
     if pnl_pct <= -cfg["soft_stop"]:
-        confirmed, breach_count, required_ticks = _soft_stop_confirmed(position)
-        persistent_required = max(required_ticks + 1, int(os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3") or 3))
+        confirmed, breach_count, required_ticks = _soft_stop_confirmed(
+            position,
+            required_override=int(cfg.get("soft_stop_confirm_ticks", 2)),
+        )
+        persistent_required = max(
+            required_ticks + 1,
+            int(cfg.get("persistent_soft_stop_ticks", os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3")) or 3),
+        )
         already_reduced = bool(position.get("soft_stop_partial_done") or position.get("partial_soft_stop_done") or position.get("last_exit_type") == EXIT_SOFT_STOP_LOSS)
         if already_reduced and breach_count >= persistent_required:
             return _emit_exit(
@@ -740,6 +755,18 @@ def prepare_exit_position_snapshots(
         if entry_price_for_state > 0 and current_price > 0:
             try:
                 from trader.us.db.repos import update_us_soft_stop_risk_state
+                from trader.us.entry_exit_contract import (
+                    contract_exit_config,
+                    us_entry_exit_contract_integrity_state,
+                )
+                integrity = us_entry_exit_contract_integrity_state(pos, pos.get("meta"))
+                if integrity == "INVALID":
+                    logger.error(
+                        "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=skip_soft_stop_state_mutation",
+                        symbol,
+                    )
+                    raise ValueError("invalid_entry_exit_contract")
+                frozen_risk_cfg = contract_exit_config(pos)
                 pnl_pct_for_state = (current_price - entry_price_for_state) / entry_price_for_state
                 risk_state = update_us_soft_stop_risk_state(
                     symbol=symbol,
@@ -747,7 +774,9 @@ def prepare_exit_position_snapshots(
                     pnl_pct=pnl_pct_for_state,
                     current_price=current_price,
                     now=now or datetime.now(),
-                    soft_stop_pct=float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05")),
+                    soft_stop_pct=float(
+                        frozen_risk_cfg.get("soft_stop", os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05"))
+                    ),
                 )
                 pos["risk_state"] = risk_state
                 pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
