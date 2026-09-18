@@ -82,6 +82,28 @@ def _kr_buy_entry_contract_hash(request_json: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _kr_entry_exit_plan_sha256(plan: Any) -> str:
+    payload = json_sanitize(plan) if isinstance(plan, dict) else {}
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _kr_parent_contract_binding_hash(request_json: dict[str, Any]) -> str:
+    """Bind a pyramid/add BUY to the already-open lifecycle without changing v1 root hashes."""
+    payload = {
+        "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
+        "parent_position_cycle_id": request_json.get("parent_position_cycle_id"),
+        "parent_portfolio_epoch_id": request_json.get("parent_portfolio_epoch_id"),
+        "entry_contract_sha256": request_json.get("entry_contract_sha256"),
+        "position_cycle_id": request_json.get("position_cycle_id"),
+        "portfolio_epoch_id": request_json.get("portfolio_epoch_id"),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _assert_kr_buy_entry_contract(request_json: Any) -> None:
     """Fail closed when a persisted KR BUY cannot be reconciled after restart."""
     if not isinstance(request_json, dict):
@@ -104,6 +126,22 @@ def _assert_kr_buy_entry_contract(request_json: Any) -> None:
         missing.append("entry_contract_version")
     if request_json.get("entry_contract_sha256") != expected_hash:
         missing.append("entry_contract_sha256")
+
+    parent_sha = str(request_json.get("parent_entry_contract_sha256") or "").strip()
+    if parent_sha:
+        parent_cycle = str(request_json.get("parent_position_cycle_id") or "").strip()
+        parent_epoch = str(request_json.get("parent_portfolio_epoch_id") or "").strip()
+        if not parent_cycle:
+            missing.append("parent_position_cycle_id")
+        if not parent_epoch:
+            missing.append("parent_portfolio_epoch_id")
+        if parent_cycle and parent_cycle != str(payload.get("position_cycle_id") or ""):
+            missing.append("parent_position_cycle_id_mismatch")
+        if parent_epoch and parent_epoch != str(payload.get("portfolio_epoch_id") or ""):
+            missing.append("parent_portfolio_epoch_id_mismatch")
+        if request_json.get("parent_contract_binding_sha256") != _kr_parent_contract_binding_hash(request_json):
+            missing.append("parent_contract_binding_sha256")
+
     if missing:
         raise RuntimeError(f"KR_BUY_ENTRY_CONTRACT_INVALID:{','.join(missing)}")
 
@@ -2860,6 +2898,41 @@ class OrdersRepo:
             str(side or "").upper() == "BUY"
             and safe_request_json.get("enforce_entry_contract") is True
         )
+        if enforce_buy_contract and safe_request_json.get("parent_entry_contract_sha256"):
+            # ADD/PYRAMID claims must match the authoritative open position,
+            # not only the caller's in-memory snapshot.
+            with self.engine.begin() as conn:
+                parent_row = conn.execute(
+                    select(
+                        self._schema.positions.c.position_cycle_id,
+                        self._schema.positions.c.portfolio_epoch_id,
+                        self._schema.positions.c.entry_meta_json,
+                    ).where(and_(
+                        self._schema.positions.c.env == env,
+                        self._schema.positions.c.strategy == strategy,
+                        self._schema.positions.c.sid == sid,
+                        self._schema.positions.c.mode == mode,
+                        self._schema.positions.c.code == code,
+                        self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
+                        self._schema.positions.c.status == "OPEN",
+                    ))
+                ).mappings().first()
+            if not parent_row:
+                raise RuntimeError("KR_ADD_PARENT_POSITION_MISSING")
+            parent_meta = parent_row.get("entry_meta_json") or {}
+            if isinstance(parent_meta, str):
+                try:
+                    parent_meta = json.loads(parent_meta)
+                except Exception:
+                    parent_meta = {}
+            authoritative_parent_sha = str((parent_meta or {}).get("entry_contract_sha256") or "").strip()
+            claimed_parent_sha = str(safe_request_json.get("parent_entry_contract_sha256") or "").strip()
+            if not authoritative_parent_sha or claimed_parent_sha != authoritative_parent_sha:
+                raise RuntimeError("KR_ADD_PARENT_CONTRACT_SHA_MISMATCH")
+            if str(parent_row.get("position_cycle_id") or "") != str(position_cycle_id or ""):
+                raise RuntimeError("KR_ADD_PARENT_POSITION_CYCLE_MISMATCH")
+            if str(parent_row.get("portfolio_epoch_id") or "") != str(portfolio_epoch_id or ""):
+                raise RuntimeError("KR_ADD_PARENT_PORTFOLIO_EPOCH_MISMATCH")
         if enforce_buy_contract:
             safe_request_json.update({
                 "client_order_key": client_order_key,
@@ -2868,6 +2941,8 @@ class OrdersRepo:
                 "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
             })
             safe_request_json["entry_contract_sha256"] = _kr_buy_entry_contract_hash(safe_request_json)
+            if safe_request_json.get("parent_entry_contract_sha256"):
+                safe_request_json["parent_contract_binding_sha256"] = _kr_parent_contract_binding_hash(safe_request_json)
             _assert_kr_buy_entry_contract(safe_request_json)
         payload = {
             "order_id": order_id,
@@ -3667,6 +3742,66 @@ class OrdersRepo:
         broker_order_id = kis_odno or client_order_key
         safe_request_json = json_sanitize(request_json or {})
         safe_response_json = json_sanitize(response_json or {})
+
+        # Reconciliation is an observation of an already-created broker order,
+        # not permission to rewrite the immutable order intent.  If an exact
+        # broker/client identity already exists, preserve its request_json and
+        # keep the incoming broker row only as diagnostic evidence.  This blocks
+        # BUY EntryExitPlan / OrderBaseline loss and the analogous SELL baseline
+        # loss without inventing or cross-binding policy.
+        existing_row = None
+        with self.engine.connect() as _read_conn:
+            if broker_order_id:
+                existing_row = _read_conn.execute(
+                    select(self._schema.orders).where(
+                        and_(
+                            self._schema.orders.c.env == env,
+                            self._schema.orders.c.broker_order_id == broker_order_id,
+                        )
+                    )
+                ).mappings().first()
+            if existing_row is None and client_order_key:
+                existing_row = _read_conn.execute(
+                    select(self._schema.orders).where(
+                        and_(
+                            self._schema.orders.c.env == env,
+                            self._schema.orders.c.client_order_key == client_order_key,
+                        )
+                    )
+                ).mappings().first()
+        if existing_row is not None:
+            same_identity = (
+                str(existing_row.get("code") or "").zfill(6) == str(code or "").zfill(6)
+                and str(existing_row.get("side") or "").upper() == str(side or "").upper()
+            )
+            if same_identity:
+                existing_request = existing_row.get("request_json")
+                if isinstance(existing_request, str):
+                    try:
+                        existing_request = json.loads(existing_request)
+                    except Exception:
+                        existing_request = {}
+                if isinstance(existing_request, dict) and existing_request:
+                    observed_request = safe_request_json
+                    safe_request_json = json_sanitize(dict(existing_request))
+                    if observed_request and observed_request != safe_request_json:
+                        safe_request_json["_reconcile_observation"] = observed_request
+                    logger.info(
+                        "[RECONCILE][ORDER_INTENT_PRESERVED] env=%s code=%s side=%s key=%s broker_order_id=%s",
+                        env, code, side, client_order_key, broker_order_id,
+                    )
+            else:
+                logger.error(
+                    "[RECONCILE][ORDER_IDENTITY_MISMATCH] env=%s broker_order_id=%s "
+                    "existing_code=%s existing_side=%s incoming_code=%s incoming_side=%s",
+                    env,
+                    broker_order_id,
+                    existing_row.get("code"),
+                    existing_row.get("side"),
+                    code,
+                    side,
+                )
+
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -5584,31 +5719,69 @@ class PositionsRepo:
         if entry_meta and not entry_meta_json:
             entry_meta_json = entry_meta
         entry_exit_plan = json_sanitize(entry_exit_plan or {})
-        if entry_exit_plan:
-            plan_meta = {
-                "entry_thesis": entry_exit_plan.get("entry_thesis"),
-                "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
-                "entry_reason": entry_exit_plan.get("entry_reason"),
-                "trade_horizon": entry_exit_plan.get("trade_horizon"),
-                "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
-                "eod_action": entry_exit_plan.get("eod_action"),
-                "force_eod_close": entry_exit_plan.get("force_eod_close"),
-                "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
-                "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
-                "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
-                "policy_source": entry_exit_plan.get("policy_source"),
-                "policy_version": entry_exit_plan.get("policy_version"),
-            }
-            entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
+        request_json: dict[str, Any] = {}
         with self.engine.begin() as conn:
-            if order_id and (position_cycle_id is None or portfolio_epoch_id is None):
+            provenance = None
+            if order_id:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
+                    self._schema.orders.c.request_json,
                 ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
                 if provenance:
                     position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                     portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
+                    request_json = provenance.get("request_json")
+                    if isinstance(request_json, str):
+                        try:
+                            request_json = json.loads(request_json)
+                        except Exception:
+                            request_json = {}
+                    if (
+                        side.upper() == "BUY"
+                        and isinstance(request_json, dict)
+                        and (request_json.get("enforce_entry_contract") or request_json.get("entry_contract_version"))
+                    ):
+                        _assert_kr_buy_entry_contract(request_json)
+                        if not entry_exit_plan:
+                            entry_exit_plan = json_sanitize(request_json.get("entry_exit_plan") or {})
+                        root_contract_sha = (
+                            request_json.get("parent_entry_contract_sha256")
+                            or request_json.get("entry_contract_sha256")
+                        )
+                        entry_meta_json = _merge_json_dict(entry_meta_json, {
+                            # Keep the lifecycle/root contract immutable across pyramid adds.
+                            "entry_contract_sha256": root_contract_sha,
+                            "entry_contract_version": request_json.get("entry_contract_version"),
+                            "last_buy_order_contract_sha256": request_json.get("entry_contract_sha256"),
+                            "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
+                            "source_buy_order_id": str(order_id),
+                            "source_buy_client_order_key": request_json.get("client_order_key"),
+                        })
+                        logger.info(
+                            "[KR_POSITION][ENTRY_CONTRACT_BOUND] code=%s order_id=%s cycle=%s contract_sha=%s",
+                            code, order_id, position_cycle_id, request_json.get("entry_contract_sha256"),
+                        )
+
+            if entry_exit_plan:
+                entry_meta_json = _merge_json_dict(entry_meta_json, {
+                    "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(entry_exit_plan),
+                })
+                plan_meta = {
+                    "entry_thesis": entry_exit_plan.get("entry_thesis"),
+                    "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
+                    "entry_reason": entry_exit_plan.get("entry_reason"),
+                    "trade_horizon": entry_exit_plan.get("trade_horizon"),
+                    "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
+                    "eod_action": entry_exit_plan.get("eod_action"),
+                    "force_eod_close": entry_exit_plan.get("force_eod_close"),
+                    "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
+                    "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
+                    "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
+                    "policy_source": entry_exit_plan.get("policy_source"),
+                    "policy_version": entry_exit_plan.get("policy_version"),
+                }
+                entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
             account_id = account_id or get_account_key(env=env)
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
@@ -5667,6 +5840,16 @@ class PositionsRepo:
                     "last_trade_at": filled_at,
                     "status": "OPEN",
                 }
+                if isinstance(request_json, dict) and request_json.get("entry_reason") == "ENTRY_PYRAMID":
+                    requested_level = int(request_json.get("level") or 0)
+                    if requested_level > 0:
+                        values["pyramid_level"] = max(int(row.get("pyramid_level") or 0) if row else 0, requested_level)
+                        values["last_add_price"] = float(price)
+                        values["last_stop_update_ts"] = filled_at.isoformat()
+                        logger.info(
+                            "[KR_POSITION][PYRAMID_FILL_CONFIRMED] code=%s level=%s fill_price=%s order_id=%s",
+                            code, requested_level, price, order_id,
+                        )
                 if entry_meta_json:
                     merged_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, entry_meta_json)
                     values.update(

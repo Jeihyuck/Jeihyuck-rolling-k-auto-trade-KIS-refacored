@@ -43,11 +43,29 @@ def save_trend_state(symbol: str, trade_date: str, trend: dict) -> dict:
     return trend
 
 
-def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetime, current_price: float | None, holding_trade_days: int = 0, final30: dict | None = None, daily: dict | None = None, lifecycle_id: str | None = None) -> dict:
+def update_us_position_trend_state(
+    *,
+    symbol: str,
+    trade_date: str,
+    now: datetime,
+    current_price: float | None,
+    holding_trade_days: int = 0,
+    final30: dict | None = None,
+    daily: dict | None = None,
+    lifecycle_id: str | None = None,
+    warning_threshold: float | None = None,
+    severe_threshold: float | None = None,
+) -> dict:
     prev = load_trend_state(symbol, trade_date)
     once = prev.get("last_daily_update_trade_date") != trade_date
-    warning_thr = float(os.getenv("US_TREND_SCORE_WARNING_THRESHOLD", "0.45"))
-    severe_thr = float(os.getenv("US_TREND_SCORE_SEVERE_THRESHOLD", "0.35"))
+    warning_thr = float(
+        warning_threshold if warning_threshold is not None
+        else os.getenv("US_TREND_SCORE_WARNING_THRESHOLD", "0.45")
+    )
+    severe_thr = float(
+        severe_threshold if severe_threshold is not None
+        else os.getenv("US_TREND_SCORE_SEVERE_THRESHOLD", "0.35")
+    )
     final30 = final30 or {}
     daily = daily or {}
     cp = _f(current_price)
@@ -114,23 +132,43 @@ def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetim
 
 
 def choose_trend_time_exit(position: dict, trend: dict, *, pnl_pct: float, orderable_qty: int) -> tuple[str, int, str] | None:
+    frozen = {}
+    try:
+        from trader.us.entry_exit_contract import (
+            contract_exit_config,
+            us_entry_exit_contract_integrity_state,
+        )
+        if us_entry_exit_contract_integrity_state(position, position.get("meta")) == "INVALID":
+            logger.error(
+                "[US_POSITION][TREND_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=BLOCK_NORMAL_EXIT",
+                position.get("symbol"),
+            )
+            return None
+        frozen = contract_exit_config(position)
+    except Exception:
+        frozen = {}
+
     hold = _i(position.get("holding_trade_days") or trend.get("holding_trade_days"))
-    min_hold = int(os.getenv("US_TREND_EXIT_MIN_HOLD_DAYS", "2"))
+    min_hold = int(frozen.get("trend_exit_min_hold_days", os.getenv("US_TREND_EXIT_MIN_HOLD_DAYS", "2")))
     if orderable_qty <= 0 or trend.get("trend_state") == "UNKNOWN" or hold < min_hold:
         return None
     st = trend.get("trend_state")
     if st == "EXIT" and not trend.get("trend_exit_done") and not trend.get("trend_exit_pending"):
         return "trend_deterioration_exit", orderable_qty, "trend_exit"
     if st == "TRIM" and not trend.get("trend_trim_done") and not trend.get("trend_trim_pending"):
-        q = max(1, min(orderable_qty, int(orderable_qty * float(os.getenv("US_TREND_TRIM_SELL_RATIO", "0.35")))))
+        trim_ratio = float(frozen.get("trend_trim_sell_ratio", os.getenv("US_TREND_TRIM_SELL_RATIO", "0.35")))
+        q = max(1, min(orderable_qty, int(orderable_qty * trim_ratio)))
         return "trend_deterioration_trim", q, "trend_trim"
-    days = int(os.getenv("US_TIME_STOP_DAYS", "20")); grace = int(os.getenv("US_TIME_STOP_GRACE_DAYS", "5")); min_profit = float(os.getenv("US_TIME_STOP_MIN_PROFIT_PCT", "0.03"))
+    days = int(frozen.get("time_stop_days", os.getenv("US_TIME_STOP_DAYS", "20")))
+    grace = int(frozen.get("time_stop_grace_days", os.getenv("US_TIME_STOP_GRACE_DAYS", "5")))
+    min_profit = float(frozen.get("time_stop_min_profit_pct", os.getenv("US_TIME_STOP_MIN_PROFIT_PCT", "0.03")))
     protected = pnl_pct >= min_profit or (st == "HEALTHY" and _f(trend.get("current_price"), 0) >= _f(trend.get("ma20"), 10**9))
     weak = st in {"WARNING","TRIM","EXIT"} or _i(trend.get("final30_absent_streak")) >= 2
     if not protected and hold >= days + grace and (trend.get("trend_trim_done") or trend.get("time_stop_trim_done")) and st != "HEALTHY" and not trend.get("time_stop_exit_done") and not trend.get("time_stop_exit_pending"):
         return "time_stop_exit", orderable_qty, "time_stop_exit"
     if not protected and hold >= days and weak and not trend.get("time_stop_trim_done") and not trend.get("time_stop_trim_pending") and not trend.get("trend_trim_done"):
-        q = max(1, min(orderable_qty, int(orderable_qty * float(os.getenv("US_TIME_STOP_FIRST_SELL_RATIO", "0.50")))))
+        first_ratio = float(frozen.get("time_stop_first_sell_ratio", os.getenv("US_TIME_STOP_FIRST_SELL_RATIO", "0.50")))
+        q = max(1, min(orderable_qty, int(orderable_qty * first_ratio)))
         return "time_stop_trim", q, "time_stop_trim"
     return None
 

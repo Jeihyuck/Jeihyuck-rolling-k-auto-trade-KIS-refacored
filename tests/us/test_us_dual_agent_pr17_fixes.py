@@ -39,7 +39,7 @@ def _run_entry(monkeypatch, pos, price=110.0):
         available_cash_usd=10000.0,
         position_count=len(pos),
         capital_usd_cap=100000.0,
-        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9}],
+        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9, "entry_style_selected": "ENTRY_PULLBACK"}],
         current_position_symbols={"AMD"},
     )
 
@@ -427,7 +427,7 @@ def test_buy_client_order_key_uses_new_york_trade_date_when_now_none(monkeypatch
         available_cash_usd=10000,
         position_count=0,
         capital_usd_cap=100000,
-        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9}],
+        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9, "entry_style_selected": "ENTRY_MOMENTUM", "momentum_score": 0.9}],
         current_position_symbols=set(),
     )
     expected = hashlib.sha256("AMD_20260617_BUY".encode()).hexdigest()[:24]

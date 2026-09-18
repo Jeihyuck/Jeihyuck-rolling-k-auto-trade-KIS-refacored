@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime
@@ -101,6 +102,89 @@ def _as_dict(row: Any) -> dict:
         return {}
 
 
+def _json_dict(value: Any) -> dict[str, Any]:
+    """Normalize PostgreSQL JSONB / driver text / bytes consistently."""
+    if isinstance(value, dict):
+        return dict(value)
+    raw = value
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except Exception:
+            return {}
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            decoded = json.loads(text)
+        except Exception:
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _recover_kr_buy_request_from_response(
+    *, order: dict[str, Any], request_json: Any, response_json: Any
+) -> dict[str, Any]:
+    """Recover only a previously validated BUY contract mirrored at broker ACK.
+
+    This never invents policy.  The redundant response snapshot must pass the
+    same hash/lifecycle validator and must match the durable order identity.
+    """
+    current = _json_dict(request_json)
+    response = _json_dict(response_json)
+    if current.get("enforce_entry_contract") is True:
+        try:
+            _assert_kr_buy_entry_contract(current)
+            return current
+        except RuntimeError:
+            pass
+
+    envelope = _json_dict(response.get("_kr_buy_entry_contract"))
+    candidate = _json_dict(envelope.get("request"))
+    if not candidate:
+        return current
+    try:
+        _assert_kr_buy_entry_contract(candidate)
+    except RuntimeError as exc:
+        logger.error(
+            "[RECONCILE][BUY_CONTRACT_RECOVERY_BLOCK] code=%s reason=INVALID_RESPONSE_SNAPSHOT detail=%s",
+            _normalize_code(order.get("code")), exc,
+        )
+        return current
+
+    code = _normalize_code(order.get("code"))
+    envelope_code = _normalize_code(envelope.get("code"))
+    expected_key = str(order.get("client_order_key") or "")
+    expected_cycle = str(order.get("position_cycle_id") or "")
+    expected_epoch = str(order.get("portfolio_epoch_id") or "")
+    identity_errors = []
+    if envelope_code and envelope_code != code:
+        identity_errors.append("code")
+    if expected_key and str(candidate.get("client_order_key") or "") != expected_key:
+        identity_errors.append("client_order_key")
+    if expected_cycle and str(candidate.get("position_cycle_id") or "") != expected_cycle:
+        identity_errors.append("position_cycle_id")
+    if expected_epoch and str(candidate.get("portfolio_epoch_id") or "") != expected_epoch:
+        identity_errors.append("portfolio_epoch_id")
+    if identity_errors:
+        logger.error(
+            "[RECONCILE][BUY_CONTRACT_RECOVERY_BLOCK] code=%s reason=IDENTITY_MISMATCH fields=%s",
+            code, identity_errors,
+        )
+        return current
+
+    candidate["recovered_request_source"] = "BROKER_ACK_CONTRACT_REDUNDANCY"
+    logger.warning(
+        "[RECONCILE][BUY_CONTRACT_RECOVERED] code=%s key=%s cycle=%s epoch=%s",
+        code, expected_key, expected_cycle, expected_epoch,
+    )
+    return candidate
+
+
 def _holdings_index(rows: list[dict]) -> tuple[dict[str, int], dict[str, float]]:
     qty_by_code: dict[str, int] = {}
     avg_price_by_code: dict[str, float] = {}
@@ -157,8 +241,18 @@ def _promote_open_buy_orders_from_holdings(
         if side == "BUY" and holding_qty <= 0:
             continue
 
-        request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
-        response_json = order.get("response_json") if isinstance(order.get("response_json"), dict) else {}
+        request_json = _json_dict(order.get("request_json"))
+        response_json = _json_dict(order.get("response_json"))
+        if side == "BUY":
+            request_json = _recover_kr_buy_request_from_response(
+                order=order, request_json=request_json, response_json=response_json
+            )
+            if response_json.get("_kr_buy_entry_contract") and request_json.get("enforce_entry_contract") is not True:
+                logger.error(
+                    "[RECONCILE][PROMOTE_BLOCK] env=%s code=%s reason=BUY_ENTRY_CONTRACT_RECOVERY_FAILED",
+                    env, code,
+                )
+                continue
         if side == "BUY" and request_json.get("enforce_entry_contract") is True:
             try:
                 _assert_kr_buy_entry_contract(request_json)
@@ -168,7 +262,7 @@ def _promote_open_buy_orders_from_holdings(
                     env, code, exc,
                 )
                 continue
-        execution_meta = response_json.get("_order_execution") if isinstance(response_json.get("_order_execution"), dict) else {}
+        execution_meta = _json_dict(response_json.get("_order_execution"))
         order_qty = _to_int(order.get("qty")) or 0
         submitted_qty = _to_int(execution_meta.get("submitted_qty")) or _to_int(response_json.get("submitted_qty")) or _to_int(request_json.get("submitted_qty")) or order_qty
         requested_qty = _to_int(execution_meta.get("requested_qty")) or _to_int(response_json.get("requested_qty")) or _to_int(request_json.get("requested_qty")) or submitted_qty
@@ -237,10 +331,20 @@ def _promote_open_buy_orders_from_holdings(
             confirmed_fill_qty = 0
 
         broker_fill_price = _broker_execution_price(response_json)
-        fill_price = broker_fill_price if side == "SELL" else (
-            broker_fill_price or _to_float(order.get("limit_price"))
-            or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0)
-        )
+        if side == "SELL":
+            fill_price = broker_fill_price
+        else:
+            # For a brand-new holding, KIS average price is direct broker truth
+            # and is more accurate than the submitted limit. For an add, the
+            # holding average mixes prior/new lots, so keep order economics unless
+            # the broker reports an execution price.
+            holding_avg = float(avg_price_by_code.get(code) or 0.0)
+            fill_price = (
+                broker_fill_price
+                or (holding_avg if int(pre_order_holding_qty or 0) == 0 and holding_avg > 0 else None)
+                or _to_float(order.get("limit_price"))
+                or _to_float(request_json.get("ORD_UNPR"))
+            )
         if (
             side == "SELL"
             and confirmed_fill_qty > 0
@@ -312,17 +416,22 @@ def _promote_open_buy_orders_from_holdings(
                 filled_qty=confirmed_fill_qty,
             )
 
-        if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
+        previous_confirmed_fill_qty = max(0, _to_int(response_json.get("confirmed_fill_qty")) or 0)
+        incremental_fill_qty = max(0, confirmed_fill_qty - previous_confirmed_fill_qty)
+        if incremental_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
             fills_repo.upsert_fill(
                 env=env,
                 run_id=ctx_run_id,
                 order_id=str(order.get("order_id") or "") or None,
                 kis_odno=kis_odno,
-                trade_id=f"PROMOTE:{side}:{kis_odno or client_order_key}",
+                trade_id=(
+                    f"PROMOTE:{side}:{kis_odno or client_order_key}:"
+                    f"{previous_confirmed_fill_qty}->{confirmed_fill_qty}"
+                ),
                 code=code,
                 market=order.get("market"),
                 side=side,
-                qty=confirmed_fill_qty,
+                qty=incremental_fill_qty,
                 price=float(fill_price or 0.0),
                 fee=0.0,
                 tax=0.0,
@@ -335,11 +444,13 @@ def _promote_open_buy_orders_from_holdings(
                     "holding_delta": delta,
                     "submitted_qty": submitted_qty,
                     "requested_qty": requested_qty,
+                    "previous_confirmed_fill_qty": previous_confirmed_fill_qty,
                     "confirmed_fill_qty": confirmed_fill_qty,
+                    "incremental_fill_qty": incremental_fill_qty,
                     "ccld_status": "timeout",
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
-                    "entry_meta": (request_json or {}).get("entry_meta") or {},
-                    "entry_exit_plan": (request_json or {}).get("entry_exit_plan") or {},
+                    "entry_meta": request_json.get("entry_meta") or {},
+                    "entry_exit_plan": request_json.get("entry_exit_plan") or {},
                 },
                 fill_meta_json={
                     "fill_source": "BROKER_EXECUTION" if broker_fill_price is not None else "kis_holdings_fallback",
@@ -349,15 +460,48 @@ def _promote_open_buy_orders_from_holdings(
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
             )
+            if side == "BUY" and positions_repo is not None:
+                # This is the production lifecycle bridge PR133 previously
+                # skipped in tests by calling PositionsRepo.apply_fill directly.
+                # Bind the broker-proven quantity to the exact BUY order lifecycle
+                # before restore_missing_from_holdings can create an IMPORTED cycle.
+                positions_repo.apply_fill(
+                    env=env,
+                    strategy=strategy,
+                    sid=int(order.get("sid") or 1),
+                    mode=int(order.get("mode") or 1),
+                    code=code,
+                    market=order.get("market"),
+                    side="BUY",
+                    qty=incremental_fill_qty,
+                    price=float(fill_price or 0.0),
+                    fee=0.0,
+                    tax=0.0,
+                    filled_at=order_time,
+                    entry_meta_json=request_json.get("entry_meta") or {},
+                    entry_exit_plan=request_json.get("entry_exit_plan") or {},
+                    portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                    position_cycle_id=str(order.get("position_cycle_id") or "") or None,
+                    order_id=str(order.get("order_id") or "") or None,
+                )
+                logger.warning(
+                    "[RECONCILE][BUY_POSITION_APPLY] code=%s incremental_qty=%s cumulative_qty=%s cycle=%s epoch=%s source=kis_holdings_fallback",
+                    code,
+                    incremental_fill_qty,
+                    confirmed_fill_qty,
+                    order.get("position_cycle_id"),
+                    order.get("portfolio_epoch_id"),
+                )
             promoted_fills += 1
             promoted_codes.append(code)
             logger.warning(
-                "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=%s qty=%s holding_qty=%s delta=%s submitted_qty=%s",
+                "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=%s incremental_qty=%s cumulative_qty=%s holding_qty=%s delta=%s submitted_qty=%s",
                 env,
                 code,
                 kis_odno,
                 status,
                 next_status,
+                incremental_fill_qty,
                 confirmed_fill_qty,
                 holding_qty,
                 delta,
@@ -645,34 +789,45 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         market = MARKET_MAP.get(code) or str(_first_value(row, ["excg_dvsn_cd", "market"]) or "").strip() or None
         order_time = _parse_date_time(row)
         client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
-        plan_record = None
-        request_json = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        broker_row = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        request_json = dict(broker_row)
         source_order = None
-        if side == "SELL" and kis_odno:
+        source_response: dict[str, Any] = {}
+        if kis_odno:
             try:
                 source_order = orders_repo.get_order_by_kis_odno(env, kis_odno)
             except Exception as exc:
-                logger.warning("[RECONCILE][SELL_SOURCE_LOOKUP_FAIL] code=%s kis_odno=%s err=%s", code, kis_odno, exc)
-            if source_order:
-                source_request = source_order.get("request_json") if isinstance(source_order.get("request_json"), dict) else {}
-                request_json = {**source_request, "kis_row": request_json}
-                client_order_key = str(source_order.get("client_order_key") or client_order_key)
-        if side == "BUY":
-            try:
-                plan_record = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code)
-            except Exception as exc:
-                logger.warning("[RECONCILE][DAILY_CCLD][ENTRY_EXIT_PLAN_LOOKUP_FAIL] code=%s err=%s", code, exc)
-                plan_record = None
-            if plan_record:
-                request_json.update({
-                    "entry_meta": plan_record.get("entry_meta") or {},
-                    "entry_exit_plan": plan_record.get("entry_exit_plan") or {},
-                    "entry_exit_plan_source": "latest_buy_order_request_json",
-                })
-                logger.info(
-                    "[RECONCILE][DAILY_CCLD][ENTRY_EXIT_PLAN_MERGE] code=%s source=latest_buy_order_request_json",
-                    code,
+                logger.warning(
+                    "[RECONCILE][SOURCE_LOOKUP_FAIL] side=%s code=%s kis_odno=%s err=%s",
+                    side, code, kis_odno, exc,
                 )
+        if source_order:
+            source_request = _json_dict(source_order.get("request_json"))
+            source_response = _json_dict(source_order.get("response_json"))
+            if side == "BUY":
+                source_request = _recover_kr_buy_request_from_response(
+                    order=source_order,
+                    request_json=source_request,
+                    response_json=source_response,
+                )
+            request_json = {**source_request, "kis_row": broker_row}
+            client_order_key = str(source_order.get("client_order_key") or client_order_key)
+            if side == "BUY" and source_request.get("entry_exit_plan"):
+                request_json["entry_exit_plan_source"] = "exact_source_buy_order"
+                logger.info(
+                    "[RECONCILE][DAILY_CCLD][ENTRY_EXIT_PLAN_MERGE] code=%s source=exact_source_buy_order cycle=%s epoch=%s",
+                    code,
+                    source_order.get("position_cycle_id"),
+                    source_order.get("portfolio_epoch_id"),
+                )
+        elif side == "BUY":
+            # A symbol-only historical order cannot prove ownership of this fill.
+            # Keep it unbound instead of attaching a possibly stale BUY policy.
+            logger.warning(
+                "[RECONCILE][DAILY_CCLD][BUY_SOURCE_MISSING] code=%s kis_odno=%s action=keep_unbound",
+                code,
+                kis_odno,
+            )
 
         orders_repo.upsert_reconciled_order(
             env=env,
@@ -691,7 +846,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             kis_odno=kis_odno,
             status=status,
             request_json=request_json,
-            response_json=row,
+            response_json={
+                **source_response,
+                **broker_row,
+                "source_order_id": (source_order or {}).get("order_id"),
+                "source_client_order_key": (source_order or {}).get("client_order_key"),
+            },
             submitted_at=order_time,
             acked_at=order_time,
         )
@@ -699,13 +859,29 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
 
         filled_qty = _to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
         filled_price = _to_float(_first_value(row, ["ccld_prc", "avg_prvs", "filled_price"]))
+        trade_id = str(_first_value(row, ["ccld_no", "trade_id", "exec_id"]) or "") or None
+        applied_fill_ids = {
+            str(item) for item in (source_response.get("applied_broker_fill_ids") or [])
+            if str(item or "").strip()
+        }
+        already_applied = bool(trade_id and trade_id in applied_fill_ids)
+        broker_cumulative_qty = _to_int(
+            _first_value(row, ["tot_ccld_qty", "cumulative_filled_qty"])
+        )
+        previous_confirmed_qty = max(0, _to_int(source_response.get("confirmed_fill_qty")) or 0)
+        if broker_cumulative_qty is not None:
+            incremental_daily_qty = max(0, broker_cumulative_qty - previous_confirmed_qty)
+            next_confirmed_qty = max(previous_confirmed_qty, broker_cumulative_qty)
+        else:
+            incremental_daily_qty = 0 if already_applied else int(filled_qty or 0)
+            next_confirmed_qty = previous_confirmed_qty + incremental_daily_qty
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
                 run_id=ctx.run_id,
-                order_id=None,
+                order_id=str((source_order or {}).get("order_id") or "") or None,
                 kis_odno=kis_odno,
-                trade_id=str(_first_value(row, ["ccld_no", "trade_id", "exec_id"]) or "") or None,
+                trade_id=trade_id,
                 code=code,
                 market=market,
                 side=side,
@@ -726,8 +902,73 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
             )
-            fill_count += 1
-            filled_codes.append(code)
+            if (
+                incremental_daily_qty > 0
+                and side == "BUY"
+                and source_order
+                and request_json.get("enforce_entry_contract") is True
+            ):
+                positions_repo.apply_fill(
+                    env=env,
+                    strategy=str(source_order.get("strategy") or strategy),
+                    sid=int(source_order.get("sid") or 1),
+                    mode=int(source_order.get("mode") or 1),
+                    code=code,
+                    market=source_order.get("market") or market,
+                    side="BUY",
+                    qty=incremental_daily_qty,
+                    price=float(filled_price),
+                    fee=0.0,
+                    tax=0.0,
+                    filled_at=order_time,
+                    entry_meta_json=request_json.get("entry_meta") or _json_dict(source_order.get("entry_meta_json")),
+                    entry_exit_plan=request_json.get("entry_exit_plan") or {},
+                    portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                    position_cycle_id=str(source_order.get("position_cycle_id") or "") or None,
+                    order_id=str(source_order.get("order_id") or "") or None,
+                )
+                logger.info(
+                    "[RECONCILE][BUY_POSITION_APPLY] code=%s incremental_qty=%s cumulative_qty=%s cycle=%s epoch=%s source=daily_ccld",
+                    code,
+                    incremental_daily_qty,
+                    next_confirmed_qty,
+                    source_order.get("position_cycle_id"),
+                    source_order.get("portfolio_epoch_id"),
+                )
+            if incremental_daily_qty > 0:
+                fill_count += 1
+                filled_codes.append(code)
+                if trade_id:
+                    applied_fill_ids.add(trade_id)
+                # Persist cumulative proof only after the position bridge succeeds.
+                orders_repo.upsert_reconciled_order(
+                    env=env,
+                    run_id=ctx.run_id,
+                    strategy=str((source_order or {}).get("strategy") or strategy),
+                    sid=int((source_order or {}).get("sid") or 1),
+                    mode=int((source_order or {}).get("mode") or 1),
+                    code=code,
+                    market=(source_order or {}).get("market") or market,
+                    side=side,
+                    ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
+                    qty=qty,
+                    limit_price=price,
+                    stage=str((source_order or {}).get("stage") or "RECONCILE"),
+                    client_order_key=client_order_key,
+                    kis_odno=kis_odno,
+                    status=status,
+                    request_json=request_json,
+                    response_json={
+                        **source_response,
+                        **broker_row,
+                        "confirmed_fill_qty": next_confirmed_qty,
+                        "applied_broker_fill_ids": sorted(applied_fill_ids),
+                        "source_order_id": (source_order or {}).get("order_id"),
+                        "source_client_order_key": (source_order or {}).get("client_order_key"),
+                    },
+                    submitted_at=(source_order or {}).get("submitted_at") or order_time,
+                    acked_at=(source_order or {}).get("acked_at") or order_time,
+                )
             profit_capture_stage = str(request_json.get("profit_capture_stage") or "").lower()
             requested_sell_qty = int((source_order or {}).get("qty") or qty or 0)
             cumulative_filled_qty = (

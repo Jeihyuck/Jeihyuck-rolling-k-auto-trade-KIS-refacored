@@ -24,8 +24,8 @@ def test_generate_entry_intents_watchlist_no_os_shadowing(monkeypatch):
     monkeypatch.setattr("trader.us.db.repos.has_position", lambda _symbol: False)
 
     watchlist_entries = [
-        {"symbol": "AAPL", "exchange": "NASDAQ", "score": 0.82, "rank": 1, "meta": {}},
-        {"symbol": "MSFT", "exchange": "NASDAQ", "score": 0.81, "rank": 2, "meta": {}},
+        {"symbol": "AAPL", "exchange": "NASDAQ", "score": 0.82, "rank": 1, "entry_style_selected": "ENTRY_PULLBACK", "meta": {}},
+        {"symbol": "MSFT", "exchange": "NASDAQ", "score": 0.81, "rank": 2, "entry_style_selected": "ENTRY_PULLBACK", "meta": {}},
     ]
 
     intents = generate_entry_intents(
@@ -53,8 +53,8 @@ def test_generate_entry_intents_respects_env_max_entries(monkeypatch):
     monkeypatch.setattr("trader.us.db.repos.has_position", lambda _symbol: False)
 
     watchlist_entries = [
-        {"symbol": "AAPL", "exchange": "NASDAQ", "score": 0.85, "rank": 1, "meta": {}},
-        {"symbol": "NVDA", "exchange": "NASDAQ", "score": 0.84, "rank": 2, "meta": {}},
+        {"symbol": "AAPL", "exchange": "NASDAQ", "score": 0.85, "rank": 1, "entry_style_selected": "ENTRY_PULLBACK", "meta": {}},
+        {"symbol": "NVDA", "exchange": "NASDAQ", "score": 0.84, "rank": 2, "entry_style_selected": "ENTRY_PULLBACK", "meta": {}},
     ]
 
     intents = generate_entry_intents(

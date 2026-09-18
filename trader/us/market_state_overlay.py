@@ -841,7 +841,7 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
     if profit_capture_state is None:
         profit_capture_state = {}
     runner_min = _env_float("US_RUNNER_MIN_REMAIN_PCT", 0.40)
-    stages = [("tp1_done", _env_float("US_TP1_PCT", .03), _env_float("US_TP1_SELL_PCT", .25), "TAKE_PROFIT_TP1"), ("tp2_done", _env_float("US_TP2_PCT", .05), _env_float("US_TP2_SELL_PCT", .25), "TAKE_PROFIT_TP2"), ("tp3_done", _env_float("US_TP3_PCT", .08), _env_float("US_TP3_SELL_PCT", .20), "TAKE_PROFIT_TP3")]
+    default_stages = [("tp1_done", _env_float("US_TP1_PCT", .03), _env_float("US_TP1_SELL_PCT", .25), "TAKE_PROFIT_TP1"), ("tp2_done", _env_float("US_TP2_PCT", .05), _env_float("US_TP2_SELL_PCT", .25), "TAKE_PROFIT_TP2"), ("tp3_done", _env_float("US_TP3_PCT", .08), _env_float("US_TP3_SELL_PCT", .20), "TAKE_PROFIT_TP3")]
     intents = []
     for p in positions or []:
         sym = _symbol(p)
@@ -852,6 +852,45 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             continue
         state = dict(profit_capture_state.get(sym) or profit_capture_state.get(sym.upper()) or {})
         meta_state = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+        stages = default_stages
+        local_runner_min = runner_min
+        contract_sha = None
+        contract_partial_exit_allowed = None
+        try:
+            from trader.us.entry_exit_contract import (
+                extract_us_entry_exit_contract,
+                contract_profit_capture,
+                us_entry_exit_contract_integrity_state,
+            )
+            integrity = us_entry_exit_contract_integrity_state(p, meta_state)
+            if integrity == "INVALID":
+                logger.error(
+                    "[US_PROFIT_CAPTURE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s decision=BLOCK",
+                    sym,
+                )
+                continue
+            entry_contract = extract_us_entry_exit_contract(p, meta_state)
+            pc = contract_profit_capture(p)
+            if entry_contract and pc:
+                contract_sha = entry_contract.get("sha256")
+                contract_partial_exit_allowed = bool(
+                    (entry_contract.get("management") or {}).get("partial_exit_allowed", False)
+                )
+                if not pc.get("enabled", True):
+                    continue
+                local_runner_min = float(pc.get("runner_min_remain_pct", runner_min))
+                frozen_stages = []
+                for stage in pc.get("stages") or []:
+                    frozen_stages.append((
+                        str(stage.get("flag")),
+                        float(stage.get("threshold_fraction")),
+                        float(stage.get("sell_fraction")),
+                        str(stage.get("reason")),
+                    ))
+                if len(frozen_stages) == 3:
+                    stages = frozen_stages
+        except Exception as exc:
+            logger.warning("[US_PROFIT_CAPTURE][ENTRY_CONTRACT_WARN] symbol=%s err=%s", sym, exc)
         try:
             executable = as_decimal(price, name="executable_price")
             broker_avg, avg_provenance = authoritative_broker_avg(p, now=now)
@@ -867,12 +906,12 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 logger.info("[US_PROFIT_CAPTURE][DECISION] symbol=%s decision=BLOCK reason=tp%d_not_filled", sym, stage_index)
                 break
             if return_rate >= threshold and return_rate > 0 and not bool(meta.get(flag)) and not bool(meta_state.get(flag)) and not bool(state.get(flag)) and not bool(state.get(pending_flag)):
-                max_sell = max(0, q - int(q * runner_min))
+                max_sell = max(0, q - int(q * local_runner_min))
                 qty = min(max_sell, max(1, int(q * sell_pct)))
                 if qty > 0:
                     lifecycle = str(p.get("position_lifecycle_id"))
                     order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
+                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {})}})
                     if trade_date:
                         try:
                             from trader.us.db.repos import mark_us_profit_capture_stage

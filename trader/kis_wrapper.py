@@ -263,6 +263,77 @@ class NetTemporaryError(KisTemporaryError):
     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
 
 
+_KR_TICK_DEADLINE_STATE = threading.local()
+
+
+def set_kr_tick_deadline(deadline_monotonic: float | None) -> None:
+    """Bind the authoritative KR tick deadline to all KIS I/O in this thread."""
+    _KR_TICK_DEADLINE_STATE.deadline = (
+        None if deadline_monotonic is None else float(deadline_monotonic)
+    )
+
+
+def clear_kr_tick_deadline() -> None:
+    _KR_TICK_DEADLINE_STATE.deadline = None
+
+
+def kr_tick_remaining_sec(stage_deadline: float | None = None) -> float:
+    deadlines = []
+    tick_deadline = getattr(_KR_TICK_DEADLINE_STATE, "deadline", None)
+    if tick_deadline is not None:
+        deadlines.append(float(tick_deadline))
+    if stage_deadline is not None:
+        deadlines.append(float(stage_deadline))
+    if not deadlines:
+        return float("inf")
+    return max(0.0, min(deadlines) - time.monotonic())
+
+
+def _kr_bounded_timeout(
+    configured_timeout: Any,
+    *,
+    stage_deadline: float | None = None,
+    reserve_sec: float = 0.05,
+) -> Any:
+    """Bound one KIS HTTP call by the shared tick/stage deadline."""
+    remaining = kr_tick_remaining_sec(stage_deadline)
+    if remaining == float("inf"):
+        return configured_timeout
+    budget = remaining - max(0.0, float(reserve_sec))
+    if budget <= 0.05:
+        raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_REQUEST")
+    if isinstance(configured_timeout, (tuple, list)) and len(configured_timeout) >= 2:
+        connect_cfg = max(0.05, float(configured_timeout[0]))
+        read_cfg = max(0.05, float(configured_timeout[1]))
+        connect_budget = min(connect_cfg, max(0.05, budget * 0.25))
+        read_budget = min(read_cfg, max(0.05, budget - connect_budget))
+        return (connect_budget, read_budget)
+    try:
+        configured = max(0.05, float(configured_timeout))
+    except Exception:
+        configured = budget
+    return min(configured, budget)
+
+
+def _kr_sleep_with_budget(
+    delay_sec: float,
+    *,
+    stage_deadline: float | None = None,
+    reserve_sec: float = 0.05,
+) -> bool:
+    delay = max(0.0, float(delay_sec))
+    remaining = kr_tick_remaining_sec(stage_deadline)
+    if remaining != float("inf") and remaining < delay + max(0.0, float(reserve_sec)):
+        logger.warning(
+            "[KR_TICK][DEADLINE_ABORT] action=skip_retry_sleep delay=%.3f remaining=%.3f",
+            delay,
+            remaining,
+        )
+        return False
+    time.sleep(delay)
+    return True
+
+
 class DataEmptyError(Exception):
     """정상응답이나 캔들이 0개 (실제 데이터 없음)."""
     pass
@@ -975,7 +1046,8 @@ class _RateLimiter:
                     "[KIS][RATE_LIMIT][SLEEP] endpoint=%s sleep=%.3f reason=global_qps_guard",
                     key, sleep_sec,
                 )
-                time.sleep(sleep_sec)
+                if not _kr_sleep_with_budget(sleep_sec):
+                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT")
             self.last_at[key] = time.time()
 
 
@@ -1004,7 +1076,8 @@ def _egw002_backoff_sleep(attempt: int = 1) -> float:
         base,
         cap,
     )
-    time.sleep(delay)
+    if not _kr_sleep_with_budget(delay):
+        return 0.0
     return delay
 
 
@@ -1406,7 +1479,10 @@ class KisAPI:
                             "[KIS][ENDPOINT_THROTTLE] endpoint=%s sleep=%.3f min_interval=%.3f",
                             endpoint, sleep_sec, min_interval,
                         )
-                        time.sleep(sleep_sec)
+                        if not _kr_sleep_with_budget(
+                            sleep_sec, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                        ):
+                            raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_ENDPOINT_THROTTLE")
                     self._limiter.last_at[endpoint] = time.time()
         
         # ✅ MINERVINI_ONLY: FORCE_HTTP 없으면 전체 차단
@@ -1498,7 +1574,10 @@ class KisAPI:
             priority=endpoint_category in {"order", "balance"},
         )
         if wait_limiter > 0:
-            time.sleep(wait_limiter)
+            if not _kr_sleep_with_budget(
+                wait_limiter, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+            ):
+                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER")
 
         breaker_open, breaker_until = _breaker_check(method, url)
         if breaker_open:
@@ -1510,13 +1589,21 @@ class KisAPI:
             )
             raise KisTemporaryError(f"FAST_FAIL breaker open for {url}")
         last_err: Exception | None = None
+        configured_timeout = kwargs.pop("timeout", (3.0, 7.0))
         for i in range(1, attempts + 1):
             try:
-                logger.info("[KIS][FINAL_URL] %s %s", method, url)
+                stage_deadline = getattr(self, "_kr_stage_deadline", None)
+                request_timeout = _kr_bounded_timeout(
+                    configured_timeout, stage_deadline=stage_deadline
+                )
+                logger.info(
+                    "[KIS][FINAL_URL] %s %s tick_remaining=%.3f timeout=%s",
+                    method, url, kr_tick_remaining_sec(stage_deadline), request_timeout,
+                )
                 resp = self.session.request(
                     method,
                     url,
-                    timeout=kwargs.pop("timeout", (3.0, 7.0)),
+                    timeout=request_timeout,
                     **kwargs,
                 )
                 status = resp.status_code
@@ -1590,7 +1677,8 @@ class KisAPI:
                         # Circuit breaker pause (15s)
                         _price_cache.open_circuit(rate_limited=True)
                         # Exponential backoff
-                        _egw002_backoff_sleep(attempt=i)
+                        if _egw002_backoff_sleep(attempt=i) <= 0:
+                            raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_EGW002_RETRY")
                         if i < attempts:
                             continue
                         raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
@@ -1713,7 +1801,10 @@ class KisAPI:
                 sleep_s,
                 last_err,
             )
-            time.sleep(sleep_s)
+            if not _kr_sleep_with_budget(
+                sleep_s, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+            ):
+                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_RETRY")
         raise KisTemporaryError(f"request failed after retries: {url} err={last_err}")
 
     @classmethod
@@ -2311,7 +2402,10 @@ class KisAPI:
                                     logger.warning("[KIS][QUOTE][TEMP_ERROR] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
                                     return {}
                                 sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
-                                time.sleep(sleep_time)
+                                if not _kr_sleep_with_budget(
+                                    sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                                ):
+                                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_QUOTE_RETRY")
                                 continue
                             except Exception as exc:
                                 last_error = exc
@@ -2326,7 +2420,10 @@ class KisAPI:
                                     logger.warning("[KIS][QUOTE][RATE_LIMIT] diag mode code=%s attempt=%s", code, attempt)
                                     return {}
                                 sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
-                                time.sleep(sleep_time)
+                                if not _kr_sleep_with_budget(
+                                    sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                                ):
+                                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_QUOTE_RETRY")
                                 continue
                             if resp.status_code == 200 and data.get("rt_cd") == "0" and data.get("output"):
                                 raw_output = dict(data["output"])
@@ -2345,7 +2442,10 @@ class KisAPI:
             if diag_mode:
                 break
             sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
-            time.sleep(sleep_time)
+            if not _kr_sleep_with_budget(
+                sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+            ):
+                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_QUOTE_RETRY")
 
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
@@ -3610,7 +3710,10 @@ class KisAPI:
                     self._set_safe_mode(reason="psbl_order_temp_error", err=exc)
                     logger.error("[PSBL_ORDER][SAFE_MODE] entry_blocked=1 err=%s", exc)
                     raise
-                time.sleep(0.5 * attempt)
+                if not _kr_sleep_with_budget(
+                    0.5 * attempt, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                ):
+                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_PSBL_RETRY")
         if last_exc:
             raise last_exc
         raise KisTemporaryError("psbl_order_failed")
@@ -3745,7 +3848,10 @@ class KisAPI:
                             empty_cnt,
                             sleep_s,
                         )
-                    time.sleep(sleep_s)
+                    if not _kr_sleep_with_budget(
+                        sleep_s, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                    ):
+                        raise KisBalanceUnavailable("KR_BALANCE_STAGE_DEADLINE_EXHAUSTED") from e
                     continue
                 raise KisBalanceUnavailable(str(e)) from e
 
@@ -3771,7 +3877,10 @@ class KisAPI:
                     break
                 empty_cnt += 1
                 if empty_cnt <= max_empty_retry:
-                    time.sleep(0.6)
+                    if not _kr_sleep_with_budget(
+                        0.6, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                    ):
+                        raise KisBalanceUnavailable("KR_BALANCE_STAGE_DEADLINE_EXHAUSTED")
                     continue
                 else:
                     detail = "empty_response"
@@ -3869,6 +3978,27 @@ class KisAPI:
             force = True
         logger.info("[KIS][BALANCE_CACHE] hit=False force=%s", force)
         snap: dict = {}
+        prior_stage_deadline = getattr(self, "_kr_stage_deadline", None)
+        configured_balance_budget = max(
+            0.1, float(os.getenv("KR_BALANCE_FETCH_BUDGET_SEC", "30") or "30")
+        )
+        routing_reserve = max(
+            0.05, float(os.getenv("KR_SELL_ROUTING_RESERVE_SEC", "10") or "10")
+        )
+        tick_remaining = kr_tick_remaining_sec(prior_stage_deadline)
+        if tick_remaining == float("inf"):
+            balance_budget = configured_balance_budget
+        else:
+            balance_budget = min(
+                configured_balance_budget, max(0.0, tick_remaining - routing_reserve)
+            )
+        if balance_budget <= 0.05:
+            raise KisBalanceUnavailable("KR_BALANCE_BUDGET_EXHAUSTED_BEFORE_FETCH")
+        self._kr_stage_deadline = time.monotonic() + balance_budget
+        logger.info(
+            "[KR_BALANCE][DEADLINE] budget_sec=%.3f tick_remaining=%.3f routing_reserve=%.3f",
+            balance_budget, tick_remaining, routing_reserve,
+        )
         try:
             snap = self.inquire_balance_all()
             raw_snapshot = _deepcopy_json(snap)
@@ -3898,6 +4028,8 @@ class KisAPI:
             logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise KisBalanceUnavailable(str(e)) from e
+        finally:
+            self._kr_stage_deadline = prior_stage_deadline
         snap_copy = _deepcopy_json(snap)
         if return_source and return_raw:
             return snap_copy, source, _deepcopy_json(raw_snapshot or snap_copy)
@@ -4013,12 +4145,15 @@ class KisAPI:
             for tr_id in tr_ids:
                 try:
                     headers = self._headers(tr_id)
+                    stage_deadline = getattr(self, "_kr_stage_deadline", None)
                     resp = self.session.request(
                         "GET",
                         url,
                         headers=headers,
                         params=params,
-                        timeout=(3.0, read_timeout),
+                        timeout=_kr_bounded_timeout(
+                            (3.0, read_timeout), stage_deadline=stage_deadline
+                        ),
                     )
                     status = resp.status_code
                     if status in (401, 403):
@@ -4067,7 +4202,10 @@ class KisAPI:
             if attempt < retry_max:
                 backoff = backoff_seq[min(attempt - 1, len(backoff_seq) - 1)]
                 jitter = random.uniform(0.0, min(0.2, backoff * 0.2))
-                time.sleep(backoff + jitter)
+                if not _kr_sleep_with_budget(
+                    backoff + jitter, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                ):
+                    return _empty_daily_ccld("TICK_DEADLINE")
         if last_err:
             logger.warning("[RECONCILE][DEGRADED] daily_ccld_failed err=%s fail_open=%s", last_err, int(fail_open))
         self._reset_session()

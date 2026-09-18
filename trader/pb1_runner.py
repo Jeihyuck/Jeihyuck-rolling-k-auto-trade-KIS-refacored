@@ -117,7 +117,15 @@ from trader.diagnostics.nontrading_smoke import (
     run_nontrading_smoke_once,
     write_nontrading_smoke_flag,
 )
-from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError, get_breaker_runtime_stats, get_price_runtime_stats
+from trader.kis_wrapper import (
+    KisAPI,
+    KisBalanceUnavailable,
+    KisTemporaryError,
+    clear_kr_tick_deadline,
+    get_breaker_runtime_stats,
+    get_price_runtime_stats,
+    set_kr_tick_deadline,
+)
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.entry_engine import scan_all_strategies, calculate_position_size
 from trader.reconcile_kis import reconcile_kis, reconcile_today
@@ -3417,6 +3425,16 @@ def _resolve_session_exit_grace_sec() -> int:
         return max(0, int(os.getenv("PB1_SESSION_EXIT_GRACE_SEC", "15")))
     except Exception:
         return 15
+
+
+def _resolve_kr_shared_tick_budget(
+    *, remaining_to_session_end: float, base_tick_timeout: float, grace_sec: float
+) -> float:
+    """US-parity budget: reserve graceful-exit time before the session boundary."""
+    return min(
+        max(0.0, float(base_tick_timeout)),
+        max(0.0, float(remaining_to_session_end) - max(0.0, float(grace_sec))),
+    )
 
 
 class TickTimeoutError(TimeoutError):
@@ -7620,10 +7638,27 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 break
             grace_sec = _resolve_session_exit_grace_sec()
             base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 90))
-            remaining_to_session_end = max(0, int((session_end_dt - now).total_seconds()))
-            tick_timeout_sec = min(
-                base_tick_timeout,
-                max(5, remaining_to_session_end + grace_sec),
+            remaining_to_session_end = max(0.0, (session_end_dt - now).total_seconds())
+            # US-parity: one authoritative tick deadline is shared by the
+            # watchdog and every KR KIS request/retry.  The grace is reserved
+            # *before* session end so Python exits before the outer shell kill.
+            shared_tick_budget_sec = _resolve_kr_shared_tick_budget(
+                remaining_to_session_end=remaining_to_session_end,
+                base_tick_timeout=base_tick_timeout,
+                grace_sec=grace_sec,
+            )
+            if shared_tick_budget_sec < 5.0:
+                logger.info(
+                    "[KR_TICK][DEADLINE_SKIP] kind=%s remaining=%.3f grace=%s action=session_end",
+                    session_kind, remaining_to_session_end, grace_sec,
+                )
+                exit_reason = "session_end"
+                break
+            tick_timeout_sec = max(1, int(shared_tick_budget_sec))
+            tick_deadline_monotonic = time_mod.monotonic() + shared_tick_budget_sec
+            logger.info(
+                "[KR_TICK][DEADLINE] kind=%s budget_sec=%.3f timeout_sec=%s grace_sec=%s",
+                session_kind, shared_tick_budget_sec, tick_timeout_sec, grace_sec,
             )
             try:
                 tick_index += 1
@@ -7635,18 +7670,22 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     now.isoformat(),
                     session_end_dt.isoformat(),
                 )
-                _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
-                    timeout_sec=tick_timeout_sec,
-                    call=lambda: run_once(
-                        args=args,
-                        engine=engine,
-                        ctx=ctx,
-                        loop_mode=True,
-                        window=window,
-                        max_seconds=remaining_budget_s,
-                        runs_ledger_fail_open=runs_ledger_fail_open,
-                    ),
-                )
+                set_kr_tick_deadline(tick_deadline_monotonic)
+                try:
+                    _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
+                        timeout_sec=tick_timeout_sec,
+                        call=lambda: run_once(
+                            args=args,
+                            engine=engine,
+                            ctx=ctx,
+                            loop_mode=True,
+                            window=window,
+                            max_seconds=max(1, int(shared_tick_budget_sec)),
+                            runs_ledger_fail_open=runs_ledger_fail_open,
+                        ),
+                    )
+                finally:
+                    clear_kr_tick_deadline()
                 last_tick_metrics = dict(metrics or {})
                 session_metrics["ticks_total"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)

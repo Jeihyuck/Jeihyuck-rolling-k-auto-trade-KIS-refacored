@@ -736,6 +736,12 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
             logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=insufficient_history state=UNKNOWN", symbol)
         try:
             from trader.us.position_trend_state import update_us_position_trend_state
+            frozen_trend_cfg = {}
+            try:
+                from trader.us.entry_exit_contract import contract_exit_config
+                frozen_trend_cfg = contract_exit_config(pos)
+            except Exception:
+                frozen_trend_cfg = {}
             trend = update_us_position_trend_state(
                 symbol=symbol,
                 trade_date=trade_date,
@@ -745,6 +751,8 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
                 final30=final30_payload,
                 daily=daily,
                 lifecycle_id=pos.get("position_lifecycle_id"),
+                warning_threshold=frozen_trend_cfg.get("trend_score_warning_threshold"),
+                severe_threshold=frozen_trend_cfg.get("trend_score_severe_threshold"),
             )
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STATE][WARN] symbol=%s err=%s", symbol, exc)
@@ -1970,12 +1978,15 @@ def run_trade_tick(
                 and not recon.get("preserve_previous_positions")
                 and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
             ),
+            fills=fills_today,
         )
         for _p in current_positions:
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
             if _lc:
                 _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
                 _p["opened_trade_date"] = _lc.get("opened_trade_date")
+                _p["opened_at"] = _lc.get("opened_at")
+                _p["opened_at_source"] = _lc.get("opened_at_source")
                 _p["holding_trade_days"] = _lc.get("holding_trade_days")
                 _p["lifecycle_state_source"] = "us_position_risk_state"
                 _p["high_watermark"] = _lc.get("high_watermark")

@@ -15,10 +15,10 @@ def test_candidate_fill_loop_exhausts_blocked_leaders_and_fills_target(monkeypat
     monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
 
     rows = [
-        {"symbol": f"BAD{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "rank_final30": i + 1}
+        {"symbol": f"BAD{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "rank_final30": i + 1, "entry_style_selected": "ENTRY_PULLBACK"}
         for i in range(10)
     ] + [
-        {"symbol": f"GOOD{i}", "exchange": "NASDAQ", "score": .8 - i * .01, "rank_final30": i + 11}
+        {"symbol": f"GOOD{i}", "exchange": "NASDAQ", "score": .8 - i * .01, "rank_final30": i + 11, "entry_style_selected": "ENTRY_PULLBACK"}
         for i in range(3)
     ]
 
@@ -52,7 +52,7 @@ def test_candidate_fill_count_equals_available_candidates(monkeypatch):
     monkeypatch.setattr(repos, "has_position", lambda symbol: False)
     monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
     monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
-    rows = [{"symbol": f"S{i}", "exchange": "NASDAQ", "score": 1 - i * .01} for i in range(7)]
+    rows = [{"symbol": f"S{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "entry_style_selected": "ENTRY_PULLBACK"} for i in range(7)]
 
     class Provider:
         def get_current_price(self, symbol, exchange):
@@ -74,7 +74,7 @@ def test_incremental_preflight_stops_price_lookups_at_target(monkeypatch):
     monkeypatch.setattr(repos, "has_position", lambda symbol: False)
     monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
     monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
-    rows = [{"symbol": f"S{i}", "exchange": "NASDAQ", "score": 1 - i * .01} for i in range(30)]
+    rows = [{"symbol": f"S{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "entry_style_selected": "ENTRY_PULLBACK"} for i in range(30)]
     class Provider:
         calls = []
         def get_current_price(self, symbol, exchange):
@@ -105,7 +105,7 @@ def test_provider_price_lookup_hard_cap_and_exhaustion_diagnostics(monkeypatch):
     monkeypatch.setattr(repos, "has_position", lambda symbol: False)
     monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
     monkeypatch.setenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20")
-    rows = [{"symbol": f"CAP{i}", "exchange": "NASDAQ", "score": 1 - i * .01} for i in range(30)]
+    rows = [{"symbol": f"CAP{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "entry_style_selected": "ENTRY_PULLBACK"} for i in range(30)]
 
     class Provider:
         calls = 0
@@ -139,7 +139,7 @@ def test_cached_prices_do_not_consume_lookup_budget_and_target_stops_early(monke
     monkeypatch.setenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "1")
     monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
     rows = [
-        {"symbol": f"CACHE{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "current_price": 100}
+        {"symbol": f"CACHE{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "current_price": 100, "entry_style_selected": "ENTRY_PULLBACK"}
         for i in range(30)
     ]
 

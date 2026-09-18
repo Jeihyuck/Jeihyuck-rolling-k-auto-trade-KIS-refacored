@@ -32,7 +32,15 @@ class _NoopUniverseRepo:
     pass
 
 
-def _make_engine(db=None, kis=None, balance_snapshot=None) -> tuple[PB1Engine, FakeKis]:
+def _make_engine(
+    db=None,
+    kis=None,
+    balance_snapshot=None,
+    *,
+    window_name: str = "day",
+    phase: str = "manage",
+    now_kst_value: datetime | None = None,
+) -> tuple[PB1Engine, FakeKis]:
     db = db or sa.create_engine("sqlite:///:memory:")
     schema_for_engine(db).metadata.create_all(db)
     kis = kis or FakeKis()
@@ -43,16 +51,16 @@ def _make_engine(db=None, kis=None, balance_snapshot=None) -> tuple[PB1Engine, F
         positions_repo=PositionsRepo(db),
         ledger_repo=LedgerEventsRepo(db),
         kis=kis,
-        window=WindowDecision(name="day", phase="manage"),
-        window_label="day",
-        phase="manage",
+        window=WindowDecision(name=window_name, phase=phase),
+        window_label=window_name,
+        phase=phase,
         dry_run=False,
         intended_live=True,
         env="practice",
         run_id="test",
         order_allowed=True,
         trading_day=True,
-        now_kst_value=datetime(2026, 8, 6, 13, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+        now_kst_value=now_kst_value or datetime(2026, 8, 6, 13, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         balance_snapshot=balance_snapshot,
         balance_source="api" if balance_snapshot else None,
     )
@@ -614,6 +622,69 @@ def test_profitable_policy_missing_adoption_uses_fill_driven_tp1_not_generic_swi
     assert row["position_meta"]["kr_tp1_pending"] is True
     assert row["position_meta"]["kr_tp1_done"] is False
     assert not row["position_meta"].get("tp1_done")
+    order = OrdersRepo(db).list_today_orders(
+        "practice", side="SELL", code="067290", status_exclude=(),
+    )[0]
+    assert order["stage"] == "TP1"
+    assert order["request_json"]["profit_capture_stage"] == "tp1"
+
+
+def test_jw_pharma_verified_adoption_close_submits_real_tp1_quantity(monkeypatch) -> None:
+    """Incident regression: 067290 must reach broker submit in the real CLOSE context."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    monkeypatch.setenv("KR_PROFIT_CAPTURE_ENABLE", "1")
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    positions = PositionsRepo(db)
+    persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
+        env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
+        sid=1, mode=1, code="067290", market="J", qty=593, avg_price=2358.671,
+    )
+    assert created
+    balance = {
+        "output1": [{
+            "pdno": "067290", "hldg_qty": "593", "ord_psbl_qty": "593",
+            "pchs_avg_pric": "2358.671",
+        }],
+        "output2": [{}],
+    }
+    engine, kis = _make_engine(
+        db, FakeKis(), balance,
+        window_name="close", phase="exit",
+        now_kst_value=datetime(2026, 9, 18, 15, 20, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+    assert engine.window_name == "intraday"
+    assert engine.market_window_name == "intraday"
+    assert engine._is_kr_equity_context() is True
+    monkeypatch.setattr(
+        engine, "_resolve_price_with_fallback",
+        lambda code, ohlcv_close=None: (3600.0, "test"),
+    )
+    pos = dict(persisted)
+    pos.update(
+        qty=593, kis_qty=593, orderable_qty=593,
+        avg_buy_price=2358.671, last_price=3600.0,
+        holding_source="kis_balance",
+    )
+
+    payload = engine._plan_exit_event(
+        pos,
+        {"close": 3600.0, "ma20": 3400.0, "ma50": 3200.0},
+        pd.DataFrame(),
+        "close",
+    )
+
+    assert payload is not None
+    assert payload["decision_reason"] == "KR_TAKE_PROFIT_TP1"
+    assert payload["router_qty"] == 148
+    assert payload["submitted"] == 1
+    assert kis.sell_quantities == [148]
+    row = positions.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1, code="067290",
+        position_cycle_id=str(persisted["position_cycle_id"]),
+        portfolio_epoch_id=str(persisted["portfolio_epoch_id"]),
+    )
+    assert row["position_meta"]["kr_tp1_pending"] is True
     order = OrdersRepo(db).list_today_orders(
         "practice", side="SELL", code="067290", status_exclude=(),
     )[0]

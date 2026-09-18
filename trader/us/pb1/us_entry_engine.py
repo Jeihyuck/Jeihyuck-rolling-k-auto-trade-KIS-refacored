@@ -422,8 +422,11 @@ def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, ent
             scores.append(float(signal_score or 0.0))
         except (TypeError, ValueError):
             pass
-    if style == "SKIP" or not style:
-        logger.error("[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=entry_style_skip_for_new_buy", symbol)
+    if style in {"SKIP", "UNKNOWN", "NONE", "GENERIC", "ENTRY_GENERIC"} or not style:
+        logger.error(
+            "[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=entry_style_unproven_for_new_buy style=%s",
+            symbol, style,
+        )
         return False, "ENTRY_EXPLAIN_CONTRACT_ERROR"
     if max(scores) <= 0.0:
         logger.error("[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=all_scores_zero", symbol)
@@ -1099,7 +1102,12 @@ def generate_entry_intents(
             )
 
         if position_action == "NEW_POSITION_BUY":
-            entry_style_for_contract = str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum")
+            entry_style_for_contract = str(
+                (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or _resolve_entry_signal_type(entry_meta)
+                or ""
+            )
             ok_contract, contract_reason = _validate_new_buy_explain_contract(symbol, entry_meta, entry_style_for_contract, signal_score=score)
             if not ok_contract:
                 track_skip(symbol, contract_reason, {"entry_style": entry_style_for_contract})
@@ -1155,7 +1163,12 @@ def generate_entry_intents(
             "block_stage": None,
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
-            "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
+            "entry_style": str(
+                (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or _resolve_entry_signal_type(entry_meta)
+                or ""
+            ).lower(),
             "projected_weight": sizing.get("projected_weight"),
             "max_symbol_weight": sizing.get("max_symbol_weight"),
             "allowed_notional": sizing.get("allowed_notional"),
@@ -1191,7 +1204,12 @@ def generate_entry_intents(
                 "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
                 "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
                 "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
-                "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
+                "entry_style": str(
+                (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or _resolve_entry_signal_type(entry_meta)
+                or ""
+            ).lower(),
                 "market_state": (entry_meta or {}).get("market_state"),
                 "market_regime": (entry_meta or {}).get("market_regime"),
                 "blocked_reason": None,
@@ -1229,6 +1247,32 @@ def generate_entry_intents(
             intent["filters_passed"] = entry_explanation.get("filters_passed", [])
             intent["explanation_quality"] = entry_explanation.get("explanation_quality", "MINIMAL")
         
+        # Persist the complete BUY explanation before the order router creates
+        # the immutable entry-to-exit contract. PostgreSQL previously retained
+        # only the thin book/horizon policy fields.
+        durable_meta = intent.setdefault("meta", {})
+        durable_meta.update({
+            "entry_style_selected": intent.get("entry_style_selected"),
+            "entry_component": intent.get("entry_component"),
+            "score_breakdown": intent.get("score_breakdown") or {},
+            "reasons": intent.get("reasons") or [],
+            "filters_passed": intent.get("filters_passed") or [],
+            "explanation_quality": intent.get("explanation_quality"),
+            "entry_reason": (
+                intent.get("entry_style_selected")
+                or intent.get("entry_signal_type")
+                or (intent.get("reasons") or [None])[0]
+            ),
+            "rank_final30": intent.get("rank_final30"),
+            "score_final": intent.get("score_final"),
+            "trend_score": intent.get("trend_score"),
+            "theme_cluster": intent.get("theme_cluster"),
+            "sector": intent.get("sector"),
+            "industry": intent.get("industry"),
+            "market_state": intent.get("market_state"),
+            "market_regime": intent.get("market_regime"),
+        })
+
         if intent_acceptor is not None:
             decision = intent_acceptor(intent)
             if not getattr(decision, "allowed", bool(decision)):

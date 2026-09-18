@@ -1789,15 +1789,34 @@ def _resolve_swing_staged_exit(
         effective_r = avg - raw_stop if avg > raw_stop > 0 else 0.0
         effective_stop = raw_stop
 
-    risk_per_share = float(effective_r) if effective_r and effective_r > 0 else 0.0
+    # Safety stop tightening and profit-R accounting are different concerns.
+    # The current effective stop may become tighter through a runtime risk
+    # overlay, but R-based TP must remain anchored to the BUY-time risk_R.
+    plan_for_r = pos.get("entry_exit_plan_json") or pos.get("entry_exit_plan") or {}
+    if isinstance(plan_for_r, str):
+        try:
+            import json as _json
+            plan_for_r = _json.loads(plan_for_r)
+        except Exception:
+            plan_for_r = {}
+    contract_risk_r = 0.0
+    if isinstance(plan_for_r, dict):
+        try:
+            contract_risk_r = float((plan_for_r.get("risk_plan") or {}).get("risk_R") or 0.0)
+        except (TypeError, ValueError):
+            contract_risk_r = 0.0
+    risk_per_share = contract_risk_r if contract_risk_r > 0 else (
+        float(effective_r) if effective_r and effective_r > 0 else 0.0
+    )
     current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
     _highest_ret = float(highest_ret_pct) if highest_ret_pct is not None else ret_pct
 
     logger.info(
         "[EXIT][SWING][R_CTX] code=%s avg=%.2f stop=%.2f mark=%.2f risk_per_share=%.2f "
-        "current_r=%.3f highest_ret=%.2f days_held=%s effective_applied=%s",
+        "current_r=%.3f highest_ret=%.2f days_held=%s effective_applied=%s r_basis=%s",
         code_for_log, avg, effective_stop, mark, risk_per_share, current_r,
         _highest_ret, days_held, int(risk_ctx.get("effective_applied", False)),
+        "ENTRY_EXIT_PLAN" if contract_risk_r > 0 else "EFFECTIVE_R_LEGACY",
     )
 
     calendar_days_held = int(pos.get("calendar_days_held") or days_held)
@@ -3047,8 +3066,12 @@ class PB1Engine:
         return (
             env in {"practice", "real", "live"}
             and session_kind in {"am", "pm", "afternoon", "close", ""}
-            and window_name in {"morning", "afternoon", "close", "am", "pm", "day", ""}
-            and market_window in {"morning", "afternoon", "close", "am", "pm", "day", ""}
+            # _resolve_session_window_name() normalizes close/preopen to
+            # "intraday" and after-hours to "after".  These normalized values
+            # must remain inside the KR context fence or CLOSE profit-capture
+            # / adoption exits are silently skipped.
+            and window_name in {"morning", "afternoon", "close", "am", "pm", "day", "intraday", "after", ""}
+            and market_window in {"morning", "afternoon", "close", "am", "pm", "day", "intraday", "after", ""}
             and (
                 "pb1_watchlist_final_scored" in final30_source
                 or "final30" in final30_source
@@ -7056,7 +7079,7 @@ class PB1Engine:
         features = cf.features or {}
         is_kr = str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
         is_practice = str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice"
-        fail_open = os.getenv("PB1_ENTRY_PLAN_FAIL_OPEN", "1") == "1" if allow_fail_open is None else bool(allow_fail_open)
+        fail_open = os.getenv("PB1_ENTRY_PLAN_FAIL_OPEN", "0") == "1" if allow_fail_open is None else bool(allow_fail_open)
 
         ep = getattr(cf, "entry_plan", None) or features.get("entry_plan")
         if not isinstance(ep, dict):
@@ -11075,6 +11098,54 @@ class PB1Engine:
         client_key = self._client_order_key(code, mode, "BUY", f"add{pyramid_level + 1}", "PB1")
         limit_price = round_to_tick(price * 1.003) if price > 0 else price
         fill_price = float(limit_price or price or 0.0)
+
+        parent_plan = pos.get("entry_exit_plan_json") or pos.get("entry_exit_plan") or {}
+        if isinstance(parent_plan, str):
+            try:
+                parent_plan = json.loads(parent_plan)
+            except Exception:
+                parent_plan = {}
+        parent_meta = pos.get("entry_meta_json") or pos.get("position_meta") or {}
+        if isinstance(parent_meta, str):
+            try:
+                parent_meta = json.loads(parent_meta)
+            except Exception:
+                parent_meta = {}
+        parent_cycle = pos.get("position_cycle_id")
+        parent_epoch = pos.get("portfolio_epoch_id")
+        position_meta_for_add = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
+        parent_contract_sha = (
+            (parent_meta or {}).get("entry_contract_sha256")
+            or position_meta_for_add.get("entry_contract_sha256")
+        )
+        if not isinstance(parent_plan, dict) or not parent_plan or not parent_cycle or not parent_epoch or not parent_contract_sha:
+            logger.error(
+                "[PB1][ADD][BLOCK] code=%s reason=KR_ADD_PARENT_CONTRACT_MISSING cycle=%s epoch=%s sha=%s",
+                display_code, parent_cycle, parent_epoch, parent_contract_sha,
+            )
+            return
+
+        add_request = {
+            "enforce_entry_contract": True,
+            "reasons": ["pyramid_add"],
+            "entry_reason": "ENTRY_PYRAMID",
+            "entry_exit_plan": parent_plan,
+            "pre_order_holding_qty": int(pos.get("orderable_qty") or pos.get("qty") or 0),
+            "requested_qty": int(qty),
+            "submitted_qty": int(qty),
+            "balance_snapshot_id": pos.get("balance_snapshot_id"),
+            "price": price,
+            "level": pyramid_level + 1,
+            "parent_entry_contract_sha256": str(parent_contract_sha),
+            "parent_position_cycle_id": str(parent_cycle),
+            "parent_portfolio_epoch_id": str(parent_epoch),
+        }
+        add_entry_meta = {
+            **(parent_meta if isinstance(parent_meta, dict) else {}),
+            "entry_reason": "ENTRY_PYRAMID",
+            "parent_entry_contract_sha256": str(parent_contract_sha),
+            "pyramid_level_requested": pyramid_level + 1,
+        }
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -11090,7 +11161,10 @@ class PB1Engine:
                 limit_price=limit_price,
                 stage="PB1-ADD",
                 client_order_key=client_key,
-                request_json={"reasons": ["pyramid_add"], "price": price, "level": pyramid_level + 1},
+                request_json=add_request,
+                entry_meta_json=add_entry_meta,
+                portfolio_epoch_id=str(parent_epoch),
+                position_cycle_id=str(parent_cycle),
                 status="CREATED",
             )
         except Exception:
@@ -12001,6 +12075,34 @@ class PB1Engine:
                 holding_bars = max(holding_bars, int(pos_age.holding_bars or 0))
             except Exception:
                 entry_ts = None
+
+        # A missing entry timestamp is NOT evidence that a broker holding was
+        # bought today. Legacy/imported POLICY_MISSING positions can otherwise
+        # be misclassified as same-day merely because days_held=0.
+        # A real same-day BUY must carry durable fill/entry timestamp evidence.
+        if entry_ts is None and qty > 0:
+            meta_for_age = pos.get("position_meta") or {}
+            if isinstance(meta_for_age, str):
+                try:
+                    meta_for_age = json.loads(meta_for_age)
+                except Exception:
+                    meta_for_age = {}
+            current_day_buy_proven = bool(
+                meta_for_age.get("same_day_entry_proven")
+                or str(meta_for_age.get("same_day_entry_provenance") or "").upper() in {
+                    "CURRENT_DAY_BUY_FILL", "ORDER_FILL_CURRENT_DAY"
+                }
+            )
+            if not current_day_buy_proven:
+                trading_days_held = max(1, int(trading_days_held or 0))
+                days_held = max(1, int(days_held or 0))
+                calendar_days_held = max(1, int(calendar_days_held or 0))
+                holding_bars = max(1, int(holding_bars or 0))
+                logger.warning(
+                    "[KR_POSITION_AGE][UNKNOWN_ENTRY_NOT_SAME_DAY] code=%s "
+                    "action=min_age_one_day reason=no_current_day_buy_fill_proof",
+                    display_code,
+                )
         logger.info(
             "[EXIT][HOLDING_META] code=%s entry_date=%s calendar_days_held=%s trading_days_held=%s holding_bars=%s last_fill_at=%s",
             display_code,
@@ -12513,19 +12615,28 @@ class PB1Engine:
                 ordered_reasons = [close_reason]
                 eval_reason = close_reason if _policy_missing_contract else "NO_EXIT_SIGNAL"
 
-        # PR49 overlay exits: hard stops/close liquidation keep priority; defense trim and profit capture can create partial SELLs when no stronger exit is active.
+        # Overlay exits: hard stops / explicit close liquidation keep priority.
+        # Verified legacy adoption is also allowed to catch up TP1/2/3 at Close;
+        # trade-close enables KR_PROFIT_CAPTURE, so silently skipping it here was
+        # an execution bug that starved profitable legacy positions.
         overlay = getattr(self, "_kr_market_state_overlay", None) or {}
+        _is_close_window = str(window_tag).lower() == "close"
+        _allow_overlay_window = (not _is_close_window) or (
+            _policy_adoption_active and str(close_action or "").upper() == "CARRY"
+        )
         if (not _policy_missing_contract and self._is_kr_equity_context()
                 and (_policy_adoption_active or env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True))
-                and str(window_tag).lower() != "close"):
+                and _allow_overlay_window):
             pos_for_overlay = {**pos, "code": code, "qty": qty, "orderable_qty": int(pos.get("orderable_qty") or qty), "unrealized_pnl_pct": ret_pct / 100.0, "market_value_krw": float(mark or 0.0) * qty}
-            strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP"}
+            strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP", "EXIT_FORCE_EOD"}
             if not strong_exit_active:
                 snapshot = getattr(self, "_kr_regime_snapshot", None)
                 trimmed_this_tick = getattr(self, "_kr_defense_trim_symbols_this_tick", set())
                 max_trim_symbols = int(os.getenv("KR_DEFENSE_MAX_TRIM_SYMBOLS_PER_TICK", "3"))
                 kr_trim = []
-                if (not _policy_adoption_active
+                # Defense trims stay intraday-only; close catch-up is limited to
+                # the verified adoption TP contract.
+                if (not _is_close_window and not _policy_adoption_active
                         and snapshot is not None and len(trimmed_this_tick) < max_trim_symbols):
                     kr_trim = generate_kr_defense_trim_intents(
                         [pos_for_overlay], snapshot,
@@ -12547,7 +12658,11 @@ class PB1Engine:
                     _router_reason = final_reason
                     signal_hit = True
                     eval_reason = final_reason
-                    logger.info("[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=%s reason=%s qty=%s market_state=%s", display_code, final_reason, _router_qty, overlay.get("market_state"))
+                    logger.info(
+                        "[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=%s reason=%s qty=%s market_state=%s window=%s source=%s",
+                        display_code, final_reason, _router_qty, overlay.get("market_state"),
+                        window_tag, kr_intent.get("exit_rule_source") or "legacy",
+                    )
 
         exit_eval = ExitEvaluation(
             code=code,

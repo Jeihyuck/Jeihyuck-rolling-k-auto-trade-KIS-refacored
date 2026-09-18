@@ -706,7 +706,7 @@ def route_order(
         save_order_intent, save_dry_run_order, save_order_ack, save_order_reject,
         mark_order_intent_sent, mark_order_intent_blocked, mark_order_intent_rejected,
         mark_order_intent_dry_run,
-        load_today_order_keys, _ensure_us_entry_policy_contract,
+        load_today_order_keys, _ensure_us_entry_policy_contract, load_us_positions_by_symbols,
     )
     from trader.utils.env import env_bool
 
@@ -729,25 +729,7 @@ def route_order(
     intent["meta"] = meta
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
-    if side == "BUY" and str(intent.get("strategy_owner") or "US_STANDARD").upper() != TQQQ_OWNER:
-        policy_contract = _ensure_us_entry_policy_contract(meta, intent)
-        meta.update(policy_contract)
-        intent.update({
-            field: policy_contract[field]
-            for field in ("book", "horizon", "exit_policy", "entry_strategy", "entry_signal_type", "partial_exit_allowed")
-            if policy_contract.get(field) is not None
-        })
-        intent["meta"] = meta
-    if same_day_semantic_sell_exists(intent):
-        logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
-        return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
-                "broker_submit": False, "intent": intent}
     symbol_upper = str(symbol or "").upper().strip()
-    is_tqqq_infinite = (
-        symbol_upper == TQQQ_SYMBOL
-        and intent.get("strategy_owner") == TQQQ_OWNER
-        and intent.get("sleeve_id") == TQQQ_OWNER
-    )
     position_action = (
         intent.get("position_action")
         or (intent.get("meta") or {}).get("position_action")
@@ -760,6 +742,77 @@ def route_order(
             position_action == "ADD_TO_EXISTING_BUY"
             or (current_position_symbols is not None and symbol_upper in current_position_symbols_upper)
         )
+    )
+
+    if side == "BUY" and str(intent.get("strategy_owner") or "US_STANDARD").upper() != TQQQ_OWNER:
+        # An ADD must inherit the already-filled lifecycle's immutable contract.
+        # Rebuilding from today's ENV would silently change the exit rules of the
+        # whole position after averaging in.
+        if is_existing_position_buy:
+            try:
+                from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+                as_of = str(intent.get("trade_date") or "").strip() or None
+                existing_map = load_us_positions_by_symbols([symbol_upper], as_of=as_of)
+                existing_position = existing_map.get(symbol_upper) or existing_map.get(symbol) or {}
+                parent_contract = extract_us_entry_exit_contract(
+                    existing_position,
+                    existing_position.get("meta") if isinstance(existing_position, dict) else None,
+                )
+            except Exception as exc:
+                logger.error("[US_ORDER][ADD_PARENT_CONTRACT][ERROR] symbol=%s err=%s", symbol_upper, exc)
+                parent_contract = {}
+                existing_position = {}
+            if not parent_contract:
+                logger.error(
+                    "[US_ORDER][ADD_PARENT_CONTRACT][BLOCK] symbol=%s reason=US_ADD_PARENT_CONTRACT_MISSING",
+                    symbol_upper,
+                )
+                return {
+                    "status": "BLOCKED", "reason": "US_ADD_PARENT_CONTRACT_MISSING",
+                    "broker_submit": False, "intent": intent,
+                }
+            management = parent_contract.get("management") or {}
+            meta["entry_exit_contract"] = parent_contract
+            meta["entry_exit_contract_sha256"] = parent_contract.get("sha256")
+            meta["entry_exit_contract_version"] = parent_contract.get("version")
+            meta["parent_entry_contract_sha256"] = parent_contract.get("sha256")
+            meta["position_lifecycle_id"] = (
+                existing_position.get("position_lifecycle_id")
+                or (existing_position.get("meta") or {}).get("position_lifecycle_id")
+            )
+            meta["add_reason"] = (
+                intent.get("entry_reason")
+                or ((intent.get("reasons") or [None])[0] if isinstance(intent.get("reasons"), list) else None)
+                or "ADD_TO_EXISTING_BUY"
+            )
+            for field in ("book", "horizon", "exit_policy", "partial_exit_allowed", "min_hold_minutes"):
+                if management.get(field) is not None:
+                    meta[field] = management[field]
+                    intent[field] = management[field]
+            intent["entry_strategy"] = parent_contract.get("entry_strategy") or intent.get("entry_strategy")
+            meta["entry_strategy"] = intent.get("entry_strategy")
+            logger.info(
+                "[US_ORDER][ADD_PARENT_CONTRACT] symbol=%s lifecycle=%s parent_sha=%s",
+                symbol_upper, meta.get("position_lifecycle_id"), parent_contract.get("sha256"),
+            )
+
+        policy_contract = _ensure_us_entry_policy_contract(meta, intent)
+        meta.update(policy_contract)
+        intent.update({
+            field: policy_contract[field]
+            for field in ("book", "horizon", "exit_policy", "entry_strategy", "entry_signal_type", "partial_exit_allowed")
+            if policy_contract.get(field) is not None
+        })
+        intent["meta"] = meta
+
+    if same_day_semantic_sell_exists(intent):
+        logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
+        return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
+                "broker_submit": False, "intent": intent}
+    is_tqqq_infinite = (
+        symbol_upper == TQQQ_SYMBOL
+        and intent.get("strategy_owner") == TQQQ_OWNER
+        and intent.get("sleeve_id") == TQQQ_OWNER
     )
     logger.info(
         "[US_ORDER][POSITION_ACTION] symbol=%s side=%s position_action=%s is_existing_position_buy=%d",

@@ -18,9 +18,9 @@ def test_entry_lookup_prioritizes_new_candidates_over_held_candidates(monkeypatc
     held = {f"HELD{i}" for i in range(8)}
     rows = []
     for i in range(8):
-        rows.append({"symbol": f"HELD{i}", "exchange": "NASDAQ", "score": 1.00 - i * 0.01})
+        rows.append({"symbol": f"HELD{i}", "exchange": "NASDAQ", "score": 1.00 - i * 0.01, "entry_style_selected": "ENTRY_PULLBACK"})
     for i in range(22):
-        rows.append({"symbol": f"NEW{i}", "exchange": "NASDAQ", "score": 0.80 - i * 0.01})
+        rows.append({"symbol": f"NEW{i}", "exchange": "NASDAQ", "score": 0.80 - i * 0.01, "entry_style_selected": "ENTRY_PULLBACK"})
 
     class Provider:
         def __init__(self):
