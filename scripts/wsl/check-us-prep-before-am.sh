@@ -40,31 +40,46 @@ check() {
 python - "$trade_date" <<'PY'
 import sys
 trade_date=sys.argv[1]
+artifact_ok=False
 try:
-    # Canonical loader resolves runtime/us/watchlist/<date>/final30_scored.json.
     from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
     contract = load_us_prep_contract(trade_date) or {}
     rows = load_us_final30_scored(trade_date) or []
     status = str(contract.get('status') or '').upper()
-    if status in {'OK', 'OK_WITH_WARNINGS'} and len(rows) >= 10:
+    artifact_ok = status in {'OK', 'OK_WITH_WARNINGS'} and len(rows) >= 10
+    if artifact_ok:
         print('OK artifact final30_scored_count=%d prep_status=%s' % (len(rows), status))
-        raise SystemExit(0)
-except SystemExit:
-    raise
+    else:
+        print('ARTIFACT_CONTRACT_FAIL count=%d prep_status=%s' % (len(rows), status))
 except Exception as exc:
     print('ARTIFACT_CHECK_WARN %s' % exc)
+
+db_ok=False
 try:
     from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+    from trader.us.score_columns import validate_us_entry_provenance_contract
     prep=load_latest_us_prep_status(trade_date) or {}
     rows=load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
-    if prep.get('status') in {'OK','OK_WITH_WARNINGS'} and len(rows) >= 10:
-        print('OK db locked_watchlist_count=%d prep_status=%s' % (len(rows), prep.get('status')))
-        raise SystemExit(0)
-except SystemExit:
-    raise
+    provenance=validate_us_entry_provenance_contract(rows)
+    db_ok = (
+        prep.get('status') in {'OK','OK_WITH_WARNINGS'}
+        and len(rows) >= 10
+        and provenance.get('ok') is True
+    )
+    if db_ok:
+        print(
+            'OK db locked_watchlist_count=%d prep_status=%s provenance_valid=%d/%d'
+            % (len(rows), prep.get('status'), provenance.get('valid_count', 0), provenance.get('total', 0))
+        )
+    else:
+        print(
+            'DB_LIVE_CONTRACT_FAIL count=%d prep_status=%s provenance_invalid=%s'
+            % (len(rows), prep.get('status'), provenance.get('invalid', []))
+        )
 except Exception as exc:
     print('DB_CHECK_WARN %s' % exc)
-raise SystemExit(1)
+
+raise SystemExit(0 if artifact_ok and db_ok else 1)
 PY
 }
 if check; then exit 0; fi
