@@ -311,6 +311,24 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     out["reason_json"] = reason_json
     out["risk_snapshot_json"] = risk_snapshot_json
     out["scores"] = scores
+
+    # ── Entry provenance recovery ──────────────────────────────────────────────
+    # Locked-watchlist PostgreSQL rows keep PREP decision provenance in meta,
+    # while live PB1 consumes canonical top-level fields. Promote the immutable
+    # decision fields without fabricating or remapping the strategy.
+    provenance_fields = (
+        "entry_style_selected", "entry_style", "entry_component",
+        "entry_signal_type", "entry_reason",
+        "reasons", "filters_passed", "score_breakdown", "explanation_quality",
+        "rank_final30", "agent_a_score", "agent_b_score",
+        "theme_cluster", "rotation_regime", "market_regime",
+    )
+    for field in provenance_fields:
+        value = src.get(field)
+        if value is None:
+            value = meta.get(field)
+        if value is not None:
+            out[field] = value
     
     # Component scores 복구
     momentum_score, momentum_source = extract_us_score(src, "momentum", return_source=True)
@@ -356,6 +374,35 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # Score Quality Stats
 # ══════════════════════════════════════════════════════════════════════════════
+
+def validate_us_entry_provenance_contract(rows: list[dict]) -> dict:
+    """Validate the post-DB representation consumed by the live PB1 engine."""
+    from trader.us.pb1.us_explain import normalize_us_entry_style
+
+    invalid: list[dict[str, str]] = []
+    valid_count = 0
+    for raw in rows or []:
+        row = canonicalize_us_watchlist_row(raw)
+        symbol = str(row.get("symbol") or "").upper()
+        style_raw = row.get("entry_style_selected") or row.get("entry_style")
+        style = normalize_us_entry_style(style_raw)
+        if style not in {"ENTRY_PULLBACK", "ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_VCP"}:
+            invalid.append({
+                "symbol": symbol,
+                "reason": "entry_style_unproven",
+                "entry_style": str(style_raw or ""),
+            })
+            continue
+        valid_count += 1
+
+    return {
+        "ok": bool(rows) and not invalid,
+        "total": len(rows or []),
+        "valid_count": valid_count,
+        "invalid_count": len(invalid),
+        "invalid": invalid,
+    }
+
 
 def collect_us_score_nonzero_stats(rows: list[dict]) -> dict:
     """US watchlist rows의 score 통계를 수집한다.
