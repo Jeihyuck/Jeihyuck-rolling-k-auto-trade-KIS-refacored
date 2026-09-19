@@ -42,6 +42,9 @@ import sys
 trade_date=sys.argv[1]
 artifact_ok=False
 try:
+    # Canonical artifact remains runtime/us/watchlist/<trade_date>/final30_scored.json.
+    # The DB provenance check below is an additional live-contract gate, not a
+    # replacement for the canonical PREP artifact contract.
     from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
     contract = load_us_prep_contract(trade_date) or {}
     rows = load_us_final30_scored(trade_date) or []
