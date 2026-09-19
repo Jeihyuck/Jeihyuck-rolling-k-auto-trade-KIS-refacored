@@ -36,6 +36,18 @@ DUPLICATE_EXIT_BLOCK_REASONS = {
 }
 
 
+def summarize_entry_contract_errors(results: list[dict]) -> dict:
+    """Keep incident evidence even when a later tick recovered."""
+    count = sum(int(row.get("entry_contract_error_count") or 0) for row in results)
+    return {
+        "entry_contract_error_count": count,
+        "entry_contract_error_symbols": sorted({
+            symbol for row in results for symbol in row.get("entry_contract_error_symbols", [])
+        }),
+        "entry_contract_error_stage": "intent_generation" if count else "",
+    }
+
+
 def is_no_balance_sell_reject(message: str) -> bool:
     text = str(message or "").lower()
     return any(pattern.lower() in text for pattern in NO_BALANCE_PATTERNS)
@@ -100,6 +112,8 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
     else:
         status = str(tick_result or "")
     if status in SUCCESS_STATUSES:
+        if isinstance(tick_result, dict) and int(tick_result.get("entry_contract_error_count") or 0):
+            return "warning"
         return "success"
     if status in WARNING_STATUSES:
         return "warning"

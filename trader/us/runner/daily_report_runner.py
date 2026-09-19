@@ -1213,6 +1213,16 @@ def run_daily_report(
             or ""
         )
 
+    # A successful close must not erase entry failures from the trading sessions.
+    from trader.us.runner.status_contract import summarize_entry_contract_errors
+    provenance_summaries = [
+        _load_json_if_exists(os.path.join(report_base, trade_date, f"{name}_summary.json"))
+        for name in (("am", "afternoon") if session in (None, "close", "daily_final") else (session,))
+    ]
+    report.update(summarize_entry_contract_errors(provenance_summaries))
+    if report["entry_contract_error_count"]:
+        report["warnings"].append("ENTRY_EXPLAIN_CONTRACT_ERROR")
+
     if not report.get("latest_prep_attempt_status"):
         report["latest_prep_attempt_status"] = report.get("prep_status") or contract_snapshot.get("latest_contract_status")
     if not report.get("effective_contract_status_used_by_session"):
@@ -1290,6 +1300,8 @@ def run_daily_report(
         report["status"] = "WARNING_RECONCILE_MISMATCH"
     elif int(report.get("open_order_pending_total", 0) or 0) > 0:
         report["status"] = "WARNING_OPEN_ORDER_PENDING"
+    elif report.get("entry_contract_error_count"):
+        report["status"] = "OK_WITH_WARNINGS"
     else:
         report["status"] = "OK"
     if report.get("report_consistency") == "FAILED" and report.get("status") != "FAILED_RECONCILE":
@@ -1340,6 +1352,9 @@ def run_daily_report(
         "| Metric | Value |",
         "|---|---|",
         f"| report_status | {report.get('status')} |",
+        f"| entry_contract_error_count | {report.get('entry_contract_error_count', 0)} |",
+        f"| entry_contract_error_symbols | {report.get('entry_contract_error_symbols', [])} |",
+        f"| entry_contract_error_stage | {report.get('entry_contract_error_stage', '')} |",
         f"| market_state | {report.get('market_state')} |",
         f"| defense_regime | {report.get('defense_regime')} |",
         f"| risk_on_regime | {report.get('risk_on_regime')} |",

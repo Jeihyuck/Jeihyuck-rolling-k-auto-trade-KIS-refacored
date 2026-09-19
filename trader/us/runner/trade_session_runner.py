@@ -1950,7 +1950,9 @@ def run_trade_session(
             or final_tick.get("entry_degraded_reason")
             or (final_reason if final_status in {"FAILED", "SKIP"} else "")
         )
+        from trader.us.runner.status_contract import summarize_entry_contract_errors
         report_payload = {
+            **summarize_entry_contract_errors(results),
             "session_run_id": session_run_id,
             "session_generation": session_generation,
             "prep_run_id": str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),
