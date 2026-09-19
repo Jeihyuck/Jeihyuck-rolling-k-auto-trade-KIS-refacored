@@ -317,11 +317,12 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     # while live PB1 consumes canonical top-level fields. Promote the immutable
     # decision fields without fabricating or remapping the strategy.
     provenance_fields = (
-        "entry_style_selected", "entry_style", "entry_component",
-        "entry_signal_type", "entry_reason",
+        "entry_reason", "entry_style_selected", "entry_style", "entry_component",
+        "entry_signal_type", "selected_reason",
         "reasons", "filters_passed", "score_breakdown", "explanation_quality",
         "rank_final30", "agent_a_score", "agent_b_score",
-        "theme_cluster", "rotation_regime", "market_regime",
+        "theme_cluster", "sector", "industry", "market_state",
+        "rotation_regime", "market_regime",
     )
     for field in provenance_fields:
         value = src.get(field)
