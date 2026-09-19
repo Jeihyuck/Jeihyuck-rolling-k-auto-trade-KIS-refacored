@@ -138,11 +138,14 @@ _US_DAILY_METRIC_FIELDS = (
     "rs_20d", "rs_60d", "rs_120d", "trend_score",
     "daily_bar_count", "daily_metrics_as_of", "daily_metrics_source", "daily_history_quality",
     # Entry-decision provenance must survive Final30 -> locked DB -> live BUY.
-    "entry_style_selected", "entry_style", "entry_component",
+    # Keep this aligned with trader.us.entry_exit_contract._PROVENANCE_FIELDS.
+    "entry_reason", "entry_style_selected", "entry_style", "entry_component",
+    "entry_signal_type", "selected_reason",
     "breakout_score", "pullback_score", "momentum_score", "vcp_score",
     "agent_a_score", "agent_b_score", "rank_final30", "score_final",
     "reason_json", "reasons", "filters_passed", "score_breakdown",
-    "explanation_quality", "theme_cluster", "rotation_regime", "market_regime",
+    "explanation_quality", "theme_cluster", "sector", "industry",
+    "market_state", "rotation_regime", "market_regime",
 )
 
 def _merge_us_daily_metrics_meta(row: dict) -> dict:
