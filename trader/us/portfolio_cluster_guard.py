@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_position_market_value_usd(position: dict) -> float:
+    """Resolve market value across live KIS and persisted DB position shapes."""
     for key in ("market_value_usd", "market_value", "eval_amount_usd"):
         try:
             value = float(position.get(key) or 0.0)
@@ -19,7 +20,16 @@ def resolve_position_market_value_usd(position: dict) -> float:
         except (TypeError, ValueError):
             pass
     try:
-        price = float(position.get("last_price") or position.get("current_price") or position.get("price") or 0.0)
+        price = float(
+            position.get("last_price")
+            or position.get("current_price")
+            or position.get("current_price_usd")
+            or position.get("current_px")
+            or position.get("price")
+            or position.get("avg_cost")
+            or position.get("entry_price")
+            or 0.0
+        )
         return max(0.0, price * _qty(position))
     except (TypeError, ValueError):
         return 0.0
