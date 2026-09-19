@@ -2904,6 +2904,17 @@ def run_trade_tick(
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
+                        contract_failures = [
+                            row for row in entry_generation_diagnostics.get("blocked", [])
+                            if row.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR"
+                        ]
+                        if contract_failures:
+                            entry_degraded = True
+                            entry_degraded_reason = "ENTRY_EXPLAIN_CONTRACT_ERROR"
+                            logger.error(
+                                "[US_ENTRY][PROVENANCE_DEGRADED] count=%d symbols=%s stage=intent_generation",
+                                len(contract_failures), [row.get("symbol") for row in contract_failures],
+                            )
                         if eligible_watchlist_rows and not entry_intents:
                             logger.warning(
                                 "[US_ENTRY][ELIGIBLE_BUT_NO_INTENT] eligible=%d preblocked=%d",
@@ -3435,7 +3446,11 @@ def run_trade_tick(
     # 최종 status 판정 (US 전용 status 체계)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
-    total_warnings = fills_warnings_count
+    entry_contract_failures = [
+        row for row in locals().get("entry_generation_diagnostics", {}).get("blocked", [])
+        if row.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR"
+    ]
+    total_warnings = fills_warnings_count + len(entry_contract_failures)
     # Broker submission truth is authoritative across normal and degraded paths.
     orders_sent = routed_sent_total
     orders_failed = reject_cnt + err_cnt
@@ -3691,7 +3706,7 @@ def run_trade_tick(
     return {
         **latency_metrics,
         "status": status,
-        "reason": primary_reject_reason or ("entry_degraded_exit_routed" if exit_routed_after_entry_degraded else ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none")),
+        "reason": primary_reject_reason or entry_degraded_reason or ("entry_degraded_exit_routed" if exit_routed_after_entry_degraded else ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none")),
         "primary_reject_reason": primary_reject_reason,
         "reject_reasons": reject_reasons,
         "no_balance_sell_reject_count": no_balance_sell_reject_count,
@@ -3767,6 +3782,9 @@ def run_trade_tick(
         "entry_error_message": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
         "entry_degraded": int(entry_degraded),
         "entry_degraded_reason": entry_degraded_reason,
+        "entry_contract_error_count": len(entry_contract_failures),
+        "entry_contract_error_symbols": sorted({row["symbol"] for row in entry_contract_failures if row.get("symbol")}),
+        "entry_contract_error_stage": "intent_generation" if entry_contract_failures else "",
         "watchlist_fallback_used": int(watchlist_fallback_used),
         "entry_watchlist_source": entry_watchlist_source,
         "exit_routed_before_entry": exit_routed_before_entry,

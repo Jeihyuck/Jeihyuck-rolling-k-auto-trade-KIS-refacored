@@ -279,6 +279,39 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     scores = coerce_json_dict(scores_raw)
     
     out = dict(src)
+    # PostgreSQL stores provenance in meta; unlike the in-memory path its
+    # SELECT does not return these fields at the top level. Restore only the
+    # known provenance fields, never arbitrary execution/risk parameters.
+    from trader.us.pb1.us_explain import normalize_us_entry_style
+    containers = (src, meta, reason_json, coerce_json_dict(meta.get("reason_json")))
+    styles = {
+        normalize_us_entry_style(container.get(field))
+        for container in containers
+        for field in ("entry_style_selected", "entry_style", "entry_signal_type", "signal_type")
+        if container.get(field)
+    } - {"SKIP", "ENTRY_GENERIC"}
+    conflict = len(styles) > 1 or bool(src.get("entry_provenance_conflict"))
+    out["entry_provenance_conflict"] = conflict
+    explicitly_skipped = any(
+        str(container.get(field) or "").strip().upper() == "SKIP"
+        for container in containers for field in ("entry_style_selected", "entry_style")
+    )
+    if explicitly_skipped:
+        out["entry_style_selected"] = "SKIP"
+    elif conflict:
+        out["entry_style_selected"] = "UNKNOWN"
+    elif styles:
+        out["entry_style_selected"] = next(iter(styles))
+    for field in (
+        "entry_component", "reasons", "filters_passed", "score_breakdown",
+        "explanation_quality", "rank_final30", "theme_cluster", "sector",
+        "industry", "rotation_regime", "market_regime", "market_state",
+    ):
+        if out.get(field) is None:
+            for container in containers[1:]:
+                if container.get(field) is not None:
+                    out[field] = container[field]
+                    break
     
     # ── Symbol / Exchange ──────────────────────────────────────────────────────
     symbol = str(src.get("symbol") or "").strip().upper()

@@ -403,6 +403,9 @@ def _risk_clamp_new_buy_size(*, symbol: str, price: float, signal_target_notiona
 
 def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, entry_style: str, signal_score: float | None = None) -> tuple[bool, str]:
     data = entry_meta or {}
+    if data.get("entry_provenance_conflict"):
+        logger.error("[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=conflicting_entry_provenance", symbol)
+        return False, "ENTRY_EXPLAIN_CONTRACT_ERROR"
     style = str(entry_style or data.get("entry_style") or "").upper()
     score_keys = ("breakout_score", "pullback_score", "momentum_score")
     scores = []
@@ -1110,7 +1113,10 @@ def generate_entry_intents(
             )
             ok_contract, contract_reason = _validate_new_buy_explain_contract(symbol, entry_meta, entry_style_for_contract, signal_score=score)
             if not ok_contract:
-                track_skip(symbol, contract_reason, {"entry_style": entry_style_for_contract})
+                track_skip(symbol, contract_reason, {
+                    "entry_style": entry_style_for_contract,
+                    "contract_error_detail": "conflicting_entry_provenance" if (entry_meta or {}).get("entry_provenance_conflict") else "missing_or_invalid_entry_provenance",
+                })
                 continue
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
