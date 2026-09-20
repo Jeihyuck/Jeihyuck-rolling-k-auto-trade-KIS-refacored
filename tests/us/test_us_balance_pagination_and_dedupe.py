@@ -154,6 +154,56 @@ class TestPaginationStop:
 
         assert call_count["n"] == 2
 
+    def test_final_tr_cont_accepts_echoed_cursor(self):
+        """D/E is authoritative final-page evidence even if KIS echoes the cursor."""
+        from trader.us.execution.kis_us_client import KisUSClient
+
+        client = KisUSClient.__new__(KisUSClient)
+        client.env = "practice"
+        client._cano = "12345"
+        client._acnt_prdt_cd = "01"
+
+        first = _page([_make_row("HELD1", "NASD", 1)], fk200="CURSOR1", nk200="CURSOR1")
+        first["_response_meta"] = {"tr_cont": "M"}
+        final = _page([_make_row("HELD2", "NASD", 1)], fk200="CURSOR1", nk200="CURSOR1")
+        final["_response_meta"] = {"tr_cont": "D"}
+
+        with patch.object(client, "_get", side_effect=[first, final]), \
+             patch.object(client, "_build_headers", return_value={}):
+            result = client._get_us_balance_single_exchange("NASD")
+
+        assert [row["pdno"] for row in result["output1"]] == ["HELD1", "HELD2"]
+
+    def test_more_status_without_cursor_fails_closed(self):
+        from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
+
+        client = KisUSClient.__new__(KisUSClient)
+        client.env = "practice"
+        client._cano = "12345"
+        client._acnt_prdt_cd = "01"
+        payload = _page([_make_row("HELD", "NASD", 1)])
+        payload["_response_meta"] = {"tr_cont": "M"}
+
+        with patch.object(client, "_get", return_value=payload), \
+             patch.object(client, "_build_headers", return_value={}):
+            with pytest.raises(KisUSTemporaryError, match="cursor missing"):
+                client._get_us_balance_single_exchange("NASD")
+
+    def test_unknown_balance_continuation_status_fails_closed(self):
+        from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
+
+        client = KisUSClient.__new__(KisUSClient)
+        client.env = "practice"
+        client._cano = "12345"
+        client._acnt_prdt_cd = "01"
+        payload = _page([_make_row("HELD", "NASD", 1)], fk200="CURSOR1", nk200="CURSOR1")
+        payload["_response_meta"] = {"tr_cont": "?"}
+
+        with patch.object(client, "_get", return_value=payload), \
+             patch.object(client, "_build_headers", return_value={}):
+            with pytest.raises(KisUSTemporaryError, match="unknown status"):
+                client._get_us_balance_single_exchange("NASD")
+
     def test_incomplete_exchange_marks_aggregate_balance_non_authoritative(self, monkeypatch):
         """Single-exchange pagination failure must propagate to the aggregate contract."""
         from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
