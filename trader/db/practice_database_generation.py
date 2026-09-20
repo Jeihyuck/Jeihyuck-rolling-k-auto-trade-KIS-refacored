@@ -192,6 +192,36 @@ def _is_outer_transaction_control(statement: str) -> bool:
     }
 
 
+def _escape_psycopg_percent_literals(statement: str) -> str:
+    """Escape lone percent literals for psycopg's client-side placeholder parser.
+
+    Existing doubled percents are already DBAPI-safe and are preserved. The
+    migration history contains PL/pgSQL RAISE format strings with both escaped
+    and legacy lone percent tokens. Doubling a lone token is only transport
+    escaping: PostgreSQL receives the original single percent.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(statement):
+        char = statement[index]
+        if char != "%":
+            out.append(char)
+            index += 1
+            continue
+        next_char = statement[index + 1] if index + 1 < len(statement) else ""
+        if next_char == "%":
+            out.append("%%")
+            index += 2
+            continue
+        if next_char in {"s", "b", "t"}:
+            raise PracticeDatabaseGenerationError(
+                "PARAMETER_PLACEHOLDER_FORBIDDEN_IN_STATIC_MIGRATION"
+            )
+        out.append("%%")
+        index += 1
+    return "".join(out)
+
+
 def run_fresh_database_migrations(
     engine: sa.Engine,
     *,
@@ -239,7 +269,7 @@ def run_fresh_database_migrations(
                 for statement in statements:
                     if _is_outer_transaction_control(statement):
                         continue
-                    _apply_pg_statement(conn, statement)
+                    _apply_pg_statement(conn, _escape_psycopg_percent_literals(statement))
                 conn.execute(
                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),
                     {"version": version},
