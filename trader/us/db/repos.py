@@ -1992,7 +1992,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                              unrealized_pnl_usd, trading_epoch_id, meta)
                         VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
                                 :unrealized_pnl_usd, :trading_epoch_id, CAST(:meta AS jsonb))
-                        ON CONFLICT (as_of, symbol, exchange) DO UPDATE
+                        ON CONFLICT (trading_epoch_id, as_of, symbol, exchange) DO UPDATE
                             SET qty               =EXCLUDED.qty,
                                 avg_cost          =EXCLUDED.avg_cost,
                                 current_px        =EXCLUDED.current_px,
