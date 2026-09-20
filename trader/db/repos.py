@@ -2786,12 +2786,16 @@ class PortfolioEpochsRepo:
         """Explicit boundary operation; normal reconciliation must never call this."""
         epoch_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
         with self.engine.begin() as conn:
+            trading_epoch_id = _ensure_active_trading_epoch(
+                conn, self._schema, env=env, account_id=account_id
+            )
             identity = and_(
                 self._schema.portfolio_epochs.c.env == env,
                 self._schema.portfolio_epochs.c.account_id == account_id,
                 self._schema.portfolio_epochs.c.sid == sid,
                 self._schema.portfolio_epochs.c.mode == mode,
                 self._schema.portfolio_epochs.c.strategy == strategy,
+                self._schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
                 self._schema.portfolio_epochs.c.status == "ACTIVE",
             )
             conn.execute(sa.update(self._schema.portfolio_epochs).where(identity).values(
@@ -2803,6 +2807,7 @@ class PortfolioEpochsRepo:
                 self._schema.portfolio_epochs.c.sid == sid,
                 self._schema.portfolio_epochs.c.mode == mode,
                 self._schema.portfolio_epochs.c.strategy == strategy,
+                self._schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
                 self._schema.portfolio_epochs.c.status == "ENDED",
             ))
             conn.execute(sa.update(self._schema.positions).where(and_(
@@ -2810,7 +2815,8 @@ class PortfolioEpochsRepo:
                 self._schema.positions.c.status == "OPEN",
             )).values(status="CLOSED", closed_ts=func.now(), closed_reason="PORTFOLIO_EPOCH_ENDED"))
             conn.execute(sa.insert(self._schema.portfolio_epochs).values(
-                portfolio_epoch_id=epoch_id, env=env, account_id=account_id, sid=sid,
+                portfolio_epoch_id=epoch_id, trading_epoch_id=trading_epoch_id,
+                env=env, account_id=account_id, sid=sid,
                 mode=mode, strategy=strategy, status="ACTIVE", reason=reason,
             ))
         return str(epoch_id)
