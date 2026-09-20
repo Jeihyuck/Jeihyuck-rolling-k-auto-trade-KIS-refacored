@@ -391,8 +391,10 @@ def inspect_us_entry_provenance(row: dict) -> dict:
     for label, value in (
         ("top.entry_style_selected", src.get("entry_style_selected")),
         ("top.entry_style", src.get("entry_style")),
+        ("top.entry_signal_type", src.get("entry_signal_type")),
         ("meta.entry_style_selected", meta.get("entry_style_selected")),
         ("meta.entry_style", meta.get("entry_style")),
+        ("meta.entry_signal_type", meta.get("entry_signal_type")),
     ):
         if value in (None, ""):
             continue
