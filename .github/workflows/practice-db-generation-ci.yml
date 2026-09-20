@@ -1,0 +1,79 @@
+name: Practice DB Generation CI
+
+on:
+  pull_request:
+    branches:
+      - dual-agent
+  workflow_dispatch:
+
+jobs:
+  practice-db-generation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/kr_ci
+      DB_DISABLE_PREPARED_STATEMENTS: "1"
+      KIS_HTTP_ENABLED: "0"
+      NO_TRADE: "1"
+      PYTHONPATH: .
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install PostgreSQL client
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte compile generation tools
+        run: |
+          set -euo pipefail
+          python -m py_compile trader/db/practice_database_generation.py
+          python -m py_compile scripts/prepare_new_practice_database.py
+          python -m py_compile scripts/verify_new_practice_database_cutover.py
+
+      - name: Verify broker cutover rejection paths without network
+        run: >-
+          python -m pytest
+          tests/test_practice_database_cutover.py
+          tests/us/test_us_balance_pagination_and_dedupe.py
+          tests/us/test_us_fills_contract.py
+          tests/us/test_us_provider_order_status.py
+          -q
+
+      - name: Prove current trading schema clone and missing-schema rejection
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_practice_database_generation.py -q

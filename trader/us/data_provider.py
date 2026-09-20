@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from decimal import Decimal, InvalidOperation
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -90,6 +91,24 @@ def _safe_int(val: Any, default: int = 0) -> int:
         except (ValueError, TypeError):
             return default
     return default
+
+
+def _is_valid_nonnegative_integral_qty(val: Any) -> bool:
+    """Validate explicit broker quantity evidence without coercing bad data to zero."""
+    try:
+        if val is None or isinstance(val, bool):
+            return False
+        cleaned = str(val).replace(",", "").strip()
+        if not cleaned or cleaned == "-":
+            return False
+        qty = Decimal(cleaned)
+        return bool(
+            qty.is_finite()
+            and qty >= 0
+            and qty == qty.to_integral_value()
+        )
+    except (InvalidOperation, ValueError, TypeError):
+        return False
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
@@ -502,9 +521,33 @@ def normalize_us_order_status_row(row: dict) -> dict:
     symbol = str(_get_first_valid(row, ("symbol", "pdno", "PDNO"), "") or "").strip().upper()
     side_raw = str(_get_first_valid(row, ("side", "sll_buy_dvsn_cd", "SLL_BUY_DVSN_CD"), "") or "").upper()
     side = "BUY" if side_raw in {"BUY", "02", "B"} else "SELL" if side_raw in {"SELL", "01", "S"} else side_raw
-    requested = _safe_int(_get_first_valid(row, ("requested_qty", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"), 0))
-    filled = _safe_int(_get_first_valid(row, ("filled_qty", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty"), 0))
-    remaining = _safe_int(_get_first_valid(row, ("remaining_qty", "nccs_qty", "rmn_qty"), max(0, requested - filled)))
+
+    requested_raw = _get_first_valid(
+        row, ("requested_qty", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"), None
+    )
+    filled_raw = _get_first_valid(
+        row, ("filled_qty", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty"), None
+    )
+    remaining_raw = _get_first_valid(
+        row, ("remaining_qty", "nccs_qty", "rmn_qty"), None
+    )
+    quantity_error = None
+    for label, raw_value in (
+        ("requested_qty", requested_raw),
+        ("filled_qty", filled_raw),
+        ("remaining_qty", remaining_raw),
+    ):
+        if raw_value is not None and not _is_valid_nonnegative_integral_qty(raw_value):
+            quantity_error = f"invalid_{label}"
+            break
+
+    requested = _safe_int(requested_raw, 0)
+    filled = _safe_int(filled_raw, 0)
+    remaining = (
+        _safe_int(remaining_raw, 0)
+        if remaining_raw is not None
+        else max(0, requested - filled)
+    )
     raw_status = str(_get_first_valid(row, ("status", "ord_dvsn_name", "ord_sttus", "rjct_rson"), "") or "").upper()
     if "REJECT" in raw_status or "거부" in raw_status:
         status = "REJECTED"
@@ -531,8 +574,21 @@ def normalize_us_order_status_row(row: dict) -> dict:
             submitted_at_utc = local.astimezone(timezone.utc).isoformat()
         except Exception:
             time_error = "invalid_kis_order_datetime"
-    normalization_result = "normalized" if order_no and symbol and side in {"BUY", "SELL"} and requested > 0 and not time_error else "quarantined"
-    filter_reason = None if normalization_result == "normalized" else time_error or "required_order_schema_missing"
+    normalization_result = (
+        "normalized"
+        if order_no
+        and symbol
+        and side in {"BUY", "SELL"}
+        and requested > 0
+        and not time_error
+        and not quantity_error
+        else "quarantined"
+    )
+    filter_reason = (
+        None
+        if normalization_result == "normalized"
+        else time_error or quantity_error or "required_order_schema_missing"
+    )
     return {
         "order_no": order_no, "raw_order_no": order_no,
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,

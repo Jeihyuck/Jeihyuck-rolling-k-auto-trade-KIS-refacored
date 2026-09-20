@@ -4094,8 +4094,15 @@ class KisAPI:
 
         return snap
 
-    def inquire_daily_ccld(self, *, start_date: str, end_date: str) -> dict:
-        """당일 주문/체결 조회."""
+    def inquire_daily_ccld(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        ctx_area_fk100: str = "",
+        ctx_area_nk100: str = "",
+    ) -> dict:
+        """당일 주문/체결 조회. Cursor args are additive for full pagination."""
         # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환
         if not kis_http_enabled():
             logger.warning("[RECONCILE][HTTP_DISABLED] mode=%s endpoint=inquire-daily-ccld → returning empty", os.getenv("STRATEGY_MODE"))
@@ -4134,6 +4141,8 @@ class KisAPI:
             "ODNO": "",
             "INQR_DVSN": "00",
             "SORT_SQN": "00",
+            "CTX_AREA_FK100": str(ctx_area_fk100 or ""),
+            "CTX_AREA_NK100": str(ctx_area_nk100 or ""),
         }
         retryable_statuses = {500, 502, 503, 504}
         retry_max = max(1, int(os.getenv("KIS_CCLD_RETRY_MAX", "2") or "2"))
@@ -4145,6 +4154,8 @@ class KisAPI:
             for tr_id in tr_ids:
                 try:
                     headers = self._headers(tr_id)
+                    if ctx_area_fk100 or ctx_area_nk100:
+                        headers["tr_cont"] = "N"
                     stage_deadline = getattr(self, "_kr_stage_deadline", None)
                     resp = self.session.request(
                         "GET",
@@ -4164,7 +4175,12 @@ class KisAPI:
                         raise KisTemporaryError(f"HTTP {status}")
                     if 400 <= status < 500:
                         raise KisPermanentError(f"HTTP {status} for {url}")
-                    return resp.json()
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        payload["_response_meta"] = {
+                            "tr_cont": str(resp.headers.get("tr_cont") or "").strip(),
+                        }
+                    return payload
                 except requests.exceptions.Timeout as exc:
                     last_err = exc
                     logger.warning(
