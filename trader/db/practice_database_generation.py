@@ -34,14 +34,26 @@ CRITICAL_STATE_TABLES = (
     "kr_infinite_order_intents",
 )
 
-REQUIRED_TRADING_TABLES = {
-    "orders",
-    "fills",
-    "positions",
-    "us_order_intents",
-    "us_orders",
-    "us_fills",
-    "us_positions",
+REQUIRED_TRADING_TABLES = set(CRITICAL_STATE_TABLES)
+
+REQUIRED_CONTRACT_COLUMNS = {
+    "orders": {
+        "position_cycle_id", "portfolio_epoch_id",
+        "entry_reason", "entry_style_selected", "entry_meta_json", "request_json",
+    },
+    "fills": {
+        "position_cycle_id", "portfolio_epoch_id",
+        "entry_reason", "entry_style_selected", "fill_meta_json",
+    },
+    "positions": {
+        "position_cycle_id", "portfolio_epoch_id",
+        "entry_reason", "entry_style_selected", "entry_meta_json",
+        "entry_exit_plan_json", "position_meta", "exit_policy_family",
+    },
+    "us_order_intents": {"client_order_key", "strategy", "meta"},
+    "us_orders": {"client_order_key", "order_no", "meta"},
+    "us_fills": {"client_order_key", "order_no", "meta"},
+    "us_positions": {"symbol", "as_of", "meta"},
 }
 
 
@@ -375,6 +387,7 @@ def _assert_source_current(
         raise PracticeDatabaseGenerationError(
             f"SOURCE_MIGRATION_SET_MISMATCH missing={missing} extra={extra}"
         )
+    _assert_required_trading_schema(source_engine, label="SOURCE")
     return actual
 
 
@@ -395,6 +408,30 @@ def _assert_target_state_empty(target_engine: sa.Engine) -> dict[str, int | None
             "TARGET_DATABASE_REQUIRED_TABLES_MISSING:" + ",".join(missing)
         )
     return counts
+
+
+def _assert_required_trading_schema(engine: sa.Engine, *, label: str) -> None:
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names(schema="public"))
+    missing_tables = sorted(set(REQUIRED_TRADING_TABLES) - tables)
+    if missing_tables:
+        raise PracticeDatabaseGenerationError(
+            f"{label}_DATABASE_REQUIRED_TABLES_MISSING:" + ",".join(missing_tables)
+        )
+
+    missing_columns: dict[str, list[str]] = {}
+    for table_name, required_columns in REQUIRED_CONTRACT_COLUMNS.items():
+        actual_columns = {
+            str(col.get("name") or "")
+            for col in inspector.get_columns(table_name, schema="public")
+        }
+        missing = sorted(set(required_columns) - actual_columns)
+        if missing:
+            missing_columns[table_name] = missing
+    if missing_columns:
+        raise PracticeDatabaseGenerationError(
+            f"{label}_DATABASE_REQUIRED_CONTRACT_COLUMNS_MISSING:{missing_columns}"
+        )
 
 
 def _assert_schema_equivalent(
@@ -449,6 +486,7 @@ def prepare_new_practice_database(
         _assert_target_fresh_before_clone(target_engine)
         clone_schema_only(source_url=source_url, target_url=resolved_target_url)
         copied_versions = _copy_migration_stamps(source_engine, target_engine)
+        _assert_required_trading_schema(target_engine, label="TARGET")
         _assert_schema_equivalent(source_engine, target_engine)
         target_counts = _assert_target_state_empty(target_engine)
 
@@ -511,6 +549,7 @@ def verify_fresh_target_database(
             raise PracticeDatabaseGenerationError(
                 f"TARGET_MIGRATION_SET_MISMATCH missing={missing} extra={extra}"
             )
+        _assert_required_trading_schema(target_engine, label="TARGET")
         _assert_schema_equivalent(source_engine, target_engine)
         counts = _assert_target_state_empty(target_engine)
         return {
