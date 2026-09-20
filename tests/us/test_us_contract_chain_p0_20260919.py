@@ -183,6 +183,7 @@ def test_us_continuous_postgres_prep_to_sell_uses_one_original_contract(monkeypa
                 "migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql",
                 "migrations/0046_us_orders_committed_notional.sql",
                 "migrations/0047_us_order_events_profit_lifecycle.sql",
+                "migrations/0051_add_global_trading_epoch.sql",
             ):
                 conn.exec_driver_sql(open(migration, encoding="utf-8").read())
 
