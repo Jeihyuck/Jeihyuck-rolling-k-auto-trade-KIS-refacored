@@ -944,6 +944,7 @@ def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> d
 def _ensure_us_position_risk_state_table(conn) -> None:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS us_position_risk_state (
+            trading_epoch_id TEXT NOT NULL,
             trade_date DATE NOT NULL,
             symbol TEXT NOT NULL,
             soft_stop_breach_count INTEGER NOT NULL DEFAULT 0,
@@ -954,7 +955,7 @@ def _ensure_us_position_risk_state_table(conn) -> None:
             last_pnl_pct NUMERIC,
             state JSONB DEFAULT '{}'::jsonb,
             updated_at TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (trade_date, symbol)
+            PRIMARY KEY (trading_epoch_id, trade_date, symbol)
         )
     """))
 
@@ -963,21 +964,23 @@ def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
     """Load per-symbol US intraday risk state; never raises into trading loop."""
     key = _risk_state_key(symbol, trade_date)
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
-        return dict(_MEM_RISK_STATE.get(key, {}))
+        value = dict(_MEM_RISK_STATE.get(key, {}))
+        return value if value.get("trading_epoch_id", trading_epoch_id) == trading_epoch_id else {}
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
             row = conn.execute(
                 text("""
-                    SELECT trade_date, symbol, soft_stop_breach_count,
+                    SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                            first_soft_stop_seen_at, last_soft_stop_seen_at,
                            lowest_price_since_breach, last_price, last_pnl_pct,
                            state, updated_at
                     FROM us_position_risk_state
-                    WHERE trade_date = :td AND symbol = :symbol
+                    WHERE trading_epoch_id=:epoch AND trade_date = :td AND symbol = :symbol
                 """),
-                {"td": trade_date, "symbol": key[1]},
+                {"epoch": trading_epoch_id, "td": trade_date, "symbol": key[1]},
             ).mappings().first()
             return dict(row) if row else {}
     except Exception as exc:
@@ -991,23 +994,25 @@ def load_latest_us_position_risk_state(symbol: str, on_or_before_trade_date: str
     key_symbol = str(symbol or "").strip().upper()
     td = str(on_or_before_trade_date)
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
-        candidates = [v for (d, sym), v in _MEM_RISK_STATE.items() if sym == key_symbol and str(d) <= td]
+        candidates = [v for (d, sym), v in _MEM_RISK_STATE.items()
+                      if sym == key_symbol and str(d) <= td and v.get("trading_epoch_id", trading_epoch_id) == trading_epoch_id]
         candidates.sort(key=lambda r: (str(r.get("trade_date") or ""), str(r.get("updated_at") or "")), reverse=True)
         return dict(candidates[0]) if candidates else {}
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
             row = conn.execute(text("""
-                SELECT trade_date, symbol, soft_stop_breach_count,
+                SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                        first_soft_stop_seen_at, last_soft_stop_seen_at,
                        lowest_price_since_breach, last_price, last_pnl_pct,
                        state, updated_at
                 FROM us_position_risk_state
-                WHERE symbol = :symbol AND trade_date <= :trade_date
+                WHERE trading_epoch_id=:epoch AND symbol = :symbol AND trade_date <= :trade_date
                 ORDER BY trade_date DESC, updated_at DESC
                 LIMIT 1
-            """), {"symbol": key_symbol, "trade_date": td}).mappings().first()
+            """), {"epoch": trading_epoch_id, "symbol": key_symbol, "trade_date": td}).mappings().first()
             return dict(row) if row else {}
     except Exception as exc:
         logger.warning("[US_RISK_STATE][LOAD_LATEST_WARN] symbol=%s trade_date=%s err=%s", key_symbol, td, exc)
@@ -1021,9 +1026,13 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
     td = str(on_or_before_trade_date)
     out: dict[str, dict] = {}
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
         latest: dict[str, dict] = {}
         for (d, sym), row in _MEM_RISK_STATE.items():
+            if row.get("trading_epoch_id", trading_epoch_id) != trading_epoch_id:
+                continue
             if str(d) <= td and (sym not in latest or (str(d), str(row.get("updated_at") or "")) > (str(latest[sym].get("trade_date") or ""), str(latest[sym].get("updated_at") or ""))):
                 latest[sym] = row
         for sym, row in latest.items():
@@ -1035,11 +1044,11 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
             rows = conn.execute(text("""
-                SELECT DISTINCT ON (symbol) trade_date, symbol, state, updated_at
+                SELECT DISTINCT ON (symbol) trading_epoch_id, trade_date, symbol, state, updated_at
                 FROM us_position_risk_state
-                WHERE trade_date <= :trade_date
+                WHERE trading_epoch_id=:epoch AND trade_date <= :trade_date
                 ORDER BY symbol, trade_date DESC, updated_at DESC
-            """), {"trade_date": td}).mappings()
+            """), {"epoch": trading_epoch_id, "trade_date": td}).mappings()
             for row in rows:
                 st = row.get("state") or {}
                 lifecycle = (st.get("lifecycle") or {}) if isinstance(st, dict) else {}
@@ -1055,6 +1064,8 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
     key = _risk_state_key(symbol, trade_date)
     normalized = _normalize_risk_state(key[1], trade_date, state)
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
+    normalized["trading_epoch_id"] = trading_epoch_id
     if engine is None:
         _MEM_RISK_STATE[key] = normalized
         return
@@ -1064,18 +1075,18 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
             conn.execute(
                 text("""
                     INSERT INTO us_position_risk_state (
-                        trade_date, symbol, soft_stop_breach_count,
+                        trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                         first_soft_stop_seen_at, last_soft_stop_seen_at,
                         lowest_price_since_breach, last_price, last_pnl_pct,
                         state, updated_at
                     )
                     VALUES (
-                        :td, :symbol, :soft_stop_breach_count,
+                        :epoch, :td, :symbol, :soft_stop_breach_count,
                         :first_soft_stop_seen_at, :last_soft_stop_seen_at,
                         :lowest_price_since_breach, :last_price, :last_pnl_pct,
                         CAST(:state AS jsonb), NOW()
                     )
-                    ON CONFLICT (trade_date, symbol) DO UPDATE SET
+                    ON CONFLICT (trading_epoch_id, trade_date, symbol) DO UPDATE SET
                         soft_stop_breach_count = EXCLUDED.soft_stop_breach_count,
                         first_soft_stop_seen_at = EXCLUDED.first_soft_stop_seen_at,
                         last_soft_stop_seen_at = EXCLUDED.last_soft_stop_seen_at,
@@ -1086,6 +1097,7 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
                         updated_at = NOW()
                 """),
                 {
+                    "epoch": trading_epoch_id,
                     "td": trade_date,
                     "symbol": key[1],
                     "soft_stop_breach_count": normalized["soft_stop_breach_count"],
@@ -1175,9 +1187,9 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                     stage,stage_status,client_order_key,raw_broker_order_no,
                     cumulative_filled_qty,state,updated_at,trade_date
                     FROM us_profit_capture_lifecycle
-                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle
+                    WHERE trading_epoch_id=:epoch AND trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle
                     ORDER BY stage,trade_date DESC,updated_at DESC"""),
-                    {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}).mappings().all()
+                    {"epoch": trading_epoch_id,"td": trade_date,"symbol":sym,"lifecycle":lifecycle}).mappings().all()
             state={"position_lifecycle_id":lifecycle,"meta":{}}
             for row in rows:
                 stage=str(row["stage"]); status=str(row["stage_status"])
@@ -1243,13 +1255,14 @@ def mark_us_profit_capture_stage(
     normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
     _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is not None:
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
         with engine.begin() as conn:
             conn.execute(text("""INSERT INTO us_profit_capture_lifecycle
-                (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                (trading_epoch_id,trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
                  raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
-                VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
+                VALUES (:epoch,:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
                 ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
                  stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
                  raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
