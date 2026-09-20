@@ -40,54 +40,54 @@ ALTER TABLE IF EXISTS kr_infinite_order_intents ADD COLUMN IF NOT EXISTS trading
 
 DO $$
 BEGIN
-    IF to_regclass('public.portfolio_epochs') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.portfolio_epochs') IS NOT NULL THEN
         UPDATE portfolio_epochs SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_portfolio_epochs_trading_epoch ON portfolio_epochs(trading_epoch_id, status);
     END IF;
-    IF to_regclass('public.orders') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.orders') IS NOT NULL THEN
         UPDATE orders SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_orders_trading_epoch ON orders(trading_epoch_id, env, created_at);
     END IF;
-    IF to_regclass('public.fills') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.fills') IS NOT NULL THEN
         UPDATE fills SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_fills_trading_epoch ON fills(trading_epoch_id, env, filled_at);
     END IF;
-    IF to_regclass('public.positions') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.positions') IS NOT NULL THEN
         UPDATE positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_positions_trading_epoch ON positions(trading_epoch_id, env, status, code);
     END IF;
 
-    IF to_regclass('public.us_order_intents') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_order_intents') IS NOT NULL THEN
         UPDATE us_order_intents SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_us_order_intents_trading_epoch ON us_order_intents(trading_epoch_id, trade_date);
     END IF;
-    IF to_regclass('public.us_orders') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_orders') IS NOT NULL THEN
         UPDATE us_orders SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_us_orders_trading_epoch ON us_orders(trading_epoch_id, trade_date);
     END IF;
-    IF to_regclass('public.us_fills') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_fills') IS NOT NULL THEN
         UPDATE us_fills SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_us_fills_trading_epoch ON us_fills(trading_epoch_id, trade_date);
     END IF;
-    IF to_regclass('public.us_positions') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_positions') IS NOT NULL THEN
         UPDATE us_positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_us_positions_trading_epoch ON us_positions(trading_epoch_id, as_of);
     END IF;
-    IF to_regclass('public.us_reconcile_logs') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_reconcile_logs') IS NOT NULL THEN
         UPDATE us_reconcile_logs SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
     END IF;
-    IF to_regclass('public.us_position_risk_state') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_position_risk_state') IS NOT NULL THEN
         UPDATE us_position_risk_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         ALTER TABLE us_position_risk_state ALTER COLUMN trading_epoch_id SET NOT NULL;
         ALTER TABLE us_position_risk_state DROP CONSTRAINT IF EXISTS us_position_risk_state_pkey;
         ALTER TABLE us_position_risk_state
             ADD CONSTRAINT us_position_risk_state_pkey PRIMARY KEY(trading_epoch_id, trade_date, symbol);
     END IF;
-    IF to_regclass('public.us_profit_capture_lifecycle') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_profit_capture_lifecycle') IS NOT NULL THEN
         UPDATE us_profit_capture_lifecycle SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
     END IF;
 
-    IF to_regclass('public.us_tqqq_infinite_state') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_tqqq_infinite_state') IS NOT NULL THEN
         UPDATE us_tqqq_infinite_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         ALTER TABLE us_tqqq_infinite_state ALTER COLUMN trading_epoch_id SET NOT NULL;
         ALTER TABLE us_tqqq_infinite_state DROP CONSTRAINT IF EXISTS us_tqqq_infinite_state_pkey;
@@ -95,7 +95,7 @@ BEGIN
             ADD CONSTRAINT us_tqqq_infinite_state_pkey PRIMARY KEY(trading_epoch_id, strategy_id, symbol);
     END IF;
 
-    IF to_regclass('public.kr_infinite_state') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.kr_infinite_state') IS NOT NULL THEN
         UPDATE kr_infinite_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         ALTER TABLE kr_infinite_state ALTER COLUMN trading_epoch_id SET NOT NULL;
         ALTER TABLE kr_infinite_state DROP CONSTRAINT IF EXISTS kr_infinite_state_pkey;
@@ -103,7 +103,7 @@ BEGIN
             ADD CONSTRAINT kr_infinite_state_pkey PRIMARY KEY(trading_epoch_id, strategy_id, symbol);
     END IF;
 
-    IF to_regclass('public.kr_infinite_order_intents') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.kr_infinite_order_intents') IS NOT NULL THEN
         UPDATE kr_infinite_order_intents SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
         CREATE INDEX IF NOT EXISTS ix_kr_inf_intent_trading_epoch
             ON kr_infinite_order_intents(trading_epoch_id, trade_date, status);
@@ -114,10 +114,10 @@ COMMENT ON TABLE trading_epochs IS 'Account-wide logical trading run boundary sh
 
 DO $$
 BEGIN
-    IF to_regclass('public.orders') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.orders') IS NOT NULL THEN
         COMMENT ON COLUMN orders.trading_epoch_id IS 'Global KR/US trading epoch identity';
     END IF;
-    IF to_regclass('public.us_orders') IS NOT NULL THEN
+    IF to_regclass(current_schema() || '.us_orders') IS NOT NULL THEN
         COMMENT ON COLUMN us_orders.trading_epoch_id IS 'Global KR/US trading epoch identity';
     END IF;
 END $$;
