@@ -411,3 +411,88 @@ def test_us_continuous_postgres_prep_to_sell_uses_one_original_contract(monkeypa
         with cleanup.begin() as conn:
             conn.execute(text(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
         cleanup.dispose()
+
+
+def _entry_test_env(monkeypatch):
+    from trader.us.db import repos
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setenv("US_MIN_ENTRY_SCORE", "0.01")
+    monkeypatch.setenv("US_MAX_NEW_ENTRIES_PER_TICK", "1")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "5000")
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "1")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "50000")
+    monkeypatch.setenv("KIS_ENV", "practice")
+
+
+class _EntryProvider:
+    def get_current_price(self, symbol, exchange):
+        return {"last": 100.0}
+
+
+def test_us_corrupted_style_is_rejected_by_preflight_and_live_engine(monkeypatch):
+    from trader.us.score_columns import canonicalize_us_watchlist_row, validate_us_entry_provenance_contract
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    _entry_test_env(monkeypatch)
+    broken = _simulate_postgres_watchlist_row()
+    broken["meta"]["entry_style_selected"] = "CORRUPTED_STYLE"
+
+    preflight = validate_us_entry_provenance_contract([broken])
+    assert preflight["ok"] is False
+    assert preflight["invalid"][0]["reason"] == "entry_style_invalid_source"
+
+    canonical = canonicalize_us_watchlist_row(broken)
+    diagnostics = {}
+    intents = generate_entry_intents(
+        tickers=None,
+        provider=_EntryProvider(),
+        sold_today=set(),
+        available_cash_usd=10000.0,
+        position_count=0,
+        capital_usd_cap=10000.0,
+        now=datetime(2026, 9, 18, 10, 5, tzinfo=ZoneInfo("America/New_York")),
+        max_new_entries=1,
+        watchlist_entries=[canonical],
+        current_position_symbols=set(),
+        diagnostics=diagnostics,
+    )
+    assert intents == []
+    blocked = diagnostics.get("blocked") or []
+    assert any(item.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR" for item in blocked)
+    assert any((item.get("detail") or {}).get("contract_reason") == "entry_style_invalid_source" for item in blocked)
+
+
+def test_us_conflicting_top_and_meta_styles_fail_closed_in_preflight_and_live(monkeypatch):
+    from trader.us.score_columns import canonicalize_us_watchlist_row, validate_us_entry_provenance_contract
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    _entry_test_env(monkeypatch)
+    conflict = _simulate_postgres_watchlist_row()
+    conflict["entry_style_selected"] = "ENTRY_BREAKOUT"
+    conflict["meta"]["entry_style_selected"] = "ENTRY_PULLBACK"
+
+    preflight = validate_us_entry_provenance_contract([conflict])
+    assert preflight["ok"] is False
+    assert preflight["invalid"][0]["reason"] == "entry_style_conflict"
+    assert sorted(preflight["invalid"][0]["conflicts"]) == ["ENTRY_BREAKOUT", "ENTRY_PULLBACK"]
+
+    canonical = canonicalize_us_watchlist_row(conflict)
+    diagnostics = {}
+    intents = generate_entry_intents(
+        tickers=None,
+        provider=_EntryProvider(),
+        sold_today=set(),
+        available_cash_usd=10000.0,
+        position_count=0,
+        capital_usd_cap=10000.0,
+        now=datetime(2026, 9, 18, 10, 5, tzinfo=ZoneInfo("America/New_York")),
+        max_new_entries=1,
+        watchlist_entries=[canonical],
+        current_position_symbols=set(),
+        diagnostics=diagnostics,
+    )
+    assert intents == []
+    blocked = diagnostics.get("blocked") or []
+    assert any(item.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR" for item in blocked)
+    assert any((item.get("detail") or {}).get("contract_reason") == "entry_style_conflict" for item in blocked)
