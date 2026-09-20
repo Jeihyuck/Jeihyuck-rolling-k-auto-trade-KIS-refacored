@@ -376,22 +376,72 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
 # Score Quality Stats
 # ══════════════════════════════════════════════════════════════════════════════
 
-def validate_us_entry_provenance_contract(rows: list[dict]) -> dict:
-    """Validate the post-DB representation consumed by the live PB1 engine."""
-    from trader.us.pb1.us_explain import normalize_us_entry_style
+def inspect_us_entry_provenance(row: dict) -> dict:
+    """Inspect entry-style provenance across top-level and meta sources.
 
-    invalid: list[dict[str, str]] = []
+    Equivalent aliases are accepted after normalization. Any non-empty
+    unrecognized value, or any semantic disagreement between sources, fails
+    closed so the live engine cannot silently choose one conflicting reason.
+    """
+    from trader.us.pb1.us_explain import validate_tradable_us_entry_style
+
+    src = dict(row or {})
+    meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+    sources = []
+    for label, value in (
+        ("top.entry_style_selected", src.get("entry_style_selected")),
+        ("top.entry_style", src.get("entry_style")),
+        ("meta.entry_style_selected", meta.get("entry_style_selected")),
+        ("meta.entry_style", meta.get("entry_style")),
+    ):
+        if value in (None, ""):
+            continue
+        ok, normalized = validate_tradable_us_entry_style(value)
+        sources.append({
+            "source": label,
+            "raw": str(value),
+            "normalized": normalized,
+            "ok": bool(ok),
+        })
+
+    invalid_sources = [item for item in sources if not item["ok"]]
+    valid_styles = {item["normalized"] for item in sources if item["ok"]}
+    conflicts = sorted(valid_styles) if len(valid_styles) > 1 else []
+    normalized_style = next(iter(valid_styles)) if len(valid_styles) == 1 else "SKIP"
+
+    if not sources:
+        reason = "entry_style_missing"
+    elif invalid_sources:
+        reason = "entry_style_invalid_source"
+    elif conflicts:
+        reason = "entry_style_conflict"
+    else:
+        reason = ""
+
+    return {
+        "ok": not reason,
+        "reason": reason,
+        "normalized_style": normalized_style,
+        "sources": sources,
+        "conflicts": conflicts,
+    }
+
+
+def validate_us_entry_provenance_contract(rows: list[dict]) -> dict:
+    """Validate the exact post-DB representation consumed by live PB1."""
+    invalid: list[dict] = []
     valid_count = 0
     for raw in rows or []:
         row = canonicalize_us_watchlist_row(raw)
         symbol = str(row.get("symbol") or "").upper()
-        style_raw = row.get("entry_style_selected") or row.get("entry_style")
-        style = normalize_us_entry_style(style_raw)
-        if style not in {"ENTRY_PULLBACK", "ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_VCP"}:
+        state = inspect_us_entry_provenance(row)
+        if not state.get("ok"):
             invalid.append({
                 "symbol": symbol,
-                "reason": "entry_style_unproven",
-                "entry_style": str(style_raw or ""),
+                "reason": state.get("reason"),
+                "entry_style": state.get("normalized_style"),
+                "sources": state.get("sources"),
+                "conflicts": state.get("conflicts"),
             })
             continue
         valid_count += 1
