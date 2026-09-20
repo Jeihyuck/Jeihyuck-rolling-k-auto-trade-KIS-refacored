@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
-from trader.db.engine import _connect_args_for_db_url, _normalize_db_url
+from trader.db.engine import _connect_args_for_db_url
 from trader.db.migrate import run_migrations
 
 
@@ -38,11 +38,24 @@ class PracticeDatabaseGenerationError(RuntimeError):
     pass
 
 
+def _driver_compatible_url(url: str) -> str:
+    value = str(url or "").strip()
+    if value.startswith("postgresql://"):
+        return value.replace("postgresql://", "postgresql+psycopg://", 1)
+    if value.startswith("postgres://"):
+        return value.replace("postgres://", "postgresql+psycopg://", 1)
+    return value
+
+
 def _engine_for_url(url: str) -> sa.Engine:
-    normalized = _normalize_db_url(url)
+    # Preserve the caller's SSL policy. The global runtime normalizer adds
+    # sslmode=require for production safety, but this DB-generation utility
+    # must also support local/direct PostgreSQL endpoints that do not expose
+    # SSL (including CI). Production URLs that already specify sslmode keep it.
+    compatible = _driver_compatible_url(url)
     return sa.create_engine(
-        normalized,
-        connect_args=_connect_args_for_db_url(normalized),
+        compatible,
+        connect_args=_connect_args_for_db_url(compatible),
         pool_pre_ping=True,
         future=True,
     )
