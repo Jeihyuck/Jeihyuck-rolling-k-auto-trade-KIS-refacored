@@ -111,6 +111,20 @@ def database_identity(url: str) -> dict[str, Any]:
     }
 
 
+def _same_database_endpoint(lhs_url: str, rhs_url: str) -> bool:
+    lhs = make_url(_driver_compatible_url(lhs_url))
+    rhs = make_url(_driver_compatible_url(rhs_url))
+    return (
+        str(lhs.host or "").lower(),
+        int(lhs.port or 5432),
+        str(lhs.database or ""),
+    ) == (
+        str(rhs.host or "").lower(),
+        int(rhs.port or 5432),
+        str(rhs.database or ""),
+    )
+
+
 def _public_tables(engine: sa.Engine) -> list[str]:
     return sorted(inspect(engine).get_table_names(schema="public"))
 
@@ -149,12 +163,12 @@ def repository_migration_versions(migrations_dir: str = "migrations") -> list[st
     )
 
 
-def schema_signature(engine: sa.Engine) -> dict[str, list[dict[str, Any]]]:
-    """Stable public-schema signature used to prove source/target equivalence."""
+def schema_signature(engine: sa.Engine) -> dict[str, dict[str, Any]]:
+    """Stable public-schema signature proving structural source/target parity."""
     inspector = inspect(engine)
-    signature: dict[str, list[dict[str, Any]]] = {}
+    signature: dict[str, dict[str, Any]] = {}
     for table_name in sorted(inspector.get_table_names(schema="public")):
-        signature[table_name] = [
+        columns = [
             {
                 "name": str(col.get("name") or ""),
                 "type": str(col.get("type") or ""),
@@ -162,6 +176,44 @@ def schema_signature(engine: sa.Engine) -> dict[str, list[dict[str, Any]]]:
             }
             for col in inspector.get_columns(table_name, schema="public")
         ]
+        pk_raw = inspector.get_pk_constraint(table_name, schema="public") or {}
+        pk = {
+            "name": str(pk_raw.get("name") or ""),
+            "columns": list(pk_raw.get("constrained_columns") or []),
+        }
+        uniques = sorted(
+            (
+                str(item.get("name") or ""),
+                tuple(item.get("column_names") or []),
+            )
+            for item in (inspector.get_unique_constraints(table_name, schema="public") or [])
+        )
+        fks = sorted(
+            (
+                str(item.get("name") or ""),
+                tuple(item.get("constrained_columns") or []),
+                str(item.get("referred_schema") or "public"),
+                str(item.get("referred_table") or ""),
+                tuple(item.get("referred_columns") or []),
+                str((item.get("options") or {}).get("ondelete") or ""),
+            )
+            for item in (inspector.get_foreign_keys(table_name, schema="public") or [])
+        )
+        indexes = sorted(
+            (
+                str(item.get("name") or ""),
+                tuple(item.get("column_names") or []),
+                bool(item.get("unique")),
+            )
+            for item in (inspector.get_indexes(table_name, schema="public") or [])
+        )
+        signature[table_name] = {
+            "columns": columns,
+            "primary_key": pk,
+            "unique_constraints": uniques,
+            "foreign_keys": fks,
+            "indexes": indexes,
+        }
     return signature
 
 
@@ -369,7 +421,7 @@ def prepare_new_practice_database(
             resolved_target_url = str(target_url).strip()
             if not resolved_target_url:
                 raise PracticeDatabaseGenerationError("PBCORE_NEW_DB_URL_EMPTY")
-            if _database_name(resolved_target_url) == _database_name(source_url):
+            if _same_database_endpoint(resolved_target_url, source_url):
                 raise PracticeDatabaseGenerationError("TARGET_DATABASE_MUST_DIFFER_FROM_SOURCE")
         else:
             if not target_database_name:
@@ -386,9 +438,10 @@ def prepare_new_practice_database(
         target_counts = _assert_target_state_empty(target_engine)
 
         source_after = source_archive_snapshot(source_engine)
-        if source_before != source_after:
+        immutable_keys = ("database", "public_tables", "migration_versions", "schema_signature")
+        if any(source_before.get(key) != source_after.get(key) for key in immutable_keys):
             raise PracticeDatabaseGenerationError(
-                "SOURCE_DATABASE_CHANGED_DURING_SCHEMA_CLONE"
+                "SOURCE_DATABASE_SCHEMA_CHANGED_DURING_SCHEMA_CLONE"
             )
 
         return {
@@ -430,7 +483,7 @@ def verify_fresh_target_database(
     target_url: str,
     migrations_dir: str = "migrations",
 ) -> dict[str, Any]:
-    if _database_name(source_url) == _database_name(target_url):
+    if _same_database_endpoint(source_url, target_url):
         raise PracticeDatabaseGenerationError("TARGET_DATABASE_MUST_DIFFER_FROM_SOURCE")
     source_engine = _engine_for_url(source_url)
     target_engine = _engine_for_url(target_url)
