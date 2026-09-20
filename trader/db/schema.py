@@ -39,6 +39,7 @@ class SchemaTables:
     orders: sa.Table
     fills: sa.Table
     positions: sa.Table
+    trading_epochs: sa.Table
     portfolio_epochs: sa.Table
     ledger_events: sa.Table
     reconcile_log: sa.Table
@@ -123,12 +124,34 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("updated_ts", sa.Text, nullable=False),
     )
 
+    trading_epochs = sa.Table(
+        "trading_epochs",
+        metadata,
+        sa.Column("trading_epoch_id", sa.Text, primary_key=True),
+        sa.Column("env", sa.String, nullable=False),
+        sa.Column("account_id", sa.String, nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("ended_at", sa.DateTime(timezone=True)),
+        sa.Column("status", sa.String, nullable=False, server_default="ACTIVE"),
+        sa.Column("reason", sa.String),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+    )
+    sa.Index(
+        "uq_trading_epochs_active",
+        trading_epochs.c.env,
+        trading_epochs.c.account_id,
+        unique=True,
+        postgresql_where=trading_epochs.c.status == "ACTIVE",
+        sqlite_where=trading_epochs.c.status == "ACTIVE",
+    )
+
     orders = sa.Table(
         "orders",
         metadata,
         uuid_col("order_id", primary_key=True),
         uuid_col("position_cycle_id", nullable=True),
         uuid_col("portfolio_epoch_id", nullable=True),
+        sa.Column("trading_epoch_id", sa.Text, nullable=True),
         sa.Column("env", sa.String, nullable=False),
         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
         sa.Column("strategy", sa.String, nullable=False),
@@ -168,6 +191,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         uuid_col("fill_id", primary_key=True),
         uuid_col("position_cycle_id", nullable=True),
         uuid_col("portfolio_epoch_id", nullable=True),
+        sa.Column("trading_epoch_id", sa.Text, nullable=True),
         sa.Column("env", sa.String, nullable=False),
         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
         sa.Column("order_id", uuid_type, sa.ForeignKey("orders.order_id")),
@@ -209,6 +233,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         "portfolio_epochs",
         metadata,
         uuid_col("portfolio_epoch_id", primary_key=True),
+        sa.Column("trading_epoch_id", sa.Text, nullable=True),
         sa.Column("env", sa.String, nullable=False),
         sa.Column("account_id", sa.String, nullable=False),
         sa.Column("sid", sa.Integer, nullable=False),
@@ -233,6 +258,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         uuid_col("position_id", primary_key=True),
         uuid_col("position_cycle_id", nullable=False),
         uuid_col("portfolio_epoch_id", nullable=False),
+        sa.Column("trading_epoch_id", sa.Text, nullable=True),
         sa.Column("opened_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("position_origin", sa.String, nullable=False, server_default="SYSTEM"),
         sa.Column("env", sa.String, nullable=False),
@@ -435,6 +461,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         orders=orders,
         fills=fills,
         positions=positions,
+        trading_epochs=trading_epochs,
         portfolio_epochs=portfolio_epochs,
         ledger_events=ledger_events,
         reconcile_log=reconcile_log,
@@ -477,6 +504,7 @@ UNIVERSE_CURRENT = DEFAULT_SCHEMA.universe_current
 ORDERS = DEFAULT_SCHEMA.orders
 FILLS = DEFAULT_SCHEMA.fills
 POSITIONS = DEFAULT_SCHEMA.positions
+TRADING_EPOCHS = DEFAULT_SCHEMA.trading_epochs
 LEDGER_EVENTS = DEFAULT_SCHEMA.ledger_events
 RECONCILE_LOG = DEFAULT_SCHEMA.reconcile_log
 PRICE_DAILY = DEFAULT_SCHEMA.price_daily
