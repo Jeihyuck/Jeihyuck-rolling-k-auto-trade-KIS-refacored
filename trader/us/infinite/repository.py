@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import text
 
 from trader.db.engine import get_engine
+from trader.trading_epoch import get_active_trading_epoch_id
 
 from .models import InfiniteState, Status
 
@@ -27,6 +28,9 @@ class InfiniteRepository:
     def __init__(self, engine=None):
         self.engine = engine or get_engine()
 
+    def _epoch(self) -> str:
+        return get_active_trading_epoch_id(self.engine, env="practice", create_if_missing=True)
+
     def ensure_schema(self) -> None:
         """Lightweight runtime readiness probe; migrations never run in a tick."""
         with self.engine.connect() as conn:
@@ -40,8 +44,8 @@ class InfiniteRepository:
             with self.engine.connect() as conn:
                 row = conn.execute(text("""
                     SELECT * FROM us_tqqq_infinite_state
-                    WHERE strategy_id=:strategy_id AND symbol=:symbol
-                """), {"strategy_id": strategy_id, "symbol": symbol}).mappings().first()
+                    WHERE trading_epoch_id=:epoch AND strategy_id=:strategy_id AND symbol=:symbol
+                """), {"epoch": self._epoch(), "strategy_id": strategy_id, "symbol": symbol}).mappings().first()
             if row is None:
                 return None
             metadata = row.get("metadata") or {}
@@ -69,19 +73,20 @@ class InfiniteRepository:
         payload = asdict(state)
         payload["status"] = state.status.value
         payload["metadata"] = json.dumps(state.metadata, default=str)
+        payload["trading_epoch_id"] = self._epoch()
         with self.engine.begin() as conn:
             conn.execute(text("""
                 INSERT INTO us_tqqq_infinite_state (
-                    strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
+                    trading_epoch_id,strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
                     core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
                     market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
                     status,metadata,version,updated_at
                 ) VALUES (
-                    :strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
+                    :trading_epoch_id,:strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
                     :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
                     :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
                     :status,CAST(:metadata AS jsonb),:version,NOW()
-                ) ON CONFLICT (strategy_id,symbol) DO UPDATE SET
+                ) ON CONFLICT (trading_epoch_id,strategy_id,symbol) DO UPDATE SET
                     cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
                     cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
                     core_filled_notional=EXCLUDED.core_filled_notional,
@@ -95,8 +100,8 @@ class InfiniteRepository:
     def pending_sides(self, trade_date: date, symbol: str = "TQQQ") -> tuple[bool, bool]:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT side,status FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol
-            """), {"trade_date": trade_date, "symbol": symbol}).mappings()
+                SELECT side,status FROM us_orders WHERE trading_epoch_id=:epoch AND trade_date=:trade_date AND symbol=:symbol
+            """), {"epoch": self._epoch(), "trade_date": trade_date, "symbol": symbol}).mappings()
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
 
@@ -108,12 +113,13 @@ class InfiniteRepository:
         bind sets.
         """
         params = {
+            "epoch": self._epoch(),
             "symbol": symbol,
             "cycle_prefix": f"TQQQ_INF_V3:{cycle_id}:%",
         }
         sql = """
             SELECT * FROM us_orders
-            WHERE symbol=:symbol AND client_order_key LIKE :cycle_prefix
+            WHERE trading_epoch_id=:epoch AND symbol=:symbol AND client_order_key LIKE :cycle_prefix
               AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
                              'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
         """
@@ -130,13 +136,13 @@ class InfiniteRepository:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT * FROM us_orders
-                WHERE symbol=:symbol AND side='BUY'
+                WHERE trading_epoch_id=:epoch AND symbol=:symbol AND side='BUY'
                   AND client_order_key LIKE 'TQQQ_INF_V3:%'
                   AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
                                  'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
                   AND created_at <= :cutoff
                 ORDER BY created_at ASC
-            """), {"symbol": symbol, "cutoff": cutoff}).mappings().all()
+            """), {"epoch": self._epoch(), "symbol": symbol, "cutoff": cutoff}).mappings().all()
         return [dict(row) for row in rows]
 
     def mark_ttl_cancel_requested(self, order: dict, *, requested_at: datetime,
@@ -212,10 +218,10 @@ class InfiniteRepository:
                         committed_notional_usd * GREATEST(qty_requested-qty_filled,0) / qty_requested
                     ELSE committed_notional_usd END
                 ),0)
-                FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol AND side='BUY'
+                FROM us_orders WHERE trading_epoch_id=:epoch AND trade_date=:trade_date AND symbol=:symbol AND side='BUY'
                   AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING','PARTIALLY_FILLED',
                                  'RECONCILE_PENDING','ACK_DB_FAILED')
-            """), {"trade_date": trade_date, "symbol": symbol}).scalar()
+            """), {"epoch": self._epoch(), "trade_date": trade_date, "symbol": symbol}).scalar()
         return max(0.0, float(value or 0))
 
     def next_full_exit_sequence(self, trade_date: date, cycle_id: str) -> int:
@@ -224,33 +230,33 @@ class InfiniteRepository:
         with self.engine.connect() as conn:
             value = conn.execute(text("""
                 SELECT COUNT(*) FROM us_orders
-                WHERE symbol='TQQQ' AND side='SELL' AND client_order_key LIKE :prefix
+                WHERE trading_epoch_id=:epoch AND symbol='TQQQ' AND side='SELL' AND client_order_key LIKE :prefix
                   AND status IN ('CANCELLED','REJECTED','EXPIRED')
-            """), {"prefix": prefix}).scalar()
+            """), {"epoch": self._epoch(), "prefix": prefix}).scalar()
         return int(value or 0) + 1
 
     def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
         with self.engine.connect() as conn:
             return bool(conn.execute(text("""
                 SELECT 1 FROM us_orders
-                WHERE symbol=:symbol
+                WHERE trading_epoch_id=:epoch AND symbol=:symbol
                   AND status IN ('INTENT','SUBMITTED','ACK','PENDING','PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
                   AND client_order_key LIKE 'TQQQ_INF_V3:%'
                 LIMIT 1
-            """), {"symbol": symbol}).first())
+            """), {"epoch": self._epoch(), "symbol": symbol}).first())
 
     def find_recovery_cycle_id(self, symbol: str = "TQQQ") -> str | None:
         """Reuse the newest durable Infinite key without rewriting its identity."""
         with self.engine.connect() as conn:
             row = conn.execute(text("""
                 SELECT client_order_key FROM (
-                    SELECT client_order_key, created_at FROM us_orders WHERE symbol=:symbol
+                    SELECT client_order_key, created_at FROM us_orders WHERE trading_epoch_id=:epoch AND symbol=:symbol
                     UNION ALL
-                    SELECT client_order_key, created_at FROM us_order_intents WHERE symbol=:symbol
+                    SELECT client_order_key, created_at FROM us_order_intents WHERE trading_epoch_id=:epoch AND symbol=:symbol
                 ) history
                 WHERE client_order_key LIKE 'TQQQ_INF_V3:%'
                 ORDER BY created_at DESC NULLS LAST LIMIT 1
-            """), {"symbol": symbol}).first()
+            """), {"epoch": self._epoch(), "symbol": symbol}).first()
         key = str(row[0] if row else "")
         parts = key.split(":")
         return parts[1] if len(parts) >= 3 and parts[1] else None
@@ -266,11 +272,11 @@ class InfiniteRepository:
             for table in ("us_order_intents", "us_orders", "us_fills"):
                 conn.execute(text(f"""
                     UPDATE {table} SET meta=COALESCE(meta, '{{}}'::jsonb) || CAST(:attribution AS jsonb)
-                    WHERE symbol='TQQQ' AND (
+                    WHERE trading_epoch_id=:epoch AND symbol='TQQQ' AND (
                         COALESCE(meta->>'strategy_owner','') <> 'TQQQ_INFINITE'
                         OR COALESCE(meta->>'sleeve_id','') <> 'TQQQ_INFINITE'
                     )
-                """), {"attribution": attribution})
+                """), {"epoch": self._epoch(), "attribution": attribution})
 
     def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
@@ -286,9 +292,9 @@ class InfiniteRepository:
                   ON i.client_order_key=f.client_order_key
                 LEFT JOIN us_orders o
                   ON o.client_order_key=f.client_order_key
-                WHERE f.symbol=:symbol AND f.trade_date>=:start
+                WHERE f.trading_epoch_id=:epoch AND f.symbol=:symbol AND f.trade_date>=:start
                 ORDER BY f.trade_date,f.filled_at,f.created_at
-            """), {"symbol": state.symbol, "start": start}).mappings().all()
+            """), {"epoch": self._epoch(), "symbol": state.symbol, "start": start}).mappings().all()
         return self._summarize_fill_rows(rows, state, trading_date)
 
     def cycle_fill_stats(self, state: InfiniteState, trading_date: date) -> dict[str, Any]:
@@ -300,9 +306,9 @@ class InfiniteRepository:
                        i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
                 FROM us_fills f LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
                 LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
-                WHERE f.symbol=:symbol AND f.trade_date>=:start
+                WHERE f.trading_epoch_id=:epoch AND f.symbol=:symbol AND f.trade_date>=:start
                 ORDER BY f.trade_date,f.filled_at,f.created_at
-            """), {"symbol": state.symbol, "start": start}).mappings().all()
+            """), {"epoch": self._epoch(), "symbol": state.symbol, "start": start}).mappings().all()
         summary = self._summarize_fill_rows(rows, state, trading_date)
         last_price = None
         last_profit_stage = None
