@@ -53,6 +53,9 @@ migrator. This includes 0033 entry metadata, 0038 US tables, 0047 profit lifecyc
 0048/0049 Infinite tables and 0050 position lifecycle. Versions are stamped only
 after successful application by that migrator. No catch-and-stamp fallback is
 used. The baseline supplies the column used by the 0032 index before 0033.
+Before replay, the empty fixture's ledger payload column is set to TEXT, the
+documented input to the one-way 0025 TEXT-to-JSONB migration. 0025 then performs
+the real conversion; it is not skipped or stamped without execution.
 
 CI clones this real PostgreSQL source into a separate database, verifies the
 sentinel stays only in the source, checks every required trading table is empty,

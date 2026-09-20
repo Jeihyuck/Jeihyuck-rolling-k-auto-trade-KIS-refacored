@@ -58,6 +58,13 @@ def _seed_current_source_schema(engine: sa.Engine) -> None:
         conn.exec_driver_sql("CREATE SCHEMA public")
     schema_for_engine(engine).metadata.create_all(engine)
     with engine.begin() as conn:
+        # 0025 is a one-way TEXT -> JSONB migration, not an idempotent repair.
+        # Restore its documented input type in this empty fixture so the real
+        # migration runs, rather than skipping/stamping it as already applied.
+        conn.exec_driver_sql("ALTER TABLE ledger_events ALTER COLUMN payload_json DROP DEFAULT")
+        conn.exec_driver_sql(
+            "ALTER TABLE ledger_events ALTER COLUMN payload_json TYPE TEXT USING payload_json::text"
+        )
         conn.exec_driver_sql(
             "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, "
             "applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
