@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from uuid import uuid4
 
@@ -9,7 +10,6 @@ import sqlalchemy as sa
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
-from trader.db.migrate import run_migrations
 from trader.db.practice_database_generation import (
     CRITICAL_STATE_TABLES,
     REQUIRED_CONTRACT_COLUMNS,
@@ -42,11 +42,50 @@ def _drop_database(source_url: str, database_name: str) -> None:
 
 
 def _seed_current_source_schema(engine: sa.Engine) -> None:
-    """Build the actual latest schema by executing every repository migration."""
+    """Build the actual latest schema by executing every SQL migration in PostgreSQL."""
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
         conn.exec_driver_sql("CREATE SCHEMA public")
-    run_migrations(engine, migrations_dir="migrations")
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+    parsed = make_url(str(engine.url))
+    cli_url = parsed.set(drivername="postgresql").render_as_string(hide_password=False)
+    for migration in sorted(Path("migrations").glob("*.sql")):
+        proc = subprocess.run(
+            [
+                "psql",
+                "--no-psqlrc",
+                "--set",
+                "ON_ERROR_STOP=1",
+                "--file",
+                str(migration),
+                cli_url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, (
+            f"migration failed: {migration.name}\n"
+            f"stdout={proc.stdout[-4000:]}\n"
+            f"stderr={proc.stderr[-4000:]}"
+        )
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO schema_migrations(version) VALUES (:version) "
+                    "ON CONFLICT (version) DO NOTHING"
+                ),
+                {"version": migration.name},
+            )
 
     with engine.begin() as conn:
         conn.exec_driver_sql(
