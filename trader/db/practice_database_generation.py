@@ -17,6 +17,15 @@ from trader.db.migrate import _apply_pg_statement, _preflight_version, _strip_sq
 
 _DATABASE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
 
+FRESH_BOOTSTRAP_SUPERSEDED_MIGRATIONS = {
+    # This historical migration tried to convert every public run_id column to
+    # UUID and re-point every run_id FK to runs(run_id). That is incompatible
+    # with universe_* ownership and with the current application TEXT ID
+    # contract. Existing production databases keep their historical stamp;
+    # physically fresh DBs preserve the canonical TEXT schema instead.
+    "0019_run_id_uuid_migration.sql",
+}
+
 CRITICAL_STATE_TABLES = (
     "orders",
     "fills",
@@ -265,6 +274,16 @@ def run_fresh_database_migrations(
                     raise PracticeDatabaseGenerationError(
                         f"FRESH_TARGET_MIGRATION_ALREADY_STAMPED:{version}"
                     )
+                if version in FRESH_BOOTSTRAP_SUPERSEDED_MIGRATIONS:
+                    # Stamp only: the current schema contract deliberately
+                    # supersedes this historical transition.
+                    conn.execute(
+                        text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                        {"version": version},
+                    )
+                    applied.append(version)
+                    continue
+
                 _preflight_version(conn, version)
                 for statement in statements:
                     if _is_outer_transaction_control(statement):
@@ -280,6 +299,39 @@ def run_fresh_database_migrations(
                 f"FRESH_DATABASE_MIGRATION_FAILED:{version}:{type(exc).__name__}:{exc}"
             ) from exc
     return applied
+
+
+def _assert_current_id_contract(target_engine: sa.Engine) -> None:
+    """Fresh DB must match the current application's TEXT-backed identity model."""
+    expected_text_columns = (
+        ("runs", "run_id"),
+        ("universe_runs", "run_id"),
+        ("universe_members", "run_id"),
+        ("universe_current", "run_id"),
+        ("orders", "run_id"),
+        ("fills", "run_id"),
+        ("ledger_events", "run_id"),
+    )
+    query = text(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=:table_name AND column_name=:column_name
+        """
+    )
+    mismatches: list[str] = []
+    with target_engine.connect() as conn:
+        for table_name, column_name in expected_text_columns:
+            data_type = conn.execute(
+                query,
+                {"table_name": table_name, "column_name": column_name},
+            ).scalar()
+            if str(data_type or "").lower() != "text":
+                mismatches.append(f"{table_name}.{column_name}={data_type}")
+    if mismatches:
+        raise PracticeDatabaseGenerationError(
+            "TARGET_DATABASE_ID_CONTRACT_MISMATCH:" + ",".join(mismatches)
+        )
 
 
 def _assert_target_state_empty(target_engine: sa.Engine) -> dict[str, int | None]:
@@ -336,6 +388,7 @@ def prepare_new_practice_database(
         new_engine = _engine_for_url(resolved_target_url)
         _assert_target_fresh_before_migration(new_engine)
         target_versions = run_fresh_database_migrations(new_engine, migrations_dir=migrations_dir)
+        _assert_current_id_contract(new_engine)
         target_counts = _assert_target_state_empty(new_engine)
 
         source_after = source_archive_snapshot(source_engine)
@@ -396,6 +449,7 @@ def verify_fresh_target_database(
             raise PracticeDatabaseGenerationError(
                 f"TARGET_MIGRATION_SET_MISMATCH missing={missing} extra={extra}"
             )
+        _assert_current_id_contract(target_engine)
         counts = _assert_target_state_empty(target_engine)
         return {
             "status": "CUTOVER_DB_READY",
