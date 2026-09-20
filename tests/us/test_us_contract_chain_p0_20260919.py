@@ -406,6 +406,53 @@ def test_us_continuous_postgres_prep_to_sell_uses_one_original_contract(monkeypa
         assert sells[0]["meta"]["source_entry_contract_sha256"] == original_sha
         assert sells[0]["source_entry_reason"] == "ENTRY_PULLBACK"
         assert sells[0]["meta"]["hard_stop_threshold_pct"] == pytest.approx(0.08)
+
+        # 8) Logical KIS reset: old US position history remains, but a new
+        # ACTIVE trading epoch must not see it. Same-day/same-symbol snapshots
+        # are allowed because position uniqueness is epoch-scoped.
+        with engine.begin() as conn:
+            active = conn.execute(text(
+                "SELECT trading_epoch_id, account_id FROM trading_epochs WHERE status='ACTIVE'"
+            )).mappings().one()
+            old_epoch = str(active["trading_epoch_id"])
+            account_id = str(active["account_id"])
+            conn.execute(text(
+                "UPDATE trading_epochs SET status='ENDED', ended_at=NOW() WHERE trading_epoch_id=:epoch"
+            ), {"epoch": old_epoch})
+            conn.execute(text("""
+                INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status,reason)
+                VALUES('POST_RESET_EPOCH','practice',:account,'ACTIVE','TEST_KIS_RESET')
+            """), {"account": account_id})
+
+        assert repos.load_us_positions_by_symbols(
+            ["AAPL"], as_of="2026-09-18"
+        ) == {}
+
+        assert repos.save_position_snapshot(
+            [{
+                "symbol": "AAPL", "exchange": "NASDAQ", "qty": 1,
+                "orderable_qty": 1, "avg_price_usd": 120.0,
+                "current_price_usd": 120.0,
+                "balance_source": "kis_balance_authoritative",
+                "meta": {"balance_source": "kis_balance_authoritative"},
+            }],
+            trade_date="2026-09-18",
+            balance_fetch_status="OK",
+            balance_parse_status="OK",
+            authoritative_positions=True,
+            preserve_previous_positions=False,
+        ) == 1
+        current = repos.load_us_positions_by_symbols(["AAPL"], as_of="2026-09-18")
+        assert current["AAPL"]["qty"] == 1
+        assert current["AAPL"]["trading_epoch_id"] == "POST_RESET_EPOCH"
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT trading_epoch_id, qty FROM us_positions
+                WHERE symbol='AAPL' AND as_of='2026-09-18'
+                ORDER BY trading_epoch_id
+            """)).mappings().all()
+        assert len(rows) == 2
+        assert {str(row["trading_epoch_id"]) for row in rows} == {old_epoch, "POST_RESET_EPOCH"}
     finally:
         engine.dispose()
         cleanup = create_engine(admin_url, future=True)
