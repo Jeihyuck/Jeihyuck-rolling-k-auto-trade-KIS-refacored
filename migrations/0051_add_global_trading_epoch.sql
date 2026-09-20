@@ -21,21 +21,12 @@ INSERT INTO trading_epochs(trading_epoch_id, env, account_id, status, reason, en
 VALUES ('LEGACY_PRE_EPOCH', 'legacy', 'legacy', 'ENDED', 'PRE_GLOBAL_EPOCH_HISTORY', NOW())
 ON CONFLICT (trading_epoch_id) DO NOTHING;
 
-ALTER TABLE portfolio_epochs ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-ALTER TABLE orders ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-ALTER TABLE fills ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-ALTER TABLE positions ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-
-UPDATE portfolio_epochs SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE orders SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE fills SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-
-CREATE INDEX IF NOT EXISTS ix_portfolio_epochs_trading_epoch ON portfolio_epochs(trading_epoch_id, status);
-CREATE INDEX IF NOT EXISTS ix_orders_trading_epoch ON orders(trading_epoch_id, env, created_at);
-CREATE INDEX IF NOT EXISTS ix_fills_trading_epoch ON fills(trading_epoch_id, env, filled_at);
-CREATE INDEX IF NOT EXISTS ix_positions_trading_epoch ON positions(trading_epoch_id, env, status, code);
-
+-- Columns are additive. Every UPDATE/index below is guarded because isolated
+-- KR-only / US-only integration schemas intentionally omit the other market.
+ALTER TABLE IF EXISTS portfolio_epochs ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
+ALTER TABLE IF EXISTS orders ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
+ALTER TABLE IF EXISTS fills ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
+ALTER TABLE IF EXISTS positions ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
 ALTER TABLE IF EXISTS us_order_intents ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
 ALTER TABLE IF EXISTS us_orders ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
 ALTER TABLE IF EXISTS us_fills ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
@@ -43,39 +34,86 @@ ALTER TABLE IF EXISTS us_positions ADD COLUMN IF NOT EXISTS trading_epoch_id TEX
 ALTER TABLE IF EXISTS us_reconcile_logs ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
 ALTER TABLE IF EXISTS us_position_risk_state ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
 ALTER TABLE IF EXISTS us_profit_capture_lifecycle ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-
-UPDATE us_order_intents SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE us_orders SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE us_fills SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE us_positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE us_reconcile_logs SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE us_position_risk_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-UPDATE us_profit_capture_lifecycle SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-
-CREATE INDEX IF NOT EXISTS ix_us_order_intents_trading_epoch ON us_order_intents(trading_epoch_id, trade_date);
-CREATE INDEX IF NOT EXISTS ix_us_orders_trading_epoch ON us_orders(trading_epoch_id, trade_date);
-CREATE INDEX IF NOT EXISTS ix_us_fills_trading_epoch ON us_fills(trading_epoch_id, trade_date);
-CREATE INDEX IF NOT EXISTS ix_us_positions_trading_epoch ON us_positions(trading_epoch_id, as_of);
-
 ALTER TABLE IF EXISTS us_tqqq_infinite_state ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-UPDATE us_tqqq_infinite_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-ALTER TABLE IF EXISTS us_tqqq_infinite_state ALTER COLUMN trading_epoch_id SET NOT NULL;
-ALTER TABLE IF EXISTS us_tqqq_infinite_state DROP CONSTRAINT IF EXISTS us_tqqq_infinite_state_pkey;
-ALTER TABLE IF EXISTS us_tqqq_infinite_state
-    ADD CONSTRAINT us_tqqq_infinite_state_pkey PRIMARY KEY(trading_epoch_id, strategy_id, symbol);
-
 ALTER TABLE IF EXISTS kr_infinite_state ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-UPDATE kr_infinite_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-ALTER TABLE IF EXISTS kr_infinite_state ALTER COLUMN trading_epoch_id SET NOT NULL;
-ALTER TABLE IF EXISTS kr_infinite_state DROP CONSTRAINT IF EXISTS kr_infinite_state_pkey;
-ALTER TABLE IF EXISTS kr_infinite_state
-    ADD CONSTRAINT kr_infinite_state_pkey PRIMARY KEY(trading_epoch_id, strategy_id, symbol);
-
 ALTER TABLE IF EXISTS kr_infinite_order_intents ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT;
-UPDATE kr_infinite_order_intents SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
-CREATE INDEX IF NOT EXISTS ix_kr_inf_intent_trading_epoch
-    ON kr_infinite_order_intents(trading_epoch_id, trade_date, status);
+
+DO $$
+BEGIN
+    IF to_regclass('public.portfolio_epochs') IS NOT NULL THEN
+        UPDATE portfolio_epochs SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_portfolio_epochs_trading_epoch ON portfolio_epochs(trading_epoch_id, status);
+    END IF;
+    IF to_regclass('public.orders') IS NOT NULL THEN
+        UPDATE orders SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_orders_trading_epoch ON orders(trading_epoch_id, env, created_at);
+    END IF;
+    IF to_regclass('public.fills') IS NOT NULL THEN
+        UPDATE fills SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_fills_trading_epoch ON fills(trading_epoch_id, env, filled_at);
+    END IF;
+    IF to_regclass('public.positions') IS NOT NULL THEN
+        UPDATE positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_positions_trading_epoch ON positions(trading_epoch_id, env, status, code);
+    END IF;
+
+    IF to_regclass('public.us_order_intents') IS NOT NULL THEN
+        UPDATE us_order_intents SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_us_order_intents_trading_epoch ON us_order_intents(trading_epoch_id, trade_date);
+    END IF;
+    IF to_regclass('public.us_orders') IS NOT NULL THEN
+        UPDATE us_orders SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_us_orders_trading_epoch ON us_orders(trading_epoch_id, trade_date);
+    END IF;
+    IF to_regclass('public.us_fills') IS NOT NULL THEN
+        UPDATE us_fills SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_us_fills_trading_epoch ON us_fills(trading_epoch_id, trade_date);
+    END IF;
+    IF to_regclass('public.us_positions') IS NOT NULL THEN
+        UPDATE us_positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_us_positions_trading_epoch ON us_positions(trading_epoch_id, as_of);
+    END IF;
+    IF to_regclass('public.us_reconcile_logs') IS NOT NULL THEN
+        UPDATE us_reconcile_logs SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+    END IF;
+    IF to_regclass('public.us_position_risk_state') IS NOT NULL THEN
+        UPDATE us_position_risk_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+    END IF;
+    IF to_regclass('public.us_profit_capture_lifecycle') IS NOT NULL THEN
+        UPDATE us_profit_capture_lifecycle SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+    END IF;
+
+    IF to_regclass('public.us_tqqq_infinite_state') IS NOT NULL THEN
+        UPDATE us_tqqq_infinite_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        ALTER TABLE us_tqqq_infinite_state ALTER COLUMN trading_epoch_id SET NOT NULL;
+        ALTER TABLE us_tqqq_infinite_state DROP CONSTRAINT IF EXISTS us_tqqq_infinite_state_pkey;
+        ALTER TABLE us_tqqq_infinite_state
+            ADD CONSTRAINT us_tqqq_infinite_state_pkey PRIMARY KEY(trading_epoch_id, strategy_id, symbol);
+    END IF;
+
+    IF to_regclass('public.kr_infinite_state') IS NOT NULL THEN
+        UPDATE kr_infinite_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        ALTER TABLE kr_infinite_state ALTER COLUMN trading_epoch_id SET NOT NULL;
+        ALTER TABLE kr_infinite_state DROP CONSTRAINT IF EXISTS kr_infinite_state_pkey;
+        ALTER TABLE kr_infinite_state
+            ADD CONSTRAINT kr_infinite_state_pkey PRIMARY KEY(trading_epoch_id, strategy_id, symbol);
+    END IF;
+
+    IF to_regclass('public.kr_infinite_order_intents') IS NOT NULL THEN
+        UPDATE kr_infinite_order_intents SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        CREATE INDEX IF NOT EXISTS ix_kr_inf_intent_trading_epoch
+            ON kr_infinite_order_intents(trading_epoch_id, trade_date, status);
+    END IF;
+END $$;
 
 COMMENT ON TABLE trading_epochs IS 'Account-wide logical trading run boundary shared by KR and US';
-COMMENT ON COLUMN orders.trading_epoch_id IS 'Global KR/US trading epoch identity';
-COMMENT ON COLUMN us_orders.trading_epoch_id IS 'Global KR/US trading epoch identity';
+
+DO $$
+BEGIN
+    IF to_regclass('public.orders') IS NOT NULL THEN
+        COMMENT ON COLUMN orders.trading_epoch_id IS 'Global KR/US trading epoch identity';
+    END IF;
+    IF to_regclass('public.us_orders') IS NOT NULL THEN
+        COMMENT ON COLUMN us_orders.trading_epoch_id IS 'Global KR/US trading epoch identity';
+    END IF;
+END $$;
