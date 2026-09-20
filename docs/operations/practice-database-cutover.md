@@ -26,6 +26,12 @@ arranged separately if recovery from loss of the source database is required.
 US balance parsing alone is insufficient. Approval requires complete and
 authoritative balance flags, no failed exchanges, coverage and result counts for
 NASD/NYSE/AMEX, valid holdings quantities, no holdings and no pending orders.
+Each US exchange balance must also finish pagination; a repeated continuation
+cursor or the page limit fails that exchange and therefore makes the aggregate
+balance non-authoritative. US same-day order/fill history likewise follows
+`tr_cont` and CTX_AREA_NK200/FK200 through completion. A missing response
+header with a non-empty cursor is treated as continuation, while unknown status,
+stalled cursor, malformed evidence or page-limit exhaustion blocks cutover.
 
 KR orders are fetched through the final page, forwarding the continuation
 cursors and `tr_cont=N`. Continuation errors, repeated cursors, invalid payloads
