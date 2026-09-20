@@ -625,6 +625,7 @@ class KisUSClient:
         output2: Any = None
         ctx_fk = ""
         ctx_nk = ""
+        pagination_complete = False
         
         for page in range(1, max_pages + 1):
             params = {
@@ -668,6 +669,7 @@ class KisUSClient:
             next_nk = str(next_nk_raw).strip()
 
             if not next_fk and not next_nk:
+                pagination_complete = True
                 logger.info(
                     "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=empty_cursor rows=%d",
                     exchange_code,
@@ -677,13 +679,15 @@ class KisUSClient:
                 break
 
             if next_fk == ctx_fk and next_nk == ctx_nk:
-                logger.warning(
-                    "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=same_cursor rows=%d",
+                logger.error(
+                    "[US_BALANCE][EXCHANGE][PAGINATION_STALLED] exchange=%s page=%d rows=%d",
                     exchange_code,
                     page,
                     len(page_output1),
                 )
-                break
+                raise KisUSTemporaryError(
+                    f"balance pagination stalled exchange={exchange_code} page={page}"
+                )
 
             ctx_fk = next_fk
             ctx_nk = next_nk
@@ -695,6 +699,17 @@ class KisUSClient:
                 len(page_output1),
                 bool(next_fk),
                 bool(next_nk),
+            )
+
+        if not pagination_complete:
+            logger.error(
+                "[US_BALANCE][EXCHANGE][PAGINATION_INCOMPLETE] exchange=%s max_pages=%d rows=%d",
+                exchange_code,
+                max_pages,
+                len(all_output1),
+            )
+            raise KisUSTemporaryError(
+                f"balance pagination incomplete exchange={exchange_code} max_pages={max_pages}"
             )
         
         result_payload = {
