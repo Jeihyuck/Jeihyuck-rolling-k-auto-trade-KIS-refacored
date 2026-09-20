@@ -1439,6 +1439,12 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_fills count=%d", len(invalid))
         return 0
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
+    for f in fills:
+        f["trading_epoch_id"] = trading_epoch_id
+        meta = dict(f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}
+        meta["trading_epoch_id"] = trading_epoch_id
+        f["meta"] = meta
     atomic_count = 0
     if engine is not None:
         # KIS order-level cumulative snapshots are the accounting source of truth.
@@ -1581,15 +1587,16 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                     text("""
                         INSERT INTO us_fills
                             (trade_date, symbol, exchange, side, qty, price_usd,
-                             order_no, client_order_key, filled_at, meta, fill_idempotency_key)
+                             order_no, client_order_key, filled_at, trading_epoch_id, meta, fill_idempotency_key)
                         VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
-                                :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
+                                :order_no, :cok, :filled_at, :trading_epoch_id, CAST(:meta AS jsonb), :fill_idempotency_key)
                         ON CONFLICT (fill_idempotency_key)
                         DO UPDATE SET
                             qty = EXCLUDED.qty,
                             price_usd = EXCLUDED.price_usd,
                             filled_at = COALESCE(EXCLUDED.filled_at, us_fills.filled_at),
                             client_order_key = EXCLUDED.client_order_key,
+                            trading_epoch_id = us_fills.trading_epoch_id,
                             meta = us_fills.meta || EXCLUDED.meta
                         WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
                               > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
@@ -1604,6 +1611,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         "order_no": f.get("order_no", ""),
                         "cok": f.get("client_order_key", ""),
                         "filled_at": f.get("filled_at"),
+                        "trading_epoch_id": trading_epoch_id,
                         "meta": _json_param(f.get("meta")),
                         "fill_idempotency_key": idem,
                     },
@@ -1852,6 +1860,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
     """
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     # An empty authoritative balance is the *only* empty-symbol case that may
     # close every existing position.  A non-empty payload without usable
     # symbols is malformed and must never be interpreted as "no positions".
@@ -1919,7 +1928,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
             p["meta"] = meta
             _MEM_POSITIONS.append({
-                **p, "as_of": td,
+                **p, "as_of": td, "trading_epoch_id": trading_epoch_id,
                 "avg_cost": p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd", 0),
                 "current_px": p.get("current_px") or p.get("current_price") or p.get("current_price_usd", 0),
                 "meta": meta,
@@ -1945,6 +1954,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     )
                 meta.update(policy)
                 meta.update({
+                    "trading_epoch_id": trading_epoch_id,
                     "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                     "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
                     "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
@@ -1966,14 +1976,15 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     text("""
                         INSERT INTO us_positions
                             (as_of, symbol, exchange, qty, avg_cost, current_px,
-                             unrealized_pnl_usd, meta)
+                             unrealized_pnl_usd, trading_epoch_id, meta)
                         VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
-                                :unrealized_pnl_usd, CAST(:meta AS jsonb))
+                                :unrealized_pnl_usd, :trading_epoch_id, CAST(:meta AS jsonb))
                         ON CONFLICT (as_of, symbol, exchange) DO UPDATE
                             SET qty               =EXCLUDED.qty,
                                 avg_cost          =EXCLUDED.avg_cost,
                                 current_px        =EXCLUDED.current_px,
                                 unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                                trading_epoch_id = us_positions.trading_epoch_id,
                                 meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
                     """),
                     {
@@ -1984,6 +1995,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         "avg_cost": avg_cost,
                         "current_px": current_px,
                         "unrealized_pnl_usd": float(p.get("unrealized_pnl_usd", 0)),
+                        "trading_epoch_id": trading_epoch_id,
                         "meta": _json_param(meta),
                     },
                 )
@@ -1995,9 +2007,9 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                           meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
                             'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
                             'closed_at',NOW()::text,'close_source',CAST(:source AS text))
-                        WHERE as_of=:td AND qty>0
+                        WHERE as_of=:td AND trading_epoch_id=:epoch AND qty>0
                           AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))
-                    """), {"td": td, "symbols": symbols, "source": close_source},
+                    """), {"td": td, "epoch": trading_epoch_id, "symbols": symbols, "source": close_source},
                 )
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
@@ -2011,16 +2023,18 @@ def load_positions(as_of: str | None = None) -> list[dict]:
     """open 포지션(qty>0) 반환. meta의 orderable_qty/sellable_qty를 top-level로 promote."""
     td = as_of or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
         rows = [p for p in _MEM_POSITIONS
                 if (p.get("as_of") == td or p.get("trade_date") == td)
+                and p.get("trading_epoch_id") == trading_epoch_id
                 and int(p.get("qty", 0)) > 0]
     else:
         try:
             with engine.begin() as conn:
                 raw = conn.execute(
-                    text("SELECT * FROM us_positions WHERE as_of=:td AND qty>0"),
-                    {"td": td},
+                    text("SELECT * FROM us_positions WHERE as_of=:td AND trading_epoch_id=:epoch AND qty>0"),
+                    {"td": td, "epoch": trading_epoch_id},
                 )
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
@@ -2220,10 +2234,13 @@ def load_us_order_for_fill(
     on_norm = normalize_us_order_no(on)
     cok = str(client_order_key or "")
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
         matches = []
         for o in _MEM_ORDERS:
             if str(o.get("trade_date") or td) != td:
+                continue
+            if str(o.get("trading_epoch_id") or "") != trading_epoch_id:
                 continue
             if sym and str(o.get("symbol") or "").upper() != sym:
                 continue
@@ -2242,24 +2259,24 @@ def load_us_order_for_fill(
             # migration/index requirement.
             row = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status, trading_epoch_id, meta
                 FROM us_orders
-                WHERE trade_date = :td AND symbol = :symbol
+                WHERE trade_date = :td AND symbol = :symbol AND trading_epoch_id=:epoch
                   AND ((:order_no <> '' AND order_no = :order_no)
                        OR (:cok <> '' AND client_order_key = :cok))
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
                 LIMIT 1
-            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok}).mappings().first()
+            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok, "epoch": trading_epoch_id}).mappings().first()
             if row:
                 return dict(row)
             if not on_norm:
                 return {}
             candidates = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
-                FROM us_orders WHERE trade_date=:td AND symbol=:symbol
+                       qty_requested, qty_filled, avg_price_usd, order_no, status, trading_epoch_id, meta
+                FROM us_orders WHERE trade_date=:td AND symbol=:symbol AND trading_epoch_id=:epoch
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-            """), {"td": td, "symbol": sym}).mappings().all()
+            """), {"td": td, "symbol": sym, "epoch": trading_epoch_id}).mappings().all()
             for candidate in candidates:
                 candidate_dict = dict(candidate)
                 meta = _parse_json_meta(candidate_dict.get("meta"))
@@ -2665,12 +2682,14 @@ def load_us_positions_by_symbols(
         return {}
     td = as_of or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
 
     rows: list[dict] = []
     if engine is None:
         rows = [
             p for p in _MEM_POSITIONS
             if p.get("symbol") in symbols
+            and p.get("trading_epoch_id") == trading_epoch_id
             and (p.get("as_of") == td or p.get("trade_date") == td)
             and int(p.get("qty", 0)) > 0
         ]
@@ -2684,10 +2703,11 @@ def load_us_positions_by_symbols(
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                           AND as_of <= :td
+                          AND trading_epoch_id = :epoch
                           AND qty > 0
                         ORDER BY symbol, as_of DESC
                     """),
-                    {"syms": list(symbols), "td": td},
+                    {"syms": list(symbols), "td": td, "epoch": trading_epoch_id},
                 )
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
