@@ -65,7 +65,11 @@ jobs:
           python -m py_compile scripts/verify_new_practice_database_cutover.py
 
       - name: Verify broker cutover rejection paths without network
-        run: python -m pytest tests/test_practice_database_cutover.py -q
+        run: >-
+          python -m pytest
+          tests/test_practice_database_cutover.py
+          tests/us/test_us_balance_pagination_and_dedupe.py
+          -q
 
       - name: Prove current trading schema clone and missing-schema rejection
         run: |
