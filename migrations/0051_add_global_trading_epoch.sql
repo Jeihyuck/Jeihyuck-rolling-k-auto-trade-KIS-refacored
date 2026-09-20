@@ -78,6 +78,10 @@ BEGIN
     END IF;
     IF to_regclass('public.us_position_risk_state') IS NOT NULL THEN
         UPDATE us_position_risk_state SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        ALTER TABLE us_position_risk_state ALTER COLUMN trading_epoch_id SET NOT NULL;
+        ALTER TABLE us_position_risk_state DROP CONSTRAINT IF EXISTS us_position_risk_state_pkey;
+        ALTER TABLE us_position_risk_state
+            ADD CONSTRAINT us_position_risk_state_pkey PRIMARY KEY(trading_epoch_id, trade_date, symbol);
     END IF;
     IF to_regclass('public.us_profit_capture_lifecycle') IS NOT NULL THEN
         UPDATE us_profit_capture_lifecycle SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
