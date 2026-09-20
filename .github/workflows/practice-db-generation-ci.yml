@@ -69,6 +69,7 @@ jobs:
           python -m pytest
           tests/test_practice_database_cutover.py
           tests/us/test_us_balance_pagination_and_dedupe.py
+          tests/us/test_us_fills_contract.py
           -q
 
       - name: Prove current trading schema clone and missing-schema rejection
