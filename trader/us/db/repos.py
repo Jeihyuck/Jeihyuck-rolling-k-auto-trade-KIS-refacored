@@ -2075,18 +2075,22 @@ def load_positions(as_of: str | None = None) -> list[dict]:
 def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
         fully_sold_keys = {o.get("client_order_key") for o in _MEM_ORDERS
-                           if o.get("trade_date") == td and o.get("side") == "SELL" and o.get("status") == "FILLED"}
-        return {f["symbol"] for f in _MEM_FILLS if f.get("trade_date") == td and f.get("side") == "SELL"
+                           if o.get("trade_date") == td and o.get("trading_epoch_id") == trading_epoch_id
+                           and o.get("side") == "SELL" and o.get("status") == "FILLED"}
+        return {f["symbol"] for f in _MEM_FILLS if f.get("trade_date") == td
+                and f.get("trading_epoch_id") == trading_epoch_id and f.get("side") == "SELL"
                 and (not f.get("client_order_key") or f.get("client_order_key") in fully_sold_keys)}
     try:
         with engine.begin() as conn:
             rows = conn.execute(
                 text("""SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
                     ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
-                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""),
-                {"td": td},
+                    WHERE f.trade_date=:td AND f.trading_epoch_id=:epoch
+                      AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""),
+                {"td": td, "epoch": trading_epoch_id},
             )
             return {r[0] for r in rows}
     except Exception as exc:
@@ -2097,14 +2101,16 @@ def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
 def load_today_order_keys(trade_date: str | None = None) -> set[str]:
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
         return {o["client_order_key"] for o in _MEM_ORDERS
-                if o.get("trade_date") == td and o.get("client_order_key")}
+                if o.get("trade_date") == td and o.get("trading_epoch_id") == trading_epoch_id
+                and o.get("client_order_key")}
     try:
         with engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td"),
-                {"td": td},
+                text("SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td AND trading_epoch_id=:epoch"),
+                {"td": td, "epoch": trading_epoch_id},
             )
             return {r[0] for r in rows}
     except Exception as exc:
@@ -2119,10 +2125,12 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
     """
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine, env)
     if engine is None:
         return [
             o for o in _MEM_ORDERS
             if o.get("trade_date") == td
+            and o.get("trading_epoch_id") == trading_epoch_id
             and o.get("status") in ("ACK", "SENT", "PARTIALLY_FILLED")
             and int(o.get("qty_filled", 0) or 0) < int(o.get("qty_requested", 0) or 0)
         ]
@@ -2133,11 +2141,12 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
                     SELECT *
                     FROM us_orders
                     WHERE trade_date = :td
+                      AND trading_epoch_id = :epoch
                       AND status IN ('ACK', 'SENT', 'PARTIALLY_FILLED')
                       AND COALESCE(qty_filled, 0) < qty_requested
                     ORDER BY created_at ASC
                 """),
-                {"td": td},
+                {"td": td, "epoch": trading_epoch_id},
             )
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
@@ -2744,9 +2753,11 @@ def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> li
     """
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
         return [o for o in _MEM_ORDERS
                 if o.get("symbol") == symbol and o.get("trade_date") == td
+                and o.get("trading_epoch_id") == trading_epoch_id
                 and o.get("status") in ("ACK", "SENT", "PARTIALLY_FILLED")
                 and not o.get("dry_run", False)]
     try:
@@ -2754,11 +2765,11 @@ def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> li
             rows = conn.execute(
                 text("""
                     SELECT * FROM us_orders
-                    WHERE symbol=:symbol AND trade_date=:td
+                    WHERE symbol=:symbol AND trade_date=:td AND trading_epoch_id=:epoch
                       AND status IN ('ACK','SENT','PARTIALLY_FILLED')
                       AND dry_run = FALSE
                 """),
-                {"symbol": symbol, "td": td},
+                {"symbol": symbol, "td": td, "epoch": trading_epoch_id},
             )
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
@@ -4275,6 +4286,7 @@ def load_today_committed_buy_notional_result(trade_date: str, env: str = "practi
     if engine is None:
         return CommittedBuyNotionalResult(False, 0.0, 0, "orders_db_engine_unavailable")
     from sqlalchemy import text
+    trading_epoch_id = _current_trading_epoch_id(engine, env)
     query = """
         SELECT o.*, i.notional_usd AS intent_notional_usd,
                i.limit_price_usd AS intent_limit_price_usd,
@@ -4282,11 +4294,13 @@ def load_today_committed_buy_notional_result(trade_date: str, env: str = "practi
         FROM us_orders o
         LEFT JOIN us_order_intents i
           ON i.client_order_key = o.client_order_key
+         AND i.trading_epoch_id = o.trading_epoch_id
         WHERE o.trade_date = :td
+          AND o.trading_epoch_id = :epoch
     """
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(query), {"td": trade_date})
+            result = conn.execute(text(query), {"td": trade_date, "epoch": trading_epoch_id})
             rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
     except Exception as exc:
         return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
