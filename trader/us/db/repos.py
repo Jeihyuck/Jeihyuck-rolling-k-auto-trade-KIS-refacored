@@ -298,6 +298,25 @@ def _get_engine_or_none():
         return None
 
 
+_MEM_TRADING_EPOCH_ID = "MEMORY_ACTIVE_EPOCH"
+
+
+def _resolve_us_env(value: str | None = None) -> str:
+    return str(value or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "practice").strip().lower()
+
+
+def _current_trading_epoch_id(engine=None, env: str | None = None) -> str:
+    if engine is None:
+        return _MEM_TRADING_EPOCH_ID
+    from trader.trading_epoch import get_active_trading_epoch_id
+    return get_active_trading_epoch_id(
+        engine,
+        env=_resolve_us_env(env),
+        create_if_missing=True,
+        reason="AUTO_INITIAL_US_TRADING_EPOCH",
+    )
+
+
 def _json_param(val: Any) -> str:
     """JSONB 파라미터를 JSON 문자열로 직렬화."""
     return json.dumps(val or {}, ensure_ascii=False, default=str)
@@ -315,6 +334,10 @@ def save_us_watchlist(entries: list[dict], trade_date: str | None = None) -> int
     """us_watchlist 저장. schema: trade_date, symbol, exchange, strategy, score, meta"""
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine, intent.get("env"))
+    intent_meta["trading_epoch_id"] = trading_epoch_id
+    intent["trading_epoch_id"] = trading_epoch_id
+    intent["meta"] = intent_meta
     if engine is None:
         for e in entries:
             _MEM_WATCHLIST.append({**e, "trade_date": td})
@@ -393,10 +416,10 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                 text("""
                     INSERT INTO us_order_intents
                         (trade_date, client_order_key, symbol, exchange, side, qty,
-                         limit_price_usd, notional_usd, strategy, status, meta)
+                         limit_price_usd, notional_usd, strategy, status, trading_epoch_id, meta)
                     VALUES (:td, :cok, :symbol, :exchange, :side, :qty,
                             :limit_price_usd, :notional_usd, :strategy, :status,
-                            CAST(:meta AS jsonb))
+                            :trading_epoch_id, CAST(:meta AS jsonb))
                     ON CONFLICT (client_order_key) DO NOTHING
                 """),
                 {
@@ -410,12 +433,14 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "notional_usd": intent.get("notional_usd"),
                     "strategy": intent.get("strategy", "us_pb1"),
                     "status": "PENDING",
+                    "trading_epoch_id": trading_epoch_id,
                     "meta": _json_param({
                         **intent_meta,
                         **{field: intent.get(field) for field in (
                             "strategy_owner", "strategy_name", "strategy_version", "sleeve_id"
                         ) if intent.get(field) is not None},
                         "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
+                        "trading_epoch_id": trading_epoch_id,
                     }),
                 },
             )
@@ -440,13 +465,15 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
 def load_open_order_intents(trade_date: str | None = None) -> list[dict]:
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    epoch_id = _current_trading_epoch_id(engine)
     if engine is None:
-        return [i for i in _MEM_INTENTS if i.get("trade_date") == td and i.get("status") == "PENDING"]
+        return [i for i in _MEM_INTENTS if i.get("trade_date") == td and i.get("status") == "PENDING"
+                and i.get("trading_epoch_id") == epoch_id]
     try:
         with engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT * FROM us_order_intents WHERE trade_date=:td AND status='PENDING'"),
-                {"td": td},
+                text("SELECT * FROM us_order_intents WHERE trade_date=:td AND status='PENDING' AND trading_epoch_id=:epoch"),
+                {"td": td, "epoch": epoch_id},
             )
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
@@ -537,7 +564,10 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
     require_identity(row.get("client_order_key"))
     existing = conn.execute(text("SELECT * FROM us_orders WHERE client_order_key=:cok FOR UPDATE"), {"cok": row["client_order_key"]}).fetchone()
     if existing:
-        assert_same_identity(dict(existing._mapping), {**row, "trade_date": td})
+        existing_dict = dict(existing._mapping)
+        if str(existing_dict.get("trading_epoch_id") or "") != str(row.get("trading_epoch_id") or ""):
+            raise ValueError("US_ORDER_TRADING_EPOCH_MISMATCH")
+        assert_same_identity(existing_dict, {**row, "trade_date": td})
     order_no = str(row.get("order_no") or "").strip()
     if order_no:
         broker_existing = conn.execute(text("SELECT * FROM us_orders WHERE trade_date=:td AND order_no=:ono FOR UPDATE"), {"td": td, "ono": order_no}).fetchone()
@@ -548,10 +578,10 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
             INSERT INTO us_orders
                 (trade_date, client_order_key, symbol, exchange, side,
                  qty_requested, qty_filled, avg_price_usd, order_no,
-                 status, dry_run, committed_notional_usd, env, meta)
+                 status, dry_run, committed_notional_usd, env, trading_epoch_id, meta)
             VALUES (:td, :cok, :symbol, :exchange, :side,
                     :qty_requested, :qty_filled, :avg_price_usd, :order_no,
-                    :status, :dry_run, :committed_notional_usd, :env, CAST(:meta AS jsonb))
+                    :status, :dry_run, :committed_notional_usd, :env, :trading_epoch_id, CAST(:meta AS jsonb))
             ON CONFLICT (client_order_key) DO UPDATE
                 SET qty_filled    =GREATEST(us_orders.qty_filled, EXCLUDED.qty_filled),
                     avg_price_usd =EXCLUDED.avg_price_usd,
@@ -564,6 +594,7 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     dry_run       =EXCLUDED.dry_run,
                     committed_notional_usd=COALESCE(us_orders.committed_notional_usd, EXCLUDED.committed_notional_usd),
                     env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
+                    trading_epoch_id=us_orders.trading_epoch_id,
                     meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
                     updated_at    =NOW()
         """),
@@ -581,6 +612,7 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
             "dry_run": bool(row.get("dry_run", False)),
             "committed_notional_usd": row.get("committed_notional_usd"),
             "env": row.get("env"),
+            "trading_epoch_id": row.get("trading_epoch_id"),
             "meta": _json_param(row.get("meta")),
         },
     )
@@ -661,6 +693,9 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
             logger.error("[US_ORDER_ACK][TP_META_INVALID] missing=%s", missing)
             return False
     engine = _get_engine_or_none()
+    trading_epoch_id = _current_trading_epoch_id(engine, order_result.get("env"))
+    order_result["trading_epoch_id"] = trading_epoch_id
+    order_result["meta"]["trading_epoch_id"] = trading_epoch_id
     if engine is None:
         for existing in _MEM_ORDERS:
             if existing.get("client_order_key") == order_result.get("client_order_key"):
@@ -695,6 +730,7 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
             "dry_run": False,
             "committed_notional_usd": order_result.get("committed_notional_usd") or order_result.get("notional_usd"),
             "env": str(order_result.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
+            "trading_epoch_id": trading_epoch_id,
             "meta": order_result.get("meta") or {},
         }
         with engine.begin() as conn:
