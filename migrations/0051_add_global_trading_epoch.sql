@@ -71,6 +71,11 @@ BEGIN
     END IF;
     IF to_regclass(current_schema() || '.us_positions') IS NOT NULL THEN
         UPDATE us_positions SET trading_epoch_id='LEGACY_PRE_EPOCH' WHERE trading_epoch_id IS NULL;
+        ALTER TABLE us_positions ALTER COLUMN trading_epoch_id SET NOT NULL;
+        ALTER TABLE us_positions DROP CONSTRAINT IF EXISTS us_positions_as_of_symbol_exchange_key;
+        DROP INDEX IF EXISTS uq_us_positions_epoch_snapshot;
+        CREATE UNIQUE INDEX uq_us_positions_epoch_snapshot
+            ON us_positions(trading_epoch_id, as_of, symbol, exchange);
         CREATE INDEX IF NOT EXISTS ix_us_positions_trading_epoch ON us_positions(trading_epoch_id, as_of);
     END IF;
     IF to_regclass(current_schema() || '.us_reconcile_logs') IS NOT NULL THEN
