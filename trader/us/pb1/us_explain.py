@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 # ── Entry Style Families ─────────────────────────────────────────────────────
 ENTRY_STYLE_FAMILIES = {"ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_VCP", "ENTRY_GENERIC", "SKIP"}
+TRADABLE_ENTRY_STYLE_FAMILIES = {"ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_VCP"}
 
 # ── Exit Style Families ──────────────────────────────────────────────────────
 EXIT_STYLE_FAMILIES = {"hard_stop", "trailing_stop", "profit_protect", "giveback", "time_stop", "risk_off", "manual", "no_exit"}
@@ -117,6 +118,17 @@ def normalize_us_entry_style(value: Any) -> str:
         return "ENTRY_GENERIC"
     
     return "SKIP"
+
+
+
+def validate_tradable_us_entry_style(value: Any) -> tuple[bool, str]:
+    """Return whether a raw style is a proven tradable entry style.
+
+    Unknown/corrupt/generic values fail closed. Aliases are normalized by the
+    same function used by both preflight and the live PB1 engine.
+    """
+    normalized = normalize_us_entry_style(value)
+    return normalized in TRADABLE_ENTRY_STYLE_FAMILIES, normalized
 
 
 def extract_us_score_breakdown(entry_data: dict[str, Any]) -> dict[str, float]:

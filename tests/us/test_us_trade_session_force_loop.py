@@ -200,3 +200,43 @@ def test_force_now_saturday_trading_day_skip():
 
     assert result["status"] == "SKIP", f"Expected SKIP for Saturday, got {result['status']}"
     assert "not_trading_day" in result.get("reason", "")
+
+
+def test_entry_contract_degraded_ticks_do_not_terminate_session():
+    from trader.us.runner import trade_session_runner as mod
+
+    tick_calls = []
+
+    def _fake_tick(session, env, offline, force_now, **kwargs):
+        tick_calls.append(kwargs.get("tick_index"))
+        return {
+            "status": "OK_EXIT_SENT_ENTRY_DEGRADED",
+            "entry_eval_status": "DEGRADED",
+            "entry_degraded": 1,
+            "entry_degraded_reason": "entry_contract_integrity_fail",
+            "entry_contract_integrity_block_count": 18,
+            "orders": [{"status": "ACK", "side": "SELL", "symbol": "BE"}],
+            "orders_sent": 1,
+            "orders_ack": 1,
+            "exit_intents": 1,
+            "entry_intents": 0,
+        }
+
+    with (
+        patch("trader.us.runner.trade_tick_runner.run_trade_tick", side_effect=_fake_tick),
+        patch("trader.us.market_calendar.is_us_trading_day", return_value=True),
+        patch("trader.us.budget.resolve_us_order_budget", return_value={"capital_usd_cap": 10000.0}),
+    ):
+        result = mod.run_trade_session(
+            session="am",
+            env="practice",
+            offline=True,
+            force_now=FORCE_NOW_FRIDAY,
+            max_ticks=3,
+            interval_sec=1,
+            max_minutes=60,
+        )
+
+    assert len(tick_calls) == 3
+    assert result["tick_count"] == 3
+    assert result["status"] == "OK_WITH_WARNINGS"

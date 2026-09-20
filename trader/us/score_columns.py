@@ -311,6 +311,25 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     out["reason_json"] = reason_json
     out["risk_snapshot_json"] = risk_snapshot_json
     out["scores"] = scores
+
+    # ── Entry provenance recovery ──────────────────────────────────────────────
+    # Locked-watchlist PostgreSQL rows keep PREP decision provenance in meta,
+    # while live PB1 consumes canonical top-level fields. Promote the immutable
+    # decision fields without fabricating or remapping the strategy.
+    provenance_fields = (
+        "entry_reason", "entry_style_selected", "entry_style", "entry_component",
+        "entry_signal_type", "selected_reason",
+        "reasons", "filters_passed", "score_breakdown", "explanation_quality",
+        "rank_final30", "agent_a_score", "agent_b_score",
+        "theme_cluster", "sector", "industry", "market_state",
+        "rotation_regime", "market_regime",
+    )
+    for field in provenance_fields:
+        value = src.get(field)
+        if value is None:
+            value = meta.get(field)
+        if value is not None:
+            out[field] = value
     
     # Component scores 복구
     momentum_score, momentum_source = extract_us_score(src, "momentum", return_source=True)
@@ -356,6 +375,87 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # Score Quality Stats
 # ══════════════════════════════════════════════════════════════════════════════
+
+def inspect_us_entry_provenance(row: dict) -> dict:
+    """Inspect entry-style provenance across top-level and meta sources.
+
+    Equivalent aliases are accepted after normalization. Any non-empty
+    unrecognized value, or any semantic disagreement between sources, fails
+    closed so the live engine cannot silently choose one conflicting reason.
+    """
+    from trader.us.pb1.us_explain import validate_tradable_us_entry_style
+
+    src = dict(row or {})
+    meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+    sources = []
+    for label, value in (
+        ("top.entry_style_selected", src.get("entry_style_selected")),
+        ("top.entry_style", src.get("entry_style")),
+        ("top.entry_signal_type", src.get("entry_signal_type")),
+        ("meta.entry_style_selected", meta.get("entry_style_selected")),
+        ("meta.entry_style", meta.get("entry_style")),
+        ("meta.entry_signal_type", meta.get("entry_signal_type")),
+    ):
+        if value in (None, ""):
+            continue
+        ok, normalized = validate_tradable_us_entry_style(value)
+        sources.append({
+            "source": label,
+            "raw": str(value),
+            "normalized": normalized,
+            "ok": bool(ok),
+        })
+
+    invalid_sources = [item for item in sources if not item["ok"]]
+    valid_styles = {item["normalized"] for item in sources if item["ok"]}
+    conflicts = sorted(valid_styles) if len(valid_styles) > 1 else []
+    normalized_style = next(iter(valid_styles)) if len(valid_styles) == 1 else "SKIP"
+
+    if not sources:
+        reason = "entry_style_missing"
+    elif invalid_sources:
+        reason = "entry_style_invalid_source"
+    elif conflicts:
+        reason = "entry_style_conflict"
+    else:
+        reason = ""
+
+    return {
+        "ok": not reason,
+        "reason": reason,
+        "normalized_style": normalized_style,
+        "sources": sources,
+        "conflicts": conflicts,
+    }
+
+
+def validate_us_entry_provenance_contract(rows: list[dict]) -> dict:
+    """Validate the exact post-DB representation consumed by live PB1."""
+    invalid: list[dict] = []
+    valid_count = 0
+    for raw in rows or []:
+        row = canonicalize_us_watchlist_row(raw)
+        symbol = str(row.get("symbol") or "").upper()
+        state = inspect_us_entry_provenance(row)
+        if not state.get("ok"):
+            invalid.append({
+                "symbol": symbol,
+                "reason": state.get("reason"),
+                "entry_style": state.get("normalized_style"),
+                "sources": state.get("sources"),
+                "conflicts": state.get("conflicts"),
+            })
+            continue
+        valid_count += 1
+
+    return {
+        "ok": bool(rows) and not invalid,
+        "total": len(rows or []),
+        "valid_count": valid_count,
+        "invalid_count": len(invalid),
+        "invalid": invalid,
+    }
+
 
 def collect_us_score_nonzero_stats(rows: list[dict]) -> dict:
     """US watchlist rows의 score 통계를 수집한다.

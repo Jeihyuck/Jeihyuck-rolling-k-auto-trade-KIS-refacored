@@ -1865,13 +1865,23 @@ def run_trade_tick(
                 "trade_date": trade_date,
                 "block_new_entry": True,
             }
+    intentional_balance_skip = str(recon.get("status") or "").upper() == "SKIPPED_BALANCE_RECONCILE"
+    if intentional_balance_skip:
+        logger.info(
+            "[US_RECONCILE][INTERVAL_SKIP] reason=reconcile_interval_skip preserve_previous=1"
+        )
     elif recon.get("preserve_previous_positions"):
         logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
     balance_fetch_failed = bool(
-        recon.get("preserve_previous_positions")
-        or str(recon.get("balance_fetch_status") or "").upper() not in {"", "OK", "SKIP"}
+        not intentional_balance_skip
+        and (
+            recon.get("preserve_previous_positions")
+            or str(recon.get("balance_fetch_status") or "").upper() not in {"", "OK", "SKIP"}
+        )
     )
-    skip_zero_snapshot_count = int(bool(recon.get("preserve_previous_positions")))
+    skip_zero_snapshot_count = int(
+        balance_fetch_failed and bool(recon.get("preserve_previous_positions"))
+    )
 
     # Evaluate only after the current reconcile result has populated the
     # failure flags. This remains before exit/entry intent generation; only
@@ -2034,12 +2044,10 @@ def run_trade_tick(
         int(full_position), int(allow_new_symbols), int(allow_add_to_existing),
     )
 
-    invested_market_value_usd = 0.0
-    for _p in current_positions:
-        try:
-            invested_market_value_usd += float(_p.get("market_value_usd") or _p.get("market_value") or _p.get("eval_amount_usd") or 0)
-        except (TypeError, ValueError):
-            pass
+    from trader.us.portfolio_cluster_guard import resolve_position_market_value_usd
+    invested_market_value_usd = sum(
+        resolve_position_market_value_usd(_p) for _p in (current_positions or [])
+    )
     # Accounting contract: reconcile.total_pvs is holdings market value, never
     # broker account equity. Exposure uses explicit risk capital and broker
     # orderable cash remains an execution-only constraint.
@@ -2406,6 +2414,7 @@ def run_trade_tick(
     _entry_engine_started = time.monotonic()
     entry_intents: list[dict] = []
     entry_eval_error_count = 0
+    entry_contract_integrity_block_count = 0
     entry_degraded = False
     entry_degraded_reason = ""
     watchlist_fallback_used = False
@@ -2904,6 +2913,23 @@ def run_trade_tick(
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
+                        contract_integrity_blocks = [
+                            item for item in (entry_generation_diagnostics.get("blocked") or [])
+                            if str(item.get("reason") or "") == "ENTRY_EXPLAIN_CONTRACT_ERROR"
+                        ]
+                        if contract_integrity_blocks:
+                            # Contract corruption is a BUY-side fail-closed condition,
+                            # not a session-fatal runtime error. Exits must continue on
+                            # this tick and on later ticks.
+                            entry_contract_integrity_block_count = len(contract_integrity_blocks)
+                            entry_degraded = True
+                            entry_degraded_reason = "entry_contract_integrity_fail"
+                            entry_intents = []
+                            logger.error(
+                                "[US_ENTRY][CONTRACT_INTEGRITY_FAIL] count=%d symbols=%s action=block_all_new_buy continue_session=1",
+                                entry_contract_integrity_block_count,
+                                sorted({str(item.get("symbol") or "").upper() for item in contract_integrity_blocks}),
+                            )
                         if eligible_watchlist_rows and not entry_intents:
                             logger.warning(
                                 "[US_ENTRY][ELIGIBLE_BUT_NO_INTENT] eligible=%d preblocked=%d",
@@ -3763,6 +3789,7 @@ def run_trade_tick(
         "prep_status": prep_status if 'prep_status' in locals() else "UNKNOWN",
         "locked_watchlist_count": len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
         "entry_eval_status": "DEGRADED" if entry_degraded else ("OK" if entry_eval_error_count == 0 else "ERROR"),
+        "entry_contract_integrity_block_count": int(entry_contract_integrity_block_count),
         "entry_error_type": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
         "entry_error_message": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
         "entry_degraded": int(entry_degraded),
