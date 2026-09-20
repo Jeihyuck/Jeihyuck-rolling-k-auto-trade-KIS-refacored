@@ -26,6 +26,7 @@ from trader.us.pb1.us_explain import (
     build_us_entry_explanation,
     log_us_entry_decision,
     validate_explanations_batch,
+    validate_tradable_us_entry_style,
 )
 
 logger = logging.getLogger(__name__)
@@ -403,8 +404,10 @@ def _risk_clamp_new_buy_size(*, symbol: str, price: float, signal_target_notiona
 
 def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, entry_style: str, signal_score: float | None = None) -> tuple[bool, str]:
     data = entry_meta or {}
-    style = str(entry_style or data.get("entry_style") or "").upper()
-    score_keys = ("breakout_score", "pullback_score", "momentum_score")
+    style_ok, style = validate_tradable_us_entry_style(
+        entry_style or data.get("entry_style_selected") or data.get("entry_style")
+    )
+    score_keys = ("breakout_score", "pullback_score", "momentum_score", "vcp_score")
     scores = []
     has_component_score = any(key in data for key in score_keys)
     for key in score_keys:
@@ -422,7 +425,7 @@ def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, ent
             scores.append(float(signal_score or 0.0))
         except (TypeError, ValueError):
             pass
-    if style in {"SKIP", "UNKNOWN", "NONE", "GENERIC", "ENTRY_GENERIC"} or not style:
+    if not style_ok:
         logger.error(
             "[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=entry_style_unproven_for_new_buy style=%s",
             symbol, style,
@@ -663,8 +666,13 @@ def generate_entry_intents(
         # entries_map에 있으면 precomputed score 사용
         entry_meta = entries_map.get(symbol)
         if entry_meta:
-            # Canonicalization import
-            from trader.us.score_columns import extract_us_score, canonicalize_us_watchlist_row
+            # Canonicalization + provenance validation use the same
+            # contract as AM preflight. Live BUY must never be more permissive.
+            from trader.us.score_columns import (
+                extract_us_score,
+                canonicalize_us_watchlist_row,
+                inspect_us_entry_provenance,
+            )
             
             # Canonicalize the entry row
             try:
@@ -675,6 +683,23 @@ def generate_entry_intents(
                     symbol, exc
                 )
                 canonical_entry = entry_meta
+
+            provenance_state = inspect_us_entry_provenance(canonical_entry)
+            if not provenance_state.get("ok"):
+                track_skip(symbol, "ENTRY_EXPLAIN_CONTRACT_ERROR", {
+                    "contract_reason": provenance_state.get("reason"),
+                    "provenance_sources": provenance_state.get("sources"),
+                    "provenance_conflicts": provenance_state.get("conflicts"),
+                })
+                logger.error(
+                    "[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=%s sources=%s conflicts=%s",
+                    symbol,
+                    provenance_state.get("reason"),
+                    provenance_state.get("sources"),
+                    provenance_state.get("conflicts"),
+                )
+                continue
+            canonical_entry["entry_style_selected"] = provenance_state.get("normalized_style")
             
             # Extract score with alias recovery
             s, score_source = extract_us_score(canonical_entry, "final", return_source=True)
