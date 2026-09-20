@@ -12,7 +12,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from trader.db.engine import _connect_args_for_db_url
-from trader.db.migrate import run_migrations
+from trader.db.migrate import _apply_pg_statement, _preflight_version, _strip_sql_comments, split_postgres_sql
 
 
 _DATABASE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
@@ -180,6 +180,78 @@ def _assert_target_fresh_before_migration(target_engine: sa.Engine) -> None:
         )
 
 
+def _is_outer_transaction_control(statement: str) -> bool:
+    """Return True for historical migration wrappers owned by this bootstrapper."""
+    normalized = " ".join(_strip_sql_comments(statement).strip().rstrip(";").upper().split())
+    return normalized in {
+        "BEGIN",
+        "BEGIN TRANSACTION",
+        "START TRANSACTION",
+        "COMMIT",
+        "END",
+    }
+
+
+def run_fresh_database_migrations(
+    engine: sa.Engine,
+    *,
+    migrations_dir: str = "migrations",
+) -> list[str]:
+    """Replay the complete migration history into a physically empty DB.
+
+    The normal runtime migrator uses nested savepoints and is optimized for
+    upgrading an existing production DB. Some historical files (notably 0017)
+    include their own BEGIN/COMMIT wrapper, which invalidates those savepoints.
+    A fresh DB has no concurrent data to recover, so bootstrap each migration
+    file in one SQLAlchemy-owned transaction and ignore only the file's outer
+    transaction-control statements. Runtime migration behavior remains unchanged.
+    """
+    migration_files = sorted(
+        path for path in Path(migrations_dir).glob("*.sql") if path.is_file()
+    )
+    if not migration_files:
+        raise PracticeDatabaseGenerationError("NO_MIGRATIONS_FOUND")
+
+    applied: list[str] = []
+    for migration_path in migration_files:
+        version = migration_path.name
+        sql = migration_path.read_text(encoding="utf-8")
+        statements = split_postgres_sql(sql)
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_migrations (
+                        version TEXT PRIMARY KEY,
+                        applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                    )
+                    """
+                )
+                existing = conn.execute(
+                    text("SELECT 1 FROM schema_migrations WHERE version=:version"),
+                    {"version": version},
+                ).scalar()
+                if existing:
+                    raise PracticeDatabaseGenerationError(
+                        f"FRESH_TARGET_MIGRATION_ALREADY_STAMPED:{version}"
+                    )
+                _preflight_version(conn, version)
+                for statement in statements:
+                    if _is_outer_transaction_control(statement):
+                        continue
+                    _apply_pg_statement(conn, statement)
+                conn.execute(
+                    text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                    {"version": version},
+                )
+            applied.append(version)
+        except Exception as exc:
+            raise PracticeDatabaseGenerationError(
+                f"FRESH_DATABASE_MIGRATION_FAILED:{version}:{type(exc).__name__}:{exc}"
+            ) from exc
+    return applied
+
+
 def _assert_target_state_empty(target_engine: sa.Engine) -> dict[str, int | None]:
     counts = state_row_counts(target_engine)
     nonzero = {name: count for name, count in counts.items() if isinstance(count, int) and count != 0}
@@ -233,9 +305,8 @@ def prepare_new_practice_database(
 
         new_engine = _engine_for_url(resolved_target_url)
         _assert_target_fresh_before_migration(new_engine)
-        run_migrations(new_engine, migrations_dir=migrations_dir)
+        target_versions = run_fresh_database_migrations(new_engine, migrations_dir=migrations_dir)
         target_counts = _assert_target_state_empty(new_engine)
-        target_versions = migration_versions(new_engine)
 
         source_after = source_archive_snapshot(source_engine)
         if source_before["public_tables"] != source_after["public_tables"]:
