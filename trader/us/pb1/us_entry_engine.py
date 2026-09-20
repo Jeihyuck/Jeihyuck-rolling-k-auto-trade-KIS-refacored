@@ -666,15 +666,11 @@ def generate_entry_intents(
         # entries_map에 있으면 precomputed score 사용
         entry_meta = entries_map.get(symbol)
         if entry_meta:
-            # Canonicalization + provenance validation use the same
-            # contract as AM preflight. Live BUY must never be more permissive.
-            from trader.us.score_columns import (
-                extract_us_score,
-                canonicalize_us_watchlist_row,
-                inspect_us_entry_provenance,
-            )
+            from trader.us.score_columns import extract_us_score, canonicalize_us_watchlist_row
             
-            # Canonicalize the entry row
+            # Canonicalize the entry row. Provenance is validated only for NEW
+            # positions later; ADD_TO_EXISTING inherits its parent lifecycle
+            # contract and must not be blocked for lacking today's entry style.
             try:
                 canonical_entry = canonicalize_us_watchlist_row(entry_meta)
             except Exception as exc:
@@ -683,23 +679,6 @@ def generate_entry_intents(
                     symbol, exc
                 )
                 canonical_entry = entry_meta
-
-            provenance_state = inspect_us_entry_provenance(canonical_entry)
-            if not provenance_state.get("ok"):
-                track_skip(symbol, "ENTRY_EXPLAIN_CONTRACT_ERROR", {
-                    "contract_reason": provenance_state.get("reason"),
-                    "provenance_sources": provenance_state.get("sources"),
-                    "provenance_conflicts": provenance_state.get("conflicts"),
-                })
-                logger.error(
-                    "[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=%s sources=%s conflicts=%s",
-                    symbol,
-                    provenance_state.get("reason"),
-                    provenance_state.get("sources"),
-                    provenance_state.get("conflicts"),
-                )
-                continue
-            canonical_entry["entry_style_selected"] = provenance_state.get("normalized_style")
             
             # Extract score with alias recovery
             s, score_source = extract_us_score(canonical_entry, "final", return_source=True)
@@ -1127,13 +1106,27 @@ def generate_entry_intents(
             )
 
         if position_action == "NEW_POSITION_BUY":
-            entry_style_for_contract = str(
-                (entry_meta or {}).get("entry_style_selected")
-                or (entry_meta or {}).get("entry_style")
-                or _resolve_entry_signal_type(entry_meta)
-                or ""
+            from trader.us.score_columns import inspect_us_entry_provenance
+            provenance_state = inspect_us_entry_provenance(entry_meta or {})
+            if not provenance_state.get("ok"):
+                track_skip(symbol, "ENTRY_EXPLAIN_CONTRACT_ERROR", {
+                    "contract_reason": provenance_state.get("reason"),
+                    "provenance_sources": provenance_state.get("sources"),
+                    "provenance_conflicts": provenance_state.get("conflicts"),
+                })
+                logger.error(
+                    "[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=%s sources=%s conflicts=%s",
+                    symbol,
+                    provenance_state.get("reason"),
+                    provenance_state.get("sources"),
+                    provenance_state.get("conflicts"),
+                )
+                continue
+            entry_meta["entry_style_selected"] = provenance_state.get("normalized_style")
+            entry_style_for_contract = str(provenance_state.get("normalized_style") or "")
+            ok_contract, contract_reason = _validate_new_buy_explain_contract(
+                symbol, entry_meta, entry_style_for_contract, signal_score=score
             )
-            ok_contract, contract_reason = _validate_new_buy_explain_contract(symbol, entry_meta, entry_style_for_contract, signal_score=score)
             if not ok_contract:
                 track_skip(symbol, contract_reason, {"entry_style": entry_style_for_contract})
                 continue
