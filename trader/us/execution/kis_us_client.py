@@ -1129,10 +1129,17 @@ class KisUSClient:
             all_rows.extend(row for row in rows if isinstance(row, dict))
 
             response_meta = result.get("_response_meta") if isinstance(result.get("_response_meta"), dict) else {}
-            tr_cont = str(response_meta.get("tr_cont") or "").upper()
-            nk200 = str(result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or "")
-            fk200 = str(result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or "")
-            if tr_cont not in {"M", "F"}:
+            tr_cont = str(response_meta.get("tr_cont") or "").strip().upper()
+            nk200 = str(result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or "").strip()
+            fk200 = str(result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or "").strip()
+            cursor = (nk200, fk200)
+
+            if tr_cont and tr_cont not in {"M", "F", "D", "E"}:
+                raise KisUSClientError(
+                    f"KIS fills pagination contract error: unknown tr_cont={tr_cont!r}"
+                )
+
+            if tr_cont in {"D", "E"} or (not tr_cont and cursor == ("", "")):
                 logger.info(
                     "[US_FILLS][FETCHED] count=%d pages=%d status=OK schema=PRACTICE_RANGE",
                     len(all_rows),
@@ -1140,7 +1147,10 @@ class KisUSClient:
                 )
                 return all_rows
 
-            cursor = (nk200, fk200)
+            # M/F explicitly means continuation. If KIS omits the response
+            # header but still supplies a cursor, fail safe by following the
+            # cursor rather than treating a potentially truncated first page
+            # as complete.
             if cursor == ("", "") or cursor in seen_cursors:
                 raise KisUSClientError(
                     f"KIS fills pagination contract error: tr_cont={tr_cont!r} cursor={cursor!r}"
@@ -1281,6 +1291,16 @@ class KisUSClient:
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
+                if isinstance(data, dict):
+                    tr_cont = str(resp.headers.get("tr_cont") or "").strip()
+                    if tr_cont:
+                        response_meta = (
+                            dict(data.get("_response_meta"))
+                            if isinstance(data.get("_response_meta"), dict)
+                            else {}
+                        )
+                        response_meta["tr_cont"] = tr_cont
+                        data["_response_meta"] = response_meta
                 
                 # Success after retry
                 if attempt > 1 and last_error:
