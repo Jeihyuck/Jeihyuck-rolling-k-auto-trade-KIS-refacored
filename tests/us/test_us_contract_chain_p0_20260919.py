@@ -460,7 +460,7 @@ def test_us_corrupted_style_is_rejected_by_preflight_and_live_engine(monkeypatch
     assert intents == []
     blocked = diagnostics.get("blocked") or []
     assert any(item.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR" for item in blocked)
-    assert any((item.get("detail") or {}).get("contract_reason") == "entry_style_invalid_source" for item in blocked)
+    assert any(item.get("contract_reason") == "entry_style_invalid_source" for item in blocked)
 
 
 def test_us_conflicting_top_and_meta_styles_fail_closed_in_preflight_and_live(monkeypatch):
@@ -495,4 +495,4 @@ def test_us_conflicting_top_and_meta_styles_fail_closed_in_preflight_and_live(mo
     assert intents == []
     blocked = diagnostics.get("blocked") or []
     assert any(item.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR" for item in blocked)
-    assert any((item.get("detail") or {}).get("contract_reason") == "entry_style_conflict" for item in blocked)
+    assert any(item.get("contract_reason") == "entry_style_conflict" for item in blocked)
