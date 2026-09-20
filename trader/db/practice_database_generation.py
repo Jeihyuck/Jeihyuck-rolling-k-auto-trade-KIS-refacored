@@ -288,6 +288,21 @@ def clone_schema_only(*, source_url: str, target_url: str) -> None:
     source_cli = _cli_postgres_url(source_url)
     target_cli = _cli_postgres_url(target_url)
 
+    # A newly created PostgreSQL database already owns an empty public schema,
+    # while pg_dump --schema-only emits CREATE SCHEMA public. The target has
+    # already been proven table-empty, so remove only this empty target schema
+    # and let the dump recreate it exactly as the source defines it.
+    target_engine = _engine_for_url(target_url)
+    try:
+        if _public_tables(target_engine):
+            raise PracticeDatabaseGenerationError(
+                "TARGET_DATABASE_NOT_EMPTY_BEFORE_PUBLIC_SCHEMA_RECREATE"
+            )
+        with target_engine.begin() as conn:
+            conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
+    finally:
+        target_engine.dispose()
+
     dump_cmd = [
         pg_dump,
         "--schema-only",
