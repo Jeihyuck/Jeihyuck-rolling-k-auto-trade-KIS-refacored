@@ -35,16 +35,116 @@ def _kr_open_holdings(snapshot: dict) -> list[dict]:
     ]
 
 
-def _kr_pending_orders(kis: KisAPI) -> list[dict]:
+def _first_present(row: dict, keys: tuple[str, ...]):
+    for key in keys:
+        if key in row and row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
+def _kr_daily_ccld_all_pages(kis: KisAPI, *, max_pages: int = 20) -> dict:
+    """Fetch authoritative KR daily order truth through the final cursor."""
     today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-    payload = kis.inquire_daily_ccld(start_date=today, end_date=today)
-    if not isinstance(payload, dict) or str(payload.get("rt_cd") or "0") not in {"0", ""}:
-        raise RuntimeError("KR_KIS_ORDER_QUERY_NOT_AUTHORITATIVE")
+    fk = ""
+    nk = ""
+    all_rows: list[dict] = []
+    last_payload: dict = {}
+
+    for page in range(1, max_pages + 1):
+        payload = kis.inquire_daily_ccld(
+            start_date=today,
+            end_date=today,
+            ctx_area_fk100=fk,
+            ctx_area_nk100=nk,
+        )
+        if (
+            not isinstance(payload, dict)
+            or str(payload.get("rt_cd") or "0") not in {"0", ""}
+            or payload.get("_diag_stub")
+            or payload.get("_ccld_status")
+        ):
+            raise RuntimeError("KR_KIS_ORDER_QUERY_NOT_AUTHORITATIVE")
+
+        rows = payload.get("output1") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, list):
+            raise RuntimeError("KR_KIS_ORDER_QUERY_NOT_AUTHORITATIVE")
+        all_rows.extend(dict(row) for row in rows if isinstance(row, dict))
+        last_payload = payload
+
+        next_fk = str(
+            payload.get("ctx_area_fk100")
+            or payload.get("CTX_AREA_FK100")
+            or ""
+        ).strip()
+        next_nk = str(
+            payload.get("ctx_area_nk100")
+            or payload.get("CTX_AREA_NK100")
+            or ""
+        ).strip()
+        if not next_fk and not next_nk:
+            return {
+                **last_payload,
+                "output1": all_rows,
+                "_cutover_pages": page,
+                "_cutover_complete": True,
+            }
+        if next_fk == fk and next_nk == nk:
+            raise RuntimeError("KR_KIS_ORDER_PAGINATION_STALLED")
+        fk, nk = next_fk, next_nk
+
+    raise RuntimeError("KR_KIS_ORDER_PAGINATION_INCOMPLETE")
+
+
+def _kr_remaining_qty(row: dict) -> int:
+    """Resolve broker remaining qty without treating fully-cancelled rows as open."""
+    explicit_remaining = _first_present(
+        row,
+        ("remaining_qty", "rmn_qty", "nccs_qty", "ord_remn_qty"),
+    )
+    if explicit_remaining is not None:
+        return _qty(explicit_remaining)
+
+    requested = _qty(
+        _first_present(row, ("ord_qty", "tot_ord_qty", "requested_qty"))
+    )
+    filled = _qty(
+        _first_present(row, ("tot_ccld_qty", "ccld_qty", "filled_qty"))
+    )
+    cancelled = _qty(
+        _first_present(
+            row,
+            ("cncl_qty", "tot_cncl_qty", "rvse_cncl_qty", "cancelled_qty"),
+        )
+    )
+    derived = max(0, requested - filled - cancelled)
+
+    status_text = " ".join(
+        str(row.get(key) or "")
+        for key in (
+            "status",
+            "ord_sttus",
+            "ord_dvsn_name",
+            "rvse_cncl_dvsn_name",
+            "cncl_yn",
+            "cancel_status",
+        )
+    ).upper()
+    cancel_complete = (
+        any(token in status_text for token in ("CANCEL_COMPLETE", "CANCELLED", "CANCELED", "취소완료"))
+        or str(row.get("cncl_yn") or "").strip().upper() in {"Y", "1", "TRUE"}
+    )
+    if cancel_complete and cancelled >= max(0, requested - filled):
+        return 0
+    return derived
+
+
+def _kr_pending_orders(kis: KisAPI) -> list[dict]:
+    payload = _kr_daily_ccld_all_pages(kis)
     pending = []
     for row in payload.get("output1") or []:
-        requested = _qty((row or {}).get("ord_qty") or (row or {}).get("tot_ord_qty"))
-        filled = _qty((row or {}).get("tot_ccld_qty") or (row or {}).get("ccld_qty"))
-        if requested > filled:
+        if _kr_remaining_qty(row) > 0:
             pending.append(dict(row))
     return pending
 
@@ -62,6 +162,38 @@ def _us_open_holdings(balance: dict) -> list[dict]:
         if qty > 0:
             out.append(dict(row))
     return out
+
+
+_EXPECTED_US_BALANCE_EXCHANGES = {"NASD", "NYSE", "AMEX"}
+
+
+def _assert_us_balance_authoritative(balance: dict) -> None:
+    if not isinstance(balance, dict):
+        raise RuntimeError("US_KIS_BALANCE_NOT_AUTHORITATIVE")
+    if str(balance.get("balance_parse_status") or "").upper() != "OK":
+        raise RuntimeError("US_KIS_BALANCE_PARSE_NOT_OK")
+    if balance.get("balance_complete") is not True:
+        raise RuntimeError("US_KIS_BALANCE_INCOMPLETE")
+    if balance.get("balance_authoritative") is not True:
+        raise RuntimeError("US_KIS_BALANCE_NOT_AUTHORITATIVE")
+    failed = balance.get("failed_exchanges")
+    if failed not in (None, {}, []):
+        raise RuntimeError("US_KIS_BALANCE_EXCHANGE_FAILURE")
+
+    queried = {
+        str(value or "").strip().upper()
+        for value in (balance.get("queried_exchanges") or [])
+        if str(value or "").strip()
+    }
+    if not _EXPECTED_US_BALANCE_EXCHANGES.issubset(queried):
+        raise RuntimeError("US_KIS_BALANCE_EXCHANGE_COVERAGE_INCOMPLETE")
+
+    counts = balance.get("exchange_result_counts")
+    if not isinstance(counts, dict):
+        raise RuntimeError("US_KIS_BALANCE_EXCHANGE_COUNTS_MISSING")
+    count_keys = {str(key or "").strip().upper() for key in counts}
+    if not _EXPECTED_US_BALANCE_EXCHANGES.issubset(count_keys):
+        raise RuntimeError("US_KIS_BALANCE_EXCHANGE_COUNTS_INCOMPLETE")
 
 
 def _us_pending_orders(provider: USDataProvider) -> list[dict]:
@@ -113,10 +245,7 @@ def main() -> int:
 
     us = USDataProvider(offline=False)
     us_balance = us.get_balance(force_refresh=True)
-    if not isinstance(us_balance, dict):
-        raise RuntimeError("US_KIS_BALANCE_NOT_AUTHORITATIVE")
-    if str(us_balance.get("balance_parse_status") or "").upper() != "OK":
-        raise RuntimeError("US_KIS_BALANCE_PARSE_NOT_OK")
+    _assert_us_balance_authoritative(us_balance)
     us_holdings = _us_open_holdings(us_balance)
     if us_holdings:
         raise RuntimeError(
