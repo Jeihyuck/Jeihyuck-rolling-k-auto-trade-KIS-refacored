@@ -2414,6 +2414,7 @@ def run_trade_tick(
     _entry_engine_started = time.monotonic()
     entry_intents: list[dict] = []
     entry_eval_error_count = 0
+    entry_contract_integrity_block_count = 0
     entry_degraded = False
     entry_degraded_reason = ""
     watchlist_fallback_used = False
@@ -2917,13 +2918,16 @@ def run_trade_tick(
                             if str(item.get("reason") or "") == "ENTRY_EXPLAIN_CONTRACT_ERROR"
                         ]
                         if contract_integrity_blocks:
-                            entry_eval_error_count += len(contract_integrity_blocks)
+                            # Contract corruption is a BUY-side fail-closed condition,
+                            # not a session-fatal runtime error. Exits must continue on
+                            # this tick and on later ticks.
+                            entry_contract_integrity_block_count = len(contract_integrity_blocks)
                             entry_degraded = True
                             entry_degraded_reason = "entry_contract_integrity_fail"
                             entry_intents = []
                             logger.error(
-                                "[US_ENTRY][CONTRACT_INTEGRITY_FAIL] count=%d symbols=%s action=block_all_new_buy",
-                                len(contract_integrity_blocks),
+                                "[US_ENTRY][CONTRACT_INTEGRITY_FAIL] count=%d symbols=%s action=block_all_new_buy continue_session=1",
+                                entry_contract_integrity_block_count,
                                 sorted({str(item.get("symbol") or "").upper() for item in contract_integrity_blocks}),
                             )
                         if eligible_watchlist_rows and not entry_intents:
@@ -3785,6 +3789,7 @@ def run_trade_tick(
         "prep_status": prep_status if 'prep_status' in locals() else "UNKNOWN",
         "locked_watchlist_count": len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
         "entry_eval_status": "DEGRADED" if entry_degraded else ("OK" if entry_eval_error_count == 0 else "ERROR"),
+        "entry_contract_integrity_block_count": int(entry_contract_integrity_block_count),
         "entry_error_type": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
         "entry_error_message": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
         "entry_degraded": int(entry_degraded),
