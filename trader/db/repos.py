@@ -2704,13 +2704,48 @@ class UniverseRepo:
             )
 
 
+def _ensure_active_trading_epoch(conn, db_schema, *, env: str, account_id: str) -> str:
+    identity = and_(
+        db_schema.trading_epochs.c.env == env,
+        db_schema.trading_epochs.c.account_id == account_id,
+        db_schema.trading_epochs.c.status == "ACTIVE",
+    )
+    active = conn.execute(
+        select(db_schema.trading_epochs.c.trading_epoch_id).where(identity)
+    ).scalar()
+    if active:
+        return str(active)
+    trading_epoch_id = str(uuid4())
+    try:
+        with conn.begin_nested():
+            conn.execute(sa.insert(db_schema.trading_epochs).values(
+                trading_epoch_id=trading_epoch_id,
+                env=env,
+                account_id=account_id,
+                status="ACTIVE",
+                reason="AUTO_INITIAL_TRADING_EPOCH",
+            ))
+        return trading_epoch_id
+    except IntegrityError:
+        active = conn.execute(
+            select(db_schema.trading_epochs.c.trading_epoch_id).where(identity)
+        ).scalar()
+        if active:
+            return str(active)
+        raise
+
+
 def _ensure_active_epoch(conn, db_schema, *, env: str, account_id: str, sid: int, mode: int, strategy: str) -> str:
+    trading_epoch_id = _ensure_active_trading_epoch(
+        conn, db_schema, env=env, account_id=account_id
+    )
     identity = and_(
         db_schema.portfolio_epochs.c.env == env,
         db_schema.portfolio_epochs.c.account_id == account_id,
         db_schema.portfolio_epochs.c.sid == sid,
         db_schema.portfolio_epochs.c.mode == mode,
         db_schema.portfolio_epochs.c.strategy == strategy,
+        db_schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
         db_schema.portfolio_epochs.c.status == "ACTIVE",
     )
     active = conn.execute(select(db_schema.portfolio_epochs.c.portfolio_epoch_id).where(identity)).scalar()
@@ -2722,7 +2757,8 @@ def _ensure_active_epoch(conn, db_schema, *, env: str, account_id: str, sid: int
         # partial-unique-index race between AM/PM/CLOSE processes.
         with conn.begin_nested():
             conn.execute(sa.insert(db_schema.portfolio_epochs).values(
-                portfolio_epoch_id=epoch_id, env=env, account_id=account_id, sid=sid,
+                portfolio_epoch_id=epoch_id, trading_epoch_id=trading_epoch_id,
+                env=env, account_id=account_id, sid=sid,
                 mode=mode, strategy=strategy, status="ACTIVE", reason="AUTO_INITIAL_EPOCH",
             ))
         return str(epoch_id)
@@ -2879,6 +2915,13 @@ class OrdersRepo:
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
             )
+            trading_epoch_id = conn.execute(
+                select(self._schema.portfolio_epochs.c.trading_epoch_id).where(
+                    self._schema.portfolio_epochs.c.portfolio_epoch_id == portfolio_epoch_id
+                )
+            ).scalar() or _ensure_active_trading_epoch(
+                conn, self._schema, env=env, account_id=account_id
+            )
             if position_cycle_id is None:
                 position_cycle_id = conn.execute(
                     select(self._schema.positions.c.position_cycle_id).where(and_(
@@ -2938,6 +2981,7 @@ class OrdersRepo:
                 "client_order_key": client_order_key,
                 "position_cycle_id": str(position_cycle_id),
                 "portfolio_epoch_id": str(portfolio_epoch_id),
+                "trading_epoch_id": str(trading_epoch_id),
                 "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
             })
             safe_request_json["entry_contract_sha256"] = _kr_buy_entry_contract_hash(safe_request_json)
@@ -2949,6 +2993,7 @@ class OrdersRepo:
             "env": env,
             "position_cycle_id": position_cycle_id,
             "portfolio_epoch_id": portfolio_epoch_id,
+            "trading_epoch_id": str(trading_epoch_id),
             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
             "strategy": strategy,
             "sid": sid,
