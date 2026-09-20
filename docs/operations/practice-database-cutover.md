@@ -56,6 +56,8 @@ used. The baseline supplies the column used by the 0032 index before 0033.
 Before replay, the empty fixture's ledger payload column is set to TEXT, the
 documented input to the one-way 0025 TEXT-to-JSONB migration. 0025 then performs
 the real conversion; it is not skipped or stamped without execution.
+The US repository's production `_ensure_us_position_risk_state_table` initializer
+also runs: that table is created lazily by runtime code, not by a SQL migration.
 
 CI clones this real PostgreSQL source into a separate database, verifies the
 sentinel stays only in the source, checks every required trading table is empty,

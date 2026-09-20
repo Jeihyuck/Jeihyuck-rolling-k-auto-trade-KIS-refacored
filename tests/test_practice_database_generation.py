@@ -11,6 +11,7 @@ from sqlalchemy.engine import make_url
 
 from trader.db.migrate import run_migrations
 from trader.db.schema import schema_for_engine
+from trader.us.db.repos import _ensure_us_position_risk_state_table
 from trader.db.practice_database_generation import (
     CRITICAL_STATE_TABLES,
     REQUIRED_CONTRACT_COLUMNS,
@@ -76,6 +77,10 @@ def _seed_current_source_schema(engine: sa.Engine) -> None:
             [{"version": version} for version in baseline],
         )
     run_migrations(engine)
+    # This real US runtime table is created lazily by the repository, not by a
+    # SQL migration. Build it via that same production DDL before cloning.
+    with engine.begin() as conn:
+        _ensure_us_position_risk_state_table(conn)
 
     with engine.begin() as conn:
         conn.exec_driver_sql(
