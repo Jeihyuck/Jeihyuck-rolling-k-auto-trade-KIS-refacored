@@ -55,8 +55,8 @@ def _seed_current_source_schema(engine: sa.Engine) -> None:
             """
         )
 
-    parsed = make_url(str(engine.url))
-    cli_url = parsed.set(drivername="postgresql").render_as_string(hide_password=False)
+    parsed = engine.url.set(drivername="postgresql")
+    cli_url = parsed.render_as_string(hide_password=False)
     for migration in sorted(Path("migrations").glob("*.sql")):
         proc = subprocess.run(
             [
