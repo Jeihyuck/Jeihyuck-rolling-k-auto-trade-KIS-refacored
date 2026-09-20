@@ -4399,6 +4399,7 @@ class FillsRepo:
         fill_meta_json: dict | None = None,
         position_cycle_id: str | None = None,
         portfolio_epoch_id: str | None = None,
+        trading_epoch_id: str | None = None,
     ) -> str:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
@@ -4410,15 +4411,29 @@ class FillsRepo:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
+                    self._schema.orders.c.trading_epoch_id,
                 ).where(self._schema.orders.c.order_id == uuid_value_for_url(db_url, order_id))).mappings().first()
             if provenance:
                 position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                 portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
+                trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
+        if not trading_epoch_id:
+            with self.engine.begin() as conn:
+                if portfolio_epoch_id:
+                    trading_epoch_id = conn.execute(
+                        select(self._schema.portfolio_epochs.c.trading_epoch_id).where(
+                            self._schema.portfolio_epochs.c.portfolio_epoch_id == portfolio_epoch_id
+                        )
+                    ).scalar()
+                trading_epoch_id = trading_epoch_id or _ensure_active_trading_epoch(
+                    conn, self._schema, env=env, account_id=get_account_key(env=env)
+                )
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
             "position_cycle_id": position_cycle_id,
             "portfolio_epoch_id": portfolio_epoch_id,
+            "trading_epoch_id": str(trading_epoch_id),
             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
             "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
             "kis_odno": kis_odno,
@@ -4449,6 +4464,7 @@ class FillsRepo:
             "broker_fill_id": broker_fill_id,
             "position_cycle_id": position_cycle_id,
             "portfolio_epoch_id": portfolio_epoch_id,
+            "trading_epoch_id": str(trading_epoch_id),
             **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
         with self.engine.begin() as conn:
@@ -5771,11 +5787,13 @@ class PositionsRepo:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
+                    self._schema.orders.c.trading_epoch_id,
                     self._schema.orders.c.request_json,
                 ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
                 if provenance:
                     position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                     portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
+                    trading_epoch_id = provenance.get("trading_epoch_id")
                     request_json = provenance.get("request_json")
                     if isinstance(request_json, str):
                         try:
@@ -5830,6 +5848,13 @@ class PositionsRepo:
             account_id = account_id or get_account_key(env=env)
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
+            )
+            trading_epoch_id = locals().get("trading_epoch_id") or conn.execute(
+                select(self._schema.portfolio_epochs.c.trading_epoch_id).where(
+                    self._schema.portfolio_epochs.c.portfolio_epoch_id == portfolio_epoch_id
+                )
+            ).scalar() or _ensure_active_trading_epoch(
+                conn, self._schema, env=env, account_id=account_id
             )
             stmt = select(self._schema.positions).where(
                 and_(
@@ -5955,6 +5980,7 @@ class PositionsRepo:
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         position_cycle_id=position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         portfolio_epoch_id=portfolio_epoch_id,
+                        trading_epoch_id=str(trading_epoch_id),
                         opened_at=filled_at,
                         position_origin="SYSTEM",
                         env=env,
@@ -5997,6 +6023,13 @@ class PositionsRepo:
         with self.engine.begin() as conn:
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
                 account_id=account_id or get_account_key(env=env), sid=sid, mode=mode, strategy=strategy)
+            trading_epoch_id = conn.execute(
+                select(self._schema.portfolio_epochs.c.trading_epoch_id).where(
+                    self._schema.portfolio_epochs.c.portfolio_epoch_id == epoch_id
+                )
+            ).scalar() or _ensure_active_trading_epoch(
+                conn, self._schema, env=env, account_id=(account_id or get_account_key(env=env))
+            )
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
@@ -6028,6 +6061,7 @@ class PositionsRepo:
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         portfolio_epoch_id=epoch_id,
+                        trading_epoch_id=str(trading_epoch_id),
                         opened_at=func.now(),
                         position_origin="IMPORTED",
                         env=env,
@@ -6103,6 +6137,7 @@ class PositionsRepo:
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         portfolio_epoch_id=epoch_id,
+                        trading_epoch_id=str(trading_epoch_id),
                         opened_at=func.now(),
                         position_origin="IMPORTED",
                         env=env,
@@ -6144,6 +6179,13 @@ class PositionsRepo:
         with self.engine.begin() as conn:
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env_n,
                 account_id=account_key, sid=1, mode=1, strategy="pb1")
+            trading_epoch_id = conn.execute(
+                select(self._schema.portfolio_epochs.c.trading_epoch_id).where(
+                    self._schema.portfolio_epochs.c.portfolio_epoch_id == epoch_id
+                )
+            ).scalar() or _ensure_active_trading_epoch(
+                conn, self._schema, env=env_n, account_id=account_key
+            )
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
