@@ -109,6 +109,51 @@ class TestPaginationStop:
         symbols = [r.get("pdno") for r in result.get("output1", [])]
         assert "VRT" in symbols
 
+    def test_repeated_nonempty_cursor_fails_closed(self):
+        """A stalled KIS cursor must never be accepted as a complete balance."""
+        from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
+
+        client = KisUSClient.__new__(KisUSClient)
+        client.env = "practice"
+        client._cano = "12345"
+        client._acnt_prdt_cd = "01"
+
+        call_count = {"n": 0}
+
+        def mock_get(path, headers=None, params=None):
+            call_count["n"] += 1
+            return _page([_make_row("HELD", "NASD", 1)], fk200="CURSOR1", nk200="CURSOR1")
+
+        with patch.object(client, "_get", side_effect=mock_get), \
+             patch.object(client, "_build_headers", return_value={}):
+            with pytest.raises(KisUSTemporaryError, match="pagination stalled"):
+                client._get_us_balance_single_exchange("NASD")
+
+        assert call_count["n"] == 2
+
+    def test_max_page_with_continuation_cursor_fails_closed(self):
+        """Hitting max_pages with a live continuation cursor is incomplete evidence."""
+        from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
+
+        client = KisUSClient.__new__(KisUSClient)
+        client.env = "practice"
+        client._cano = "12345"
+        client._acnt_prdt_cd = "01"
+
+        call_count = {"n": 0}
+
+        def mock_get(path, headers=None, params=None):
+            call_count["n"] += 1
+            cursor = f"CURSOR{call_count['n']}"
+            return _page([_make_row(f"HELD{call_count['n']}", "NASD", 1)], fk200=cursor, nk200=cursor)
+
+        with patch.object(client, "_get", side_effect=mock_get), \
+             patch.object(client, "_build_headers", return_value={}):
+            with pytest.raises(KisUSTemporaryError, match="pagination incomplete"):
+                client._get_us_balance_single_exchange("NASD", max_pages=2)
+
+        assert call_count["n"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Duplicate row deduplication tests
