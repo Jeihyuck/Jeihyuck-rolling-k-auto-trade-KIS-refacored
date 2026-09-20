@@ -667,8 +667,34 @@ class KisUSClient:
 
             next_fk = str(next_fk_raw).strip()
             next_nk = str(next_nk_raw).strip()
+            response_meta = (
+                result.get("_response_meta")
+                if isinstance(result.get("_response_meta"), dict)
+                else {}
+            )
+            tr_cont = str(response_meta.get("tr_cont") or "").strip().upper()
+            if tr_cont and tr_cont not in {"M", "F", "D", "E"}:
+                raise KisUSTemporaryError(
+                    f"balance pagination unknown status exchange={exchange_code} tr_cont={tr_cont!r}"
+                )
+
+            if tr_cont in {"D", "E"}:
+                pagination_complete = True
+                logger.info(
+                    "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=tr_cont_%s rows=%d",
+                    exchange_code,
+                    page,
+                    tr_cont,
+                    len(page_output1),
+                )
+                break
 
             if not next_fk and not next_nk:
+                if tr_cont in {"M", "F"}:
+                    raise KisUSTemporaryError(
+                        f"balance pagination cursor missing exchange={exchange_code} "
+                        f"page={page} tr_cont={tr_cont}"
+                    )
                 pagination_complete = True
                 logger.info(
                     "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=empty_cursor rows=%d",
