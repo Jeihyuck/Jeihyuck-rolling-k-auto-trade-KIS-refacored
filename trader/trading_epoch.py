@@ -87,11 +87,26 @@ def start_new_trading_epoch(
             .values(status="ENDED", ended_at=func.now(), reason=reason)
         )
 
-        active_portfolios = select(schema.portfolio_epochs.c.portfolio_epoch_id).where(and_(
-            schema.portfolio_epochs.c.env == env_name,
-            schema.portfolio_epochs.c.account_id == account,
-            schema.portfolio_epochs.c.status == "ACTIVE",
-        ))
+        active_portfolio_ids = list(conn.execute(
+            select(schema.portfolio_epochs.c.portfolio_epoch_id).where(and_(
+                schema.portfolio_epochs.c.env == env_name,
+                schema.portfolio_epochs.c.account_id == account,
+                schema.portfolio_epochs.c.status == "ACTIVE",
+            ))
+        ).scalars())
+        if active_portfolio_ids:
+            conn.execute(
+                sa.update(schema.positions)
+                .where(and_(
+                    schema.positions.c.portfolio_epoch_id.in_(active_portfolio_ids),
+                    schema.positions.c.status == "OPEN",
+                ))
+                .values(
+                    status="CLOSED",
+                    closed_ts=func.now(),
+                    closed_reason="TRADING_EPOCH_ENDED",
+                )
+            )
         conn.execute(
             sa.update(schema.portfolio_epochs)
             .where(and_(
@@ -100,18 +115,6 @@ def start_new_trading_epoch(
                 schema.portfolio_epochs.c.status == "ACTIVE",
             ))
             .values(status="ENDED", ended_at=func.now(), reason=reason)
-        )
-        conn.execute(
-            sa.update(schema.positions)
-            .where(and_(
-                schema.positions.c.portfolio_epoch_id.in_(active_portfolios),
-                schema.positions.c.status == "OPEN",
-            ))
-            .values(
-                status="CLOSED",
-                closed_ts=func.now(),
-                closed_reason="TRADING_EPOCH_ENDED",
-            )
         )
         conn.execute(sa.insert(schema.trading_epochs).values(
             trading_epoch_id=epoch_id,
