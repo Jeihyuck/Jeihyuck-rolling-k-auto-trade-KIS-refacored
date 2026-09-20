@@ -154,6 +154,26 @@ class TestPaginationStop:
 
         assert call_count["n"] == 2
 
+    def test_incomplete_exchange_marks_aggregate_balance_non_authoritative(self, monkeypatch):
+        """Single-exchange pagination failure must propagate to the aggregate contract."""
+        from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
+
+        client = KisUSClient(offline=False)
+        monkeypatch.setenv("US_BALANCE_EXCHANGES", "NASD,NYSE,AMEX")
+
+        def fake_exchange(exchange_code: str):
+            if exchange_code == "NYSE":
+                raise KisUSTemporaryError("balance pagination stalled exchange=NYSE page=2")
+            return {"rt_cd": "0", "output1": [], "output2": {}}
+
+        client._get_us_balance_single_exchange = fake_exchange
+        result = client.get_us_balance(force_refresh=True)
+
+        assert result["balance_complete"] is False
+        assert result["balance_authoritative"] is False
+        assert "NYSE" in result["failed_exchanges"]
+        assert set(result["exchange_result_counts"]) == {"NASD", "NYSE", "AMEX"}
+
 
 # ---------------------------------------------------------------------------
 # Duplicate row deduplication tests
