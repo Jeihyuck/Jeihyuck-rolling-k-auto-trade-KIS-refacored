@@ -30,6 +30,9 @@ jobs:
       KIS_ENV: practice
       PBCORE_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/kr_ci
       DB_DISABLE_PREPARED_STATEMENTS: "1"
+      KIS_HTTP_ENABLED: "0"
+      NO_TRADE: "1"
+      PYTHONPATH: .
 
     steps:
       - name: Checkout
@@ -61,7 +64,10 @@ jobs:
           python -m py_compile scripts/prepare_new_practice_database.py
           python -m py_compile scripts/verify_new_practice_database_cutover.py
 
-      - name: Prove old DB preserved and fresh DB initialized
+      - name: Verify broker cutover rejection paths without network
+        run: python -m pytest tests/test_practice_database_cutover.py -q
+
+      - name: Prove current trading schema clone and missing-schema rejection
         run: |
           set -euo pipefail
-          pytest tests/test_practice_database_generation.py -q
+          python -m pytest tests/test_practice_database_generation.py -q

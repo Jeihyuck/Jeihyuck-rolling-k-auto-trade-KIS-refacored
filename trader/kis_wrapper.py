@@ -4154,6 +4154,8 @@ class KisAPI:
             for tr_id in tr_ids:
                 try:
                     headers = self._headers(tr_id)
+                    if ctx_area_fk100 or ctx_area_nk100:
+                        headers["tr_cont"] = "N"
                     stage_deadline = getattr(self, "_kr_stage_deadline", None)
                     resp = self.session.request(
                         "GET",
@@ -4173,7 +4175,12 @@ class KisAPI:
                         raise KisTemporaryError(f"HTTP {status}")
                     if 400 <= status < 500:
                         raise KisPermanentError(f"HTTP {status} for {url}")
-                    return resp.json()
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        payload["_response_meta"] = {
+                            "tr_cont": str(resp.headers.get("tr_cont") or "").strip(),
+                        }
+                    return payload
                 except requests.exceptions.Timeout as exc:
                     last_err = exc
                     logger.warning(

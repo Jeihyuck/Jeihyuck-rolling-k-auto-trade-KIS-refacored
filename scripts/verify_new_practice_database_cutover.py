@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from trader.account_state import get_masked_account_key
@@ -20,18 +21,26 @@ logger = logging.getLogger(__name__)
 
 
 def _qty(value) -> int:
+    """Bad quantity evidence must never be converted into an empty account."""
     try:
-        return max(0, int(float(str(value or 0).replace(",", ""))))
-    except Exception:
-        return 0
+        if value is None or isinstance(value, bool):
+            raise ValueError
+        qty = Decimal(str(value).replace(",", "").strip())
+        if not qty.is_finite() or qty < 0 or qty != qty.to_integral_value():
+            raise ValueError
+        return int(qty)
+    except (ValueError, InvalidOperation):
+        raise RuntimeError("CUTOVER_QUANTITY_INVALID") from None
 
 
 def _kr_open_holdings(snapshot: dict) -> list[dict]:
-    rows = (snapshot or {}).get("output1") or []
+    rows = snapshot.get("output1")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("KR_KIS_BALANCE_NOT_AUTHORITATIVE")
     return [
         dict(row)
         for row in rows
-        if _qty((row or {}).get("hldg_qty") or (row or {}).get("ord_psbl_qty")) > 0
+        if _qty(_first_present(row, ("hldg_qty", "ord_psbl_qty"))) > 0
     ]
 
 
@@ -48,6 +57,7 @@ def _kr_daily_ccld_all_pages(kis: KisAPI, *, max_pages: int = 20) -> dict:
     fk = ""
     nk = ""
     all_rows: list[dict] = []
+    seen_cursors: set[tuple[str, str]] = set()
     last_payload: dict = {}
 
     for page in range(1, max_pages + 1):
@@ -59,16 +69,16 @@ def _kr_daily_ccld_all_pages(kis: KisAPI, *, max_pages: int = 20) -> dict:
         )
         if (
             not isinstance(payload, dict)
-            or str(payload.get("rt_cd") or "0") not in {"0", ""}
+            or str(payload.get("rt_cd")) != "0"
             or payload.get("_diag_stub")
             or payload.get("_ccld_status")
         ):
             raise RuntimeError("KR_KIS_ORDER_QUERY_NOT_AUTHORITATIVE")
 
-        rows = payload.get("output1") or []
+        rows = payload.get("output1")
         if isinstance(rows, dict):
             rows = [rows]
-        if not isinstance(rows, list):
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             raise RuntimeError("KR_KIS_ORDER_QUERY_NOT_AUTHORITATIVE")
         all_rows.extend(dict(row) for row in rows if isinstance(row, dict))
         last_payload = payload
@@ -83,15 +93,22 @@ def _kr_daily_ccld_all_pages(kis: KisAPI, *, max_pages: int = 20) -> dict:
             or payload.get("CTX_AREA_NK100")
             or ""
         ).strip()
-        if not next_fk and not next_nk:
+        meta = payload.get("_response_meta") or {}
+        tr_cont = str(meta.get("tr_cont") or "").strip().upper()
+        if tr_cont and tr_cont not in {"F", "M", "D", "E"}:
+            raise RuntimeError("KR_KIS_ORDER_PAGINATION_UNKNOWN_STATUS")
+        if tr_cont in {"D", "E"} or (not tr_cont and not next_fk and not next_nk):
             return {
                 **last_payload,
                 "output1": all_rows,
                 "_cutover_pages": page,
                 "_cutover_complete": True,
             }
-        if next_fk == fk and next_nk == nk:
+        if not next_fk and not next_nk:
+            raise RuntimeError("KR_KIS_ORDER_PAGINATION_CURSOR_MISSING")
+        if (next_fk, next_nk) in seen_cursors:
             raise RuntimeError("KR_KIS_ORDER_PAGINATION_STALLED")
+        seen_cursors.add((next_fk, next_nk))
         fk, nk = next_fk, next_nk
 
     raise RuntimeError("KR_KIS_ORDER_PAGINATION_INCOMPLETE")
@@ -115,8 +132,8 @@ def _kr_remaining_qty(row: dict) -> int:
     cancelled = _qty(
         _first_present(
             row,
-            ("cncl_qty", "tot_cncl_qty", "rvse_cncl_qty", "cancelled_qty"),
-        )
+            ("cncl_qty", "tot_cncl_qty", "cancelled_qty"),
+        ) or 0
     )
     derived = max(0, requested - filled - cancelled)
 
@@ -150,14 +167,13 @@ def _kr_pending_orders(kis: KisAPI) -> list[dict]:
 
 
 def _us_open_holdings(balance: dict) -> list[dict]:
-    rows = (balance or {}).get("positions") or []
+    rows = balance.get("positions")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("US_KIS_BALANCE_NOT_AUTHORITATIVE")
     out = []
     for row in rows:
         qty = _qty(
-            (row or {}).get("qty")
-            or (row or {}).get("holding_qty")
-            or (row or {}).get("hldg_qty")
-            or (row or {}).get("ord_psbl_qty")
+            _first_present(row, ("qty", "holding_qty", "hldg_qty", "ord_psbl_qty"))
         )
         if qty > 0:
             out.append(dict(row))
@@ -177,7 +193,7 @@ def _assert_us_balance_authoritative(balance: dict) -> None:
     if balance.get("balance_authoritative") is not True:
         raise RuntimeError("US_KIS_BALANCE_NOT_AUTHORITATIVE")
     failed = balance.get("failed_exchanges")
-    if failed not in (None, {}, []):
+    if failed not in ({}, []):
         raise RuntimeError("US_KIS_BALANCE_EXCHANGE_FAILURE")
 
     queried = {
@@ -194,11 +210,15 @@ def _assert_us_balance_authoritative(balance: dict) -> None:
     count_keys = {str(key or "").strip().upper() for key in counts}
     if not _EXPECTED_US_BALANCE_EXCHANGES.issubset(count_keys):
         raise RuntimeError("US_KIS_BALANCE_EXCHANGE_COUNTS_INCOMPLETE")
+    for count in counts.values():
+        _qty(count)
 
 
 def _us_pending_orders(provider: USDataProvider) -> list[dict]:
     trade_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     rows = provider.get_today_orders(trade_date)
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("US_KIS_ORDER_QUERY_NOT_AUTHORITATIVE")
     pending = []
     for row in rows or []:
         if str((row or {}).get("normalization_result") or "").lower() == "quarantined":
@@ -231,7 +251,15 @@ def main() -> int:
 
     kr = KisAPI(kis_env="practice")
     kr_balance = kr.get_balance_cached(force=True)
-    if not isinstance(kr_balance, dict) or kr_balance.get("_stub"):
+    if (
+        not isinstance(kr_balance, dict)
+        or kr_balance.get("_stub")
+        or kr_balance.get("_diag_stub")
+        or str(kr_balance.get("rt_cd", "0")) != "0"
+        or any(str(kr_balance.get(key) or "").strip() for key in (
+            "ctx_area_fk100", "ctx_area_nk100", "CTX_AREA_FK100", "CTX_AREA_NK100",
+        ))
+    ):
         raise RuntimeError("KR_KIS_BALANCE_NOT_AUTHORITATIVE")
     kr_holdings = _kr_open_holdings(kr_balance)
     if kr_holdings:

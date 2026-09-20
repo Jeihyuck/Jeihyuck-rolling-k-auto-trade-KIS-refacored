@@ -24,6 +24,7 @@ CRITICAL_STATE_TABLES = (
     "positions",
     "portfolio_epochs",
     "us_order_intents",
+    "us_order_events",
     "us_orders",
     "us_fills",
     "us_positions",
@@ -40,15 +41,19 @@ REQUIRED_CONTRACT_COLUMNS = {
     "orders": {
         "position_cycle_id", "portfolio_epoch_id",
         "entry_reason", "entry_style_selected", "entry_meta_json", "request_json",
+        "entry_decision_family", "entry_rule_version", "stop_price_at_entry", "pivot_price_at_entry",
     },
     "fills": {
         "position_cycle_id", "portfolio_epoch_id",
         "entry_reason", "entry_style_selected", "fill_meta_json",
+        "entry_decision_family", "entry_rule_version", "stop_price_at_entry", "pivot_price_at_entry",
     },
     "positions": {
         "position_cycle_id", "portfolio_epoch_id",
         "entry_reason", "entry_style_selected", "entry_meta_json",
         "entry_exit_plan_json", "position_meta", "exit_policy_family",
+        "entry_decision_family", "entry_rule_version", "stop_price_at_entry", "pivot_price_at_entry",
+        "policy_source", "policy_version", "position_origin", "opened_at",
     },
     "us_order_intents": {"client_order_key", "strategy", "meta"},
     "us_orders": {"client_order_key", "order_no", "meta"},

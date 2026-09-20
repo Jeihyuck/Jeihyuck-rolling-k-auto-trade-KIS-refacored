@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,9 +9,12 @@ import sqlalchemy as sa
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
+from trader.db.migrate import run_migrations
+from trader.db.schema import schema_for_engine
 from trader.db.practice_database_generation import (
     CRITICAL_STATE_TABLES,
     REQUIRED_CONTRACT_COLUMNS,
+    _assert_required_trading_schema,
     PracticeDatabaseGenerationError,
     prepare_new_practice_database,
     target_url_from_source,
@@ -42,50 +44,31 @@ def _drop_database(source_url: str, database_name: str) -> None:
 
 
 def _seed_current_source_schema(engine: sa.Engine) -> None:
-    """Build the actual latest schema by executing every SQL migration in PostgreSQL."""
+    """Current model baseline + actual 0020-and-later migrations, NOT legacy replay.
+
+    The production SQLAlchemy model supplies the current TEXT-backed core tables.
+    0001..0019 are explicitly recorded as a fixture baseline, not claimed to have
+    run. Historical 0019 is incompatible with that model and universe ownership.
+    Every later migration (including all US/Infinite/lifecycle DDL) must execute
+    successfully before the production migrator records its version. No errors
+    are caught or stamped as success by this fixture.
+    """
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
         conn.exec_driver_sql("CREATE SCHEMA public")
+    schema_for_engine(engine).metadata.create_all(engine)
+    with engine.begin() as conn:
         conn.exec_driver_sql(
-            """
-            CREATE TABLE schema_migrations (
-                version TEXT PRIMARY KEY,
-                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
+            "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, "
+            "applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
-
-    parsed = engine.url.set(drivername="postgresql")
-    cli_url = parsed.render_as_string(hide_password=False)
-    for migration in sorted(Path("migrations").glob("*.sql")):
-        proc = subprocess.run(
-            [
-                "psql",
-                "--no-psqlrc",
-                "--set",
-                "ON_ERROR_STOP=1",
-                "--file",
-                str(migration),
-                cli_url,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
+        baseline = sorted(p.name for p in Path("migrations").glob("*.sql") if p.name < "0020")
+        assert len(baseline) == 19  # A reviewed, explicit baseline boundary.
+        conn.execute(
+            text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+            [{"version": version} for version in baseline],
         )
-        assert proc.returncode == 0, (
-            f"migration failed: {migration.name}\n"
-            f"stdout={proc.stdout[-4000:]}\n"
-            f"stderr={proc.stderr[-4000:]}"
-        )
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO schema_migrations(version) VALUES (:version) "
-                    "ON CONFLICT (version) DO NOTHING"
-                ),
-                {"version": migration.name},
-            )
+    run_migrations(engine)
 
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -186,7 +169,48 @@ def test_old_database_is_preserved_and_new_database_is_schema_clone_without_data
                 for col in inspector.get_columns(table_name, schema="public")
             }
             assert required_columns <= actual_columns
+
+        # Real PostgreSQL negative cases: matching migration stamps cannot hide
+        # missing physical tables/columns. Roll back each DDL mutation so every
+        # case starts from the independently constructed complete schema.
+        for table_name in CRITICAL_STATE_TABLES:
+            with target.connect() as conn:
+                tx = conn.begin()
+                try:
+                    conn.exec_driver_sql(f'DROP TABLE "{table_name}" CASCADE')
+                    with pytest.raises(PracticeDatabaseGenerationError, match="REQUIRED_TABLES_MISSING"):
+                        _assert_required_trading_schema(conn, label="TARGET")
+                finally:
+                    tx.rollback()
+        for table_name, columns in REQUIRED_CONTRACT_COLUMNS.items():
+            for column in sorted(columns):
+                with target.connect() as conn:
+                    tx = conn.begin()
+                    try:
+                        conn.exec_driver_sql(f'ALTER TABLE "{table_name}" DROP COLUMN "{column}" CASCADE')
+                        with pytest.raises(PracticeDatabaseGenerationError, match="REQUIRED_CONTRACT_COLUMNS_MISSING"):
+                            _assert_required_trading_schema(conn, label="TARGET")
+                    finally:
+                        tx.rollback()
+
+        # Also exercise the real top-level verifier with committed defects,
+        # including identical source/target defects that schema parity misses.
+        with target.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE positions DROP COLUMN entry_meta_json")
+        with pytest.raises(PracticeDatabaseGenerationError, match="TARGET_DATABASE_REQUIRED_CONTRACT_COLUMNS_MISSING"):
+            verify_fresh_target_database(source_url=source_url, target_url=target_url)
+        with source.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE positions DROP COLUMN entry_meta_json")
+        with pytest.raises(PracticeDatabaseGenerationError, match="SOURCE_DATABASE_REQUIRED_CONTRACT_COLUMNS_MISSING"):
+            verify_fresh_target_database(source_url=source_url, target_url=target_url)
+        for engine in (source, target):
+            with engine.begin() as conn:
+                conn.exec_driver_sql("DROP TABLE kr_infinite_state")
+        with pytest.raises(PracticeDatabaseGenerationError, match="SOURCE_DATABASE_REQUIRED_TABLES_MISSING"):
+            verify_fresh_target_database(source_url=source_url, target_url=target_url)
     finally:
+        if "target" in locals():
+            target.dispose()
         source.dispose()
         _drop_database(source_url, target_name)
 
