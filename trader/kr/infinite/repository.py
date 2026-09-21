@@ -8,7 +8,7 @@ from datetime import date
 from sqlalchemy import text
 from trader.db.engine import get_engine
 from trader.account_state import get_account_key, resolve_env_name
-from trader.db.trading_epoch import active_trading_epoch_id
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 
 from .models import BrokerOrderState, Decision, OrderIntent, State, Status
 
@@ -21,7 +21,7 @@ class InfiniteRepository:
 
     def _epoch_id(self, bind, *, required: bool | None = None) -> str | None:
         if required is None:
-            required = str(os.getenv("TRADING_EPOCH_ENFORCE") or "0").strip().lower() in {"1","true","yes","on"}
+            required = trading_epoch_enforced()
         env = resolve_env_name()
         return active_trading_epoch_id(
             bind, env=env, account_id=get_account_key(env=env), required=bool(required)
