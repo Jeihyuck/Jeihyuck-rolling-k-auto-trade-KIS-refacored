@@ -18,6 +18,18 @@ class TradingEpochError(RuntimeError):
 
 
 def trading_epoch_enforced() -> bool:
+    """Fail closed in canonical KR/US WSL runtime even if .env overrides a flag."""
+    explicit = str(os.getenv("TRADING_EPOCH_ENFORCE") or "").strip().lower()
+    if explicit in {"1", "true", "yes", "on"}:
+        return True
+    market = str(os.getenv("WSL_RUN_MARKET") or "").strip().upper()
+    # Unit tests intentionally exercise legacy fixtures without an active epoch.
+    if market in {"KR", "US"} and not os.getenv("PYTEST_CURRENT_TEST"):
+        return True
+    return False
+
+
+def trading_epoch_enforced() -> bool:
     return str(os.getenv("TRADING_EPOCH_ENFORCE") or "0").strip().lower() in {
         "1", "true", "yes", "on"
     }
