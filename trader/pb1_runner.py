@@ -4848,6 +4848,20 @@ def _handle_balance_unknown_precheck(
         return True, False, entry_block_reason or "BALANCE_FAIL_SOFT_ENTRY_DISABLED", None
     return False, order_allowed, entry_block_reason, "DEGRADED_BALANCE_UNKNOWN"
 
+def _register_kr_run_row(*, engine, ctx: RunContext) -> tuple[RunsRepo, str]:
+    """Persist the early KR run row used by run_once before any order/reconcile work."""
+    runs_repo = RunsRepo(engine)
+    run_id = os.getenv("TRADER_RUN_ID", "local")
+    runs_repo.upsert_run(
+        run_id=run_id,
+        env=ctx.env,
+        strategy=ctx.strategy,
+        workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
+        ts_start=ctx.started_at,
+    )
+    return runs_repo, run_id
+
+
 def run_once(
     *,
     args: argparse.Namespace,
@@ -5770,16 +5784,8 @@ def run_once(
         if diag_enabled:
             logger.warning("[PB1][DIAG] non-trading-day(%s) but running diagnostics", now.date())
 
-    runs_repo = RunsRepo(engine)
-    run_id = os.getenv("TRADER_RUN_ID", "local")
-    # Ensure run row exists early to prevent FK errors
-    runs_repo.upsert_run(
-        run_id=run_id,
-        env=ctx.env,
-        strategy=ctx.strategy,
-        workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
-        ts_start=ctx.started_at,
-    )
+    # Ensure run row exists early to prevent FK errors.
+    runs_repo, run_id = _register_kr_run_row(engine=engine, ctx=ctx)
     universe_repo = UniverseRepo(engine)
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)

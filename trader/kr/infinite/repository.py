@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from datetime import date
 
 from sqlalchemy import text
 from trader.db.engine import get_engine
+from trader.account_state import get_account_key, resolve_env_name
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 
 from .models import BrokerOrderState, Decision, OrderIntent, State, Status
 
@@ -16,6 +19,14 @@ class InfiniteRepository:
     def __init__(self, engine=None):
         self.engine = engine or get_engine()
 
+    def _epoch_id(self, bind, *, required: bool | None = None) -> str | None:
+        if required is None:
+            required = trading_epoch_enforced()
+        env = resolve_env_name()
+        return active_trading_epoch_id(
+            bind, env=env, account_id=get_account_key(env=env), required=bool(required)
+        )
+
     def ensure_schema(self) -> None:
         with self.engine.connect() as conn:
             state = conn.execute(text("SELECT to_regclass('public.kr_infinite_state')")).scalar()
@@ -25,7 +36,14 @@ class InfiniteRepository:
 
     def load_state(self) -> State | None:
         with self.engine.connect() as conn:
-            row = conn.execute(text("SELECT * FROM kr_infinite_state WHERE strategy_id='KR_INFINITE_V1' AND symbol='122630'")).mappings().first()
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                row = conn.execute(text("""SELECT * FROM kr_infinite_state
+                    WHERE trading_epoch_id=:epoch_id
+                      AND strategy_id='KR_INFINITE_V1' AND symbol='122630'"""),
+                    {"epoch_id": epoch_id}).mappings().first()
+            else:
+                row = conn.execute(text("SELECT * FROM kr_infinite_state WHERE strategy_id='KR_INFINITE_V1' AND symbol='122630'")).mappings().first()
         if row is None:
             return None
         values = {key: row[key] for key in State.__dataclass_fields__ if key in row}
@@ -35,14 +53,26 @@ class InfiniteRepository:
 
     def intent_keys(self) -> frozenset[str]:
         with self.engine.connect() as conn:
-            rows = conn.execute(text("SELECT idempotency_key FROM kr_infinite_order_intents")).all()
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                rows = conn.execute(text("""SELECT idempotency_key FROM kr_infinite_order_intents
+                    WHERE trading_epoch_id=:epoch_id"""), {"epoch_id": epoch_id}).all()
+            else:
+                rows = conn.execute(text("SELECT idempotency_key FROM kr_infinite_order_intents")).all()
         return frozenset(row[0] for row in rows)
 
     def pending_intents(self) -> list[OrderIntent]:
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
-                broker_order_id,status,filled_qty,filled_notional_krw,metadata FROM kr_infinite_order_intents
-                WHERE status=ANY(:statuses) ORDER BY id"""), {"statuses": list(PENDING)}).mappings().all()
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
+                    broker_order_id,status,filled_qty,filled_notional_krw,metadata FROM kr_infinite_order_intents
+                    WHERE trading_epoch_id=:epoch_id AND status=ANY(:statuses) ORDER BY id"""),
+                    {"epoch_id": epoch_id, "statuses": list(PENDING)}).mappings().all()
+            else:
+                rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
+                    broker_order_id,status,filled_qty,filled_notional_krw,metadata FROM kr_infinite_order_intents
+                    WHERE status=ANY(:statuses) ORDER BY id"""), {"statuses": list(PENDING)}).mappings().all()
         result: list[OrderIntent] = []
         for row in rows:
             payload = dict(row)
@@ -87,11 +117,16 @@ class InfiniteRepository:
         """Persist first. A uniqueness loss means the caller must not submit."""
         intent_metadata = self._intent_metadata(state, decision)
         with self.engine.begin() as conn:
+            epoch_id = self._epoch_id(conn)
+            if not epoch_id:
+                raise RuntimeError("KR_INFINITE_ACTIVE_TRADING_EPOCH_REQUIRED")
+            intent_metadata["trading_epoch_id"] = epoch_id
             row = conn.execute(text("""INSERT INTO kr_infinite_order_intents(
-                strategy_id,symbol,cycle_id,trade_date,side,reason,unit_sequence,requested_notional_krw,
+                trading_epoch_id,strategy_id,symbol,cycle_id,trade_date,side,reason,unit_sequence,requested_notional_krw,
                 requested_qty,limit_price,idempotency_key,market_state,metadata)
-                VALUES('KR_INFINITE_V1','122630',:cycle,:day,:side,:reason,:seq,:notional,:qty,:price,:key,:market,CAST(:metadata AS jsonb))
-                ON CONFLICT(idempotency_key) DO NOTHING RETURNING id"""), {
+                VALUES(:epoch_id,'KR_INFINITE_V1','122630',:cycle,:day,:side,:reason,:seq,:notional,:qty,:price,:key,:market,CAST(:metadata AS jsonb))
+                ON CONFLICT(trading_epoch_id,idempotency_key) DO NOTHING RETURNING id"""), {
+                "epoch_id": epoch_id,
                 "cycle": state.cycle_id, "day": trade_date, "side": decision.action.value,
                 "reason": decision.reason, "seq": state.units_used + 1 if decision.action.value in {"BUY", "RECOVERY"} else None,
                 "notional": decision.notional, "qty": decision.qty,
@@ -103,36 +138,44 @@ class InfiniteRepository:
 
     def mark_submitted(self, key: str, broker_order_id: str | None) -> None:
         with self.engine.begin() as conn:
+            epoch_id = self._epoch_id(conn, required=True)
             conn.execute(text("""UPDATE kr_infinite_order_intents SET broker_order_id=:order_id,
-                status='SUBMITTED',updated_at=NOW() WHERE idempotency_key=:key"""), {"order_id": broker_order_id, "key": key})
+                status='SUBMITTED',updated_at=NOW()
+                WHERE trading_epoch_id=:epoch_id AND idempotency_key=:key"""),
+                {"epoch_id": epoch_id, "order_id": broker_order_id, "key": key})
 
     def mark_rejected(self, key: str, reason: str) -> None:
         with self.engine.begin() as conn:
+            epoch_id = self._epoch_id(conn, required=True)
             conn.execute(text("""UPDATE kr_infinite_order_intents SET status='REJECTED',
-                metadata=metadata || CAST(:metadata AS jsonb),updated_at=NOW() WHERE idempotency_key=:key"""),
-                {"key": key, "metadata": json.dumps({"rejection": reason})})
+                metadata=metadata || CAST(:metadata AS jsonb),updated_at=NOW()
+                WHERE trading_epoch_id=:epoch_id AND idempotency_key=:key"""),
+                {"epoch_id": epoch_id, "key": key, "metadata": json.dumps({"rejection": reason})})
 
     def persist_reconciliation(self, state: State, updates: list[tuple[OrderIntent, BrokerOrderState]]) -> None:
         with self.engine.begin() as conn:
+            epoch_id = self._epoch_id(conn, required=True)
             for intent, broker in updates:
                 conn.execute(text("""UPDATE kr_infinite_order_intents SET status=:status,filled_qty=:qty,
                     filled_notional_krw=:notional,filled_avg_price=:average,updated_at=NOW() WHERE id=:id"""),
                     {"status": broker.status, "qty": broker.filled_qty, "notional": broker.filled_notional_krw,
                      "average": broker.filled_avg_price, "id": intent.id})
-            self._save_state(conn, state)
+            self._save_state(conn, state, epoch_id=epoch_id)
 
     def save_state(self, state: State) -> None:
         with self.engine.begin() as conn:
-            self._save_state(conn, state)
+            epoch_id = self._epoch_id(conn, required=True)
+            self._save_state(conn, state, epoch_id=epoch_id)
 
     @staticmethod
-    def _save_state(conn, state: State) -> None:
+    def _save_state(conn, state: State, *, epoch_id: str) -> None:
         payload = asdict(state)
         payload["status"] = state.status.value
-        payload["metadata"] = json.dumps(state.metadata, default=str)
+        payload["metadata"] = json.dumps({**state.metadata, "trading_epoch_id": epoch_id}, default=str)
+        payload["trading_epoch_id"] = epoch_id
         columns = ",".join(payload)
         values = ",".join(f":{key}" if key != "metadata" else "CAST(:metadata AS jsonb)" for key in payload)
-        updates = ",".join(f"{key}=EXCLUDED.{key}" for key in payload if key not in {"strategy_id", "symbol", "version"})
+        updates = ",".join(f"{key}=EXCLUDED.{key}" for key in payload if key not in {"trading_epoch_id", "strategy_id", "symbol", "version"})
         conn.execute(text(f"""INSERT INTO kr_infinite_state({columns}) VALUES({values})
-            ON CONFLICT(strategy_id,symbol) DO UPDATE SET {updates},
+            ON CONFLICT(trading_epoch_id,strategy_id,symbol) DO UPDATE SET {updates},
             version=kr_infinite_state.version+1,updated_at=NOW()"""), payload)

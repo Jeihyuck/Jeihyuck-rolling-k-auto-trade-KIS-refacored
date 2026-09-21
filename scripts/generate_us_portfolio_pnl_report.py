@@ -347,13 +347,16 @@ def _load_db_positions(engine, trade_date: str) -> list[dict]:
         base_sql = f"SELECT {fields_sql} FROM us_positions WHERE qty > 0"
         if where_sql:
             base_sql += f" AND {where_sql}"
-        base_sql += " ORDER BY symbol ASC"
 
         with engine.begin() as conn:
-            rows = conn.execute(
-                text(base_sql),
-                {"td": trade_date},
-            ).fetchall()
+            from trader.us.db.repos import _active_us_epoch
+            epoch_id = _active_us_epoch(conn)
+            params = {"td": trade_date}
+            if epoch_id and "trading_epoch_id" in cols:
+                base_sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            base_sql += " ORDER BY symbol ASC"
+            rows = conn.execute(text(base_sql), params).fetchall()
             positions = [dict(r._mapping) for r in rows]
             logger.info(
                 "[US_PNL][DB_POSITIONS] count=%d date_col=%s alias=%s",
@@ -415,13 +418,17 @@ def _load_db_fills(engine, trade_date: str) -> list[dict]:
             fills_where = "1=1"  # no reliable date filter
 
         order_clause = " ORDER BY filled_at ASC" if "filled_at" in cols else ""
-        fills_sql = f"SELECT {fields_sql} FROM us_fills WHERE {fills_where}{order_clause}"
+        fills_sql = f"SELECT {fields_sql} FROM us_fills WHERE {fills_where}"
 
         with engine.begin() as conn:
-            rows = conn.execute(
-                text(fills_sql),
-                {"td": trade_date},
-            ).fetchall()
+            from trader.us.db.repos import _active_us_epoch
+            epoch_id = _active_us_epoch(conn)
+            params = {"td": trade_date}
+            if epoch_id and "trading_epoch_id" in cols:
+                fills_sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            fills_sql += order_clause
+            rows = conn.execute(text(fills_sql), params).fetchall()
             fills = [dict(r._mapping) for r in rows]
             logger.info("[US_PNL][DB_FILLS] count=%d", len(fills))
             return fills

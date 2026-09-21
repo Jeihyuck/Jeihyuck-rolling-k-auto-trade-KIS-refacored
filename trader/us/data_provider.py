@@ -102,11 +102,7 @@ def _is_valid_nonnegative_integral_qty(val: Any) -> bool:
         if not cleaned or cleaned == "-":
             return False
         qty = Decimal(cleaned)
-        return bool(
-            qty.is_finite()
-            and qty >= 0
-            and qty == qty.to_integral_value()
-        )
+        return bool(qty.is_finite() and qty >= 0 and qty == qty.to_integral_value())
     except (InvalidOperation, ValueError, TypeError):
         return False
 
@@ -521,7 +517,6 @@ def normalize_us_order_status_row(row: dict) -> dict:
     symbol = str(_get_first_valid(row, ("symbol", "pdno", "PDNO"), "") or "").strip().upper()
     side_raw = str(_get_first_valid(row, ("side", "sll_buy_dvsn_cd", "SLL_BUY_DVSN_CD"), "") or "").upper()
     side = "BUY" if side_raw in {"BUY", "02", "B"} else "SELL" if side_raw in {"SELL", "01", "S"} else side_raw
-
     requested_raw = _get_first_valid(
         row, ("requested_qty", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"), None
     )
@@ -543,11 +538,7 @@ def normalize_us_order_status_row(row: dict) -> dict:
 
     requested = _safe_int(requested_raw, 0)
     filled = _safe_int(filled_raw, 0)
-    remaining = (
-        _safe_int(remaining_raw, 0)
-        if remaining_raw is not None
-        else max(0, requested - filled)
-    )
+    remaining = _safe_int(remaining_raw, 0) if remaining_raw is not None else max(0, requested - filled)
     raw_status = str(_get_first_valid(row, ("status", "ord_dvsn_name", "ord_sttus", "rjct_rson"), "") or "").upper()
     if "REJECT" in raw_status or "거부" in raw_status:
         status = "REJECTED"
@@ -614,7 +605,7 @@ class USDataProvider:
         cache_enabled: True이면 prep run 내에서 daily/price 캐시 사용
     """
 
-    def __init__(self, offline: bool = False, cache_enabled: bool = False) -> None:
+    def __init__(self, offline: bool = False, cache_enabled: bool = False, env: str = "practice") -> None:
         try:
             from trader.us.execution.kis_us_client import kis_http_block_enabled
             offline = bool(offline or kis_http_block_enabled())
@@ -622,6 +613,7 @@ class USDataProvider:
             offline = bool(offline)
         self._offline = offline
         self._cache_enabled = cache_enabled
+        self._env = str(env or "practice").strip().lower()
         self._client = None
         self._daily_cache: dict = {}
         self._price_cache: dict = {}
@@ -648,7 +640,7 @@ class USDataProvider:
     def _get_client(self):
         if self._client is None:
             from trader.us.execution.kis_us_client import KisUSClient
-            self._client = KisUSClient(env="practice", offline=self._offline)
+            self._client = KisUSClient(env=self._env, offline=self._offline)
         if self._tick_context is not None and hasattr(self._client, "bind_tick_context"):
             self._client.bind_tick_context(self._tick_context)
         return self._client

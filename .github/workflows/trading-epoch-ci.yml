@@ -1,0 +1,71 @@
+name: Trading Epoch CI
+
+on:
+  pull_request:
+    branches:
+      - dual-agent
+  workflow_dispatch:
+
+jobs:
+  trading-epoch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: epoch_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d epoch_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      KIS_HTTP_ENABLED: "0"
+      NO_TRADE: "1"
+      PYTHONPATH: .
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/epoch_ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte compile epoch paths
+        run: |
+          set -euo pipefail
+          python -m py_compile             trader/db/trading_epoch.py             trader/db/trading_epoch_broker_guard.py             trader/db/repos.py             trader/db/schema.py             trader/kr/infinite/repository.py             trader/us/db/repos.py             trader/us/db/strict_order_state.py             trader/us/infinite/repository.py             trader/us/runner/daily_report_runner.py             trader/us/runner/pnl_report_runner.py             scripts/start_new_trading_epoch.py             scripts/verify_active_trading_epoch.py             scripts/generate_us_portfolio_pnl_report.py
+
+      - name: Run epoch lifecycle regression
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_unified_trading_epoch.py tests/test_trading_epoch_broker_guard.py tests/kr/test_pr138_runs_repo_startup.py -q
+
+      - name: Execute 0052 on PostgreSQL 16
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_unified_trading_epoch_postgres.py -q
+
+      - name: Verify US order-fill epoch lineage on PostgreSQL 16
+        run: |
+          set -euo pipefail
+          python -m pytest tests/us/test_unified_trading_epoch_integrity.py -q

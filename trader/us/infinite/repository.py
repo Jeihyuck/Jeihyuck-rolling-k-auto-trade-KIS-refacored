@@ -27,6 +27,10 @@ class InfiniteRepository:
     def __init__(self, engine=None):
         self.engine = engine or get_engine()
 
+    def _epoch_id(self, bind=None, *, required: bool | None = None) -> str | None:
+        from trader.us.db.repos import _active_us_epoch
+        return _active_us_epoch(bind or self.engine, required=required)
+
     def ensure_schema(self) -> None:
         """Lightweight runtime readiness probe; migrations never run in a tick."""
         with self.engine.connect() as conn:
@@ -38,10 +42,18 @@ class InfiniteRepository:
     def load_state(self, strategy_id: str = "TQQQ_INFINITE_V3", symbol: str = "TQQQ") -> InfiniteState | None:
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(text("""
-                    SELECT * FROM us_tqqq_infinite_state
-                    WHERE strategy_id=:strategy_id AND symbol=:symbol
-                """), {"strategy_id": strategy_id, "symbol": symbol}).mappings().first()
+                epoch_id = self._epoch_id(conn)
+                if epoch_id:
+                    row = conn.execute(text("""
+                        SELECT * FROM us_tqqq_infinite_state
+                        WHERE trading_epoch_id=:epoch_id
+                          AND strategy_id=:strategy_id AND symbol=:symbol
+                    """), {"epoch_id": epoch_id, "strategy_id": strategy_id, "symbol": symbol}).mappings().first()
+                else:
+                    row = conn.execute(text("""
+                        SELECT * FROM us_tqqq_infinite_state
+                        WHERE strategy_id=:strategy_id AND symbol=:symbol
+                    """), {"strategy_id": strategy_id, "symbol": symbol}).mappings().first()
             if row is None:
                 return None
             metadata = row.get("metadata") or {}
@@ -68,35 +80,66 @@ class InfiniteRepository:
         state.validate()
         payload = asdict(state)
         payload["status"] = state.status.value
-        payload["metadata"] = json.dumps(state.metadata, default=str)
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO us_tqqq_infinite_state (
-                    strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
-                    core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
-                    market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
-                    status,metadata,version,updated_at
-                ) VALUES (
-                    :strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
-                    :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
-                    :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
-                    :status,CAST(:metadata AS jsonb),:version,NOW()
-                ) ON CONFLICT (strategy_id,symbol) DO UPDATE SET
-                    cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
-                    cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
-                    core_filled_notional=EXCLUDED.core_filled_notional,
-                    reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
-                    last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
-                    material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
-                    cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
-                    metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
-            """), payload)
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                payload["trading_epoch_id"] = epoch_id
+                payload["metadata"] = json.dumps({**state.metadata, "trading_epoch_id": epoch_id}, default=str)
+                sql = """
+                    INSERT INTO us_tqqq_infinite_state (
+                        trading_epoch_id,strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
+                        core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
+                        market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
+                        status,metadata,version,updated_at
+                    ) VALUES (
+                        :trading_epoch_id,:strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
+                        :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
+                        :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
+                        :status,CAST(:metadata AS jsonb),:version,NOW()
+                    ) ON CONFLICT (trading_epoch_id,strategy_id,symbol) DO UPDATE SET
+                        cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
+                        cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
+                        core_filled_notional=EXCLUDED.core_filled_notional,
+                        reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
+                        last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
+                        material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
+                        cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
+                        metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+                """
+            else:
+                payload["metadata"] = json.dumps(state.metadata, default=str)
+                sql = """
+                    INSERT INTO us_tqqq_infinite_state (
+                        strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
+                        core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
+                        market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
+                        status,metadata,version,updated_at
+                    ) VALUES (
+                        :strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
+                        :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
+                        :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
+                        :status,CAST(:metadata AS jsonb),:version,NOW()
+                    ) ON CONFLICT (strategy_id,symbol) DO UPDATE SET
+                        cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
+                        cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
+                        core_filled_notional=EXCLUDED.core_filled_notional,
+                        reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
+                        last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
+                        material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
+                        cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
+                        metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+                """
+            conn.execute(text(sql), payload)
 
     def pending_sides(self, trade_date: date, symbol: str = "TQQQ") -> tuple[bool, bool]:
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT side,status FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol
-            """), {"trade_date": trade_date, "symbol": symbol}).mappings()
+            epoch_id = self._epoch_id(conn)
+            sql = "SELECT side,status FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol"
+            params = {"trade_date": trade_date, "symbol": symbol}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            rows = conn.execute(text(sql), params).mappings()
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
 
@@ -121,6 +164,10 @@ class InfiniteRepository:
             sql += " AND side=:side"
             params["side"] = str(side).upper()
         with self.engine.connect() as conn:
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
             return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
 
     def load_expired_open_buy_orders(self, *, now: datetime, ttl_seconds: int,
@@ -128,15 +175,21 @@ class InfiniteRepository:
         """Return only this sleeve's unresolved BUYs whose broker TTL elapsed."""
         cutoff = now - timedelta(seconds=max(0, int(ttl_seconds)))
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
+            epoch_id = self._epoch_id(conn)
+            sql = """
                 SELECT * FROM us_orders
                 WHERE symbol=:symbol AND side='BUY'
                   AND client_order_key LIKE 'TQQQ_INF_V3:%'
                   AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
                                  'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
                   AND created_at <= :cutoff
-                ORDER BY created_at ASC
-            """), {"symbol": symbol, "cutoff": cutoff}).mappings().all()
+            """
+            params = {"symbol": symbol, "cutoff": cutoff}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at ASC"
+            rows = conn.execute(text(sql), params).mappings().all()
         return [dict(row) for row in rows]
 
     def mark_ttl_cancel_requested(self, order: dict, *, requested_at: datetime,
@@ -152,11 +205,15 @@ class InfiniteRepository:
             "tqqq_ttl_cancel_result": cancel_result or {},
         }, default=str)
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE us_orders
+            epoch_id = self._epoch_id(conn)
+            sql = """UPDATE us_orders
                 SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
-                WHERE trade_date=:trade_date AND client_order_key=:key
-            """), {"patch": patch, "trade_date": trade_date, "key": key})
+                WHERE trade_date=:trade_date AND client_order_key=:key"""
+            params = {"patch": patch, "trade_date": trade_date, "key": key}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            conn.execute(text(sql), params)
 
     def mark_ttl_unresolved_escalated(self, order: dict, *, escalated_at: datetime, unresolved_age_sec: float) -> None:
         """Persist a manual-reconcile RED marker without changing broker/order status."""
@@ -171,11 +228,15 @@ class InfiniteRepository:
             "manual_reconcile_reason": "TQQQ_TTL_UNRESOLVED_AFTER_CANCEL",
         }, default=str)
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE us_orders
+            epoch_id = self._epoch_id(conn)
+            sql = """UPDATE us_orders
                 SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
-                WHERE trade_date=:trade_date AND client_order_key=:key
-            """), {"patch": patch, "trade_date": trade_date, "key": key})
+                WHERE trade_date=:trade_date AND client_order_key=:key"""
+            params = {"patch": patch, "trade_date": trade_date, "key": key}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            conn.execute(text(sql), params)
 
     def apply_ttl_terminal_observation(self, order: dict, observation: dict) -> dict:
         """Persist only broker-confirmed terminal truth for the original order."""
@@ -206,7 +267,8 @@ class InfiniteRepository:
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
         """Capital reserved by unresolved BUY ACK/pending quantities."""
         with self.engine.connect() as conn:
-            value = conn.execute(text("""
+            epoch_id = self._epoch_id(conn)
+            sql = """
                 SELECT COALESCE(SUM(
                     CASE WHEN qty_requested > 0 THEN
                         committed_notional_usd * GREATEST(qty_requested-qty_filled,0) / qty_requested
@@ -215,42 +277,69 @@ class InfiniteRepository:
                 FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol AND side='BUY'
                   AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING','PARTIALLY_FILLED',
                                  'RECONCILE_PENDING','ACK_DB_FAILED')
-            """), {"trade_date": trade_date, "symbol": symbol}).scalar()
+            """
+            params = {"trade_date": trade_date, "symbol": symbol}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            value = conn.execute(text(sql), params).scalar()
         return max(0.0, float(value or 0))
 
     def next_full_exit_sequence(self, trade_date: date, cycle_id: str) -> int:
         """Return a deterministic retry sequence after terminal full-exit orders."""
         prefix = f"TQQQ_INF_V3:{cycle_id}:{trade_date.isoformat()}:SELL%"
         with self.engine.connect() as conn:
-            value = conn.execute(text("""
-                SELECT COUNT(*) FROM us_orders
+            epoch_id = self._epoch_id(conn)
+            sql = """SELECT COUNT(*) FROM us_orders
                 WHERE symbol='TQQQ' AND side='SELL' AND client_order_key LIKE :prefix
-                  AND status IN ('CANCELLED','REJECTED','EXPIRED')
-            """), {"prefix": prefix}).scalar()
+                  AND status IN ('CANCELLED','REJECTED','EXPIRED')"""
+            params = {"prefix": prefix}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            value = conn.execute(text(sql), params).scalar()
         return int(value or 0) + 1
 
     def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
         with self.engine.connect() as conn:
-            return bool(conn.execute(text("""
-                SELECT 1 FROM us_orders
+            epoch_id = self._epoch_id(conn)
+            sql = """SELECT 1 FROM us_orders
                 WHERE symbol=:symbol
                   AND status IN ('INTENT','SUBMITTED','ACK','PENDING','PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
-                  AND client_order_key LIKE 'TQQQ_INF_V3:%'
-                LIMIT 1
-            """), {"symbol": symbol}).first())
+                  AND client_order_key LIKE 'TQQQ_INF_V3:%'"""
+            params = {"symbol": symbol}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " LIMIT 1"
+            return bool(conn.execute(text(sql), params).first())
 
     def find_recovery_cycle_id(self, symbol: str = "TQQQ") -> str | None:
         """Reuse the newest durable Infinite key without rewriting its identity."""
         with self.engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT client_order_key FROM (
-                    SELECT client_order_key, created_at FROM us_orders WHERE symbol=:symbol
-                    UNION ALL
-                    SELECT client_order_key, created_at FROM us_order_intents WHERE symbol=:symbol
-                ) history
-                WHERE client_order_key LIKE 'TQQQ_INF_V3:%'
-                ORDER BY created_at DESC NULLS LAST LIMIT 1
-            """), {"symbol": symbol}).first()
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                row = conn.execute(text("""
+                    SELECT client_order_key FROM (
+                        SELECT client_order_key, created_at FROM us_orders
+                        WHERE symbol=:symbol AND trading_epoch_id=:epoch_id
+                        UNION ALL
+                        SELECT client_order_key, created_at FROM us_order_intents
+                        WHERE symbol=:symbol AND trading_epoch_id=:epoch_id
+                    ) history
+                    WHERE client_order_key LIKE 'TQQQ_INF_V3:%'
+                    ORDER BY created_at DESC NULLS LAST LIMIT 1
+                """), {"symbol": symbol, "epoch_id": epoch_id}).first()
+            else:
+                row = conn.execute(text("""
+                    SELECT client_order_key FROM (
+                        SELECT client_order_key, created_at FROM us_orders WHERE symbol=:symbol
+                        UNION ALL
+                        SELECT client_order_key, created_at FROM us_order_intents WHERE symbol=:symbol
+                    ) history
+                    WHERE client_order_key LIKE 'TQQQ_INF_V3:%'
+                    ORDER BY created_at DESC NULLS LAST LIMIT 1
+                """), {"symbol": symbol}).first()
         key = str(row[0] if row else "")
         parts = key.split(":")
         return parts[1] if len(parts) >= 3 and parts[1] else None
@@ -276,33 +365,70 @@ class InfiniteRepository:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
         start = state.cycle_start_date or trading_date
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
-                       f.client_order_key,f.order_no,
-                       i.strategy AS intent_strategy,i.meta AS intent_meta,
-                       o.meta AS order_meta
-                FROM us_fills f
-                LEFT JOIN us_order_intents i
-                  ON i.client_order_key=f.client_order_key
-                LEFT JOIN us_orders o
-                  ON o.client_order_key=f.client_order_key
-                WHERE f.symbol=:symbol AND f.trade_date>=:start
-                ORDER BY f.trade_date,f.filled_at,f.created_at
-            """), {"symbol": state.symbol, "start": start}).mappings().all()
+            epoch_id = self._epoch_id(conn)
+            params = {"symbol": state.symbol, "start": start}
+            if epoch_id:
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
+                           f.client_order_key,f.order_no,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,
+                           o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key=f.client_order_key
+                     AND i.trading_epoch_id=f.trading_epoch_id
+                    LEFT JOIN us_orders o
+                      ON o.client_order_key=f.client_order_key
+                     AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                      AND f.trading_epoch_id=:epoch_id
+                """
+                params["epoch_id"] = epoch_id
+            else:
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
+                           f.client_order_key,f.order_no,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,
+                           o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                    LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                """
+            sql += " ORDER BY f.trade_date,f.filled_at,f.created_at"
+            rows = conn.execute(text(sql), params).mappings().all()
         return self._summarize_fill_rows(rows, state, trading_date)
 
     def cycle_fill_stats(self, state: InfiniteState, trading_date: date) -> dict[str, Any]:
         """Extended fill diagnostics without changing ``fill_accounting``'s tuple contract."""
         start = state.cycle_start_date or trading_date
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
-                       i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
-                FROM us_fills f LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
-                LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
-                WHERE f.symbol=:symbol AND f.trade_date>=:start
-                ORDER BY f.trade_date,f.filled_at,f.created_at
-            """), {"symbol": state.symbol, "start": start}).mappings().all()
+            epoch_id = self._epoch_id(conn)
+            params = {"symbol": state.symbol, "start": start}
+            if epoch_id:
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                     AND i.trading_epoch_id=f.trading_epoch_id
+                    LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                     AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                      AND f.trading_epoch_id=:epoch_id
+                """
+                params["epoch_id"] = epoch_id
+            else:
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                    LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                """
+            sql += " ORDER BY f.trade_date,f.filled_at,f.created_at"
+            rows = conn.execute(text(sql), params).mappings().all()
         summary = self._summarize_fill_rows(rows, state, trading_date)
         last_price = None
         last_profit_stage = None

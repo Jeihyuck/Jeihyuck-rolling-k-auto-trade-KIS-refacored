@@ -1567,12 +1567,16 @@ def load_us_fills_count(trade_date: str) -> int:
     engine = _get_engine_or_none()
     if engine is None:
         return 0
+    from trader.us.db.repos import _active_us_epoch
+    epoch_id = _active_us_epoch(engine)
+    epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+    epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
     queries = [
-        "SELECT COUNT(*) AS n FROM us_fills WHERE trade_date = :td",
+        "SELECT COUNT(*) AS n FROM us_fills WHERE trade_date = :td" + epoch_clause,
     ]
     for sql in queries:
         try:
-            rows = _read_autocommit(engine, sql, {"td": trade_date})
+            rows = _read_autocommit(engine, sql, {"td": trade_date, **epoch_params})
             if rows:
                 return int(rows[0].get("n") or 0)
         except Exception as exc:
@@ -1605,6 +1609,10 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         result["fills_count"] = load_us_fills_count(trade_date)
         return result
     try:
+        from trader.us.db.repos import _active_us_epoch
+        epoch_id = _active_us_epoch(engine)
+        epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+        epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
         rows = _read_autocommit(
             engine,
             """
@@ -1616,8 +1624,8 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
               COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source
             FROM us_fills
             WHERE trade_date = :td
-            """,
-            {"td": trade_date},
+            """ + epoch_clause,
+            {"td": trade_date, **epoch_params},
         )
         unique_rows = {}
         for row in rows:
@@ -1688,13 +1696,17 @@ def load_balance_confirmed_count(trade_date: str) -> int:
     engine = _get_engine_or_none()
     if engine is None:
         return 0
+    from trader.us.db.repos import _active_us_epoch
+    epoch_id = _active_us_epoch(engine)
+    epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+    epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
     queries = [
-        "SELECT COUNT(*) AS n FROM us_orders WHERE trade_date = :td AND UPPER(COALESCE(state, status, '')) = 'BALANCE_CONFIRMED'",
-        "SELECT COUNT(*) AS n FROM us_positions WHERE as_of = :td AND COALESCE(qty, quantity, 0) > 0",
+        "SELECT COUNT(*) AS n FROM us_orders WHERE trade_date = :td AND UPPER(COALESCE(state, status, '')) = 'BALANCE_CONFIRMED'" + epoch_clause,
+        "SELECT COUNT(*) AS n FROM us_positions WHERE as_of = :td AND COALESCE(qty, quantity, 0) > 0" + epoch_clause,
     ]
     for sql in queries:
         try:
-            rows = _read_autocommit(engine, sql, {"td": trade_date})
+            rows = _read_autocommit(engine, sql, {"td": trade_date, **epoch_params})
             if rows and int(rows[0].get("n") or 0) > 0:
                 return int(rows[0].get("n") or 0)
         except Exception as exc:

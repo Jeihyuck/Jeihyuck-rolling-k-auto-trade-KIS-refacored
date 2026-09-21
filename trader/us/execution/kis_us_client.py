@@ -464,7 +464,8 @@ class KisUSClient:
         """
         self._assert_not_offline("get_us_balance")
         
-        exchanges_env = os.getenv("US_BALANCE_EXCHANGES", "NASD,NYSE,AMEX")
+        default_exchanges = "NASD" if getattr(self, "env", "practice") == "real" else "NASD,NYSE,AMEX"
+        exchanges_env = os.getenv("US_BALANCE_EXCHANGES", default_exchanges)
         exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
@@ -616,7 +617,8 @@ class KisUSClient:
         Returns:
             KIS raw response (output1 list, output2 dict/list)
         """
-        tr = get_tr_info("us_balance")
+        tr = dict(get_tr_info("us_balance"))
+        tr["tr_id"] = "TTTS3012R" if getattr(self, "env", "practice") == "real" else "VTTS3012R"
         headers = self._build_headers(tr["tr_id"])
         
         logger.info("[US_BALANCE][EXCHANGE][START] exchange=%s", exchange_code)
@@ -1112,7 +1114,8 @@ class KisUSClient:
         range fields. Pagination follows tr_cont plus CTX_AREA_NK200/FK200.
         """
         self._assert_not_offline("get_us_fills_today")
-        tr = get_tr_info("us_fills_today")
+        tr = dict(get_tr_info("us_fills_today"))
+        tr["tr_id"] = "TTTS3035R" if getattr(self, "env", "practice") == "real" else "VTTS3035R"
         headers = self._build_headers(tr["tr_id"])
 
         if trade_date:
@@ -1174,9 +1177,8 @@ class KisUSClient:
                 return all_rows
 
             # M/F explicitly means continuation. If KIS omits the response
-            # header but still supplies a cursor, fail safe by following the
-            # cursor rather than treating a potentially truncated first page
-            # as complete.
+            # header but still supplies a cursor, follow the cursor rather than
+            # treating a potentially truncated page as complete.
             if cursor == ("", "") or cursor in seen_cursors:
                 raise KisUSClientError(
                     f"KIS fills pagination contract error: tr_cont={tr_cont!r} cursor={cursor!r}"
@@ -1196,15 +1198,16 @@ class KisUSClient:
         """Build the official KIS practice inquire-ccnl parameter contract."""
         if schema not in {"PRACTICE_RANGE", "ALL_DATES", "ORD_DT", "ORD_RANGE"}:
             raise ValueError(f"unknown fills schema: {schema}")
+        real_mode = getattr(self, "env", "practice") == "real"
         return {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
-            "PDNO": "",
+            "PDNO": "%" if real_mode else "",
             "ORD_STRT_DT": ord_dt,
             "ORD_END_DT": ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
-            "OVRS_EXCG_CD": "",
+            "OVRS_EXCG_CD": "NASD" if real_mode else "",
             "SORT_SQN": "DS",
             "ORD_DT": "",
             "ORD_GNO_BRNO": "",
@@ -1318,7 +1321,8 @@ class KisUSClient:
                 data = resp.json()
                 self._check_rt_cd(data)
                 if isinstance(data, dict):
-                    tr_cont = str(resp.headers.get("tr_cont") or "").strip()
+                    response_headers = getattr(resp, "headers", {}) or {}
+                    tr_cont = str(response_headers.get("tr_cont") or "").strip()
                     if tr_cont:
                         response_meta = (
                             dict(data.get("_response_meta"))

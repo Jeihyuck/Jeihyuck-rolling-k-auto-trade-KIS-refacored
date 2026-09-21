@@ -36,14 +36,21 @@ def load_today_symbols_sold_strict(trade_date: str | None = None) -> set[str]:
     td = trade_date or date.today().isoformat()
     engine = _persistent_engine()
     with engine.begin() as conn:
-        rows = conn.execute(
-            text(
-                """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+        epoch_id = repos._active_us_epoch(conn)
+        if epoch_id:
+            sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                   AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.trade_date=:td AND f.side='SELL'
+                      AND f.trading_epoch_id=:epoch_id
+                      AND (o.id IS NULL OR o.status='FILLED')"""
+            params = {"td": td, "epoch_id": epoch_id}
+        else:
+            sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
                     ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
                     WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""
-            ),
-            {"td": td},
-        )
+            params = {"td": td}
+        rows = conn.execute(text(sql), params)
         return {r[0] for r in rows}
 
 
@@ -60,16 +67,17 @@ def has_pending_order_for_symbol_side_strict(
     side_u = str(side or "").strip().upper()
     engine = _persistent_engine()
     with engine.begin() as conn:
-        row = conn.execute(
-            text(
-                """
+        epoch_id = repos._active_us_epoch(conn)
+        sql = """
                 SELECT 1 FROM us_orders
                 WHERE symbol=:symbol AND side=:side AND trade_date=:td
                   AND status = ANY(:statuses)
                   AND dry_run = FALSE
-                LIMIT 1
-                """
-            ),
-            {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)},
-        ).first()
+        """
+        params = {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)}
+        if epoch_id:
+            sql += " AND trading_epoch_id=:epoch_id"
+            params["epoch_id"] = epoch_id
+        sql += " LIMIT 1"
+        row = conn.execute(text(sql), params).first()
         return row is not None

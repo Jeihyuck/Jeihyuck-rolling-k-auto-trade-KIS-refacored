@@ -59,6 +59,10 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
       AND order_no = CAST(:order_no AS text)
       AND symbol = CAST(:symbol AS text)
       AND side = CAST(:side AS text)
+      AND (
+        :trading_epoch_id IS NULL
+        OR trading_epoch_id = CAST(:trading_epoch_id AS text)
+      )
       AND NOT COALESCE(
         (meta->>'is_synthetic')::boolean,
         (meta->>'synthetic')::boolean,
@@ -72,7 +76,7 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
 """
 
 
-def _mark_filled_by_reconcile_stmt():
+def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
     """Build the typed actual-fill update used by PostgreSQL reconciliation.
 
     psycopg3 must not receive JSONB object values as ``unknown`` parameters:
@@ -80,7 +84,18 @@ def _mark_filled_by_reconcile_stmt():
     casts and SQLAlchemy bind types because this statement is executed through
     different SQLAlchemy/psycopg3 versions in production and repair jobs.
     """
-    return sa.text(_MARK_FILLED_BY_RECONCILE_SQL).bindparams(
+    sql = _MARK_FILLED_BY_RECONCILE_SQL
+    if not epoch_scoped:
+        sql = sql.replace(
+            """      AND (
+        :trading_epoch_id IS NULL
+        OR trading_epoch_id = CAST(:trading_epoch_id AS text)
+      )
+""",
+            "",
+        )
+    stmt = sa.text(sql)
+    bindparams = [
         sa.bindparam("qty", type_=sa.Integer()),
         sa.bindparam("price", type_=sa.Numeric()),
         sa.bindparam("cok", type_=sa.String()),
@@ -91,7 +106,10 @@ def _mark_filled_by_reconcile_stmt():
         sa.bindparam("order_no", type_=sa.String()),
         sa.bindparam("symbol", type_=sa.String()),
         sa.bindparam("side", type_=sa.String()),
-    )
+    ]
+    if epoch_scoped:
+        bindparams.append(sa.bindparam("trading_epoch_id", type_=sa.String()))
+    return stmt.bindparams(*bindparams)
 
 # ---------------------------------------------------------------------------
 # In-memory fallback store (offline / test 환경)
@@ -298,6 +316,47 @@ def _get_engine_or_none():
         return None
 
 
+def _epoch_enforced() -> bool:
+    from trader.db.trading_epoch import trading_epoch_enforced
+    return trading_epoch_enforced()
+
+
+def _active_us_epoch(bind: Any | None = None, *, required: bool | None = None) -> str | None:
+    """Resolve the current account generation without importing KR repositories."""
+    if required is None:
+        required = _epoch_enforced()
+    try:
+        from trader.account_state import get_account_key, resolve_env_name
+        from trader.db.trading_epoch import active_trading_epoch_id
+        env = resolve_env_name()
+        account_id = get_account_key(env=env)
+        target = bind or _get_engine_or_none()
+        if target is None:
+            if required:
+                raise RuntimeError("ACTIVE_TRADING_EPOCH_DB_UNAVAILABLE")
+            return None
+        return active_trading_epoch_id(
+            target, env=env, account_id=account_id, required=bool(required)
+        )
+    except Exception:
+        if required:
+            raise
+        return None
+
+
+def _us_state_epoch_id(bind: Any | None = None) -> str:
+    return str(_active_us_epoch(bind) or "legacy-unscoped-0052")
+
+
+def _assert_us_order_epoch(order: dict, active_epoch_id: str | None) -> str | None:
+    order_epoch = order.get("trading_epoch_id")
+    if active_epoch_id is not None and str(order_epoch or "") != str(active_epoch_id):
+        raise RuntimeError(
+            f"US_ORDER_TRADING_EPOCH_MISMATCH order_epoch={order_epoch!r} active_epoch={active_epoch_id!r}"
+        )
+    return str(order_epoch) if order_epoch not in (None, "") else None
+
+
 def _json_param(val: Any) -> str:
     """JSONB 파라미터를 JSON 문자열로 직렬화."""
     return json.dumps(val or {}, ensure_ascii=False, default=str)
@@ -389,8 +448,58 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
         return True
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("""
+            trading_epoch_id = _active_us_epoch(conn)
+            existing_result = conn.execute(
+                text("SELECT * FROM us_order_intents WHERE client_order_key=:cok FOR UPDATE"),
+                {"cok": intent.get("client_order_key")},
+            )
+            existing_row = existing_result.fetchone()
+            existing_intent = (
+                dict(existing_row._mapping)
+                if existing_row is not None and hasattr(existing_row, "_mapping")
+                else (dict(existing_row) if existing_row is not None else None)
+            )
+            incoming_identity = {
+                **intent,
+                "trade_date": td,
+                "trading_epoch_id": trading_epoch_id,
+                "meta": {**intent_meta, "trading_epoch_id": trading_epoch_id} if trading_epoch_id else intent_meta,
+            }
+            if existing_intent:
+                assert_same_identity(dict(existing_intent), incoming_identity)
+            intent_meta_to_store = {
+                **intent_meta,
+                **{field: intent.get(field) for field in (
+                    "strategy_owner", "strategy_name", "strategy_version", "sleeve_id"
+                ) if intent.get(field) is not None},
+                "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
+            }
+            params = {
+                "td": td,
+                "cok": intent.get("client_order_key"),
+                "symbol": intent.get("symbol"),
+                "exchange": intent.get("exchange", "NASDAQ"),
+                "side": intent.get("side", "BUY"),
+                "qty": int(intent.get("qty", 0)),
+                "limit_price_usd": intent.get("limit_price_usd") or intent.get("limit_price"),
+                "notional_usd": intent.get("notional_usd"),
+                "strategy": intent.get("strategy", "us_pb1"),
+                "status": "PENDING",
+            }
+            if trading_epoch_id:
+                intent_meta_to_store["trading_epoch_id"] = trading_epoch_id
+                params["trading_epoch_id"] = trading_epoch_id
+                sql = """
+                    INSERT INTO us_order_intents
+                        (trade_date, client_order_key, symbol, exchange, side, qty,
+                         limit_price_usd, notional_usd, strategy, status, trading_epoch_id, meta)
+                    VALUES (:td, :cok, :symbol, :exchange, :side, :qty,
+                            :limit_price_usd, :notional_usd, :strategy, :status, :trading_epoch_id,
+                            CAST(:meta AS jsonb))
+                    ON CONFLICT (client_order_key) DO NOTHING
+                """
+            else:
+                sql = """
                     INSERT INTO us_order_intents
                         (trade_date, client_order_key, symbol, exchange, side, qty,
                          limit_price_usd, notional_usd, strategy, status, meta)
@@ -398,27 +507,9 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                             :limit_price_usd, :notional_usd, :strategy, :status,
                             CAST(:meta AS jsonb))
                     ON CONFLICT (client_order_key) DO NOTHING
-                """),
-                {
-                    "td": td,
-                    "cok": intent.get("client_order_key"),
-                    "symbol": intent.get("symbol"),
-                    "exchange": intent.get("exchange", "NASDAQ"),
-                    "side": intent.get("side", "BUY"),
-                    "qty": int(intent.get("qty", 0)),
-                    "limit_price_usd": intent.get("limit_price_usd") or intent.get("limit_price"),
-                    "notional_usd": intent.get("notional_usd"),
-                    "strategy": intent.get("strategy", "us_pb1"),
-                    "status": "PENDING",
-                    "meta": _json_param({
-                        **intent_meta,
-                        **{field: intent.get(field) for field in (
-                            "strategy_owner", "strategy_name", "strategy_version", "sleeve_id"
-                        ) if intent.get(field) is not None},
-                        "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
-                    }),
-                },
-            )
+                """
+            params["meta"] = _json_param(intent_meta_to_store)
+            conn.execute(text(sql), params)
             if standard_buy:
                 persisted = conn.execute(
                     text("SELECT meta FROM us_order_intents WHERE client_order_key=:cok"),
@@ -444,10 +535,13 @@ def load_open_order_intents(trade_date: str | None = None) -> list[dict]:
         return [i for i in _MEM_INTENTS if i.get("trade_date") == td and i.get("status") == "PENDING"]
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM us_order_intents WHERE trade_date=:td AND status='PENDING'"),
-                {"td": td},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "SELECT * FROM us_order_intents WHERE trade_date=:td AND status='PENDING'"
+            params = {"td": td}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:trading_epoch_id"
+                params["trading_epoch_id"] = trading_epoch_id
+            rows = conn.execute(text(sql), params)
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
         logger.error("[US_INTENT][LOAD][ERROR] %s", exc)
@@ -463,10 +557,13 @@ def mark_order_intent_sent(client_order_key: str) -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='SENT' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='SENT' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_SENT][ERROR] %s", exc)
 
@@ -481,10 +578,13 @@ def mark_order_intent_blocked(client_order_key: str, reason: str = "") -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='BLOCKED' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='BLOCKED' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_BLOCKED][ERROR] %s", exc)
 
@@ -499,10 +599,13 @@ def mark_order_intent_rejected(client_order_key: str, reason: str = "") -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='REJECTED' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='REJECTED' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_REJECTED][ERROR] %s", exc)
 
@@ -517,10 +620,13 @@ def mark_order_intent_dry_run(client_order_key: str) -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='DRY_RUN' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='DRY_RUN' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_DRY_RUN][ERROR] %s", exc)
 
@@ -535,16 +641,61 @@ def mark_order_intent_dry_run(client_order_key: str) -> None:
 def _upsert_order(conn: Any, td: str, row: dict) -> None:
     from trader.us.execution.order_identity import assert_same_identity, require_identity
     require_identity(row.get("client_order_key"))
+    trading_epoch_id = row.get("trading_epoch_id") or _active_us_epoch(conn)
+    incoming_identity = {**row, "trade_date": td, "trading_epoch_id": trading_epoch_id}
     existing = conn.execute(text("SELECT * FROM us_orders WHERE client_order_key=:cok FOR UPDATE"), {"cok": row["client_order_key"]}).fetchone()
     if existing:
-        assert_same_identity(dict(existing._mapping), {**row, "trade_date": td})
+        assert_same_identity(dict(existing._mapping), incoming_identity)
     order_no = str(row.get("order_no") or "").strip()
     if order_no:
         broker_existing = conn.execute(text("SELECT * FROM us_orders WHERE trade_date=:td AND order_no=:ono FOR UPDATE"), {"td": td, "ono": order_no}).fetchone()
         if broker_existing:
-            assert_same_identity(dict(broker_existing._mapping), {**row, "trade_date": td})
-    conn.execute(
-        text("""
+            assert_same_identity(dict(broker_existing._mapping), incoming_identity)
+    params = {
+        "td": td,
+        "cok": row["client_order_key"],
+        "symbol": row["symbol"],
+        "exchange": row.get("exchange", "NASDAQ"),
+        "side": row["side"],
+        "qty_requested": row["qty_requested"],
+        "qty_filled": row.get("qty_filled", 0),
+        "avg_price_usd": row.get("avg_price_usd"),
+        "order_no": row.get("order_no", ""),
+        "status": row["status"],
+        "dry_run": bool(row.get("dry_run", False)),
+        "committed_notional_usd": row.get("committed_notional_usd"),
+        "env": row.get("env"),
+    }
+    order_meta = _parse_json_meta(row.get("meta"))
+    if trading_epoch_id:
+        order_meta["trading_epoch_id"] = trading_epoch_id
+        params["trading_epoch_id"] = trading_epoch_id
+        sql = """
+            INSERT INTO us_orders
+                (trade_date, client_order_key, symbol, exchange, side,
+                 qty_requested, qty_filled, avg_price_usd, order_no,
+                 status, dry_run, committed_notional_usd, env, trading_epoch_id, meta)
+            VALUES (:td, :cok, :symbol, :exchange, :side,
+                    :qty_requested, :qty_filled, :avg_price_usd, :order_no,
+                    :status, :dry_run, :committed_notional_usd, :env, :trading_epoch_id, CAST(:meta AS jsonb))
+            ON CONFLICT (client_order_key) DO UPDATE
+                SET qty_filled    =GREATEST(us_orders.qty_filled, EXCLUDED.qty_filled),
+                    avg_price_usd =EXCLUDED.avg_price_usd,
+                    order_no      =EXCLUDED.order_no,
+                    status        =CASE
+                        WHEN us_orders.status IN ('FILLED','CANCELLED','REJECTED','EXPIRED')
+                             AND EXCLUDED.status NOT IN ('FILLED','CANCELLED','REJECTED','EXPIRED') THEN us_orders.status
+                        WHEN us_orders.status='PARTIALLY_FILLED' AND EXCLUDED.status IN ('ACK','OPEN') THEN us_orders.status
+                        ELSE EXCLUDED.status END,
+                    dry_run       =EXCLUDED.dry_run,
+                    committed_notional_usd=COALESCE(us_orders.committed_notional_usd, EXCLUDED.committed_notional_usd),
+                    env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
+                    trading_epoch_id=us_orders.trading_epoch_id,
+                    meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
+                    updated_at    =NOW()
+        """
+    else:
+        sql = """
             INSERT INTO us_orders
                 (trade_date, client_order_key, symbol, exchange, side,
                  qty_requested, qty_filled, avg_price_usd, order_no,
@@ -566,24 +717,9 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
                     meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
                     updated_at    =NOW()
-        """),
-        {
-            "td": td,
-            "cok": row["client_order_key"],
-            "symbol": row["symbol"],
-            "exchange": row.get("exchange", "NASDAQ"),
-            "side": row["side"],
-            "qty_requested": row["qty_requested"],
-            "qty_filled": row.get("qty_filled", 0),
-            "avg_price_usd": row.get("avg_price_usd"),
-            "order_no": row.get("order_no", ""),
-            "status": row["status"],
-            "dry_run": bool(row.get("dry_run", False)),
-            "committed_notional_usd": row.get("committed_notional_usd"),
-            "env": row.get("env"),
-            "meta": _json_param(row.get("meta")),
-        },
-    )
+        """
+    params["meta"] = _json_param(order_meta)
+    conn.execute(text(sql), params)
 
 
 def append_us_order_event(event: dict) -> bool:
@@ -593,18 +729,39 @@ def append_us_order_event(event: dict) -> bool:
         return False
     try:
         with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO us_order_events
-                (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,
-                 client_order_key,submit_attempt_id,symbol,side,requested_qty,
-                 raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
-                 profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
-                VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
-                 :session,:session_run_id,:tick_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
-                 :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
-                 :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
-                ON CONFLICT (idempotency_key) DO NOTHING
-            """), {**event, "payload": _json_param(event.get("payload") or {})})
+            trading_epoch_id = _active_us_epoch(conn)
+            payload = _parse_json_meta(event.get("payload") or {})
+            params = {**event}
+            if trading_epoch_id:
+                payload["trading_epoch_id"] = trading_epoch_id
+                params["trading_epoch_id"] = trading_epoch_id
+                sql = """
+                    INSERT INTO us_order_events
+                    (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,trading_epoch_id,
+                     client_order_key,submit_attempt_id,symbol,side,requested_qty,
+                     raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
+                     profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
+                    VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
+                     :session,:session_run_id,:tick_id,:trading_epoch_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
+                     :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
+                     :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                """
+            else:
+                sql = """
+                    INSERT INTO us_order_events
+                    (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,
+                     client_order_key,submit_attempt_id,symbol,side,requested_qty,
+                     raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
+                     profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
+                    VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
+                     :session,:session_run_id,:tick_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
+                     :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
+                     :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
+                    ON CONFLICT (idempotency_key) DO NOTHING
+                """
+            params["payload"] = _json_param(payload)
+            conn.execute(text(sql), params)
         return True
     except Exception as exc:
         logger.error("[US_ORDER_EVENT][DB_APPEND_FAILED] %s", exc)
@@ -617,6 +774,10 @@ def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> 
         return None
     sql = "SELECT *, event_timestamp AS timestamp, raw_broker_order_no AS broker_order_no FROM us_order_events WHERE trade_date=:td"
     params = {"td": trade_date}
+    epoch_id = _active_us_epoch(engine)
+    if epoch_id:
+        sql += " AND trading_epoch_id=:epoch_id"
+        params["epoch_id"] = epoch_id
     if session_run_id:
         sql += " AND session_run_id=:session_run_id"
         params["session_run_id"] = session_run_id
@@ -731,13 +892,26 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         old_filled=int(identity_rows[0].get("qty_filled") or 0)
     else:
         with engine.connect() as conn:
-            identity_row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key"), {"td": td, "key": key}).mappings().first()
-        if not identity_row: return {"status": "ORDER_NOT_FOUND"}
+            active_epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
+            identity_row = conn.execute(
+                text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                {"td": td, "key": key, **epoch_params},
+            ).mappings().first()
+            state_row = conn.execute(
+                text("SELECT status,qty_filled,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                {"td": td, "key": key, **epoch_params},
+            ).mappings().first()
+        if not identity_row:
+            return {"status": "ORDER_NOT_FOUND"}
+        _assert_us_order_epoch(dict(identity_row), active_epoch_id)
         order_meta = {**_parse_json_meta(identity_row.get("meta")), **meta_patch}
         old_status="ACK"; old_filled=0
-        with engine.connect() as conn:
-            state_row=conn.execute(text("SELECT status,qty_filled FROM us_orders WHERE trade_date=:td AND client_order_key=:key"),{"td":td,"key":key}).mappings().first()
-        if state_row: old_status=str(state_row.get("status") or "ACK").upper(); old_filled=int(state_row.get("qty_filled") or 0)
+        if state_row:
+            _assert_us_order_epoch(dict(state_row), active_epoch_id)
+            old_status=str(state_row.get("status") or "ACK").upper()
+            old_filled=int(state_row.get("qty_filled") or 0)
     terminal={"FILLED","CANCELLED","REJECTED","EXPIRED"}
     stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
     if stale:
@@ -766,16 +940,27 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             order_meta = order["meta"]
         else:
             with engine.begin() as conn:
-                row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key FOR UPDATE"), {"td": td, "key": key}).mappings().first()
-                if not row: return {"status": "ORDER_NOT_FOUND"}
+                active_epoch_id = _active_us_epoch(conn)
+                epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+                epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
+                row = conn.execute(
+                    text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause + " FOR UPDATE"),
+                    {"td": td, "key": key, **epoch_params},
+                ).mappings().first()
+                if not row:
+                    return {"status": "ORDER_NOT_FOUND"}
+                _assert_us_order_epoch(dict(row), active_epoch_id)
                 order_meta = {**_parse_json_meta(row.get("meta")), **meta_patch}
-                conn.execute(text("""UPDATE us_orders SET status=CASE
+                result = conn.execute(text("""UPDATE us_orders SET status=CASE
                     WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
                     WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
                     ELSE :status END,
                     order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
-                    WHERE trade_date=:td AND client_order_key=:key"""),
-                             {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta), "td": td, "key": key})
+                    WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
+                    {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta),
+                     "td": td, "key": key, **epoch_params})
+                if int(result.rowcount or 0) != 1:
+                    return {"status": "ORDER_NOT_FOUND"}
         if side.upper() == "SELL" and order_meta.get("profit_capture_stage"):
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
             sync_profit_capture_stage_from_order(trade_date=td, symbol=symbol,
@@ -908,6 +1093,7 @@ def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> d
 def _ensure_us_position_risk_state_table(conn) -> None:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS us_position_risk_state (
+            trading_epoch_id TEXT NOT NULL,
             trade_date DATE NOT NULL,
             symbol TEXT NOT NULL,
             soft_stop_breach_count INTEGER NOT NULL DEFAULT 0,
@@ -918,7 +1104,7 @@ def _ensure_us_position_risk_state_table(conn) -> None:
             last_pnl_pct NUMERIC,
             state JSONB DEFAULT '{}'::jsonb,
             updated_at TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (trade_date, symbol)
+            PRIMARY KEY (trading_epoch_id, trade_date, symbol)
         )
     """))
 
@@ -932,16 +1118,18 @@ def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             row = conn.execute(
                 text("""
-                    SELECT trade_date, symbol, soft_stop_breach_count,
+                    SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                            first_soft_stop_seen_at, last_soft_stop_seen_at,
                            lowest_price_since_breach, last_price, last_pnl_pct,
                            state, updated_at
                     FROM us_position_risk_state
-                    WHERE trade_date = :td AND symbol = :symbol
+                    WHERE trading_epoch_id=:epoch_id
+                      AND trade_date = :td AND symbol = :symbol
                 """),
-                {"td": trade_date, "symbol": key[1]},
+                {"epoch_id": epoch_id, "td": trade_date, "symbol": key[1]},
             ).mappings().first()
             return dict(row) if row else {}
     except Exception as exc:
@@ -962,16 +1150,18 @@ def load_latest_us_position_risk_state(symbol: str, on_or_before_trade_date: str
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             row = conn.execute(text("""
-                SELECT trade_date, symbol, soft_stop_breach_count,
+                SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                        first_soft_stop_seen_at, last_soft_stop_seen_at,
                        lowest_price_since_breach, last_price, last_pnl_pct,
                        state, updated_at
                 FROM us_position_risk_state
-                WHERE symbol = :symbol AND trade_date <= :trade_date
+                WHERE trading_epoch_id=:epoch_id
+                  AND symbol = :symbol AND trade_date <= :trade_date
                 ORDER BY trade_date DESC, updated_at DESC
                 LIMIT 1
-            """), {"symbol": key_symbol, "trade_date": td}).mappings().first()
+            """), {"epoch_id": epoch_id, "symbol": key_symbol, "trade_date": td}).mappings().first()
             return dict(row) if row else {}
     except Exception as exc:
         logger.warning("[US_RISK_STATE][LOAD_LATEST_WARN] symbol=%s trade_date=%s err=%s", key_symbol, td, exc)
@@ -998,12 +1188,13 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             rows = conn.execute(text("""
-                SELECT DISTINCT ON (symbol) trade_date, symbol, state, updated_at
+                SELECT DISTINCT ON (symbol) trading_epoch_id, trade_date, symbol, state, updated_at
                 FROM us_position_risk_state
-                WHERE trade_date <= :trade_date
+                WHERE trading_epoch_id=:epoch_id AND trade_date <= :trade_date
                 ORDER BY symbol, trade_date DESC, updated_at DESC
-            """), {"trade_date": td}).mappings()
+            """), {"epoch_id": epoch_id, "trade_date": td}).mappings()
             for row in rows:
                 st = row.get("state") or {}
                 lifecycle = (st.get("lifecycle") or {}) if isinstance(st, dict) else {}
@@ -1025,21 +1216,22 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             conn.execute(
                 text("""
                     INSERT INTO us_position_risk_state (
-                        trade_date, symbol, soft_stop_breach_count,
+                        trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                         first_soft_stop_seen_at, last_soft_stop_seen_at,
                         lowest_price_since_breach, last_price, last_pnl_pct,
                         state, updated_at
                     )
                     VALUES (
-                        :td, :symbol, :soft_stop_breach_count,
+                        :epoch_id, :td, :symbol, :soft_stop_breach_count,
                         :first_soft_stop_seen_at, :last_soft_stop_seen_at,
                         :lowest_price_since_breach, :last_price, :last_pnl_pct,
                         CAST(:state AS jsonb), NOW()
                     )
-                    ON CONFLICT (trade_date, symbol) DO UPDATE SET
+                    ON CONFLICT (trading_epoch_id, trade_date, symbol) DO UPDATE SET
                         soft_stop_breach_count = EXCLUDED.soft_stop_breach_count,
                         first_soft_stop_seen_at = EXCLUDED.first_soft_stop_seen_at,
                         last_soft_stop_seen_at = EXCLUDED.last_soft_stop_seen_at,
@@ -1050,6 +1242,7 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
                         updated_at = NOW()
                 """),
                 {
+                    "epoch_id": epoch_id,
                     "td": trade_date,
                     "symbol": key[1],
                     "soft_stop_breach_count": normalized["soft_stop_breach_count"],
@@ -1135,13 +1328,18 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                         state[key] = candidate[key]
         if engine is not None:
             with engine.connect() as conn:
-                rows = conn.execute(text("""SELECT DISTINCT ON (stage)
+                epoch_id = _active_us_epoch(conn)
+                sql = """SELECT DISTINCT ON (stage)
                     stage,stage_status,client_order_key,raw_broker_order_no,
                     cumulative_filled_qty,state,updated_at,trade_date
                     FROM us_profit_capture_lifecycle
-                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle
-                    ORDER BY stage,trade_date DESC,updated_at DESC"""),
-                    {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}).mappings().all()
+                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle"""
+                params = {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                sql += " ORDER BY stage,trade_date DESC,updated_at DESC"
+                rows = conn.execute(text(sql), params).mappings().all()
             state={"position_lifecycle_id":lifecycle,"meta":{}}
             for row in rows:
                 stage=str(row["stage"]); status=str(row["stage_status"])
@@ -1210,21 +1408,39 @@ def mark_us_profit_capture_stage(
     if engine is not None:
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
         with engine.begin() as conn:
-            conn.execute(text("""INSERT INTO us_profit_capture_lifecycle
-                (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
-                 raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
-                VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
-                ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
-                 stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
-                 raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
-                 canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
-                 requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
-                 cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
-                 state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""),
-                {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
-                 "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
-                 "requested":int(qty or meta.get(f"{stg}_qty") or 0),"filled":int(meta.get(f"{stg}_filled_qty") or 0),
-                 "state":_json_param(normalized)})
+            epoch_id = _active_us_epoch(conn)
+            params = {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
+                      "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
+                      "requested":int(qty or meta.get(f"{stg}_qty") or 0),
+                      "filled":int(meta.get(f"{stg}_filled_qty") or 0),
+                      "state":_json_param(normalized)}
+            if epoch_id:
+                params["epoch_id"] = epoch_id
+                sql = """INSERT INTO us_profit_capture_lifecycle
+                    (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                     raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,trading_epoch_id,state,updated_at)
+                    VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,:epoch_id,CAST(:state AS jsonb),NOW())
+                    ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                     stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                     raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                     canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                     requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                     cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                     trading_epoch_id=COALESCE(us_profit_capture_lifecycle.trading_epoch_id,EXCLUDED.trading_epoch_id),
+                     state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
+            else:
+                sql = """INSERT INTO us_profit_capture_lifecycle
+                    (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                     raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
+                    VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
+                    ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                     stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                     raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                     canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                     requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                     cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                     state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
+            conn.execute(text(sql), params)
 
 
 def mark_us_position_exit_stage(
@@ -1523,26 +1739,90 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     skipped_duplicates = 0
     try:
         with engine.begin() as conn:
+            trading_epoch_id = _active_us_epoch(conn)
             for f in fills:
                 idem = _us_fill_idempotency_key_text(f, td)
                 incoming_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
                 evidence = str(incoming_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
                 incoming_cum = int(incoming_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
-                if _is_kis_order_cumulative_evidence(evidence):
-                    existing = conn.execute(
-                        text("""SELECT qty, meta FROM us_fills
-                                  WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
-                        {"fill_idempotency_key": idem},
+
+                order_epoch_id = trading_epoch_id
+                if trading_epoch_id and _is_actual_evidence(evidence):
+                    order_row = conn.execute(
+                        text("""SELECT trading_epoch_id FROM us_orders
+                                WHERE trade_date=:td
+                                  AND ((:cok <> '' AND client_order_key=:cok)
+                                       OR (:order_no <> '' AND order_no=:order_no))
+                                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                                LIMIT 1"""),
+                        {
+                            "td": td,
+                            "cok": str(f.get("client_order_key") or ""),
+                            "order_no": str(f.get("order_no") or ""),
+                        },
                     ).mappings().first()
-                    if existing:
-                        existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
-                        existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing.get("qty") or 0)
-                        if incoming_cum < existing_cum:
-                            f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
-                            skipped_duplicates += 1
-                            continue
-                result = conn.execute(
-                    text("""
+                    if not order_row:
+                        f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                        skipped_duplicates += 1
+                        continue
+                    order_epoch_id = _assert_us_order_epoch(dict(order_row), trading_epoch_id)
+
+                existing_select_cols = "qty, meta, trading_epoch_id" if order_epoch_id else "qty, meta"
+                existing = conn.execute(
+                    text(f"""SELECT {existing_select_cols} FROM us_fills
+                             WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
+                    {"fill_idempotency_key": idem},
+                ).mappings().first()
+                if existing and (
+                    order_epoch_id is not None
+                    and str(existing.get("trading_epoch_id") or "") != str(order_epoch_id)
+                ):
+                    f["save_status"] = "FILL_EPOCH_COLLISION"
+                    skipped_duplicates += 1
+                    continue
+
+                if _is_kis_order_cumulative_evidence(evidence) and existing:
+                    existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+                    existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing.get("qty") or 0)
+                    if incoming_cum < existing_cum:
+                        f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
+                        skipped_duplicates += 1
+                        continue
+                fill_meta_to_store = _parse_json_meta(f.get("meta"))
+                params = {
+                    "td": td,
+                    "symbol": f.get("symbol"),
+                    "exchange": f.get("exchange", "NASDAQ"),
+                    "side": f.get("side"),
+                    "qty": int(f.get("qty", 0)),
+                    "price_usd": float(f.get("price_usd") or f.get("price", 0)),
+                    "order_no": f.get("order_no", ""),
+                    "cok": f.get("client_order_key", ""),
+                    "filled_at": f.get("filled_at"),
+                    "fill_idempotency_key": idem,
+                }
+                if order_epoch_id:
+                    fill_meta_to_store["trading_epoch_id"] = order_epoch_id
+                    params["trading_epoch_id"] = order_epoch_id
+                    sql = """
+                        INSERT INTO us_fills
+                            (trade_date, symbol, exchange, side, qty, price_usd,
+                             order_no, client_order_key, filled_at, trading_epoch_id, meta, fill_idempotency_key)
+                        VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
+                                :order_no, :cok, :filled_at, :trading_epoch_id, CAST(:meta AS jsonb), :fill_idempotency_key)
+                        ON CONFLICT (fill_idempotency_key)
+                        DO UPDATE SET
+                            qty = EXCLUDED.qty,
+                            price_usd = EXCLUDED.price_usd,
+                            filled_at = COALESCE(EXCLUDED.filled_at, us_fills.filled_at),
+                            client_order_key = EXCLUDED.client_order_key,
+                            trading_epoch_id = us_fills.trading_epoch_id,
+                            meta = us_fills.meta || EXCLUDED.meta
+                        WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
+                              > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
+                    """
+                else:
+                    sql = """
                         INSERT INTO us_fills
                             (trade_date, symbol, exchange, side, qty, price_usd,
                              order_no, client_order_key, filled_at, meta, fill_idempotency_key)
@@ -1557,21 +1837,9 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                             meta = us_fills.meta || EXCLUDED.meta
                         WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
                               > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
-                    """),
-                    {
-                        "td": td,
-                        "symbol": f.get("symbol"),
-                        "exchange": f.get("exchange", "NASDAQ"),
-                        "side": f.get("side"),
-                        "qty": int(f.get("qty", 0)),
-                        "price_usd": float(f.get("price_usd") or f.get("price", 0)),
-                        "order_no": f.get("order_no", ""),
-                        "cok": f.get("client_order_key", ""),
-                        "filled_at": f.get("filled_at"),
-                        "meta": _json_param(f.get("meta")),
-                        "fill_idempotency_key": idem,
-                    },
-                )
+                    """
+                params["meta"] = _json_param(fill_meta_to_store)
+                result = conn.execute(text(sql), params)
                 if int(result.rowcount or 0) > 0:
                     count += 1
                 else:
@@ -1598,6 +1866,8 @@ def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> 
         "RECONCILE_ORDER_IDENTITY_REQUIRED",
         "RECONCILE_TRADE_DATE_REQUIRED",
         "RECONCILE_QTY_EVIDENCE_MISSING",
+        "FILL_EPOCH_COLLISION",
+        "ORDER_EPOCH_MISMATCH",
     }
     status_counts: dict[str, int] = {}
     for f in fills or []:
@@ -1620,6 +1890,8 @@ def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> 
             "RECONCILE_ORDER_IDENTITY_REQUIRED",
             "RECONCILE_TRADE_DATE_REQUIRED",
             "RECONCILE_QTY_EVIDENCE_MISSING",
+            "FILL_EPOCH_COLLISION",
+            "ORDER_EPOCH_MISMATCH",
         ]
         status = next((s for s in priority if status_counts.get(s)), next(iter(status_counts)))
         return {"status": status, "inserted_count": int(inserted or 0),
@@ -1651,16 +1923,25 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
     
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("""
+            trading_epoch_id = _active_us_epoch(conn)
+            params = {"td": td}
+            if trading_epoch_id:
+                sql = """
+                    SELECT trade_date, symbol, exchange, side, qty, price_usd,
+                           order_no, client_order_key, filled_at, trading_epoch_id, meta
+                    FROM us_fills
+                    WHERE trade_date=:td AND trading_epoch_id=:trading_epoch_id
+                """
+                params["trading_epoch_id"] = trading_epoch_id
+            else:
+                sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
                            order_no, client_order_key, filled_at, meta
                     FROM us_fills
                     WHERE trade_date=:td
-                    ORDER BY filled_at DESC
-                """),
-                {"td": td},
-            )
+                """
+            sql += " ORDER BY filled_at DESC"
+            rows = conn.execute(text(sql), params)
             fills = [dict(r._mapping) for r in rows]
             logger.info("[US_FILLS][DB_ONLY][OK] count=%d trade_date=%s", len(fills), td)
             return fills
@@ -1753,14 +2034,19 @@ def _load_us_entry_policy_for_position(
     trade_date: str,
     position_lifecycle_id: str | None = None,
 ) -> dict[str, Any]:
+    trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
+
     # Inspect the latest snapshot regardless of qty. A qty=0 row is an explicit
     # lifecycle boundary; skipping it (the old qty>0 query) could resurrect a
     # fully closed cycle's policy on a later repurchase.
     latest_result = conn.execute(text("""
         SELECT meta, qty, as_of FROM us_positions
         WHERE UPPER(symbol)=:symbol AND as_of<=:td
+    """ + epoch_clause + """
         ORDER BY as_of DESC LIMIT 1
-    """), {"symbol": symbol, "td": trade_date})
+    """), {"symbol": symbol, "td": trade_date, **epoch_params})
     latest_rows = _mapping_rows_from_result(latest_result)
     latest = latest_rows[0] if latest_rows else {}
     latest_meta = _parse_json_meta(latest.get("meta"))
@@ -1777,8 +2063,9 @@ def _load_us_entry_policy_for_position(
         SELECT meta, trade_date, created_at FROM us_orders
         WHERE UPPER(symbol)=:symbol AND trade_date<=:td AND side='BUY' AND dry_run=FALSE
           AND status IN ('SENT','ACK','OPEN','PARTIALLY_FILLED','FILLED')
+    """ + epoch_clause + """
         ORDER BY trade_date DESC,created_at DESC LIMIT 20
-    """), {"symbol": symbol, "td": trade_date})
+    """), {"symbol": symbol, "td": trade_date, **epoch_params})
     buy_orders = _mapping_rows_from_result(buy_result)
     for row in buy_orders:
         order_meta = _parse_json_meta(row.get("meta"))
@@ -1892,6 +2179,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
     count = 0
     try:
         with engine.begin() as conn:
+            trading_epoch_id = _active_us_epoch(conn)
             for p in positions:
                 avg_cost = float(p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd") or 0)
                 current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
@@ -1926,8 +2214,34 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 })
                 p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
                 p["meta"] = meta
-                conn.execute(
-                    text("""
+                params = {
+                    "as_of": td,
+                    "symbol": p.get("symbol"),
+                    "exchange": p.get("exchange", "NASDAQ"),
+                    "qty": int(p.get("qty", 0)),
+                    "avg_cost": avg_cost,
+                    "current_px": current_px,
+                    "unrealized_pnl_usd": float(p.get("unrealized_pnl_usd", 0)),
+                }
+                meta_to_store = dict(meta)
+                if trading_epoch_id:
+                    meta_to_store["trading_epoch_id"] = trading_epoch_id
+                    params["trading_epoch_id"] = trading_epoch_id
+                    sql = """
+                        INSERT INTO us_positions
+                            (as_of, symbol, exchange, qty, avg_cost, current_px,
+                             unrealized_pnl_usd, trading_epoch_id, meta)
+                        VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
+                                :unrealized_pnl_usd, :trading_epoch_id, CAST(:meta AS jsonb))
+                        ON CONFLICT (trading_epoch_id, as_of, symbol, exchange) DO UPDATE
+                            SET qty               =EXCLUDED.qty,
+                                avg_cost          =EXCLUDED.avg_cost,
+                                current_px        =EXCLUDED.current_px,
+                                unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                                meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
+                    """
+                else:
+                    sql = """
                         INSERT INTO us_positions
                             (as_of, symbol, exchange, qty, avg_cost, current_px,
                              unrealized_pnl_usd, meta)
@@ -1939,30 +2253,24 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 current_px        =EXCLUDED.current_px,
                                 unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
                                 meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
-                    """),
-                    {
-                        "as_of": td,
-                        "symbol": p.get("symbol"),
-                        "exchange": p.get("exchange", "NASDAQ"),
-                        "qty": int(p.get("qty", 0)),
-                        "avg_cost": avg_cost,
-                        "current_px": current_px,
-                        "unrealized_pnl_usd": float(p.get("unrealized_pnl_usd", 0)),
-                        "meta": _json_param(meta),
-                    },
-                )
+                    """
+                params["meta"] = _json_param(meta_to_store)
+                conn.execute(text(sql), params)
                 count += 1
             if stale_close_requested:
-                conn.execute(
-                    text("""
-                        UPDATE us_positions SET qty=0,
-                          meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
-                            'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
-                            'closed_at',NOW()::text,'close_source',CAST(:source AS text))
-                        WHERE as_of=:td AND qty>0
-                          AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))
-                    """), {"td": td, "symbols": symbols, "source": close_source},
-                )
+                params = {"td": td, "symbols": symbols, "source": close_source}
+                sql = """
+                    UPDATE us_positions SET qty=0,
+                      meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                        'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
+                        'closed_at',NOW()::text,'close_source',CAST(:source AS text))
+                    WHERE as_of=:td AND qty>0
+                """
+                if trading_epoch_id:
+                    sql += " AND trading_epoch_id=:trading_epoch_id"
+                    params["trading_epoch_id"] = trading_epoch_id
+                sql += " AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))"
+                conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
         if authoritative_positions:
@@ -1982,10 +2290,13 @@ def load_positions(as_of: str | None = None) -> list[dict]:
     else:
         try:
             with engine.begin() as conn:
-                raw = conn.execute(
-                    text("SELECT * FROM us_positions WHERE as_of=:td AND qty>0"),
-                    {"td": td},
-                )
+                trading_epoch_id = _active_us_epoch(conn)
+                sql = "SELECT * FROM us_positions WHERE as_of=:td AND qty>0"
+                params = {"td": td}
+                if trading_epoch_id:
+                    sql += " AND trading_epoch_id=:trading_epoch_id"
+                    params["trading_epoch_id"] = trading_epoch_id
+                raw = conn.execute(text(sql), params)
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
             logger.error("[US_POSITIONS][LOAD][ERROR] %s", exc)
@@ -2032,12 +2343,21 @@ def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
                 and (not f.get("client_order_key") or f.get("client_order_key") in fully_sold_keys)}
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("""SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+            epoch_id = _active_us_epoch(conn)
+            if epoch_id:
+                sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
                     ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
-                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""),
-                {"td": td},
-            )
+                   AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.trade_date=:td AND f.side='SELL'
+                      AND f.trading_epoch_id=:epoch_id
+                      AND (o.id IS NULL OR o.status='FILLED')"""
+                params = {"td": td, "epoch_id": epoch_id}
+            else:
+                sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""
+                params = {"td": td}
+            rows = conn.execute(text(sql), params)
             return {r[0] for r in rows}
     except Exception as exc:
         logger.error("[US_FILLS][SOLD_TODAY][ERROR] %s", exc)
@@ -2052,10 +2372,13 @@ def load_today_order_keys(trade_date: str | None = None) -> set[str]:
                 if o.get("trade_date") == td and o.get("client_order_key")}
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td"),
-                {"td": td},
-            )
+            epoch_id = _active_us_epoch(conn)
+            sql = "SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td"
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            rows = conn.execute(text(sql), params)
             return {r[0] for r in rows}
     except Exception as exc:
         logger.error("[US_ORDERS][KEYS][ERROR] %s", exc)
@@ -2078,17 +2401,20 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
         ]
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("""
+            epoch_id = _active_us_epoch(conn)
+            sql = """
                     SELECT *
                     FROM us_orders
                     WHERE trade_date = :td
                       AND status IN ('ACK', 'SENT', 'PARTIALLY_FILLED')
                       AND COALESCE(qty_filled, 0) < qty_requested
-                    ORDER BY created_at ASC
-                """),
-                {"td": td},
-            )
+            """
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at ASC"
+            rows = conn.execute(text(sql), params)
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
         logger.error("[US_ORDERS][PENDING_ACK][ERROR] %s", exc)
@@ -2201,29 +2527,35 @@ def load_us_order_for_fill(
         return dict(matches[-1]) if matches else {}
     try:
         with engine.begin() as conn:
-            # Exact lookup remains the fast path.  The bounded candidate query
-            # then handles KIS' leading-zero presentation difference without a
-            # migration/index requirement.
+            # Exact lookup remains the fast path.  Bound it to the active
+            # account generation so reused broker order numbers cannot attach
+            # a new fill to a legacy order.
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            epoch_select = ", trading_epoch_id" if epoch_id else ""
             row = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
                 FROM us_orders
                 WHERE trade_date = :td AND symbol = :symbol
                   AND ((:order_no <> '' AND order_no = :order_no)
                        OR (:cok <> '' AND client_order_key = :cok))
+            """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
                 LIMIT 1
-            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok}).mappings().first()
+            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok, **epoch_params}).mappings().first()
             if row:
                 return dict(row)
             if not on_norm:
                 return {}
             candidates = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
                 FROM us_orders WHERE trade_date=:td AND symbol=:symbol
+            """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-            """), {"td": td, "symbol": sym}).mappings().all()
+            """), {"td": td, "symbol": sym, **epoch_params}).mappings().all()
             for candidate in candidates:
                 candidate_dict = dict(candidate)
                 meta = _parse_json_meta(candidate_dict.get("meta"))
@@ -2234,7 +2566,15 @@ def load_us_order_for_fill(
         logger.warning("[US_ORDER][LOAD_FOR_FILL_WARN] symbol=%s order_no=%s cok=%s err=%s", sym, on, cok, exc)
         return {}
 
-def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, client_order_key: str, cumulative: int, conn: Any | None = None) -> dict:
+def _supersede_synthetic_fills_for_actual(
+    *,
+    trade_date: str,
+    order_no: str,
+    client_order_key: str,
+    cumulative: int,
+    conn: Any | None = None,
+    trading_epoch_id: str | None = None,
+) -> dict:
     """Deactivate synthetic cumulative evidence once KIS actual evidence arrives.
 
     When ``conn`` is provided, the caller's open transaction is used so order
@@ -2262,11 +2602,16 @@ def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, cli
             else:
                 result["conflict"] += 1
         return result
+    if trading_epoch_id is None:
+        trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
     rows = conn.execute(text("""SELECT id, qty, meta FROM us_fills WHERE trade_date=:td
         AND (:order_no='' OR order_no=:order_no) AND (:cok='' OR client_order_key=:cok)
+    """ + epoch_clause + """
         AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
         AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-        {"td": trade_date, "order_no": order_no, "cok": client_order_key}).mappings().all()
+        {"td": trade_date, "order_no": order_no, "cok": client_order_key, **epoch_params}).mappings().all()
     for row in rows:
         meta = _parse_json_meta(row.get("meta"))
         synth_cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
@@ -2280,7 +2625,16 @@ def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, cli
     return result
 
 
-def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client_order_key: str, symbol: str = "", side: str = "", conn: Any | None = None) -> dict:
+def _active_fill_cumulatives_for_order(
+    *,
+    trade_date: str,
+    order_no: str,
+    client_order_key: str,
+    symbol: str = "",
+    side: str = "",
+    conn: Any | None = None,
+    trading_epoch_id: str | None = None,
+) -> dict:
     result = {"actual": 0, "synthetic": 0, "actual_individual": 0}
     if conn is None:
         for f in _MEM_FILLS:
@@ -2307,18 +2661,25 @@ def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client
                 if _is_kis_execution_evidence(evidence):
                     result["actual_individual"] += int(f.get("qty") or 0)
         return result
+    if trading_epoch_id is None:
+        trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
     if order_no:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND order_no=:order_no
             AND (:symbol='' OR symbol=:symbol)
             AND (:side='' OR side=:side)
+        """ + epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-            {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(), "side": str(side).upper()}).mappings().all()
+            {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(),
+             "side": str(side).upper(), **epoch_params}).mappings().all()
     else:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND client_order_key=:cok
+        """ + epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-            {"td": trade_date, "cok": client_order_key}).mappings().all()
+            {"td": trade_date, "cok": client_order_key, **epoch_params}).mappings().all()
     for row in rows:
         meta = _parse_json_meta(row.get("meta"))
         cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
@@ -2438,14 +2799,20 @@ def mark_order_filled_by_reconcile(
         return result
     try:
         with engine.begin() as conn:
+            active_epoch_id = _active_us_epoch(conn)
+            epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            epoch_clause = " AND trading_epoch_id=:active_epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "order_no": on, "cok": cok, "symbol": sym}
+            if active_epoch_id:
+                order_params["active_epoch_id"] = active_epoch_id
             rows = conn.execute(text("""
                 SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
-                       qty_requested, qty_filled
+                       qty_requested, qty_filled""" + epoch_select + """
                 FROM us_orders WHERE trade_date=:td AND
                   ((:order_no <> '' AND order_no=:order_no) OR
                    (:cok <> '' AND client_order_key=:cok)
-                   OR (:order_no <> '' AND symbol=:symbol)) FOR UPDATE
-            """), {"td": td, "order_no": on, "cok": cok, "symbol": sym}).mappings().all()
+                   OR (:order_no <> '' AND symbol=:symbol))
+            """ + epoch_clause + " FOR UPDATE"), order_params).mappings().all()
             matches = [dict(row) for row in rows if
                        (cok and str(row.get("client_order_key") or "") == cok)
                        or (on and normalize_us_order_no(row.get("order_no")) == normalize_us_order_no(on))]
@@ -2453,6 +2820,7 @@ def mark_order_filled_by_reconcile(
                                                 requested_symbol=sym, requested_side=side_u, matches=matches)
             if check["status"] != "OK": return check
             order = check["order"]
+            order_epoch_id = _assert_us_order_epoch(order, active_epoch_id)
             on = str(order.get("order_no") or on)
             requested = int(requested_qty or order.get("qty_requested") or qty)
             previous = int(order.get("qty_filled") or 0)
@@ -2460,7 +2828,15 @@ def mark_order_filled_by_reconcile(
             evidence = evidence_type or ("KIS_ORDER_CUMULATIVE_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
             synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
             resolved_client_order_key = cok or order["client_order_key"] or ""
-            active = _active_fill_cumulatives_for_order(trade_date=td, order_no=on, client_order_key=resolved_client_order_key, symbol=sym, side=side_u, conn=conn)
+            active = _active_fill_cumulatives_for_order(
+                trade_date=td,
+                order_no=on,
+                client_order_key=resolved_client_order_key,
+                symbol=sym,
+                side=side_u,
+                conn=conn,
+                trading_epoch_id=order_epoch_id,
+            )
             if not synthetic and observed_cumulative > requested:
                 return {"status": "EVIDENCE_QUANTITY_OVERFLOW", "requires_reconcile": True, "retry_order": False,
                         "observed_actual_cumulative": observed_cumulative, "requested_qty": requested, "entry_fence": True}
@@ -2476,24 +2852,61 @@ def mark_order_filled_by_reconcile(
             cumulative = max(previous, min(observed_cumulative, requested))
             remaining = max(0, requested - cumulative)
             status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
-            merged = {**_parse_json_meta(order.get("meta")), **(meta or {}), "remaining_qty": remaining}
+            merged = {
+                **_parse_json_meta(order.get("meta")),
+                **(meta or {}),
+                "remaining_qty": remaining,
+            }
+            if order_epoch_id:
+                merged["trading_epoch_id"] = order_epoch_id
             promotion = {"superseded": 0, "conflict": 0}
             if not synthetic:
-                promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=resolved_client_order_key, cumulative=observed_cumulative, conn=conn)
-            conn.execute(text("""UPDATE us_orders SET status = :status, qty_filled = :qty,
-                avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts WHERE id = :id"""),
-                {"status": status, "qty": cumulative, "price": price, "meta": _json_param(merged), "ts": now_utc, "id": order["id"]})
+                promotion = _supersede_synthetic_fills_for_actual(
+                    trade_date=td,
+                    order_no=on,
+                    client_order_key=resolved_client_order_key,
+                    cumulative=observed_cumulative,
+                    conn=conn,
+                    trading_epoch_id=order_epoch_id,
+                )
+            update_params = {
+                "status": status,
+                "qty": cumulative,
+                "price": price,
+                "meta": _json_param(merged),
+                "ts": now_utc,
+                "id": order["id"],
+                "trading_epoch_id": order_epoch_id,
+            }
+            update_sql = """UPDATE us_orders SET status = :status, qty_filled = :qty,
+                avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts
+                WHERE id = :id"""
+            if order_epoch_id:
+                update_sql += " AND trading_epoch_id=:trading_epoch_id"
+            conn.execute(text(update_sql), update_params)
             if not synthetic and _is_kis_order_cumulative_evidence(evidence):
-                conn.execute(_mark_filled_by_reconcile_stmt(),
-                    {"qty": observed_cumulative, "price": price, "cok": resolved_client_order_key, "remaining": remaining, "requested": requested, "ts": now_utc,
-                     "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u})
+                mark_params = {
+                    "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
+                    "remaining": remaining, "requested": requested, "ts": now_utc,
+                    "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
+                }
+                if order_epoch_id:
+                    mark_params["trading_epoch_id"] = order_epoch_id
+                conn.execute(
+                    _mark_filled_by_reconcile_stmt(epoch_scoped=bool(order_epoch_id)),
+                    mark_params,
+                )
+            fill_epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if order_epoch_id else ""
+            fill_epoch_params = {"trading_epoch_id": order_epoch_id} if order_epoch_id else {}
             actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
                 AND :order_no <> '' AND order_no=:order_no
                 AND symbol=:symbol AND side=:side
+            """ + fill_epoch_clause + """
                 AND NOT COALESCE((meta->>'is_synthetic')::boolean,
                     (meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
                 AND COALESCE((meta->>'cumulative_filled_qty')::integer, qty)=:cumulative LIMIT 1"""),
-                {"td": td, "order_no": on, "symbol": sym, "side": side_u, "cumulative": observed_cumulative}).first()
+                {"td": td, "order_no": on, "symbol": sym, "side": side_u,
+                 "cumulative": observed_cumulative, **fill_epoch_params}).first()
             delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
             delta = max(0, observed_cumulative - delta_base)
             fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
@@ -2508,20 +2921,34 @@ def mark_order_filled_by_reconcile(
                 fill_meta["cumulative_filled_qty"] = observed_cumulative
                 fill_meta["fill_evidence_type"] = evidence
                 fill_meta["is_synthetic"] = synthetic
+                if order_epoch_id:
+                    fill_meta["trading_epoch_id"] = order_epoch_id
                 fill = {"symbol": sym, "side": side_u, "qty": fill_delta, "price_usd": price,
                         "order_no": on, "client_order_key": resolved_client_order_key,
                         "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence, "meta": fill_meta}
-                conn.execute(text("""INSERT INTO us_fills
-                    (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
-                    VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
-                    ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
-                    {"td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
-                     "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
-                     "cok": resolved_client_order_key, "ts": now_utc,
-                     "meta": _json_param(fill_meta),
-                     "idem": _us_fill_idempotency_key_text(fill, td)})
+                insert_params = {
+                    "td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                    "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
+                    "cok": resolved_client_order_key, "ts": now_utc,
+                    "meta": _json_param(fill_meta),
+                    "idem": _us_fill_idempotency_key_text(fill, td),
+                }
+                if order_epoch_id:
+                    insert_params["trading_epoch_id"] = order_epoch_id
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                else:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                conn.execute(text(insert_sql), insert_params)
             rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
-                AND COALESCE((meta->>'accounting_active')::boolean,true)"""), {"td": td, "order_no": on}).mappings().all()
+            """ + fill_epoch_clause + """
+                AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+                {"td": td, "order_no": on, **fill_epoch_params}).mappings().all()
             execution_qty = 0; cumulative_qty = 0; synthetic_qty = 0
             for fill_after in rows_after:
                 meta_after = _parse_json_meta(fill_after.get("meta"))
@@ -2598,12 +3025,31 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
         actual_qty, synthetic_qty, total = _qty_from_rows(rows)
     else:
         with engine.begin() as conn:
-            row = conn.execute(text("SELECT qty_filled FROM us_orders WHERE trade_date=:td AND order_no=:on"), {"td": td, "on": on}).first()
+            active_epoch_id = _active_us_epoch(conn)
+            order_epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            order_epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "on": on}
+            if active_epoch_id:
+                order_params["epoch_id"] = active_epoch_id
+            row = conn.execute(
+                text("""SELECT qty_filled""" + order_epoch_select + """ FROM us_orders
+                        WHERE trade_date=:td AND order_no=:on""" + order_epoch_clause),
+                order_params,
+            ).mappings().first()
             if not row:
                 return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
-            order_qty = int(row[0] if not isinstance(row, dict) else row.get("qty_filled") or 0)
-            rows = [dict(r) for r in conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
-                AND COALESCE((meta->>'accounting_active')::boolean,true)"""), {"td": td, "on": on}).mappings().all()]
+            order_epoch_id = _assert_us_order_epoch(dict(row), active_epoch_id)
+            order_qty = int(row.get("qty_filled") or 0)
+            fill_epoch_clause = " AND trading_epoch_id=:epoch_id" if order_epoch_id else ""
+            fill_params = {"td": td, "on": on}
+            if order_epoch_id:
+                fill_params["epoch_id"] = order_epoch_id
+            rows = [dict(r) for r in conn.execute(
+                text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
+                    """ + fill_epoch_clause + """
+                    AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+                fill_params,
+            ).mappings().all()]
             actual_qty, synthetic_qty, total = _qty_from_rows(rows)
     if order_qty != total:
         return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
@@ -2641,18 +3087,21 @@ def load_us_positions_by_symbols(
     else:
         try:
             with engine.begin() as conn:
-                raw = conn.execute(
-                    text("""
+                epoch_id = _active_us_epoch(conn)
+                sql = """
                         SELECT DISTINCT ON (symbol)
                             *
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                           AND as_of <= :td
                           AND qty > 0
-                        ORDER BY symbol, as_of DESC
-                    """),
-                    {"syms": list(symbols), "td": td},
-                )
+                """
+                params = {"syms": list(symbols), "td": td}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                sql += " ORDER BY symbol, as_of DESC"
+                raw = conn.execute(text(sql), params)
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
             logger.error("[US_POSITIONS][BY_SYMBOLS][ERROR] %s", exc)
@@ -2695,14 +3144,19 @@ def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> li
                 and not o.get("dry_run", False)]
     try:
         with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            params = {"symbol": symbol, "td": td}
+            if epoch_id:
+                params["epoch_id"] = epoch_id
             rows = conn.execute(
                 text("""
                     SELECT * FROM us_orders
                     WHERE symbol=:symbol AND trade_date=:td
                       AND status IN ('ACK','SENT','PARTIALLY_FILLED')
                       AND dry_run = FALSE
-                """),
-                {"symbol": symbol, "td": td},
+                """ + epoch_clause),
+                params,
             )
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
@@ -3942,12 +4396,31 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
         actual_qty, synthetic_qty, total = _qty_from_rows(rows)
     else:
         with engine.begin() as conn:
-            row = conn.execute(text("SELECT qty_filled FROM us_orders WHERE trade_date=:td AND order_no=:on"), {"td": td, "on": on}).first()
+            active_epoch_id = _active_us_epoch(conn)
+            order_epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            order_epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "on": on}
+            if active_epoch_id:
+                order_params["epoch_id"] = active_epoch_id
+            row = conn.execute(
+                text("""SELECT qty_filled""" + order_epoch_select + """ FROM us_orders
+                        WHERE trade_date=:td AND order_no=:on""" + order_epoch_clause),
+                order_params,
+            ).mappings().first()
             if not row:
                 return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
-            order_qty = int(row[0] if not isinstance(row, dict) else row.get("qty_filled") or 0)
-            rows = [dict(r) for r in conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
-                AND COALESCE((meta->>'accounting_active')::boolean,true)"""), {"td": td, "on": on}).mappings().all()]
+            order_epoch_id = _assert_us_order_epoch(dict(row), active_epoch_id)
+            order_qty = int(row.get("qty_filled") or 0)
+            fill_epoch_clause = " AND trading_epoch_id=:epoch_id" if order_epoch_id else ""
+            fill_params = {"td": td, "on": on}
+            if order_epoch_id:
+                fill_params["epoch_id"] = order_epoch_id
+            rows = [dict(r) for r in conn.execute(
+                text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
+                    """ + fill_epoch_clause + """
+                    AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+                fill_params,
+            ).mappings().all()]
             actual_qty, synthetic_qty, total = _qty_from_rows(rows)
     if order_qty != total:
         return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
@@ -3991,6 +4464,9 @@ def load_us_positions_by_symbols(
 
     try:
         with engine.connect() as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
             if as_of:
                 rows = conn.execute(
                     text("""
@@ -4001,9 +4477,10 @@ def load_us_positions_by_symbols(
                         WHERE symbol = ANY(:syms)
                           AND qty > 0
                           AND as_of <= :as_of
+                    """ + epoch_clause + """
                         ORDER BY symbol, as_of DESC
                     """),
-                    {"syms": normalized, "as_of": as_of},
+                    {"syms": normalized, "as_of": as_of, **epoch_params},
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -4014,9 +4491,10 @@ def load_us_positions_by_symbols(
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                           AND qty > 0
+                    """ + epoch_clause + """
                         ORDER BY symbol, as_of DESC
                     """),
-                    {"syms": normalized},
+                    {"syms": normalized, **epoch_params},
                 ).fetchall()
 
             result = {}
@@ -4072,8 +4550,8 @@ def load_latest_us_buy_fills_by_symbols(
     try:
         td = trade_date or _today()
         with engine.connect() as conn:
-            rows = conn.execute(
-                text("""
+            epoch_id = _active_us_epoch(conn)
+            sql = """
                     SELECT DISTINCT ON (symbol)
                         symbol, exchange, qty, price_usd,
                         filled_at, trade_date, client_order_key, order_no, meta
@@ -4082,10 +4560,13 @@ def load_latest_us_buy_fills_by_symbols(
                       AND side = 'BUY'
                       AND trade_date >= (:td::date - :lookback * INTERVAL '1 day')
                       AND trade_date <= :td::date
-                    ORDER BY symbol, filled_at DESC
-                """),
-                {"syms": normalized, "td": td, "lookback": lookback_days},
-            ).fetchall()
+            """
+            params = {"syms": normalized, "td": td, "lookback": lookback_days}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY symbol, filled_at DESC"
+            rows = conn.execute(text(sql), params).fetchall()
 
             result = {}
             cols = ["symbol", "exchange", "qty", "price_usd",
@@ -4125,16 +4606,19 @@ def has_pending_order_for_symbol_side(
         )
     try:
         with engine.begin() as conn:
-            row = conn.execute(
-                text("""
+            epoch_id = _active_us_epoch(conn)
+            sql = """
                     SELECT 1 FROM us_orders
                     WHERE symbol=:symbol AND side=:side AND trade_date=:td
                       AND status = ANY(:statuses)
                       AND dry_run = FALSE
-                    LIMIT 1
-                """),
-                {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)},
-            ).first()
+            """
+            params = {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " LIMIT 1"
+            row = conn.execute(text(sql), params).first()
             return row is not None
     except Exception as exc:
         logger.error("[US_ORDERS][PENDING_SYMBOL_SIDE][ERROR] %s", exc)
@@ -4154,11 +4638,15 @@ def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | N
         return None
     try:
         with engine.begin() as conn:
-            row = conn.execute(text("""
-                SELECT * FROM us_orders WHERE symbol=:symbol AND side='SELL' AND trade_date=:td
-                  AND status = ANY(:statuses) AND dry_run = FALSE
-                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1
-            """), {"symbol": sym, "td": td, "statuses": list(statuses)}).first()
+            epoch_id = _active_us_epoch(conn)
+            sql = """SELECT * FROM us_orders WHERE symbol=:symbol AND side='SELL' AND trade_date=:td
+                  AND status = ANY(:statuses) AND dry_run = FALSE"""
+            params = {"symbol": sym, "td": td, "statuses": list(statuses)}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1"
+            row = conn.execute(text(sql), params).first()
             return dict(row._mapping) if row else None
     except Exception as exc:
         logger.error("[US_ORDERS][RECENT_SELL_ACK][ERROR] %s", exc)
@@ -4188,11 +4676,16 @@ def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
     d = date.fromisoformat(trade_date)
     start_utc = datetime.combine(d, time.min, tzinfo=ny).astimezone(utc).isoformat()
     end_utc = datetime.combine(d + timedelta(days=1), time.min, tzinfo=ny).astimezone(utc).isoformat()
-    queries = [("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date})]
-    for col in ("created_at", "updated_at", "submitted_at", "acked_at"):
-        queries.append((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}))
     try:
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            queries = [("SELECT * FROM us_orders WHERE trade_date = :td" + epoch_clause,
+                        {"td": trade_date, **epoch_params})]
+            for col in ("created_at", "updated_at", "submitted_at", "acked_at"):
+                queries.append((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts" + epoch_clause,
+                                {"start_ts": start_utc, "end_ts": end_utc, **epoch_params}))
             for sql, params in queries:
                 try:
                     rows = _rows(conn.execute(text(sql), params))
@@ -4219,18 +4712,33 @@ def load_today_committed_buy_notional_result(trade_date: str, env: str = "practi
     if engine is None:
         return CommittedBuyNotionalResult(False, 0.0, 0, "orders_db_engine_unavailable")
     from sqlalchemy import text
-    query = """
-        SELECT o.*, i.notional_usd AS intent_notional_usd,
-               i.limit_price_usd AS intent_limit_price_usd,
-               i.meta AS intent_meta
-        FROM us_orders o
-        LEFT JOIN us_order_intents i
-          ON i.client_order_key = o.client_order_key
-        WHERE o.trade_date = :td
-    """
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(query), {"td": trade_date})
+            epoch_id = _active_us_epoch(conn)
+            params = {"td": trade_date}
+            if epoch_id:
+                query = """
+                    SELECT o.*, i.notional_usd AS intent_notional_usd,
+                           i.limit_price_usd AS intent_limit_price_usd,
+                           i.meta AS intent_meta
+                    FROM us_orders o
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key = o.client_order_key
+                     AND i.trading_epoch_id=o.trading_epoch_id
+                    WHERE o.trade_date = :td AND o.trading_epoch_id=:epoch_id
+                """
+                params["epoch_id"] = epoch_id
+            else:
+                query = """
+                    SELECT o.*, i.notional_usd AS intent_notional_usd,
+                           i.limit_price_usd AS intent_limit_price_usd,
+                           i.meta AS intent_meta
+                    FROM us_orders o
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key = o.client_order_key
+                    WHERE o.trade_date = :td
+                """
+            result = conn.execute(text(query), params)
             rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
     except Exception as exc:
         return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
