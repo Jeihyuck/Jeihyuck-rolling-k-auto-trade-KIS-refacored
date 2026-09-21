@@ -2984,21 +2984,29 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
     else:
         with engine.begin() as conn:
             active_epoch_id = _active_us_epoch(conn)
+            order_epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            order_epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "on": on}
+            if active_epoch_id:
+                order_params["epoch_id"] = active_epoch_id
             row = conn.execute(
-                text("""SELECT qty_filled, trading_epoch_id FROM us_orders
-                        WHERE trade_date=:td AND order_no=:on
-                          AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)"""),
-                {"td": td, "on": on, "epoch_id": active_epoch_id},
+                text("""SELECT qty_filled""" + order_epoch_select + """ FROM us_orders
+                        WHERE trade_date=:td AND order_no=:on""" + order_epoch_clause),
+                order_params,
             ).mappings().first()
             if not row:
                 return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
             order_epoch_id = _assert_us_order_epoch(dict(row), active_epoch_id)
             order_qty = int(row.get("qty_filled") or 0)
+            fill_epoch_clause = " AND trading_epoch_id=:epoch_id" if order_epoch_id else ""
+            fill_params = {"td": td, "on": on}
+            if order_epoch_id:
+                fill_params["epoch_id"] = order_epoch_id
             rows = [dict(r) for r in conn.execute(
                 text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
-                    AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
+                    """ + fill_epoch_clause + """
                     AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-                {"td": td, "on": on, "epoch_id": order_epoch_id},
+                fill_params,
             ).mappings().all()]
             actual_qty, synthetic_qty, total = _qty_from_rows(rows)
     if order_qty != total:
@@ -3095,15 +3103,18 @@ def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> li
     try:
         with engine.begin() as conn:
             epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            params = {"symbol": symbol, "td": td}
+            if epoch_id:
+                params["epoch_id"] = epoch_id
             rows = conn.execute(
                 text("""
                     SELECT * FROM us_orders
                     WHERE symbol=:symbol AND trade_date=:td
                       AND status IN ('ACK','SENT','PARTIALLY_FILLED')
                       AND dry_run = FALSE
-                      AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
-                """),
-                {"symbol": symbol, "td": td, "epoch_id": epoch_id},
+                """ + epoch_clause),
+                params,
             )
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
@@ -4344,21 +4355,29 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
     else:
         with engine.begin() as conn:
             active_epoch_id = _active_us_epoch(conn)
+            order_epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            order_epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "on": on}
+            if active_epoch_id:
+                order_params["epoch_id"] = active_epoch_id
             row = conn.execute(
-                text("""SELECT qty_filled, trading_epoch_id FROM us_orders
-                        WHERE trade_date=:td AND order_no=:on
-                          AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)"""),
-                {"td": td, "on": on, "epoch_id": active_epoch_id},
+                text("""SELECT qty_filled""" + order_epoch_select + """ FROM us_orders
+                        WHERE trade_date=:td AND order_no=:on""" + order_epoch_clause),
+                order_params,
             ).mappings().first()
             if not row:
                 return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
             order_epoch_id = _assert_us_order_epoch(dict(row), active_epoch_id)
             order_qty = int(row.get("qty_filled") or 0)
+            fill_epoch_clause = " AND trading_epoch_id=:epoch_id" if order_epoch_id else ""
+            fill_params = {"td": td, "on": on}
+            if order_epoch_id:
+                fill_params["epoch_id"] = order_epoch_id
             rows = [dict(r) for r in conn.execute(
                 text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
-                    AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
+                    """ + fill_epoch_clause + """
                     AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-                {"td": td, "on": on, "epoch_id": order_epoch_id},
+                fill_params,
             ).mappings().all()]
             actual_qty, synthetic_qty, total = _qty_from_rows(rows)
     if order_qty != total:
@@ -4404,6 +4423,8 @@ def load_us_positions_by_symbols(
     try:
         with engine.connect() as conn:
             epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
             if as_of:
                 rows = conn.execute(
                     text("""
@@ -4414,10 +4435,10 @@ def load_us_positions_by_symbols(
                         WHERE symbol = ANY(:syms)
                           AND qty > 0
                           AND as_of <= :as_of
-                          AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
+                    """ + epoch_clause + """
                         ORDER BY symbol, as_of DESC
                     """),
-                    {"syms": normalized, "as_of": as_of, "epoch_id": epoch_id},
+                    {"syms": normalized, "as_of": as_of, **epoch_params},
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -4428,10 +4449,10 @@ def load_us_positions_by_symbols(
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                           AND qty > 0
-                          AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
+                    """ + epoch_clause + """
                         ORDER BY symbol, as_of DESC
                     """),
-                    {"syms": normalized, "epoch_id": epoch_id},
+                    {"syms": normalized, **epoch_params},
                 ).fetchall()
 
             result = {}
