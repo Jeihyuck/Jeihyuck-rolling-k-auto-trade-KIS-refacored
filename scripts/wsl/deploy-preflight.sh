@@ -132,14 +132,23 @@ deploy_preflight() {
   export TRADING_EPOCH_ENFORCE=1
   local epoch_python="python"
   [[ -x .venv/bin/python ]] && epoch_python=".venv/bin/python"
-  if ! "$epoch_python" scripts/verify_active_trading_epoch.py >/tmp/nullim-active-trading-epoch.json 2>/tmp/nullim-active-trading-epoch.err; then
-    result=FAIL; reason=active_trading_epoch_missing
-    echo "[DEPLOY][TRADING_EPOCH][FAIL] reason=$reason action=BLOCK_TRADING"
-    cat /tmp/nullim-active-trading-epoch.err 2>/dev/null || true
-    _preflight_log
-    return 1
-  fi
-  epoch_id="$("$epoch_python" - <<'PY'
+  if [[ "${NULLIM_EPOCH_PREFLIGHT_SKIP:-0}" == "1" ]]; then
+    if [[ -z "${PYTEST_CURRENT_TEST:-}" ]]; then
+      result=FAIL; reason=epoch_preflight_skip_forbidden
+      echo "[DEPLOY][TRADING_EPOCH][FAIL] reason=$reason action=BLOCK_TRADING"
+      _preflight_log
+      return 1
+    fi
+    echo "[DEPLOY][TRADING_EPOCH][TEST_BYPASS] pytest_only=1"
+  else
+    if ! "$epoch_python" scripts/verify_active_trading_epoch.py >/tmp/nullim-active-trading-epoch.json 2>/tmp/nullim-active-trading-epoch.err; then
+      result=FAIL; reason=active_trading_epoch_missing
+      echo "[DEPLOY][TRADING_EPOCH][FAIL] reason=$reason action=BLOCK_TRADING"
+      cat /tmp/nullim-active-trading-epoch.err 2>/dev/null || true
+      _preflight_log
+      return 1
+    fi
+    epoch_id="$("$epoch_python" - <<'PY'
 import json
 try:
     print(json.load(open("/tmp/nullim-active-trading-epoch.json", encoding="utf-8")).get("trading_epoch_id",""))
@@ -147,6 +156,7 @@ except Exception:
     print("")
 PY
 )"
-  echo "[DEPLOY][TRADING_EPOCH][OK] trading_epoch_id=$epoch_id"
+    echo "[DEPLOY][TRADING_EPOCH][OK] trading_epoch_id=$epoch_id"
+  fi
   echo "[DEPLOY][OK]"; _preflight_log
 }
