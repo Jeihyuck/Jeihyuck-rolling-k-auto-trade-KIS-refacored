@@ -2707,6 +2707,60 @@ class UniverseRepo:
             )
 
 
+def _assert_portfolio_epoch_binding(
+    conn,
+    db_schema,
+    *,
+    portfolio_epoch_id: str,
+    trading_epoch_id: str | None,
+) -> None:
+    row = conn.execute(
+        select(
+            db_schema.portfolio_epochs.c.trading_epoch_id,
+            db_schema.portfolio_epochs.c.status,
+        ).where(
+            sa.cast(db_schema.portfolio_epochs.c.portfolio_epoch_id, sa.String)
+            == str(portfolio_epoch_id)
+        )
+    ).mappings().first()
+    if not row:
+        raise RuntimeError("KR_PORTFOLIO_EPOCH_NOT_FOUND")
+    actual = row.get("trading_epoch_id")
+    if trading_epoch_id is not None and str(actual or "") != str(trading_epoch_id):
+        raise RuntimeError("KR_PORTFOLIO_TRADING_EPOCH_MISMATCH")
+
+
+def _normalize_epoch_observed_at(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return pytz.timezone("Asia/Seoul").localize(value)
+    return value
+
+
+def _assert_reconciled_order_is_current_epoch(
+    conn,
+    db_schema,
+    *,
+    trading_epoch_id: str | None,
+    observed_at: datetime | None,
+) -> None:
+    if trading_epoch_id is None:
+        return
+    started_at = conn.execute(
+        select(db_schema.trading_epochs.c.started_at).where(
+            sa.cast(db_schema.trading_epochs.c.trading_epoch_id, sa.String)
+            == str(trading_epoch_id)
+        )
+    ).scalar()
+    observed = _normalize_epoch_observed_at(observed_at)
+    if started_at is None or observed is None:
+        raise RuntimeError("KR_RECONCILE_ORDER_EPOCH_UNPROVEN")
+    started = _normalize_epoch_observed_at(started_at)
+    if observed.astimezone(pytz.UTC) < started.astimezone(pytz.UTC):
+        raise RuntimeError("KR_RECONCILE_ORDER_PRE_DATES_ACTIVE_EPOCH")
+
+
 def _ensure_active_epoch(conn, db_schema, *, env: str, account_id: str, sid: int, mode: int, strategy: str) -> str:
     trading_epoch_id = active_trading_epoch_id(
         conn, env=env, account_id=account_id, required=trading_epoch_enforced()
@@ -3765,39 +3819,60 @@ class OrdersRepo:
         broker_order_id = kis_odno or client_order_key
         safe_request_json = json_sanitize(request_json or {})
         safe_response_json = json_sanitize(response_json or {})
+        account_id = get_account_key(env=env)
 
-        # Reconciliation is an observation of an already-created broker order,
-        # not permission to rewrite the immutable order intent.  If an exact
-        # broker/client identity already exists, preserve its request_json and
-        # keep the incoming broker row only as diagnostic evidence.  This blocks
-        # BUY EntryExitPlan / OrderBaseline loss and the analogous SELL baseline
-        # loss without inventing or cross-binding policy.
-        existing_row = None
-        with self.engine.connect() as _read_conn:
-            if broker_order_id:
-                existing_row = _read_conn.execute(
-                    select(self._schema.orders).where(
-                        and_(
-                            self._schema.orders.c.env == env,
-                            self._schema.orders.c.broker_order_id == broker_order_id,
-                        )
-                    )
-                ).mappings().first()
-            if existing_row is None and client_order_key:
-                existing_row = _read_conn.execute(
-                    select(self._schema.orders).where(
-                        and_(
-                            self._schema.orders.c.env == env,
-                            self._schema.orders.c.client_order_key == client_order_key,
-                        )
-                    )
-                ).mappings().first()
-        if existing_row is not None:
-            same_identity = (
-                str(existing_row.get("code") or "").zfill(6) == str(code or "").zfill(6)
-                and str(existing_row.get("side") or "").upper() == str(side or "").upper()
+        with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=account_id, required=trading_epoch_enforced()
             )
-            if same_identity:
+            active_portfolio_epoch_id = _ensure_active_epoch(
+                conn, self._schema, env=env, account_id=account_id,
+                sid=sid, mode=mode, strategy=strategy,
+            )
+            _assert_portfolio_epoch_binding(
+                conn, self._schema,
+                portfolio_epoch_id=active_portfolio_epoch_id,
+                trading_epoch_id=trading_epoch_id,
+            )
+
+            broker_row = None
+            client_row = None
+            if broker_order_id:
+                broker_row = conn.execute(
+                    select(self._schema.orders).where(and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.broker_order_id == broker_order_id,
+                    ))
+                ).mappings().first()
+            if client_order_key:
+                client_row = conn.execute(
+                    select(self._schema.orders).where(and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.client_order_key == client_order_key,
+                    ))
+                ).mappings().first()
+            if broker_row and client_row and str(broker_row.get("order_id")) != str(client_row.get("order_id")):
+                raise RuntimeError("KR_RECONCILE_ORDER_IDENTITY_COLLISION")
+            existing_row = broker_row or client_row
+
+            position_cycle_id = None
+            portfolio_epoch_id = active_portfolio_epoch_id
+            if existing_row is not None:
+                if trading_epoch_id is not None and str(existing_row.get("trading_epoch_id") or "") != str(trading_epoch_id):
+                    raise RuntimeError("KR_RECONCILE_ORDER_TRADING_EPOCH_MISMATCH")
+                same_identity = (
+                    str(existing_row.get("code") or "").zfill(6) == str(code or "").zfill(6)
+                    and str(existing_row.get("side") or "").upper() == str(side or "").upper()
+                )
+                if not same_identity:
+                    raise RuntimeError("KR_RECONCILE_ORDER_IDENTITY_MISMATCH")
+                portfolio_epoch_id = str(existing_row.get("portfolio_epoch_id") or active_portfolio_epoch_id)
+                position_cycle_id = existing_row.get("position_cycle_id")
+                _assert_portfolio_epoch_binding(
+                    conn, self._schema,
+                    portfolio_epoch_id=portfolio_epoch_id,
+                    trading_epoch_id=trading_epoch_id,
+                )
                 existing_request = existing_row.get("request_json")
                 if isinstance(existing_request, str):
                     try:
@@ -3809,97 +3884,71 @@ class OrdersRepo:
                     safe_request_json = json_sanitize(dict(existing_request))
                     if observed_request and observed_request != safe_request_json:
                         safe_request_json["_reconcile_observation"] = observed_request
-                    logger.info(
-                        "[RECONCILE][ORDER_INTENT_PRESERVED] env=%s code=%s side=%s key=%s broker_order_id=%s",
-                        env, code, side, client_order_key, broker_order_id,
-                    )
+                logger.info(
+                    "[RECONCILE][ORDER_INTENT_PRESERVED] env=%s code=%s side=%s key=%s broker_order_id=%s epoch=%s",
+                    env, code, side, client_order_key, broker_order_id, trading_epoch_id,
+                )
             else:
-                logger.error(
-                    "[RECONCILE][ORDER_IDENTITY_MISMATCH] env=%s broker_order_id=%s "
-                    "existing_code=%s existing_side=%s incoming_code=%s incoming_side=%s",
-                    env,
-                    broker_order_id,
-                    existing_row.get("code"),
-                    existing_row.get("side"),
-                    code,
-                    side,
+                _assert_reconciled_order_is_current_epoch(
+                    conn,
+                    self._schema,
+                    trading_epoch_id=trading_epoch_id,
+                    observed_at=submitted_at or acked_at,
                 )
 
-        payload = {
-            "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
-            "env": env,
-            "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
-            "strategy": strategy,
-            "sid": sid,
-            "mode": mode,
-            "code": code,
-            "market": market,
-            "side": side,
-            "ord_type": ord_type,
-            "qty": qty,
-            "limit_price": limit_price,
-            "stage": stage,
-            "client_order_key": client_order_key,
-            "status": status,
-            "kis_odno": kis_odno,
-            "broker_order_id": broker_order_id,
-            "request_json": safe_request_json,
-            "response_json": safe_response_json,
-            "submitted_at": submitted_at,
-            "acked_at": acked_at,
-        }
-        conflict_cols = ["env", "broker_order_id"] if broker_order_id else ["env", "client_order_key"]
-        update_cols = {
-            "status": status,
-            "kis_odno": kis_odno,
-            "broker_order_id": broker_order_id,
-            "response_json": safe_response_json,
-            "request_json": safe_request_json,
-            "submitted_at": submitted_at,
-            "acked_at": acked_at,
-            "updated_at": func.now(),
-        }
-        with self.engine.begin() as conn:
-            if conn.dialect.name == "postgresql":
-                # Use PostgreSQL-specific upsert with on_conflict_do_update
-                stmt = pg_insert(self._schema.orders).values(**payload).on_conflict_do_update(
-                    index_elements=conflict_cols,
-                    set_=update_cols,
-                ).returning(self._schema.orders.c.order_id)
-                res = conn.execute(stmt)
-                order_id = res.scalar()
-                if order_id:
-                    return str(order_id)
-            else:
-                # Fallback upsert for non-PostgreSQL dialects
-                try:
-                    stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
-                    res = conn.execute(stmt)
-                    order_id = res.scalar()
-                    if order_id:
-                        return str(order_id)
-                except IntegrityError:
-                    # Update existing row
-                    where_conditions = [self._schema.orders.c[col] == payload[col] for col in conflict_cols]
-                    conn.execute(
-                        sa.update(self._schema.orders).where(and_(*where_conditions)).values(**update_cols)
-                    )
-                    existing = conn.execute(
-                        select(self._schema.orders.c.order_id).where(and_(*where_conditions))
-                    ).scalar()
-                    if existing:
-                        return str(existing)
-            
-            # Fallback query if stmt didn't return anything
-            existing = conn.execute(
-                select(self._schema.orders.c.order_id).where(
-                    and_(
-                        self._schema.orders.c.env == env,
-                        self._schema.orders.c.client_order_key == client_order_key,
-                    )
+            payload = {
+                "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
+                "position_cycle_id": position_cycle_id,
+                "portfolio_epoch_id": portfolio_epoch_id,
+                "trading_epoch_id": trading_epoch_id,
+                "env": env,
+                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+                "strategy": strategy,
+                "sid": sid,
+                "mode": mode,
+                "code": code,
+                "market": market,
+                "side": side,
+                "ord_type": ord_type,
+                "qty": qty,
+                "limit_price": limit_price,
+                "stage": stage,
+                "client_order_key": client_order_key,
+                "status": status,
+                "kis_odno": kis_odno,
+                "broker_order_id": broker_order_id,
+                "request_json": safe_request_json,
+                "response_json": safe_response_json,
+                "submitted_at": submitted_at,
+                "acked_at": acked_at,
+            }
+            update_cols = {
+                "status": status,
+                "kis_odno": kis_odno,
+                "broker_order_id": broker_order_id,
+                "response_json": safe_response_json,
+                "request_json": safe_request_json,
+                "submitted_at": submitted_at,
+                "acked_at": acked_at,
+                "updated_at": func.now(),
+            }
+
+            if existing_row is not None:
+                result = conn.execute(
+                    sa.update(self._schema.orders)
+                    .where(self._schema.orders.c.order_id == existing_row["order_id"])
+                    .values(**update_cols)
                 )
-            ).scalar()
-            return str(existing or payload["order_id"])
+                if int(result.rowcount or 0) != 1:
+                    raise RuntimeError("KR_RECONCILE_ORDER_UPDATE_FAILED")
+                return str(existing_row["order_id"])
+
+            stmt = sa.insert(self._schema.orders).values(**payload).returning(self._schema.orders.c.order_id)
+            try:
+                order_id = conn.execute(stmt).scalar()
+            except IntegrityError as exc:
+                raise RuntimeError("KR_RECONCILE_ORDER_EPOCH_COLLISION") from exc
+            return str(order_id or payload["order_id"])
 
     # ------------------------------------------------------------------
     # Guard helpers — exit block / re-entry guard
@@ -5262,10 +5311,18 @@ class LedgerEventsRepo:
         KIS balance unavailable일 때만 fallback 용도로 사용한다.
         """
         env_n = _norm_env(env)
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine,
+            env=env_n,
+            account_id=get_account_key(env=env_n),
+            required=trading_epoch_enforced(),
+        )
         
         # PostgreSQL의 경우 SQL로 처리
         if self.engine.dialect.name == "postgresql":
             conditions = [self._schema.fills.c.env == env_n]
+            if trading_epoch_id:
+                conditions.append(self._schema.fills.c.trading_epoch_id == trading_epoch_id)
             if strategy:
                 conditions.append(self._schema.fills.c.strategy == strategy)
             if codes:
@@ -5340,6 +5397,8 @@ class LedgerEventsRepo:
         
         # SQLite/기타: Python fallback
         stmt = select(self._schema.fills).where(self._schema.fills.c.env == env_n)
+        if trading_epoch_id:
+            stmt = stmt.where(self._schema.fills.c.trading_epoch_id == trading_epoch_id)
         if strategy:
             stmt = stmt.where(self._schema.fills.c.strategy == strategy)
         if codes:
@@ -5791,6 +5850,7 @@ class PositionsRepo:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
+                    self._schema.orders.c.trading_epoch_id,
                     self._schema.orders.c.request_json,
                 ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
                 if provenance:
@@ -5848,8 +5908,21 @@ class PositionsRepo:
                 }
                 entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
             account_id = account_id or get_account_key(env=env)
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=account_id, required=trading_epoch_enforced()
+            )
+            if provenance and trading_epoch_id is not None:
+                provenance_epoch = provenance.get("trading_epoch_id")
+                if str(provenance_epoch or "") != str(trading_epoch_id):
+                    raise RuntimeError("KR_FILL_ORDER_TRADING_EPOCH_MISMATCH")
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
+            )
+            _assert_portfolio_epoch_binding(
+                conn,
+                self._schema,
+                portfolio_epoch_id=str(portfolio_epoch_id),
+                trading_epoch_id=trading_epoch_id,
             )
             stmt = select(self._schema.positions).where(
                 and_(
@@ -5859,12 +5932,15 @@ class PositionsRepo:
                     self._schema.positions.c.mode == mode,
                     self._schema.positions.c.code == code,
                     self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id,
                     self._schema.positions.c.status == "OPEN",
                 )
             )
             row = conn.execute(stmt).mappings().first()
             if row:
                 row = dict(row)
+                if trading_epoch_id is not None and str(row.get("trading_epoch_id") or "") != str(trading_epoch_id):
+                    raise RuntimeError("KR_POSITION_TRADING_EPOCH_MISMATCH")
             qty = int(qty)
             cost_delta = (qty * float(price)) + float(fee) + float(tax)
             if row:
@@ -5975,6 +6051,7 @@ class PositionsRepo:
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         position_cycle_id=position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         portfolio_epoch_id=portfolio_epoch_id,
+                        trading_epoch_id=trading_epoch_id,
                         opened_at=filled_at,
                         position_origin="SYSTEM",
                         env=env,
@@ -6041,6 +6118,7 @@ class PositionsRepo:
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
                             self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                            self._schema.positions.c.trading_epoch_id == trading_epoch_id,
                             self._schema.positions.c.status == "OPEN",
                         )
                     )
@@ -6229,6 +6307,7 @@ class PositionsRepo:
                                 self._schema.positions.c.env == env_n,
                                 self._schema.positions.c.code == code,
                                 self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                                self._schema.positions.c.trading_epoch_id == trading_epoch_id,
                                 self._schema.positions.c.status == "OPEN",
                             )
                         )
@@ -6251,6 +6330,7 @@ class PositionsRepo:
                             ),
                             position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                             portfolio_epoch_id=epoch_id,
+                            trading_epoch_id=trading_epoch_id,
                             opened_at=func.now(),
                             position_origin="IMPORTED",
                             env=env_n,
