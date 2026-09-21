@@ -17,6 +17,12 @@ class TradingEpochError(RuntimeError):
     pass
 
 
+def trading_epoch_enforced() -> bool:
+    return str(os.getenv("TRADING_EPOCH_ENFORCE") or "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 def _identity(*, env: str | None = None, account_id: str | None = None) -> tuple[str, str]:
     env_name = resolve_env_name(env)
     account_key = str(account_id or get_account_key(env=env_name))
