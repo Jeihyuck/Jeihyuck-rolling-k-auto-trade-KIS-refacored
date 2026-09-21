@@ -9,6 +9,7 @@ from trader.db.repos import PortfolioEpochsRepo
 from trader.db.trading_epoch import (
     active_trading_epoch_id,
     start_new_trading_epoch,
+    trading_epoch_enforced,
 )
 
 
@@ -116,3 +117,17 @@ def test_pr137_db_replacement_is_not_part_of_restored_design():
     # depend on the PR137 fresh-database cutover path.
     assert not Path("scripts/prepare_new_practice_database.py").exists()
     assert not Path("scripts/verify_new_practice_database_cutover.py").exists()
+
+
+
+def test_canonical_wsl_runtime_enforces_epoch_even_if_flag_is_zero(monkeypatch):
+    monkeypatch.setenv("TRADING_EPOCH_ENFORCE", "0")
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    assert trading_epoch_enforced() is True
+
+
+def test_noncanonical_test_fixture_keeps_legacy_compatibility(monkeypatch):
+    monkeypatch.setenv("TRADING_EPOCH_ENFORCE", "0")
+    monkeypatch.delenv("WSL_RUN_MARKET", raising=False)
+    assert trading_epoch_enforced() is False
