@@ -8,7 +8,11 @@ from trader.kis_wrapper import KisAPI
 from trader.us.data_provider import USDataProvider
 
 
-EXPECTED_US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
+EXPECTED_US_EXCHANGES_BY_ENV = {
+    "practice": {"NASD", "NYSE", "AMEX"},
+    # KIS real-account contract: NASD represents the entire US market.
+    "real": {"NASD"},
+}
 
 
 class TradingEpochBrokerGuardError(RuntimeError):
@@ -112,7 +116,7 @@ def _kr_pending_orders(kis: KisAPI) -> list[dict]:
     return [dict(row) for row in payload.get("output1") or [] if _kr_remaining_qty(row) > 0]
 
 
-def _assert_us_balance_authoritative(balance: dict) -> None:
+def _assert_us_balance_authoritative(balance: dict, *, env: str) -> None:
     if not isinstance(balance, dict):
         raise TradingEpochBrokerGuardError("US_KIS_BALANCE_NOT_AUTHORITATIVE")
     if str(balance.get("balance_parse_status") or "").upper() != "OK":
@@ -124,19 +128,20 @@ def _assert_us_balance_authoritative(balance: dict) -> None:
     if balance.get("failed_exchanges") not in ({}, []):
         raise TradingEpochBrokerGuardError("US_KIS_BALANCE_EXCHANGE_FAILURE")
 
+    expected_exchanges = EXPECTED_US_EXCHANGES_BY_ENV[str(env).lower()]
     queried = {
         str(value or "").strip().upper()
         for value in (balance.get("queried_exchanges") or [])
         if str(value or "").strip()
     }
-    if not EXPECTED_US_EXCHANGES.issubset(queried):
+    if not expected_exchanges.issubset(queried):
         raise TradingEpochBrokerGuardError("US_KIS_BALANCE_EXCHANGE_COVERAGE_INCOMPLETE")
 
     counts = balance.get("exchange_result_counts")
     if not isinstance(counts, dict):
         raise TradingEpochBrokerGuardError("US_KIS_BALANCE_EXCHANGE_COUNTS_MISSING")
     count_keys = {str(key or "").strip().upper() for key in counts}
-    if not EXPECTED_US_EXCHANGES.issubset(count_keys):
+    if not expected_exchanges.issubset(count_keys):
         raise TradingEpochBrokerGuardError("US_KIS_BALANCE_EXCHANGE_COUNTS_INCOMPLETE")
     for count in counts.values():
         _qty(count)
@@ -194,7 +199,7 @@ def verify_broker_flat(*, env: str) -> dict:
 
     us = USDataProvider(offline=False, env=env_n)
     us_balance = us.get_balance(force_refresh=True)
-    _assert_us_balance_authoritative(us_balance)
+    _assert_us_balance_authoritative(us_balance, env=env_n)
     us_holdings = _us_open_holdings(us_balance)
     if us_holdings:
         raise TradingEpochBrokerGuardError("US_KIS_ACCOUNT_NOT_FLAT")
@@ -209,5 +214,5 @@ def verify_broker_flat(*, env: str) -> dict:
         "kr_pending_orders": 0,
         "us_holdings": 0,
         "us_pending_orders": 0,
-        "us_exchanges": sorted(EXPECTED_US_EXCHANGES),
+        "us_exchanges": sorted(EXPECTED_US_EXCHANGES_BY_ENV[env_n]),
     }
