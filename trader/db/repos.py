@@ -2730,6 +2730,8 @@ def _assert_portfolio_epoch_binding(
     portfolio_epoch_id: str,
     trading_epoch_id: str | None,
 ) -> None:
+    if trading_epoch_id is None:
+        return
     row = conn.execute(
         select(
             db_schema.portfolio_epochs.c.trading_epoch_id,
@@ -4599,6 +4601,28 @@ class FillsRepo:
         return None
 
 
+    def list_net_positions_from_fills(
+        self,
+        env: str,
+        *,
+        strategy: str | None = None,
+        codes: list[str] | None = None,
+        kr_only: bool = True,
+    ) -> list[dict]:
+        """Compatibility entry point for the KR fills fallback.
+
+        The historical implementation lives on LedgerEventsRepo. Keep that
+        implementation as-is, but expose it on FillsRepo as callers/tests
+        have always documented and expected.
+        """
+        return LedgerEventsRepo(self.engine).list_net_positions_from_fills(
+            env,
+            strategy=strategy,
+            codes=codes,
+            kr_only=kr_only,
+        )
+
+
 class LedgerEventsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -5956,18 +5980,20 @@ class PositionsRepo:
                 portfolio_epoch_id=str(portfolio_epoch_id),
                 trading_epoch_id=trading_epoch_id,
             )
-            stmt = select(self._schema.positions).where(
-                and_(
-                    self._schema.positions.c.env == env,
-                    self._schema.positions.c.strategy == strategy,
-                    self._schema.positions.c.sid == sid,
-                    self._schema.positions.c.mode == mode,
-                    self._schema.positions.c.code == code,
-                    self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
-                    self._schema.positions.c.trading_epoch_id == trading_epoch_id,
-                    self._schema.positions.c.status == "OPEN",
+            position_conditions = [
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code,
+                self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
+                self._schema.positions.c.status == "OPEN",
+            ]
+            if trading_epoch_id is not None:
+                position_conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
                 )
-            )
+            stmt = select(self._schema.positions).where(and_(*position_conditions))
             row = conn.execute(stmt).mappings().first()
             if row:
                 row = dict(row)
