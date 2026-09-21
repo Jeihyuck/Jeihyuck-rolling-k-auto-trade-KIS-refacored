@@ -4214,17 +4214,26 @@ class OrdersRepo:
 
     def find_latest_buy_entry_exit_plan(self, env: str, strategy: str, code: str, *, lookback: int | None = None) -> dict | None:
         lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
+        conditions = [
+            self._schema.orders.c.env == env,
+            self._schema.orders.c.strategy == strategy,
+            self._schema.orders.c.code == str(code).zfill(6),
+            self._schema.orders.c.side == "BUY",
+            ~self._schema.orders.c.status.in_(["ERROR", "CANCELED", "CANCELLED", "REJECTED"]),
+        ]
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine,
+            env=env,
+            account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id is not None:
+            conditions.append(
+                self._schema.orders.c.trading_epoch_id == trading_epoch_id
+            )
         stmt = (
             select(self._schema.orders.c.request_json)
-            .where(
-                and_(
-                    self._schema.orders.c.env == env,
-                    self._schema.orders.c.strategy == strategy,
-                    self._schema.orders.c.code == str(code).zfill(6),
-                    self._schema.orders.c.side == "BUY",
-                    ~self._schema.orders.c.status.in_(["ERROR", "CANCELED", "CANCELLED", "REJECTED"]),
-                )
-            )
+            .where(and_(*conditions))
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(lookback_n)
         )
@@ -4678,15 +4687,24 @@ class FillsRepo:
 
     def find_latest_buy_entry_exit_plan(self, env: str, code: str, *, lookback: int | None = None) -> dict | None:
         lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
+        conditions = [
+            self._schema.fills.c.env == env,
+            self._schema.fills.c.code == str(code).zfill(6),
+            self._schema.fills.c.side == "BUY",
+        ]
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine,
+            env=env,
+            account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id is not None:
+            conditions.append(
+                self._schema.fills.c.trading_epoch_id == trading_epoch_id
+            )
         stmt = (
             select(self._schema.fills.c.raw_json)
-            .where(
-                and_(
-                    self._schema.fills.c.env == env,
-                    self._schema.fills.c.code == str(code).zfill(6),
-                    self._schema.fills.c.side == "BUY",
-                )
-            )
+            .where(and_(*conditions))
             .order_by(self._schema.fills.c.filled_at.desc(), self._schema.fills.c.created_at.desc())
             .limit(lookback_n)
         )
