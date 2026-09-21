@@ -625,7 +625,6 @@ class KisUSClient:
         output2: Any = None
         ctx_fk = ""
         ctx_nk = ""
-        pagination_complete = False
         
         for page in range(1, max_pages + 1):
             params = {
@@ -667,35 +666,8 @@ class KisUSClient:
 
             next_fk = str(next_fk_raw).strip()
             next_nk = str(next_nk_raw).strip()
-            response_meta = (
-                result.get("_response_meta")
-                if isinstance(result.get("_response_meta"), dict)
-                else {}
-            )
-            tr_cont = str(response_meta.get("tr_cont") or "").strip().upper()
-            if tr_cont and tr_cont not in {"M", "F", "D", "E"}:
-                raise KisUSTemporaryError(
-                    f"balance pagination unknown status exchange={exchange_code} tr_cont={tr_cont!r}"
-                )
-
-            if tr_cont in {"D", "E"}:
-                pagination_complete = True
-                logger.info(
-                    "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=tr_cont_%s rows=%d",
-                    exchange_code,
-                    page,
-                    tr_cont,
-                    len(page_output1),
-                )
-                break
 
             if not next_fk and not next_nk:
-                if tr_cont in {"M", "F"}:
-                    raise KisUSTemporaryError(
-                        f"balance pagination cursor missing exchange={exchange_code} "
-                        f"page={page} tr_cont={tr_cont}"
-                    )
-                pagination_complete = True
                 logger.info(
                     "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=empty_cursor rows=%d",
                     exchange_code,
@@ -705,15 +677,13 @@ class KisUSClient:
                 break
 
             if next_fk == ctx_fk and next_nk == ctx_nk:
-                logger.error(
-                    "[US_BALANCE][EXCHANGE][PAGINATION_STALLED] exchange=%s page=%d rows=%d",
+                logger.warning(
+                    "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=same_cursor rows=%d",
                     exchange_code,
                     page,
                     len(page_output1),
                 )
-                raise KisUSTemporaryError(
-                    f"balance pagination stalled exchange={exchange_code} page={page}"
-                )
+                break
 
             ctx_fk = next_fk
             ctx_nk = next_nk
@@ -725,17 +695,6 @@ class KisUSClient:
                 len(page_output1),
                 bool(next_fk),
                 bool(next_nk),
-            )
-
-        if not pagination_complete:
-            logger.error(
-                "[US_BALANCE][EXCHANGE][PAGINATION_INCOMPLETE] exchange=%s max_pages=%d rows=%d",
-                exchange_code,
-                max_pages,
-                len(all_output1),
-            )
-            raise KisUSTemporaryError(
-                f"balance pagination incomplete exchange={exchange_code} max_pages={max_pages}"
             )
         
         result_payload = {
@@ -1155,17 +1114,10 @@ class KisUSClient:
             all_rows.extend(row for row in rows if isinstance(row, dict))
 
             response_meta = result.get("_response_meta") if isinstance(result.get("_response_meta"), dict) else {}
-            tr_cont = str(response_meta.get("tr_cont") or "").strip().upper()
-            nk200 = str(result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or "").strip()
-            fk200 = str(result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or "").strip()
-            cursor = (nk200, fk200)
-
-            if tr_cont and tr_cont not in {"M", "F", "D", "E"}:
-                raise KisUSClientError(
-                    f"KIS fills pagination contract error: unknown tr_cont={tr_cont!r}"
-                )
-
-            if tr_cont in {"D", "E"} or (not tr_cont and cursor == ("", "")):
+            tr_cont = str(response_meta.get("tr_cont") or "").upper()
+            nk200 = str(result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or "")
+            fk200 = str(result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or "")
+            if tr_cont not in {"M", "F"}:
                 logger.info(
                     "[US_FILLS][FETCHED] count=%d pages=%d status=OK schema=PRACTICE_RANGE",
                     len(all_rows),
@@ -1173,10 +1125,7 @@ class KisUSClient:
                 )
                 return all_rows
 
-            # M/F explicitly means continuation. If KIS omits the response
-            # header but still supplies a cursor, fail safe by following the
-            # cursor rather than treating a potentially truncated first page
-            # as complete.
+            cursor = (nk200, fk200)
             if cursor == ("", "") or cursor in seen_cursors:
                 raise KisUSClientError(
                     f"KIS fills pagination contract error: tr_cont={tr_cont!r} cursor={cursor!r}"
@@ -1317,16 +1266,6 @@ class KisUSClient:
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
-                if isinstance(data, dict):
-                    tr_cont = str(resp.headers.get("tr_cont") or "").strip()
-                    if tr_cont:
-                        response_meta = (
-                            dict(data.get("_response_meta"))
-                            if isinstance(data.get("_response_meta"), dict)
-                            else {}
-                        )
-                        response_meta["tr_cont"] = tr_cont
-                        data["_response_meta"] = response_meta
                 
                 # Success after retry
                 if attempt > 1 and last_error:
