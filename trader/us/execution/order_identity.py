@@ -67,7 +67,7 @@ def normalize_and_validate_order_identity(intent: dict, context: Any | None = No
     normalized["side"] = side
     normalized["qty"] = int(normalized.get("qty", normalized.get("quantity", 0)) or 0)
     for field in ("trade_date", "session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source",
-                  "position_lifecycle_id", "pre_order_position_qty"):
+                  "position_lifecycle_id", "pre_order_position_qty", "trading_epoch_id"):
         value = normalized.get(field, meta.get(field))
         if value is None and context is not None:
             value = getattr(context, field, None)
@@ -79,8 +79,19 @@ def normalize_and_validate_order_identity(intent: dict, context: Any | None = No
 
 
 def assert_same_identity(existing: dict, incoming: dict) -> None:
+    existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+    incoming_meta = incoming.get("meta") if isinstance(incoming.get("meta"), dict) else {}
     for field in ("trade_date", "symbol", "side", "exchange", "position_lifecycle_id"):
-        old = existing.get(field) or (existing.get("meta") or {}).get(field)
-        new = incoming.get(field) or (incoming.get("meta") or {}).get(field)
+        old = existing.get(field) or existing_meta.get(field)
+        new = incoming.get(field) or incoming_meta.get(field)
         if old not in (None, "") and new not in (None, "") and str(old).upper() != str(new).upper():
             raise OrderIdentityCollision(f"{field} collision: {old!r} != {new!r}")
+
+    # Epoch is a hard generation boundary. A legacy NULL row must never be
+    # silently adopted into the active epoch by a reused client_order_key.
+    old_epoch = existing.get("trading_epoch_id") or existing_meta.get("trading_epoch_id")
+    new_epoch = incoming.get("trading_epoch_id") or incoming_meta.get("trading_epoch_id")
+    if (old_epoch not in (None, "") or new_epoch not in (None, "")) and str(old_epoch or "") != str(new_epoch or ""):
+        raise OrderIdentityCollision(
+            f"trading_epoch_id collision: {old_epoch!r} != {new_epoch!r}"
+        )
