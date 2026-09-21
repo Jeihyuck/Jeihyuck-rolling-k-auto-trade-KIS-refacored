@@ -3079,7 +3079,7 @@ class OrdersRepo:
                 if entry_meta_json:
                     conn.execute(
                         sa.update(self._schema.orders)
-                        .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                        .where(self._schema.orders.c.order_id == existing_row["order_id"])
                         .values(**_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"), updated_at=func.now())
                     )
                 return str(existing), False
@@ -3135,27 +3135,56 @@ class OrdersRepo:
         if entry_meta_json:
             values.update(_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"))
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            order_conditions = [
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.client_order_key == client_order_key,
+            ]
+            if trading_epoch_id is not None:
+                order_conditions.append(
+                    self._schema.orders.c.trading_epoch_id == trading_epoch_id
+                )
             stmt = (
                 sa.update(self._schema.orders)
-                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                .where(and_(*order_conditions))
                 .values(**values)
             )
             try:
                 with conn.begin_nested():
-                    conn.execute(stmt)
+                    result = conn.execute(stmt)
+                if int(result.rowcount or 0) != 1:
+                    logger.error(
+                        "[ORDERS][MARK_SUBMITTED][EPOCH_MISS] env=%s key=%s epoch=%s",
+                        env, client_order_key, trading_epoch_id,
+                    )
+                    return "ORDER_NOT_FOUND_CURRENT_EPOCH"
                 return "SUBMITTED"
             except IntegrityError as exc:
                 if not kis_odno:
                     raise
-                existing = conn.execute(
-                    select(self._schema.orders).where(
-                        and_(self._schema.orders.c.env == env, self._schema.orders.c.broker_order_id == kis_odno)
+                existing_conditions = [
+                    self._schema.orders.c.env == env,
+                    self._schema.orders.c.broker_order_id == kis_odno,
+                ]
+                current_conditions = [
+                    self._schema.orders.c.env == env,
+                    self._schema.orders.c.client_order_key == client_order_key,
+                ]
+                if trading_epoch_id is not None:
+                    existing_conditions.append(
+                        self._schema.orders.c.trading_epoch_id == trading_epoch_id
                     )
+                    current_conditions.append(
+                        self._schema.orders.c.trading_epoch_id == trading_epoch_id
+                    )
+                existing = conn.execute(
+                    select(self._schema.orders).where(and_(*existing_conditions))
                 ).mappings().first()
                 current = conn.execute(
-                    select(self._schema.orders).where(
-                        and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
-                    )
+                    select(self._schema.orders).where(and_(*current_conditions))
                 ).mappings().first()
                 same_identity = bool(existing and current and (
                     str(existing.get("client_order_key") or "") == client_order_key or
@@ -3169,14 +3198,14 @@ class OrdersRepo:
                     recovered_values["status"] = "ACKED_IDEMPOTENT_RECOVERED"
                     conn.execute(
                         sa.update(self._schema.orders)
-                        .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                        .where(and_(*current_conditions))
                         .values(**recovered_values)
                     )
                     logger.warning("[ORDER_ACK_IDEMPOTENT_RECOVERED] env=%s key=%s broker_order_id=%s", env, client_order_key, kis_odno)
                     return "ORDER_ACK_IDEMPOTENT_RECOVERED"
                 conn.execute(
                     sa.update(self._schema.orders)
-                    .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                    .where(and_(*current_conditions))
                     .values(status="ACK_DB_FAILED_RECONCILE_REQUIRED", response_json=safe_response_json, updated_at=func.now())
                 )
                 logger.error("[AMBIGUOUS_BROKER_ORDER_ID] env=%s key=%s broker_order_id=%s err=%s", env, client_order_key, kis_odno, exc)
@@ -3201,9 +3230,19 @@ class OrdersRepo:
         if entry_meta_json:
             values.update(_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"))
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.kis_odno == kis_odno,
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
             conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.kis_odno == kis_odno))
+                .where(and_(*conditions))
                 .values(**values)
             )
 
@@ -3235,6 +3274,12 @@ class OrdersRepo:
             conditions.append(self._schema.orders.c.client_order_key == client_order_key)
         
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
             result = conn.execute(
                 sa.update(self._schema.orders)
                 .where(and_(*conditions))
@@ -3250,18 +3295,38 @@ class OrdersRepo:
     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
         safe_error_payload = json_sanitize(error_payload or {})
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.client_order_key == client_order_key,
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
             conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                .where(and_(*conditions))
                 .values(status="ERROR", response_json=safe_error_payload, updated_at=func.now()),
             )
 
     def mark_cancelled(self, env: str, client_order_key: str, response_json: dict | None = None) -> None:
         safe_response_json = json_sanitize(response_json or {})
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.client_order_key == client_order_key,
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
             conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                .where(and_(*conditions))
                 .values(status="CANCELLED", response_json=safe_response_json, updated_at=func.now()),
             )
 
@@ -3394,15 +3459,20 @@ class OrdersRepo:
         logger.info("[ORDERS][STALE_REPAIR][START] env=%s before=%s reason=%s", env, before_dt.isoformat(), reason)
         
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.status.in_(open_statuses),
+                self._schema.orders.c.created_at < before_dt,
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
             result = conn.execute(
                 sa.update(self._schema.orders)
-                .where(
-                    and_(
-                        self._schema.orders.c.env == env,
-                        self._schema.orders.c.status.in_(open_statuses),
-                        self._schema.orders.c.created_at < before_dt,
-                    )
-                )
+                .where(and_(*conditions))
                 .values(
                     status="EXPIRED",
                     updated_at=func.now(),
