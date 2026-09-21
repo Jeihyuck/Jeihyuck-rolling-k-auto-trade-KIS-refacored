@@ -69,8 +69,18 @@ def test_broker_flat_guard_accepts_only_complete_flat_evidence(broker):
 
 
 def test_broker_flat_guard_is_real_env_aware(broker):
+    broker.us.get_balance.return_value = {
+        "positions": [],
+        "balance_parse_status": "OK",
+        "balance_complete": True,
+        "balance_authoritative": True,
+        "failed_exchanges": {},
+        "queried_exchanges": ["NASD"],
+        "exchange_result_counts": {"NASD": 0},
+    }
     result = guard.verify_broker_flat(env="real")
     assert result["env"] == "real"
+    assert result["us_exchanges"] == ["NASD"]
     assert broker.seen == {"kr_env": "real", "us_env": "real"}
 
 
