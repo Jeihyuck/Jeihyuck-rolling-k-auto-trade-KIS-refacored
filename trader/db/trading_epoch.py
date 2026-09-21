@@ -4,7 +4,7 @@ import os
 from uuid import uuid4
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from trader.account_state import get_account_key, resolve_env_name
 from trader.db.engine import get_engine
@@ -117,16 +117,14 @@ def start_new_trading_epoch(
             ).all()
         ]
         if old_portfolio_ids:
-            conn.execute(
-                text("""
-                    UPDATE positions
-                    SET status='CLOSED', closed_ts=NOW(),
-                        closed_reason='TRADING_EPOCH_ENDED'
-                    WHERE status='OPEN'
-                      AND portfolio_epoch_id = ANY(CAST(:portfolio_ids AS text[]))
-                """),
-                {"portfolio_ids": old_portfolio_ids},
-            )
+            close_stmt = text("""
+                UPDATE positions
+                SET status='CLOSED', closed_ts=CURRENT_TIMESTAMP,
+                    closed_reason='TRADING_EPOCH_ENDED'
+                WHERE status='OPEN'
+                  AND portfolio_epoch_id IN :portfolio_ids
+            """).bindparams(bindparam("portfolio_ids", expanding=True))
+            conn.execute(close_stmt, {"portfolio_ids": old_portfolio_ids})
             conn.execute(
                 text("""
                     UPDATE portfolio_epochs
