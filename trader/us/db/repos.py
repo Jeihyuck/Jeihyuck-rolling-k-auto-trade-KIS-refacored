@@ -2477,7 +2477,15 @@ def load_us_order_for_fill(
         logger.warning("[US_ORDER][LOAD_FOR_FILL_WARN] symbol=%s order_no=%s cok=%s err=%s", sym, on, cok, exc)
         return {}
 
-def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, client_order_key: str, cumulative: int, conn: Any | None = None) -> dict:
+def _supersede_synthetic_fills_for_actual(
+    *,
+    trade_date: str,
+    order_no: str,
+    client_order_key: str,
+    cumulative: int,
+    conn: Any | None = None,
+    trading_epoch_id: str | None = None,
+) -> dict:
     """Deactivate synthetic cumulative evidence once KIS actual evidence arrives.
 
     When ``conn`` is provided, the caller's open transaction is used so order
@@ -2505,11 +2513,15 @@ def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, cli
             else:
                 result["conflict"] += 1
         return result
+    if trading_epoch_id is None:
+        trading_epoch_id = _active_us_epoch(conn)
     rows = conn.execute(text("""SELECT id, qty, meta FROM us_fills WHERE trade_date=:td
         AND (:order_no='' OR order_no=:order_no) AND (:cok='' OR client_order_key=:cok)
+        AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
         AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
         AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-        {"td": trade_date, "order_no": order_no, "cok": client_order_key}).mappings().all()
+        {"td": trade_date, "order_no": order_no, "cok": client_order_key,
+         "trading_epoch_id": trading_epoch_id}).mappings().all()
     for row in rows:
         meta = _parse_json_meta(row.get("meta"))
         synth_cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
@@ -2523,7 +2535,16 @@ def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, cli
     return result
 
 
-def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client_order_key: str, symbol: str = "", side: str = "", conn: Any | None = None) -> dict:
+def _active_fill_cumulatives_for_order(
+    *,
+    trade_date: str,
+    order_no: str,
+    client_order_key: str,
+    symbol: str = "",
+    side: str = "",
+    conn: Any | None = None,
+    trading_epoch_id: str | None = None,
+) -> dict:
     result = {"actual": 0, "synthetic": 0, "actual_individual": 0}
     if conn is None:
         for f in _MEM_FILLS:
@@ -2550,18 +2571,24 @@ def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client
                 if _is_kis_execution_evidence(evidence):
                     result["actual_individual"] += int(f.get("qty") or 0)
         return result
+    if trading_epoch_id is None:
+        trading_epoch_id = _active_us_epoch(conn)
     if order_no:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND order_no=:order_no
             AND (:symbol='' OR symbol=:symbol)
             AND (:side='' OR side=:side)
+            AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-            {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(), "side": str(side).upper()}).mappings().all()
+            {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(),
+             "side": str(side).upper(), "trading_epoch_id": trading_epoch_id}).mappings().all()
     else:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND client_order_key=:cok
+            AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-            {"td": trade_date, "cok": client_order_key}).mappings().all()
+            {"td": trade_date, "cok": client_order_key,
+             "trading_epoch_id": trading_epoch_id}).mappings().all()
     for row in rows:
         meta = _parse_json_meta(row.get("meta"))
         cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
