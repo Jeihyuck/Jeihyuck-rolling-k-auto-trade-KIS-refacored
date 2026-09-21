@@ -76,7 +76,7 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
 """
 
 
-def _mark_filled_by_reconcile_stmt():
+def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
     """Build the typed actual-fill update used by PostgreSQL reconciliation.
 
     psycopg3 must not receive JSONB object values as ``unknown`` parameters:
@@ -84,7 +84,18 @@ def _mark_filled_by_reconcile_stmt():
     casts and SQLAlchemy bind types because this statement is executed through
     different SQLAlchemy/psycopg3 versions in production and repair jobs.
     """
-    return sa.text(_MARK_FILLED_BY_RECONCILE_SQL).bindparams(
+    sql = _MARK_FILLED_BY_RECONCILE_SQL
+    if not epoch_scoped:
+        sql = sql.replace(
+            """      AND (
+        :trading_epoch_id IS NULL
+        OR trading_epoch_id = CAST(:trading_epoch_id AS text)
+      )
+""",
+            "",
+        )
+    stmt = sa.text(sql)
+    bindparams = [
         sa.bindparam("qty", type_=sa.Integer()),
         sa.bindparam("price", type_=sa.Numeric()),
         sa.bindparam("cok", type_=sa.String()),
@@ -95,8 +106,10 @@ def _mark_filled_by_reconcile_stmt():
         sa.bindparam("order_no", type_=sa.String()),
         sa.bindparam("symbol", type_=sa.String()),
         sa.bindparam("side", type_=sa.String()),
-        sa.bindparam("trading_epoch_id", type_=sa.String()),
-    )
+    ]
+    if epoch_scoped:
+        bindparams.append(sa.bindparam("trading_epoch_id", type_=sa.String()))
+    return stmt.bindparams(*bindparams)
 
 # ---------------------------------------------------------------------------
 # In-memory fallback store (offline / test 환경)
@@ -2745,14 +2758,19 @@ def mark_order_filled_by_reconcile(
     try:
         with engine.begin() as conn:
             active_epoch_id = _active_us_epoch(conn)
+            epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            epoch_clause = " AND trading_epoch_id=:active_epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "order_no": on, "cok": cok, "symbol": sym}
+            if active_epoch_id:
+                order_params["active_epoch_id"] = active_epoch_id
             rows = conn.execute(text("""
                 SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
-                       qty_requested, qty_filled, trading_epoch_id
+                       qty_requested, qty_filled""" + epoch_select + """
                 FROM us_orders WHERE trade_date=:td AND
                   ((:order_no <> '' AND order_no=:order_no) OR
                    (:cok <> '' AND client_order_key=:cok)
-                   OR (:order_no <> '' AND symbol=:symbol)) FOR UPDATE
-            """), {"td": td, "order_no": on, "cok": cok, "symbol": sym}).mappings().all()
+                   OR (:order_no <> '' AND symbol=:symbol))
+            """ + epoch_clause + " FOR UPDATE"), order_params).mappings().all()
             matches = [dict(row) for row in rows if
                        (cok and str(row.get("client_order_key") or "") == cok)
                        or (on and normalize_us_order_no(row.get("order_no")) == normalize_us_order_no(on))]
@@ -2818,25 +2836,35 @@ def mark_order_filled_by_reconcile(
                 "id": order["id"],
                 "trading_epoch_id": order_epoch_id,
             }
-            conn.execute(text("""UPDATE us_orders SET status = :status, qty_filled = :qty,
+            update_sql = """UPDATE us_orders SET status = :status, qty_filled = :qty,
                 avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts
-                WHERE id = :id
-                  AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)"""),
-                update_params)
+                WHERE id = :id"""
+            if order_epoch_id:
+                update_sql += " AND trading_epoch_id=:trading_epoch_id"
+            conn.execute(text(update_sql), update_params)
             if not synthetic and _is_kis_order_cumulative_evidence(evidence):
-                conn.execute(_mark_filled_by_reconcile_stmt(),
-                    {"qty": observed_cumulative, "price": price, "cok": resolved_client_order_key, "remaining": remaining, "requested": requested, "ts": now_utc,
-                     "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
-                     "trading_epoch_id": order_epoch_id})
+                mark_params = {
+                    "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
+                    "remaining": remaining, "requested": requested, "ts": now_utc,
+                    "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
+                }
+                if order_epoch_id:
+                    mark_params["trading_epoch_id"] = order_epoch_id
+                conn.execute(
+                    _mark_filled_by_reconcile_stmt(epoch_scoped=bool(order_epoch_id)),
+                    mark_params,
+                )
+            fill_epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if order_epoch_id else ""
+            fill_epoch_params = {"trading_epoch_id": order_epoch_id} if order_epoch_id else {}
             actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
                 AND :order_no <> '' AND order_no=:order_no
                 AND symbol=:symbol AND side=:side
-                AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
+            """ + fill_epoch_clause + """
                 AND NOT COALESCE((meta->>'is_synthetic')::boolean,
                     (meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
                 AND COALESCE((meta->>'cumulative_filled_qty')::integer, qty)=:cumulative LIMIT 1"""),
                 {"td": td, "order_no": on, "symbol": sym, "side": side_u,
-                 "cumulative": observed_cumulative, "trading_epoch_id": order_epoch_id}).first()
+                 "cumulative": observed_cumulative, **fill_epoch_params}).first()
             delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
             delta = max(0, observed_cumulative - delta_base)
             fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
@@ -2856,20 +2884,29 @@ def mark_order_filled_by_reconcile(
                 fill = {"symbol": sym, "side": side_u, "qty": fill_delta, "price_usd": price,
                         "order_no": on, "client_order_key": resolved_client_order_key,
                         "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence, "meta": fill_meta}
-                conn.execute(text("""INSERT INTO us_fills
-                    (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
-                    VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
-                    ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
-                    {"td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
-                     "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
-                     "cok": resolved_client_order_key, "ts": now_utc,
-                     "trading_epoch_id": order_epoch_id,
-                     "meta": _json_param(fill_meta),
-                     "idem": _us_fill_idempotency_key_text(fill, td)})
+                insert_params = {
+                    "td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                    "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
+                    "cok": resolved_client_order_key, "ts": now_utc,
+                    "meta": _json_param(fill_meta),
+                    "idem": _us_fill_idempotency_key_text(fill, td),
+                }
+                if order_epoch_id:
+                    insert_params["trading_epoch_id"] = order_epoch_id
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                else:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                conn.execute(text(insert_sql), insert_params)
             rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
-                AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
+            """ + fill_epoch_clause + """
                 AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-                {"td": td, "order_no": on, "trading_epoch_id": order_epoch_id}).mappings().all()
+                {"td": td, "order_no": on, **fill_epoch_params}).mappings().all()
             execution_qty = 0; cumulative_qty = 0; synthetic_qty = 0
             for fill_after in rows_after:
                 meta_after = _parse_json_meta(fill_after.get("meta"))
