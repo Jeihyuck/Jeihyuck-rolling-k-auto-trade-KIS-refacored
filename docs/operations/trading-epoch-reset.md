@@ -65,7 +65,8 @@ Required broker evidence:
 - KR same-day order inquiry is paginated to completion and has no remaining quantity;
 - US balance parse status is OK;
 - US balance is complete and authoritative;
-- NASD, NYSE, and AMEX were all queried successfully;
+- practice: NASD, NYSE, and AMEX were all queried successfully;
+- real: NASD (KIS real-account US-wide balance contract) was queried successfully;
 - US holdings are zero;
 - US same-day order inquiry is paginated to completion;
 - malformed/quarantined US quantity evidence is rejected;
