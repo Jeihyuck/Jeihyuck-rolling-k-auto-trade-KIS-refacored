@@ -557,10 +557,13 @@ def mark_order_intent_sent(client_order_key: str) -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='SENT' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='SENT' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_SENT][ERROR] %s", exc)
 
@@ -575,10 +578,13 @@ def mark_order_intent_blocked(client_order_key: str, reason: str = "") -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='BLOCKED' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='BLOCKED' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_BLOCKED][ERROR] %s", exc)
 
@@ -593,10 +599,13 @@ def mark_order_intent_rejected(client_order_key: str, reason: str = "") -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='REJECTED' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='REJECTED' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_REJECTED][ERROR] %s", exc)
 
@@ -611,10 +620,13 @@ def mark_order_intent_dry_run(client_order_key: str) -> None:
         return
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE us_order_intents SET status='DRY_RUN' WHERE client_order_key=:cok"),
-                {"cok": client_order_key},
-            )
+            trading_epoch_id = _active_us_epoch(conn)
+            sql = "UPDATE us_order_intents SET status='DRY_RUN' WHERE client_order_key=:cok"
+            params = {"cok": client_order_key}
+            if trading_epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = trading_epoch_id
+            conn.execute(text(sql), params)
     except Exception as exc:
         logger.error("[US_INTENT][MARK_DRY_RUN][ERROR] %s", exc)
 
