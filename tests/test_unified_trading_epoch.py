@@ -427,3 +427,48 @@ def test_kr_position_mutators_never_touch_previous_trading_epoch(monkeypatch):
     assert by_epoch["old-epoch"]["status"] == "OPEN"
     assert by_epoch["old-epoch"]["qty"] == 7
     assert float(by_epoch["old-epoch"]["max_price"]) == 111
+
+
+
+def test_kr_order_lifecycle_mutators_never_touch_previous_epoch(monkeypatch):
+    engine = _engine()
+    _activate_practice_epoch(engine, monkeypatch)
+    schema = schema_for_engine(engine)
+    orders = OrdersRepo(engine)
+    old_id = str(uuid4())
+    old_created = datetime.now(timezone.utc) - timedelta(days=2)
+
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=old_id,
+            position_cycle_id=str(uuid4()),
+            portfolio_epoch_id=str(uuid4()),
+            trading_epoch_id="old-epoch",
+            env="practice", strategy="pb1", sid=1, mode=1,
+            code="005930", market="KOSPI", side="BUY", ord_type="LIMIT",
+            qty=1, limit_price=70000, stage="ENTRY",
+            client_order_key="old-epoch-order-key",
+            status="CREATED", kis_odno="OLD-KIS-ORDER",
+            broker_order_id="OLD-KIS-ORDER",
+            request_json={}, response_json={},
+            created_at=old_created, updated_at=old_created,
+        ))
+
+    assert orders.mark_submitted(
+        "practice", "old-epoch-order-key", "OLD-KIS-ORDER", {"rt_cd": "0"}
+    ) == "ORDER_NOT_FOUND_CURRENT_EPOCH"
+    orders.mark_acked("practice", "OLD-KIS-ORDER", {"rt_cd": "0"})
+    orders.mark_filled("practice", kis_odno="OLD-KIS-ORDER")
+    orders.mark_error("practice", "old-epoch-order-key", {"error": "should-not-write"})
+    orders.mark_cancelled("practice", "old-epoch-order-key", {"cancel": "should-not-write"})
+    assert orders.expire_stale_open_orders(
+        "practice", before_dt=datetime.now(timezone.utc) + timedelta(days=1)
+    ) == 0
+
+    with engine.connect() as conn:
+        row = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == old_id
+        )).mappings().one()
+    assert row["status"] == "CREATED"
+    assert row["trading_epoch_id"] == "old-epoch"
+    assert row["response_json"] == {}
