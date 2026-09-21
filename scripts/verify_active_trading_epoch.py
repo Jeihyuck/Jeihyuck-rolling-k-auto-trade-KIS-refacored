@@ -5,7 +5,6 @@ import json
 
 from trader.account_state import get_account_key, get_masked_account_key, resolve_env_name
 from trader.db.engine import make_engine
-from trader.db.migrate import run_migrations
 from trader.db.trading_epoch import active_trading_epoch_id
 
 
@@ -13,7 +12,6 @@ def main() -> int:
     env = resolve_env_name()
     account_id = get_account_key(env=env)
     engine = make_engine()
-    run_migrations(engine)
     epoch_id = active_trading_epoch_id(
         engine, env=env, account_id=account_id, required=True
     )
