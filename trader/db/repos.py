@@ -2080,22 +2080,6 @@ class RunsRepo:
             **kwargs
         }
         with self.engine.begin() as conn:
-            conflict_conditions = [self._schema.fills.c[col] == payload[col] for col in conflict_cols]
-            existing_fill = conn.execute(
-                select(
-                    self._schema.fills.c.fill_id,
-                    self._schema.fills.c.trading_epoch_id,
-                    self._schema.fills.c.portfolio_epoch_id,
-                    self._schema.fills.c.position_cycle_id,
-                ).where(and_(*conflict_conditions))
-            ).mappings().first()
-            if existing_fill:
-                if trading_epoch_id is not None and str(existing_fill.get("trading_epoch_id") or "") != str(trading_epoch_id):
-                    raise RuntimeError("KR_FILL_TRADING_EPOCH_COLLISION")
-                if portfolio_epoch_id and str(existing_fill.get("portfolio_epoch_id") or "") != str(portfolio_epoch_id):
-                    raise RuntimeError("KR_FILL_PORTFOLIO_EPOCH_COLLISION")
-                if position_cycle_id and str(existing_fill.get("position_cycle_id") or "") != str(position_cycle_id):
-                    raise RuntimeError("KR_FILL_POSITION_CYCLE_COLLISION")
             if conn.dialect.name == "postgresql":
                 # Use PostgreSQL-specific upsert
                 pk_cols = list(self._schema.runs.primary_key.columns)
