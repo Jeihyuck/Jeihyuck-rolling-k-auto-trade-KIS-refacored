@@ -2846,6 +2846,7 @@ class PortfolioEpochsRepo:
                 status="ENDED", ended_at=func.now(), reason=reason,
             ))
             old_epoch_ids = select(self._schema.portfolio_epochs.c.portfolio_epoch_id).where(and_(
+                self._schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
                 self._schema.portfolio_epochs.c.env == env,
                 self._schema.portfolio_epochs.c.account_id == account_id,
                 self._schema.portfolio_epochs.c.sid == sid,
@@ -5715,14 +5716,19 @@ class PositionsRepo:
                     return dict(candidate) | {"qty": int(qty), "avg_buy_price": float(avg_price)}, False
 
             # Close every stale OPEN identity, including legacy epochs, without deleting history.
-            stale_identity = and_(
+            stale_conditions = [
                 self._schema.positions.c.env == env_n,
                 self._schema.positions.c.strategy == strategy,
                 self._schema.positions.c.sid == sid,
                 self._schema.positions.c.mode == mode,
                 self._schema.positions.c.code == code_n,
                 self._schema.positions.c.status == "OPEN",
-            )
+            ]
+            if trading_epoch_id is not None:
+                stale_conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
+                )
+            stale_identity = and_(*stale_conditions)
             conn.execute(sa.update(self._schema.positions).where(stale_identity).values(
                 status="CLOSED", closed_reason="SUPERSEDED_BY_IMPORTED_CURRENT_CYCLE",
                 closed_ts=func.now(), updated_at=func.now(),
@@ -5778,19 +5784,36 @@ class PositionsRepo:
     def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:
         if not codes:
             return 0
-        stmt = (
-            sa.update(self._schema.positions)
-            .where(
-                and_(
-                    self._schema.positions.c.env == env,
-                    self._schema.positions.c.strategy == strategy,
-                    self._schema.positions.c.code.in_(codes),
-                    self._schema.positions.c.qty > 0,
+        with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn,
+                env=env,
+                account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.code.in_(codes),
+                self._schema.positions.c.qty > 0,
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
+                )
+            stmt = (
+                sa.update(self._schema.positions)
+                .where(and_(*conditions))
+                .values(
+                    qty=0,
+                    avg_buy_price=None,
+                    total_cost=0.0,
+                    status="CLOSED",
+                    closed_ts=func.now(),
+                    closed_reason="RECONCILED_ZERO",
+                    updated_at=func.now(),
                 )
             )
-            .values(qty=0, avg_buy_price=None, total_cost=0.0, status="CLOSED", closed_ts=func.now(), closed_reason="RECONCILED_ZERO", updated_at=func.now())
-        )
-        with self.engine.begin() as conn:
             result = conn.execute(stmt)
             return int(result.rowcount or 0)
 
@@ -5812,6 +5835,12 @@ class PositionsRepo:
         fail_soft = set(values).isdisjoint({"qty", "avg_buy_price", "total_cost", "realized_pnl"})
         try:
             with self.engine.begin() as conn:
+                trading_epoch_id = active_trading_epoch_id(
+                    conn,
+                    env=env,
+                    account_id=get_account_key(env=env),
+                    required=trading_epoch_enforced(),
+                )
                 conditions = [
                     self._schema.positions.c.env == env,
                     self._schema.positions.c.strategy == strategy,
@@ -5820,6 +5849,10 @@ class PositionsRepo:
                     self._schema.positions.c.code == code,
                     self._schema.positions.c.status == "OPEN",
                 ]
+                if trading_epoch_id is not None:
+                    conditions.append(
+                        self._schema.positions.c.trading_epoch_id == trading_epoch_id
+                    )
                 if position_cycle_id:
                     conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
                 if portfolio_epoch_id:
@@ -5881,6 +5914,16 @@ class PositionsRepo:
         if position_cycle_id:
             conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
         with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn,
+                env=env,
+                account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            if trading_epoch_id is not None:
+                conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
+                )
             row = conn.execute(select(self._schema.positions).where(and_(*conditions))).mappings().first()
             if not row:
                 logger.error(
