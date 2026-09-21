@@ -225,3 +225,35 @@ def test_kr_wrapper_carries_pagination_cursor_and_response_status(monkeypatch):
     assert kwargs["params"]["CTX_AREA_FK100"] == "FK"
     assert kwargs["params"]["CTX_AREA_NK100"] == "NK"
     assert result["_response_meta"]["tr_cont"] == "D"
+
+
+
+def test_kr_balance_pagination_rejects_repeated_cursor(monkeypatch):
+    from trader import kis_wrapper
+
+    monkeypatch.setattr(kis_wrapper, "kis_http_enabled", lambda: True)
+    kis = object.__new__(kis_wrapper.KisAPI)
+    kis.env = "practice"
+    kis._inquire_balance_page = Mock(side_effect=[
+        {"rt_cd": "0", "output1": [{"pdno": "005930", "hldg_qty": "0"}], "output2": {}, "ctx_area_fk100": "FK2", "ctx_area_nk100": "NK2"},
+        {"rt_cd": "0", "output1": [{"pdno": "005930", "hldg_qty": "0"}], "output2": {}, "ctx_area_fk100": "FK2", "ctx_area_nk100": "NK2"},
+    ])
+    with pytest.raises(kis_wrapper.KisBalanceUnavailable, match="KR_BALANCE_PAGINATION_STALLED"):
+        kis.inquire_balance_all(max_pages=5)
+
+
+def test_kr_balance_pagination_cannot_silently_hit_page_limit(monkeypatch):
+    from trader import kis_wrapper
+
+    monkeypatch.setattr(kis_wrapper, "kis_http_enabled", lambda: True)
+    kis = object.__new__(kis_wrapper.KisAPI)
+    kis.env = "practice"
+    kis._inquire_balance_page = Mock(return_value={
+        "rt_cd": "0",
+        "output1": [{"pdno": "005930", "hldg_qty": "0"}],
+        "output2": {},
+        "ctx_area_fk100": "FK2",
+        "ctx_area_nk100": "NK2",
+    })
+    with pytest.raises(kis_wrapper.KisBalanceUnavailable, match="KR_BALANCE_PAGINATION_INCOMPLETE"):
+        kis.inquire_balance_all(max_pages=1)
