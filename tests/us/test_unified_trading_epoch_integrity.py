@@ -264,6 +264,39 @@ def test_us_legacy_order_key_cannot_be_adopted_into_active_epoch(epoch_pg):
     assert row["meta"] == {}
 
 
+def test_us_same_trade_date_order_key_reuse_is_rejected_across_epochs(epoch_pg):
+    with epoch_pg.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,qty_requested,
+                qty_filled,avg_price_usd,order_no,status,dry_run,env,meta,trading_epoch_id
+            ) VALUES (
+                '2026-09-22','same-day-reused-key','AMD','NASDAQ','BUY',1,
+                0,100,'OLD-EPOCH-ORDER','ACK',false,'practice','{}'::jsonb,'epoch-old'
+            )
+        """))
+
+    saved = repos.save_order_ack({
+        "client_order_key": "same-day-reused-key",
+        "symbol": "AMD", "exchange": "NASDAQ", "side": "BUY",
+        "qty_requested": 1, "qty_filled": 0, "avg_price_usd": 100,
+        "order_no": "NEW-EPOCH-ORDER", "status": "ACK", "env": "practice",
+        "meta": {"strategy_owner": "US_STANDARD"},
+    }, trade_date="2026-09-22")
+    assert saved is False
+
+    with epoch_pg.connect() as conn:
+        row = conn.execute(text("""
+            SELECT trading_epoch_id,status,order_no,meta
+            FROM us_orders
+            WHERE client_order_key='same-day-reused-key'
+        """)).mappings().one()
+    assert row["trading_epoch_id"] == "epoch-old"
+    assert row["status"] == "ACK"
+    assert row["order_no"] == "OLD-EPOCH-ORDER"
+    assert row["meta"] == {}
+
+
 def test_us_old_epoch_fill_cannot_make_current_accounting_pass(epoch_pg):
     _save_current_order(
         key="epoch-order-3", order_no="EPOCH-O3", qty_requested=5, qty_filled=2
