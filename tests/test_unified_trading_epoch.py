@@ -338,3 +338,35 @@ def test_kr_old_order_key_cannot_be_adopted_into_new_epoch(monkeypatch):
         old = conn.execute(sa.select(schema.orders).where(schema.orders.c.order_id == legacy_id)).mappings().one()
     assert old["trading_epoch_id"] is None
     assert top
+
+
+
+def test_kr_fill_dedupe_cannot_adopt_previous_epoch(monkeypatch):
+    engine = _engine()
+    top = _activate_practice_epoch(engine, monkeypatch)
+    schema = schema_for_engine(engine)
+    now = datetime.now(timezone.utc)
+
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.fills).values(
+            fill_id=str(uuid4()), env="practice", trading_epoch_id="old-epoch",
+            trade_id="BROKER-FILL-REUSED", broker_fill_id="BROKER-FILL-REUSED",
+            code="005930", market="KOSPI", side="BUY", qty=1,
+            price=70000, fee=0, tax=0, filled_at=now, raw_json={"old": True},
+        ))
+
+    with pytest.raises(RuntimeError, match="KR_FILL_TRADING_EPOCH_COLLISION"):
+        FillsRepo(engine).upsert_fill(
+            env="practice", run_id=None, order_id=None, kis_odno="KR-REUSED",
+            trade_id="BROKER-FILL-REUSED", code="005930", market="KOSPI",
+            side="BUY", qty=1, price=71000, fee=0, tax=0,
+            filled_at=now, raw_json={"new": True},
+        )
+
+    with engine.connect() as conn:
+        row = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.broker_fill_id == "BROKER-FILL-REUSED"
+        )).mappings().one()
+    assert row["trading_epoch_id"] == "old-epoch"
+    assert row["raw_json"] == {"old": True}
+    assert top != "old-epoch"
