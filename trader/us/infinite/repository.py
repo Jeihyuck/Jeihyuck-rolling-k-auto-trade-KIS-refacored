@@ -81,30 +81,55 @@ class InfiniteRepository:
         payload = asdict(state)
         payload["status"] = state.status.value
         with self.engine.begin() as conn:
-            epoch_id = self._epoch_id(conn, required=True)
-            payload["trading_epoch_id"] = epoch_id
-            payload["metadata"] = json.dumps({**state.metadata, "trading_epoch_id": epoch_id}, default=str)
-            conn.execute(text("""
-                INSERT INTO us_tqqq_infinite_state (
-                    trading_epoch_id,strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
-                    core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
-                    market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
-                    status,metadata,version,updated_at
-                ) VALUES (
-                    :trading_epoch_id,:strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
-                    :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
-                    :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
-                    :status,CAST(:metadata AS jsonb),:version,NOW()
-                ) ON CONFLICT (trading_epoch_id,strategy_id,symbol) DO UPDATE SET
-                    cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
-                    cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
-                    core_filled_notional=EXCLUDED.core_filled_notional,
-                    reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
-                    last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
-                    material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
-                    cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
-                    metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
-            """), payload)
+            epoch_id = self._epoch_id(conn)
+            if epoch_id:
+                payload["trading_epoch_id"] = epoch_id
+                payload["metadata"] = json.dumps({**state.metadata, "trading_epoch_id": epoch_id}, default=str)
+                sql = """
+                    INSERT INTO us_tqqq_infinite_state (
+                        trading_epoch_id,strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
+                        core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
+                        market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
+                        status,metadata,version,updated_at
+                    ) VALUES (
+                        :trading_epoch_id,:strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
+                        :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
+                        :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
+                        :status,CAST(:metadata AS jsonb),:version,NOW()
+                    ) ON CONFLICT (trading_epoch_id,strategy_id,symbol) DO UPDATE SET
+                        cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
+                        cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
+                        core_filled_notional=EXCLUDED.core_filled_notional,
+                        reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
+                        last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
+                        material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
+                        cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
+                        metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+                """
+            else:
+                payload["metadata"] = json.dumps(state.metadata, default=str)
+                sql = """
+                    INSERT INTO us_tqqq_infinite_state (
+                        strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
+                        core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
+                        market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
+                        status,metadata,version,updated_at
+                    ) VALUES (
+                        :strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
+                        :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
+                        :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
+                        :status,CAST(:metadata AS jsonb),:version,NOW()
+                    ) ON CONFLICT (strategy_id,symbol) DO UPDATE SET
+                        cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
+                        cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
+                        core_filled_notional=EXCLUDED.core_filled_notional,
+                        reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
+                        last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
+                        material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
+                        cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
+                        metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+                """
+            conn.execute(text(sql), payload)
 
     def pending_sides(self, trade_date: date, symbol: str = "TQQQ") -> tuple[bool, bool]:
         with self.engine.connect() as conn:
@@ -180,13 +205,15 @@ class InfiniteRepository:
             "tqqq_ttl_cancel_result": cancel_result or {},
         }, default=str)
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE us_orders
+            epoch_id = self._epoch_id(conn)
+            sql = """UPDATE us_orders
                 SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
-                WHERE trade_date=:trade_date AND client_order_key=:key
-                  AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
-            """), {"patch": patch, "trade_date": trade_date, "key": key,
-                    "epoch_id": self._epoch_id(conn)})
+                WHERE trade_date=:trade_date AND client_order_key=:key"""
+            params = {"patch": patch, "trade_date": trade_date, "key": key}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            conn.execute(text(sql), params)
 
     def mark_ttl_unresolved_escalated(self, order: dict, *, escalated_at: datetime, unresolved_age_sec: float) -> None:
         """Persist a manual-reconcile RED marker without changing broker/order status."""
@@ -201,13 +228,15 @@ class InfiniteRepository:
             "manual_reconcile_reason": "TQQQ_TTL_UNRESOLVED_AFTER_CANCEL",
         }, default=str)
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE us_orders
+            epoch_id = self._epoch_id(conn)
+            sql = """UPDATE us_orders
                 SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
-                WHERE trade_date=:trade_date AND client_order_key=:key
-                  AND (:epoch_id IS NULL OR trading_epoch_id=:epoch_id)
-            """), {"patch": patch, "trade_date": trade_date, "key": key,
-                    "epoch_id": self._epoch_id(conn)})
+                WHERE trade_date=:trade_date AND client_order_key=:key"""
+            params = {"patch": patch, "trade_date": trade_date, "key": key}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            conn.execute(text(sql), params)
 
     def apply_ttl_terminal_observation(self, order: dict, observation: dict) -> dict:
         """Persist only broker-confirmed terminal truth for the original order."""
@@ -337,24 +366,35 @@ class InfiniteRepository:
         start = state.cycle_start_date or trading_date
         with self.engine.connect() as conn:
             epoch_id = self._epoch_id(conn)
-            sql = """
-                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
-                       f.client_order_key,f.order_no,
-                       i.strategy AS intent_strategy,i.meta AS intent_meta,
-                       o.meta AS order_meta
-                FROM us_fills f
-                LEFT JOIN us_order_intents i
-                  ON i.client_order_key=f.client_order_key
-                 AND (f.trading_epoch_id IS NULL OR i.trading_epoch_id=f.trading_epoch_id)
-                LEFT JOIN us_orders o
-                  ON o.client_order_key=f.client_order_key
-                 AND (f.trading_epoch_id IS NULL OR o.trading_epoch_id=f.trading_epoch_id)
-                WHERE f.symbol=:symbol AND f.trade_date>=:start
-            """
             params = {"symbol": state.symbol, "start": start}
             if epoch_id:
-                sql += " AND f.trading_epoch_id=:epoch_id"
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
+                           f.client_order_key,f.order_no,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,
+                           o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key=f.client_order_key
+                     AND i.trading_epoch_id=f.trading_epoch_id
+                    LEFT JOIN us_orders o
+                      ON o.client_order_key=f.client_order_key
+                     AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                      AND f.trading_epoch_id=:epoch_id
+                """
                 params["epoch_id"] = epoch_id
+            else:
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
+                           f.client_order_key,f.order_no,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,
+                           o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                    LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                """
             sql += " ORDER BY f.trade_date,f.filled_at,f.created_at"
             rows = conn.execute(text(sql), params).mappings().all()
         return self._summarize_fill_rows(rows, state, trading_date)
@@ -364,20 +404,29 @@ class InfiniteRepository:
         start = state.cycle_start_date or trading_date
         with self.engine.connect() as conn:
             epoch_id = self._epoch_id(conn)
-            sql = """
-                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
-                       i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
-                FROM us_fills f
-                LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
-                 AND (f.trading_epoch_id IS NULL OR i.trading_epoch_id=f.trading_epoch_id)
-                LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
-                 AND (f.trading_epoch_id IS NULL OR o.trading_epoch_id=f.trading_epoch_id)
-                WHERE f.symbol=:symbol AND f.trade_date>=:start
-            """
             params = {"symbol": state.symbol, "start": start}
             if epoch_id:
-                sql += " AND f.trading_epoch_id=:epoch_id"
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                     AND i.trading_epoch_id=f.trading_epoch_id
+                    LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                     AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                      AND f.trading_epoch_id=:epoch_id
+                """
                 params["epoch_id"] = epoch_id
+            else:
+                sql = """
+                    SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
+                           i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
+                    FROM us_fills f
+                    LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                    LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                    WHERE f.symbol=:symbol AND f.trade_date>=:start
+                """
             sql += " ORDER BY f.trade_date,f.filled_at,f.created_at"
             rows = conn.execute(text(sql), params).mappings().all()
         summary = self._summarize_fill_rows(rows, state, trading_date)
