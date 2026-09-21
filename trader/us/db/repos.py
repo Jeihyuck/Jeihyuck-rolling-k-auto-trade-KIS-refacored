@@ -1326,22 +1326,38 @@ def mark_us_profit_capture_stage(
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
         with engine.begin() as conn:
             epoch_id = _active_us_epoch(conn)
-            conn.execute(text("""INSERT INTO us_profit_capture_lifecycle
-                (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
-                 raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,trading_epoch_id,state,updated_at)
-                VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,:epoch_id,CAST(:state AS jsonb),NOW())
-                ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
-                 stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
-                 raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
-                 canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
-                 requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
-                 cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
-                 trading_epoch_id=COALESCE(us_profit_capture_lifecycle.trading_epoch_id,EXCLUDED.trading_epoch_id),
-                 state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""),
-                {"epoch_id":epoch_id,"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
-                 "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
-                 "requested":int(qty or meta.get(f"{stg}_qty") or 0),"filled":int(meta.get(f"{stg}_filled_qty") or 0),
-                 "state":_json_param(normalized)})
+            params = {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
+                      "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
+                      "requested":int(qty or meta.get(f"{stg}_qty") or 0),
+                      "filled":int(meta.get(f"{stg}_filled_qty") or 0),
+                      "state":_json_param(normalized)}
+            if epoch_id:
+                params["epoch_id"] = epoch_id
+                sql = """INSERT INTO us_profit_capture_lifecycle
+                    (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                     raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,trading_epoch_id,state,updated_at)
+                    VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,:epoch_id,CAST(:state AS jsonb),NOW())
+                    ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                     stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                     raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                     canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                     requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                     cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                     trading_epoch_id=COALESCE(us_profit_capture_lifecycle.trading_epoch_id,EXCLUDED.trading_epoch_id),
+                     state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
+            else:
+                sql = """INSERT INTO us_profit_capture_lifecycle
+                    (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                     raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
+                    VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
+                    ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                     stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                     raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                     canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                     requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                     cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                     state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
+            conn.execute(text(sql), params)
 
 
 def mark_us_position_exit_stage(
