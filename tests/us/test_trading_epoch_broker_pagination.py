@@ -97,3 +97,58 @@ def test_today_orders_reject_unknown_continuation_status(monkeypatch):
     })
     with pytest.raises(mod.KisUSClientError, match="unknown tr_cont"):
         client.get_us_fills_today("2026-09-21")
+
+
+
+def test_real_fills_use_real_tr_and_us_wide_params(monkeypatch):
+    monkeypatch.setattr(mod, "get_tr_info", lambda name: {"tr_id": "REGISTRY", "path": "/fills"})
+    client = _client()
+    client.env = "real"
+    headers = Mock(return_value={})
+    client._build_headers = headers
+    client._get = Mock(return_value={
+        "output": [],
+        "_response_meta": {"tr_cont": "D"},
+    })
+
+    assert client.get_us_fills_today("2026-09-21") == []
+    headers.assert_called_once_with("TTTS3035R")
+    params = client._get.call_args.kwargs["params"]
+    assert params["PDNO"] == "%"
+    assert params["OVRS_EXCG_CD"] == "NASD"
+
+
+def test_real_balance_uses_real_tr_id(monkeypatch):
+    monkeypatch.setattr(mod, "get_tr_info", lambda name: {"tr_id": "REGISTRY", "path": "/balance"})
+    client = _client()
+    client.env = "real"
+    headers = Mock(return_value={})
+    client._build_headers = headers
+    client._get = Mock(return_value={
+        "output1": [],
+        "output2": {},
+        "_response_meta": {"tr_cont": "D"},
+    })
+
+    result = client._get_us_balance_single_exchange("NASD", max_pages=2)
+    assert result["output1"] == []
+    headers.assert_called_once_with("TTTS3012R")
+
+
+def test_real_balance_defaults_to_nasd_us_wide(monkeypatch):
+    monkeypatch.delenv("US_BALANCE_EXCHANGES", raising=False)
+    client = _client()
+    client.env = "real"
+    client._tick_context = None
+    client._response_cache = {}
+    client._stage_deadline = None
+    client._stage_max_attempts = None
+    client._balance_conflicts = []
+    client._get_us_balance_single_exchange = Mock(return_value={
+        "rt_cd": "0", "output1": [], "output2": {}
+    })
+    client._merge_duplicate_symbols = lambda rows: rows
+
+    result = client.get_us_balance(force_refresh=True)
+    assert result["queried_exchanges"] == ["NASD"]
+    client._get_us_balance_single_exchange.assert_called_once_with("NASD")
