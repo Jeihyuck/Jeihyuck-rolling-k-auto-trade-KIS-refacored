@@ -2080,6 +2080,22 @@ class RunsRepo:
             **kwargs
         }
         with self.engine.begin() as conn:
+            conflict_conditions = [self._schema.fills.c[col] == payload[col] for col in conflict_cols]
+            existing_fill = conn.execute(
+                select(
+                    self._schema.fills.c.fill_id,
+                    self._schema.fills.c.trading_epoch_id,
+                    self._schema.fills.c.portfolio_epoch_id,
+                    self._schema.fills.c.position_cycle_id,
+                ).where(and_(*conflict_conditions))
+            ).mappings().first()
+            if existing_fill:
+                if trading_epoch_id is not None and str(existing_fill.get("trading_epoch_id") or "") != str(trading_epoch_id):
+                    raise RuntimeError("KR_FILL_TRADING_EPOCH_COLLISION")
+                if portfolio_epoch_id and str(existing_fill.get("portfolio_epoch_id") or "") != str(portfolio_epoch_id):
+                    raise RuntimeError("KR_FILL_PORTFOLIO_EPOCH_COLLISION")
+                if position_cycle_id and str(existing_fill.get("position_cycle_id") or "") != str(position_cycle_id):
+                    raise RuntimeError("KR_FILL_POSITION_CYCLE_COLLISION")
             if conn.dialect.name == "postgresql":
                 # Use PostgreSQL-specific upsert
                 pk_cols = list(self._schema.runs.primary_key.columns)
@@ -3039,12 +3055,24 @@ class OrdersRepo:
         }
         payload = dict(payload)
         with self.engine.begin() as conn:
-            existing = conn.execute(
-                select(self._schema.orders.c.order_id).where(
+            existing_row = conn.execute(
+                select(
+                    self._schema.orders.c.order_id,
+                    self._schema.orders.c.trading_epoch_id,
+                    self._schema.orders.c.portfolio_epoch_id,
+                    self._schema.orders.c.position_cycle_id,
+                ).where(
                     and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
                 )
-            ).scalar()
-            if existing:
+            ).mappings().first()
+            if existing_row:
+                if trading_epoch_id is not None and str(existing_row.get("trading_epoch_id") or "") != str(trading_epoch_id):
+                    raise RuntimeError("KR_ORDER_TRADING_EPOCH_COLLISION")
+                if str(existing_row.get("portfolio_epoch_id") or "") != str(portfolio_epoch_id or ""):
+                    raise RuntimeError("KR_ORDER_PORTFOLIO_EPOCH_COLLISION")
+                if position_cycle_id and str(existing_row.get("position_cycle_id") or "") != str(position_cycle_id):
+                    raise RuntimeError("KR_ORDER_POSITION_CYCLE_COLLISION")
+                existing = existing_row["order_id"]
                 if entry_meta_json:
                     conn.execute(
                         sa.update(self._schema.orders)
@@ -4454,10 +4482,13 @@ class FillsRepo:
                 position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                 portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
                 trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
+        active_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
+        )
         if trading_epoch_id is None:
-            trading_epoch_id = active_trading_epoch_id(
-                self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
-            )
+            trading_epoch_id = active_epoch_id
+        elif active_epoch_id is not None and str(trading_epoch_id or "") != str(active_epoch_id):
+            raise RuntimeError("KR_FILL_TRADING_EPOCH_MISMATCH")
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
