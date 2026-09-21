@@ -5604,6 +5604,7 @@ class PositionsRepo:
                 self._schema.positions.c.mode == mode,
                 self._schema.positions.c.code == code_n,
                 self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                self._schema.positions.c.trading_epoch_id == trading_epoch_id,
                 self._schema.positions.c.status == "OPEN",
             )
             rows = list(conn.execute(select(self._schema.positions).where(identity)
@@ -6191,6 +6192,7 @@ class PositionsRepo:
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
                             self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                            self._schema.positions.c.trading_epoch_id == trading_epoch_id,
                             self._schema.positions.c.status == "OPEN",
                         )
                     )
@@ -6294,6 +6296,7 @@ class PositionsRepo:
                             self._schema.positions.c.env == env_n,
                             self._schema.positions.c.code == code,
                             self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                            self._schema.positions.c.trading_epoch_id == trading_epoch_id,
                             self._schema.positions.c.status == "OPEN",
                         )
                     )
