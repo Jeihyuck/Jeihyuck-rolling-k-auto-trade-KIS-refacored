@@ -449,10 +449,16 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
     try:
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
-            existing_intent = conn.execute(
+            existing_result = conn.execute(
                 text("SELECT * FROM us_order_intents WHERE client_order_key=:cok FOR UPDATE"),
                 {"cok": intent.get("client_order_key")},
-            ).mappings().first()
+            )
+            existing_row = existing_result.fetchone()
+            existing_intent = (
+                dict(existing_row._mapping)
+                if existing_row is not None and hasattr(existing_row, "_mapping")
+                else (dict(existing_row) if existing_row is not None else None)
+            )
             incoming_identity = {
                 **intent,
                 "trade_date": td,
