@@ -325,6 +325,10 @@ def _active_us_epoch(bind: Any | None = None, *, required: bool | None = None) -
         return None
 
 
+def _us_state_epoch_id(bind: Any | None = None) -> str:
+    return str(_active_us_epoch(bind) or "legacy-unscoped-0052")
+
+
 def _json_param(val: Any) -> str:
     """JSONB 파라미터를 JSON 문자열로 직렬화."""
     return json.dumps(val or {}, ensure_ascii=False, default=str)
@@ -659,6 +663,10 @@ def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> 
         return None
     sql = "SELECT *, event_timestamp AS timestamp, raw_broker_order_no AS broker_order_no FROM us_order_events WHERE trade_date=:td"
     params = {"td": trade_date}
+    epoch_id = _active_us_epoch(engine)
+    if epoch_id:
+        sql += " AND trading_epoch_id=:epoch_id"
+        params["epoch_id"] = epoch_id
     if session_run_id:
         sql += " AND session_run_id=:session_run_id"
         params["session_run_id"] = session_run_id
@@ -950,6 +958,7 @@ def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> d
 def _ensure_us_position_risk_state_table(conn) -> None:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS us_position_risk_state (
+            trading_epoch_id TEXT NOT NULL,
             trade_date DATE NOT NULL,
             symbol TEXT NOT NULL,
             soft_stop_breach_count INTEGER NOT NULL DEFAULT 0,
@@ -960,7 +969,7 @@ def _ensure_us_position_risk_state_table(conn) -> None:
             last_pnl_pct NUMERIC,
             state JSONB DEFAULT '{}'::jsonb,
             updated_at TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (trade_date, symbol)
+            PRIMARY KEY (trading_epoch_id, trade_date, symbol)
         )
     """))
 
@@ -974,16 +983,18 @@ def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             row = conn.execute(
                 text("""
-                    SELECT trade_date, symbol, soft_stop_breach_count,
+                    SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                            first_soft_stop_seen_at, last_soft_stop_seen_at,
                            lowest_price_since_breach, last_price, last_pnl_pct,
                            state, updated_at
                     FROM us_position_risk_state
-                    WHERE trade_date = :td AND symbol = :symbol
+                    WHERE trading_epoch_id=:epoch_id
+                      AND trade_date = :td AND symbol = :symbol
                 """),
-                {"td": trade_date, "symbol": key[1]},
+                {"epoch_id": epoch_id, "td": trade_date, "symbol": key[1]},
             ).mappings().first()
             return dict(row) if row else {}
     except Exception as exc:
@@ -1004,16 +1015,18 @@ def load_latest_us_position_risk_state(symbol: str, on_or_before_trade_date: str
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             row = conn.execute(text("""
-                SELECT trade_date, symbol, soft_stop_breach_count,
+                SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                        first_soft_stop_seen_at, last_soft_stop_seen_at,
                        lowest_price_since_breach, last_price, last_pnl_pct,
                        state, updated_at
                 FROM us_position_risk_state
-                WHERE symbol = :symbol AND trade_date <= :trade_date
+                WHERE trading_epoch_id=:epoch_id
+                  AND symbol = :symbol AND trade_date <= :trade_date
                 ORDER BY trade_date DESC, updated_at DESC
                 LIMIT 1
-            """), {"symbol": key_symbol, "trade_date": td}).mappings().first()
+            """), {"epoch_id": epoch_id, "symbol": key_symbol, "trade_date": td}).mappings().first()
             return dict(row) if row else {}
     except Exception as exc:
         logger.warning("[US_RISK_STATE][LOAD_LATEST_WARN] symbol=%s trade_date=%s err=%s", key_symbol, td, exc)
@@ -1040,12 +1053,13 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             rows = conn.execute(text("""
-                SELECT DISTINCT ON (symbol) trade_date, symbol, state, updated_at
+                SELECT DISTINCT ON (symbol) trading_epoch_id, trade_date, symbol, state, updated_at
                 FROM us_position_risk_state
-                WHERE trade_date <= :trade_date
+                WHERE trading_epoch_id=:epoch_id AND trade_date <= :trade_date
                 ORDER BY symbol, trade_date DESC, updated_at DESC
-            """), {"trade_date": td}).mappings()
+            """), {"epoch_id": epoch_id, "trade_date": td}).mappings()
             for row in rows:
                 st = row.get("state") or {}
                 lifecycle = (st.get("lifecycle") or {}) if isinstance(st, dict) else {}
@@ -1067,21 +1081,22 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
             conn.execute(
                 text("""
                     INSERT INTO us_position_risk_state (
-                        trade_date, symbol, soft_stop_breach_count,
+                        trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
                         first_soft_stop_seen_at, last_soft_stop_seen_at,
                         lowest_price_since_breach, last_price, last_pnl_pct,
                         state, updated_at
                     )
                     VALUES (
-                        :td, :symbol, :soft_stop_breach_count,
+                        :epoch_id, :td, :symbol, :soft_stop_breach_count,
                         :first_soft_stop_seen_at, :last_soft_stop_seen_at,
                         :lowest_price_since_breach, :last_price, :last_pnl_pct,
                         CAST(:state AS jsonb), NOW()
                     )
-                    ON CONFLICT (trade_date, symbol) DO UPDATE SET
+                    ON CONFLICT (trading_epoch_id, trade_date, symbol) DO UPDATE SET
                         soft_stop_breach_count = EXCLUDED.soft_stop_breach_count,
                         first_soft_stop_seen_at = EXCLUDED.first_soft_stop_seen_at,
                         last_soft_stop_seen_at = EXCLUDED.last_soft_stop_seen_at,
@@ -1092,6 +1107,7 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
                         updated_at = NOW()
                 """),
                 {
+                    "epoch_id": epoch_id,
                     "td": trade_date,
                     "symbol": key[1],
                     "soft_stop_breach_count": normalized["soft_stop_breach_count"],
@@ -1177,13 +1193,18 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                         state[key] = candidate[key]
         if engine is not None:
             with engine.connect() as conn:
-                rows = conn.execute(text("""SELECT DISTINCT ON (stage)
+                epoch_id = _active_us_epoch(conn)
+                sql = """SELECT DISTINCT ON (stage)
                     stage,stage_status,client_order_key,raw_broker_order_no,
                     cumulative_filled_qty,state,updated_at,trade_date
                     FROM us_profit_capture_lifecycle
-                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle
-                    ORDER BY stage,trade_date DESC,updated_at DESC"""),
-                    {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}).mappings().all()
+                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle"""
+                params = {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                sql += " ORDER BY stage,trade_date DESC,updated_at DESC"
+                rows = conn.execute(text(sql), params).mappings().all()
             state={"position_lifecycle_id":lifecycle,"meta":{}}
             for row in rows:
                 stage=str(row["stage"]); status=str(row["stage_status"])
@@ -1252,18 +1273,20 @@ def mark_us_profit_capture_stage(
     if engine is not None:
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
         with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
             conn.execute(text("""INSERT INTO us_profit_capture_lifecycle
                 (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
-                 raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
-                VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
+                 raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,trading_epoch_id,state,updated_at)
+                VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,:epoch_id,CAST(:state AS jsonb),NOW())
                 ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
                  stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
                  raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
                  canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
                  requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
                  cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                 trading_epoch_id=COALESCE(us_profit_capture_lifecycle.trading_epoch_id,EXCLUDED.trading_epoch_id),
                  state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""),
-                {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
+                {"epoch_id":epoch_id,"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
                  "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
                  "requested":int(qty or meta.get(f"{stg}_qty") or 0),"filled":int(meta.get(f"{stg}_filled_qty") or 0),
                  "state":_json_param(normalized)})
@@ -4252,11 +4275,16 @@ def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
     d = date.fromisoformat(trade_date)
     start_utc = datetime.combine(d, time.min, tzinfo=ny).astimezone(utc).isoformat()
     end_utc = datetime.combine(d + timedelta(days=1), time.min, tzinfo=ny).astimezone(utc).isoformat()
-    queries = [("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date})]
-    for col in ("created_at", "updated_at", "submitted_at", "acked_at"):
-        queries.append((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}))
     try:
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            queries = [("SELECT * FROM us_orders WHERE trade_date = :td" + epoch_clause,
+                        {"td": trade_date, **epoch_params})]
+            for col in ("created_at", "updated_at", "submitted_at", "acked_at"):
+                queries.append((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts" + epoch_clause,
+                                {"start_ts": start_utc, "end_ts": end_utc, **epoch_params}))
             for sql, params in queries:
                 try:
                     rows = _rows(conn.execute(text(sql), params))
@@ -4290,11 +4318,17 @@ def load_today_committed_buy_notional_result(trade_date: str, env: str = "practi
         FROM us_orders o
         LEFT JOIN us_order_intents i
           ON i.client_order_key = o.client_order_key
+         AND (o.trading_epoch_id IS NULL OR i.trading_epoch_id=o.trading_epoch_id)
         WHERE o.trade_date = :td
     """
     try:
         with engine.connect() as conn:
-            result = conn.execute(text(query), {"td": trade_date})
+            epoch_id = _active_us_epoch(conn)
+            params = {"td": trade_date}
+            if epoch_id:
+                query += " AND o.trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            result = conn.execute(text(query), params)
             rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
     except Exception as exc:
         return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
