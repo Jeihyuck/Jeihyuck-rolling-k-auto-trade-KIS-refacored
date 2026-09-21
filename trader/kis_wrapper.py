@@ -4149,6 +4149,7 @@ class KisAPI:
             "INQR_DVSN": "00",
             "PDNO": "",
             "CCLD_DVSN": "00",
+            "INQR_DVSN_3": "00",
             "ORD_GNO_BRNO": "",
             "ODNO": "",
             "INQR_DVSN": "00",
