@@ -1690,19 +1690,48 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                 incoming_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
                 evidence = str(incoming_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
                 incoming_cum = int(incoming_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
-                if _is_kis_order_cumulative_evidence(evidence):
-                    existing = conn.execute(
-                        text("""SELECT qty, meta FROM us_fills
-                                  WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
-                        {"fill_idempotency_key": idem},
+
+                order_epoch_id = trading_epoch_id
+                if trading_epoch_id and _is_actual_evidence(evidence):
+                    order_row = conn.execute(
+                        text("""SELECT trading_epoch_id FROM us_orders
+                                WHERE trade_date=:td
+                                  AND ((:cok <> '' AND client_order_key=:cok)
+                                       OR (:order_no <> '' AND order_no=:order_no))
+                                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                                LIMIT 1"""),
+                        {
+                            "td": td,
+                            "cok": str(f.get("client_order_key") or ""),
+                            "order_no": str(f.get("order_no") or ""),
+                        },
                     ).mappings().first()
-                    if existing:
-                        existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
-                        existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing.get("qty") or 0)
-                        if incoming_cum < existing_cum:
-                            f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
-                            skipped_duplicates += 1
-                            continue
+                    if not order_row:
+                        f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                        skipped_duplicates += 1
+                        continue
+                    order_epoch_id = _assert_us_order_epoch(dict(order_row), trading_epoch_id)
+
+                existing = conn.execute(
+                    text("""SELECT qty, meta, trading_epoch_id FROM us_fills
+                            WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
+                    {"fill_idempotency_key": idem},
+                ).mappings().first()
+                if existing and (
+                    order_epoch_id is not None
+                    and str(existing.get("trading_epoch_id") or "") != str(order_epoch_id)
+                ):
+                    f["save_status"] = "FILL_EPOCH_COLLISION"
+                    skipped_duplicates += 1
+                    continue
+
+                if _is_kis_order_cumulative_evidence(evidence) and existing:
+                    existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+                    existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing.get("qty") or 0)
+                    if incoming_cum < existing_cum:
+                        f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
+                        skipped_duplicates += 1
+                        continue
                 fill_meta_to_store = _parse_json_meta(f.get("meta"))
                 params = {
                     "td": td,
@@ -1716,9 +1745,9 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                     "filled_at": f.get("filled_at"),
                     "fill_idempotency_key": idem,
                 }
-                if trading_epoch_id:
-                    fill_meta_to_store["trading_epoch_id"] = trading_epoch_id
-                    params["trading_epoch_id"] = trading_epoch_id
+                if order_epoch_id:
+                    fill_meta_to_store["trading_epoch_id"] = order_epoch_id
+                    params["trading_epoch_id"] = order_epoch_id
                     sql = """
                         INSERT INTO us_fills
                             (trade_date, symbol, exchange, side, qty, price_usd,
@@ -1731,7 +1760,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                             price_usd = EXCLUDED.price_usd,
                             filled_at = COALESCE(EXCLUDED.filled_at, us_fills.filled_at),
                             client_order_key = EXCLUDED.client_order_key,
-                            trading_epoch_id = COALESCE(us_fills.trading_epoch_id, EXCLUDED.trading_epoch_id),
+                            trading_epoch_id = us_fills.trading_epoch_id,
                             meta = us_fills.meta || EXCLUDED.meta
                         WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
                               > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
@@ -1781,6 +1810,8 @@ def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> 
         "RECONCILE_ORDER_IDENTITY_REQUIRED",
         "RECONCILE_TRADE_DATE_REQUIRED",
         "RECONCILE_QTY_EVIDENCE_MISSING",
+        "FILL_EPOCH_COLLISION",
+        "ORDER_EPOCH_MISMATCH",
     }
     status_counts: dict[str, int] = {}
     for f in fills or []:
@@ -1803,6 +1834,8 @@ def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> 
             "RECONCILE_ORDER_IDENTITY_REQUIRED",
             "RECONCILE_TRADE_DATE_REQUIRED",
             "RECONCILE_QTY_EVIDENCE_MISSING",
+            "FILL_EPOCH_COLLISION",
+            "ORDER_EPOCH_MISMATCH",
         ]
         status = next((s for s in priority if status_counts.get(s)), next(iter(status_counts)))
         return {"status": status, "inserted_count": int(inserted or 0),
