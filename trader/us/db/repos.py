@@ -59,6 +59,10 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
       AND order_no = CAST(:order_no AS text)
       AND symbol = CAST(:symbol AS text)
       AND side = CAST(:side AS text)
+      AND (
+        :trading_epoch_id IS NULL
+        OR trading_epoch_id = CAST(:trading_epoch_id AS text)
+      )
       AND NOT COALESCE(
         (meta->>'is_synthetic')::boolean,
         (meta->>'synthetic')::boolean,
@@ -91,6 +95,7 @@ def _mark_filled_by_reconcile_stmt():
         sa.bindparam("order_no", type_=sa.String()),
         sa.bindparam("symbol", type_=sa.String()),
         sa.bindparam("side", type_=sa.String()),
+        sa.bindparam("trading_epoch_id", type_=sa.String()),
     )
 
 # ---------------------------------------------------------------------------
@@ -330,6 +335,15 @@ def _us_state_epoch_id(bind: Any | None = None) -> str:
     return str(_active_us_epoch(bind) or "legacy-unscoped-0052")
 
 
+def _assert_us_order_epoch(order: dict, active_epoch_id: str | None) -> str | None:
+    order_epoch = order.get("trading_epoch_id")
+    if active_epoch_id is not None and str(order_epoch or "") != str(active_epoch_id):
+        raise RuntimeError(
+            f"US_ORDER_TRADING_EPOCH_MISMATCH order_epoch={order_epoch!r} active_epoch={active_epoch_id!r}"
+        )
+    return str(order_epoch) if order_epoch not in (None, "") else None
+
+
 def _json_param(val: Any) -> str:
     """JSONB 파라미터를 JSON 문자열로 직렬화."""
     return json.dumps(val or {}, ensure_ascii=False, default=str)
@@ -422,6 +436,18 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
     try:
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
+            existing_intent = conn.execute(
+                text("SELECT * FROM us_order_intents WHERE client_order_key=:cok FOR UPDATE"),
+                {"cok": intent.get("client_order_key")},
+            ).mappings().first()
+            incoming_identity = {
+                **intent,
+                "trade_date": td,
+                "trading_epoch_id": trading_epoch_id,
+                "meta": {**intent_meta, "trading_epoch_id": trading_epoch_id} if trading_epoch_id else intent_meta,
+            }
+            if existing_intent:
+                assert_same_identity(dict(existing_intent), incoming_identity)
             intent_meta_to_store = {
                 **intent_meta,
                 **{field: intent.get(field) for field in (
@@ -585,14 +611,15 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
     from trader.us.execution.order_identity import assert_same_identity, require_identity
     require_identity(row.get("client_order_key"))
     trading_epoch_id = row.get("trading_epoch_id") or _active_us_epoch(conn)
+    incoming_identity = {**row, "trade_date": td, "trading_epoch_id": trading_epoch_id}
     existing = conn.execute(text("SELECT * FROM us_orders WHERE client_order_key=:cok FOR UPDATE"), {"cok": row["client_order_key"]}).fetchone()
     if existing:
-        assert_same_identity(dict(existing._mapping), {**row, "trade_date": td})
+        assert_same_identity(dict(existing._mapping), incoming_identity)
     order_no = str(row.get("order_no") or "").strip()
     if order_no:
         broker_existing = conn.execute(text("SELECT * FROM us_orders WHERE trade_date=:td AND order_no=:ono FOR UPDATE"), {"td": td, "ono": order_no}).fetchone()
         if broker_existing:
-            assert_same_identity(dict(broker_existing._mapping), {**row, "trade_date": td})
+            assert_same_identity(dict(broker_existing._mapping), incoming_identity)
     params = {
         "td": td,
         "cok": row["client_order_key"],
@@ -632,7 +659,7 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     dry_run       =EXCLUDED.dry_run,
                     committed_notional_usd=COALESCE(us_orders.committed_notional_usd, EXCLUDED.committed_notional_usd),
                     env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
-                    trading_epoch_id=COALESCE(us_orders.trading_epoch_id, EXCLUDED.trading_epoch_id),
+                    trading_epoch_id=us_orders.trading_epoch_id,
                     meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
                     updated_at    =NOW()
         """
