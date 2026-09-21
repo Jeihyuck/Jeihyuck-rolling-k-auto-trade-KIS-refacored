@@ -25,6 +25,26 @@ The last rule matters because some legacy client-order identities are determinis
 trade date. The epoch boundary isolates DB reads/writes, but PR138 intentionally does
 not rewrite strategy order-key semantics.
 
+### Same-trade-date restart is intentionally unsupported
+
+This PR does **not** claim that a new epoch is independently tradable later in the same
+market trade date. In particular, US `us_orders.client_order_key` and
+`us_order_intents.client_order_key` retain their existing global uniqueness contract.
+If a deterministic key from the earlier epoch is generated again on the same trade date,
+the new code must reject the collision rather than adopt, overwrite, or relabel the old
+row into the active epoch.
+
+Therefore:
+
+- cross-epoch contamination is fail-closed;
+- same-trade-date key reuse is not made tradable by this PR;
+- do not change the UNIQUE constraints or append the epoch to strategy order keys as part
+  of this reset change;
+- resume automated practice trading on the next market trading date only.
+
+Supporting same-trade-date restart would be a separate policy/schema project because it
+changes durable order identity semantics and idempotency constraints.
+
 ## 1. Pull merged code
 
 ```bash
