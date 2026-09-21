@@ -58,7 +58,7 @@ jobs:
       - name: Run epoch lifecycle regression
         run: |
           set -euo pipefail
-          python -m pytest tests/test_unified_trading_epoch.py tests/test_trading_epoch_broker_guard.py -q
+          python -m pytest tests/test_unified_trading_epoch.py tests/test_trading_epoch_broker_guard.py tests/kr/test_pr138_runs_repo_startup.py -q
 
       - name: Execute 0052 on PostgreSQL 16
         run: |
