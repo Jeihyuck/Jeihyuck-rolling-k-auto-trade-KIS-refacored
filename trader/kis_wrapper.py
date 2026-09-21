@@ -3789,7 +3789,7 @@ class KisAPI:
             )
         return payload
 
-    def inquire_balance_all(self, *, max_empty_retry: int = 2) -> dict:
+    def inquire_balance_all(self, *, max_empty_retry: int = 2, max_pages: int = 20) -> dict:
         """
         ✅ 페이징/디바운스 적용 잔고 전체 조회
         반환: {'output1': [...], 'output2': {...}, 'ctx_area_fk100': '...', 'ctx_area_nk100': '...'}
@@ -3819,7 +3819,12 @@ class KisAPI:
         out2_last = None  # 🔸 요약 블록(예수금 등) → '첫 페이지' 것만 유지
         empty_cnt = 0
         last_error: Exception | None = None
+        page_count = 0
+        seen_cursors: set[tuple[str, str]] = set()
         while True:
+            page_count += 1
+            if page_count > max(1, int(max_pages)):
+                raise KisBalanceUnavailable("KR_BALANCE_PAGINATION_INCOMPLETE")
             try:
                 j = self._inquire_balance_page(fk, nk)
             except Exception as e:
@@ -3895,10 +3900,17 @@ class KisAPI:
             if out2 is not None and out2_last is None:
                 out2_last = out2
 
-            fk = (j.get("ctx_area_fk100") or "").strip()
-            nk = (j.get("ctx_area_nk100") or "").strip()
-            if not fk and not nk:
+            next_fk = (j.get("ctx_area_fk100") or "").strip()
+            next_nk = (j.get("ctx_area_nk100") or "").strip()
+            if not next_fk and not next_nk:
+                fk = next_fk
+                nk = next_nk
                 break
+            cursor = (next_fk, next_nk)
+            if cursor in seen_cursors:
+                raise KisBalanceUnavailable("KR_BALANCE_PAGINATION_STALLED")
+            seen_cursors.add(cursor)
+            fk, nk = cursor
 
         out2_summary = _summarize_balance_output2(out2_last or {})
         logger.info(
