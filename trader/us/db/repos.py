@@ -2227,14 +2227,19 @@ def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
     try:
         with engine.begin() as conn:
             epoch_id = _active_us_epoch(conn)
-            sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
-                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
-                   AND (f.trading_epoch_id IS NULL OR o.trading_epoch_id=f.trading_epoch_id)
-                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""
-            params = {"td": td}
             if epoch_id:
-                sql += " AND f.trading_epoch_id=:epoch_id"
-                params["epoch_id"] = epoch_id
+                sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                   AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.trade_date=:td AND f.side='SELL'
+                      AND f.trading_epoch_id=:epoch_id
+                      AND (o.id IS NULL OR o.status='FILLED')"""
+                params = {"td": td, "epoch_id": epoch_id}
+            else:
+                sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""
+                params = {"td": td}
             rows = conn.execute(text(sql), params)
             return {r[0] for r in rows}
     except Exception as exc:
@@ -2411,9 +2416,10 @@ def load_us_order_for_fill(
             epoch_id = _active_us_epoch(conn)
             epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
             epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            epoch_select = ", trading_epoch_id" if epoch_id else ""
             row = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, trading_epoch_id, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
                 FROM us_orders
                 WHERE trade_date = :td AND symbol = :symbol
                   AND ((:order_no <> '' AND order_no = :order_no)
@@ -2428,7 +2434,7 @@ def load_us_order_for_fill(
                 return {}
             candidates = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, trading_epoch_id, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
                 FROM us_orders WHERE trade_date=:td AND symbol=:symbol
             """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
@@ -4446,23 +4452,32 @@ def load_today_committed_buy_notional_result(trade_date: str, env: str = "practi
     if engine is None:
         return CommittedBuyNotionalResult(False, 0.0, 0, "orders_db_engine_unavailable")
     from sqlalchemy import text
-    query = """
-        SELECT o.*, i.notional_usd AS intent_notional_usd,
-               i.limit_price_usd AS intent_limit_price_usd,
-               i.meta AS intent_meta
-        FROM us_orders o
-        LEFT JOIN us_order_intents i
-          ON i.client_order_key = o.client_order_key
-         AND (o.trading_epoch_id IS NULL OR i.trading_epoch_id=o.trading_epoch_id)
-        WHERE o.trade_date = :td
-    """
     try:
         with engine.connect() as conn:
             epoch_id = _active_us_epoch(conn)
             params = {"td": trade_date}
             if epoch_id:
-                query += " AND o.trading_epoch_id=:epoch_id"
+                query = """
+                    SELECT o.*, i.notional_usd AS intent_notional_usd,
+                           i.limit_price_usd AS intent_limit_price_usd,
+                           i.meta AS intent_meta
+                    FROM us_orders o
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key = o.client_order_key
+                     AND i.trading_epoch_id=o.trading_epoch_id
+                    WHERE o.trade_date = :td AND o.trading_epoch_id=:epoch_id
+                """
                 params["epoch_id"] = epoch_id
+            else:
+                query = """
+                    SELECT o.*, i.notional_usd AS intent_notional_usd,
+                           i.limit_price_usd AS intent_limit_price_usd,
+                           i.meta AS intent_meta
+                    FROM us_orders o
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key = o.client_order_key
+                    WHERE o.trade_date = :td
+                """
             result = conn.execute(text(query), params)
             rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
     except Exception as exc:
