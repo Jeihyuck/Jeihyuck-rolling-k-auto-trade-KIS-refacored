@@ -4189,8 +4189,9 @@ class KisAPI:
                         raise KisPermanentError(f"HTTP {status} for {url}")
                     payload = resp.json()
                     if isinstance(payload, dict):
+                        response_headers = getattr(resp, "headers", {}) or {}
                         payload["_response_meta"] = {
-                            "tr_cont": str(resp.headers.get("tr_cont") or "").strip(),
+                            "tr_cont": str(response_headers.get("tr_cont") or "").strip(),
                         }
                     return payload
                 except requests.exceptions.Timeout as exc:
