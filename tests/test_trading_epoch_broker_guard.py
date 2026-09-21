@@ -234,6 +234,8 @@ def test_kr_wrapper_carries_pagination_cursor_and_response_status(monkeypatch):
     assert kwargs["headers"]["tr_cont"] == "N"
     assert kwargs["params"]["CTX_AREA_FK100"] == "FK"
     assert kwargs["params"]["CTX_AREA_NK100"] == "NK"
+    assert kwargs["params"]["INQR_DVSN_3"] == "00"
+    assert kwargs["params"]["INQR_DVSN_1"] == ""
     assert result["_response_meta"]["tr_cont"] == "D"
 
 
