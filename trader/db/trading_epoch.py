@@ -23,8 +23,7 @@ def trading_epoch_enforced() -> bool:
     if explicit in {"1", "true", "yes", "on"}:
         return True
     market = str(os.getenv("WSL_RUN_MARKET") or "").strip().upper()
-    # Unit tests intentionally exercise legacy fixtures without an active epoch.
-    if market in {"KR", "US"} and not os.getenv("PYTEST_CURRENT_TEST"):
+    if market in {"KR", "US"}:
         return True
     return False
 
