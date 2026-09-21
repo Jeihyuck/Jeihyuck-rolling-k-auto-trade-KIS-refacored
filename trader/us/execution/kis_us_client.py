@@ -464,7 +464,8 @@ class KisUSClient:
         """
         self._assert_not_offline("get_us_balance")
         
-        exchanges_env = os.getenv("US_BALANCE_EXCHANGES", "NASD,NYSE,AMEX")
+        default_exchanges = "NASD" if self.env == "real" else "NASD,NYSE,AMEX"
+        exchanges_env = os.getenv("US_BALANCE_EXCHANGES", default_exchanges)
         exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
@@ -616,7 +617,8 @@ class KisUSClient:
         Returns:
             KIS raw response (output1 list, output2 dict/list)
         """
-        tr = get_tr_info("us_balance")
+        tr = dict(get_tr_info("us_balance"))
+        tr["tr_id"] = "TTTS3012R" if self.env == "real" else "VTTS3012R"
         headers = self._build_headers(tr["tr_id"])
         
         logger.info("[US_BALANCE][EXCHANGE][START] exchange=%s", exchange_code)
@@ -1112,7 +1114,8 @@ class KisUSClient:
         range fields. Pagination follows tr_cont plus CTX_AREA_NK200/FK200.
         """
         self._assert_not_offline("get_us_fills_today")
-        tr = get_tr_info("us_fills_today")
+        tr = dict(get_tr_info("us_fills_today"))
+        tr["tr_id"] = "TTTS3035R" if self.env == "real" else "VTTS3035R"
         headers = self._build_headers(tr["tr_id"])
 
         if trade_date:
@@ -1195,15 +1198,16 @@ class KisUSClient:
         """Build the official KIS practice inquire-ccnl parameter contract."""
         if schema not in {"PRACTICE_RANGE", "ALL_DATES", "ORD_DT", "ORD_RANGE"}:
             raise ValueError(f"unknown fills schema: {schema}")
+        real_mode = self.env == "real"
         return {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
-            "PDNO": "",
+            "PDNO": "%" if real_mode else "",
             "ORD_STRT_DT": ord_dt,
             "ORD_END_DT": ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
-            "OVRS_EXCG_CD": "",
+            "OVRS_EXCG_CD": "NASD" if real_mode else "",
             "SORT_SQN": "DS",
             "ORD_DT": "",
             "ORD_GNO_BRNO": "",
