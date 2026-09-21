@@ -319,3 +319,31 @@ def test_us_broker_observation_cannot_update_previous_epoch_order(epoch_pg):
     assert row["status"] == "ACK"
     assert row["trading_epoch_id"] == "epoch-old"
     assert row["meta"] == {"legacy": True}
+
+
+
+def test_us_intent_lifecycle_mutators_never_touch_previous_epoch(epoch_pg):
+    with epoch_pg.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_order_intents(
+                trade_date,client_order_key,symbol,exchange,side,qty,
+                strategy,status,trading_epoch_id,meta
+            ) VALUES (
+                '2026-09-22','old-intent-key','AMD','NASDAQ','BUY',1,
+                'us_pb1','PENDING','epoch-old','{"legacy":true}'::jsonb
+            )
+        """))
+
+    repos.mark_order_intent_sent("old-intent-key")
+    repos.mark_order_intent_blocked("old-intent-key", "should-not-write")
+    repos.mark_order_intent_rejected("old-intent-key", "should-not-write")
+    repos.mark_order_intent_dry_run("old-intent-key")
+
+    with epoch_pg.connect() as conn:
+        row = conn.execute(text("""
+            SELECT status,trading_epoch_id,meta FROM us_order_intents
+            WHERE client_order_key='old-intent-key'
+        """)).mappings().one()
+    assert row["status"] == "PENDING"
+    assert row["trading_epoch_id"] == "epoch-old"
+    assert row["meta"] == {"legacy": True}
