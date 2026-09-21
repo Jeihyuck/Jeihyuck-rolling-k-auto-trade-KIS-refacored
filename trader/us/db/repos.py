@@ -2119,12 +2119,16 @@ def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
                 and (not f.get("client_order_key") or f.get("client_order_key") in fully_sold_keys)}
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("""SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+            epoch_id = _active_us_epoch(conn)
+            sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
                     ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
-                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""),
-                {"td": td},
-            )
+                   AND (f.trading_epoch_id IS NULL OR o.trading_epoch_id=f.trading_epoch_id)
+                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND f.trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            rows = conn.execute(text(sql), params)
             return {r[0] for r in rows}
     except Exception as exc:
         logger.error("[US_FILLS][SOLD_TODAY][ERROR] %s", exc)
@@ -2139,10 +2143,13 @@ def load_today_order_keys(trade_date: str | None = None) -> set[str]:
                 if o.get("trade_date") == td and o.get("client_order_key")}
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td"),
-                {"td": td},
-            )
+            epoch_id = _active_us_epoch(conn)
+            sql = "SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td"
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            rows = conn.execute(text(sql), params)
             return {r[0] for r in rows}
     except Exception as exc:
         logger.error("[US_ORDERS][KEYS][ERROR] %s", exc)
@@ -2165,17 +2172,20 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
         ]
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("""
+            epoch_id = _active_us_epoch(conn)
+            sql = """
                     SELECT *
                     FROM us_orders
                     WHERE trade_date = :td
                       AND status IN ('ACK', 'SENT', 'PARTIALLY_FILLED')
                       AND COALESCE(qty_filled, 0) < qty_requested
-                    ORDER BY created_at ASC
-                """),
-                {"td": td},
-            )
+            """
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at ASC"
+            rows = conn.execute(text(sql), params)
             return [dict(r._mapping) for r in rows]
     except Exception as exc:
         logger.error("[US_ORDERS][PENDING_ACK][ERROR] %s", exc)
@@ -2288,29 +2298,34 @@ def load_us_order_for_fill(
         return dict(matches[-1]) if matches else {}
     try:
         with engine.begin() as conn:
-            # Exact lookup remains the fast path.  The bounded candidate query
-            # then handles KIS' leading-zero presentation difference without a
-            # migration/index requirement.
+            # Exact lookup remains the fast path.  Bound it to the active
+            # account generation so reused broker order numbers cannot attach
+            # a new fill to a legacy order.
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
             row = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status, trading_epoch_id, meta
                 FROM us_orders
                 WHERE trade_date = :td AND symbol = :symbol
                   AND ((:order_no <> '' AND order_no = :order_no)
                        OR (:cok <> '' AND client_order_key = :cok))
+            """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
                 LIMIT 1
-            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok}).mappings().first()
+            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok, **epoch_params}).mappings().first()
             if row:
                 return dict(row)
             if not on_norm:
                 return {}
             candidates = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
-                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                       qty_requested, qty_filled, avg_price_usd, order_no, status, trading_epoch_id, meta
                 FROM us_orders WHERE trade_date=:td AND symbol=:symbol
+            """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-            """), {"td": td, "symbol": sym}).mappings().all()
+            """), {"td": td, "symbol": sym, **epoch_params}).mappings().all()
             for candidate in candidates:
                 candidate_dict = dict(candidate)
                 meta = _parse_json_meta(candidate_dict.get("meta"))
@@ -2728,18 +2743,21 @@ def load_us_positions_by_symbols(
     else:
         try:
             with engine.begin() as conn:
-                raw = conn.execute(
-                    text("""
+                epoch_id = _active_us_epoch(conn)
+                sql = """
                         SELECT DISTINCT ON (symbol)
                             *
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                           AND as_of <= :td
                           AND qty > 0
-                        ORDER BY symbol, as_of DESC
-                    """),
-                    {"syms": list(symbols), "td": td},
-                )
+                """
+                params = {"syms": list(symbols), "td": td}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                sql += " ORDER BY symbol, as_of DESC"
+                raw = conn.execute(text(sql), params)
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
             logger.error("[US_POSITIONS][BY_SYMBOLS][ERROR] %s", exc)
@@ -4159,8 +4177,8 @@ def load_latest_us_buy_fills_by_symbols(
     try:
         td = trade_date or _today()
         with engine.connect() as conn:
-            rows = conn.execute(
-                text("""
+            epoch_id = _active_us_epoch(conn)
+            sql = """
                     SELECT DISTINCT ON (symbol)
                         symbol, exchange, qty, price_usd,
                         filled_at, trade_date, client_order_key, order_no, meta
@@ -4169,10 +4187,13 @@ def load_latest_us_buy_fills_by_symbols(
                       AND side = 'BUY'
                       AND trade_date >= (:td::date - :lookback * INTERVAL '1 day')
                       AND trade_date <= :td::date
-                    ORDER BY symbol, filled_at DESC
-                """),
-                {"syms": normalized, "td": td, "lookback": lookback_days},
-            ).fetchall()
+            """
+            params = {"syms": normalized, "td": td, "lookback": lookback_days}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY symbol, filled_at DESC"
+            rows = conn.execute(text(sql), params).fetchall()
 
             result = {}
             cols = ["symbol", "exchange", "qty", "price_usd",
@@ -4212,16 +4233,19 @@ def has_pending_order_for_symbol_side(
         )
     try:
         with engine.begin() as conn:
-            row = conn.execute(
-                text("""
+            epoch_id = _active_us_epoch(conn)
+            sql = """
                     SELECT 1 FROM us_orders
                     WHERE symbol=:symbol AND side=:side AND trade_date=:td
                       AND status = ANY(:statuses)
                       AND dry_run = FALSE
-                    LIMIT 1
-                """),
-                {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)},
-            ).first()
+            """
+            params = {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " LIMIT 1"
+            row = conn.execute(text(sql), params).first()
             return row is not None
     except Exception as exc:
         logger.error("[US_ORDERS][PENDING_SYMBOL_SIDE][ERROR] %s", exc)
@@ -4241,11 +4265,15 @@ def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | N
         return None
     try:
         with engine.begin() as conn:
-            row = conn.execute(text("""
-                SELECT * FROM us_orders WHERE symbol=:symbol AND side='SELL' AND trade_date=:td
-                  AND status = ANY(:statuses) AND dry_run = FALSE
-                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1
-            """), {"symbol": sym, "td": td, "statuses": list(statuses)}).first()
+            epoch_id = _active_us_epoch(conn)
+            sql = """SELECT * FROM us_orders WHERE symbol=:symbol AND side='SELL' AND trade_date=:td
+                  AND status = ANY(:statuses) AND dry_run = FALSE"""
+            params = {"symbol": sym, "td": td, "statuses": list(statuses)}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1"
+            row = conn.execute(text(sql), params).first()
             return dict(row._mapping) if row else None
     except Exception as exc:
         logger.error("[US_ORDERS][RECENT_SELL_ACK][ERROR] %s", exc)
