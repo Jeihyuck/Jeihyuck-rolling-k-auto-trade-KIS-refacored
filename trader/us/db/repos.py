@@ -880,13 +880,26 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         old_filled=int(identity_rows[0].get("qty_filled") or 0)
     else:
         with engine.connect() as conn:
-            identity_row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key"), {"td": td, "key": key}).mappings().first()
-        if not identity_row: return {"status": "ORDER_NOT_FOUND"}
+            active_epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
+            identity_row = conn.execute(
+                text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                {"td": td, "key": key, **epoch_params},
+            ).mappings().first()
+            state_row = conn.execute(
+                text("SELECT status,qty_filled,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                {"td": td, "key": key, **epoch_params},
+            ).mappings().first()
+        if not identity_row:
+            return {"status": "ORDER_NOT_FOUND"}
+        _assert_us_order_epoch(dict(identity_row), active_epoch_id)
         order_meta = {**_parse_json_meta(identity_row.get("meta")), **meta_patch}
         old_status="ACK"; old_filled=0
-        with engine.connect() as conn:
-            state_row=conn.execute(text("SELECT status,qty_filled FROM us_orders WHERE trade_date=:td AND client_order_key=:key"),{"td":td,"key":key}).mappings().first()
-        if state_row: old_status=str(state_row.get("status") or "ACK").upper(); old_filled=int(state_row.get("qty_filled") or 0)
+        if state_row:
+            _assert_us_order_epoch(dict(state_row), active_epoch_id)
+            old_status=str(state_row.get("status") or "ACK").upper()
+            old_filled=int(state_row.get("qty_filled") or 0)
     terminal={"FILLED","CANCELLED","REJECTED","EXPIRED"}
     stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
     if stale:
@@ -915,16 +928,27 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             order_meta = order["meta"]
         else:
             with engine.begin() as conn:
-                row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key FOR UPDATE"), {"td": td, "key": key}).mappings().first()
-                if not row: return {"status": "ORDER_NOT_FOUND"}
+                active_epoch_id = _active_us_epoch(conn)
+                epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+                epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
+                row = conn.execute(
+                    text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause + " FOR UPDATE"),
+                    {"td": td, "key": key, **epoch_params},
+                ).mappings().first()
+                if not row:
+                    return {"status": "ORDER_NOT_FOUND"}
+                _assert_us_order_epoch(dict(row), active_epoch_id)
                 order_meta = {**_parse_json_meta(row.get("meta")), **meta_patch}
-                conn.execute(text("""UPDATE us_orders SET status=CASE
+                result = conn.execute(text("""UPDATE us_orders SET status=CASE
                     WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
                     WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
                     ELSE :status END,
                     order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
-                    WHERE trade_date=:td AND client_order_key=:key"""),
-                             {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta), "td": td, "key": key})
+                    WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
+                    {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta),
+                     "td": td, "key": key, **epoch_params})
+                if int(result.rowcount or 0) != 1:
+                    return {"status": "ORDER_NOT_FOUND"}
         if side.upper() == "SELL" and order_meta.get("profit_capture_stage"):
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
             sync_profit_capture_stage_from_order(trade_date=td, symbol=symbol,
