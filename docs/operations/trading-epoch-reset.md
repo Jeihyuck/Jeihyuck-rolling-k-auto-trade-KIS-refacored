@@ -1,0 +1,130 @@
+# Unified KR/US Trading Epoch Reset
+
+This runbook replaces the PR137 fresh-database cutover design.
+
+## Contract
+
+- Keep the existing PostgreSQL database.
+- Keep all historical rows.
+- Do not copy, truncate, or replace the database.
+- End the prior account generation and create one new ACTIVE `trading_epoch_id`.
+- New KR/US orders, fills, positions, risk lifecycle, and Infinite state belong to the new epoch.
+- Legacy rows stay queryable but are excluded from active-epoch trading/PnL reads.
+- Strategy policy is unchanged. This is an execution/accounting boundary only.
+
+## Hard stop conditions
+
+Do not create or activate a new trading epoch unless all of the following are true:
+
+1. Windows Task Scheduler trading tasks are disabled.
+2. No KR or US trading wrapper is running.
+3. The KIS account has no KR holdings, no US holdings, and no pending orders.
+4. You intend to resume on the **next trading session**, not later in the same market trade date.
+
+The last rule matters because some legacy client-order identities are deterministic by
+trade date. The epoch boundary isolates DB reads/writes, but PR138 intentionally does
+not rewrite strategy order-key semantics.
+
+## 1. Pull merged code
+
+```bash
+cd /home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored || exit 1
+git fetch origin
+git checkout dual-agent
+git pull --ff-only origin dual-agent
+git status --short
+```
+
+Expected: clean working tree on `dual-agent`.
+
+## 2. Load the existing DB/KIS environment
+
+The DB URL does **not** change.
+
+```bash
+set -a
+source .env
+set +a
+
+export STRATEGY_ENV=practice
+export KIS_ENV=practice
+```
+
+For real trading, use the real environment/account deliberately. Never reuse a
+practice confirmation for a real account.
+
+## 3. Confirm broker flatness
+
+Confirm through KIS that KR and US holdings are both zero and there are no pending
+orders. PR138 requires an explicit operator confirmation; it does not treat DB state
+as broker truth for this destructive accounting boundary.
+
+## 4. Start the new epoch
+
+```bash
+export TRADING_EPOCH_CONFIRM=YES
+export TRADING_EPOCH_BROKER_FLAT_CONFIRMED=YES
+export TRADING_EPOCH_REASON="PRACTICE_RESET_20260922"
+
+python scripts/start_new_trading_epoch.py
+```
+
+Expected:
+
+```text
+"status": "TRADING_EPOCH_STARTED"
+"history_deleted": false
+"database_replaced": false
+```
+
+The command runs DB migrations first, ends the prior top-level epoch, ends prior
+ACTIVE KR portfolio epochs, closes their DB-only OPEN position rows, and creates one
+new ACTIVE `trading_epoch_id`.
+
+## 5. Verify the active epoch
+
+```bash
+python scripts/verify_active_trading_epoch.py
+```
+
+Expected:
+
+```text
+"status": "ACTIVE_TRADING_EPOCH_OK"
+```
+
+If this fails, do not enable trading.
+
+## 6. Run no-order preflight
+
+Use the next trading date.
+
+```bash
+NULLIM_TRADE_DATE=2026-09-22 NULLIM_PREFLIGHT_ONLY=1 bash scripts/wsl/run-kr-prep.sh
+NULLIM_TRADE_DATE=2026-09-22 NULLIM_PREFLIGHT_ONLY=1 bash scripts/wsl/run-us-prep.sh
+```
+
+Canonical WSL preflight now fails closed with
+`active_trading_epoch_missing` if the account has no ACTIVE top-level epoch.
+
+## 7. Re-enable scheduler only for the next session
+
+Do not resume same-trade-date order production after an epoch reset.
+
+Windows Task Scheduler remains the sole automatic scheduler owner. WSL cron/systemd
+must not independently launch KR/US trading jobs.
+
+## 8. First-session validation
+
+For the first KR and US sessions after reset, verify:
+
+- new order rows carry the current `trading_epoch_id`;
+- fills inherit the same epoch;
+- positions/snapshots are read only from the active epoch;
+- KR Infinite starts from the new epoch state;
+- TQQQ Infinite starts from the new epoch state;
+- PnL/report DB fallbacks include only active-epoch rows;
+- BUY contract -> fill -> position -> SELL policy lineage remains the PR135 contract.
+
+If `POLICY_MISSING`, a cross-epoch order identity, or an epoch-less new trading row
+appears, stop order production and investigate before continuing.
