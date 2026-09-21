@@ -3446,7 +3446,7 @@ class OrdersRepo:
         end_bp = sa.bindparam("created_at_2", end, type_=sa.DateTime(timezone=True))
         conditions = [self._schema.orders.c.env == sa.bindparam("env_1", env), self._schema.orders.c.created_at >= start_bp, self._schema.orders.c.created_at < end_bp]
         trading_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=False
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id:
             conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
@@ -4196,7 +4196,7 @@ class FillsRepo:
         filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
         conditions = self._filled_at_window_conditions(env=env, start_at=start, end_at=end)
         trading_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=False
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id:
             conditions.append(self._schema.fills.c.trading_epoch_id == trading_epoch_id)
@@ -5456,7 +5456,7 @@ class PositionsRepo:
             self._schema.positions.c.status == "OPEN",
         ]
         trading_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=False
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id:
             conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
@@ -5475,7 +5475,7 @@ class PositionsRepo:
             self._schema.positions.c.strategy == strategy,
         ]
         trading_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=False
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id:
             conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
@@ -5504,7 +5504,7 @@ class PositionsRepo:
         if portfolio_epoch_id:
             conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
         trading_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=False
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id:
             conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
@@ -5614,7 +5614,7 @@ class PositionsRepo:
             self._schema.positions.c.status == "OPEN",
         ]
         trading_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=False
+            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id:
             conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
