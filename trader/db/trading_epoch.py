@@ -4,7 +4,7 @@ import os
 from uuid import uuid4
 from typing import Any
 
-from sqlalchemy import bindparam, text
+from sqlalchemy import bindparam, inspect, text
 
 from trader.account_state import get_account_key, resolve_env_name
 from trader.db.engine import get_engine
@@ -41,6 +41,16 @@ def active_trading_epoch_id(
     engine = bind or get_engine()
     conn = engine.connect() if owns_connection else bind
     try:
+        # Legacy/test fixtures and the migration bootstrap may legitimately run
+        # before migration 0052 exists.  Never probe a missing table with a
+        # SELECT on PostgreSQL: even when Python catches the exception it would
+        # abort the caller's transaction.
+        if not inspect(conn).has_table("trading_epochs"):
+            if required:
+                raise TradingEpochError(
+                    f"ACTIVE_TRADING_EPOCH_TABLE_MISSING env={env_name} account={account_key}"
+                )
+            return None
         rows = conn.execute(
             text("""
                 SELECT trading_epoch_id
