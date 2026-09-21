@@ -370,3 +370,60 @@ def test_kr_fill_dedupe_cannot_adopt_previous_epoch(monkeypatch):
     assert row["trading_epoch_id"] == "old-epoch"
     assert row["raw_json"] == {"old": True}
     assert top != "old-epoch"
+
+
+
+def test_kr_position_mutators_never_touch_previous_trading_epoch(monkeypatch):
+    engine = _engine()
+    top = _activate_practice_epoch(engine, monkeypatch)
+    schema = schema_for_engine(engine)
+    positions = PositionsRepo(engine)
+    current_child = PortfolioEpochsRepo(engine).get_or_create_active(
+        env="practice", account_id="practice:test", sid=1, mode=1, strategy="pb1"
+    )
+    old_child = str(uuid4())
+
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.portfolio_epochs).values(
+            portfolio_epoch_id=old_child,
+            trading_epoch_id="old-epoch",
+            env="practice", account_id="practice:test",
+            sid=1, mode=1, strategy="pb1",
+            status="ENDED", reason="HISTORICAL",
+        ))
+        conn.execute(sa.insert(schema.positions).values(
+            position_id=str(uuid4()), position_cycle_id=str(uuid4()),
+            portfolio_epoch_id=old_child, trading_epoch_id="old-epoch",
+            opened_at=datetime.now(timezone.utc), position_origin="SYSTEM",
+            env="practice", strategy="pb1", sid=1, mode=1,
+            code="035420", market="KOSPI", qty=7, avg_buy_price=100,
+            total_cost=700, realized_pnl=0, max_price=111, status="OPEN",
+        ))
+        conn.execute(sa.insert(schema.positions).values(
+            position_id=str(uuid4()), position_cycle_id=str(uuid4()),
+            portfolio_epoch_id=current_child, trading_epoch_id=top,
+            opened_at=datetime.now(timezone.utc), position_origin="SYSTEM",
+            env="practice", strategy="pb1", sid=1, mode=1,
+            code="035420", market="KOSPI", qty=3, avg_buy_price=200,
+            total_cost=600, realized_pnl=0, max_price=222, status="OPEN",
+        ))
+
+    positions.update_position_fields(
+        env="practice", strategy="pb1", sid=1, mode=1,
+        code="035420", fields={"max_price": 333},
+    )
+    assert positions.close_positions(
+        env="practice", strategy="pb1", codes=["035420"]
+    ) == 1
+
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.code == "035420"
+        )).mappings().all()
+    by_epoch = {str(row["trading_epoch_id"]): row for row in rows}
+    assert by_epoch[top]["status"] == "CLOSED"
+    assert by_epoch[top]["qty"] == 0
+    assert float(by_epoch[top]["max_price"]) == 333
+    assert by_epoch["old-epoch"]["status"] == "OPEN"
+    assert by_epoch["old-epoch"]["qty"] == 7
+    assert float(by_epoch["old-epoch"]["max_price"]) == 111
