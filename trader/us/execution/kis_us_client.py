@@ -1317,7 +1317,8 @@ class KisUSClient:
                 data = resp.json()
                 self._check_rt_cd(data)
                 if isinstance(data, dict):
-                    tr_cont = str(resp.headers.get("tr_cont") or "").strip()
+                    response_headers = getattr(resp, "headers", {}) or {}
+                    tr_cont = str(response_headers.get("tr_cont") or "").strip()
                     if tr_cont:
                         response_meta = (
                             dict(data.get("_response_meta"))
