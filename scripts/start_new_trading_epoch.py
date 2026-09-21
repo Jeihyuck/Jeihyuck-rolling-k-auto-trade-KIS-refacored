@@ -9,6 +9,7 @@ from trader.account_state import get_account_key, get_masked_account_key, resolv
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
 from trader.db.trading_epoch import start_new_trading_epoch
+from trader.db.trading_epoch_broker_guard import verify_broker_flat
 
 
 def main() -> int:
@@ -25,6 +26,10 @@ def main() -> int:
 
     env = resolve_env_name()
     account_id = get_account_key(env=env)
+
+    # Broker truth is checked before any DB migration or epoch mutation.
+    broker_evidence = verify_broker_flat(env=env)
+
     engine = make_engine()
     run_migrations(engine)
     epoch_id = start_new_trading_epoch(
@@ -36,6 +41,7 @@ def main() -> int:
         "env": env,
         "account": get_masked_account_key(env=env),
         "reason": reason,
+        "broker_flat_evidence": broker_evidence,
         "history_deleted": False,
         "database_replaced": False,
     }, ensure_ascii=False, indent=2))
