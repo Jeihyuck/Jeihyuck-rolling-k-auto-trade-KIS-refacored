@@ -196,19 +196,22 @@ def _fetch_latest_us_positions_safe(engine: object) -> list[dict]:
         columns = set()
 
     try:
+        from trader.us.db.repos import _active_us_epoch
         with engine.connect() as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id and "trading_epoch_id" in columns else ""
+            params = {"epoch_id": epoch_id} if epoch_clause else {}
             if "trade_date" in columns:
-                # trade_date 컬럼이 있으면 최신 trade_date 기준
                 rows = conn.execute(
                     sa_text("""
                         SELECT DISTINCT ON (symbol) *
                         FROM us_positions
                         WHERE qty > 0
+                    """ + epoch_clause + """
                         ORDER BY symbol, trade_date DESC
-                    """)
+                    """), params
                 ).fetchall()
             else:
-                # trade_date 컬럼 없음: 최신 as_of 기준으로 fallback
                 logger.warning(
                     "[US_PNL][SCHEMA_FALLBACK] us_positions.trade_date missing; "
                     "using latest as_of or all rows"
@@ -219,12 +222,14 @@ def _fetch_latest_us_positions_safe(engine: object) -> list[dict]:
                             SELECT DISTINCT ON (symbol) *
                             FROM us_positions
                             WHERE qty > 0
+                        """ + epoch_clause + """
                             ORDER BY symbol, as_of DESC
-                        """)
+                        """), params
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        sa_text("SELECT * FROM us_positions WHERE qty > 0")
+                        sa_text("SELECT * FROM us_positions WHERE qty > 0" + epoch_clause),
+                        params,
                     ).fetchall()
         keys = list(rows[0]._fields) if rows and hasattr(rows[0], "_fields") else []
         return [dict(zip(keys, r)) for r in rows] if keys else [dict(r._mapping) for r in rows]
@@ -310,7 +315,7 @@ def get_today_trades(trade_date: str) -> list[dict]:
 
 def get_blocked_orders(trade_date: str) -> list[dict]:
     """Get today's blocked/skipped order intents."""
-    from trader.us.db.repos import _get_engine_or_none
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
     from sqlalchemy import text
     
     engine = _get_engine_or_none()
@@ -319,15 +324,16 @@ def get_blocked_orders(trade_date: str) -> list[dict]:
     
     try:
         with engine.begin() as conn:
-            rows = conn.execute(
-                text("""
-                    SELECT * FROM us_order_intents
+            epoch_id = _active_us_epoch(conn)
+            sql = """SELECT * FROM us_order_intents
                     WHERE trade_date = :td
-                      AND status IN ('BLOCKED', 'REJECTED')
-                    ORDER BY created_at
-                """),
-                {"td": trade_date},
-            )
+                      AND status IN ('BLOCKED', 'REJECTED')"""
+            params = {"td": trade_date}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at"
+            rows = conn.execute(text(sql), params)
             blocked = []
             for r in rows:
                 blocked.append({
