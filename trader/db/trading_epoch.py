@@ -97,7 +97,7 @@ def start_new_trading_epoch(
         conn.execute(
             text("""
                 UPDATE trading_epochs
-                SET status='ENDED', ended_at=NOW()
+                SET status='ENDED', ended_at=CURRENT_TIMESTAMP
                 WHERE env=:env AND account_id=:account_id AND status='ACTIVE'
             """),
             {"env": env_name, "account_id": account_key},
@@ -128,7 +128,7 @@ def start_new_trading_epoch(
             conn.execute(
                 text("""
                     UPDATE portfolio_epochs
-                    SET status='ENDED', ended_at=NOW(), reason=:reason
+                    SET status='ENDED', ended_at=CURRENT_TIMESTAMP, reason=:reason
                     WHERE env=:env AND account_id=:account_id AND status='ACTIVE'
                 """),
                 {"env": env_name, "account_id": account_key, "reason": reason_n},
