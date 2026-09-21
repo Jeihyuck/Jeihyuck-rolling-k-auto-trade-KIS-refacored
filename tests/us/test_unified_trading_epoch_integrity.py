@@ -283,16 +283,19 @@ def test_us_old_epoch_fill_cannot_make_current_accounting_pass(epoch_pg):
 
 def test_us_broker_observation_cannot_update_previous_epoch_order(epoch_pg):
     with epoch_pg.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO us_orders(
-                trade_date,client_order_key,symbol,exchange,side,qty_requested,
-                qty_filled,avg_price_usd,order_no,status,dry_run,env,meta,trading_epoch_id
-            ) VALUES (
-                '2026-09-22','old-observation-key','AMD','NASDAQ','BUY',1,
-                0,100,'OLD-OBS','ACK',false,'practice',
-                '{"legacy":true}'::jsonb,'epoch-old'
-            )
-        """))
+        conn.execute(
+            text("""
+                INSERT INTO us_orders(
+                    trade_date,client_order_key,symbol,exchange,side,qty_requested,
+                    qty_filled,avg_price_usd,order_no,status,dry_run,env,meta,trading_epoch_id
+                ) VALUES (
+                    '2026-09-22','old-observation-key','AMD','NASDAQ','BUY',1,
+                    0,100,'OLD-OBS','ACK',false,'practice',
+                    CAST(:meta AS jsonb),'epoch-old'
+                )
+            """),
+            {"meta": json.dumps({"legacy": True})},
+        )
 
     result = repos.apply_broker_order_observation(
         trade_date="2026-09-22",
@@ -324,15 +327,18 @@ def test_us_broker_observation_cannot_update_previous_epoch_order(epoch_pg):
 
 def test_us_intent_lifecycle_mutators_never_touch_previous_epoch(epoch_pg):
     with epoch_pg.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO us_order_intents(
-                trade_date,client_order_key,symbol,exchange,side,qty,
-                strategy,status,trading_epoch_id,meta
-            ) VALUES (
-                '2026-09-22','old-intent-key','AMD','NASDAQ','BUY',1,
-                'us_pb1','PENDING','epoch-old','{"legacy":true}'::jsonb
-            )
-        """))
+        conn.execute(
+            text("""
+                INSERT INTO us_order_intents(
+                    trade_date,client_order_key,symbol,exchange,side,qty,
+                    strategy,status,trading_epoch_id,meta
+                ) VALUES (
+                    '2026-09-22','old-intent-key','AMD','NASDAQ','BUY',1,
+                    'us_pb1','PENDING','epoch-old',CAST(:meta AS jsonb)
+                )
+            """),
+            {"meta": json.dumps({"legacy": True})},
+        )
 
     repos.mark_order_intent_sent("old-intent-key")
     repos.mark_order_intent_blocked("old-intent-key", "should-not-write")
