@@ -278,3 +278,44 @@ def test_us_old_epoch_fill_cannot_make_current_accounting_pass(epoch_pg):
     assert result["status"] == "FILL_ACCOUNTING_INVARIANT_FAILED"
     assert result["order_qty_filled"] == 2
     assert result["active_fill_qty"] == 0
+
+
+
+def test_us_broker_observation_cannot_update_previous_epoch_order(epoch_pg):
+    with epoch_pg.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,qty_requested,
+                qty_filled,avg_price_usd,order_no,status,dry_run,env,meta,trading_epoch_id
+            ) VALUES (
+                '2026-09-22','old-observation-key','AMD','NASDAQ','BUY',1,
+                0,100,'OLD-OBS','ACK',false,'practice',
+                '{"legacy":true}'::jsonb,'epoch-old'
+            )
+        """))
+
+    result = repos.apply_broker_order_observation(
+        trade_date="2026-09-22",
+        client_order_key="old-observation-key",
+        raw_order_no="OLD-OBS",
+        canonical_order_no="OLD-OBS",
+        symbol="AMD",
+        side="BUY",
+        requested_qty=1,
+        filled_qty=0,
+        remaining_qty=1,
+        broker_status="OPEN",
+        evidence_type="KIS_ORDER_STATUS_ACTUAL",
+        observed_at="2026-09-22T14:00:00+00:00",
+        raw_row={"status": "OPEN"},
+    )
+    assert result["status"] == "ORDER_NOT_FOUND"
+
+    with epoch_pg.connect() as conn:
+        row = conn.execute(text("""
+            SELECT status,trading_epoch_id,meta FROM us_orders
+            WHERE client_order_key='old-observation-key'
+        """)).mappings().one()
+    assert row["status"] == "ACK"
+    assert row["trading_epoch_id"] == "epoch-old"
+    assert row["meta"] == {"legacy": True}
