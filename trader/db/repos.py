@@ -4621,13 +4621,28 @@ class FillsRepo:
                     select(
                         self._schema.fills.c.fill_id,
                         self._schema.fills.c.trading_epoch_id,
+                        self._schema.fills.c.portfolio_epoch_id,
+                        self._schema.fills.c.position_cycle_id,
                     ).where(and_(*collision_conditions))
                 ).mappings().first()
-                if existing_fill is not None and (
-                    str(existing_fill.get("trading_epoch_id") or "")
-                    != str(active_epoch_id)
-                ):
-                    raise RuntimeError("KR_FILL_TRADING_EPOCH_COLLISION")
+                if existing_fill is not None:
+                    if (
+                        str(existing_fill.get("trading_epoch_id") or "")
+                        != str(active_epoch_id)
+                    ):
+                        raise RuntimeError("KR_FILL_TRADING_EPOCH_COLLISION")
+                    if (
+                        portfolio_epoch_id is not None
+                        and str(existing_fill.get("portfolio_epoch_id") or "")
+                        != str(portfolio_epoch_id)
+                    ):
+                        raise RuntimeError("KR_FILL_PORTFOLIO_EPOCH_COLLISION")
+                    if (
+                        position_cycle_id is not None
+                        and str(existing_fill.get("position_cycle_id") or "")
+                        != str(position_cycle_id)
+                    ):
+                        raise RuntimeError("KR_FILL_POSITION_CYCLE_COLLISION")
             if conn.dialect.name == "postgresql":
                 # Use PostgreSQL-specific upsert with on_conflict_do_update
                 stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
