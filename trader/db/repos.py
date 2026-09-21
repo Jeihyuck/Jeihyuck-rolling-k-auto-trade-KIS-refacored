@@ -49,7 +49,7 @@ from trader.time_coerce import to_date
 from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 from trader.account_state import get_account_key
-from trader.db.trading_epoch import active_trading_epoch_id
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 
 logger = logging.getLogger(__name__)
 
@@ -2709,7 +2709,7 @@ class UniverseRepo:
 
 def _ensure_active_epoch(conn, db_schema, *, env: str, account_id: str, sid: int, mode: int, strategy: str) -> str:
     trading_epoch_id = active_trading_epoch_id(
-        conn, env=env, account_id=account_id, required=True
+        conn, env=env, account_id=account_id, required=trading_epoch_enforced()
     )
     identity = and_(
         db_schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
@@ -2759,7 +2759,7 @@ class PortfolioEpochsRepo:
         epoch_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=account_id, required=True
+                conn, env=env, account_id=account_id, required=trading_epoch_enforced()
             )
             identity = and_(
                 self._schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
@@ -2890,7 +2890,7 @@ class OrdersRepo:
         account_id = account_id or get_account_key(env=env)
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=account_id, required=True
+                conn, env=env, account_id=account_id, required=trading_epoch_enforced()
             )
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
@@ -4279,18 +4279,20 @@ class FillsRepo:
         normalized_codes = [str(code or "").zfill(6) for code in (codes or []) if str(code or "").strip()]
         if not normalized_codes:
             return {}
+        conditions = [
+            self._schema.fills.c.env == _norm_env(env),
+            self._schema.fills.c.side == "BUY",
+            self._schema.fills.c.code.in_(normalized_codes),
+        ]
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id:
+            conditions.append(self._schema.fills.c.trading_epoch_id == trading_epoch_id)
         stmt = (
             select(self._schema.fills)
-            .where(
-                and_(
-                    self._schema.fills.c.env == _norm_env(env),
-                    self._schema.fills.c.trading_epoch_id == active_trading_epoch_id(
-                        self.engine, env=env, account_id=get_account_key(env=env), required=True
-                    ),
-                    self._schema.fills.c.side == "BUY",
-                    self._schema.fills.c.code.in_(normalized_codes),
-                )
-            )
+            .where(and_(*conditions))
             .order_by(self._window_expr(self._schema.fills.c.filled_at).desc())
         )
         latest: dict[str, dict] = {}
@@ -4405,7 +4407,7 @@ class FillsRepo:
                 trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
         if trading_epoch_id is None:
             trading_epoch_id = active_trading_epoch_id(
-                self.engine, env=env, account_id=get_account_key(env=env), required=True
+                self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
             )
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
@@ -5530,7 +5532,7 @@ class PositionsRepo:
         db_url = str(self.engine.url)
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
-                conn, env=env_n, account_id=account_id, required=True
+                conn, env=env_n, account_id=account_id, required=trading_epoch_enforced()
             )
             epoch_id = _ensure_active_epoch(
                 conn, self._schema, env=env_n, account_id=account_id,
@@ -6015,7 +6017,7 @@ class PositionsRepo:
         account_key = account_id or get_account_key(env=env)
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=account_key, required=True
+                conn, env=env, account_id=account_key, required=trading_epoch_enforced()
             )
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
                 account_id=account_key, sid=sid, mode=mode, strategy=strategy)
@@ -6087,7 +6089,7 @@ class PositionsRepo:
         account_key = account_id or get_account_key(env=env)
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=account_key, required=True
+                conn, env=env, account_id=account_key, required=trading_epoch_enforced()
             )
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
                 account_id=account_key, sid=sid, mode=mode, strategy=strategy)
@@ -6171,7 +6173,7 @@ class PositionsRepo:
         env_n = _norm_env(env)
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
-                conn, env=env_n, account_id=account_key, required=True
+                conn, env=env_n, account_id=account_key, required=trading_epoch_enforced()
             )
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env_n,
                 account_id=account_key, sid=1, mode=1, strategy="pb1")
