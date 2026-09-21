@@ -1712,9 +1712,10 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         continue
                     order_epoch_id = _assert_us_order_epoch(dict(order_row), trading_epoch_id)
 
+                existing_select_cols = "qty, meta, trading_epoch_id" if order_epoch_id else "qty, meta"
                 existing = conn.execute(
-                    text("""SELECT qty, meta, trading_epoch_id FROM us_fills
-                            WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
+                    text(f"""SELECT {existing_select_cols} FROM us_fills
+                             WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
                     {"fill_idempotency_key": idem},
                 ).mappings().first()
                 if existing and (
@@ -2548,13 +2549,14 @@ def _supersede_synthetic_fills_for_actual(
         return result
     if trading_epoch_id is None:
         trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
     rows = conn.execute(text("""SELECT id, qty, meta FROM us_fills WHERE trade_date=:td
         AND (:order_no='' OR order_no=:order_no) AND (:cok='' OR client_order_key=:cok)
-        AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
+    """ + epoch_clause + """
         AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
         AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-        {"td": trade_date, "order_no": order_no, "cok": client_order_key,
-         "trading_epoch_id": trading_epoch_id}).mappings().all()
+        {"td": trade_date, "order_no": order_no, "cok": client_order_key, **epoch_params}).mappings().all()
     for row in rows:
         meta = _parse_json_meta(row.get("meta"))
         synth_cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
@@ -2606,22 +2608,23 @@ def _active_fill_cumulatives_for_order(
         return result
     if trading_epoch_id is None:
         trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
     if order_no:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND order_no=:order_no
             AND (:symbol='' OR symbol=:symbol)
             AND (:side='' OR side=:side)
-            AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
+        """ + epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
             {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(),
-             "side": str(side).upper(), "trading_epoch_id": trading_epoch_id}).mappings().all()
+             "side": str(side).upper(), **epoch_params}).mappings().all()
     else:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND client_order_key=:cok
-            AND (:trading_epoch_id IS NULL OR trading_epoch_id=:trading_epoch_id)
+        """ + epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-            {"td": trade_date, "cok": client_order_key,
-             "trading_epoch_id": trading_epoch_id}).mappings().all()
+            {"td": trade_date, "cok": client_order_key, **epoch_params}).mappings().all()
     for row in rows:
         meta = _parse_json_meta(row.get("meta"))
         cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
