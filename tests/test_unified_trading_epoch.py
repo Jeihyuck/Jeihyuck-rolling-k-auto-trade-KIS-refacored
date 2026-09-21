@@ -472,3 +472,47 @@ def test_kr_order_lifecycle_mutators_never_touch_previous_epoch(monkeypatch):
     assert row["status"] == "CREATED"
     assert row["trading_epoch_id"] == "old-epoch"
     assert row["response_json"] == {}
+
+
+
+def test_kr_policy_recovery_never_reads_previous_trading_epoch(monkeypatch):
+    engine = _engine()
+    _activate_practice_epoch(engine, monkeypatch)
+    schema = schema_for_engine(engine)
+    old_order_id = str(uuid4())
+    old_fill_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    old_plan = {"entry_thesis": "OLD_EPOCH_PLAN", "exit_policy_family": "OLD"}
+
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=old_order_id,
+            position_cycle_id=str(uuid4()),
+            portfolio_epoch_id=str(uuid4()),
+            trading_epoch_id="old-epoch",
+            env="practice", strategy="pb1", sid=1, mode=1,
+            code="000660", market="KOSPI", side="BUY", ord_type="LIMIT",
+            qty=1, limit_price=100000, stage="ENTRY",
+            client_order_key="old-policy-order", status="FILLED",
+            request_json={"entry_exit_plan": old_plan},
+            response_json={}, created_at=now, updated_at=now,
+        ))
+        conn.execute(sa.insert(schema.fills).values(
+            fill_id=old_fill_id,
+            position_cycle_id=str(uuid4()),
+            portfolio_epoch_id=str(uuid4()),
+            trading_epoch_id="old-epoch",
+            env="practice", order_id=old_order_id,
+            kis_odno="OLD-POLICY-KIS", trade_id="OLD-POLICY-TRADE",
+            broker_fill_id="OLD-POLICY-TRADE",
+            code="000660", market="KOSPI", side="BUY", qty=1,
+            price=100000, fee=0, tax=0, filled_at=now,
+            raw_json={"entry_exit_plan": old_plan},
+        ))
+
+    assert OrdersRepo(engine).find_latest_buy_entry_exit_plan(
+        "practice", "pb1", "000660"
+    ) is None
+    assert FillsRepo(engine).find_latest_buy_entry_exit_plan(
+        "practice", "000660"
+    ) is None
