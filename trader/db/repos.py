@@ -4473,14 +4473,24 @@ class FillsRepo:
         safe_raw_json = json_sanitize(raw_json or {})
         if run_id:
             self.ensure_run_exists(run_id)
-        if order_id is not None and (position_cycle_id is None or portfolio_epoch_id is None):
+        if order_id is not None:
             with self.engine.begin() as conn:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
                     self._schema.orders.c.trading_epoch_id,
-                ).where(self._schema.orders.c.order_id == uuid_value_for_url(db_url, order_id))).mappings().first()
+                ).where(
+                    self._schema.orders.c.order_id
+                    == uuid_value_for_url(db_url, order_id)
+                )).mappings().first()
             if provenance:
+                for field_name, supplied, persisted in (
+                    ("position_cycle_id", position_cycle_id, provenance.get("position_cycle_id")),
+                    ("portfolio_epoch_id", portfolio_epoch_id, provenance.get("portfolio_epoch_id")),
+                    ("trading_epoch_id", trading_epoch_id, provenance.get("trading_epoch_id")),
+                ):
+                    if supplied is not None and persisted is not None and str(supplied) != str(persisted):
+                        raise RuntimeError(f"KR_FILL_ORDER_{field_name.upper()}_MISMATCH")
                 position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                 portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
                 trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
@@ -4491,6 +4501,14 @@ class FillsRepo:
             trading_epoch_id = active_epoch_id
         elif active_epoch_id is not None and str(trading_epoch_id or "") != str(active_epoch_id):
             raise RuntimeError("KR_FILL_TRADING_EPOCH_MISMATCH")
+        if active_epoch_id is not None and portfolio_epoch_id is not None:
+            with self.engine.begin() as conn:
+                _assert_portfolio_epoch_binding(
+                    conn,
+                    self._schema,
+                    portfolio_epoch_id=str(portfolio_epoch_id),
+                    trading_epoch_id=active_epoch_id,
+                )
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
@@ -4530,6 +4548,22 @@ class FillsRepo:
             **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
         with self.engine.begin() as conn:
+            if active_epoch_id is not None:
+                collision_conditions = [
+                    self._schema.fills.c[col] == payload[col]
+                    for col in conflict_cols
+                ]
+                existing_fill = conn.execute(
+                    select(
+                        self._schema.fills.c.fill_id,
+                        self._schema.fills.c.trading_epoch_id,
+                    ).where(and_(*collision_conditions))
+                ).mappings().first()
+                if existing_fill is not None and (
+                    str(existing_fill.get("trading_epoch_id") or "")
+                    != str(active_epoch_id)
+                ):
+                    raise RuntimeError("KR_FILL_TRADING_EPOCH_COLLISION")
             if conn.dialect.name == "postgresql":
                 # Use PostgreSQL-specific upsert with on_conflict_do_update
                 stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
