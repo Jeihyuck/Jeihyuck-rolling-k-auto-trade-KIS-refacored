@@ -53,12 +53,12 @@ jobs:
       - name: Byte compile epoch paths
         run: |
           set -euo pipefail
-          python -m py_compile             trader/db/trading_epoch.py             trader/db/repos.py             trader/db/schema.py             trader/kr/infinite/repository.py             trader/us/db/repos.py             trader/us/db/strict_order_state.py             trader/us/infinite/repository.py             trader/us/runner/daily_report_runner.py             trader/us/runner/pnl_report_runner.py             scripts/start_new_trading_epoch.py             scripts/verify_active_trading_epoch.py             scripts/generate_us_portfolio_pnl_report.py
+          python -m py_compile             trader/db/trading_epoch.py             trader/db/trading_epoch_broker_guard.py             trader/db/repos.py             trader/db/schema.py             trader/kr/infinite/repository.py             trader/us/db/repos.py             trader/us/db/strict_order_state.py             trader/us/infinite/repository.py             trader/us/runner/daily_report_runner.py             trader/us/runner/pnl_report_runner.py             scripts/start_new_trading_epoch.py             scripts/verify_active_trading_epoch.py             scripts/generate_us_portfolio_pnl_report.py
 
       - name: Run epoch lifecycle regression
         run: |
           set -euo pipefail
-          python -m pytest tests/test_unified_trading_epoch.py -q
+          python -m pytest tests/test_unified_trading_epoch.py tests/test_trading_epoch_broker_guard.py -q
 
       - name: Execute 0052 on PostgreSQL 16
         run: |
