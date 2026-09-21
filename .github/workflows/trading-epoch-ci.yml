@@ -68,4 +68,4 @@ jobs:
       - name: Verify US order-fill epoch lineage on PostgreSQL 16
         run: |
           set -euo pipefail
-          python -m pytest tests/us/test_trading_epoch_fill_lineage.py -q
+          python -m pytest tests/us/test_unified_trading_epoch_integrity.py -q
