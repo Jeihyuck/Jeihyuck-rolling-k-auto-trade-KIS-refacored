@@ -299,7 +299,8 @@ def _get_engine_or_none():
 
 
 def _epoch_enforced() -> bool:
-    return str(os.getenv("TRADING_EPOCH_ENFORCE") or "0").strip().lower() in {"1","true","yes","on"}
+    from trader.db.trading_epoch import trading_epoch_enforced
+    return trading_epoch_enforced()
 
 
 def _active_us_epoch(bind: Any | None = None, *, required: bool | None = None) -> str | None:
