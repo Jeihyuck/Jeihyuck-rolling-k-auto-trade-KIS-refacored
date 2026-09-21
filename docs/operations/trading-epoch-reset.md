@@ -53,11 +53,26 @@ export KIS_ENV=practice
 For real trading, use the real environment/account deliberately. Never reuse a
 practice confirmation for a real account.
 
-## 3. Confirm broker flatness
+## 3. Broker-flat contract
 
-Confirm through KIS that KR and US holdings are both zero and there are no pending
-orders. PR138 requires an explicit operator confirmation; it does not treat DB state
-as broker truth for this destructive accounting boundary.
+The operator confirmation is necessary but **not sufficient**. The epoch start command
+queries KIS directly before any database migration or epoch mutation and fails closed
+unless all broker evidence is authoritative and flat.
+
+Required broker evidence:
+
+- KR balance is authoritative and contains no holdings;
+- KR same-day order inquiry is paginated to completion and has no remaining quantity;
+- US balance parse status is OK;
+- US balance is complete and authoritative;
+- NASD, NYSE, and AMEX were all queried successfully;
+- US holdings are zero;
+- US same-day order inquiry is paginated to completion;
+- malformed/quarantined US quantity evidence is rejected;
+- no US order has remaining quantity.
+
+If any balance exchange, pagination cursor, quantity, or order-status evidence is
+incomplete, the command aborts **before** DB migrations or epoch state changes.
 
 ## 4. Start the new epoch
 
@@ -73,13 +88,14 @@ Expected:
 
 ```text
 "status": "TRADING_EPOCH_STARTED"
+"broker_flat_evidence": {"status": "BROKER_FLAT_VERIFIED", ...}
 "history_deleted": false
 "database_replaced": false
 ```
 
-The command runs DB migrations first, ends the prior top-level epoch, ends prior
-ACTIVE KR portfolio epochs, closes their DB-only OPEN position rows, and creates one
-new ACTIVE `trading_epoch_id`.
+The command verifies broker flatness first. Only after that succeeds does it run DB
+migrations, end the prior top-level epoch, end prior ACTIVE KR portfolio epochs, close
+their DB-only OPEN position rows, and create one new ACTIVE `trading_epoch_id`.
 
 ## 5. Verify the active epoch
 
