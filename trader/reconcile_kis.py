@@ -777,12 +777,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     requested_run_id = ctx.run_id or run_id
     resolved_run_id = runs_repo.resolve_existing_run_id_or_none(
         requested_run_id,
-        context="reconcile_today",
+        context="reconcile_today.ctx",
     )
+    if resolved_run_id is None and run_id and str(run_id) != str(requested_run_id or ""):
+        resolved_run_id = runs_repo.resolve_existing_run_id_or_none(
+            run_id,
+            context="reconcile_today.env",
+        )
     if requested_run_id and resolved_run_id is None:
         logger.warning(
-            "[RECONCILE][RUN_ID_UNBOUND] requested_run_id=%s action=CONTINUE_WITH_NULL_RUN_FK",
+            "[RECONCILE][RUN_ID_UNBOUND] requested_run_id=%s env_run_id=%s action=CONTINUE_WITH_NULL_RUN_FK",
             requested_run_id,
+            run_id,
         )
 
     order_count = 0
