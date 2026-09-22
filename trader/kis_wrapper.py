@@ -274,6 +274,12 @@ def set_kr_tick_deadline(deadline_monotonic: float | None) -> None:
     )
 
 
+def get_kr_tick_deadline() -> float | None:
+    """Expose the shared deadline so safety layers can reserve tail budget."""
+    value = getattr(_KR_TICK_DEADLINE_STATE, "deadline", None)
+    return None if value is None else float(value)
+
+
 def clear_kr_tick_deadline() -> None:
     _KR_TICK_DEADLINE_STATE.deadline = None
 
