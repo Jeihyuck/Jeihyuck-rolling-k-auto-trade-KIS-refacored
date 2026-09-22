@@ -11,7 +11,7 @@ from trader.config import MARKET_MAP
 from trader.account_state import account_reset_mode, env_flag, get_account_key, get_masked_account_key
 from trader.runtime_paths import runtime_root
 from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
-                             ReconcileLogRepo, _assert_kr_buy_entry_contract)
+                             ReconcileLogRepo, RunsRepo, _assert_kr_buy_entry_contract)
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -773,6 +773,17 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     positions_repo = PositionsRepo(engine)
     ledger_repo = LedgerEventsRepo(engine)
     reconcile_repo = ReconcileLogRepo(engine)
+    runs_repo = RunsRepo(engine)
+    requested_run_id = ctx.run_id or run_id
+    resolved_run_id = runs_repo.resolve_existing_run_id_or_none(
+        requested_run_id,
+        context="reconcile_today",
+    )
+    if requested_run_id and resolved_run_id is None:
+        logger.warning(
+            "[RECONCILE][RUN_ID_UNBOUND] requested_run_id=%s action=CONTINUE_WITH_NULL_RUN_FK",
+            requested_run_id,
+        )
 
     order_count = 0
     fill_count = 0
@@ -831,7 +842,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
 
         orders_repo.upsert_reconciled_order(
             env=env,
-            run_id=ctx.run_id,
+            run_id=resolved_run_id,
             strategy=strategy,
             sid=1,
             mode=1,
@@ -878,7 +889,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
-                run_id=ctx.run_id,
+                run_id=resolved_run_id,
                 order_id=str((source_order or {}).get("order_id") or "") or None,
                 kis_odno=kis_odno,
                 trade_id=trade_id,
@@ -943,7 +954,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 # Persist cumulative proof only after the position bridge succeeds.
                 orders_repo.upsert_reconciled_order(
                     env=env,
-                    run_id=ctx.run_id,
+                    run_id=resolved_run_id,
                     strategy=str((source_order or {}).get("strategy") or strategy),
                     sid=int((source_order or {}).get("sid") or 1),
                     mode=int((source_order or {}).get("mode") or 1),
@@ -998,7 +1009,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         reasons.append(f"degraded:{degraded_reason}")
     ledger_repo.append_event(
         env=env,
-        run_id=run_id,
+        run_id=resolved_run_id,
         strategy=strategy,
         event_type="RECONCILE",
         ts=now_kst(),
