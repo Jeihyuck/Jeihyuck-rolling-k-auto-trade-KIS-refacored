@@ -18389,7 +18389,7 @@ class PB1Engine:
                         for reason in reasons:
                             self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                             order_stage_counter[reason] += 1
-                        self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                        self._log_order_skip(cf, reasons, self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18438,7 +18438,7 @@ class PB1Engine:
                         for reason in reasons:
                             self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                             order_stage_counter[reason] += 1
-                        self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                        self._log_order_skip(cf, reasons, self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
