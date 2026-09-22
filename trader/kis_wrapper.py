@@ -2398,24 +2398,16 @@ class KisAPI:
         if cached:
             return cached
 
-        # 게이트 + 스로틀링
+        # Legacy endpoint gate: wait within a bounded budget instead of
+        # converting a local throttle/cooldown directly into price_unavailable.
         gate = get_kis_gate()
-        if not gate.allow("inquire-price"):
-            cooldown = max(0.0, gate.get_cooldown_until("inquire-price") - time.time())
-            sleep_time = max(gate.wait_if_needed("inquire-price"), min(cooldown, 2.0))
-            if sleep_time > 0 and _kr_sleep_with_budget(
-                sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
-            ):
-                logger.info("[PRICE_GATE_WAIT] code=%s wait=%.3fs", c, sleep_time)
-            if not gate.allow("inquire-price"):
-                logger.warning("[PRICE_GATE_BLOCKED] %s reason=cooldown_or_quota", c)
-                return {}
-        sleep_time = gate.wait_if_needed("inquire-price")
-        if sleep_time > 0:
-            if not _kr_sleep_with_budget(
-                sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
-            ):
-                return {}
+        gate_wait_budget = _env_float("KIS_PRICE_GATE_MAX_WAIT_SEC", 2.0)
+        if not gate.wait_until_allowed("inquire-price", max_wait_sec=gate_wait_budget):
+            logger.warning(
+                "[PRICE_GATE_BLOCKED] %s reason=cooldown_or_quota wait_budget=%.2f",
+                c, gate_wait_budget,
+            )
+            return {}
 
         start_time = time.time()
         code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
