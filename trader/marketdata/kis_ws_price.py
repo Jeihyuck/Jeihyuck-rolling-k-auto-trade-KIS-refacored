@@ -477,8 +477,18 @@ class KisWebSocketPriceService:
         # KIS currently exposes a 25-field helper layout, while legacy/raw
         # samples include one extra leading realtime-code field. Accept both
         # explicitly so LAST/PBID/PASK cannot shift silently.
-        if len(fields) >= 26:
-            symbol_field = fields[0] if fields[0].startswith(("DNAS", "DNYS", "DAMS")) else fields[1]
+        second_field = str(fields[1] if len(fields) > 1 else "").strip().upper()
+        # Legacy/raw layout has a separate realtime-market code followed by the
+        # ticker. Current helper layout starts with the subscription symbol and
+        # has numeric ZDIV in field 1. This distinction also prevents a trailing
+        # delimiter on a 25-field message from being mistaken for legacy.
+        legacy_layout = bool(
+            len(fields) >= 26
+            and second_field
+            and cls._number(second_field) is None
+        )
+        if legacy_layout:
+            symbol_field = second_field
             last_idx, bid_idx, ask_idx = 11, 15, 16
         elif len(fields) >= 16:
             symbol_field = fields[0]
@@ -488,7 +498,7 @@ class KisWebSocketPriceService:
         last = cls._number(fields[last_idx])
         if not last:
             return None
-        exchange_probe = fields[0] if fields[0].startswith(("DNAS", "DNYS", "DAMS")) else symbol_field
+        exchange_probe = fields[0] if str(fields[0]).startswith(("DNAS", "DNYS", "DAMS")) else symbol_field
         exchange = None
         if exchange_probe.startswith("DNAS"):
             exchange = "NASDAQ"
