@@ -616,6 +616,36 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
     tick_snapshot = getattr(engine_obj, "_balance_snapshot", None)
     snapshot_source = "unknown"
 
+    # Reconciliation itself can still call daily-ccld and perform DB work even
+    # when the PB1 balance snapshot is reusable. Apply one common tail-budget
+    # gate before choosing the balance source so no post-tick reconcile path can
+    # start after the shared KR tick budget is effectively exhausted.
+    remaining_sec = kr_tick_remaining_sec()
+    min_remaining_sec = max(
+        0.5, float(os.getenv("KR_BROKER_TRUTH_MIN_REMAINING_SEC", "12") or "12")
+    )
+    if math.isfinite(remaining_sec) and remaining_sec < min_remaining_sec:
+        order_activity = int(bool(broker_crossed))
+        if isinstance(payload, dict):
+            payload.update(
+                {
+                    "broker_truth_reconcile_ran": 0,
+                    "broker_truth_reconcile_deferred": 1,
+                    "broker_truth_reconcile_defer_reason": "INSUFFICIENT_TICK_BUDGET",
+                    "broker_truth_remaining_sec": float(max(0.0, remaining_sec)),
+                    "broker_truth_health_status": "RED" if order_activity > 0 else "DEFERRED",
+                }
+            )
+        logger.warning(
+            "[KR_BROKER_TRUTH][POST_TICK][DEFER] remaining_sec=%.3f min_required_sec=%.3f "
+            "order_activity=%s snapshot_available=%s action=NEXT_TICK_RECONCILE",
+            remaining_sec,
+            min_remaining_sec,
+            order_activity,
+            int(isinstance(tick_snapshot, dict)),
+        )
+        return
+
     # If this tick never crossed the broker, the balance injected into PB1 is
     # still authoritative for this tick. Reuse it instead of burning another
     # KIS transaction call and shared tick budget.
@@ -627,31 +657,6 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
             snapshot_source,
         )
     else:
-        remaining_sec = kr_tick_remaining_sec()
-        min_remaining_sec = max(
-            0.5, float(os.getenv("KR_BROKER_TRUTH_MIN_REMAINING_SEC", "12") or "12")
-        )
-        if math.isfinite(remaining_sec) and remaining_sec < min_remaining_sec:
-            order_activity = int(bool(broker_crossed))
-            if isinstance(payload, dict):
-                payload.update(
-                    {
-                        "broker_truth_reconcile_ran": 0,
-                        "broker_truth_reconcile_deferred": 1,
-                        "broker_truth_reconcile_defer_reason": "INSUFFICIENT_TICK_BUDGET",
-                        "broker_truth_remaining_sec": float(max(0.0, remaining_sec)),
-                        "broker_truth_health_status": "RED" if order_activity > 0 else "DEFERRED",
-                    }
-                )
-            logger.warning(
-                "[KR_BROKER_TRUTH][POST_TICK][DEFER] remaining_sec=%.3f min_required_sec=%.3f "
-                "order_activity=%s action=NEXT_TICK_RECONCILE",
-                remaining_sec,
-                min_remaining_sec,
-                order_activity,
-            )
-            return
-
         if hasattr(kis, "invalidate_balance_cache"):
             try:
                 kis.invalidate_balance_cache(reason="post_pb1_tick_broker_truth")
