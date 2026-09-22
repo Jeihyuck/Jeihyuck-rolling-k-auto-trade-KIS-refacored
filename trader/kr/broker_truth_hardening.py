@@ -19,6 +19,8 @@ from __future__ import annotations
 from datetime import datetime
 import functools
 import logging
+import os
+import time
 from typing import Any
 
 import sqlalchemy as sa
@@ -26,6 +28,7 @@ import sqlalchemy as sa
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
+from trader.kis_wrapper import get_kr_tick_deadline, set_kr_tick_deadline
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
@@ -559,6 +562,54 @@ def _install_reconcile_guards() -> None:
         rk._kr_broker_truth_daily_guard_installed = True
 
 
+def _broker_crossed_this_tick(engine_obj: Any) -> bool:
+    buy = dict(getattr(engine_obj, "_run_summary_payload", {}) or {})
+    sell = dict(getattr(engine_obj, "_exit_summary_payload", {}) or {})
+    return any(
+        int(value or 0) > 0
+        for value in (
+            buy.get("api_submitted"),
+            buy.get("submitted"),
+            buy.get("accepted"),
+            sell.get("api_submitted"),
+            sell.get("submitted"),
+            sell.get("sell_orders_ack"),
+            sell.get("accepted_sell_count"),
+            sell.get("accepted_sells"),
+        )
+    )
+
+
+def _post_tick_balance_snapshot(engine_obj: Any, kis: Any) -> tuple[dict, str]:
+    """Reuse authoritative tick balance unless this tick crossed the broker."""
+    broker_crossed = _broker_crossed_this_tick(engine_obj)
+    tick_snapshot = getattr(engine_obj, "_balance_snapshot", None)
+    if not broker_crossed and isinstance(tick_snapshot, dict):
+        logger.info(
+            "[KR_BROKER_TRUTH][BALANCE_SOURCE] source=engine_tick_snapshot broker_crossed=0 action=reuse"
+        )
+        return tick_snapshot, "engine_tick_snapshot"
+
+    snapshot, snapshot_source = _post_tick_balance_snapshot(engine_obj, kis)
+    logger.info(
+        "[KR_BROKER_TRUTH][BALANCE_SOURCE] source=fresh_kis broker_crossed=%s action=force_refresh",
+        int(bool(broker_crossed)),
+    )
+    return snapshot, "fresh_kis"
+
+
+def _reserved_engine_deadline(outer_deadline: float | None) -> float | None:
+    if outer_deadline is None:
+        return None
+    reserve = max(0.0, float(os.getenv("KR_POST_ENGINE_RESERVE_SEC", "20") or 20.0))
+    min_engine = max(1.0, float(os.getenv("KR_ENGINE_MIN_IO_BUDGET_SEC", "20") or 20.0))
+    now_mono = time.monotonic()
+    candidate = float(outer_deadline) - reserve
+    if candidate <= now_mono + min_engine:
+        return None
+    return candidate
+
+
 def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
     if bool(getattr(engine_obj, "dry_run", True)):
         return
@@ -613,6 +664,7 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
         payload.update(
             {
                 "broker_truth_reconcile_ran": 1,
+                "broker_truth_balance_source": snapshot_source,
                 "broker_truth_orders": int(result.get("orders") or 0),
                 "broker_truth_fills": int(result.get("fills") or 0),
                 "broker_truth_promoted_fills": int(result.get("promoted_fills") or 0),
@@ -625,7 +677,8 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
             }
         )
     logger.info(
-        "[KR_BROKER_TRUTH][POST_TICK][DONE] orders=%s fills=%s promoted_fills=%s linked_fills=%s policy_recovered=%s policy_review=%s qty_mismatch=%s stale_open=%s health=%s",
+        "[KR_BROKER_TRUTH][POST_TICK][DONE] balance_source=%s orders=%s fills=%s promoted_fills=%s linked_fills=%s policy_recovered=%s policy_review=%s qty_mismatch=%s stale_open=%s health=%s",
+        snapshot_source,
         result.get("orders"),
         result.get("fills"),
         result.get("promoted_fills"),
@@ -647,7 +700,21 @@ def _install_engine_post_tick_guard() -> None:
 
     @functools.wraps(original_run)
     def run_guarded(self: Any, *args: Any, **kwargs: Any):
-        result = original_run(self, *args, **kwargs)
+        outer_deadline = get_kr_tick_deadline()
+        engine_deadline = _reserved_engine_deadline(outer_deadline)
+        if engine_deadline is not None:
+            logger.info(
+                "[KR_BROKER_TRUTH][RESERVE] outer_remaining=%.3f engine_io_remaining=%.3f reserve_sec=%.3f",
+                max(0.0, float(outer_deadline) - time.monotonic()),
+                max(0.0, float(engine_deadline) - time.monotonic()),
+                max(0.0, float(outer_deadline) - float(engine_deadline)),
+            )
+            set_kr_tick_deadline(engine_deadline)
+        try:
+            result = original_run(self, *args, **kwargs)
+        finally:
+            if outer_deadline is not None:
+                set_kr_tick_deadline(outer_deadline)
         try:
             _post_pb1_tick_reconcile(self)
         except Exception as exc:
