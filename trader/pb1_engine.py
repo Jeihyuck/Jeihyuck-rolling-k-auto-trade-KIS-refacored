@@ -9502,19 +9502,18 @@ class PB1Engine:
             return None
         
         if self.kis:
-            # ✅ 서킷 브레이커 체크
+            # Do not return early on a REST symbol circuit. The canonical
+            # snapshot path is WebSocket-first and can still provide a fresh
+            # pushed quote while REST for this symbol is cooling down.
             try:
                 from trader.kis_wrapper import _price_cache
                 if _price_cache.is_circuit_open(code):
                     self._warn_once(
                         f"price_circuit_open:{code}",
-                        "[PB1][PRICE][CIRCUIT_OPEN] code=%s scope=symbol skip REST price fetch until=%.0f",
+                        "[PB1][PRICE][CIRCUIT_OPEN] code=%s scope=symbol action=TRY_WS_THEN_REST_FALLBACK until=%.0f",
                         code,
                         _price_cache.circuit_until_for(code),
                     )
-                    # Do not fall back to a process-wide blackout. Other symbols
-                    # and fresh WebSocket quotes remain independently usable.
-                    return None
             except Exception as e:
                 logger.debug("[PB1][PRICE][CIRCUIT_CHECK_FAIL] %s", e)
             
