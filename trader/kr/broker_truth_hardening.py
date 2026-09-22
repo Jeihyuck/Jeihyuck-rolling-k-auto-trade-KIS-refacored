@@ -580,19 +580,32 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
     # path. Reuse that cache instead of consuming the final tick budget on a
     # redundant broker call. Once an order crossed the broker boundary, force a
     # fresh balance because broker truth must reflect the new order/fill state.
-    if force_refresh and hasattr(kis, "invalidate_balance_cache"):
-        try:
-            kis.invalidate_balance_cache(reason="post_pb1_tick_broker_truth_after_submit")
-        except Exception:
-            pass
-    if hasattr(kis, "get_balance_cached"):
-        snapshot = kis.get_balance_cached(force=force_refresh)
-    else:
-        snapshot = kis.get_balance(force=force_refresh) if hasattr(kis, "get_balance") else None
+    snapshot = None
+    balance_source = "none"
+    if not force_refresh:
+        tick_snapshot = getattr(engine_obj, "_balance_snapshot", None)
+        if isinstance(tick_snapshot, dict):
+            snapshot = tick_snapshot
+            balance_source = "pb1_tick_snapshot"
+
+    if snapshot is None:
+        if force_refresh and hasattr(kis, "invalidate_balance_cache"):
+            try:
+                kis.invalidate_balance_cache(reason="post_pb1_tick_broker_truth_after_submit")
+            except Exception:
+                pass
+        if hasattr(kis, "get_balance_cached"):
+            snapshot = kis.get_balance_cached(force=force_refresh)
+            balance_source = "kis_forced" if force_refresh else "kis_cached_or_fetch"
+        elif hasattr(kis, "get_balance"):
+            snapshot = kis.get_balance()
+            balance_source = "kis_get_balance"
+
     logger.info(
-        "[KR_BROKER_TRUTH][POST_TICK][BALANCE_SOURCE] api_submitted=%s force_refresh=%s",
+        "[KR_BROKER_TRUTH][POST_TICK][BALANCE_SOURCE] api_submitted=%s force_refresh=%s source=%s",
         api_submitted,
         int(force_refresh),
+        balance_source,
     )
     if not isinstance(snapshot, dict):
         raise RuntimeError("KR_BROKER_TRUTH_BALANCE_INVALID")
