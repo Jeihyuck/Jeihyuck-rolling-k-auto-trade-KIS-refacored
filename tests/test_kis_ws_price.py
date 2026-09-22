@@ -79,7 +79,7 @@ def test_disabled_service_does_not_wait(monkeypatch):
 
 def test_us_trade_parser_accepts_legacy_26_field_layout():
     fields = [
-        "DNASAAPL", "AAPL", "4", "20260922", "20260922", "101500", "20260922", "231500",
+        "DNAS", "AAPL", "4", "20260922", "20260922", "101500", "20260922", "231500",
         "200.0", "205.0", "198.0", "203.5", "2", "1.0", "0.5", "203.4", "203.6",
         "10", "11", "12", "13", "14", "15", "16", "17", "18",
     ]
@@ -87,6 +87,19 @@ def test_us_trade_parser_accepts_legacy_26_field_layout():
     assert parsed["market"] == "US"
     assert parsed["symbol"] == "AAPL"
     assert parsed["exchange"] == "NASDAQ"
+    assert parsed["last"] == 203.5
+    assert parsed["bid"] == 203.4
+    assert parsed["ask"] == 203.6
+
+
+def test_us_current_layout_with_trailing_delimiter_is_not_shifted():
+    fields = [
+        "DNASAAPL", "4", "20260922", "20260922", "101500", "20260922", "231500",
+        "200.0", "205.0", "198.0", "203.5", "2", "1.0", "0.5", "203.4", "203.6",
+        "10", "11", "12", "13", "14", "15", "16", "17", "18", "",
+    ]
+    parsed = KisWebSocketPriceService.parse_us_trade("^".join(fields))
+    assert parsed["symbol"] == "AAPL"
     assert parsed["last"] == 203.5
     assert parsed["bid"] == 203.4
     assert parsed["ask"] == 203.6
