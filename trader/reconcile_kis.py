@@ -815,7 +815,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     if not isinstance(resp, dict):
         degraded_reason = degraded_reason or "invalid_response"
         resp = {"output1": [], "output2": []}
-    rows = resp.get("output1") or resp.get("output2") or resp.get("output") or []
+    # KIS domestic daily-ccld contract: output1 contains order/execution rows.
+    # output2 is an aggregate summary and must never be promoted into an order.
+    rows = resp.get("output1") or []
     ccld_status = str(resp.get("_ccld_status") or ("ok" if isinstance(resp, dict) else "unknown"))
     if isinstance(rows, dict):
         rows = [rows]
@@ -829,18 +831,27 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     fill_count = 0
     filled_codes: list[str] = []
     for row in rows or []:
-        code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
-        if not code:
-            continue
-        side = _parse_side(row)
-        qty = _to_int(_first_value(row, ["ord_qty", "qty", "tot_ccld_qty", "ord_qty_sum"])) or 0
-        price = _to_float(_first_value(row, ["ord_unpr", "ord_price", "avg_prvs", "ccld_prc"])) or 0.0
-        kis_odno = str(_first_value(row, ["odno", "ODNO", "ordno"]) or "").strip() or None
-        status = str(_first_value(row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
-        market = MARKET_MAP.get(code) or str(_first_value(row, ["excg_dvsn_cd", "market"]) or "").strip() or None
-        order_time = _parse_date_time(row)
-        client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         broker_row = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        raw_code = _first_value(broker_row, ["pdno", "stck_shrn_iscd", "code"])
+        code = _normalize_code(raw_code)
+        side = _parse_side(broker_row)
+        if raw_code is None or not str(raw_code).strip() or code == "000000" or side not in {"BUY", "SELL"}:
+            logger.warning(
+                "[RECONCILE][DAILY_CCLD][INVALID_ROW_SKIP] raw_code=%s normalized_code=%s side=%s "
+                "keys=%s action=SKIP_NO_DB_WRITE",
+                raw_code,
+                code,
+                side,
+                sorted(str(key) for key in broker_row.keys()),
+            )
+            continue
+        qty = _to_int(_first_value(broker_row, ["ord_qty", "qty", "tot_ccld_qty", "ord_qty_sum"])) or 0
+        price = _to_float(_first_value(broker_row, ["ord_unpr", "ord_price", "avg_prvs", "ccld_prc"])) or 0.0
+        kis_odno = str(_first_value(broker_row, ["odno", "ODNO", "ordno"]) or "").strip() or None
+        status = str(_first_value(broker_row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
+        market = MARKET_MAP.get(code) or str(_first_value(broker_row, ["excg_dvsn_cd", "market"]) or "").strip() or None
+        order_time = _parse_date_time(broker_row)
+        client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         request_json = dict(broker_row)
         source_order = None
         source_response: dict[str, Any] = {}
