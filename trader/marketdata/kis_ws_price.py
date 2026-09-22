@@ -242,7 +242,8 @@ class KisWebSocketPriceService:
         if explicit:
             return explicit
         env = str(os.getenv("KIS_ENV") or "practice").strip().lower()
-        return "ws://ops.koreainvestment.com:21000" if env == "real" else "ws://ops.koreainvestment.com:31000"
+        base = "ws://ops.koreainvestment.com:21000" if env == "real" else "ws://ops.koreainvestment.com:31000"
+        return f"{base}/tryitout"
 
     def _approval_key(self) -> str:
         app_key, app_secret = self._credentials()
