@@ -17742,6 +17742,11 @@ class PB1Engine:
             )
             today_spent = 0.0
             for row in today_orders:
+                # A local CREATED/INTENT that never reached KIS is not spent
+                # capital. Counting it here would shrink the next-tick budget
+                # even after we deliberately allow its safe retry.
+                if not self._is_blocking_open_buy_row(row):
+                    continue
                 qty = float(row.get("qty") or 0)
                 limit_price = row.get("limit_price")
                 if limit_price is None:
@@ -18020,8 +18025,21 @@ class PB1Engine:
                             duplicate_intent_status = ""
                             if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
                                 existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
-                                duplicate_intent_exists = bool(existing_order)
-                                duplicate_intent_status = str((existing_order or {}).get("status") or "")
+                                duplicate_intent_status = str((existing_order or {}).get("status") or "").upper()
+                                retryable_unsubmitted = bool(
+                                    existing_order
+                                    and self._is_retryable_entry_order_status(duplicate_intent_status)
+                                    and not any(
+                                        (existing_order or {}).get(field)
+                                        for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
+                                    )
+                                )
+                                duplicate_intent_exists = bool(existing_order) and not retryable_unsubmitted
+                                if retryable_unsubmitted:
+                                    logger.info(
+                                        "[BUYABLE_GATE][RETRYABLE_PRIOR_INTENT] code=%s status=%s action=ALLOW_SAFE_RETRY",
+                                        code_key, duplicate_intent_status,
+                                    )
                             gate_snapshot = {**(gate_snapshot or {}),
                                 "market_state": (cf.features or {}).get("market_state") or getattr(self, "_kr_market_state", ""),
                                 "entry_score_strong": bool((cf.features or {}).get("entry_score_strong")
