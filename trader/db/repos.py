@@ -175,6 +175,8 @@ def _resolve_internal_run_id_or_none(
     conn: "sa.Connection",
     schema: "SchemaTables",
     run_id: Any,
+    *,
+    context: str = "ledger_event",
 ) -> str | None:
     """GitHub numeric run_id는 내부 runs.run_id로 사용하지 않는다.
 
@@ -189,8 +191,8 @@ def _resolve_internal_run_id_or_none(
     # GitHub run id는 순수 숫자 문자열 → 내부 UUID 아님
     if raw.isdigit():
         logger.info(
-            "[DB][LEDGER_EVENT][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=github_run_id_not_internal_uuid",
-            raw,
+            "[DB][RUN_ID_RESOLVE] context=%s input=%s resolved_run_id=None reason=github_run_id_not_internal_uuid",
+            context, raw,
         )
         return None
     # runs 테이블에 존재하는지 확인
@@ -201,13 +203,14 @@ def _resolve_internal_run_id_or_none(
         if exists:
             return raw
         logger.warning(
-            "[DB][LEDGER_EVENT][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=run_id_not_found_in_runs",
-            raw,
+            "[DB][RUN_ID_RESOLVE] context=%s input=%s resolved_run_id=None reason=run_id_not_found_in_runs",
+            context, raw,
         )
         return None
     except Exception as exc:
         logger.warning(
-            "[DB][LEDGER_EVENT][RUN_ID_RESOLVE][FAIL] input=%s resolved_run_id=None err_type=%s err=%s",
+            "[DB][RUN_ID_RESOLVE][FAIL] context=%s input=%s resolved_run_id=None err_type=%s err=%s",
+            context,
             raw,
             type(exc).__name__,
             exc,
@@ -2106,6 +2109,15 @@ class RunsRepo:
                         sa.update(self._schema.runs).where(where_clause).values(**update_values)
                     )
 
+    def resolve_existing_run_id_or_none(self, run_id: Any, *, context: str = "runtime") -> str | None:
+        with self.engine.begin() as conn:
+            return _resolve_internal_run_id_or_none(
+                conn,
+                self._schema,
+                run_id,
+                context=context,
+            )
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -3981,13 +3993,26 @@ class OrdersRepo:
                     observed_at=submitted_at or acked_at,
                 )
 
+            resolved_run_id = _resolve_internal_run_id_or_none(
+                conn,
+                self._schema,
+                run_id,
+                context="orders.upsert_reconciled_order",
+            )
+            if run_id is not None and resolved_run_id is None:
+                safe_response_json = {
+                    **safe_response_json,
+                    "_reconcile_run_id_unbound": str(run_id),
+                    "_reconcile_run_id_reason": "not_present_in_runs",
+                }
+
             payload = {
                 "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
                 "position_cycle_id": position_cycle_id,
                 "portfolio_epoch_id": portfolio_epoch_id,
                 "trading_epoch_id": trading_epoch_id,
                 "env": env,
-                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+                "run_id": uuid_value_for_url(db_url, resolved_run_id) if resolved_run_id is not None else None,
                 "strategy": strategy,
                 "sid": sid,
                 "mode": mode,
@@ -5147,7 +5172,7 @@ class LedgerEventsRepo:
             resolved_run_id = raw_run_id
         elif raw_run_id and raw_run_id.isdigit():
             logger.info(
-                "[DB][LEDGER_EVENT][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=github_run_id_not_internal_uuid",
+                "[DB][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=github_run_id_not_internal_uuid",
                 raw_run_id,
             )
             if not workflow_run_id:

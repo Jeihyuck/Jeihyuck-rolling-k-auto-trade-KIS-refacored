@@ -268,15 +268,41 @@ def _is_krx_context() -> bool:
     return False
 
 
+def _iter_exception_chain(exc: BaseException):
+    """Yield SQLAlchemy/DBAPI/Python wrapped exceptions without looping."""
+    queue = [exc]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for child in (
+            getattr(current, "orig", None),
+            getattr(current, "__cause__", None),
+            getattr(current, "__context__", None),
+        ):
+            if isinstance(child, BaseException) and id(child) not in seen:
+                queue.append(child)
+
+
+def _find_runner_tick_timeout(exc: BaseException) -> BaseException | None:
+    for current in _iter_exception_chain(exc):
+        name = current.__class__.__name__
+        msg = str(current)
+        if (
+            name == "TickTimeoutError"
+            or "tick_hard_timeout" in msg
+            or ("timeout_sec=" in msg and "last_stage=" in msg)
+        ):
+            return current
+    return None
+
+
 def _is_runner_tick_timeout(exc: BaseException) -> bool:
-    """TickTimeoutError 성격의 예외인지 판정."""
-    name = exc.__class__.__name__
-    msg = str(exc)
-    return (
-        name == "TickTimeoutError"
-        or "tick_hard_timeout" in msg
-        or ("timeout_sec=" in msg and "last_stage=" in msg)
-    )
+    """TickTimeoutError 성격의 예외를 wrapper chain 전체에서 판정."""
+    return _find_runner_tick_timeout(exc) is not None
 
 
 def _krx_db_fail_open_enabled(default: bool = False) -> bool:
@@ -327,6 +353,18 @@ def safe_read_mappings(
                         read_timeout_ms,
                     )
                 except Exception as _tset_exc:
+                    if _is_runner_tick_timeout(_tset_exc):
+                        logger.error(
+                            "[DB][READ][TIMEOUT_SET][TICK_TIMEOUT] op=%s err_type=%s err=%s action=ABORT_CONNECTION",
+                            op_name,
+                            type(_tset_exc).__name__,
+                            _tset_exc,
+                        )
+                        dispose_engine_safely(
+                            engine,
+                            reason=f"safe_read_mappings:{op_name}:timeout_set_tick_timeout",
+                        )
+                        raise
                     logger.warning(
                         "[DB][READ][TIMEOUT_SET][SKIP] op=%s err_type=%s err=%s",
                         op_name,
@@ -359,6 +397,25 @@ def safe_read_mappings(
         SATimeoutError,
         StatementError,
     ) as exc:
+        wrapped_tick_timeout = _find_runner_tick_timeout(exc)
+        if wrapped_tick_timeout is not None:
+            krx_fail_open = bool(fail_open) or _krx_db_fail_open_enabled(default=False)
+            logger.error(
+                "[DB][READ][WRAPPED_TICK_TIMEOUT] op=%s fail_open=%s outer=%s inner=%s err=%s",
+                op_name,
+                int(bool(krx_fail_open)),
+                type(exc).__name__,
+                type(wrapped_tick_timeout).__name__,
+                wrapped_tick_timeout,
+            )
+            dispose_engine_safely(
+                engine,
+                reason=f"safe_read_mappings:{op_name}:wrapped_tick_timeout",
+            )
+            if krx_fail_open:
+                return [], True
+            raise wrapped_tick_timeout
+
         poison = _is_connection_poison_error(exc)
         logger.exception(
             "[DB][READ][FAIL] op=%s fail_open=%s poison=%s err_type=%s err=%s",
