@@ -75,3 +75,18 @@ def test_disabled_service_does_not_wait(monkeypatch):
     started = time.monotonic()
     assert svc.wait_for_fresh_quote("KR", "005930", max_age_sec=5, wait_sec=2.0) is None
     assert time.monotonic() - started < 0.2
+
+
+def test_us_trade_parser_accepts_legacy_26_field_layout():
+    fields = [
+        "DNASAAPL", "AAPL", "4", "20260922", "20260922", "101500", "20260922", "231500",
+        "200.0", "205.0", "198.0", "203.5", "2", "1.0", "0.5", "203.4", "203.6",
+        "10", "11", "12", "13", "14", "15", "16", "17", "18",
+    ]
+    parsed = KisWebSocketPriceService.parse_us_trade("^".join(fields))
+    assert parsed["market"] == "US"
+    assert parsed["symbol"] == "AAPL"
+    assert parsed["exchange"] == "NASDAQ"
+    assert parsed["last"] == 203.5
+    assert parsed["bid"] == 203.4
+    assert parsed["ask"] == 203.6
