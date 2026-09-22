@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import time
+import asyncio
+import json
+
+import pytest
 
 from trader.marketdata.kis_ws_price import KisWebSocketPriceService
+
+
+
+@pytest.fixture(autouse=True)
+def _enable_ws_test_contract(monkeypatch):
+    monkeypatch.setenv("KIS_WS_PRICE_TEST_ENABLE", "1")
+    monkeypatch.setenv("KIS_WS_PRICE_ENABLED", "1")
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "1")
+    monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+    monkeypatch.delenv("KIS_EXPLICIT_OFFLINE", raising=False)
+    monkeypatch.delenv("DIAG_KIS_CALLS_ENABLED", raising=False)
+    monkeypatch.delenv("MINERVINI_ONLY", raising=False)
+    monkeypatch.delenv("KIS_WS_PRICE_FORCE_ENABLE", raising=False)
 
 
 def test_kr_trade_parser_extracts_fresh_price_and_top_of_book():
@@ -71,7 +88,7 @@ def test_us_process_uses_existing_us_specific_credentials(monkeypatch):
 def test_disabled_service_does_not_wait(monkeypatch):
     svc = KisWebSocketPriceService()
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "1")
-    monkeypatch.delenv("KIS_WS_PRICE_TEST_ENABLE", raising=False)
+    monkeypatch.setenv("KIS_WS_PRICE_TEST_ENABLE", "0")
     started = time.monotonic()
     assert svc.wait_for_fresh_quote("KR", "005930", max_age_sec=5, wait_sec=2.0) is None
     assert time.monotonic() - started < 0.2
@@ -103,3 +120,36 @@ def test_us_current_layout_with_trailing_delimiter_is_not_shifted():
     assert parsed["last"] == 203.5
     assert parsed["bid"] == 203.4
     assert parsed["ask"] == 203.6
+
+
+def test_kr_ws_respects_existing_no_network_contracts(monkeypatch):
+    svc = KisWebSocketPriceService()
+
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "0")
+    assert svc.network_allowed("KR") is False
+
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "1")
+    monkeypatch.setenv("DIAG_KIS_CALLS_ENABLED", "0")
+    assert svc.network_allowed("KR") is False
+
+    monkeypatch.delenv("DIAG_KIS_CALLS_ENABLED", raising=False)
+    monkeypatch.setenv("MINERVINI_ONLY", "1")
+    assert svc.network_allowed("KR") is False
+
+    monkeypatch.setenv("KIS_WS_PRICE_FORCE_ENABLE", "1")
+    assert svc.network_allowed("KR") is True
+
+
+def test_subscription_nack_is_requeued_for_retry():
+    svc = KisWebSocketPriceService()
+
+    class _FakeWs:
+        async def pong(self, _payload):
+            return None
+
+    payload = {
+        "header": {"tr_id": "H0STCNT0", "tr_key": "005930"},
+        "body": {"rt_cd": "1", "msg1": "temporary subscription reject"},
+    }
+    asyncio.run(svc._handle_message(_FakeWs(), json.dumps(payload)))
+    assert ("H0STCNT0", "005930") in svc._retry_subscriptions
