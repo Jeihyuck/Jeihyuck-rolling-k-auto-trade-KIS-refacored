@@ -383,13 +383,36 @@ class KisWebSocketPriceService:
         if len(parts) < 4:
             return
         tr_id = parts[1]
+        try:
+            record_count = max(1, int(parts[2] or 1))
+        except (TypeError, ValueError):
+            record_count = 1
         raw = parts[3]
         if tr_id == self.KR_TR_ID:
-            parsed = self.parse_kr_trade(raw)
+            self._handle_trade_records(raw, record_count, fields_per_record=46, parser=self.parse_kr_trade)
+        elif tr_id == self.US_TR_ID:
+            self._handle_trade_records(raw, record_count, fields_per_record=25, parser=self.parse_us_trade)
+
+    def _handle_trade_records(
+        self,
+        raw: str,
+        record_count: int,
+        *,
+        fields_per_record: int,
+        parser: Any,
+    ) -> None:
+        fields = str(raw or "").split("^")
+        if record_count <= 1:
+            parsed = parser(raw)
             if parsed:
                 self.put_quote(**parsed)
-        elif tr_id == self.US_TR_ID:
-            parsed = self.parse_us_trade(raw)
+            return
+        for index in range(record_count):
+            start = index * fields_per_record
+            chunk = fields[start:start + fields_per_record]
+            if len(chunk) < fields_per_record:
+                break
+            parsed = parser("^".join(chunk))
             if parsed:
                 self.put_quote(**parsed)
 
