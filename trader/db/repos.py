@@ -3981,13 +3981,35 @@ class OrdersRepo:
                     observed_at=submitted_at or acked_at,
                 )
 
+            resolved_run_id = None
+            if run_id is not None:
+                candidate_run_id = uuid_value_for_url(db_url, run_id)
+                run_exists = conn.execute(
+                    select(self._schema.runs.c.run_id)
+                    .where(self._schema.runs.c.run_id == candidate_run_id)
+                    .limit(1)
+                ).scalar()
+                if run_exists is not None:
+                    resolved_run_id = candidate_run_id
+                else:
+                    logger.error(
+                        "[RECONCILE][RUN_ID_ORPHAN] env=%s strategy=%s code=%s side=%s run_id=%s "
+                        "action=NULL_RUN_ID preserve_broker_observation=1",
+                        env, strategy, code, side, run_id,
+                    )
+                    safe_response_json = json_sanitize({
+                        **(safe_response_json or {}),
+                        "reconcile_run_id_orphan": str(run_id),
+                        "reconcile_run_id_action": "NULL_RUN_ID",
+                    })
+
             payload = {
                 "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
                 "position_cycle_id": position_cycle_id,
                 "portfolio_epoch_id": portfolio_epoch_id,
                 "trading_epoch_id": trading_epoch_id,
                 "env": env,
-                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+                "run_id": resolved_run_id,
                 "strategy": strategy,
                 "sid": sid,
                 "mode": mode,
@@ -4032,7 +4054,10 @@ class OrdersRepo:
             try:
                 order_id = conn.execute(stmt).scalar()
             except IntegrityError as exc:
-                raise RuntimeError("KR_RECONCILE_ORDER_EPOCH_COLLISION") from exc
+                message = str(exc)
+                if "orders_run_id_fkey" in message:
+                    raise RuntimeError("KR_RECONCILE_ORDER_RUN_ID_FK") from exc
+                raise RuntimeError("KR_RECONCILE_ORDER_INTEGRITY_ERROR") from exc
             return str(order_id or payload["order_id"])
 
     # ------------------------------------------------------------------

@@ -28,6 +28,25 @@ logger = logging.getLogger(__name__)
 _LAST_GOOD_BALANCE: tuple[dict, datetime] | None = None
 
 
+def prewarm_kr_infinite_price(symbol: str | None = None) -> None:
+    """Start the dedicated 122630 stream before PB1 consumes tick budget.
+
+    Market-data only: this never changes KR_INFINITE policy and never submits.
+    """
+    try:
+        config = InfiniteConfig.from_env()
+        if not config.enabled:
+            return
+        target = str(symbol or config.symbol or "122630").strip().lstrip("A")
+        if not target:
+            return
+        from trader.marketdata.kis_ws_price import get_kis_ws_price_service
+        get_kis_ws_price_service().subscribe_kr(target)
+        logger.info("[KR_INF][PRICE_PREWARM] symbol=%s source=KIS_WEBSOCKET action=subscribe", target)
+    except Exception as exc:
+        logger.warning("[KR_INF][PRICE_PREWARM][FAIL_SOFT] symbol=%s err=%s", symbol or "122630", exc)
+
+
 def _is_kr_infinite_opening_buy_blocked(at: datetime) -> tuple[bool, str]:
     """Return the KR Infinite entry-only gate; sell actions never call this gate."""
     if os.getenv("KR_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:

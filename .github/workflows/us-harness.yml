@@ -6,6 +6,10 @@ on:
     paths:
       - "trader/us/**"
       - "tests/us/**"
+      - "trader/db/**"
+      - "trader/kis_wrapper.py"
+      - "trader/marketdata/**"
+      - "requirements.txt"
       - "config/us_*.yaml"
       - ".github/workflows/us-harness.yml"
   workflow_dispatch:

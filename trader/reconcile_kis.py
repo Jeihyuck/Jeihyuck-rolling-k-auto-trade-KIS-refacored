@@ -7,11 +7,14 @@ from datetime import datetime
 from typing import Any
 from pathlib import Path
 
+import sqlalchemy as sa
+
 from trader.config import MARKET_MAP
 from trader.account_state import account_reset_mode, env_flag, get_account_key, get_masked_account_key
 from trader.runtime_paths import runtime_root
 from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
                              ReconcileLogRepo, _assert_kr_buy_entry_contract)
+from trader.db.schema import schema_for_engine, uuid_value_for_url
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -27,6 +30,49 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_reconcile_run_id(engine, *candidates: str | None) -> str | None:
+    """Use only a run id that is already durable in runs; never fabricate one."""
+    schema = schema_for_engine(engine)
+    db_url = str(engine.url)
+    normalized: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        try:
+            normalized.append((text, uuid_value_for_url(db_url, text)))
+        except Exception as exc:
+            logger.warning(
+                "[RECONCILE][RUN_ID_INVALID] run_id=%s err_type=%s action=IGNORE",
+                text, type(exc).__name__,
+            )
+    if not normalized:
+        return None
+    try:
+        with engine.connect() as conn:
+            for original, candidate in normalized:
+                exists = conn.execute(
+                    sa.select(schema.runs.c.run_id)
+                    .where(schema.runs.c.run_id == candidate)
+                    .limit(1)
+                ).scalar()
+                if exists is not None:
+                    return original
+    except Exception as exc:
+        logger.warning(
+            "[RECONCILE][RUN_ID_LOOKUP_FAIL] candidates=%s err_type=%s err=%s action=NULL_RUN_ID",
+            [item[0] for item in normalized], type(exc).__name__, exc,
+        )
+        return None
+    logger.error(
+        "[RECONCILE][RUN_ID_ORPHAN] candidates=%s action=NULL_RUN_ID preserve_broker_observation=1",
+        [item[0] for item in normalized],
+    )
+    return None
 
 
 def _first_value(row: dict, keys: list[str]) -> Any:
@@ -751,7 +797,12 @@ def _restore_entry_meta_for_promoted_positions(
 
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     env = ctx.env
-    run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
+    env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
+    reconcile_run_id = _resolve_reconcile_run_id(
+        engine,
+        getattr(ctx, "run_id", None),
+        env_run_id,
+    )
     strategy = ctx.strategy
     today = now_kst().strftime("%Y%m%d")
     degraded_reason: str | None = None
@@ -764,7 +815,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     if not isinstance(resp, dict):
         degraded_reason = degraded_reason or "invalid_response"
         resp = {"output1": [], "output2": []}
-    rows = resp.get("output1") or resp.get("output2") or resp.get("output") or []
+    # KIS domestic daily-ccld contract: output1 contains order/execution rows.
+    # output2 is an aggregate summary and must never be promoted into an order.
+    rows = resp.get("output1") or []
     ccld_status = str(resp.get("_ccld_status") or ("ok" if isinstance(resp, dict) else "unknown"))
     if isinstance(rows, dict):
         rows = [rows]
@@ -778,18 +831,27 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     fill_count = 0
     filled_codes: list[str] = []
     for row in rows or []:
-        code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
-        if not code:
-            continue
-        side = _parse_side(row)
-        qty = _to_int(_first_value(row, ["ord_qty", "qty", "tot_ccld_qty", "ord_qty_sum"])) or 0
-        price = _to_float(_first_value(row, ["ord_unpr", "ord_price", "avg_prvs", "ccld_prc"])) or 0.0
-        kis_odno = str(_first_value(row, ["odno", "ODNO", "ordno"]) or "").strip() or None
-        status = str(_first_value(row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
-        market = MARKET_MAP.get(code) or str(_first_value(row, ["excg_dvsn_cd", "market"]) or "").strip() or None
-        order_time = _parse_date_time(row)
-        client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         broker_row = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        raw_code = _first_value(broker_row, ["pdno", "stck_shrn_iscd", "code"])
+        code = _normalize_code(raw_code)
+        side = _parse_side(broker_row)
+        if raw_code is None or not str(raw_code).strip() or code == "000000" or side not in {"BUY", "SELL"}:
+            logger.warning(
+                "[RECONCILE][DAILY_CCLD][INVALID_ROW_SKIP] raw_code=%s normalized_code=%s side=%s "
+                "keys=%s action=SKIP_NO_DB_WRITE",
+                raw_code,
+                code,
+                side,
+                sorted(str(key) for key in broker_row.keys()),
+            )
+            continue
+        qty = _to_int(_first_value(broker_row, ["ord_qty", "qty", "tot_ccld_qty", "ord_qty_sum"])) or 0
+        price = _to_float(_first_value(broker_row, ["ord_unpr", "ord_price", "avg_prvs", "ccld_prc"])) or 0.0
+        kis_odno = str(_first_value(broker_row, ["odno", "ODNO", "ordno"]) or "").strip() or None
+        status = str(_first_value(broker_row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
+        market = MARKET_MAP.get(code) or str(_first_value(broker_row, ["excg_dvsn_cd", "market"]) or "").strip() or None
+        order_time = _parse_date_time(broker_row)
+        client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         request_json = dict(broker_row)
         source_order = None
         source_response: dict[str, Any] = {}
@@ -831,7 +893,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
 
         orders_repo.upsert_reconciled_order(
             env=env,
-            run_id=ctx.run_id,
+            run_id=reconcile_run_id,
             strategy=strategy,
             sid=1,
             mode=1,
@@ -878,7 +940,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
-                run_id=ctx.run_id,
+                run_id=reconcile_run_id,
                 order_id=str((source_order or {}).get("order_id") or "") or None,
                 kis_odno=kis_odno,
                 trade_id=trade_id,
@@ -943,7 +1005,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 # Persist cumulative proof only after the position bridge succeeds.
                 orders_repo.upsert_reconciled_order(
                     env=env,
-                    run_id=ctx.run_id,
+                    run_id=reconcile_run_id,
                     strategy=str((source_order or {}).get("strategy") or strategy),
                     sid=int((source_order or {}).get("sid") or 1),
                     mode=int((source_order or {}).get("mode") or 1),
@@ -998,7 +1060,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         reasons.append(f"degraded:{degraded_reason}")
     ledger_repo.append_event(
         env=env,
-        run_id=run_id,
+        run_id=reconcile_run_id,
         strategy=strategy,
         event_type="RECONCILE",
         ts=now_kst(),
@@ -1036,6 +1098,11 @@ def reconcile_kis(
     balance_snapshot: dict | None = None,
     runtime_dir: str | None = None,
 ) -> dict[str, object]:
+    reconcile_run_id = _resolve_reconcile_run_id(
+        engine,
+        run_id,
+        (os.getenv("TRADER_RUN_ID") or "").strip() or None,
+    )
     holdings_error = None
     holdings_rows: list[dict] = []
     try:
@@ -1053,11 +1120,12 @@ def reconcile_kis(
     ctx: RunContext | None = None
     try:
         exec_mode = "LIVE" if env == "real" else "DIAG"
-        ctx = RunContext.new(
+        ctx = RunContext(
             account_env=env,
             exec_mode=exec_mode,
             strategy=strategy,
             dry_run=False,
+            run_id=reconcile_run_id,
         )
         reconcile_result = reconcile_today(engine=engine, kis=kis, ctx=ctx)
     except Exception as exc:
@@ -1075,7 +1143,7 @@ def reconcile_kis(
     promoted = _promote_open_buy_orders_from_holdings(
         env=env,
         strategy=strategy,
-        ctx_run_id=run_id,
+        ctx_run_id=reconcile_run_id,
         tick_ts=tick_ts,
         holdings_rows=holdings_rows,
         orders_repo=orders_repo,
@@ -1255,4 +1323,9 @@ def reconcile_kis(
             "allow_purge": allow_purge,
         }
     )
+    # Transient caller-only broker truth.  When daily-ccld observes a fill,
+    # holdings_rows has already been force-refreshed above; expose that final
+    # authoritative view so post-tick policy/health checks do not fall back to
+    # the stale balance snapshot captured near the beginning of the tick.
+    reconcile_result["_final_holdings_rows"] = list(holdings_rows)
     return reconcile_result
