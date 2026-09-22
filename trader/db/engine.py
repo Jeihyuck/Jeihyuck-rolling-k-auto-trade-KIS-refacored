@@ -214,6 +214,8 @@ def _is_connection_poison_error(exc: BaseException) -> bool:
             "statement timeout",
             "lock timeout",
             "pool timeout",
+            "can't reconnect until invalid transaction is rolled back",
+            "pendingrollbackerror",
         )
     )
 
@@ -268,15 +270,34 @@ def _is_krx_context() -> bool:
     return False
 
 
+def _iter_exception_chain(exc: BaseException):
+    """Yield wrapper/original exceptions once, including SQLAlchemy/DBAPI causes."""
+    seen: set[int] = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for attr in ("orig", "__cause__", "__context__"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException) and id(nested) not in seen:
+                stack.append(nested)
+
+
 def _is_runner_tick_timeout(exc: BaseException) -> bool:
-    """TickTimeoutError 성격의 예외인지 판정."""
-    name = exc.__class__.__name__
-    msg = str(exc)
-    return (
-        name == "TickTimeoutError"
-        or "tick_hard_timeout" in msg
-        or ("timeout_sec=" in msg and "last_stage=" in msg)
-    )
+    """Recognize KR tick watchdog timeouts even after driver/SQLAlchemy wrapping."""
+    for current in _iter_exception_chain(exc):
+        name = current.__class__.__name__
+        msg = str(current)
+        if (
+            name == "TickTimeoutError"
+            or "tick_hard_timeout" in msg
+            or ("timeout_sec=" in msg and "last_stage=" in msg)
+        ):
+            return True
+    return False
 
 
 def _krx_db_fail_open_enabled(default: bool = False) -> bool:
@@ -327,12 +348,27 @@ def safe_read_mappings(
                         read_timeout_ms,
                     )
                 except Exception as _tset_exc:
+                    tick_timeout = _is_runner_tick_timeout(_tset_exc)
+                    poison = tick_timeout or _is_connection_poison_error(_tset_exc)
                     logger.warning(
-                        "[DB][READ][TIMEOUT_SET][SKIP] op=%s err_type=%s err=%s",
+                        "[DB][READ][TIMEOUT_SET][FAIL] op=%s err_type=%s tick_timeout=%s poison=%s err=%s",
                         op_name,
                         type(_tset_exc).__name__,
+                        int(tick_timeout),
+                        int(poison),
                         _tset_exc,
                     )
+                    if poison:
+                        dispose_engine_safely(
+                            engine,
+                            reason=f"safe_read_mappings:{op_name}:timeout_set:{type(_tset_exc).__name__}",
+                        )
+                        if tick_timeout:
+                            raise RuntimeError(
+                                f"tick_hard_timeout_wrapped op={op_name} "
+                                f"cause={type(_tset_exc).__name__}: {_tset_exc}"
+                            ) from _tset_exc
+                        raise
 
             try:
                 rows = conn.execute(stmt).mappings().all()
@@ -359,12 +395,14 @@ def safe_read_mappings(
         SATimeoutError,
         StatementError,
     ) as exc:
-        poison = _is_connection_poison_error(exc)
+        tick_timeout = _is_runner_tick_timeout(exc)
+        poison = tick_timeout or _is_connection_poison_error(exc)
         logger.exception(
-            "[DB][READ][FAIL] op=%s fail_open=%s poison=%s err_type=%s err=%s",
+            "[DB][READ][FAIL] op=%s fail_open=%s poison=%s tick_timeout=%s err_type=%s err=%s",
             op_name,
             int(bool(fail_open)),
             int(bool(poison)),
+            int(bool(tick_timeout)),
             type(exc).__name__,
             exc,
         )
@@ -376,6 +414,21 @@ def safe_read_mappings(
                 type(exc).__name__,
             )
             dispose_engine_safely(engine, reason=f"safe_read_mappings:{op_name}:{type(exc).__name__}")
+
+        if tick_timeout:
+            krx_fail_open = bool(fail_open) or _krx_db_fail_open_enabled(default=False)
+            logger.error(
+                "[DB][READ][TICK_TIMEOUT_WRAPPED] op=%s fail_open=%s krx=%s err_type=%s",
+                op_name,
+                int(bool(krx_fail_open)),
+                int(_is_krx_context()),
+                type(exc).__name__,
+            )
+            if krx_fail_open:
+                return [], True
+            raise RuntimeError(
+                f"tick_hard_timeout_wrapped op={op_name} cause={type(exc).__name__}: {exc}"
+            ) from exc
 
         if fail_open:
             logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
