@@ -109,4 +109,6 @@ def test_submit_time_policy_skip_drives_zero_api_classification():
     assert '"OPENING_30MIN_BUY_BLOCK"' in source
     assert '"BUYABLE_OPEN_ORDER"' in source
     assert '"BUYABLE_DUPLICATE_INTENT"' in source
+    assert '"KR_INF_OWNERSHIP_RESERVED"' in source
+    assert '"OWNERSHIP_RESERVED"' in source
     assert "top_policy_blocker = drop_policy_blocker or submit_policy_blocker" in source
