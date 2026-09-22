@@ -85,3 +85,18 @@ def test_open_buy_code_derivation_uses_broker_boundary_filter():
     source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
     assert "and self._is_blocking_open_buy_row(row)" in source
     assert "[PB1][OPEN_BUY][PREBROKER_IGNORED]" in source
+
+
+def test_retryable_intent_bypass_exists_in_both_buyable_gates():
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    assert source.count("duplicate_intent_exists = bool(existing_order) and not retryable_unsubmitted") >= 2
+    assert "[BUYABLE_GATE][RETRYABLE_PRIOR_INTENT]" in source
+
+
+def test_unsubmitted_intents_do_not_consume_today_spent_budget():
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    anchor = "today_spent = 0.0"
+    block = source[source.index(anchor):]
+    block = block[:block.index("planned_spent = today_spent")]
+    assert "if not self._is_blocking_open_buy_row(row):" in block
+    assert "continue" in block
