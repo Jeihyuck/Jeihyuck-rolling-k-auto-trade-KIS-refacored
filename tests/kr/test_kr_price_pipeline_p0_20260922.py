@@ -112,3 +112,15 @@ def test_submit_time_policy_skip_drives_zero_api_classification():
     assert '"KR_INF_OWNERSHIP_RESERVED"' in source
     assert '"OWNERSHIP_RESERVED"' in source
     assert "top_policy_blocker = drop_policy_blocker or submit_policy_blocker" in source
+
+
+def test_pb1_mark_price_never_uses_process_wide_price_circuit():
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    start = source.index("def _mark_price")
+    end = source.index("def _resolve_price_with_fallback", start)
+    block = source[start:end]
+    assert "_price_cache.is_circuit_open(code)" in block
+    assert "_price_cache.circuit_until_for(code)" in block
+    assert "_price_cache.open_circuit(code=code, rate_limited=True)" in block
+    assert "_price_cache.is_circuit_open()" not in block
+    assert "_price_cache.open_circuit()" not in block
