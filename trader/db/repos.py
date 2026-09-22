@@ -3981,13 +3981,29 @@ class OrdersRepo:
                     observed_at=submitted_at or acked_at,
                 )
 
+            bound_run_id = None
+            if run_id is not None:
+                candidate_run_id = uuid_value_for_url(db_url, run_id)
+                run_exists = conn.execute(
+                    select(self._schema.runs.c.run_id).where(
+                        self._schema.runs.c.run_id == candidate_run_id
+                    )
+                ).scalar()
+                if run_exists is not None:
+                    bound_run_id = candidate_run_id
+                else:
+                    logger.warning(
+                        "[RECONCILE][RUN_ID_UNBOUND] env=%s code=%s side=%s run_id=%s action=insert_without_optional_run_fk",
+                        env, code, side, run_id,
+                    )
+
             payload = {
                 "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
                 "position_cycle_id": position_cycle_id,
                 "portfolio_epoch_id": portfolio_epoch_id,
                 "trading_epoch_id": trading_epoch_id,
                 "env": env,
-                "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
+                "run_id": bound_run_id,
                 "strategy": strategy,
                 "sid": sid,
                 "mode": mode,
@@ -4032,7 +4048,19 @@ class OrdersRepo:
             try:
                 order_id = conn.execute(stmt).scalar()
             except IntegrityError as exc:
-                raise RuntimeError("KR_RECONCILE_ORDER_EPOCH_COLLISION") from exc
+                diag = getattr(getattr(exc, "orig", None), "diag", None)
+                constraint_name = str(getattr(diag, "constraint_name", "") or "")
+                message = str(exc)
+                if constraint_name == "orders_run_id_fkey" or "orders_run_id_fkey" in message:
+                    raise RuntimeError("KR_RECONCILE_ORDER_RUN_FK_MISSING") from exc
+                if constraint_name in {
+                    "uq_orders_env_client_order_key",
+                    "uq_orders_env_broker_order_id",
+                }:
+                    raise RuntimeError(f"KR_RECONCILE_ORDER_IDENTITY_COLLISION:{constraint_name}") from exc
+                raise RuntimeError(
+                    f"KR_RECONCILE_ORDER_INTEGRITY_ERROR:{constraint_name or type(getattr(exc, 'orig', exc)).__name__}"
+                ) from exc
             return str(order_id or payload["order_id"])
 
     # ------------------------------------------------------------------
