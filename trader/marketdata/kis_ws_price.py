@@ -347,7 +347,7 @@ class KisWebSocketPriceService:
                             await ws.send(json.dumps(payload, ensure_ascii=False))
                             sent.add(logical_key)
                             logger.info("[KIS_WS][SUBSCRIBE] market=%s symbol=%s tr_id=%s tr_key=%s", logical_key[0], logical_key[1], tr_id, tr_key)
-                            await asyncio.sleep(0.08)
+                            await asyncio.sleep(_env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5))
                         try:
                             message = await asyncio.wait_for(ws.recv(), timeout=0.25)
                         except asyncio.TimeoutError:
