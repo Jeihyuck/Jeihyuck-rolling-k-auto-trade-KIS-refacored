@@ -11,6 +11,7 @@ from trader.db.schema import schema_for_engine
 from trader.kr import broker_truth_hardening as broker_truth
 from trader.pb1_engine import PB1Engine
 from trader.pb1_runner import TickTimeoutError, _exception_chain_has_tick_timeout
+from trader.reconcile_kis import _resolve_reconcile_run_id
 
 
 class _FakeDialect:
@@ -133,6 +134,41 @@ def test_reconciled_order_drops_orphan_run_id_instead_of_violating_fk(monkeypatc
     assert row["run_id"] is None
     assert row["response_json"]["reconcile_run_id_orphan"] == missing_run_id
     assert row["response_json"]["reconcile_run_id_action"] == "NULL_RUN_ID"
+
+
+
+def test_reconcile_run_identity_uses_only_existing_runs(monkeypatch):
+    monkeypatch.delenv("WSL_RUN_MARKET", raising=False)
+    monkeypatch.delenv("TRADING_EPOCH_ENFORCE", raising=False)
+
+    engine = sa.create_engine("sqlite:///:memory:", future=True)
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    durable_run_id = str(uuid4())
+    missing_run_id = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(schema.runs).values(
+                run_id=durable_run_id,
+                env="practice",
+                strategy="pb1_pullback_close",
+                status="STARTED",
+                config_json={},
+            )
+        )
+
+    assert _resolve_reconcile_run_id(engine, missing_run_id, durable_run_id) == durable_run_id
+    assert _resolve_reconcile_run_id(engine, missing_run_id) is None
+
+
+def test_reconcile_kis_source_defines_run_id_before_holding_promotion():
+    source = Path("trader/reconcile_kis.py").read_text(encoding="utf-8")
+    fn = source[source.index("def reconcile_kis("):]
+    assert "reconcile_run_id = _resolve_reconcile_run_id(" in fn
+    assert fn.index("reconcile_run_id = _resolve_reconcile_run_id(") < fn.index(
+        "ctx_run_id=reconcile_run_id"
+    )
 
 
 def test_broker_truth_defers_without_network_when_tick_budget_is_exhausted(monkeypatch):
