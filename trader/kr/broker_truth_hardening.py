@@ -19,6 +19,8 @@ from __future__ import annotations
 from datetime import datetime
 import functools
 import logging
+import math
+import os
 from typing import Any
 
 import sqlalchemy as sa
@@ -26,6 +28,7 @@ import sqlalchemy as sa
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
+from trader.kis_wrapper import kr_tick_remaining_sec
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
@@ -570,6 +573,38 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
     db_engine = getattr(engine_obj, "engine", None)
     kis = getattr(engine_obj, "kis", None) or getattr(engine_obj, "kis_api", None)
     if db_engine is None or kis is None:
+        return
+
+    remaining_sec = kr_tick_remaining_sec()
+    min_remaining_sec = max(
+        0.5, float(os.getenv("KR_BROKER_TRUTH_MIN_REMAINING_SEC", "12") or "12")
+    )
+    if math.isfinite(remaining_sec) and remaining_sec < min_remaining_sec:
+        payload = getattr(engine_obj, "_run_summary_payload", None)
+        order_activity = 0
+        if isinstance(payload, dict):
+            order_activity = int(
+                payload.get("api_submitted")
+                or payload.get("submitted")
+                or payload.get("accepted")
+                or 0
+            )
+            payload.update(
+                {
+                    "broker_truth_reconcile_ran": 0,
+                    "broker_truth_reconcile_deferred": 1,
+                    "broker_truth_reconcile_defer_reason": "INSUFFICIENT_TICK_BUDGET",
+                    "broker_truth_remaining_sec": float(max(0.0, remaining_sec)),
+                    "broker_truth_health_status": "RED" if order_activity > 0 else "DEFERRED",
+                }
+            )
+        logger.warning(
+            "[KR_BROKER_TRUTH][POST_TICK][DEFER] remaining_sec=%.3f min_required_sec=%.3f "
+            "order_activity=%s action=NEXT_TICK_RECONCILE",
+            remaining_sec,
+            min_remaining_sec,
+            order_activity,
+        )
         return
 
     if hasattr(kis, "invalidate_balance_cache"):
