@@ -9505,12 +9505,15 @@ class PB1Engine:
             # ✅ 서킷 브레이커 체크
             try:
                 from trader.kis_wrapper import _price_cache
-                if _price_cache.is_circuit_open():
+                if _price_cache.is_circuit_open(code):
                     self._warn_once(
-                        "price_circuit_open",
-                        "[PB1][PRICE][CIRCUIT_OPEN] skip price fetch until circuit closes (until=%.0f)",
-                        _price_cache.circuit_until,
+                        f"price_circuit_open:{code}",
+                        "[PB1][PRICE][CIRCUIT_OPEN] code=%s scope=symbol skip REST price fetch until=%.0f",
+                        code,
+                        _price_cache.circuit_until_for(code),
                     )
+                    # Do not fall back to a process-wide blackout. Other symbols
+                    # and fresh WebSocket quotes remain independently usable.
                     return None
             except Exception as e:
                 logger.debug("[PB1][PRICE][CIRCUIT_CHECK_FAIL] %s", e)
@@ -9549,9 +9552,9 @@ class PB1Engine:
                 if "rate_limit" in exc_str or "egw002" in exc_str or "초당" in exc_str:
                     try:
                         from trader.kis_wrapper import _price_cache
-                        _price_cache.open_circuit()
+                        _price_cache.open_circuit(code=code, rate_limited=True)
                         logger.warning(
-                            "[PB1][PRICE][RATE_LIMIT] code=%s opened circuit for %ss err=%s",
+                            "[PB1][PRICE][RATE_LIMIT] code=%s opened symbol circuit for %ss err=%s",
                             code,
                             _price_cache.circuit_sec,
                             repr(exc),
