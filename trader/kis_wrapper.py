@@ -45,6 +45,7 @@ from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
+from trader.marketdata.kis_ws_price import get_kis_ws_price_service
 from trader.eventlog import emit_event
 from trader.kr_price_utils import krx_tick, normalize_kr_order_price
 
@@ -786,17 +787,41 @@ class _PriceCache:
         self.inflight: Dict[Tuple[str, str], threading.Event] = {}
         self.inflight_result: Dict[Tuple[str, str], dict] = {}
         self.lock = threading.Lock()
+        # Backward-compatible aggregate timestamp for observability/tests.
+        # Actual blocking is symbol-scoped so one EGW002 never blacks out
+        # unrelated candidates.
         self.circuit_until = 0.0
+        self.circuit_until_by_code: Dict[str, float] = {}
         self.cache_hits = 0
         self.cache_misses = 0
         self.rate_limit_hits = 0
         self.retry_waits = 0
 
-    def is_circuit_open(self) -> bool:
-        return time.time() < self.circuit_until
+    def is_circuit_open(self, code: str | None = None) -> bool:
+        now = time.time()
+        if code:
+            normalized = str(code).strip().lstrip("A")
+            return now < float(self.circuit_until_by_code.get(normalized, 0.0) or 0.0)
+        return now < self.circuit_until
 
-    def open_circuit(self, *, rate_limited: bool = False):
-        self.circuit_until = max(self.circuit_until, time.time() + self.circuit_sec)
+    def circuit_until_for(self, code: str | None = None) -> float:
+        if code:
+            return float(self.circuit_until_by_code.get(str(code).strip().lstrip("A"), 0.0) or 0.0)
+        return float(self.circuit_until)
+
+    def open_circuit(self, *, code: str | None = None, rate_limited: bool = False):
+        until = time.time() + self.circuit_sec
+        if code:
+            normalized = str(code).strip().lstrip("A")
+            self.circuit_until_by_code[normalized] = max(
+                float(self.circuit_until_by_code.get(normalized, 0.0) or 0.0),
+                until,
+            )
+        else:
+            # Aggregate breaker is reserved for truly non-symbol-specific
+            # failures. A single symbol EGW002 must not black out unrelated
+            # candidates or hide their fresh WebSocket quotes.
+            self.circuit_until = max(self.circuit_until, until)
         if rate_limited:
             self.rate_limit_hits += 1
 
@@ -897,7 +922,7 @@ def _mark_price_rate_limited(endpoint: str, code: str | None, msg_cd: str, msg1:
         msg_cd,
         msg1,
     )
-    _price_cache.open_circuit(rate_limited=True)
+    _price_cache.open_circuit(code=code, rate_limited=True)
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -1674,8 +1699,11 @@ class KisAPI:
                             msg_cd,
                             body.get("msg1"),
                         )
-                        # Circuit breaker pause (15s)
-                        _price_cache.open_circuit(rate_limited=True)
+                        # Price breaker is symbol-scoped. The account-wide REST
+                        # governor/cooldown still serializes traffic, but a single
+                        # symbol may not black out unrelated price candidates.
+                        _rate_code = str((kwargs.get("params") or {}).get("fid_input_iscd") or "").strip().lstrip("A")
+                        _price_cache.open_circuit(code=_rate_code or None, rate_limited=True)
                         # Exponential backoff
                         if _egw002_backoff_sleep(attempt=i) <= 0:
                             raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_EGW002_RETRY")
@@ -2346,25 +2374,46 @@ class KisAPI:
         diag_mode=True 이면 실패 시 경고만 남기고 빈 dict 반환.
         - 캐시 우선, 게이트 + 스로틀링 적용
         """
-        # 캐시 확인
-        cache_key = ("inquire-price", code)
+        c = safe_strip(code).lstrip("A")
+        if not c:
+            return {}
+
+        # Primary market-data source: KIS WebSocket. Subscription is lazy and
+        # uses the existing App Key/Secret to obtain approval_key automatically.
+        ws_service = get_kis_ws_price_service()
+        ws_service.subscribe_kr(c)
+        ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+        ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
+        ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
+        if ws_quote is None and ws_wait > 0:
+            ws_quote = ws_service.wait_for_fresh_quote(
+                "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
+            )
+        if ws_quote:
+            logger.debug(
+                "[KIS_WS][PRICE_HIT] market=KR code=%s age_sec=%.3f",
+                c, float(ws_quote.get("age_sec") or 0.0),
+            )
+            return ws_quote
+
+        # REST/cache fallback.
+        cache_key = ("inquire-price", c)
         cached = price_cache.get(cache_key)
         if cached:
             return cached
 
-        # 게이트 + 스로틀링
+        # Legacy endpoint gate: wait within a bounded budget instead of
+        # converting a local throttle/cooldown directly into price_unavailable.
         gate = get_kis_gate()
-        if not gate.allow("inquire-price"):
-            logger.warning("[PRICE_GATE_BLOCKED] %s", code)
+        gate_wait_budget = _env_float("KIS_PRICE_GATE_MAX_WAIT_SEC", 2.0)
+        if not gate.wait_until_allowed("inquire-price", max_wait_sec=gate_wait_budget):
+            logger.warning(
+                "[PRICE_GATE_BLOCKED] %s reason=cooldown_or_quota wait_budget=%.2f",
+                c, gate_wait_budget,
+            )
             return {}
-        sleep_time = gate.wait_if_needed("inquire-price")
-        if sleep_time > 0:
-            time.sleep(sleep_time)
 
         start_time = time.time()
-        c = safe_strip(code)
-        if not c:
-            return {}
         code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
         markets = ("J", "U")
         base = normalize_base_url(API_BASE_URL)
@@ -2399,8 +2448,7 @@ class KisAPI:
                             except KisTemporaryError as exc:
                                 last_error = exc
                                 if diag_mode:
-                                    logger.warning("[KIS][QUOTE][TEMP_ERROR] diag mode code=%s attempt=%s err=%s", code, attempt, repr(exc))
-                                    return {}
+                                    logger.warning("[KIS][QUOTE][TEMP_ERROR] diag mode code=%s attempt=%s err=%s action=bounded_retry", code, attempt, repr(exc))
                                 sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
                                 if not _kr_sleep_with_budget(
                                     sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
@@ -2417,8 +2465,7 @@ class KisAPI:
                                 # Rate limit 초과 시 TEMP_ERROR로 처리
                                 last_error = KisTemporaryError("Rate limit exceeded")
                                 if diag_mode:
-                                    logger.warning("[KIS][QUOTE][RATE_LIMIT] diag mode code=%s attempt=%s", code, attempt)
-                                    return {}
+                                    logger.warning("[KIS][QUOTE][RATE_LIMIT] diag mode code=%s attempt=%s action=bounded_retry", code, attempt)
                                 sleep_time = min(base_sleep ** attempt, 10.0) * (1 + random.uniform(0, jitter))
                                 if not _kr_sleep_with_budget(
                                     sleep_time, stage_deadline=getattr(self, "_kr_stage_deadline", None)
@@ -3037,9 +3084,27 @@ class KisAPI:
         """
         key = (market, code)
 
-        # 1) circuit open: do not hammer
-        if _price_cache.is_circuit_open():
-            logger.warning("[PRICE][CIRCUIT_OPEN] skip inquire-price key=%s until=%.0f", key, _price_cache.circuit_until)
+        # WebSocket is independent of the REST circuit. A prior EGW002 on this
+        # symbol must not hide a newly-arrived fresh streaming quote.
+        ws_service = get_kis_ws_price_service()
+        ws_service.subscribe_kr(code)
+        ws_quote = ws_service.get_fresh_quote(
+            "KR", code, max_age_sec=_env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+        )
+        if ws_quote:
+            logger.debug(
+                "[KIS_WS][SNAPSHOT_HIT] code=%s age_sec=%.3f",
+                code, float(ws_quote.get("age_sec") or 0.0),
+            )
+            return ws_quote
+
+        # 1) symbol-scoped REST circuit: one bad symbol must not black out all
+        # KR candidates.
+        if _price_cache.is_circuit_open(code):
+            logger.warning(
+                "[PRICE][CIRCUIT_OPEN] skip inquire-price key=%s until=%.0f scope=symbol",
+                key, _price_cache.circuit_until_for(code),
+            )
             cached = _price_cache.get_cached(key)
             return cached or {}
 
@@ -3084,27 +3149,28 @@ class KisAPI:
                     "[KIS][EGW002][BACKOFF] endpoint=inquire-price code=%s msg_cd=%s msg1=%s attempt=1",
                     code, msg_cd, msg1[:80],
                 )
-                _price_cache.open_circuit(rate_limited=True)
+                _price_cache.open_circuit(code=code, rate_limited=True)
                 _egw002_backoff_sleep(attempt=1)
             elif rt_cd != "0" and msg_cd.startswith("EGW002"):
                 logger.warning("[PRICE][RATE_LIMITED] code=%s msg_cd=%s -> open circuit %ss", code, msg_cd, _PRICE_CIRCUIT_SEC)
-                _price_cache.open_circuit(rate_limited=True)
+                _price_cache.open_circuit(code=code, rate_limited=True)
             elif "초당 거래건수" in msg1:
                 logger.warning("[PRICE][RATE_LIMITED] code=%s msg1=%s -> open circuit %ss", code, msg1, _PRICE_CIRCUIT_SEC)
-                _price_cache.open_circuit(rate_limited=True)
+                _price_cache.open_circuit(code=code, rate_limited=True)
 
-            _price_cache.set_cached(key, data or {})
+            # Never negative-cache an empty quote. A transient miss must be able
+            # to recover on the next tick or via the WebSocket cache.
+            if data:
+                _price_cache.set_cached(key, data)
             return data or {}
 
         except Exception as exc:
             logger.warning("[PRICE][EXCEPTION] code=%s err=%s", code, repr(exc))
-            # 예외 발생 시 빈 dict 반환
-            empty = {}
-            _price_cache.set_cached(key, empty)
-            return empty
+            return {}
 
         finally:
             _price_cache.finish_inflight(key, _price_cache.get_cached(key) or {})
+
 
     # === ATR ===
     def get_atr(self, code: str, window: int = 14) -> Optional[float]:

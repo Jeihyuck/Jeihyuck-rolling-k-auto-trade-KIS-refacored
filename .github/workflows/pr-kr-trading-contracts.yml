@@ -73,6 +73,7 @@ jobs:
       - name: KR contract tests
         run: |
           pytest tests/test_kr_final30_contract.py -q
+          pytest tests/test_kis_ws_price.py -q
 
       - name: Migration 0050 legacy schema hotfix tests
         run: |

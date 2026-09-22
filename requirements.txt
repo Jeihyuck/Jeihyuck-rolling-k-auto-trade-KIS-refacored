@@ -16,3 +16,6 @@ pytest
 reportlab>=4.0  # PDF report generation for institutional decision tracking
 
 PyYAML>=6.0
+
+# KIS realtime price feed (KR/US WebSocket-first market data)
+websockets>=12,<16

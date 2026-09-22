@@ -71,7 +71,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python -m pytest tests/us -q 2>&1 | tee /tmp/us-pytest.log
+          python -m pytest tests/test_kis_ws_price.py tests/us -q 2>&1 | tee /tmp/us-pytest.log
 
       - name: Run harness runner (offline, all scenarios)
         run: python -m trader.us.harness.runner --scenario all --offline

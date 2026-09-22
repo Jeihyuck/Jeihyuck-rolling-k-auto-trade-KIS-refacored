@@ -138,16 +138,35 @@ class KisCallGate:
             return True
     
     def wait_if_needed(self, endpoint: str) -> float:
-        """최소 간격을 보장하기 위해 필요한 sleep 시간 반환"""
+        """Return the next deterministic wait required for this legacy endpoint."""
         now = time.time()
         with self.lock:
-            last_call = self.last_call_time[endpoint]
-            if last_call > 0:
-                elapsed = now - last_call
-                if elapsed < MIN_INTERVAL_SEC:
-                    sleep_time = MIN_INTERVAL_SEC - elapsed
-                    return sleep_time
-        return 0.0
+            waits = []
+            cooldown = float(self.cooldown_until[endpoint] or 0.0)
+            if now < cooldown:
+                waits.append(cooldown - now)
+            last_call = float(self.last_call_time[endpoint] or 0.0)
+            if last_call > 0 and now - last_call < MIN_INTERVAL_SEC:
+                waits.append(MIN_INTERVAL_SEC - (now - last_call))
+            window_start = float(self.call_windows[endpoint] or 0.0)
+            if self.call_counts[endpoint] >= MAX_CALLS_PER_SEC and now - window_start < 1.0:
+                waits.append(1.0 - (now - window_start))
+            return max(waits or [0.0])
+
+    def wait_until_allowed(self, endpoint: str, *, max_wait_sec: float = 2.0) -> bool:
+        """Bounded blocking acquire for callers that prefer waiting over data loss.
+
+        This does not change quota semantics: allow() still owns the counter.
+        """
+        deadline = time.monotonic() + max(0.0, float(max_wait_sec))
+        while True:
+            if self.allow(endpoint):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait = self.wait_if_needed(endpoint)
+            time.sleep(min(remaining, max(0.01, wait if wait > 0 else 0.05)))
 
     def penalize(self, endpoint: str, seconds: float = RATE_LIMIT_COOLDOWN_SEC):
         now = time.time()

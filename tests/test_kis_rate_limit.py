@@ -20,13 +20,15 @@ def test_load_price_policy_prefers_kis_specific_env(monkeypatch):
     assert policy["jitter_sec"] == 0.25
 
 
-def test_mark_price_rate_limited_opens_circuit(monkeypatch):
+def test_mark_price_rate_limited_opens_symbol_circuit_only(monkeypatch):
     importlib.reload(kis_wrapper)
     try:
-        before = kis_wrapper._price_cache.circuit_until
+        aggregate_before = kis_wrapper._price_cache.circuit_until
         kis_wrapper._mark_price_rate_limited("inquire-price", "005930", "EGW00201", "too many")
 
-        assert kis_wrapper._price_cache.circuit_until > before
+        assert kis_wrapper._price_cache.is_circuit_open("005930") is True
+        assert kis_wrapper._price_cache.is_circuit_open("000660") is False
+        assert kis_wrapper._price_cache.circuit_until == aggregate_before
         assert kis_wrapper.get_price_runtime_stats()["price_http_fail_count"] >= 1
     finally:
         importlib.reload(kis_wrapper)

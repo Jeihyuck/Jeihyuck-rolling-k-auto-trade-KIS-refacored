@@ -5343,7 +5343,27 @@ class PB1Engine:
 
     @staticmethod
     def _is_open_entry_order_status(status: Any) -> bool:
-        return str(status or "").upper() in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED"}
+        return str(status or "").upper() in {
+            "SUBMITTED", "ACKED", "ACCEPTED", "PENDING_CONFIRM",
+            "PARTIAL_FILLED", "PARTIALLY_FILLED", "UNRESOLVED_ACK", "FILLED",
+        }
+
+    @classmethod
+    def _is_blocking_open_buy_row(cls, row: dict[str, Any] | None) -> bool:
+        """True only when durable evidence says the BUY crossed the broker boundary.
+
+        OrdersRepo.get_open_orders intentionally includes CREATED/INTENT for
+        reconciliation visibility. Those pre-broker rows must not become
+        open_buy_codes and self-block a safe retry after local pretrade failure.
+        """
+        data = row if isinstance(row, dict) else {}
+        status = str(data.get("status") or "").upper()
+        if cls._is_open_entry_order_status(status):
+            return True
+        return any(
+            data.get(field)
+            for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
+        )
 
     @staticmethod
     def _is_retryable_sell_order_row(order: dict[str, Any] | None) -> bool:
@@ -5532,9 +5552,26 @@ class PB1Engine:
         if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
             existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
         existing_status = str((existing_order or {}).get("status") or "").upper()
+        retryable_unsubmitted = bool(
+            existing_order
+            and self._is_retryable_entry_order_status(existing_status)
+            and not any(
+                (existing_order or {}).get(field)
+                for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
+            )
+        )
         open_order_exists = bool(gate_snapshot.get("open_order_exists")) or self._is_open_entry_order_status(existing_status)
-        duplicate_intent_exists = bool(existing_order)
+        if retryable_unsubmitted:
+            # A local pre-submit failure is not a live broker order. Allow the
+            # later retry-key path to rotate identity and submit again.
+            open_order_exists = bool(gate_snapshot.get("open_order_exists"))
+        duplicate_intent_exists = bool(existing_order) and not retryable_unsubmitted
         blocking_duplicate_exists = bool(open_order_exists)
+        if retryable_unsubmitted:
+            logger.info(
+                "[ORDER][PRE_SUBMIT][RETRYABLE_PRIOR_INTENT] code=%s status=%s action=allow_retry_key",
+                self._display_code(cf.code), existing_status,
+            )
         gate_context = self._build_unified_gate_context(
             code=cf.code,
             qty=int(cf.planned_qty or 0),
@@ -9422,7 +9459,7 @@ class PB1Engine:
             cf.features["planned_qty"] = int(qty)
             cf.features["planned_value"] = float(cf.planned_value)
             cf.features["sizing_details"] = cf.sizing_details
-            cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
+            cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", self.window_internal, self._entry_stage_name())
             allocated_slots += 1
             logger.info(
                 "[PB1][RANK] code=%s score=%.1f cap=%.0f qty=%s value=%.0f atr_pct=%.2f%% value20=%s tick_budget=%.0f",
@@ -9465,16 +9502,18 @@ class PB1Engine:
             return None
         
         if self.kis:
-            # ✅ 서킷 브레이커 체크
+            # Do not return early on a REST symbol circuit. The canonical
+            # snapshot path is WebSocket-first and can still provide a fresh
+            # pushed quote while REST for this symbol is cooling down.
             try:
                 from trader.kis_wrapper import _price_cache
-                if _price_cache.is_circuit_open():
+                if _price_cache.is_circuit_open(code):
                     self._warn_once(
-                        "price_circuit_open",
-                        "[PB1][PRICE][CIRCUIT_OPEN] skip price fetch until circuit closes (until=%.0f)",
-                        _price_cache.circuit_until,
+                        f"price_circuit_open:{code}",
+                        "[PB1][PRICE][CIRCUIT_OPEN] code=%s scope=symbol action=TRY_WS_THEN_REST_FALLBACK until=%.0f",
+                        code,
+                        _price_cache.circuit_until_for(code),
                     )
-                    return None
             except Exception as e:
                 logger.debug("[PB1][PRICE][CIRCUIT_CHECK_FAIL] %s", e)
             
@@ -9512,9 +9551,9 @@ class PB1Engine:
                 if "rate_limit" in exc_str or "egw002" in exc_str or "초당" in exc_str:
                     try:
                         from trader.kis_wrapper import _price_cache
-                        _price_cache.open_circuit()
+                        _price_cache.open_circuit(code=code, rate_limited=True)
                         logger.warning(
-                            "[PB1][PRICE][RATE_LIMIT] code=%s opened circuit for %ss err=%s",
+                            "[PB1][PRICE][RATE_LIMIT] code=%s opened symbol circuit for %ss err=%s",
                             code,
                             _price_cache.circuit_sec,
                             repr(exc),
@@ -10290,8 +10329,15 @@ class PB1Engine:
         ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
         if not ownership_ok:
             logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", cf.code, ownership_reason)
-            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved",
-                    "terminal_event": "FINAL_SKIP"}
+            return {
+                "submitted": 0,
+                "api_submitted": 0,
+                "accepted": 0,
+                "skipped": 1,
+                "skipped_reason": ownership_reason or "ownership_reserved",
+                "submit_terminal_status": "SKIPPED_BY_POLICY",
+                "terminal_event": "FINAL_SKIP",
+            }
         status: dict[str, Any] = self._empty_order_status()
         stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
@@ -10820,6 +10866,28 @@ class PB1Engine:
             client_order_key=effective_client_order_key,
             stage=stage,
         ):
+            # The broker was never called. Do not leave a CREATED intent that
+            # self-blocks the next tick as OPEN_ORDER/DUPLICATE_INTENT.
+            try:
+                self.orders_repo.mark_error(
+                    self.env,
+                    effective_client_order_key or "",
+                    {
+                        "rt_cd": "LOCAL_PRETRADE_BLOCK",
+                        "msg_cd": "PRETRADE_CHECK_FAILED",
+                        "msg1": "broker_not_called; safe_to_retry",
+                        "broker_submit": False,
+                    },
+                )
+                logger.info(
+                    "[ORDER][PRETRADE][INTENT_CLOSED] code=%s key=%s status=ERROR retryable=1",
+                    display_code, effective_client_order_key,
+                )
+            except Exception:
+                logger.exception(
+                    "[ORDER][PRETRADE][INTENT_CLOSE_FAIL] code=%s key=%s",
+                    display_code, effective_client_order_key,
+                )
             self._log_final_skip(
                 cf=cf,
                 reason_code="PRETRADE_CHECK_FAILED",
@@ -17635,7 +17703,23 @@ class PB1Engine:
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
             with self._stage_timer("entry.open_orders_lookup"):
                 open_orders = self._safe_get_open_orders()
-            open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+            open_buy_codes = {
+                row.get("code")
+                for row in open_orders
+                if str(row.get("side") or "").upper() == "BUY"
+                and self._is_blocking_open_buy_row(row)
+            }
+            ignored_prebroker_open = [
+                row for row in open_orders
+                if str(row.get("side") or "").upper() == "BUY"
+                and not self._is_blocking_open_buy_row(row)
+            ]
+            if ignored_prebroker_open:
+                logger.info(
+                    "[PB1][OPEN_BUY][PREBROKER_IGNORED] count=%s codes=%s action=ALLOW_SAFE_RETRY",
+                    len(ignored_prebroker_open),
+                    sorted({str(row.get("code") or "") for row in ignored_prebroker_open}),
+                )
             try:
                 with self._stage_timer("entry.today_buy_orders_lookup"):
                     today_orders = self._safe_list_today_orders(side="BUY")
@@ -17660,6 +17744,11 @@ class PB1Engine:
             )
             today_spent = 0.0
             for row in today_orders:
+                # A local CREATED/INTENT that never reached KIS is not spent
+                # capital. Counting it here would shrink the next-tick budget
+                # even after we deliberately allow its safe retry.
+                if not self._is_blocking_open_buy_row(row):
+                    continue
                 qty = float(row.get("qty") or 0)
                 limit_price = row.get("limit_price")
                 if limit_price is None:
@@ -17938,8 +18027,21 @@ class PB1Engine:
                             duplicate_intent_status = ""
                             if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
                                 existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
-                                duplicate_intent_exists = bool(existing_order)
-                                duplicate_intent_status = str((existing_order or {}).get("status") or "")
+                                duplicate_intent_status = str((existing_order or {}).get("status") or "").upper()
+                                retryable_unsubmitted = bool(
+                                    existing_order
+                                    and self._is_retryable_entry_order_status(duplicate_intent_status)
+                                    and not any(
+                                        (existing_order or {}).get(field)
+                                        for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
+                                    )
+                                )
+                                duplicate_intent_exists = bool(existing_order) and not retryable_unsubmitted
+                                if retryable_unsubmitted:
+                                    logger.info(
+                                        "[BUYABLE_GATE][RETRYABLE_PRIOR_INTENT] code=%s status=%s action=ALLOW_SAFE_RETRY",
+                                        code_key, duplicate_intent_status,
+                                    )
                             gate_snapshot = {**(gate_snapshot or {}),
                                 "market_state": (cf.features or {}).get("market_state") or getattr(self, "_kr_market_state", ""),
                                 "entry_score_strong": bool((cf.features or {}).get("entry_score_strong")
@@ -18562,7 +18664,7 @@ class PB1Engine:
                         emergency_cf.features["setup_strict_ok"] = False
                         emergency_cf.planned_qty = 1
                         emergency_cf.planned_value = float(order_px)
-                        emergency_cf.client_order_key = self._client_order_key(emergency_cf.code, emergency_cf.mode, "BUY", "close", "PB1")
+                        emergency_cf.client_order_key = self._client_order_key(emergency_cf.code, emergency_cf.mode, "BUY", self.window_internal, self._entry_stage_name())
                         orderable_candidates.append(emergency_cf)
                         logger.warning(
                             "[ORDER_CANDIDATES][EMERGENCY] selected=%s qty=1 reason=EMERGENCY_CANDIDATE_FALLBACK",
@@ -19229,17 +19331,24 @@ class PB1Engine:
                     )
                     policy_block_reasons = {
                         "BUYABLE_EXISTING_HOLDING_KIS",
+                        "BUYABLE_EXISTING_BROKER_HOLDING",
                         "BUYABLE_TODAY_BUY_EXISTS",
                         "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
                         "BUYABLE_COOLDOWN",
                         "BUYABLE_DUPLICATE",
+                        "BUYABLE_DUPLICATE_INTENT",
+                        "BUYABLE_DUPLICATE_CLIENT_KEY",
+                        "BUYABLE_OPEN_ORDER",
                         "MARKET_RISK_OFF_ENTRY_BLOCK",
                         "SECTOR_CAP_BLOCK",
                         "GROSS_EXPOSURE_CAP",
                         "CASH_INSUFFICIENT",
                         "MAX_POSITIONS_REACHED",
+                        "OPENING_30MIN_BUY_BLOCK",
+                        "KR_INF_OWNERSHIP_RESERVED",
+                        "OWNERSHIP_RESERVED",
                     }
-                    top_policy_blocker = next(
+                    drop_policy_blocker = next(
                         (
                             str(reason)
                             for reason, count in getattr(drop_reason_counter, "items", lambda: [])()
@@ -19247,6 +19356,16 @@ class PB1Engine:
                         ),
                         "",
                     )
+                    submit_policy_blocker = next(
+                        (
+                            str((result or {}).get("skipped_reason") or "")
+                            for result in (submit_result.get("results") or [])
+                            if int((result or {}).get("skipped", 0) or 0) > 0
+                            and str((result or {}).get("skipped_reason") or "").upper() in policy_block_reasons
+                        ),
+                        "",
+                    )
+                    top_policy_blocker = drop_policy_blocker or submit_policy_blocker
                     plan_skip_reasons = [
                         str(r)
                         for r in getattr(self, "_last_order_skip_reasons", [])
