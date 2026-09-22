@@ -322,6 +322,7 @@ class KisWebSocketPriceService:
                     logger.info("[KIS_WS][CONNECTED] url=%s connection=%d", self._ws_url(), self._connection_count)
                     sent: set[tuple[str, str]] = set()
                     backoff = 1.0
+                    last_subscribe_at = 0.0
                     while not self._stop.is_set():
                         with self._lock:
                             desired = dict(self._desired)
@@ -331,9 +332,19 @@ class KisWebSocketPriceService:
                                 "[KIS_WS][SUBSCRIPTION_LIMIT] desired=%d max=%d action=REST_FALLBACK_FOR_EXCESS",
                                 len(desired), max_subscriptions,
                             )
-                        for logical_key, subscription in list(desired.items())[:max_subscriptions]:
-                            if logical_key in sent:
-                                continue
+
+                        # Interleave subscribe and receive work. Sending every
+                        # pending subscription first can delay quote consumption
+                        # by N * subscribe_interval for a Final30 basket.
+                        pending = [
+                            (logical_key, subscription)
+                            for logical_key, subscription in list(desired.items())[:max_subscriptions]
+                            if logical_key not in sent
+                        ]
+                        subscribe_interval = _env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5)
+                        now_mono = time.monotonic()
+                        if pending and (now_mono - last_subscribe_at >= subscribe_interval):
+                            logical_key, subscription = pending[0]
                             tr_id, tr_key = subscription
                             payload = {
                                 "header": {
@@ -346,11 +357,18 @@ class KisWebSocketPriceService:
                             }
                             await ws.send(json.dumps(payload, ensure_ascii=False))
                             sent.add(logical_key)
-                            logger.info("[KIS_WS][SUBSCRIBE] market=%s symbol=%s tr_id=%s tr_key=%s", logical_key[0], logical_key[1], tr_id, tr_key)
-                            await asyncio.sleep(_env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5))
+                            last_subscribe_at = time.monotonic()
+                            logger.info(
+                                "[KIS_WS][SUBSCRIBE] market=%s symbol=%s tr_id=%s tr_key=%s",
+                                logical_key[0], logical_key[1], tr_id, tr_key,
+                            )
+
                         try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=0.25)
+                            message = await asyncio.wait_for(ws.recv(), timeout=0.20)
                         except asyncio.TimeoutError:
+                            # Short cooperative sleep keeps the loop from spinning
+                            # while preserving subscription pacing.
+                            await asyncio.sleep(0.02)
                             continue
                         await self._handle_message(ws, message)
             except Exception as exc:
