@@ -19329,10 +19329,14 @@ class PB1Engine:
                     )
                     policy_block_reasons = {
                         "BUYABLE_EXISTING_HOLDING_KIS",
+                        "BUYABLE_EXISTING_BROKER_HOLDING",
                         "BUYABLE_TODAY_BUY_EXISTS",
                         "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
                         "BUYABLE_COOLDOWN",
                         "BUYABLE_DUPLICATE",
+                        "BUYABLE_DUPLICATE_INTENT",
+                        "BUYABLE_DUPLICATE_CLIENT_KEY",
+                        "BUYABLE_OPEN_ORDER",
                         "MARKET_RISK_OFF_ENTRY_BLOCK",
                         "SECTOR_CAP_BLOCK",
                         "GROSS_EXPOSURE_CAP",
@@ -19340,7 +19344,7 @@ class PB1Engine:
                         "MAX_POSITIONS_REACHED",
                         "OPENING_30MIN_BUY_BLOCK",
                     }
-                    top_policy_blocker = next(
+                    drop_policy_blocker = next(
                         (
                             str(reason)
                             for reason, count in getattr(drop_reason_counter, "items", lambda: [])()
@@ -19348,6 +19352,16 @@ class PB1Engine:
                         ),
                         "",
                     )
+                    submit_policy_blocker = next(
+                        (
+                            str((result or {}).get("skipped_reason") or "")
+                            for result in (submit_result.get("results") or [])
+                            if int((result or {}).get("skipped", 0) or 0) > 0
+                            and str((result or {}).get("skipped_reason") or "").upper() in policy_block_reasons
+                        ),
+                        "",
+                    )
+                    top_policy_blocker = drop_policy_blocker or submit_policy_blocker
                     plan_skip_reasons = [
                         str(r)
                         for r in getattr(self, "_last_order_skip_reasons", [])
