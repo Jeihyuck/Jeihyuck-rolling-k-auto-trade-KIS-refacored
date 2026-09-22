@@ -153,3 +153,26 @@ def test_subscription_nack_is_requeued_for_retry():
     }
     asyncio.run(svc._handle_message(_FakeWs(), json.dumps(payload)))
     assert ("H0STCNT0", "005930") in svc._retry_subscriptions
+
+
+def test_us_intent_only_auto_policy_allows_websocket_marketdata(monkeypatch):
+    svc = KisWebSocketPriceService()
+    monkeypatch.setenv("MARKET_SCOPE", "US")
+    monkeypatch.setenv("STRATEGY_MODE", "INTENT_ONLY")
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "AUTO")
+    monkeypatch.delenv("US_KIS_HTTP_ENABLED", raising=False)
+    monkeypatch.delenv("KIS_EXPLICIT_OFFLINE", raising=False)
+    monkeypatch.delenv("DIAG_KIS_CALLS_ENABLED", raising=False)
+    monkeypatch.delenv("MINERVINI_ONLY", raising=False)
+    assert svc.network_allowed("US") is True
+
+
+def test_kr_intent_only_auto_policy_remains_blocked(monkeypatch):
+    svc = KisWebSocketPriceService()
+    monkeypatch.setenv("MARKET_SCOPE", "KR")
+    monkeypatch.setenv("STRATEGY_MODE", "INTENT_ONLY")
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "AUTO")
+    monkeypatch.delenv("KIS_EXPLICIT_OFFLINE", raising=False)
+    monkeypatch.delenv("DIAG_KIS_CALLS_ENABLED", raising=False)
+    monkeypatch.delenv("MINERVINI_ONLY", raising=False)
+    assert svc.network_allowed("KR") is False
