@@ -3441,6 +3441,30 @@ class TickTimeoutError(TimeoutError):
     pass
 
 
+def _exception_chain_has_tick_timeout(exc: BaseException) -> bool:
+    """Preserve watchdog identity through SQLAlchemy/driver exception wrappers."""
+    seen: set[int] = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        name = current.__class__.__name__
+        message = str(current)
+        if (
+            name == "TickTimeoutError"
+            or "tick_hard_timeout" in message
+            or ("timeout_sec=" in message and "last_stage=" in message)
+        ):
+            return True
+        for attr in ("orig", "__cause__", "__context__"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException) and id(nested) not in seen:
+                stack.append(nested)
+    return False
+
+
 def _run_once_with_hard_timeout(*, timeout_sec: int, call):
     if timeout_sec <= 0:
         last_stage = str(os.getenv("PB1_LAST_STAGE") or "unknown")
@@ -7115,11 +7139,7 @@ def run_once(
         touched_files = engine_runner.get_touched_files() if engine_runner and hasattr(engine_runner, "get_touched_files") else []
     except Exception as exc:
         # KRX TickTimeoutError는 traceback 없이 기록 (traceback_seen 방지)
-        _guard_is_tick_timeout = (
-            exc.__class__.__name__ == "TickTimeoutError"
-            or "tick_hard_timeout" in str(exc)
-            or ("timeout_sec=" in str(exc) and "last_stage=" in str(exc))
-        )
+        _guard_is_tick_timeout = _exception_chain_has_tick_timeout(exc)
         _guard_is_krx = (
             str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KRX"}
             or str(os.getenv("MARKET") or "").upper() == "KR"
@@ -7160,11 +7180,7 @@ def run_once(
         # KRX 한국장: positions_lookup 또는 account_reconcile 단계에서 TickTimeoutError를
         # FATAL_RUNTIME이 아닌 RECOVERABLE_DB_TIMEOUT으로 분류한다.
         _last_stage_at_fatal = str(os.getenv("PB1_LAST_STAGE") or "")
-        _is_tick_timeout = (
-            exc.__class__.__name__ == "TickTimeoutError"
-            or "tick_hard_timeout" in str(exc)
-            or ("timeout_sec=" in str(exc) and "last_stage=" in str(exc))
-        )
+        _is_tick_timeout = _exception_chain_has_tick_timeout(exc)
         _is_krx_context_fatal = (
             str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KRX"}
             or str(os.getenv("MARKET") or "").upper() == "KR"
