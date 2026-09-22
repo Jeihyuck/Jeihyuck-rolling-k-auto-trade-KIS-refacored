@@ -121,6 +121,34 @@ def test_pb1_mark_price_never_uses_process_wide_price_circuit():
     block = source[start:end]
     assert "_price_cache.is_circuit_open(code)" in block
     assert "_price_cache.circuit_until_for(code)" in block
+    assert "action=TRY_WS_THEN_REST_FALLBACK" in block
     assert "_price_cache.open_circuit(code=code, rate_limited=True)" in block
     assert "_price_cache.is_circuit_open()" not in block
     assert "_price_cache.open_circuit()" not in block
+
+
+def test_mark_price_uses_fresh_snapshot_even_when_rest_symbol_circuit_is_open(monkeypatch):
+    import time
+    from trader.pb1_engine import PB1Engine
+    from trader import kis_wrapper
+
+    engine = object.__new__(PB1Engine)
+    engine.price_fetch_count = 0
+    engine.askbid_fail_count = 0
+    engine.kis = object()
+    engine._warn_once = lambda *args, **kwargs: None
+
+    calls = []
+    def _fresh_snapshot(code, market="J"):
+        calls.append((code, market))
+        return {"ask": 70100, "bid": 70000, "prpr": 70050}
+
+    engine._get_price_snapshot_cached = _fresh_snapshot
+    monkeypatch.setitem(
+        kis_wrapper._price_cache.circuit_until_by_code,
+        "005930",
+        time.time() + 30,
+    )
+
+    assert engine._mark_price("005930") == 70100
+    assert calls == [("005930", "J")]
