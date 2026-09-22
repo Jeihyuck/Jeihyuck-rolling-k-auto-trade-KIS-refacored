@@ -1087,6 +1087,11 @@ def reconcile_kis(
     balance_snapshot: dict | None = None,
     runtime_dir: str | None = None,
 ) -> dict[str, object]:
+    reconcile_run_id = _resolve_reconcile_run_id(
+        engine,
+        run_id,
+        (os.getenv("TRADER_RUN_ID") or "").strip() or None,
+    )
     holdings_error = None
     holdings_rows: list[dict] = []
     try:
@@ -1104,11 +1109,12 @@ def reconcile_kis(
     ctx: RunContext | None = None
     try:
         exec_mode = "LIVE" if env == "real" else "DIAG"
-        ctx = RunContext.new(
+        ctx = RunContext(
             account_env=env,
             exec_mode=exec_mode,
             strategy=strategy,
             dry_run=False,
+            run_id=reconcile_run_id,
         )
         reconcile_result = reconcile_today(engine=engine, kis=kis, ctx=ctx)
     except Exception as exc:
