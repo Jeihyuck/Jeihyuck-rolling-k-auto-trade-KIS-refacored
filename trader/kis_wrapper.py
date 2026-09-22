@@ -811,13 +811,17 @@ class _PriceCache:
 
     def open_circuit(self, *, code: str | None = None, rate_limited: bool = False):
         until = time.time() + self.circuit_sec
-        self.circuit_until = max(self.circuit_until, until)
         if code:
             normalized = str(code).strip().lstrip("A")
             self.circuit_until_by_code[normalized] = max(
                 float(self.circuit_until_by_code.get(normalized, 0.0) or 0.0),
                 until,
             )
+        else:
+            # Aggregate breaker is reserved for truly non-symbol-specific
+            # failures. A single symbol EGW002 must not black out unrelated
+            # candidates or hide their fresh WebSocket quotes.
+            self.circuit_until = max(self.circuit_until, until)
         if rate_limited:
             self.rate_limit_hits += 1
 
