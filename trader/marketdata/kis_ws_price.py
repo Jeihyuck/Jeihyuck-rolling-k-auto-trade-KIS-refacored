@@ -155,6 +155,8 @@ class KisWebSocketPriceService:
         max_age_sec: float,
         wait_sec: float,
     ) -> dict[str, Any] | None:
+        if not self.enabled():
+            return None
         deadline = time.monotonic() + max(0.0, float(wait_sec))
         while True:
             quote = self.get_fresh_quote(market, symbol, max_age_sec=max_age_sec)
