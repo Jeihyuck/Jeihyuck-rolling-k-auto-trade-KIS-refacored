@@ -176,3 +176,48 @@ def test_kr_intent_only_auto_policy_remains_blocked(monkeypatch):
     monkeypatch.delenv("DIAG_KIS_CALLS_ENABLED", raising=False)
     monkeypatch.delenv("MINERVINI_ONLY", raising=False)
     assert svc.network_allowed("KR") is False
+
+
+def test_subscription_nack_backoff_allows_later_symbol_first(monkeypatch):
+    svc = KisWebSocketPriceService()
+    monkeypatch.setenv("KIS_WS_SUBSCRIBE_RETRY_BASE_SEC", "2")
+    monkeypatch.setenv("KIS_WS_SUBSCRIBE_RETRY_MAX_SEC", "8")
+
+    desired = {
+        ("KR", "005930"): ("H0STCNT0", "005930"),
+        ("KR", "000660"): ("H0STCNT0", "000660"),
+    }
+    sent = {("KR", "005930")}
+
+    class _FakeWs:
+        async def pong(self, _payload):
+            return None
+
+    nack = {
+        "header": {"tr_id": "H0STCNT0", "tr_key": "005930"},
+        "body": {"rt_cd": "1", "msg1": "temporary subscription reject"},
+    }
+    asyncio.run(svc._handle_message(_FakeWs(), json.dumps(nack)))
+
+    # The connection loop removes the rejected logical key from sent.
+    sent.discard(("KR", "005930"))
+    now = time.monotonic()
+    next_item = svc._next_pending_subscription(
+        desired,
+        sent,
+        max_subscriptions=40,
+        now_mono=now,
+    )
+    assert next_item == (("KR", "000660"), ("H0STCNT0", "000660"))
+
+    # Once the later symbol is sent and the rejected symbol's backoff expires,
+    # the rejected symbol becomes eligible again.
+    sent.add(("KR", "000660"))
+    retry_after = svc._subscription_retry_after[("H0STCNT0", "005930")]
+    next_after_backoff = svc._next_pending_subscription(
+        desired,
+        sent,
+        max_subscriptions=40,
+        now_mono=retry_after + 0.01,
+    )
+    assert next_after_backoff == (("KR", "005930"), ("H0STCNT0", "005930"))
