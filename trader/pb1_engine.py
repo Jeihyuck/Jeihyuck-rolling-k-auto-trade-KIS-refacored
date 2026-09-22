@@ -17858,7 +17858,7 @@ class PB1Engine:
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
                             buyable_stage_counter[reject_reason] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
-                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._log_order_skip(cf, [reject_reason], self._entry_stage_name())
                             self._emit_buy_decision(
                                 cf,
                                 order_value=order_value,
@@ -17892,7 +17892,7 @@ class PB1Engine:
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
                             buyable_stage_counter[reject_reason] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
-                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._log_order_skip(cf, [reject_reason], self._entry_stage_name())
                             self._emit_buy_decision(
                                 cf,
                                 order_value=order_value,
@@ -17916,7 +17916,7 @@ class PB1Engine:
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
                             buyable_stage_counter[reject_reason] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
-                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._log_order_skip(cf, [reject_reason], self._entry_stage_name())
                             self._emit_buy_decision(
                                 cf,
                                 order_value=order_value,
@@ -17960,7 +17960,7 @@ class PB1Engine:
                                             self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
                                             buyable_stage_counter["pivot_not_broken"] += 1
                                             self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
-                                            self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
+                                            self._log_order_skip(cf, ["pivot_not_broken"], self._entry_stage_name())
                                             self._emit_buy_decision(
                                                 cf,
                                                 order_value=order_value,
@@ -17973,7 +17973,7 @@ class PB1Engine:
                                             self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
                                             buyable_stage_counter["pivot_overshoot"] += 1
                                             self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
-                                            self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
+                                            self._log_order_skip(cf, ["pivot_overshoot"], self._entry_stage_name())
                                             self._emit_buy_decision(
                                                 cf,
                                                 order_value=order_value,
@@ -17987,7 +17987,7 @@ class PB1Engine:
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
                             buyable_stage_counter[reject_reason] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
-                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._log_order_skip(cf, [reject_reason], self._entry_stage_name())
                             self._emit_buy_decision(
                                 cf,
                                 order_value=order_value,
@@ -18002,7 +18002,7 @@ class PB1Engine:
                                 sizing_reason = _normalize_sizing_failure_reason(getattr(cf, "sizing_reason", None))
                                 self._record_drop(drop_reason_counter, drop_examples, sizing_reason, cf.code)
                                 order_stage_counter[sizing_reason] += 1
-                                self._log_order_skip(cf, [sizing_reason], "PB1-CLOSE")
+                                self._log_order_skip(cf, [sizing_reason], self._entry_stage_name())
                                 self._emit_buy_decision(
                                     cf,
                                     order_value=0.0,
@@ -18073,7 +18073,7 @@ class PB1Engine:
                                     self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                                     buyable_stage_counter[reason] += 1
                                 self._log_buyable_gate(code=cf.code, ok=False, reasons=final_reasons)
-                                self._log_order_skip(cf, final_reasons, "PB1-CLOSE")
+                                self._log_order_skip(cf, final_reasons, self._entry_stage_name())
                                 self._emit_buy_decision(
                                     cf,
                                     order_value=order_value,
@@ -18097,7 +18097,7 @@ class PB1Engine:
                                 self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
                                 buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
                                 self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
-                                self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
+                                self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], self._entry_stage_name())
                                 self._emit_buy_decision(
                                     cf,
                                     order_value=order_value,
@@ -18110,7 +18110,7 @@ class PB1Engine:
                                 self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
                                 buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
                                 self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
-                                self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
+                                self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], self._entry_stage_name())
                                 self._emit_buy_decision(
                                     cf,
                                     order_value=order_value,
@@ -18130,7 +18130,7 @@ class PB1Engine:
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
                             buyable_stage_counter[reject_reason] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
-                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._log_order_skip(cf, [reject_reason], self._entry_stage_name())
                             self._emit_buy_decision(
                                 cf,
                                 order_value=order_value,
@@ -18151,7 +18151,7 @@ class PB1Engine:
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
                             buyable_stage_counter[reject_reason] += 1
                             self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
-                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._log_order_skip(cf, [reject_reason], self._entry_stage_name())
                             self._emit_buy_decision(
                                 cf,
                                 order_value=order_value,
@@ -18264,7 +18264,7 @@ class PB1Engine:
                         for reason in entry_reasons:
                             self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                             order_stage_counter[reason] += 1
-                        self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
+                        self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18291,7 +18291,7 @@ class PB1Engine:
                     if ohlcv_block_reason:
                         self._record_drop(drop_reason_counter, drop_examples, ohlcv_block_reason, cf.code)
                         order_stage_counter[ohlcv_block_reason] += 1
-                        self._log_order_skip(cf, [ohlcv_block_reason], "PB1-CLOSE")
+                        self._log_order_skip(cf, [ohlcv_block_reason], self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18314,7 +18314,7 @@ class PB1Engine:
                     if df.empty:
                         self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
                         order_stage_counter["stop_calc_fail"] += 1
-                        self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
+                        self._log_order_skip(cf, ["stop_calc_fail"], self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18338,7 +18338,7 @@ class PB1Engine:
                     if stop0 >= entry_price:
                         self._record_drop(drop_reason_counter, drop_examples, "stop_above_entry", cf.code)
                         order_stage_counter["stop_above_entry"] += 1
-                        self._log_order_skip(cf, ["stop_above_entry"], "PB1-CLOSE")
+                        self._log_order_skip(cf, ["stop_above_entry"], self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18389,7 +18389,7 @@ class PB1Engine:
                         for reason in reasons:
                             self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                             order_stage_counter[reason] += 1
-                        self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                        self._log_order_skip(cf, reasons, self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18438,7 +18438,7 @@ class PB1Engine:
                         for reason in reasons:
                             self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                             order_stage_counter[reason] += 1
-                        self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                        self._log_order_skip(cf, reasons, self._entry_stage_name())
                         self._emit_buy_decision(
                             cf,
                             order_value=order_value,
@@ -18736,18 +18736,18 @@ class PB1Engine:
                     normalized_market = "KOSPI" if candidate_market in {"KOSPI", "KS", "P"} else "KOSDAQ" if candidate_market in {"KOSDAQ", "KQ", "Q"} else "UNKNOWN"
                     if snapshot is None or not market_allows_buy(snapshot, normalized_market):
                         logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=BLOCK stage=market", cf.code, normalized_market)
-                        self._log_order_skip(cf, ["KR_MARKET_REGIME_BLOCK" if normalized_market != "UNKNOWN" else "KR_MARKET_UNKNOWN_ENTRY_BLOCK"], "PB1-CLOSE")
+                        self._log_order_skip(cf, ["KR_MARKET_REGIME_BLOCK" if normalized_market != "UNKNOWN" else "KR_MARKET_UNKNOWN_ENTRY_BLOCK"], self._entry_stage_name())
                         continue
                     stock_ok, stock_reason = candidate_allows_buy(intent, snapshot.market_states[normalized_market].state)
                     if not stock_ok:
                         logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=BLOCK stage=stock reason=%s", cf.code, normalized_market, stock_reason)
-                        self._log_order_skip(cf, [str(stock_reason)], "PB1-CLOSE")
+                        self._log_order_skip(cf, [str(stock_reason)], self._entry_stage_name())
                         continue
                     local_overlay = build_market_local_overlay(overlay, snapshot, normalized_market)
                     blocked = filter_kr_entry_intent(intent, local_overlay, positions=getattr(self, "_kr_overlay_positions", existing_positions if 'existing_positions' in locals() else []))
                     if blocked.get("status") == "BLOCKED":
                         order_stage_counter[str(blocked.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")] += 1
-                        self._log_order_skip(cf, [str(blocked.get("reason"))], "PB1-CLOSE")
+                        self._log_order_skip(cf, [str(blocked.get("reason"))], self._entry_stage_name())
                     else:
                         logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=PASS", cf.code, normalized_market)
                         kept_orderable.append(cf)
@@ -18774,7 +18774,7 @@ class PB1Engine:
                 if not invariant_valid:
                     logger.error("[KR_REGIME][BUDGET_INVARIANT][BLOCK] reason=%s total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f", final_invariants.get("reason") or "COMPOSITE_INVARIANT_FAILURE", total_tick_cap, budget_sum, planned_sum)
                     for candidate in orderable_candidates:
-                        self._log_order_skip(candidate, ["KR_FINAL_ORDER_INVARIANT_BLOCK"], "PB1-CLOSE")
+                        self._log_order_skip(candidate, ["KR_FINAL_ORDER_INVARIANT_BLOCK"], self._entry_stage_name())
                     orderable_candidates = []
                     final_invariants["final_new_orders"] = 0
                 logger.info("[KR_REGIME][BUDGET_INVARIANT] total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f planned_kospi=%.0f planned_kosdaq=%.0f slots_start=%s final_new_orders=%s projected_gross=%.4f valid=%s", total_tick_cap, budget_sum, planned_sum, planned_by_market["KOSPI"], planned_by_market["KOSDAQ"], final_invariants["slots_start"], final_invariants["final_new_orders"], final_invariants["projected_gross_exposure_pct"], int(invariant_valid))
