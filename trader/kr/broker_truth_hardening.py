@@ -684,7 +684,13 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
         tick_ts=now_kst(),
         balance_snapshot=snapshot,
     )
-    holdings_rows = snapshot.get("output1") or []
+    final_holdings_rows = result.pop("_final_holdings_rows", None)
+    if isinstance(final_holdings_rows, list):
+        holdings_rows = final_holdings_rows
+        holdings_source = "reconcile_final"
+    else:
+        holdings_rows = snapshot.get("output1") or []
+        holdings_source = snapshot_source
     policy = _recover_proven_policy_positions(
         engine=db_engine,
         env=env,
@@ -705,6 +711,7 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
             {
                 "broker_truth_reconcile_ran": 1,
                 "broker_truth_balance_source": snapshot_source,
+                "broker_truth_holdings_source": holdings_source,
                 "broker_truth_orders": int(result.get("orders") or 0),
                 "broker_truth_fills": int(result.get("fills") or 0),
                 "broker_truth_promoted_fills": int(result.get("promoted_fills") or 0),
@@ -717,8 +724,9 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
             }
         )
     logger.info(
-        "[KR_BROKER_TRUTH][POST_TICK][DONE] balance_source=%s orders=%s fills=%s promoted_fills=%s linked_fills=%s policy_recovered=%s policy_review=%s qty_mismatch=%s stale_open=%s health=%s",
+        "[KR_BROKER_TRUTH][POST_TICK][DONE] balance_source=%s holdings_source=%s orders=%s fills=%s promoted_fills=%s linked_fills=%s policy_recovered=%s policy_review=%s qty_mismatch=%s stale_open=%s health=%s",
         snapshot_source,
+        holdings_source,
         result.get("orders"),
         result.get("fills"),
         result.get("promoted_fills"),
