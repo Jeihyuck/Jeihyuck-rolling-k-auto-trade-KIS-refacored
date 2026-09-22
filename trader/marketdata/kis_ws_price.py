@@ -95,11 +95,38 @@ class KisWebSocketPriceService:
         self._last_error: str | None = None
         self._connection_count = 0
         self._reconnect_count = 0
+        self._retry_subscriptions: set[tuple[str, str]] = set()
 
     def enabled(self) -> bool:
         if os.getenv("PYTEST_CURRENT_TEST") and not _env_flag("KIS_WS_PRICE_TEST_ENABLE", False):
             return False
         return _env_flag("KIS_WS_PRICE_ENABLED", True)
+
+    def network_allowed(self, market: str) -> bool:
+        """Respect existing no-network contracts before approval-key HTTP/socket startup."""
+        if not self.enabled():
+            return False
+        if _env_flag("KIS_WS_PRICE_FORCE_ENABLE", False):
+            return True
+        if _env_flag("KIS_EXPLICIT_OFFLINE", False):
+            return False
+        if str(os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
+            return False
+        force_http = str(os.getenv("FORCE_HTTP") or "0").strip() == "1"
+        if _env_flag("MINERVINI_ONLY", False) and not force_http:
+            return False
+        market_u = str(market or "").upper()
+        raw = (
+            os.getenv("US_KIS_HTTP_ENABLED")
+            if market_u == "US" and os.getenv("US_KIS_HTTP_ENABLED") is not None
+            else os.getenv("KIS_HTTP_ENABLED", "AUTO")
+        )
+        http_policy = str(raw or "AUTO").strip().upper()
+        if http_policy in {"0", "FALSE", "NO", "OFF"}:
+            return force_http
+        if http_policy == "AUTO":
+            return str(os.getenv("STRATEGY_MODE") or "").strip().upper() == "LIVE" or force_http
+        return True
 
     @staticmethod
     def _normalize_symbol(market: str, symbol: str) -> str:
@@ -118,6 +145,8 @@ class KisWebSocketPriceService:
         return f"{prefix}{cls._normalize_symbol('US', symbol)}"
 
     def subscribe_kr(self, symbol: str) -> None:
+        if not self.network_allowed("KR"):
+            return
         symbol = self._normalize_symbol("KR", symbol)
         if not symbol:
             return
@@ -126,6 +155,8 @@ class KisWebSocketPriceService:
         self._ensure_started()
 
     def subscribe_us(self, symbol: str, exchange: str) -> None:
+        if not self.network_allowed("US"):
+            return
         symbol = self._normalize_symbol("US", symbol)
         if not symbol:
             return
@@ -135,6 +166,8 @@ class KisWebSocketPriceService:
         self._ensure_started()
 
     def get_fresh_quote(self, market: str, symbol: str, *, max_age_sec: float) -> dict[str, Any] | None:
+        if not self.network_allowed(market):
+            return None
         key = (str(market or "").upper(), self._normalize_symbol(market, symbol))
         with self._lock:
             quote = self._quotes.get(key)
@@ -326,6 +359,16 @@ class KisWebSocketPriceService:
                     while not self._stop.is_set():
                         with self._lock:
                             desired = dict(self._desired)
+                            retry_subscriptions = set(self._retry_subscriptions)
+                            self._retry_subscriptions.clear()
+                        if retry_subscriptions:
+                            for logical_key, subscription in desired.items():
+                                if subscription in retry_subscriptions:
+                                    sent.discard(logical_key)
+                            logger.info(
+                                "[KIS_WS][RESUBSCRIBE_QUEUED] count=%d",
+                                len(retry_subscriptions),
+                            )
                         max_subscriptions = int(float(os.getenv("KIS_WS_MAX_SUBSCRIPTIONS", "40") or 40))
                         if len(desired) > max_subscriptions:
                             logger.error(
@@ -396,7 +439,18 @@ class KisWebSocketPriceService:
                 except Exception:
                     pass
             elif str((payload.get("body") or {}).get("rt_cd") or "0") != "0":
-                logger.warning("[KIS_WS][SUBSCRIBE_FAIL] tr_id=%s msg=%s", tr_id, (payload.get("body") or {}).get("msg1"))
+                tr_key = str((payload.get("header") or {}).get("tr_key") or "")
+                logger.warning(
+                    "[KIS_WS][SUBSCRIBE_FAIL] tr_id=%s tr_key=%s msg=%s action=RETRY",
+                    tr_id, tr_key, (payload.get("body") or {}).get("msg1"),
+                )
+                if tr_id and tr_key:
+                    with self._lock:
+                        self._retry_subscriptions.add((tr_id, tr_key))
+                else:
+                    # Without a subscription identity, reconnect so the local
+                    # sent set is cleared and every desired symbol is retried.
+                    raise RuntimeError(f"KIS WebSocket subscription rejected tr_id={tr_id or 'unknown'}")
             return
 
         parts = text.split("|", 3)
