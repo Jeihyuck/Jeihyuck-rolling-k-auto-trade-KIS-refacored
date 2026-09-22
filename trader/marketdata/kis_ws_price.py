@@ -297,7 +297,13 @@ class KisWebSocketPriceService:
                     while not self._stop.is_set():
                         with self._lock:
                             desired = dict(self._desired)
-                        for logical_key, subscription in desired.items():
+                        max_subscriptions = int(float(os.getenv("KIS_WS_MAX_SUBSCRIPTIONS", "40") or 40))
+                        if len(desired) > max_subscriptions:
+                            logger.error(
+                                "[KIS_WS][SUBSCRIPTION_LIMIT] desired=%d max=%d action=REST_FALLBACK_FOR_EXCESS",
+                                len(desired), max_subscriptions,
+                            )
+                        for logical_key, subscription in list(desired.items())[:max_subscriptions]:
                             if logical_key in sent:
                                 continue
                             tr_id, tr_key = subscription
@@ -340,7 +346,7 @@ class KisWebSocketPriceService:
             tr_id = str((payload.get("header") or {}).get("tr_id") or "")
             if tr_id == "PINGPONG":
                 try:
-                    await ws.send(text)
+                    await ws.pong(text.encode("utf-8"))
                 except Exception:
                     pass
             elif str((payload.get("body") or {}).get("rt_cd") or "0") != "0":
