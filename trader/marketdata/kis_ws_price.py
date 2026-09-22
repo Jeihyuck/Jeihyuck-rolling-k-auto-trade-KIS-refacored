@@ -225,13 +225,39 @@ class KisWebSocketPriceService:
             self._last_error = f"{type(exc).__name__}: {exc}"
             logger.exception("[KIS_WS][FATAL] err=%s", exc)
 
+    @staticmethod
+    def _us_process() -> bool:
+        scope = str(
+            os.getenv("MARKET_SCOPE")
+            or os.getenv("TRADING_MARKET")
+            or os.getenv("TRADING_REGION")
+            or ""
+        ).strip().upper()
+        return scope == "US"
+
     def _credentials(self) -> tuple[str, str]:
-        key = str(os.getenv("KIS_APP_KEY") or os.getenv("US_KIS_APP_KEY") or "").strip()
-        secret = str(os.getenv("KIS_APP_SECRET") or os.getenv("US_KIS_APP_SECRET") or "").strip()
+        if self._us_process():
+            key = str(os.getenv("KIS_US_APP_KEY") or os.getenv("KIS_APP_KEY") or "").strip()
+            secret = str(os.getenv("KIS_US_APP_SECRET") or os.getenv("KIS_APP_SECRET") or "").strip()
+        else:
+            key = str(os.getenv("KIS_APP_KEY") or os.getenv("KIS_US_APP_KEY") or "").strip()
+            secret = str(os.getenv("KIS_APP_SECRET") or os.getenv("KIS_US_APP_SECRET") or "").strip()
         return key, secret
 
     def _rest_base(self) -> str:
-        explicit = str(os.getenv("KIS_REST_URL") or os.getenv("API_BASE_URL") or "").strip().rstrip("/")
+        if self._us_process():
+            explicit = str(
+                os.getenv("KIS_US_REST_URL")
+                or os.getenv("KIS_REST_URL")
+                or os.getenv("API_BASE_URL")
+                or ""
+            ).strip().rstrip("/")
+        else:
+            explicit = str(
+                os.getenv("KIS_REST_URL")
+                or os.getenv("API_BASE_URL")
+                or ""
+            ).strip().rstrip("/")
         if explicit:
             return explicit
         env = str(os.getenv("KIS_ENV") or "practice").strip().lower()
