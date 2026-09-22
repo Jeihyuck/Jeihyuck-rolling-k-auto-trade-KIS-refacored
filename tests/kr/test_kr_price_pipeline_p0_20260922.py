@@ -100,3 +100,13 @@ def test_unsubmitted_intents_do_not_consume_today_spent_budget():
     block = block[:block.index("planned_spent = today_spent")]
     assert "if not self._is_blocking_open_buy_row(row):" in block
     assert "continue" in block
+
+
+def test_submit_time_policy_skip_drives_zero_api_classification():
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    assert 'submit_policy_blocker = next(' in source
+    assert 'for result in (submit_result.get("results") or [])' in source
+    assert '"OPENING_30MIN_BUY_BLOCK"' in source
+    assert '"BUYABLE_OPEN_ORDER"' in source
+    assert '"BUYABLE_DUPLICATE_INTENT"' in source
+    assert "top_policy_blocker = drop_policy_blocker or submit_policy_blocker" in source
