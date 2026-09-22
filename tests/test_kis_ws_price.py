@@ -56,3 +56,22 @@ def test_batched_kr_records_update_every_symbol():
     svc._handle_trade_records("^".join(rec1 + rec2), 2, fields_per_record=46, parser=svc.parse_kr_trade)
     assert svc.get_fresh_quote("KR", "005930", max_age_sec=5)["last"] == 70100
     assert svc.get_fresh_quote("KR", "000660", max_age_sec=5)["last"] == 1900000
+
+
+def test_us_process_uses_existing_us_specific_credentials(monkeypatch):
+    svc = KisWebSocketPriceService()
+    monkeypatch.setenv("MARKET_SCOPE", "us")
+    monkeypatch.setenv("KIS_US_APP_KEY", "us-key")
+    monkeypatch.setenv("KIS_US_APP_SECRET", "us-secret")
+    monkeypatch.setenv("KIS_APP_KEY", "kr-key")
+    monkeypatch.setenv("KIS_APP_SECRET", "kr-secret")
+    assert svc._credentials() == ("us-key", "us-secret")
+
+
+def test_disabled_service_does_not_wait(monkeypatch):
+    svc = KisWebSocketPriceService()
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "1")
+    monkeypatch.delenv("KIS_WS_PRICE_TEST_ENABLE", raising=False)
+    started = time.monotonic()
+    assert svc.wait_for_fresh_quote("KR", "005930", max_age_sec=5, wait_sec=2.0) is None
+    assert time.monotonic() - started < 0.2
