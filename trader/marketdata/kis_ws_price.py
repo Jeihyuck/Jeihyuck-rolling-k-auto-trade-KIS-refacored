@@ -96,6 +96,8 @@ class KisWebSocketPriceService:
         self._connection_count = 0
         self._reconnect_count = 0
         self._retry_subscriptions: set[tuple[str, str]] = set()
+        self._subscription_retry_after: dict[tuple[str, str], float] = {}
+        self._subscription_retry_attempts: dict[tuple[str, str], int] = {}
 
     def enabled(self) -> bool:
         if os.getenv("PYTEST_CURRENT_TEST") and not _env_flag("KIS_WS_PRICE_TEST_ENABLE", False):
@@ -333,6 +335,49 @@ class KisWebSocketPriceService:
             raise RuntimeError(f"KIS approval_key missing rt={data.get('rt_cd')} msg={data.get('msg1')}")
         return approval
 
+    def _schedule_subscription_retry(
+        self,
+        subscription: tuple[str, str],
+        *,
+        now_mono: float | None = None,
+    ) -> float:
+        """Back off one rejected subscription without starving other symbols."""
+        now_value = time.monotonic() if now_mono is None else float(now_mono)
+        base = max(0.1, _env_float("KIS_WS_SUBSCRIBE_RETRY_BASE_SEC", 1.0))
+        max_delay = max(base, _env_float("KIS_WS_SUBSCRIBE_RETRY_MAX_SEC", 15.0))
+        with self._lock:
+            attempt = int(self._subscription_retry_attempts.get(subscription, 0) or 0) + 1
+            self._subscription_retry_attempts[subscription] = attempt
+            delay = min(max_delay, base * (2 ** max(0, attempt - 1)))
+            self._subscription_retry_after[subscription] = now_value + delay
+            self._retry_subscriptions.add(subscription)
+        return delay
+
+    def _clear_subscription_retry(self, subscription: tuple[str, str]) -> None:
+        with self._lock:
+            self._subscription_retry_after.pop(subscription, None)
+            self._subscription_retry_attempts.pop(subscription, None)
+            self._retry_subscriptions.discard(subscription)
+
+    def _next_pending_subscription(
+        self,
+        desired: dict[tuple[str, str], tuple[str, str]],
+        sent: set[tuple[str, str]],
+        *,
+        max_subscriptions: int,
+        now_mono: float,
+    ) -> tuple[tuple[str, str], tuple[str, str]] | None:
+        """Pick a ready symbol fairly; rejected symbols wait for their backoff."""
+        with self._lock:
+            retry_after = dict(self._subscription_retry_after)
+        for logical_key, subscription in list(desired.items())[:max_subscriptions]:
+            if logical_key in sent:
+                continue
+            if float(retry_after.get(subscription, 0.0) or 0.0) > float(now_mono):
+                continue
+            return logical_key, subscription
+        return None
+
     async def _run_forever(self) -> None:
         try:
             import websockets
@@ -371,7 +416,7 @@ class KisWebSocketPriceService:
                                 if subscription in retry_subscriptions:
                                     sent.discard(logical_key)
                             logger.info(
-                                "[KIS_WS][RESUBSCRIBE_QUEUED] count=%d",
+                                "[KIS_WS][RESUBSCRIBE_QUEUED] count=%d action=BACKOFF_AND_CONTINUE_OTHERS",
                                 len(retry_subscriptions),
                             )
                         max_subscriptions = int(float(os.getenv("KIS_WS_MAX_SUBSCRIPTIONS", "40") or 40))
@@ -381,18 +426,19 @@ class KisWebSocketPriceService:
                                 len(desired), max_subscriptions,
                             )
 
-                        # Interleave subscribe and receive work. Sending every
-                        # pending subscription first can delay quote consumption
-                        # by N * subscribe_interval for a Final30 basket.
-                        pending = [
-                            (logical_key, subscription)
-                            for logical_key, subscription in list(desired.items())[:max_subscriptions]
-                            if logical_key not in sent
-                        ]
+                        # Interleave subscribe and receive work. A rejected
+                        # symbol is held behind its own retry deadline so it
+                        # cannot starve later Final30/US subscriptions.
                         subscribe_interval = _env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5)
                         now_mono = time.monotonic()
-                        if pending and (now_mono - last_subscribe_at >= subscribe_interval):
-                            logical_key, subscription = pending[0]
+                        pending_item = self._next_pending_subscription(
+                            desired,
+                            sent,
+                            max_subscriptions=max_subscriptions,
+                            now_mono=now_mono,
+                        )
+                        if pending_item and (now_mono - last_subscribe_at >= subscribe_interval):
+                            logical_key, subscription = pending_item
                             tr_id, tr_key = subscription
                             payload = {
                                 "header": {
@@ -450,12 +496,19 @@ class KisWebSocketPriceService:
                     tr_id, tr_key, (payload.get("body") or {}).get("msg1"),
                 )
                 if tr_id and tr_key:
-                    with self._lock:
-                        self._retry_subscriptions.add((tr_id, tr_key))
+                    delay = self._schedule_subscription_retry((tr_id, tr_key))
+                    logger.warning(
+                        "[KIS_WS][SUBSCRIBE_RETRY_BACKOFF] tr_id=%s tr_key=%s delay_sec=%.2f",
+                        tr_id, tr_key, delay,
+                    )
                 else:
                     # Without a subscription identity, reconnect so the local
                     # sent set is cleared and every desired symbol is retried.
                     raise RuntimeError(f"KIS WebSocket subscription rejected tr_id={tr_id or 'unknown'}")
+            else:
+                tr_key = str((payload.get("header") or {}).get("tr_key") or "")
+                if tr_id and tr_key:
+                    self._clear_subscription_retry((tr_id, tr_key))
             return
 
         parts = text.split("|", 3)
