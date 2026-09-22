@@ -189,6 +189,7 @@ class _FakeEngineObj:
     def __init__(self, submitted: int):
         self.kis = _FakeKis()
         self._run_summary_payload = {"api_submitted": submitted}
+        self._balance_snapshot = {"output1": [], "output2": []} if submitted == 0 else None
 
 
 @pytest.mark.parametrize("submitted, expected_force", [(0, False), (1, True)])
@@ -221,7 +222,10 @@ def test_sep22_post_tick_balance_refresh_only_after_broker_submit(
 
     obj = _FakeEngineObj(submitted)
     hardening._post_pb1_tick_reconcile(obj)
-    assert obj.kis.force_args == [expected_force]
+    if submitted == 0:
+        assert obj.kis.force_args == []
+    else:
+        assert obj.kis.force_args == [expected_force]
 
 
 def test_sep22_entry_skip_stage_is_session_aware():
