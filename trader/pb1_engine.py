@@ -10307,8 +10307,15 @@ class PB1Engine:
         ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
         if not ownership_ok:
             logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", cf.code, ownership_reason)
-            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved",
-                    "terminal_event": "FINAL_SKIP"}
+            return {
+                "submitted": 0,
+                "api_submitted": 0,
+                "accepted": 0,
+                "skipped": 1,
+                "skipped_reason": ownership_reason or "ownership_reserved",
+                "submit_terminal_status": "SKIPPED_BY_POLICY",
+                "terminal_event": "FINAL_SKIP",
+            }
         status: dict[str, Any] = self._empty_order_status()
         stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
