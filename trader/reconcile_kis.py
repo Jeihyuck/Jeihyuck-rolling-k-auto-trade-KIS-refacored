@@ -1323,4 +1323,9 @@ def reconcile_kis(
             "allow_purge": allow_purge,
         }
     )
+    # Transient caller-only broker truth.  When daily-ccld observes a fill,
+    # holdings_rows has already been force-refreshed above; expose that final
+    # authoritative view so post-tick policy/health checks do not fall back to
+    # the stale balance snapshot captured near the beginning of the tick.
+    reconcile_result["_final_holdings_rows"] = list(holdings_rows)
     return reconcile_result
