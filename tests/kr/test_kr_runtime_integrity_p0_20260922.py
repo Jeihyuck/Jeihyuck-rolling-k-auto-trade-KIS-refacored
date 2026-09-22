@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import sqlalchemy as sa
@@ -9,9 +10,11 @@ from trader.db.engine import _is_runner_tick_timeout, safe_read_mappings
 from trader.db.repos import OrdersRepo
 from trader.db.schema import schema_for_engine
 from trader.kr import broker_truth_hardening as broker_truth
+from trader.kr.infinite.runner import prewarm_kr_infinite_price
+from trader.kis_wrapper import KisAPI
 from trader.pb1_engine import PB1Engine
 from trader.pb1_runner import TickTimeoutError, _exception_chain_has_tick_timeout
-from trader.reconcile_kis import _resolve_reconcile_run_id
+from trader.reconcile_kis import _resolve_reconcile_run_id, reconcile_today
 
 
 class _FakeDialect:
@@ -160,6 +163,136 @@ def test_reconcile_run_identity_uses_only_existing_runs(monkeypatch):
 
     assert _resolve_reconcile_run_id(engine, missing_run_id, durable_run_id) == durable_run_id
     assert _resolve_reconcile_run_id(engine, missing_run_id) is None
+
+
+
+def test_daily_ccld_output2_summary_never_creates_synthetic_order(monkeypatch):
+    monkeypatch.delenv("WSL_RUN_MARKET", raising=False)
+    monkeypatch.delenv("TRADING_EPOCH_ENFORCE", raising=False)
+
+    engine = sa.create_engine("sqlite:///:memory:", future=True)
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    class FakeKis:
+        def inquire_daily_ccld(self, **_kwargs):
+            return {
+                "rt_cd": "0",
+                "output1": [],
+                "output2": [{
+                    "tot_ord_qty": "0",
+                    "tot_ccld_qty": "0",
+                    "tot_ccld_amt": "0",
+                }],
+            }
+
+    ctx = SimpleNamespace(
+        env="practice",
+        strategy="pb1_pullback_close",
+        run_id=None,
+    )
+    result = reconcile_today(engine=engine, kis=FakeKis(), ctx=ctx)
+
+    assert result["orders"] == 0
+    assert result["fills"] == 0
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.orders)).mappings().all()
+    assert rows == []
+
+
+def test_daily_ccld_malformed_output1_row_is_skipped_before_db_write(monkeypatch):
+    monkeypatch.delenv("WSL_RUN_MARKET", raising=False)
+    monkeypatch.delenv("TRADING_EPOCH_ENFORCE", raising=False)
+
+    engine = sa.create_engine("sqlite:///:memory:", future=True)
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    class FakeKis:
+        def inquire_daily_ccld(self, **_kwargs):
+            return {
+                "rt_cd": "0",
+                "output1": [{
+                    "ord_qty": "0",
+                    "tot_ccld_qty": "0",
+                    "ord_stat_cd": "RECONCILED",
+                }],
+                "output2": [],
+            }
+
+    ctx = SimpleNamespace(
+        env="practice",
+        strategy="pb1_pullback_close",
+        run_id=None,
+    )
+    result = reconcile_today(engine=engine, kis=FakeKis(), ctx=ctx)
+
+    assert result["orders"] == 0
+    assert result["fills"] == 0
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.orders)).mappings().all()
+    assert rows == []
+
+
+def test_kr_infinite_122630_prewarm_and_fresh_ws_quote_avoid_rest(monkeypatch):
+    class FakeWsService:
+        def __init__(self):
+            self.subscriptions = []
+            self.quote_reads = []
+
+        def subscribe_kr(self, symbol):
+            self.subscriptions.append(str(symbol))
+
+        def get_fresh_quote(self, market, symbol, *, max_age_sec):
+            self.quote_reads.append((market, str(symbol), float(max_age_sec)))
+            return {
+                "market": "KR",
+                "symbol": str(symbol),
+                "last": 50125.0,
+                "prpr": 50125.0,
+                "bid": 50100.0,
+                "ask": 50150.0,
+                "age_sec": 0.01,
+                "source": "KIS_WEBSOCKET",
+            }
+
+        def wait_for_fresh_quote(self, *args, **kwargs):
+            raise AssertionError("fresh prewarmed quote should not require waiting")
+
+    service = FakeWsService()
+    monkeypatch.setenv("KR_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "1")
+    monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+    monkeypatch.setattr(
+        "trader.marketdata.kis_ws_price.get_kis_ws_price_service",
+        lambda: service,
+    )
+    monkeypatch.setattr(
+        "trader.kis_wrapper.get_kis_ws_price_service",
+        lambda: service,
+    )
+
+    prewarm_kr_infinite_price("122630")
+    assert service.subscriptions == ["122630"]
+
+    kis = object.__new__(KisAPI)
+    kis._safe_request = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("REST quote must not run when a fresh WS quote exists")
+    )
+    price = kis.get_current_price("122630")
+
+    assert price == 50125.0
+    assert service.quote_reads
+    assert all(item[0] == "KR" and item[1] == "122630" for item in service.quote_reads)
+
+
+def test_kr_infinite_prewarm_is_before_pb1_heavy_engine_run():
+    source = Path("trader/pb1_runner.py").read_text(encoding="utf-8")
+    prewarm = 'prewarm_kr_infinite_price("122630")'
+    run_call = "result = engine_runner.run()"
+    assert prewarm in source
+    assert run_call in source
+    assert source.index(prewarm) < source.index(run_call)
 
 
 def test_reconcile_kis_source_defines_run_id_before_holding_promotion():
