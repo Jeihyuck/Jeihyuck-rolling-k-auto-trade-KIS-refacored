@@ -6387,6 +6387,8 @@ def run_once(
                 "dry_run": dry_run,
             },
         )
+        # The per-tick runs row is the authoritative FK lineage for this tick.
+        ctx.run_id = str(run_record_id)
         db_write_reasons.append("run_start")
         reconcile_result: dict | None = None
         if kis and not nontrading_eval_mode:
@@ -6863,6 +6865,14 @@ def run_once(
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
         else:
+            # KR_INFINITE owns 122630 but shares this process/tick budget.
+            # Subscribe before PB1's heavy evaluation so the sleeve reads a hot
+            # WebSocket cache instead of starting REST at the tail of the tick.
+            try:
+                from trader.kr.infinite.runner import prewarm_kr_infinite_price
+                prewarm_kr_infinite_price("122630")
+            except Exception as _inf_prewarm_exc:
+                logger.warning("[KR_INF][PRICE_PREWARM][FAIL_SOFT] err=%s", _inf_prewarm_exc)
             engine_started = True
             try:
                 result = engine_runner.run()
@@ -7875,6 +7885,38 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 time_mod.sleep(sleep_for)
                 continue
             except Exception as exc:
+                if _exception_chain_has_tick_timeout(exc):
+                    ticks_degraded += 1
+                    session_warning_counts["timeout_count"] = int(session_warning_counts.get("timeout_count", 0)) + 1
+                    session_warning_counts["tick_timeout_recoverable"] = int(session_warning_counts.get("tick_timeout_recoverable", 0)) + 1
+                    _last_stage_on_timeout = os.getenv("PB1_LAST_STAGE", "unknown")
+                    logger.warning(
+                        "[PB1][TICK_TIMEOUT][RECOVERABLE_WRAPPED] kind=%s tick=%s last_stage=%s timeout_sec=%s wrapper=%s err=%s",
+                        session_kind,
+                        ticks_total + 1,
+                        _last_stage_on_timeout,
+                        tick_timeout_sec,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    if os.getenv("PB1_DISPOSE_ENGINE_ON_TICK_TIMEOUT", "1") not in {"0", "false"}:
+                        dispose_engine_safely(engine, reason=f"wrapped_tick_hard_timeout:{_last_stage_on_timeout}")
+                        session_warning_counts["db_engine_dispose_count"] = int(session_warning_counts.get("db_engine_dispose_count", 0)) + 1
+                    _recovery_sleep_sec = max(1, int(os.getenv("PB1_DB_RECOVERY_SLEEP_SEC", "2")))
+                    time_mod.sleep(_recovery_sleep_sec)
+                    now_after_timeout = _get_now_kst()
+                    if now_after_timeout >= session_end_dt:
+                        exit_reason = "session_end"
+                        break
+                    sleep_for = _sleep_until_next_tick_or_session_end(
+                        now_after_timeout, session_end_dt, min(loop_interval, 5)
+                    )
+                    if sleep_for <= 0:
+                        exit_reason = "session_end"
+                        break
+                    time_mod.sleep(sleep_for)
+                    continue
+
                 message = str(exc)
                 if message.startswith("ENTRY_ABORT_PRECHECK:"):
                     precheck_reason = message.split(":", 1)[1]
