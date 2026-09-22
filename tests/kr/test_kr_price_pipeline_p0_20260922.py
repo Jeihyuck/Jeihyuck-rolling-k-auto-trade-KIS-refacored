@@ -35,3 +35,13 @@ def test_opening_buy_block_is_classified_as_policy_skip():
     source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
     marker = '"OPENING_30MIN_BUY_BLOCK",'
     assert marker in source
+
+
+def test_strategy_owner_reject_counts_as_terminal_skip():
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    marker = 'ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")'
+    owner_block = source[source.index(marker):]
+    owner_block = owner_block[:owner_block.index('status: dict[str, Any] = self._empty_order_status()')]
+    assert '"skipped": 1' in owner_block
+    assert '"api_submitted": 0' in owner_block
+    assert '"submit_terminal_status": "SKIPPED_BY_POLICY"' in owner_block
