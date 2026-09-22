@@ -342,6 +342,47 @@ def test_broker_truth_defers_without_network_when_tick_budget_is_exhausted(monke
     assert obj._run_summary_payload["broker_truth_health_status"] == "DEFERRED"
 
 
+def test_broker_truth_snapshot_reuse_still_defers_when_tick_budget_is_exhausted(monkeypatch):
+    class FakeKis:
+        def get_balance_cached(self, **_kwargs):
+            raise AssertionError("snapshot-reuse path must not fetch balance when budget is exhausted")
+
+    reconcile_called = {"value": False}
+
+    def fail_if_reconcile_runs(**_kwargs):
+        reconcile_called["value"] = True
+        raise AssertionError("reconcile_kis must not run when post-tick budget is exhausted")
+
+    class EngineObj:
+        dry_run = False
+        intended_live = True
+        env = "practice"
+        engine = object()
+        kis = FakeKis()
+        STRATEGY_NAME = "pb1_pullback_close"
+        run_id = "trace-only-run-id"
+        _run_summary_payload = {"api_submitted": 0}
+        _balance_snapshot = {
+            "rt_cd": "0",
+            "output1": [],
+            "output2": [{"tot_evlu_amt": "1000000"}],
+        }
+
+    monkeypatch.setattr(broker_truth, "kr_tick_remaining_sec", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setenv("KR_BROKER_TRUTH_MIN_REMAINING_SEC", "12")
+    monkeypatch.setattr("trader.reconcile_kis.reconcile_kis", fail_if_reconcile_runs)
+
+    obj = EngineObj()
+    broker_truth._post_pb1_tick_reconcile(obj)
+
+    assert reconcile_called["value"] is False
+    assert obj._run_summary_payload["broker_truth_reconcile_ran"] == 0
+    assert obj._run_summary_payload["broker_truth_reconcile_deferred"] == 1
+    assert obj._run_summary_payload["broker_truth_reconcile_defer_reason"] == "INSUFFICIENT_TICK_BUDGET"
+    assert obj._run_summary_payload["broker_truth_remaining_sec"] == 0.0
+    assert obj._run_summary_payload["broker_truth_health_status"] == "DEFERRED"
+
+
 def test_broker_truth_budget_defer_is_red_when_broker_activity_exists(monkeypatch):
     class FakeKis:
         def get_balance_cached(self, **_kwargs):
