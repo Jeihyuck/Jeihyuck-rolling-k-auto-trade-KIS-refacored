@@ -45,3 +45,43 @@ def test_strategy_owner_reject_counts_as_terminal_skip():
     assert '"skipped": 1' in owner_block
     assert '"api_submitted": 0' in owner_block
     assert '"submit_terminal_status": "SKIPPED_BY_POLICY"' in owner_block
+
+
+def test_unsubmitted_created_intent_is_not_open_buy_blocker():
+    from trader.pb1_engine import PB1Engine
+
+    assert PB1Engine._is_blocking_open_buy_row({
+        "status": "CREATED",
+        "submitted_at": None,
+        "acked_at": None,
+        "kis_odno": None,
+        "broker_order_id": None,
+    }) is False
+    assert PB1Engine._is_blocking_open_buy_row({
+        "status": "INTENT",
+        "submitted_at": None,
+        "acked_at": None,
+        "kis_odno": None,
+        "broker_order_id": None,
+    }) is False
+
+
+def test_broker_boundary_evidence_still_blocks_duplicate_buy():
+    from trader.pb1_engine import PB1Engine
+
+    assert PB1Engine._is_blocking_open_buy_row({"status": "SUBMITTED"}) is True
+    assert PB1Engine._is_blocking_open_buy_row({"status": "UNRESOLVED_ACK"}) is True
+    assert PB1Engine._is_blocking_open_buy_row({
+        "status": "CREATED",
+        "kis_odno": "1234567890",
+    }) is True
+    assert PB1Engine._is_blocking_open_buy_row({
+        "status": "ERROR",
+        "submitted_at": "2026-09-22T09:37:05+09:00",
+    }) is True
+
+
+def test_open_buy_code_derivation_uses_broker_boundary_filter():
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    assert "and self._is_blocking_open_buy_row(row)" in source
+    assert "[PB1][OPEN_BUY][PREBROKER_IGNORED]" in source
