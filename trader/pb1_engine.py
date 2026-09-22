@@ -19343,6 +19343,8 @@ class PB1Engine:
                         "CASH_INSUFFICIENT",
                         "MAX_POSITIONS_REACHED",
                         "OPENING_30MIN_BUY_BLOCK",
+                        "KR_INF_OWNERSHIP_RESERVED",
+                        "OWNERSHIP_RESERVED",
                     }
                     drop_policy_blocker = next(
                         (
