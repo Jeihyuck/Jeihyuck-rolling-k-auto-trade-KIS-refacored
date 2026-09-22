@@ -3080,9 +3080,22 @@ class KisAPI:
         """
         key = (market, code)
 
-        # 1) symbol-scoped circuit: one bad symbol must not black out all KR
-        # candidates. Fresh WebSocket data (handled by get_price_quote) remains
-        # available even while this REST fallback is cooling down.
+        # WebSocket is independent of the REST circuit. A prior EGW002 on this
+        # symbol must not hide a newly-arrived fresh streaming quote.
+        ws_service = get_kis_ws_price_service()
+        ws_service.subscribe_kr(code)
+        ws_quote = ws_service.get_fresh_quote(
+            "KR", code, max_age_sec=_env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+        )
+        if ws_quote:
+            logger.debug(
+                "[KIS_WS][SNAPSHOT_HIT] code=%s age_sec=%.3f",
+                code, float(ws_quote.get("age_sec") or 0.0),
+            )
+            return ws_quote
+
+        # 1) symbol-scoped REST circuit: one bad symbol must not black out all
+        # KR candidates.
         if _price_cache.is_circuit_open(code):
             logger.warning(
                 "[PRICE][CIRCUIT_OPEN] skip inquire-price key=%s until=%.0f scope=symbol",
