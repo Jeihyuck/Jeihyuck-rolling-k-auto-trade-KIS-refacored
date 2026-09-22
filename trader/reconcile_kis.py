@@ -7,11 +7,14 @@ from datetime import datetime
 from typing import Any
 from pathlib import Path
 
+import sqlalchemy as sa
+
 from trader.config import MARKET_MAP
 from trader.account_state import account_reset_mode, env_flag, get_account_key, get_masked_account_key
 from trader.runtime_paths import runtime_root
 from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
                              ReconcileLogRepo, _assert_kr_buy_entry_contract)
+from trader.db.schema import schema_for_engine, uuid_value_for_url
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -27,6 +30,49 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_reconcile_run_id(engine, *candidates: str | None) -> str | None:
+    """Use only a run id that is already durable in runs; never fabricate one."""
+    schema = schema_for_engine(engine)
+    db_url = str(engine.url)
+    normalized: list[tuple[str, Any]] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        try:
+            normalized.append((text, uuid_value_for_url(db_url, text)))
+        except Exception as exc:
+            logger.warning(
+                "[RECONCILE][RUN_ID_INVALID] run_id=%s err_type=%s action=IGNORE",
+                text, type(exc).__name__,
+            )
+    if not normalized:
+        return None
+    try:
+        with engine.connect() as conn:
+            for original, candidate in normalized:
+                exists = conn.execute(
+                    sa.select(schema.runs.c.run_id)
+                    .where(schema.runs.c.run_id == candidate)
+                    .limit(1)
+                ).scalar()
+                if exists is not None:
+                    return original
+    except Exception as exc:
+        logger.warning(
+            "[RECONCILE][RUN_ID_LOOKUP_FAIL] candidates=%s err_type=%s err=%s action=NULL_RUN_ID",
+            [item[0] for item in normalized], type(exc).__name__, exc,
+        )
+        return None
+    logger.error(
+        "[RECONCILE][RUN_ID_ORPHAN] candidates=%s action=NULL_RUN_ID preserve_broker_observation=1",
+        [item[0] for item in normalized],
+    )
+    return None
 
 
 def _first_value(row: dict, keys: list[str]) -> Any:
@@ -751,7 +797,12 @@ def _restore_entry_meta_for_promoted_positions(
 
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     env = ctx.env
-    run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
+    env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
+    reconcile_run_id = _resolve_reconcile_run_id(
+        engine,
+        getattr(ctx, "run_id", None),
+        env_run_id,
+    )
     strategy = ctx.strategy
     today = now_kst().strftime("%Y%m%d")
     degraded_reason: str | None = None
@@ -831,7 +882,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
 
         orders_repo.upsert_reconciled_order(
             env=env,
-            run_id=ctx.run_id,
+            run_id=reconcile_run_id,
             strategy=strategy,
             sid=1,
             mode=1,
@@ -878,7 +929,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
-                run_id=ctx.run_id,
+                run_id=reconcile_run_id,
                 order_id=str((source_order or {}).get("order_id") or "") or None,
                 kis_odno=kis_odno,
                 trade_id=trade_id,
@@ -943,7 +994,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 # Persist cumulative proof only after the position bridge succeeds.
                 orders_repo.upsert_reconciled_order(
                     env=env,
-                    run_id=ctx.run_id,
+                    run_id=reconcile_run_id,
                     strategy=str((source_order or {}).get("strategy") or strategy),
                     sid=int((source_order or {}).get("sid") or 1),
                     mode=int((source_order or {}).get("mode") or 1),
@@ -998,7 +1049,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         reasons.append(f"degraded:{degraded_reason}")
     ledger_repo.append_event(
         env=env,
-        run_id=run_id,
+        run_id=reconcile_run_id,
         strategy=strategy,
         event_type="RECONCILE",
         ts=now_kst(),
@@ -1075,7 +1126,7 @@ def reconcile_kis(
     promoted = _promote_open_buy_orders_from_holdings(
         env=env,
         strategy=strategy,
-        ctx_run_id=run_id,
+        ctx_run_id=reconcile_run_id,
         tick_ts=tick_ts,
         holdings_rows=holdings_rows,
         orders_repo=orders_repo,
