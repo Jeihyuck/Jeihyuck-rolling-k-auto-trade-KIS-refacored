@@ -5343,7 +5343,27 @@ class PB1Engine:
 
     @staticmethod
     def _is_open_entry_order_status(status: Any) -> bool:
-        return str(status or "").upper() in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED"}
+        return str(status or "").upper() in {
+            "SUBMITTED", "ACKED", "ACCEPTED", "PENDING_CONFIRM",
+            "PARTIAL_FILLED", "PARTIALLY_FILLED", "UNRESOLVED_ACK", "FILLED",
+        }
+
+    @classmethod
+    def _is_blocking_open_buy_row(cls, row: dict[str, Any] | None) -> bool:
+        """True only when durable evidence says the BUY crossed the broker boundary.
+
+        OrdersRepo.get_open_orders intentionally includes CREATED/INTENT for
+        reconciliation visibility. Those pre-broker rows must not become
+        open_buy_codes and self-block a safe retry after local pretrade failure.
+        """
+        data = row if isinstance(row, dict) else {}
+        status = str(data.get("status") or "").upper()
+        if cls._is_open_entry_order_status(status):
+            return True
+        return any(
+            data.get(field)
+            for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
+        )
 
     @staticmethod
     def _is_retryable_sell_order_row(order: dict[str, Any] | None) -> bool:
@@ -17681,7 +17701,23 @@ class PB1Engine:
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
             with self._stage_timer("entry.open_orders_lookup"):
                 open_orders = self._safe_get_open_orders()
-            open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+            open_buy_codes = {
+                row.get("code")
+                for row in open_orders
+                if str(row.get("side") or "").upper() == "BUY"
+                and self._is_blocking_open_buy_row(row)
+            }
+            ignored_prebroker_open = [
+                row for row in open_orders
+                if str(row.get("side") or "").upper() == "BUY"
+                and not self._is_blocking_open_buy_row(row)
+            ]
+            if ignored_prebroker_open:
+                logger.info(
+                    "[PB1][OPEN_BUY][PREBROKER_IGNORED] count=%s codes=%s action=ALLOW_SAFE_RETRY",
+                    len(ignored_prebroker_open),
+                    sorted({str(row.get("code") or "") for row in ignored_prebroker_open}),
+                )
             try:
                 with self._stage_timer("entry.today_buy_orders_lookup"):
                     today_orders = self._safe_list_today_orders(side="BUY")
