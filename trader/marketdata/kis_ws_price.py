@@ -393,7 +393,18 @@ class KisWebSocketPriceService:
         if tr_id == self.KR_TR_ID:
             self._handle_trade_records(raw, record_count, fields_per_record=46, parser=self.parse_kr_trade)
         elif tr_id == self.US_TR_ID:
-            self._handle_trade_records(raw, record_count, fields_per_record=25, parser=self.parse_us_trade)
+            total_fields = len(str(raw or "").split("^"))
+            fields_per_record = 25
+            if record_count > 0 and total_fields % record_count == 0:
+                candidate_width = total_fields // record_count
+                if candidate_width in {25, 26}:
+                    fields_per_record = candidate_width
+            self._handle_trade_records(
+                raw,
+                record_count,
+                fields_per_record=fields_per_record,
+                parser=self.parse_us_trade,
+            )
 
     def _handle_trade_records(
         self,
@@ -445,25 +456,34 @@ class KisWebSocketPriceService:
     @classmethod
     def parse_us_trade(cls, raw: str) -> dict[str, Any] | None:
         fields = str(raw or "").split("^")
-        if len(fields) < 16:
+        # KIS currently exposes a 25-field helper layout, while legacy/raw
+        # samples include one extra leading realtime-code field. Accept both
+        # explicitly so LAST/PBID/PASK cannot shift silently.
+        if len(fields) >= 26:
+            symbol_field = fields[0] if fields[0].startswith(("DNAS", "DNYS", "DAMS")) else fields[1]
+            last_idx, bid_idx, ask_idx = 11, 15, 16
+        elif len(fields) >= 16:
+            symbol_field = fields[0]
+            last_idx, bid_idx, ask_idx = 10, 14, 15
+        else:
             return None
-        last = cls._number(fields[10])
+        last = cls._number(fields[last_idx])
         if not last:
             return None
-        raw_symbol = fields[0]
+        exchange_probe = fields[0] if fields[0].startswith(("DNAS", "DNYS", "DAMS")) else symbol_field
         exchange = None
-        if raw_symbol.startswith("DNAS"):
+        if exchange_probe.startswith("DNAS"):
             exchange = "NASDAQ"
-        elif raw_symbol.startswith("DNYS"):
+        elif exchange_probe.startswith("DNYS"):
             exchange = "NYSE"
-        elif raw_symbol.startswith("DAMS"):
+        elif exchange_probe.startswith("DAMS"):
             exchange = "AMEX"
         return {
             "market": "US",
-            "symbol": cls._normalize_symbol("US", raw_symbol),
+            "symbol": cls._normalize_symbol("US", symbol_field),
             "last": last,
-            "bid": cls._number(fields[14]),
-            "ask": cls._number(fields[15]),
+            "bid": cls._number(fields[bid_idx]),
+            "ask": cls._number(fields[ask_idx]),
             "exchange": exchange,
         }
 
