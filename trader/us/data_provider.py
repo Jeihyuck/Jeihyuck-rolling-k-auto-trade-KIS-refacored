@@ -743,46 +743,46 @@ class USDataProvider:
                 return ctx.price_cache[cache_key]
         started = __import__("time").monotonic()
 
-        # WebSocket-first: KIS pushes US prices into a freshness-tagged cache.
-        # Existing REST governor/retry/cache remains the fallback and continues
-        # to fail closed when only stale DB data is available.
-        try:
-            from trader.marketdata.kis_ws_price import get_kis_ws_price_service
-            ws_service = get_kis_ws_price_service()
-            ws_service.subscribe_us(symbol, exchange)
-            ws_max_age = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
-            ws_wait = float(os.getenv("KIS_WS_INITIAL_WAIT_SEC", "0.35") or 0.35)
-            ws_quote = ws_service.get_fresh_quote("US", symbol, max_age_sec=ws_max_age)
-            if ws_quote is None and ws_wait > 0:
-                ws_quote = ws_service.wait_for_fresh_quote(
-                    "US", symbol, max_age_sec=ws_max_age, wait_sec=ws_wait
-                )
-            if ws_quote:
-                data = {
-                    "last": str(ws_quote.get("last") or "0"),
-                    "open": "0",
-                    "high": "0",
-                    "low": "0",
-                    "tvol": "0",
-                    "symbol": symbol,
-                    "stale": False,
-                    "quality": "fresh",
-                    "source": "KIS_WEBSOCKET",
-                    "asof_epoch": ws_quote.get("received_at"),
-                    "age_sec": ws_quote.get("age_sec"),
-                    "bid": ws_quote.get("bid"),
-                    "ask": ws_quote.get("ask"),
-                }
-                if ctx is not None:
-                    ctx.price_cache[cache_key] = data
-                    ctx.count("quote_ws_hits")
-                logger.debug(
-                    "[US_KIS][WS_PRICE_HIT] symbol=%s exchange=%s age_sec=%.3f",
-                    symbol, exchange, float(ws_quote.get("age_sec") or 0.0),
-                )
-                return data
-        except Exception as exc:
-            logger.warning("[US_KIS][WS_PRICE_FALLBACK] symbol=%s err=%s", symbol, exc)
+        # WebSocket-first is live-data only. Offline harnesses must never
+        # request an approval key or start a background socket.
+        if not self._offline:
+            try:
+                from trader.marketdata.kis_ws_price import get_kis_ws_price_service
+                ws_service = get_kis_ws_price_service()
+                ws_service.subscribe_us(symbol, exchange)
+                ws_max_age = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+                ws_wait = float(os.getenv("KIS_WS_INITIAL_WAIT_SEC", "0.35") or 0.35)
+                ws_quote = ws_service.get_fresh_quote("US", symbol, max_age_sec=ws_max_age)
+                if ws_quote is None and ws_wait > 0:
+                    ws_quote = ws_service.wait_for_fresh_quote(
+                        "US", symbol, max_age_sec=ws_max_age, wait_sec=ws_wait
+                    )
+                if ws_quote:
+                    data = {
+                        "last": str(ws_quote.get("last") or "0"),
+                        "open": "0",
+                        "high": "0",
+                        "low": "0",
+                        "tvol": "0",
+                        "symbol": symbol,
+                        "stale": False,
+                        "quality": "fresh",
+                        "source": "KIS_WEBSOCKET",
+                        "asof_epoch": ws_quote.get("received_at"),
+                        "age_sec": ws_quote.get("age_sec"),
+                        "bid": ws_quote.get("bid"),
+                        "ask": ws_quote.get("ask"),
+                    }
+                    if ctx is not None:
+                        ctx.price_cache[cache_key] = data
+                        ctx.count("quote_ws_hits")
+                    logger.debug(
+                        "[US_KIS][WS_PRICE_HIT] symbol=%s exchange=%s age_sec=%.3f",
+                        symbol, exchange, float(ws_quote.get("age_sec") or 0.0),
+                    )
+                    return data
+            except Exception as exc:
+                logger.warning("[US_KIS][WS_PRICE_FALLBACK] symbol=%s err=%s", symbol, exc)
 
         # Cache hit
         if self._cache_enabled and cache_key in self._price_cache:
