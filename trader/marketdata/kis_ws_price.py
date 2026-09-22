@@ -125,7 +125,12 @@ class KisWebSocketPriceService:
         if http_policy in {"0", "FALSE", "NO", "OFF"}:
             return force_http
         if http_policy == "AUTO":
-            return str(os.getenv("STRATEGY_MODE") or "").strip().upper() == "LIVE" or force_http
+            strategy_mode = str(os.getenv("STRATEGY_MODE") or "").strip().upper()
+            if market_u == "US":
+                # US INTENT_ONLY workflows still use live market data while
+                # keeping broker order submission disabled by separate guards.
+                return strategy_mode in {"LIVE", "INTENT_ONLY"} or force_http
+            return strategy_mode == "LIVE" or force_http
         return True
 
     @staticmethod
