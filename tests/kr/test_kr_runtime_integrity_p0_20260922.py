@@ -383,6 +383,72 @@ def test_broker_truth_snapshot_reuse_still_defers_when_tick_budget_is_exhausted(
     assert obj._run_summary_payload["broker_truth_health_status"] == "DEFERRED"
 
 
+def test_broker_truth_uses_reconcile_final_holdings_after_async_fill(monkeypatch):
+    original_snapshot = {
+        "rt_cd": "0",
+        "output1": [{"pdno": "005930", "hldg_qty": "10", "ord_psbl_qty": "10"}],
+        "output2": [{"tot_evlu_amt": "1000000"}],
+    }
+    refreshed_holdings = [
+        {"pdno": "005930", "hldg_qty": "11", "ord_psbl_qty": "11"}
+    ]
+    captured = {}
+
+    class FakeKis:
+        def get_balance_cached(self, **_kwargs):
+            raise AssertionError("reconcile_final holdings should avoid a duplicate balance fetch")
+
+    def fake_reconcile_kis(**_kwargs):
+        return {
+            "ok": True,
+            "orders": 1,
+            "fills": 1,
+            "promoted_fills": 0,
+            "linked_fills": 0,
+            "_final_holdings_rows": refreshed_holdings,
+        }
+
+    def fake_policy(**kwargs):
+        captured["policy_holdings"] = list(kwargs["holdings_rows"])
+        return {"recovered": [], "review_required": []}
+
+    def fake_health(**kwargs):
+        captured["health_holdings"] = list(kwargs["holdings_rows"])
+        return {"qty_mismatch_count": 0, "stale_open_order_count": 0}
+
+    class EngineObj:
+        dry_run = False
+        intended_live = True
+        env = "practice"
+        engine = object()
+        kis = FakeKis()
+        STRATEGY_NAME = "pb1_pullback_close"
+        run_id = "durable-run-id"
+        _run_summary_payload = {"api_submitted": 0}
+        _balance_snapshot = original_snapshot
+
+    monkeypatch.setattr(broker_truth, "kr_tick_remaining_sec", lambda *_args, **_kwargs: 30.0)
+    monkeypatch.setenv("KR_BROKER_TRUTH_MIN_REMAINING_SEC", "12")
+    monkeypatch.setattr("trader.reconcile_kis.reconcile_kis", fake_reconcile_kis)
+    monkeypatch.setattr(broker_truth, "_recover_proven_policy_positions", fake_policy)
+    monkeypatch.setattr(broker_truth, "_health_after_reconcile", fake_health)
+
+    obj = EngineObj()
+    broker_truth._post_pb1_tick_reconcile(obj)
+
+    assert captured["policy_holdings"] == refreshed_holdings
+    assert captured["health_holdings"] == refreshed_holdings
+    assert captured["policy_holdings"] != original_snapshot["output1"]
+    assert obj._run_summary_payload["broker_truth_balance_source"] == "engine_tick_snapshot"
+    assert obj._run_summary_payload["broker_truth_holdings_source"] == "reconcile_final"
+    assert obj._run_summary_payload["broker_truth_health_status"] == "OK"
+
+
+def test_reconcile_kis_publishes_final_holdings_for_post_tick_consumers():
+    source = Path("trader/reconcile_kis.py").read_text(encoding="utf-8")
+    assert 'reconcile_result["_final_holdings_rows"] = list(holdings_rows)' in source
+
+
 def test_broker_truth_budget_defer_is_red_when_broker_activity_exists(monkeypatch):
     class FakeKis:
         def get_balance_cached(self, **_kwargs):
