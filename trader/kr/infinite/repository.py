@@ -152,6 +152,25 @@ class InfiniteRepository:
                 WHERE trading_epoch_id=:epoch_id AND idempotency_key=:key"""),
                 {"epoch_id": epoch_id, "key": key, "metadata": json.dumps({"rejection": reason})})
 
+    def mark_reconcile_pending(self, key: str, reason: str) -> None:
+        """Persist an ambiguous broker submit as a durable duplicate fence."""
+        with self.engine.begin() as conn:
+            epoch_id = self._epoch_id(conn, required=True)
+            conn.execute(text("""UPDATE kr_infinite_order_intents
+                SET status='RECONCILE_PENDING',
+                    metadata=metadata || CAST(:metadata AS jsonb),
+                    updated_at=NOW()
+                WHERE trading_epoch_id=:epoch_id AND idempotency_key=:key"""),
+                {
+                    "epoch_id": epoch_id,
+                    "key": key,
+                    "metadata": json.dumps({
+                        "submit_outcome": "UNKNOWN",
+                        "reconcile_required": True,
+                        "submit_exception": reason,
+                    }),
+                })
+
     def persist_reconciliation(self, state: State, updates: list[tuple[OrderIntent, BrokerOrderState]]) -> None:
         with self.engine.begin() as conn:
             epoch_id = self._epoch_id(conn, required=True)

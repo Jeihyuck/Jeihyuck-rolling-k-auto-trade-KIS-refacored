@@ -7,7 +7,10 @@ from trader.us.execution.order_economics import order_intent_economics_valid
 from trader.us.execution.tick_context import TickExecutionContext
 from trader.us.pb1.us_exit_engine import _make_exit_intent
 from trader.us.runner.trade_session_runner import effective_child_tick_budget
-from trader.us.runner.trade_tick_runner import calculate_latency_accounting
+from trader.us.runner.trade_tick_runner import (
+    calculate_latency_accounting,
+    is_recoverable_order_route_budget_error,
+)
 
 
 @pytest.mark.parametrize("symbol,decision_price,qty", [
@@ -50,6 +53,13 @@ def test_kis_retry_aborts_before_shared_tick_deadline(monkeypatch):
         client._get("/uapi/overseas-stock/v1/trading/inquire-balance", {}, {})
     assert time.monotonic() - started < 0.2
     assert client.stats["get_retry_count"] == 1
+
+
+def test_order_route_budget_exhaustion_is_recoverable_not_fatal():
+    assert is_recoverable_order_route_budget_error(
+        KisUSTemporaryError("tick deadline budget exhausted before KIS request")
+    )
+    assert not is_recoverable_order_route_budget_error(RuntimeError("programming error"))
 
 
 def test_order_post_timeout_is_never_blind_retried(monkeypatch):

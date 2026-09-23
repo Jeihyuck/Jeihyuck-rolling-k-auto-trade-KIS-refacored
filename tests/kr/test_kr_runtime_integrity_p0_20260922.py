@@ -501,3 +501,27 @@ def test_entry_skip_paths_do_not_hardcode_close_stage():
         if "_log_order_skip" in line and '"PB1-CLOSE"' in line
     ]
     assert offending == []
+
+
+def test_entry_disabled_order_candidates_initialize_submit_result_before_policy_summary():
+    """Regression for 2026-09-23 AM UnboundLocalError on submit_result."""
+    source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
+    anchor = source.index('with self._stage_timer("entry.order_submit")')
+    section = source[anchor:source.index('if entry_allowed and self.phase in {"entry", "pm_entry"}', anchor)]
+    init = 'submit_result = {'
+    blocked = "if not entry_allowed:"
+    policy_read = 'for result in (submit_result.get("results") or [])'
+    assert init in section
+    assert blocked in section
+    assert policy_read in section
+    assert section.index(init) < section.index(blocked) < section.index(policy_read)
+
+
+def test_broker_truth_health_is_scoped_to_active_trading_epoch():
+    source = Path("trader/kr/broker_truth_hardening.py").read_text(encoding="utf-8")
+    start = source.index("def _health_after_reconcile(")
+    end = source.index("def _install_reconcile_guards(", start)
+    section = source[start:end]
+    assert "active_trading_epoch_id(" in section
+    assert "schema.positions.c.trading_epoch_id == epoch_id" in section
+    assert 'order.get("trading_epoch_id")' in section

@@ -24,7 +24,12 @@ from .core_utils import (
     _with_retry,
     log_trade,
 )
-from .kis_wrapper import KisAPI, NetTemporaryError
+from .kis_wrapper import (
+    KisAPI,
+    KisAuthError,
+    NetTemporaryError,
+    is_kr_order_submit_outcome_ambiguous,
+)
 from .fills import append_fill
 from .signals import (
     _get_atr,
@@ -607,23 +612,36 @@ def _maybe_scale_in_dips(
 
 
 def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Optional[float], Any]:
+    """Submit one economic SELL exactly once, except a proven auth rejection.
+
+    A timeout after POST is ambiguous: KIS may have accepted the order while
+    the ACK was lost. Blind retry can therefore duplicate a live SELL.
+    """
     cur_price = _safe_get_price(kis, code)
+
+    def _submit():
+        if prefer_market and hasattr(kis, "sell_stock_market"):
+            return kis.sell_stock_market(code, qty)
+        return kis.sell_stock(code, qty)
+
     try:
-        if prefer_market and hasattr(kis, "sell_stock_market"):
-            result = _with_retry(kis.sell_stock_market, code, qty)
-        else:
-            result = _with_retry(kis.sell_stock, code, qty)
-    except Exception as e:
-        logger.warning(f"[매도 재시도: 토큰 갱신 후 1회] {code} qty={qty} err={e}")
-        try:
-            if hasattr(kis, "refresh_token"):
-                kis.refresh_token()
-        except Exception:
-            pass
-        if prefer_market and hasattr(kis, "sell_stock_market"):
-            result = _with_retry(kis.sell_stock_market, code, qty)
-        else:
-            result = _with_retry(kis.sell_stock, code, qty)
+        result = _submit()
+    except KisAuthError as exc:
+        # _safe_request() already refreshed the token before raising KisAuthError
+        # for order 401/403. Reuse that fresh token exactly once; a second refresh
+        # here can invalidate the newly issued token and hit token rate limits.
+        logger.warning(
+            "[SELL][AUTH_REJECT] code=%s qty=%s err=%s action=RETRY_ONCE_WITH_WRAPPER_REFRESHED_TOKEN",
+            code, qty, exc,
+        )
+        result = _submit()
+    except Exception as exc:
+        logger.critical(
+            "[SELL][SUBMIT_UNRESOLVED] code=%s qty=%s action=NO_BLIND_RETRY err=%s",
+            code, qty, exc,
+        )
+        raise
+
     logger.info(f"[매도호출] {code}, qty={qty}, price(log)={cur_price}, result={result}")
     return cur_price, result
 
@@ -752,7 +770,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     try:
         # [PATCH] 예수금/과매수 방지: 가드형 지정가 사용
         if hasattr(kis, "buy_stock_limit_guarded") and order_price and order_price > 0:  # [PATCH]
-            result_limit = _with_retry(kis.buy_stock_limit_guarded, code, qty, int(order_price))  # [PATCH]
+            result_limit = kis.buy_stock_limit_guarded(code, qty, int(order_price))
             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, order_price, result_limit)
             logger.info(
                 "[ORDER_RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
@@ -797,10 +815,32 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
                 if slippage is not None and abs(slippage) > SLIPPAGE_LIMIT_PCT:
                     logger.warning(f"[슬리피지 경고] {code} slippage {slippage:.2f}% > 임계값({SLIPPAGE_LIMIT_PCT}%)")
                 return result_limit
+
+            if isinstance(result_limit, dict):
+                # Any broker response is terminal for this economic order.
+                # ACKed-but-not-yet-filled orders must reconcile; explicit
+                # rejects must not be converted into an automatic market order.
+                if str(result_limit.get("rt_cd") or "") == "0":
+                    logger.info(
+                        "[BUY-LIMIT][ACK_PENDING_FILL] code=%s qty=%s action=RECONCILE_NO_MARKET_FALLBACK",
+                        code, qty,
+                    )
+                else:
+                    logger.warning(
+                        "[BUY-LIMIT][BROKER_REJECT] code=%s qty=%s reason=%s action=NO_MARKET_FALLBACK",
+                        code, qty, _format_order_response_reason(result_limit),
+                    )
+                return result_limit
         else:
             logger.info("[BUY-LIMIT] API 미지원 또는 limit_price 무효 → 시장가로 진행")
     except Exception as e:
         logger.error("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, order_price, e)
+        if is_kr_order_submit_outcome_ambiguous(e):
+            logger.critical(
+                "[BUY-LIMIT-AMBIGUOUS] code=%s qty=%s limit=%s action=RECONCILE_NO_MARKET_FALLBACK",
+                code, qty, order_price,
+            )
+            raise
         log_trade({
             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "code": code,
@@ -819,11 +859,11 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     try:
         # [PATCH] 예수금/과매수 방지: 가드형 시장가 사용
         if hasattr(kis, "buy_stock_market_guarded"):  # [PATCH]
-            result_mkt = _with_retry(kis.buy_stock_market_guarded, code, qty)  # [PATCH]
+            result_mkt = kis.buy_stock_market_guarded(code, qty)
         elif hasattr(kis, "buy_stock_market"):
-            result_mkt = _with_retry(kis.buy_stock_market, code, qty)
+            result_mkt = kis.buy_stock_market(code, qty)
         else:
-            result_mkt = _with_retry(kis.buy_stock, code, qty)
+            result_mkt = kis.buy_stock(code, qty)
         logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, order_price, result_mkt)
         logger.info(
             "[ORDER_RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",

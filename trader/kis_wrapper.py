@@ -40,7 +40,7 @@ from trader.config import (
     SUBJECT_FLOW_TIMEOUT_SEC,
     SUBJECT_FLOW_RETRY,
 )
-from trader.fills import append_fill
+from trader.fills import append_fill  # legacy patch point; ACK paths must never call it
 from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
@@ -241,6 +241,10 @@ class KisTemporaryError(Exception):
     """429/5xx/timeout 등 재시도 가능한 오류."""
 
 
+class KisOrderOutcomeUnknown(KisTemporaryError):
+    """Order request crossed the HTTP boundary but broker ACK could not be decoded."""
+
+
 class KisAuthError(Exception):
     """401/403 인증 오류."""
 
@@ -262,6 +266,27 @@ class KisBalanceUnavailable(KisTemporaryError):
 
 class NetTemporaryError(KisTemporaryError):
     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
+
+
+def is_kr_order_submit_outcome_ambiguous(exc: BaseException) -> bool:
+    """Return True when a domestic order may have reached KIS but ACK was lost.
+
+    Only errors proven to happen before the HTTP order request are retry-safe.
+    Every other temporary order error is fenced for broker reconciliation so
+    the caller never blindly submits the same economic order again.
+    """
+    if not isinstance(exc, KisTemporaryError):
+        return False
+    message = str(exc or "").upper()
+    definitely_pre_submit = (
+        "KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_REQUEST",
+        "KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER",
+        "KR_TICK_DEADLINE_EXHAUSTED_DURING_ENDPOINT_THROTTLE",
+        "KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT",
+        "FAST_FAIL BREAKER OPEN",
+        "HASHKEY",
+    )
+    return not any(token in message for token in definitely_pre_submit)
 
 
 _KR_TICK_DEADLINE_STATE = threading.local()
@@ -1574,7 +1599,18 @@ class KisAPI:
             self._wait_before_data_request(endpoint_name)
 
         if is_order_endpoint(url):
-            attempts = max(int(os.getenv("KIS_ORDER_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
+            configured_order_attempts = max(
+                int(os.getenv("KIS_ORDER_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1
+            )
+            # Order POSTs are non-idempotent at KIS. A timeout can mean the
+            # broker accepted the order but the ACK was lost; blind retry can
+            # therefore duplicate a live order. Reconcile before any resubmit.
+            attempts = 1
+            if configured_order_attempts > 1:
+                logger.warning(
+                    "[KIS][ORDER][NO_BLIND_RETRY] configured_attempts=%s effective_attempts=1 endpoint=%s",
+                    configured_order_attempts, _endpoint_name(url),
+                )
         elif any(token in path_lower for token in data_gap_paths):
             attempts = max(int(os.getenv("KIS_DATA_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
         else:
@@ -1647,6 +1683,21 @@ class KisAPI:
                 if status in (401, 403):
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
+                    if is_order_endpoint(url):
+                        # 401/403 is an explicit pre-acceptance auth rejection.
+                        # Refresh may prepare the *next* tick, but never resubmit
+                        # the same economic order inside this request loop.
+                        if not auth_refreshed and "/oauth2/token" not in url:
+                            auth_refreshed = True
+                            try:
+                                logger.warning("[NET:AUTH][ORDER] status=%s url=%s -> refresh token for next attempt/tick only", status, url)
+                                self.refresh_token()
+                            except Exception as refresh_exc:
+                                logger.warning(
+                                    "[NET:AUTH][ORDER][REFRESH_FAIL] status=%s url=%s err=%s",
+                                    status, url, refresh_exc,
+                                )
+                        raise KisAuthError(f"HTTP {status} order auth rejection for {url}")
                     if not auth_refreshed and "/oauth2/token" not in url:
                         auth_refreshed = True
                         logger.warning("[NET:AUTH] status=%s url=%s -> refresh token", status, url)
@@ -1654,14 +1705,26 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
-                    if status == 429 and "inquire-price" in _endpoint_path(url):
-                        gate.set_global_cooldown(str(self.env or "practice"), account_key, seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"))
-                        _mark_price_rate_limited(
-                            _endpoint_name(url),
-                            str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
-                            "HTTP_429",
-                            "too_many_requests",
+                    if status == 429:
+                        gate.set_global_cooldown(
+                            str(self.env or "practice"),
+                            account_key,
+                            seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
                         )
+                        if "inquire-price" in _endpoint_path(url):
+                            _mark_price_rate_limited(
+                                _endpoint_name(url),
+                                str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
+                                "HTTP_429",
+                                "too_many_requests",
+                            )
+                        if is_order_endpoint(url):
+                            logger.warning(
+                                "[KIS][ORDER][HTTP_429_EXPLICIT_REJECT] endpoint=%s code=%s action=NO_UNRESOLVED_FENCE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                            )
+                            raise KisPermanentError(f"HTTP 429 order rate-limit reject for {url}")
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisTemporaryError(f"HTTP {status} for {url}")
@@ -1670,6 +1733,13 @@ class KisAPI:
                 except Exception as json_err:
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s json_parse_err=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500], json_err)
+                    if is_order_endpoint(url) and 200 <= status < 300:
+                        # HTTP success reached the broker boundary, but we cannot
+                        # distinguish accepted/rejected without the JSON body.
+                        # Treat exactly like a lost ACK: reconcile, never resubmit.
+                        raise KisOrderOutcomeUnknown(
+                            f"KR_ORDER_RESPONSE_JSON_UNPARSEABLE status={status} endpoint={_endpoint_name(url)} err={type(json_err).__name__}"
+                        ) from json_err
                     body = None
                 if isinstance(body, dict):
                     msg_cd = str(body.get("msg_cd") or "").strip()
@@ -1678,6 +1748,25 @@ class KisAPI:
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
+                        if is_order_endpoint(url):
+                            # A valid KIS JSON body with rt_cd != 0 is explicit
+                            # rejection evidence, not a lost ACK. Preserve the
+                            # account-wide rate-limit cooldown, but never fence it
+                            # as UNRESOLVED_ACK and never auto-resubmit here.
+                            gate.set_global_cooldown(
+                                str(self.env or "practice"),
+                                account_key,
+                                seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                            )
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                                rt_cd,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
+                            return resp
                         if no_retry_inquire_investor and msg_cd == "EGW00201" and "초당" in str(body.get("msg1") or ""):
                             logger.warning(
                                 "[KR_FLOW][KIS_INVESTOR][RATE_LIMIT_FAIL_SOFT] code=%s action=impute_and_continue",
@@ -1726,6 +1815,16 @@ class KisAPI:
                         )
                         return resp
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        if is_order_endpoint(url):
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                                rt_cd,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
+                            return resp
                         if msg_cd == "EGW00201":
                             gate.set_global_cooldown(
                                 str(self.env or "practice"),
@@ -1765,6 +1864,16 @@ class KisAPI:
                         )
                         return resp
                     if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연", "초당")):
+                        if is_order_endpoint(url):
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                                rt_cd,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
+                            return resp
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
                                 _endpoint_name(url),
@@ -1806,6 +1915,8 @@ class KisAPI:
                 if reset_on_error and not reset_done and consecutive_temp_failures >= 2:
                     self._reset_session()
                     reset_done = True
+            except KisOrderOutcomeUnknown:
+                raise
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
@@ -4440,78 +4551,86 @@ class KisAPI:
                 except Exception as exc:
                     logger.warning("[ORDER_SENT][EVENT_FAIL] %s", exc)
 
-                # 네트워크/게이트웨이 재시도
+                # Only errors proven to occur before the broker HTTP boundary may
+                # be retried here. Once POST may have reached KIS, the economic
+                # order is fenced for reconciliation and is never re-submitted.
                 for attempt in range(1, 4):
                     try:
-                        # [CHG] 안전요청 사용
                         resp = self._safe_request(
                             "POST",
                             url,
                             headers=headers,
                             data=_json_dumps(body).encode("utf-8"),
                         )
-                        data = resp.json()
                     except Exception as e:
+                        if is_kr_order_submit_outcome_ambiguous(e):
+                            logger.critical(
+                                "[ORDER_SUBMIT_UNRESOLVED] code=%s side=%s tr_id=%s ord_dvsn=%s "
+                                "attempt=%s action=NO_RESUBMIT err=%s",
+                                body.get("PDNO"), "SELL" if is_sell else "BUY",
+                                tr_id, ord_dvsn, attempt, e,
+                            )
+                            raise
+                        if isinstance(e, (KisAuthError, KisPermanentError)):
+                            logger.error(
+                                "[ORDER_EXPLICIT_REJECT] code=%s side=%s tr_id=%s ord_dvsn=%s "
+                                "attempt=%s action=NO_RESUBMIT err=%s",
+                                body.get("PDNO"), "SELL" if is_sell else "BUY",
+                                tr_id, ord_dvsn, attempt, e,
+                            )
+                            raise
+                        if not isinstance(e, KisTemporaryError):
+                            raise
+                        # Classifier false + KisTemporaryError means the request
+                        # is proven pre-submit (deadline/gate/hashkey path).
+                        last_err = e
+                        if attempt >= 3:
+                            break
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
-                        logger.error(
-                            f"[ORDER_NET_EX] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
-                            f"ex={e} → sleep {backoff:.2f}s"
+                        logger.warning(
+                            "[ORDER_PRE_SUBMIT_RETRY] code=%s side=%s tr_id=%s ord_dvsn=%s "
+                            "attempt=%s sleep=%.2f err=%s",
+                            body.get("PDNO"), "SELL" if is_sell else "BUY",
+                            tr_id, ord_dvsn, attempt, backoff, e,
                         )
                         time.sleep(backoff)
-                        last_err = e
                         continue
+
+                    try:
+                        data = resp.json()
+                    except Exception as json_err:
+                        raise KisOrderOutcomeUnknown(
+                            "KR_ORDER_RESPONSE_JSON_UNPARSEABLE_AFTER_POST "
+                            f"status={getattr(resp, 'status_code', None)} "
+                            f"tr_id={tr_id} ord_dvsn={ord_dvsn} "
+                            f"err={type(json_err).__name__}"
+                        ) from json_err
 
                     if resp.status_code == 200 and data.get("rt_cd") == "0":
                         logger.info(
                             f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}"
                         )
-                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
-                        try:
-                            out = data.get("output") or {}
-                            odno = out.get("ODNO") or out.get("ord_no") or ""
-                            pdno = safe_strip(body.get("PDNO", ""))
-                            qty = int(float(body.get("ORD_QTY", "0")))
-                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
-                            price_for_fill = None
-                            try:
-                                ord_unpr = body.get("ORD_UNPR")
-                                if ord_unpr and str(ord_unpr) not in ("0", "0.0", ""):
-                                    price_for_fill = float(ord_unpr)
-                                else:
-                                    try:
-                                        price_for_fill = float(self.get_last_price(pdno))
-                                    except Exception:
-                                        price_for_fill = 0.0
-                            except Exception:
-                                price_for_fill = 0.0
-
-                            side = "SELL" if is_sell else "BUY"
-                            append_fill(
-                                side=side,
-                                code=pdno,
-                                name="",
-                                qty=qty,
-                                price=price_for_fill,
-                                odno=odno,
-                                note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
-                                reason="order_cash",
-                            )
-                        except Exception as e:
-                            logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
+                        logger.info(
+                            "[ORDER_ACK_ONLY] code=%s side=%s tr_id=%s ord_dvsn=%s action=WAIT_FOR_RECONCILIATION",
+                            body.get("PDNO"),
+                            "SELL" if is_sell else "BUY",
+                            tr_id,
+                            ord_dvsn,
+                        )
                         return data
 
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
-                    # 게이트웨이/서버 에러류는 재시도
+                    # A valid broker response with rt_cd != 0 is explicit
+                    # rejection evidence. Do not transform gateway/business
+                    # rejects into another economic order (different TR/ORD_DVSN).
                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
-                        backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                         logger.error(
-                            f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
-                            f"resp={data} → sleep {backoff:.2f}s"
+                            "[ORDER_FAIL_GATEWAY] code=%s tr_id=%s ord_dvsn=%s "
+                            "attempt=%s resp=%s action=NO_RESUBMIT",
+                            body.get("PDNO"), tr_id, ord_dvsn, attempt, data,
                         )
-                        time.sleep(backoff)
-                        last_err = data
-                        continue
+                        return data
 
                     logger.error(
                         "[ORDER_FAIL_BIZ] code=%s tr_id=%s ord_dvsn=%s msg_cd=%s msg1=%s resp=%s",
@@ -4736,29 +4855,18 @@ class KisAPI:
         )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
-            try:
-                out = data.get("output") or {}
-                odno = out.get("ODNO") or out.get("ord_no") or ""
-                pdno = safe_strip(body.get("PDNO", ""))
-                qty_int = int(float(body.get("ORD_QTY", "0")))
-                price_for_fill = float(body.get("ORD_UNPR", 0))
-                append_fill(
-                    side="BUY",
-                    code=pdno,
-                    name="",
-                    qty=qty_int,
-                    price=price_for_fill,
-                    odno=odno,
-                    note=f"limit,tr={tr_id}",
-                )
-            except Exception as e:
-                logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
+            logger.info(
+                "[ORDER_ACK_ONLY] code=%s side=BUY tr_id=%s action=WAIT_FOR_RECONCILIATION",
+                pdno, tr_id,
+            )
             return data
         logger.error(f"[BUY_LIMIT_FAIL] {data}")
         blocked = _is_order_disallowed(data)
         if blocked:
             _mark_order_blocked(blocked, now)
-        return None
+        # Preserve explicit broker rejection evidence. Returning None collapses
+        # a real KIS response into the same shape as a lost ACK.
+        return data
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         from trader.config import get_live_gate_status_fresh
@@ -4870,24 +4978,10 @@ class KisAPI:
         )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
-            try:
-                out = data.get("output") or {}
-                odno = out.get("ODNO") or out.get("ord_no") or ""
-                pdno = safe_strip(body.get("PDNO", ""))
-                qty_int = int(float(body.get("ORD_QTY", "0")))
-                price_for_fill = float(body.get("ORD_UNPR", 0))
-                append_fill(
-                    side="SELL",
-                    code=pdno,
-                    name="",
-                    qty=qty_int,
-                    price=price_for_fill,
-                    odno=odno,
-                    note=f"limit,tr={tr_id}",
-                    reason="sell_limit",
-                )
-            except Exception as e:
-                logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+            logger.info(
+                "[ORDER_ACK_ONLY] code=%s side=SELL tr_id=%s action=WAIT_FOR_RECONCILIATION",
+                pdno, tr_id,
+            )
             with self._recent_sells_lock:
                 self._recent_sells[pdno] = time.time()
             return data

@@ -15,6 +15,7 @@ from trader.runtime_paths import runtime_root
 from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
                              ReconcileLogRepo, _assert_kr_buy_entry_contract)
 from trader.db.schema import schema_for_engine, uuid_value_for_url
+from trader.db.trading_epoch import active_trading_epoch_id
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -73,6 +74,56 @@ def _resolve_reconcile_run_id(engine, *candidates: str | None) -> str | None:
         [item[0] for item in normalized],
     )
     return None
+
+
+def _has_unresolved_broker_activity(*, engine, orders_repo: OrdersRepo, env: str, trade_date) -> bool:
+    """Fail closed when a recent broker submit has not reached terminal truth."""
+    open_states = {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
+    try:
+        rows = orders_repo.get_open_orders(env, trade_date=trade_date)
+        if any(str(row.get("status") or "").upper() in open_states for row in rows or []):
+            return True
+    except Exception as exc:
+        logger.warning(
+            "[RECONCILE][UNRESOLVED_ACTIVITY][ORDERS_LOOKUP_FAIL] err=%s action=FAIL_CLOSED",
+            exc,
+        )
+        return True
+
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(sa.text(
+                "SELECT to_regclass('public.kr_infinite_order_intents')"
+            )).scalar()
+            if exists:
+                epoch_id = active_trading_epoch_id(
+                    conn,
+                    env=env,
+                    account_id=get_account_key(env=env),
+                    required=False,
+                )
+                sql = """
+                    SELECT COUNT(*)
+                    FROM kr_infinite_order_intents
+                    WHERE trade_date=:trade_date
+                      AND status IN (
+                        'INTENT_CREATED','SUBMITTED','ACK','PENDING',
+                        'PARTIALLY_FILLED','RECONCILE_PENDING'
+                      )
+                """
+                params = {"trade_date": trade_date}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                if int(conn.execute(sa.text(sql), params).scalar() or 0) > 0:
+                    return True
+    except Exception as exc:
+        logger.warning(
+            "[RECONCILE][UNRESOLVED_ACTIVITY][KR_INF_LOOKUP_FAIL] err=%s action=FAIL_CLOSED",
+            exc,
+        )
+        return True
+    return False
 
 
 def _first_value(row: dict, keys: list[str]) -> Any:
@@ -376,20 +427,55 @@ def _promote_open_buy_orders_from_holdings(
             next_status = "RECONCILE_ERROR"
             confirmed_fill_qty = 0
 
+        previous_confirmed_fill_qty = max(0, _to_int(response_json.get("confirmed_fill_qty")) or 0)
+        incremental_fill_qty = max(0, confirmed_fill_qty - previous_confirmed_fill_qty)
+        previous_confirmed_fill_notional = max(
+            0.0, _to_float(response_json.get("confirmed_fill_notional")) or 0.0
+        )
+        stage_name = str(order.get("stage") or "")
+        is_pyramid_add = bool(
+            side == "BUY"
+            and (
+                stage_name.upper() == "PB1-ADD"
+                or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
+            )
+        )
+
         broker_fill_price = _broker_execution_price(response_json)
+        confirmed_fill_notional = previous_confirmed_fill_notional
         if side == "SELL":
             fill_price = broker_fill_price
         else:
-            # For a brand-new holding, KIS average price is direct broker truth
-            # and is more accurate than the submitted limit. For an add, the
-            # holding average mixes prior/new lots, so keep order economics unless
-            # the broker reports an execution price.
             holding_avg = float(avg_price_by_code.get(code) or 0.0)
+            inferred_add_fill_price = None
+            if is_pyramid_add and confirmed_fill_qty > 0:
+                pre_avg = _to_float(request_json.get("pre_order_avg_buy_price")) or 0.0
+                pre_qty = int(pre_order_holding_qty or 0)
+                if holding_avg > 0 and pre_avg > 0 and holding_qty >= pre_qty:
+                    cumulative_add_notional = max(
+                        0.0,
+                        (holding_avg * float(holding_qty)) - (pre_avg * float(pre_qty)),
+                    )
+                    if incremental_fill_qty > 0:
+                        incremental_add_notional = max(
+                            0.0, cumulative_add_notional - previous_confirmed_fill_notional
+                        )
+                        if incremental_add_notional > 0:
+                            inferred_add_fill_price = (
+                                incremental_add_notional / float(incremental_fill_qty)
+                            )
+                    confirmed_fill_notional = cumulative_add_notional
+            if broker_fill_price is not None and incremental_fill_qty > 0:
+                confirmed_fill_notional = (
+                    previous_confirmed_fill_notional
+                    + float(broker_fill_price) * float(incremental_fill_qty)
+                )
             fill_price = (
                 broker_fill_price
+                or inferred_add_fill_price
                 or (holding_avg if int(pre_order_holding_qty or 0) == 0 and holding_avg > 0 else None)
-                or _to_float(order.get("limit_price"))
-                or _to_float(request_json.get("ORD_UNPR"))
+                or (None if is_pyramid_add else _to_float(order.get("limit_price")))
+                or (None if is_pyramid_add else _to_float(request_json.get("ORD_UNPR")))
             )
         if (
             side == "SELL"
@@ -429,8 +515,15 @@ def _promote_open_buy_orders_from_holdings(
                 "submitted_qty": submitted_qty,
                 "requested_qty": requested_qty,
                 "confirmed_fill_qty": confirmed_fill_qty,
+                "confirmed_fill_notional": confirmed_fill_notional,
                 "confirmed_fill_price": broker_fill_price,
-                "fill_price_source": "BROKER_EXECUTION" if broker_fill_price is not None else "UNRESOLVED",
+                "fill_price_source": (
+                    "BROKER_EXECUTION"
+                    if broker_fill_price is not None
+                    else "HOLDING_AVG_DERIVED"
+                    if is_pyramid_add and fill_price is not None
+                    else "UNRESOLVED"
+                ),
                 "realized_pnl_status": "CONFIRMED" if broker_fill_price is not None else "REALIZED_PNL_UNRESOLVED",
             },
             submitted_at=order.get("submitted_at") or order_time,
@@ -462,8 +555,6 @@ def _promote_open_buy_orders_from_holdings(
                 filled_qty=confirmed_fill_qty,
             )
 
-        previous_confirmed_fill_qty = max(0, _to_int(response_json.get("confirmed_fill_qty")) or 0)
-        incremental_fill_qty = max(0, confirmed_fill_qty - previous_confirmed_fill_qty)
         if incremental_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
             fills_repo.upsert_fill(
                 env=env,
@@ -481,7 +572,10 @@ def _promote_open_buy_orders_from_holdings(
                 price=float(fill_price or 0.0),
                 fee=0.0,
                 tax=0.0,
-                filled_at=order_time,
+                # Holdings fallback has no authoritative execution timestamp.
+                # Use this reconciliation observation time so distinct partial
+                # fills do not collapse under the fallback uniqueness key.
+                filled_at=tick_ts,
                 raw_json={
                     "promotion_source": "kis_holdings_fallback",
                     "promoted_from_status": status,
@@ -492,6 +586,7 @@ def _promote_open_buy_orders_from_holdings(
                     "requested_qty": requested_qty,
                     "previous_confirmed_fill_qty": previous_confirmed_fill_qty,
                     "confirmed_fill_qty": confirmed_fill_qty,
+                    "confirmed_fill_notional": confirmed_fill_notional,
                     "incremental_fill_qty": incremental_fill_qty,
                     "ccld_status": "timeout",
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
@@ -523,7 +618,7 @@ def _promote_open_buy_orders_from_holdings(
                     price=float(fill_price or 0.0),
                     fee=0.0,
                     tax=0.0,
-                    filled_at=order_time,
+                    filled_at=tick_ts,
                     entry_meta_json=request_json.get("entry_meta") or {},
                     entry_exit_plan=request_json.get("entry_exit_plan") or {},
                     portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
@@ -538,6 +633,33 @@ def _promote_open_buy_orders_from_holdings(
                     order.get("position_cycle_id"),
                     order.get("portfolio_epoch_id"),
                 )
+                if (
+                    is_pyramid_add
+                    and confirmed_fill_qty >= int(submitted_qty or 0) > 0
+                    and next_status == "FILLED"
+                ):
+                    stage_avg_fill_price = (
+                        confirmed_fill_notional / float(confirmed_fill_qty)
+                        if confirmed_fill_notional > 0 and confirmed_fill_qty > 0
+                        else float(fill_price or 0.0)
+                    )
+                    positions_repo.mark_pyramid_add_fill(
+                        env=env,
+                        strategy=strategy,
+                        sid=int(order.get("sid") or 1),
+                        mode=int(order.get("mode") or 1),
+                        code=code,
+                        position_cycle_id=str(order.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                        target_level=int(request_json.get("level") or 0),
+                        client_order_key=client_order_key,
+                        filled_qty=confirmed_fill_qty,
+                        requested_qty=int(submitted_qty or 0),
+                        fill_price=float(stage_avg_fill_price or 0.0),
+                        filled_at=tick_ts,
+                        pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
+                        pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                    )
             promoted_fills += 1
             promoted_codes.append(code)
             logger.warning(
@@ -931,12 +1053,21 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             _first_value(row, ["tot_ccld_qty", "cumulative_filled_qty"])
         )
         previous_confirmed_qty = max(0, _to_int(source_response.get("confirmed_fill_qty")) or 0)
+        previous_confirmed_notional = max(
+            0.0, _to_float(source_response.get("confirmed_fill_notional")) or 0.0
+        )
         if broker_cumulative_qty is not None:
             incremental_daily_qty = max(0, broker_cumulative_qty - previous_confirmed_qty)
             next_confirmed_qty = max(previous_confirmed_qty, broker_cumulative_qty)
         else:
             incremental_daily_qty = 0 if already_applied else int(filled_qty or 0)
             next_confirmed_qty = previous_confirmed_qty + incremental_daily_qty
+        next_confirmed_notional = previous_confirmed_notional
+        if incremental_daily_qty > 0 and filled_price is not None:
+            next_confirmed_notional = (
+                previous_confirmed_notional
+                + float(filled_price) * float(incremental_daily_qty)
+            )
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
@@ -997,6 +1128,37 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     source_order.get("position_cycle_id"),
                     source_order.get("portfolio_epoch_id"),
                 )
+                is_pyramid_add = bool(
+                    str((source_order or {}).get("stage") or "").upper() == "PB1-ADD"
+                    or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
+                )
+                requested_buy_qty = int((source_order or {}).get("qty") or qty or 0)
+                if (
+                    is_pyramid_add
+                    and next_confirmed_qty >= requested_buy_qty > 0
+                ):
+                    stage_avg_fill_price = (
+                        next_confirmed_notional / float(next_confirmed_qty)
+                        if next_confirmed_notional > 0 and next_confirmed_qty > 0
+                        else float(filled_price or 0.0)
+                    )
+                    positions_repo.mark_pyramid_add_fill(
+                        env=env,
+                        strategy=str(source_order.get("strategy") or strategy),
+                        sid=int(source_order.get("sid") or 1),
+                        mode=int(source_order.get("mode") or 1),
+                        code=code,
+                        position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                        target_level=int(request_json.get("level") or 0),
+                        client_order_key=client_order_key,
+                        filled_qty=next_confirmed_qty,
+                        requested_qty=requested_buy_qty,
+                        fill_price=float(stage_avg_fill_price or 0.0),
+                        filled_at=order_time,
+                        pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
+                        pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                    )
             if incremental_daily_qty > 0:
                 fill_count += 1
                 filled_codes.append(code)
@@ -1024,6 +1186,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         **source_response,
                         **broker_row,
                         "confirmed_fill_qty": next_confirmed_qty,
+                        "confirmed_fill_notional": next_confirmed_notional,
                         "applied_broker_fill_ids": sorted(applied_fill_ids),
                         "source_order_id": (source_order or {}).get("order_id"),
                         "source_client_order_key": (source_order or {}).get("client_order_key"),
@@ -1257,6 +1420,12 @@ def reconcile_kis(
     guard_result = None
     guard_reason = None
     allow_purge = None
+    unresolved_broker_activity = _has_unresolved_broker_activity(
+        engine=engine,
+        orders_repo=orders_repo,
+        env=env,
+        trade_date=tick_ts.date(),
+    )
     runtime_dir = Path(runtime_dir) if runtime_dir else runtime_root()
     allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
         runtime_dir=runtime_dir,
@@ -1272,6 +1441,13 @@ def reconcile_kis(
         logger.warning(
             "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=holdings_error err=%s",
             holdings_error,
+        )
+    if not holdings_rows and unresolved_broker_activity:
+        allow_purge = False
+        guard_reason = "unresolved_broker_activity"
+        logger.error(
+            "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=unresolved_broker_activity "
+            "holdings=0 action=PRESERVE_DB_AND_BLOCK_DUPLICATE"
         )
     if allow_purge:
         logger.warning(
@@ -1303,6 +1479,7 @@ def reconcile_kis(
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
             "run_id": run_id,
@@ -1319,6 +1496,7 @@ def reconcile_kis(
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
         }

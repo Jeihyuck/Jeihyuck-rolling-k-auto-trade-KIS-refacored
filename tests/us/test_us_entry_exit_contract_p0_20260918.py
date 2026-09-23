@@ -561,7 +561,7 @@ def test_us_profit_capture_carries_frozen_partial_exit_allowed_into_sell_guard(m
     assert guard["strategic_partial"] is True
 
 
-def test_us_profit_capture_respects_frozen_partial_exit_disallow_after_env_change(monkeypatch):
+def test_us_profit_capture_stage_partial_overrides_legacy_global_disallow(monkeypatch):
     from trader.us.execution.us_sell_qty_guard import resolve_sell_qty
 
     monkeypatch.setenv("US_SELL_PARTIAL_ALLOWED", "0")
@@ -585,12 +585,13 @@ def test_us_profit_capture_respects_frozen_partial_exit_disallow_after_env_chang
         [position], {"profit_capture_enabled": True, "market_state": "NORMAL"},
         now=now, trade_date="2026-09-18", profit_capture_state={},
     )
-    assert intents and intents[0]["partial_exit_allowed"] is False
+    assert intents and intents[0]["partial_exit_allowed"] is True
+    assert intents[0]["meta"]["partial_exit_scope"] == "PROFIT_CAPTURE_STAGE"
     sell_qty, guard = resolve_sell_qty(
         intents[0], {"holding_qty": 20, "orderable_qty": 20}
     )
-    assert sell_qty == 20
-    assert guard["strategic_partial"] is False
+    assert sell_qty == 5
+    assert guard["strategic_partial"] is True
 
 
 def test_us_corrupted_day_contract_still_honors_day_hard_stop(monkeypatch):

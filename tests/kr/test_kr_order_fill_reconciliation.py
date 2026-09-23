@@ -28,12 +28,13 @@ def test_impossible_delta_is_reconcile_error():
 
 
 class _Orders:
-    def __init__(self, response):
+    def __init__(self, response, status="ACKED"):
         self.response = response
+        self.status = status
         self.saved = []
 
     def get_open_orders(self, _env):
-        return [{"order_id": "o1", "side": "SELL", "status": "ACKED", "code": "010060",
+        return [{"order_id": "o1", "side": "SELL", "status": self.status, "code": "010060",
                  "qty": 14, "ord_type": "MARKET", "client_order_key": "sell-1",
                  "request_json": {"pre_order_holding_qty": 21, "submitted_qty": 14},
                  "response_json": self.response}]
@@ -47,8 +48,8 @@ class _Fills:
     def upsert_fill(self, **kwargs): self.saved.append(kwargs)
 
 
-def _reconcile_sell(response):
-    orders, fills = _Orders(response), _Fills()
+def _reconcile_sell(response, status="ACKED"):
+    orders, fills = _Orders(response, status=status), _Fills()
     result = _promote_open_buy_orders_from_holdings(
         env="practice", strategy="pb1_pullback_close", ctx_run_id=None,
         tick_ts=datetime(2026, 8, 31, 13, 0),
@@ -66,6 +67,17 @@ def test_sell_qty_confirmed_without_execution_price_does_not_fabricate_fill():
     assert orders.saved[-1]["response_json"]["confirmed_fill_qty"] == 14
     assert orders.saved[-1]["response_json"]["confirmed_fill_price"] is None
     assert orders.saved[-1]["response_json"]["realized_pnl_status"] == "REALIZED_PNL_UNRESOLVED"
+
+
+def test_unresolved_sell_reconciles_to_confirmed_fill_without_resubmit():
+    result, orders, fills = _reconcile_sell(
+        {"execution_detail": {"ccld_unpr": "266700"}},
+        status="UNRESOLVED_ACK",
+    )
+    assert result["fills"] == 1
+    assert orders.saved[-1]["status"] == "FILLED"
+    assert fills.saved[-1]["qty"] == 14
+    assert fills.saved[-1]["price"] == 266700
 
 
 def test_sell_uses_actual_broker_execution_price():

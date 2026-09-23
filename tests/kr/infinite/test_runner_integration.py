@@ -6,6 +6,7 @@ import pytest
 from trader.kr.infinite.config import InfiniteConfig
 from trader.kr.infinite.models import Action, OrderIntent, State, Status
 from trader.kr.infinite.runner import run_once
+from trader.kis_wrapper import KisTemporaryError
 
 DAY = date(2026, 8, 14)
 REGIME = lambda: ("KR_NORMAL", "OK")
@@ -73,6 +74,9 @@ class FakeRepository:
     def mark_rejected(self, key, reason):
         self.intents = [replace(item, status="REJECTED") if item.idempotency_key == key else item for item in self.intents]
 
+    def mark_reconcile_pending(self, key, reason):
+        self.intents = [replace(item, status="RECONCILE_PENDING") if item.idempotency_key == key else item for item in self.intents]
+
     def persist_reconciliation(self, state, updates):
         self.state = state
         by_id = {intent.id: broker for intent, broker in updates}
@@ -119,6 +123,38 @@ def test_intent_is_persisted_before_submit(armed_practice_env):
         return original(*args)
     kis.buy_stock_limit = checked
     run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+
+
+def test_ambiguous_submit_is_fenced_and_cycle_is_not_recreated(armed_practice_env):
+    class AmbiguousKIS(FakeKIS):
+        def buy_stock_limit(self, symbol, qty, price):
+            self.events.append("submit")
+            self.orders.append(("BUY", qty))
+            self.last_side = "BUY"
+            raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_RETRY")
+
+        def inquire_daily_ccld(self, **kwargs):
+            return {"rt_cd": "0", "output1": []}
+
+    kis, repo = AmbiguousKIS(), FakeRepository()
+    first = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+    first_cycle = repo.state.cycle_id
+
+    assert first.decision.action == Action.WAIT
+    assert first.decision.reason == "KR_INF_ORDER_SUBMIT_UNRESOLVED_ACK"
+    assert len(kis.orders) == 1
+    assert repo.intents[0].status == "RECONCILE_PENDING"
+
+    second = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+    assert len(kis.orders) == 1
+    assert repo.state.cycle_id == first_cycle
+    assert second.decision.action in {Action.WAIT, Action.BLOCK}
 
 
 def test_accepted_unfilled_and_restart_do_not_consume_or_retry(armed_practice_env):
@@ -465,3 +501,30 @@ def test_old_partial_fill_missing_from_history_stays_fenced_for_manual_reconcile
     assert repo.intents[0].status == "RECONCILE_PENDING"
     assert result.decision.action == Action.WAIT
     assert result.decision.reason == "KR_INF_PROFIT_SELL_PENDING"
+
+
+def test_tail_budget_defer_skips_infinite_db_and_broker_work(monkeypatch, armed_practice_env):
+    import trader.kr.infinite.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "kr_tick_remaining_sec", lambda: 1.0)
+    monkeypatch.setenv("KR_INF_MIN_REMAINING_SEC", "8")
+
+    class GuardRepo(FakeRepository):
+        def ensure_schema(self):
+            raise AssertionError("Infinite DB work must not start in tail budget")
+
+    class GuardKIS(FakeKIS):
+        def get_balance_cached(self, *args, **kwargs):
+            raise AssertionError("Broker work must not start in tail budget")
+
+    result = run_once(
+        config=config(),
+        kis=GuardKIS(),
+        repository=GuardRepo(),
+        regime_provider=REGIME,
+        trade_date=DAY,
+        kis_env="practice",
+    )
+
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "KR_INF_TICK_BUDGET_DEFERRED"
