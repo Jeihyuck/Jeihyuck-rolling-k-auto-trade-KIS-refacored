@@ -3808,21 +3808,23 @@ class OrdersRepo:
         schema = schema_for_engine(self.engine)
         stmt = select(schema.job_checkpoints.c.payload).where(schema.job_checkpoints.c.job_key == job_key)
         self._last_read_fail_open_op = None
-        try:
-            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                payload = conn.execute(stmt).scalar()
-            return dict(payload or {}) if isinstance(payload, dict) else {}
-        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            fail_open = _order_lookup_fail_open_default()
-            logger.exception(
-                "[DB][READ][FAIL] op=orders.get_today_session_marker_payload fail_open=%s err_type=%s err=%s",
-                int(bool(fail_open)), type(exc).__name__, exc,
+        fail_open = _order_lookup_fail_open_default()
+        rows, read_fail_open = safe_read_mappings(
+            self.engine,
+            stmt,
+            op_name="orders.get_today_session_marker_payload",
+            fail_open=fail_open,
+        )
+        if read_fail_open:
+            self._last_read_fail_open_op = "orders.get_today_session_marker_payload"
+            logger.warning(
+                "[DB][READ][FAIL_OPEN] op=orders.get_today_session_marker_payload -> returning {}"
             )
-            if fail_open:
-                self._last_read_fail_open_op = "orders.get_today_session_marker_payload"
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.get_today_session_marker_payload -> returning {}")
-                return {}
-            raise
+            return {}
+        if not rows:
+            return {}
+        payload = rows[0].get("payload")
+        return dict(payload or {}) if isinstance(payload, dict) else {}
 
     def has_today_session_marker(
         self,
