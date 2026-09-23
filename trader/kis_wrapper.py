@@ -280,6 +280,7 @@ def is_kr_order_submit_outcome_ambiguous(exc: BaseException) -> bool:
         "KR_TICK_DEADLINE_EXHAUSTED_DURING_ENDPOINT_THROTTLE",
         "KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT",
         "FAST_FAIL BREAKER OPEN",
+        "HASHKEY",
     )
     return not any(token in message for token in definitely_pre_submit)
 
