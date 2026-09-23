@@ -11234,15 +11234,12 @@ class PB1Engine:
             else None
         )
         existing_add_status = str((existing_add or {}).get("status") or "").upper()
-        retryable_unsubmitted_add = bool(
+        retryable_add = bool(
             existing_add
             and self._is_retryable_entry_order_status(existing_add_status)
-            and not any(
-                (existing_add or {}).get(field)
-                for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
-            )
+            and not self._is_blocking_open_buy_row(existing_add)
         )
-        if retryable_unsubmitted_add:
+        if retryable_add:
             previous_key = client_key
             client_key = self._next_retry_client_order_key(client_key)
             logger.info(
