@@ -39,6 +39,17 @@ def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float
     accounted = min(total, sum(max(0.0, float(stage_metrics.get(key, 0.0)))
                                for key in _ACCOUNTED_TOP_LEVEL_STAGES))
     return round(accounted, 3), round(total - accounted, 3)
+
+
+def is_recoverable_order_route_budget_error(exc: BaseException) -> bool:
+    """Classify local/shared tick-budget exhaustion as recoverable routing deferral."""
+    text = str(exc or "").lower()
+    return (
+        "deadline budget exhausted" in text
+        or "budget exhausted before kis request" in text
+    )
+
+
 def _audit_gate_value(intent: dict, *keys: str):
     """Return 1/0 only for explicit evidence; missing audit fields stay NA."""
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
@@ -3333,10 +3344,7 @@ def run_trade_tick(
                     logger.warning("[US_POSITION][TREND_STATE][REJECT_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_rej_exc)
         except Exception as exc:
             error_text = str(exc or "")
-            budget_exhausted = (
-                "deadline budget exhausted" in error_text.lower()
-                or "budget exhausted before kis request" in error_text.lower()
-            )
+            budget_exhausted = is_recoverable_order_route_budget_error(exc)
             if budget_exhausted and str(intent.get("side") or "BUY").upper() == "BUY":
                 logger.warning(
                     "[US_ORDER][ROUTE][DEFERRED_BUDGET] symbol=%s action=STOP_NEW_BUYS_NEXT_TICK error=%s",
