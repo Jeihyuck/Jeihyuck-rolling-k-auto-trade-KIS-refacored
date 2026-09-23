@@ -5363,6 +5363,14 @@ class PB1Engine:
         status = str(data.get("status") or "").upper()
         if cls._is_open_entry_order_status(status):
             return True
+        if status in {"ERROR", "REJECTED"}:
+            response = data.get("response_json") if isinstance(data.get("response_json"), dict) else {}
+            rt_cd = str(response.get("rt_cd") or "").strip()
+            # A valid non-zero broker response proves rejection. submitted_at
+            # only means we attempted the API; it must not fence a symbol after
+            # an explicit reject such as EGW00201 or auth/business rejection.
+            if rt_cd and rt_cd not in {"0", "UNRESOLVED_ACK"}:
+                return False
         return any(
             data.get(field)
             for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
