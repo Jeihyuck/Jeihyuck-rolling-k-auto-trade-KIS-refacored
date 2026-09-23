@@ -3195,6 +3195,49 @@ class OrdersRepo:
                 logger.error("[AMBIGUOUS_BROKER_ORDER_ID] env=%s key=%s broker_order_id=%s err=%s", env, client_order_key, kis_odno, exc)
                 return "AMBIGUOUS_BROKER_ORDER_ID"
 
+    def mark_unresolved_ack(
+        self,
+        env: str,
+        client_order_key: str,
+        error_payload: dict | None,
+        *,
+        submitted_qty: int | None = None,
+        kis_odno: str | None = None,
+    ) -> None:
+        """Fence a broker submit whose ACK outcome is unknown.
+
+        This is intentionally an open-order state. It blocks duplicate BUY
+        submission until broker reconciliation proves fill/reject/cancel.
+        """
+        safe_payload = json_sanitize(error_payload or {})
+        values = {
+            "status": "UNRESOLVED_ACK",
+            "response_json": safe_payload,
+            "submitted_at": func.now(),
+            "updated_at": func.now(),
+        }
+        if submitted_qty is not None and int(submitted_qty) > 0:
+            values["qty"] = int(submitted_qty)
+        if kis_odno:
+            values["kis_odno"] = kis_odno
+            values["broker_order_id"] = kis_odno
+        with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.client_order_key == client_order_key,
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
+            conn.execute(
+                sa.update(self._schema.orders)
+                .where(and_(*conditions))
+                .values(**values)
+            )
+
     def mark_acked(
         self,
         env: str,
