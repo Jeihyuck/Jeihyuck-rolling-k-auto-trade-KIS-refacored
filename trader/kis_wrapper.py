@@ -264,6 +264,26 @@ class NetTemporaryError(KisTemporaryError):
     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
 
 
+def is_kr_order_submit_outcome_ambiguous(exc: BaseException) -> bool:
+    """Return True when a domestic order may have reached KIS but ACK was lost.
+
+    Only errors proven to happen before the HTTP order request are retry-safe.
+    Every other temporary order error is fenced for broker reconciliation so
+    the caller never blindly submits the same economic order again.
+    """
+    if not isinstance(exc, KisTemporaryError):
+        return False
+    message = str(exc or "").upper()
+    definitely_pre_submit = (
+        "KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_REQUEST",
+        "KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER",
+        "KR_TICK_DEADLINE_EXHAUSTED_DURING_ENDPOINT_THROTTLE",
+        "KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT",
+        "FAST_FAIL BREAKER OPEN",
+    )
+    return not any(token in message for token in definitely_pre_submit)
+
+
 _KR_TICK_DEADLINE_STATE = threading.local()
 
 
@@ -1574,7 +1594,18 @@ class KisAPI:
             self._wait_before_data_request(endpoint_name)
 
         if is_order_endpoint(url):
-            attempts = max(int(os.getenv("KIS_ORDER_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
+            configured_order_attempts = max(
+                int(os.getenv("KIS_ORDER_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1
+            )
+            # Order POSTs are non-idempotent at KIS. A timeout can mean the
+            # broker accepted the order but the ACK was lost; blind retry can
+            # therefore duplicate a live order. Reconcile before any resubmit.
+            attempts = 1
+            if configured_order_attempts > 1:
+                logger.warning(
+                    "[KIS][ORDER][NO_BLIND_RETRY] configured_attempts=%s effective_attempts=1 endpoint=%s",
+                    configured_order_attempts, _endpoint_name(url),
+                )
         elif any(token in path_lower for token in data_gap_paths):
             attempts = max(int(os.getenv("KIS_DATA_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
         else:
@@ -4758,7 +4789,9 @@ class KisAPI:
         blocked = _is_order_disallowed(data)
         if blocked:
             _mark_order_blocked(blocked, now)
-        return None
+        # Preserve explicit broker rejection evidence. Returning None collapses
+        # a real KIS response into the same shape as a lost ACK.
+        return data
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         from trader.config import get_live_gate_status_fresh
