@@ -40,7 +40,6 @@ from trader.config import (
     SUBJECT_FLOW_TIMEOUT_SEC,
     SUBJECT_FLOW_RETRY,
 )
-from trader.fills import append_fill
 from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
@@ -4592,39 +4591,13 @@ class KisAPI:
                         logger.info(
                             f"[ORDER_OK] tr_id={tr_id} ord_dvsn={ord_dvsn} output={data.get('output')}"
                         )
-                        # 주문 성공 → fills에 기록 (추정 체결가 사용)
-                        try:
-                            out = data.get("output") or {}
-                            odno = out.get("ODNO") or out.get("ord_no") or ""
-                            pdno = safe_strip(body.get("PDNO", ""))
-                            qty = int(float(body.get("ORD_QTY", "0")))
-                            # 가능한 경우 지정가 사용, 아니면 현재가로 추정
-                            price_for_fill = None
-                            try:
-                                ord_unpr = body.get("ORD_UNPR")
-                                if ord_unpr and str(ord_unpr) not in ("0", "0.0", ""):
-                                    price_for_fill = float(ord_unpr)
-                                else:
-                                    try:
-                                        price_for_fill = float(self.get_last_price(pdno))
-                                    except Exception:
-                                        price_for_fill = 0.0
-                            except Exception:
-                                price_for_fill = 0.0
-
-                            side = "SELL" if is_sell else "BUY"
-                            append_fill(
-                                side=side,
-                                code=pdno,
-                                name="",
-                                qty=qty,
-                                price=price_for_fill,
-                                odno=odno,
-                                note=f"tr={tr_id},ord_dvsn={ord_dvsn}",
-                                reason="order_cash",
-                            )
-                        except Exception as e:
-                            logger.warning(f"[APPEND_FILL_EX] ex={e} resp={data}")
+                        logger.info(
+                            "[ORDER_ACK_ONLY] code=%s side=%s tr_id=%s ord_dvsn=%s action=WAIT_FOR_RECONCILIATION",
+                            body.get("PDNO"),
+                            "SELL" if is_sell else "BUY",
+                            tr_id,
+                            ord_dvsn,
+                        )
                         return data
 
                     msg_cd = data.get("msg_cd", "")
@@ -4863,23 +4836,10 @@ class KisAPI:
         )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
-            try:
-                out = data.get("output") or {}
-                odno = out.get("ODNO") or out.get("ord_no") or ""
-                pdno = safe_strip(body.get("PDNO", ""))
-                qty_int = int(float(body.get("ORD_QTY", "0")))
-                price_for_fill = float(body.get("ORD_UNPR", 0))
-                append_fill(
-                    side="BUY",
-                    code=pdno,
-                    name="",
-                    qty=qty_int,
-                    price=price_for_fill,
-                    odno=odno,
-                    note=f"limit,tr={tr_id}",
-                )
-            except Exception as e:
-                logger.warning(f"[APPEND_FILL_LIMIT_BUY_FAIL] ex={e}")
+            logger.info(
+                "[ORDER_ACK_ONLY] code=%s side=BUY tr_id=%s action=WAIT_FOR_RECONCILIATION",
+                pdno, tr_id,
+            )
             return data
         logger.error(f"[BUY_LIMIT_FAIL] {data}")
         blocked = _is_order_disallowed(data)
@@ -4999,24 +4959,10 @@ class KisAPI:
         )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
-            try:
-                out = data.get("output") or {}
-                odno = out.get("ODNO") or out.get("ord_no") or ""
-                pdno = safe_strip(body.get("PDNO", ""))
-                qty_int = int(float(body.get("ORD_QTY", "0")))
-                price_for_fill = float(body.get("ORD_UNPR", 0))
-                append_fill(
-                    side="SELL",
-                    code=pdno,
-                    name="",
-                    qty=qty_int,
-                    price=price_for_fill,
-                    odno=odno,
-                    note=f"limit,tr={tr_id}",
-                    reason="sell_limit",
-                )
-            except Exception as e:
-                logger.warning(f"[APPEND_FILL_LIMIT_SELL_FAIL] ex={e}")
+            logger.info(
+                "[ORDER_ACK_ONLY] code=%s side=SELL tr_id=%s action=WAIT_FOR_RECONCILIATION",
+                pdno, tr_id,
+            )
             with self._recent_sells_lock:
                 self._recent_sells[pdno] = time.time()
             return data
