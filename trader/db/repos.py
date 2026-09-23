@@ -6105,6 +6105,121 @@ class PositionsRepo:
         )
         return bool(result.rowcount)
 
+    def mark_pyramid_add_fill(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        sid: int,
+        mode: int,
+        code: str,
+        position_cycle_id: str,
+        portfolio_epoch_id: str | None,
+        target_level: int,
+        client_order_key: str,
+        filled_qty: int,
+        requested_qty: int,
+        fill_price: float,
+        filled_at: datetime,
+        pre_order_avg_buy_price: float | None = None,
+        pre_order_stop_price: float | None = None,
+    ) -> bool:
+        """Advance one pyramid stage only after the ADD order is fully filled.
+
+        Partial fills change physical position quantity through apply_fill(), but
+        never advance pyramid_level/last_add_price/stop_price.
+        """
+        target_level = int(target_level or 0)
+        filled_qty = int(filled_qty or 0)
+        requested_qty = int(requested_qty or 0)
+        if target_level <= 0 or requested_qty <= 0 or filled_qty < requested_qty:
+            return False
+
+        conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.sid == sid,
+            self._schema.positions.c.mode == mode,
+            self._schema.positions.c.code == str(code).zfill(6),
+            self._schema.positions.c.status == "OPEN",
+        ]
+        if position_cycle_id:
+            conditions.append(
+                sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id)
+            )
+        if portfolio_epoch_id:
+            conditions.append(
+                sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id)
+            )
+
+        with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn,
+                env=env,
+                account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            if trading_epoch_id is not None:
+                conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
+            row = conn.execute(
+                select(self._schema.positions).where(and_(*conditions))
+            ).mappings().first()
+            if not row:
+                logger.error(
+                    "[KR_PYRAMID][FILL_SYNC_BLOCK] code=%s level=%s cycle=%s reason=open_cycle_not_found",
+                    code, target_level, position_cycle_id,
+                )
+                return False
+
+            current_level = int(row.get("pyramid_level") or 0)
+            current_meta = _merge_json_dict(row.get("position_meta"), {})
+            if (
+                current_level >= target_level
+                and str(current_meta.get("pyramid_last_filled_order_key") or "") == str(client_order_key or "")
+            ):
+                return True
+
+            base_avg = float(pre_order_avg_buy_price or 0.0)
+            if base_avg <= 0:
+                base_avg = float(row.get("avg_buy_price") or fill_price or 0.0)
+            existing_stop = float(
+                row.get("stop_price")
+                or pre_order_stop_price
+                or row.get("initial_stop")
+                or 0.0
+            )
+            next_stop = existing_stop
+            if base_avg > 0:
+                next_stop = max(existing_stop, base_avg * 0.995)
+
+            next_meta = _merge_json_dict(current_meta, {
+                "pyramid_last_filled_order_key": client_order_key,
+                "pyramid_last_filled_qty": filled_qty,
+                "pyramid_last_filled_level": target_level,
+                "pyramid_last_fill_price": float(fill_price or 0.0),
+            })
+            values = {
+                "pyramid_level": max(current_level, target_level),
+                "last_add_price": float(fill_price or 0.0) or row.get("last_add_price"),
+                "last_stop_update_ts": filled_at.isoformat(),
+                "position_meta": next_meta,
+            }
+            if next_stop > 0:
+                values["stop_price"] = next_stop
+            result = conn.execute(
+                sa.update(self._schema.positions)
+                .where(and_(*conditions))
+                .values(**values, updated_at=func.now())
+            )
+
+        logger.info(
+            "[KR_POSITION][PYRAMID_FULL_FILL_CONFIRMED] code=%s level=%s filled_qty=%s "
+            "requested_qty=%s fill_price=%s order_key=%s updated=%s",
+            code, target_level, filled_qty, requested_qty, fill_price,
+            client_order_key, int(result.rowcount or 0),
+        )
+        return bool(result.rowcount)
+
     def apply_fill(
         self,
         *,
