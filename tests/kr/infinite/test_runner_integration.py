@@ -501,3 +501,30 @@ def test_old_partial_fill_missing_from_history_stays_fenced_for_manual_reconcile
     assert repo.intents[0].status == "RECONCILE_PENDING"
     assert result.decision.action == Action.WAIT
     assert result.decision.reason == "KR_INF_PROFIT_SELL_PENDING"
+
+
+def test_tail_budget_defer_skips_infinite_db_and_broker_work(monkeypatch, armed_practice_env):
+    import trader.kr.infinite.runner as runner_module
+
+    monkeypatch.setattr(runner_module, "kr_tick_remaining_sec", lambda: 1.0)
+    monkeypatch.setenv("KR_INF_MIN_REMAINING_SEC", "8")
+
+    class GuardRepo(FakeRepository):
+        def ensure_schema(self):
+            raise AssertionError("Infinite DB work must not start in tail budget")
+
+    class GuardKIS(FakeKIS):
+        def get_balance_cached(self, *args, **kwargs):
+            raise AssertionError("Broker work must not start in tail budget")
+
+    result = run_once(
+        config=config(),
+        kis=GuardKIS(),
+        repository=GuardRepo(),
+        regime_provider=REGIME,
+        trade_date=DAY,
+        kis_env="practice",
+    )
+
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "KR_INF_TICK_BUDGET_DEFERRED"
