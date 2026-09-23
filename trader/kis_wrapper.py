@@ -241,6 +241,10 @@ class KisTemporaryError(Exception):
     """429/5xx/timeout 등 재시도 가능한 오류."""
 
 
+class KisOrderOutcomeUnknown(KisTemporaryError):
+    """Order request crossed the HTTP boundary but broker ACK could not be decoded."""
+
+
 class KisAuthError(Exception):
     """401/403 인증 오류."""
 
@@ -1679,6 +1683,21 @@ class KisAPI:
                 if status in (401, 403):
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
+                    if is_order_endpoint(url):
+                        # 401/403 is an explicit pre-acceptance auth rejection.
+                        # Refresh may prepare the *next* tick, but never resubmit
+                        # the same economic order inside this request loop.
+                        if not auth_refreshed and "/oauth2/token" not in url:
+                            auth_refreshed = True
+                            try:
+                                logger.warning("[NET:AUTH][ORDER] status=%s url=%s -> refresh token for next attempt/tick only", status, url)
+                                self.refresh_token()
+                            except Exception as refresh_exc:
+                                logger.warning(
+                                    "[NET:AUTH][ORDER][REFRESH_FAIL] status=%s url=%s err=%s",
+                                    status, url, refresh_exc,
+                                )
+                        raise KisAuthError(f"HTTP {status} order auth rejection for {url}")
                     if not auth_refreshed and "/oauth2/token" not in url:
                         auth_refreshed = True
                         logger.warning("[NET:AUTH] status=%s url=%s -> refresh token", status, url)
@@ -1702,6 +1721,13 @@ class KisAPI:
                 except Exception as json_err:
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s json_parse_err=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500], json_err)
+                    if is_order_endpoint(url) and 200 <= status < 300:
+                        # HTTP success reached the broker boundary, but we cannot
+                        # distinguish accepted/rejected without the JSON body.
+                        # Treat exactly like a lost ACK: reconcile, never resubmit.
+                        raise KisOrderOutcomeUnknown(
+                            f"KR_ORDER_RESPONSE_JSON_UNPARSEABLE status={status} endpoint={_endpoint_name(url)} err={type(json_err).__name__}"
+                        ) from json_err
                     body = None
                 if isinstance(body, dict):
                     msg_cd = str(body.get("msg_cd") or "").strip()
@@ -1838,6 +1864,8 @@ class KisAPI:
                 if reset_on_error and not reset_done and consecutive_temp_failures >= 2:
                     self._reset_session()
                     reset_done = True
+            except KisOrderOutcomeUnknown:
+                raise
             except KisTemporaryError as e:
                 logger.warning("[NET:TEMP_ERROR] attempt=%s url=%s err=%s", i, url, e)
                 _breaker_record_temp_failure(method, url)
