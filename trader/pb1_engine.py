@@ -206,7 +206,10 @@ from trader.db.repos import (
     load_price_daily_bulk,
 )
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
-from trader.kis_wrapper import KisAPI, KISBlockedError, extract_order_no, is_order_accepted
+from trader.kis_wrapper import (
+    KisAPI, KISBlockedError, extract_order_no, is_order_accepted,
+    is_kr_order_submit_outcome_ambiguous,
+)
 from trader.ledger.store import LedgerStore
 from trader.universe.validation import validate_tradeable
 from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
@@ -10929,6 +10932,7 @@ class PB1Engine:
         )
         resp = None
         kis_odno = None
+        submit_exc: Exception | None = None
         try:
             if order_type == "LIMIT":
                 raw_submit_price = float(limit_price)
@@ -10945,10 +10949,62 @@ class PB1Engine:
             kis_odno = extract_order_no(resp)
             status["broker_submit_called"] = 1
             status["api_submitted"] = 1
-        except Exception:
+        except Exception as exc:
+            submit_exc = exc
             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
             status["failed"] = 1
+
         submitted_qty = int(qty or 0)
+        if submit_exc is not None:
+            if is_kr_order_submit_outcome_ambiguous(submit_exc):
+                status["broker_submit_called"] = 1
+                status["api_submitted"] = 1
+                status["submitted"] = 1
+                status["reconcile_required"] = 1
+                status["rejected"] = 0
+                status["submit_terminal_status"] = "UNRESOLVED_ACK"
+                status["terminal_event"] = "ORDER_SUBMIT_UNRESOLVED"
+                self.orders_repo.mark_unresolved_ack(
+                    self.env,
+                    effective_client_order_key or "",
+                    {
+                        "rt_cd": "UNRESOLVED_ACK",
+                        "msg_cd": "BROKER_SUBMIT_OUTCOME_UNKNOWN",
+                        "msg1": str(submit_exc),
+                        "broker_submit": True,
+                        "reconcile_required": True,
+                    },
+                    submitted_qty=submitted_qty,
+                )
+                self._append_ledger_event(
+                    event_type="ORDER_SUBMIT_UNRESOLVED",
+                    code=cf.code, market=cf.market, mode=cf.mode, side="BUY",
+                    qty=submitted_qty, price=record_price,
+                    client_order_key=effective_client_order_key, ok=False,
+                    reasons=["UNRESOLVED_ACK", "RECONCILE_REQUIRED"],
+                    stage=stage,
+                    payload_json={"error": str(submit_exc), "entry_meta": entry_meta},
+                )
+                logger.critical(
+                    "[ORDER][UNRESOLVED_ACK] code=%s key=%s action=BLOCK_DUPLICATE_UNTIL_RECONCILED err=%s",
+                    cf.code, effective_client_order_key, submit_exc,
+                )
+                return status
+
+            self.orders_repo.mark_error(
+                self.env,
+                effective_client_order_key or "",
+                {
+                    "rt_cd": "LOCAL_SUBMIT_FAILURE",
+                    "msg_cd": type(submit_exc).__name__,
+                    "msg1": str(submit_exc),
+                    "broker_submit": False,
+                },
+            )
+            status["rejected"] = 1
+            status["submit_terminal_status"] = "NO_API_CALL"
+            status["terminal_event"] = "API_RESULT"
+            return status
         if isinstance(resp, dict):
             execution_meta = resp.get("_order_execution") if isinstance(resp.get("_order_execution"), dict) else {}
             submitted_qty = int(execution_meta.get("submitted_qty") or submitted_qty)
