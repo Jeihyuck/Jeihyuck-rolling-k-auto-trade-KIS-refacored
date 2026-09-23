@@ -267,6 +267,7 @@ def _bare_order_cash_api(monkeypatch):
         ),
     )
     monkeypatch.setattr("trader.kis_wrapper._assert_orders_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("trader.kis_wrapper._order_block_reason", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("trader.kis_wrapper._pick_tr", lambda *_args, **_kwargs: ["VTTC0802U"])
     monkeypatch.setattr("trader.kis_wrapper.emit_event", lambda **_kwargs: None)
 
