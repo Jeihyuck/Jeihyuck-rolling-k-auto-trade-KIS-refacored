@@ -1704,14 +1704,26 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
-                    if status == 429 and "inquire-price" in _endpoint_path(url):
-                        gate.set_global_cooldown(str(self.env or "practice"), account_key, seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"))
-                        _mark_price_rate_limited(
-                            _endpoint_name(url),
-                            str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
-                            "HTTP_429",
-                            "too_many_requests",
+                    if status == 429:
+                        gate.set_global_cooldown(
+                            str(self.env or "practice"),
+                            account_key,
+                            seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
                         )
+                        if "inquire-price" in _endpoint_path(url):
+                            _mark_price_rate_limited(
+                                _endpoint_name(url),
+                                str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
+                                "HTTP_429",
+                                "too_many_requests",
+                            )
+                        if is_order_endpoint(url):
+                            logger.warning(
+                                "[KIS][ORDER][HTTP_429_EXPLICIT_REJECT] endpoint=%s code=%s action=NO_UNRESOLVED_FENCE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                            )
+                            raise KisPermanentError(f"HTTP 429 order rate-limit reject for {url}")
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisTemporaryError(f"HTTP {status} for {url}")
