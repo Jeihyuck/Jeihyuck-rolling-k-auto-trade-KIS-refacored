@@ -152,6 +152,10 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
         },
         "profit_capture": {
             "enabled": os.getenv("US_PROFIT_CAPTURE_ENABLE", "1") not in {"0", "false", "False"},
+            # TP1/TP2/TP3 are contract-authorized staged exits. This scope is
+            # intentionally independent from the legacy global partial flag so
+            # hard stops and mandatory liquidations remain full exits.
+            "partial_exit_allowed": True,
             "runner_min_remain_pct": float(os.getenv("US_RUNNER_MIN_REMAIN_PCT", "0.40")),
             "stages": [
                 {"flag": "tp1_done", "reason": "TAKE_PROFIT_TP1", "threshold_fraction": float(os.getenv("US_TP1_PCT", "0.03")), "sell_fraction": float(os.getenv("US_TP1_SELL_PCT", "0.25"))},
