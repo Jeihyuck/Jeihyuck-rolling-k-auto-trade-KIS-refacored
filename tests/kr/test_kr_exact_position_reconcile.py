@@ -189,3 +189,62 @@ def test_authoritative_adjustment_updates_only_current_open_lifecycle(tmp_path) 
     assert float(rows[closed_id]["avg_buy_price"]) == 90000.0
     assert float(rows[closed_id]["total_cost"]) == 810000.0
     assert rows[closed_id]["status"] == "CLOSED"
+
+
+def test_unresolved_ack_sell_blocks_zeroing_after_empty_streak(tmp_path) -> None:
+    """A broker-ambiguous SELL must fence stale cleanup until reconciliation resolves it."""
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    open_id = _insert_position(engine, schema, code="005930", qty=10, avg=70000.0)
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(schema.orders).values(
+                env="practice",
+                strategy="best_k_meta",
+                sid=1,
+                mode=1,
+                code="005930",
+                market="KOSPI",
+                side="SELL",
+                ord_type="MARKET",
+                qty=10,
+                client_order_key="unresolved-sell-005930",
+                status="UNRESOLVED_ACK",
+                request_json={"pre_order_holding_qty": 10, "submitted_qty": 10},
+            )
+        )
+
+    save_reconcile_guard(
+        tmp_path,
+        {
+            "last_holdings_empty": True,
+            "empty_streak": 2,
+            "last_tick_ts": datetime(2026, 9, 23, 15, 30, 0).isoformat(),
+        },
+    )
+
+    closed = close_stale_positions_guarded(
+        engine=engine,
+        env="practice",
+        strategy="best_k_meta",
+        reason="stale_db_holdings_empty",
+        ts=datetime(2026, 9, 23, 15, 31, 0),
+        kis_balance={"output1": []},
+        sell_fill_codes=[],
+        runtime_dir=tmp_path,
+    )
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.select(
+                schema.positions.c.qty,
+                schema.positions.c.status,
+            ).where(schema.positions.c.position_id == open_id)
+        ).first()
+
+    assert closed == 0
+    assert row is not None
+    assert int(row[0]) == 10
+    assert str(row[1]).upper() == "OPEN"
