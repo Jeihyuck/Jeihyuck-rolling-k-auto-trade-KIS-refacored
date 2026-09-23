@@ -245,3 +245,99 @@ def test_order_401_is_explicit_auth_reject_not_unresolved(monkeypatch):
     assert calls["n"] == 1
     assert refreshes["n"] == 1
     assert is_kr_order_submit_outcome_ambiguous(exc_info.value) is False
+
+
+
+def _bare_order_cash_api(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("NO_TRADE", "0")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("FORCE_RUN", "1")
+    monkeypatch.setenv("INTENDED_LIVE", "1")
+    monkeypatch.setattr(
+        "trader.config.get_live_gate_status_fresh",
+        lambda **_kwargs: SimpleNamespace(
+            allow_live_gate=True,
+            force_block_live=False,
+            reason="ok",
+            window="day",
+            now_kst=__import__("datetime").datetime.now(),
+        ),
+    )
+    monkeypatch.setattr("trader.kis_wrapper._assert_orders_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("trader.kis_wrapper._pick_tr", lambda *_args, **_kwargs: ["VTTC0802U"])
+    monkeypatch.setattr("trader.kis_wrapper.emit_event", lambda **_kwargs: None)
+
+    api = KisAPI.__new__(KisAPI)
+    api.env = "practice"
+    api._create_hashkey = lambda _body: "HASH"
+    api._headers = lambda _tr, _hk=None: {}
+    api._wait_before_order_submit = lambda: None
+    return api
+
+
+def _market_order_body():
+    return {
+        "CANO": "00000000",
+        "ACNT_PRDT_CD": "01",
+        "PDNO": "000660",
+        "ORD_QTY": "1",
+        "ORD_DVSN": "01",
+        "ORD_UNPR": "0",
+    }
+
+
+def test_order_cash_outer_loop_does_not_retry_ambiguous_post(monkeypatch):
+    api = _bare_order_cash_api(monkeypatch)
+    calls = {"n": 0}
+
+    def ambiguous(*_args, **_kwargs):
+        calls["n"] += 1
+        raise KisOrderOutcomeUnknown("ACK lost after POST")
+
+    api._safe_request = ambiguous
+
+    with pytest.raises(KisOrderOutcomeUnknown):
+        api._order_cash(_market_order_body(), is_sell=False)
+
+    assert calls["n"] == 1
+
+
+def test_order_cash_outer_loop_does_not_retry_auth_reject(monkeypatch):
+    api = _bare_order_cash_api(monkeypatch)
+    calls = {"n": 0}
+
+    def rejected(*_args, **_kwargs):
+        calls["n"] += 1
+        raise KisAuthError("HTTP 401 order auth rejection")
+
+    api._safe_request = rejected
+
+    with pytest.raises(KisAuthError):
+        api._order_cash(_market_order_body(), is_sell=True)
+
+    assert calls["n"] == 1
+
+
+def test_order_cash_explicit_gateway_reject_does_not_change_order_mode(monkeypatch):
+    api = _bare_order_cash_api(monkeypatch)
+    calls = {"n": 0}
+
+    class GatewayReject:
+        status_code = 200
+
+        def json(self):
+            return {"rt_cd": "1", "msg_cd": "IGW00008", "msg1": "gateway reject"}
+
+    def rejected(*_args, **_kwargs):
+        calls["n"] += 1
+        return GatewayReject()
+
+    api._safe_request = rejected
+    result = api._order_cash(_market_order_body(), is_sell=False)
+
+    assert result["rt_cd"] == "1"
+    assert result["msg_cd"] == "IGW00008"
+    assert calls["n"] == 1
