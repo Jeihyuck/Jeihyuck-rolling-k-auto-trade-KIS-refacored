@@ -7,6 +7,8 @@ import requests
 
 from trader.kis_wrapper import (
     KisAPI,
+    KisAuthError,
+    KisOrderOutcomeUnknown,
     KisTemporaryError,
     is_kr_order_submit_outcome_ambiguous,
 )
@@ -157,3 +159,89 @@ def test_sell_timeout_is_not_blindly_retried():
         _sell_once(kis, "000660", 1, prefer_market=True)
 
     assert kis.sell_calls == 1
+
+
+
+def _configure_direct_order_http_test(monkeypatch):
+    monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+    monkeypatch.setenv("KIS_HTTP_ENABLED", "1")
+    monkeypatch.setenv("PB1_KIS_RATE_LIMIT_SAFE", "0")
+    monkeypatch.setenv("KIS_ORDER_RETRY_MAX", "5")
+    monkeypatch.setattr(KisAPI, "get_valid_token", lambda self: "TEST")
+    monkeypatch.setattr(KisAPI, "_load_safe_mode_state", lambda self: None)
+
+    class Gate:
+        def acquire(self, **_kwargs):
+            return 0.0
+
+        def set_global_cooldown(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr("trader.kis_wrapper.get_kis_gate", lambda: Gate())
+    monkeypatch.setattr("trader.kis_wrapper._breaker_check", lambda *_a, **_k: (False, None))
+    monkeypatch.setattr("trader.kis_wrapper._breaker_record_temp_failure", lambda *_a, **_k: None)
+
+
+def test_order_http_200_invalid_json_becomes_unresolved_ack(monkeypatch):
+    _configure_direct_order_http_test(monkeypatch)
+    api = KisAPI(kis_env="practice")
+    calls = {"n": 0}
+
+    class BadJsonResponse:
+        status_code = 200
+        text = "<html>gateway returned non-json</html>"
+
+        def json(self):
+            raise ValueError("invalid json")
+
+    def respond(*_args, **_kwargs):
+        calls["n"] += 1
+        return BadJsonResponse()
+
+    monkeypatch.setattr(api.session, "request", respond)
+
+    with pytest.raises(KisOrderOutcomeUnknown) as exc_info:
+        api._safe_request(
+            "POST",
+            "https://openapivts.koreainvestment.com:29443/uapi/domestic-stock/v1/trading/order-cash",
+            headers={},
+            data=b"{}",
+            timeout=(0.05, 0.05),
+        )
+
+    assert calls["n"] == 1
+    assert is_kr_order_submit_outcome_ambiguous(exc_info.value) is True
+
+
+def test_order_401_is_explicit_auth_reject_not_unresolved(monkeypatch):
+    _configure_direct_order_http_test(monkeypatch)
+    api = KisAPI(kis_env="practice")
+    calls = {"n": 0}
+    refreshes = {"n": 0}
+
+    class AuthRejectResponse:
+        status_code = 401
+        text = "unauthorized"
+
+        def json(self):
+            return {"rt_cd": "1", "msg_cd": "AUTH", "msg1": "unauthorized"}
+
+    def respond(*_args, **_kwargs):
+        calls["n"] += 1
+        return AuthRejectResponse()
+
+    monkeypatch.setattr(api.session, "request", respond)
+    monkeypatch.setattr(api, "refresh_token", lambda: refreshes.__setitem__("n", refreshes["n"] + 1))
+
+    with pytest.raises(KisAuthError) as exc_info:
+        api._safe_request(
+            "POST",
+            "https://openapivts.koreainvestment.com:29443/uapi/domestic-stock/v1/trading/order-cash",
+            headers={},
+            data=b"{}",
+            timeout=(0.05, 0.05),
+        )
+
+    assert calls["n"] == 1
+    assert refreshes["n"] == 1
+    assert is_kr_order_submit_outcome_ambiguous(exc_info.value) is False
