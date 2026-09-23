@@ -8,7 +8,7 @@ import sqlalchemy as sa
 
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
-from trader.kis_wrapper import KisOrderOutcomeUnknown
+from trader.kis_wrapper import KisAuthError, KisOrderOutcomeUnknown
 from trader.pb1_engine import PB1Engine
 from trader.trade_plan import build_entry_exit_plan
 from trader.window_router import WindowDecision
@@ -26,6 +26,23 @@ class AmbiguousBuyKis:
     def get_quote_snapshot(self, code: str):
         return {"ap": 10000.0, "tp": 10000.0, "close": 10000.0}
 
+
+
+
+class AuthRejectThenAcceptBuyKis:
+    def __init__(self) -> None:
+        self.buy_calls = 0
+
+    def buy_stock_limit(self, code: str, qty: int, price: float):
+        self.buy_calls += 1
+        if self.buy_calls == 1:
+            raise KisAuthError("HTTP 401 order auth rejection")
+        return {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"RETRY-{code}-{qty}"},
+        }
 
 class AmbiguousSellKis:
     def __init__(self) -> None:
@@ -279,3 +296,41 @@ def test_tp_sell_unresolved_ack_keeps_pending_and_blocks_restart_resubmit(monkey
 
     assert kis.sell_calls == 1
     assert second["order_result"] == "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+
+
+
+def test_add_on_auth_reject_is_retryable_next_tick_with_new_key(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    parent = _prepare_parent_position(db)
+    kis = AuthRejectThenAcceptBuyKis()
+
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+    assert kis.buy_calls == 1
+
+    with db.connect() as conn:
+        first_rows = list(
+            conn.execute(
+                sa.select(schema_for_engine(db).orders).where(
+                    schema_for_engine(db).orders.c.stage == "PB1-ADD"
+                )
+            ).mappings()
+        )
+    assert len(first_rows) == 1
+    assert first_rows[0]["status"] == "ERROR"
+    assert first_rows[0]["submitted_at"] is None
+
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+    assert kis.buy_calls == 2
+
+    with db.connect() as conn:
+        rows = list(
+            conn.execute(
+                sa.select(schema_for_engine(db).orders)
+                .where(schema_for_engine(db).orders.c.stage == "PB1-ADD")
+                .order_by(schema_for_engine(db).orders.c.created_at)
+            ).mappings()
+        )
+    assert len(rows) == 2
+    assert rows[0]["client_order_key"] != rows[1]["client_order_key"]
+    assert rows[1]["status"] in {"ACKED", "FILLED"}
