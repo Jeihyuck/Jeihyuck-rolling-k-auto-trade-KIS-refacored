@@ -9,6 +9,7 @@ from trader.kis_wrapper import (
     KisAPI,
     KisAuthError,
     KisOrderOutcomeUnknown,
+    KisPermanentError,
     KisTemporaryError,
     is_kr_order_submit_outcome_ambiguous,
 )
@@ -423,3 +424,41 @@ def test_sell_auth_retry_reuses_wrapper_refreshed_token_without_second_refresh()
     assert result["rt_cd"] == "0"
     assert kis.sell_calls == 2
     assert kis.refresh_calls == 0
+
+
+def test_order_http_429_is_explicit_reject_not_unresolved(monkeypatch):
+    _configure_direct_order_http_test(monkeypatch)
+    api = KisAPI(kis_env="practice")
+    calls = {"n": 0}
+
+    class Http429Response:
+        status_code = 429
+        text = "too many requests"
+
+        def json(self):
+            return {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수 초과"}
+
+    def respond(*_args, **_kwargs):
+        calls["n"] += 1
+        return Http429Response()
+
+    monkeypatch.setattr(api.session, "request", respond)
+
+    with pytest.raises(KisPermanentError) as exc_info:
+        api._safe_request(
+            "POST",
+            "https://openapivts.koreainvestment.com:29443/uapi/domestic-stock/v1/trading/order-cash",
+            headers={},
+            data=b"{}",
+            timeout=(0.05, 0.05),
+        )
+
+    assert calls["n"] == 1
+    assert is_kr_order_submit_outcome_ambiguous(exc_info.value) is False
+
+
+def test_kis_order_ack_never_writes_legacy_fill_csv():
+    from pathlib import Path
+    source = Path("trader/kis_wrapper.py").read_text(encoding="utf-8")
+    assert "append_fill(" not in source
+    assert "[ORDER_ACK_ONLY]" in source
