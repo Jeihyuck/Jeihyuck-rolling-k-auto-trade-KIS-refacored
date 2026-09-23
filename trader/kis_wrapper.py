@@ -1750,8 +1750,14 @@ class KisAPI:
                     if _is_egw002_error(body, msg_cd):
                         if is_order_endpoint(url):
                             # A valid KIS JSON body with rt_cd != 0 is explicit
-                            # rejection evidence, not a lost ACK. Never fence it
+                            # rejection evidence, not a lost ACK. Preserve the
+                            # account-wide rate-limit cooldown, but never fence it
                             # as UNRESOLVED_ACK and never auto-resubmit here.
+                            gate.set_global_cooldown(
+                                str(self.env or "practice"),
+                                account_key,
+                                seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                            )
                             logger.warning(
                                 "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
                                 _endpoint_name(url),
