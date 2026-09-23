@@ -3332,8 +3332,28 @@ def run_trade_tick(
                 except Exception as _trend_rej_exc:
                     logger.warning("[US_POSITION][TREND_STATE][REJECT_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_rej_exc)
         except Exception as exc:
+            error_text = str(exc or "")
+            budget_exhausted = (
+                "deadline budget exhausted" in error_text.lower()
+                or "budget exhausted before kis request" in error_text.lower()
+            )
+            if budget_exhausted and str(intent.get("side") or "BUY").upper() == "BUY":
+                logger.warning(
+                    "[US_ORDER][ROUTE][DEFERRED_BUDGET] symbol=%s action=STOP_NEW_BUYS_NEXT_TICK error=%s",
+                    intent.get("symbol"), error_text,
+                )
+                orders.append({
+                    "status": "DEFERRED_BUDGET",
+                    "reason": "ORDER_ROUTE_BUDGET_EXHAUSTED",
+                    "error": error_text,
+                    "intent": intent,
+                })
+                entry_degraded = True
+                entry_degraded_reason = "ORDER_ROUTE_BUDGET_EXHAUSTED"
+                global_stop_reason = "order_route_budget_exhausted"
+                break
             logger.warning("[US_ORDER][ROUTE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
-            orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
+            orders.append({"status": "ERROR", "error": error_text, "intent": intent})
     tick_context.metrics["order_route_ms"] = (time.monotonic() - _order_route_started) * 1000.0 if all_intents else 0.0
 
     # Normal completion must use the same broker-truth contract as degraded returns.
@@ -3569,6 +3589,12 @@ def run_trade_tick(
             "[US_TICK][STATUS_DECISION] status=%s orders_sent=%d blocked=%d block_reasons=%s",
             status, orders_sent, blocked_cnt, block_reasons
         )
+    elif entry_intents_count > 0 and orders_sent == 0 and entry_degraded:
+        status = "OK_NO_TRADE_ENTRY_DEGRADED"
+        logger.warning(
+            "[US_TICK][STATUS_DECISION] status=%s reason=%s entry_intents=%d",
+            status, entry_degraded_reason, entry_intents_count,
+        )
     elif signal_only:
         status = "OK_SIGNAL_ONLY"
         logger.info(
@@ -3576,7 +3602,7 @@ def run_trade_tick(
             status
         )
     elif orders_sent > 0:
-        status = "OK_ORDERS_SENT" if total_warnings == 0 else "OK_WITH_WARNINGS"
+        status = "OK_WITH_WARNINGS" if (entry_degraded or total_warnings > 0) else "OK_ORDERS_SENT"
         logger.info(
             "[US_TICK][STATUS_DECISION] status=%s orders_sent=%d warnings=%d",
             status, orders_sent, total_warnings
