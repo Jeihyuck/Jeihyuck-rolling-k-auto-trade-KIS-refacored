@@ -627,10 +627,13 @@ def _sell_once(kis: KisAPI, code: str, qty: int, prefer_market=True) -> Tuple[Op
     try:
         result = _submit()
     except KisAuthError as exc:
-        # 401/403 is explicit non-acceptance, so one token refresh + resubmit is safe.
-        logger.warning("[SELL][AUTH_REJECT] code=%s qty=%s err=%s action=REFRESH_ONCE", code, qty, exc)
-        if hasattr(kis, "refresh_token"):
-            kis.refresh_token()
+        # _safe_request() already refreshed the token before raising KisAuthError
+        # for order 401/403. Reuse that fresh token exactly once; a second refresh
+        # here can invalidate the newly issued token and hit token rate limits.
+        logger.warning(
+            "[SELL][AUTH_REJECT] code=%s qty=%s err=%s action=RETRY_ONCE_WITH_WRAPPER_REFRESHED_TOKEN",
+            code, qty, exc,
+        )
         result = _submit()
     except Exception as exc:
         logger.critical(
