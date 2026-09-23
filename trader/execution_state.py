@@ -42,7 +42,8 @@ def balance_freshness_for_source(source: str | None) -> BalanceFreshness:
     return BalanceFreshness.CACHED
 
 
-SELL_GUARD_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED",
+SELL_GUARD_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+                               "PARTIAL_FILLED", "FILLED",
                                "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
                                "ACKED_IDEMPOTENT_RECOVERED", "NO_SELLABLE_QTY"})
 PENDING_SELL_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
