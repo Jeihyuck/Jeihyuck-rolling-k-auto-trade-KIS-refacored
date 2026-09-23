@@ -572,7 +572,10 @@ def _promote_open_buy_orders_from_holdings(
                 price=float(fill_price or 0.0),
                 fee=0.0,
                 tax=0.0,
-                filled_at=order_time,
+                # Holdings fallback has no authoritative execution timestamp.
+                # Use this reconciliation observation time so distinct partial
+                # fills do not collapse under the fallback uniqueness key.
+                filled_at=tick_ts,
                 raw_json={
                     "promotion_source": "kis_holdings_fallback",
                     "promoted_from_status": status,
@@ -615,7 +618,7 @@ def _promote_open_buy_orders_from_holdings(
                     price=float(fill_price or 0.0),
                     fee=0.0,
                     tax=0.0,
-                    filled_at=order_time,
+                    filled_at=tick_ts,
                     entry_meta_json=request_json.get("entry_meta") or {},
                     entry_exit_plan=request_json.get("entry_exit_plan") or {},
                     portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
@@ -653,7 +656,7 @@ def _promote_open_buy_orders_from_holdings(
                         filled_qty=confirmed_fill_qty,
                         requested_qty=int(submitted_qty or 0),
                         fill_price=float(stage_avg_fill_price or 0.0),
-                        filled_at=order_time,
+                        filled_at=tick_ts,
                         pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
                         pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
                     )
