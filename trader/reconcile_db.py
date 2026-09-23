@@ -212,7 +212,7 @@ def close_stale_positions_guarded(
                 sa.and_(
                     schema.orders.c.env == env,
                     schema.orders.c.strategy == strategy,
-                    schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+                    schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"]),
                 )
             )
         ).mappings().all()
