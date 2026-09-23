@@ -11276,6 +11276,9 @@ class PB1Engine:
             "entry_reason": "ENTRY_PYRAMID",
             "entry_exit_plan": parent_plan,
             "pre_order_holding_qty": int(pos.get("orderable_qty") or pos.get("qty") or 0),
+            "pre_order_avg_buy_price": float(pos.get("avg_buy_price") or 0.0),
+            "pre_order_stop_price": float(pos.get("stop_price") or pos.get("initial_stop") or 0.0),
+            "pyramid_level_before": int(pyramid_level),
             "requested_qty": int(qty),
             "submitted_qty": int(qty),
             "balance_snapshot_id": pos.get("balance_snapshot_id"),
@@ -11441,74 +11444,10 @@ class PB1Engine:
                 )
                 if not _soft_ack:
                     raise
-            filled_at = now_kst()
-            self.fills_repo.upsert_fill(
-                env=self.env,
-                run_id=self.run_id,
-                order_id=order_id,
-                kis_odno=kis_odno,
-                trade_id=None,
-                code=code,
-                market=pos.get("market"),
-                side="BUY",
-                qty=qty,
-                price=fill_price,
-                fee=0.0,
-                tax=0.0,
-                filled_at=filled_at,
-                raw_json={
-                    "source": "pb1_add_order_ack",
-                    "kis_response": resp if isinstance(resp, dict) else {},
-                },
-                fill_meta_json={
-                    **add_entry_meta,
-                    "fill_source": "ORDER_ACK_SYNTHETIC",
-                    "price_confirmed": False,
-                    "reconcile_required": True,
-                },
-                position_cycle_id=str(parent_cycle),
-                portfolio_epoch_id=str(parent_epoch),
-            )
             logger.info(
-                "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
-                code,
-                stock_name,
-                "BUY",
-                qty,
-                fill_price,
-            )
-            updated_level = pyramid_level + 1
-            entry_price = float(pos.get("avg_buy_price") or fill_price)
-            stop_price = float(pos.get("stop_price") or pos.get("initial_stop") or 0.0)
-            if entry_price > 0:
-                stop_price = max(stop_price, entry_price * 0.995)
-            self.positions_repo.update_position_fields(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=1,
-                mode=mode,
-                code=code,
-                fields={
-                    "pyramid_level": updated_level,
-                    "last_add_price": fill_price,
-                    "stop_price": stop_price if stop_price > 0 else None,
-                    "last_stop_update_ts": filled_at.isoformat(),
-                },
-            )
-            self._log_fill_reconcile(
-                code=code,
-                sid=1,
-                mode=mode,
-                submitted_price=float(limit_price or price or 0.0),
-                filled_price=float(fill_price or 0.0),
-            )
-            logger.info(
-                "[TRADE][FILL][BUY] code=%s name=%s oid=%s fill_qty=%s fill_px=%.2f",
-                code,
-                stock_name,
-                kis_odno or order_id,
-                qty,
-                float(fill_price or 0.0),
+                "[PB1][ADD][ACK_ONLY] code=%s kis_odno=%s qty=%s target_level=%s "
+                "action=WAIT_FOR_RECONCILIATION",
+                code, kis_odno, qty, pyramid_level + 1,
             )
         else:
             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
