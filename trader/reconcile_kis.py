@@ -427,20 +427,55 @@ def _promote_open_buy_orders_from_holdings(
             next_status = "RECONCILE_ERROR"
             confirmed_fill_qty = 0
 
+        previous_confirmed_fill_qty = max(0, _to_int(response_json.get("confirmed_fill_qty")) or 0)
+        incremental_fill_qty = max(0, confirmed_fill_qty - previous_confirmed_fill_qty)
+        previous_confirmed_fill_notional = max(
+            0.0, _to_float(response_json.get("confirmed_fill_notional")) or 0.0
+        )
+        stage_name = str(order.get("stage") or "")
+        is_pyramid_add = bool(
+            side == "BUY"
+            and (
+                stage_name.upper() == "PB1-ADD"
+                or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
+            )
+        )
+
         broker_fill_price = _broker_execution_price(response_json)
+        confirmed_fill_notional = previous_confirmed_fill_notional
         if side == "SELL":
             fill_price = broker_fill_price
         else:
-            # For a brand-new holding, KIS average price is direct broker truth
-            # and is more accurate than the submitted limit. For an add, the
-            # holding average mixes prior/new lots, so keep order economics unless
-            # the broker reports an execution price.
             holding_avg = float(avg_price_by_code.get(code) or 0.0)
+            inferred_add_fill_price = None
+            if is_pyramid_add and confirmed_fill_qty > 0:
+                pre_avg = _to_float(request_json.get("pre_order_avg_buy_price")) or 0.0
+                pre_qty = int(pre_order_holding_qty or 0)
+                if holding_avg > 0 and pre_avg > 0 and holding_qty >= pre_qty:
+                    cumulative_add_notional = max(
+                        0.0,
+                        (holding_avg * float(holding_qty)) - (pre_avg * float(pre_qty)),
+                    )
+                    if incremental_fill_qty > 0:
+                        incremental_add_notional = max(
+                            0.0, cumulative_add_notional - previous_confirmed_fill_notional
+                        )
+                        if incremental_add_notional > 0:
+                            inferred_add_fill_price = (
+                                incremental_add_notional / float(incremental_fill_qty)
+                            )
+                    confirmed_fill_notional = cumulative_add_notional
+            if broker_fill_price is not None and incremental_fill_qty > 0:
+                confirmed_fill_notional = (
+                    previous_confirmed_fill_notional
+                    + float(broker_fill_price) * float(incremental_fill_qty)
+                )
             fill_price = (
                 broker_fill_price
+                or inferred_add_fill_price
                 or (holding_avg if int(pre_order_holding_qty or 0) == 0 and holding_avg > 0 else None)
-                or _to_float(order.get("limit_price"))
-                or _to_float(request_json.get("ORD_UNPR"))
+                or (None if is_pyramid_add else _to_float(order.get("limit_price")))
+                or (None if is_pyramid_add else _to_float(request_json.get("ORD_UNPR")))
             )
         if (
             side == "SELL"
@@ -480,8 +515,15 @@ def _promote_open_buy_orders_from_holdings(
                 "submitted_qty": submitted_qty,
                 "requested_qty": requested_qty,
                 "confirmed_fill_qty": confirmed_fill_qty,
+                "confirmed_fill_notional": confirmed_fill_notional,
                 "confirmed_fill_price": broker_fill_price,
-                "fill_price_source": "BROKER_EXECUTION" if broker_fill_price is not None else "UNRESOLVED",
+                "fill_price_source": (
+                    "BROKER_EXECUTION"
+                    if broker_fill_price is not None
+                    else "HOLDING_AVG_DERIVED"
+                    if is_pyramid_add and fill_price is not None
+                    else "UNRESOLVED"
+                ),
                 "realized_pnl_status": "CONFIRMED" if broker_fill_price is not None else "REALIZED_PNL_UNRESOLVED",
             },
             submitted_at=order.get("submitted_at") or order_time,
@@ -513,8 +555,6 @@ def _promote_open_buy_orders_from_holdings(
                 filled_qty=confirmed_fill_qty,
             )
 
-        previous_confirmed_fill_qty = max(0, _to_int(response_json.get("confirmed_fill_qty")) or 0)
-        incremental_fill_qty = max(0, confirmed_fill_qty - previous_confirmed_fill_qty)
         if incremental_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
             fills_repo.upsert_fill(
                 env=env,
@@ -543,6 +583,7 @@ def _promote_open_buy_orders_from_holdings(
                     "requested_qty": requested_qty,
                     "previous_confirmed_fill_qty": previous_confirmed_fill_qty,
                     "confirmed_fill_qty": confirmed_fill_qty,
+                    "confirmed_fill_notional": confirmed_fill_notional,
                     "incremental_fill_qty": incremental_fill_qty,
                     "ccld_status": "timeout",
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
@@ -589,6 +630,33 @@ def _promote_open_buy_orders_from_holdings(
                     order.get("position_cycle_id"),
                     order.get("portfolio_epoch_id"),
                 )
+                if (
+                    is_pyramid_add
+                    and confirmed_fill_qty >= int(submitted_qty or 0) > 0
+                    and next_status == "FILLED"
+                ):
+                    stage_avg_fill_price = (
+                        confirmed_fill_notional / float(confirmed_fill_qty)
+                        if confirmed_fill_notional > 0 and confirmed_fill_qty > 0
+                        else float(fill_price or 0.0)
+                    )
+                    positions_repo.mark_pyramid_add_fill(
+                        env=env,
+                        strategy=strategy,
+                        sid=int(order.get("sid") or 1),
+                        mode=int(order.get("mode") or 1),
+                        code=code,
+                        position_cycle_id=str(order.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                        target_level=int(request_json.get("level") or 0),
+                        client_order_key=client_order_key,
+                        filled_qty=confirmed_fill_qty,
+                        requested_qty=int(submitted_qty or 0),
+                        fill_price=float(stage_avg_fill_price or 0.0),
+                        filled_at=order_time,
+                        pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
+                        pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                    )
             promoted_fills += 1
             promoted_codes.append(code)
             logger.warning(
