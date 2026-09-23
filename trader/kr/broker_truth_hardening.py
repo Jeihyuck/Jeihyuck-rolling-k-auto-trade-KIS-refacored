@@ -26,7 +26,9 @@ from typing import Any
 
 import sqlalchemy as sa
 
+from trader.account_state import get_account_key
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
 from trader.kis_wrapper import (
@@ -458,22 +460,29 @@ def _recover_proven_policy_positions(
 
 
 def _health_after_reconcile(*, engine, env: str, strategy: str, holdings_rows: list[dict] | None) -> dict[str, Any]:
-    """Return RED evidence that must not be hidden after reconciliation."""
+    """Return RED evidence for the active trading epoch only."""
     schema = schema_for_engine(engine)
     kis = _holdings_index(holdings_rows)
     mismatches: list[dict[str, Any]] = []
+    epoch_id = active_trading_epoch_id(
+        engine,
+        env=env,
+        account_id=get_account_key(env=env),
+        required=trading_epoch_enforced(),
+    )
     with engine.connect() as conn:
+        position_conditions = [
+            schema.positions.c.env == env,
+            schema.positions.c.strategy == strategy,
+            schema.positions.c.status == "OPEN",
+            schema.positions.c.qty > 0,
+        ]
+        if epoch_id:
+            position_conditions.append(schema.positions.c.trading_epoch_id == epoch_id)
         positions = [
             dict(row)
             for row in conn.execute(
-                sa.select(schema.positions).where(
-                    sa.and_(
-                        schema.positions.c.env == env,
-                        schema.positions.c.strategy == strategy,
-                        schema.positions.c.status == "OPEN",
-                        schema.positions.c.qty > 0,
-                    )
-                )
+                sa.select(schema.positions).where(sa.and_(*position_conditions))
             ).mappings().all()
         ]
     for row in positions:
@@ -490,6 +499,8 @@ def _health_after_reconcile(*, engine, env: str, strategy: str, holdings_rows: l
     try:
         for order in OrdersRepo(engine).get_open_orders(env, include_stale=True) or []:
             if str(order.get("strategy") or "") != strategy:
+                continue
+            if epoch_id and str(order.get("trading_epoch_id") or "") != str(epoch_id):
                 continue
             created_day = _date_of(order.get("created_at"))
             if created_day is not None and created_day < today:
