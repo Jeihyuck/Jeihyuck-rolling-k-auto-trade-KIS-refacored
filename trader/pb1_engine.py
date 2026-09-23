@@ -11220,6 +11220,27 @@ class PB1Engine:
         mode = int(pos.get("mode") or 1)
         pyramid_level = int(pos.get("pyramid_level") or 0)
         client_key = self._client_order_key(code, mode, "BUY", f"add{pyramid_level + 1}", "PB1")
+        existing_add = (
+            self.orders_repo.get_order_by_client_order_key(self.env, client_key)
+            if hasattr(self.orders_repo, "get_order_by_client_order_key")
+            else None
+        )
+        existing_add_status = str((existing_add or {}).get("status") or "").upper()
+        retryable_unsubmitted_add = bool(
+            existing_add
+            and self._is_retryable_entry_order_status(existing_add_status)
+            and not any(
+                (existing_add or {}).get(field)
+                for field in ("submitted_at", "acked_at", "kis_odno", "broker_order_id")
+            )
+        )
+        if retryable_unsubmitted_add:
+            previous_key = client_key
+            client_key = self._next_retry_client_order_key(client_key)
+            logger.info(
+                "[PB1][ADD][RETRY_KEY] code=%s old_key=%s new_key=%s prior_status=%s",
+                display_code, previous_key, client_key, existing_add_status,
+            )
         limit_price = round_to_tick(price * 1.003) if price > 0 else price
         fill_price = float(limit_price or price or 0.0)
 
