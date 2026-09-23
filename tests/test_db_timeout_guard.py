@@ -61,10 +61,10 @@ class _Engine:
         return self.conn
 
 
-def test_safe_read_mappings_calls_autocommit():
+def test_safe_read_mappings_does_not_switch_autocommit():
     conn = _Conn()
     rows, fail_open = safe_read_mappings(_Engine(conn), sa.text("select 1"), op_name="orders.get_open_orders")
-    assert conn.autocommit_called is True
+    assert conn.autocommit_called is False
     assert rows == [{"ok": 1}]
     assert fail_open is False
 
