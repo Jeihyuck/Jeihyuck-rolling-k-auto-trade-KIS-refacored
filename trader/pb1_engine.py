@@ -19429,12 +19429,31 @@ class PB1Engine:
                     rejected_count = 0
                     skipped_count = 0
                     submit_attempt_count = len(orderable_candidates)
+                    submit_result = {
+                        "attempted": 0,
+                        "api_submitted": 0,
+                        "accepted": 0,
+                        "filled": 0,
+                        "rejected": 0,
+                        "skipped": 0,
+                        "failed": 0,
+                        "results": [],
+                    }
                     if not entry_allowed:
                         logger.info(
                             "[ORDER_SUBMIT][SKIP] reason=LIVE_GATE_BLOCKED count=%s",
                             len(orderable_candidates),
                         )
                         skipped_count = len(orderable_candidates)
+                        submit_result["skipped"] = skipped_count
+                        submit_result["results"] = [
+                            {
+                                "skipped": 1,
+                                "skipped_reason": str(entry_reason or "ENTRY_DISABLED"),
+                                "terminal_event": "FINAL_SKIP",
+                            }
+                            for _cf in orderable_candidates
+                        ]
                     else:
                         def _pre_submit_gate(cf: CandidateFeature) -> bool:
                             buy_allowed, buy_block_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(now_kst())
@@ -19457,7 +19476,7 @@ class PB1Engine:
                             logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
                             status = self._place_entry_close(cf) if self.window_internal == "close" else self._place_entry(cf)
                             terminal_event = str(status.get("terminal_event") or "")
-                            if terminal_event not in {"API_RESULT", "FINAL_SKIP"}:
+                            if terminal_event not in {"API_RESULT", "FINAL_SKIP", "ORDER_SUBMIT_UNRESOLVED"}:
                                 raise RuntimeError(f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}")
                             return status
 
@@ -19559,6 +19578,8 @@ class PB1Engine:
                         "OPENING_30MIN_BUY_BLOCK",
                         "KR_INF_OWNERSHIP_RESERVED",
                         "OWNERSHIP_RESERVED",
+                        "ENTRY_DISABLED",
+                        "SAFE_MODE",
                     }
                     drop_policy_blocker = next(
                         (
