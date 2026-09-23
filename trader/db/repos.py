@@ -6271,16 +6271,6 @@ class PositionsRepo:
                     "last_trade_at": filled_at,
                     "status": "OPEN",
                 }
-                if isinstance(request_json, dict) and request_json.get("entry_reason") == "ENTRY_PYRAMID":
-                    requested_level = int(request_json.get("level") or 0)
-                    if requested_level > 0:
-                        values["pyramid_level"] = max(int(row.get("pyramid_level") or 0) if row else 0, requested_level)
-                        values["last_add_price"] = float(price)
-                        values["last_stop_update_ts"] = filled_at.isoformat()
-                        logger.info(
-                            "[KR_POSITION][PYRAMID_FILL_CONFIRMED] code=%s level=%s fill_price=%s order_id=%s",
-                            code, requested_level, price, order_id,
-                        )
                 if entry_meta_json:
                     merged_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, entry_meta_json)
                     values.update(
