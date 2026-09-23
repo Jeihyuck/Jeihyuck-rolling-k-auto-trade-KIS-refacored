@@ -24,7 +24,7 @@ from .core_utils import (
     _with_retry,
     log_trade,
 )
-from .kis_wrapper import KisAPI, NetTemporaryError
+from .kis_wrapper import KisAPI, NetTemporaryError, is_kr_order_submit_outcome_ambiguous
 from .fills import append_fill
 from .signals import (
     _get_atr,
@@ -752,7 +752,7 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     try:
         # [PATCH] 예수금/과매수 방지: 가드형 지정가 사용
         if hasattr(kis, "buy_stock_limit_guarded") and order_price and order_price > 0:  # [PATCH]
-            result_limit = _with_retry(kis.buy_stock_limit_guarded, code, qty, int(order_price))  # [PATCH]
+            result_limit = kis.buy_stock_limit_guarded(code, qty, int(order_price))
             logger.info("[BUY-LIMIT] %s qty=%s limit=%s -> %s", code, qty, order_price, result_limit)
             logger.info(
                 "[ORDER_RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
@@ -801,6 +801,12 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
             logger.info("[BUY-LIMIT] API 미지원 또는 limit_price 무효 → 시장가로 진행")
     except Exception as e:
         logger.error("[BUY-LIMIT-FAIL] %s qty=%s limit=%s err=%s", code, qty, order_price, e)
+        if is_kr_order_submit_outcome_ambiguous(e):
+            logger.critical(
+                "[BUY-LIMIT-AMBIGUOUS] code=%s qty=%s limit=%s action=RECONCILE_NO_MARKET_FALLBACK",
+                code, qty, order_price,
+            )
+            raise
         log_trade({
             "datetime": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
             "code": code,
@@ -819,11 +825,11 @@ def place_buy_with_fallback(kis: KisAPI, code: str, qty: int, limit_price: int) 
     try:
         # [PATCH] 예수금/과매수 방지: 가드형 시장가 사용
         if hasattr(kis, "buy_stock_market_guarded"):  # [PATCH]
-            result_mkt = _with_retry(kis.buy_stock_market_guarded, code, qty)  # [PATCH]
+            result_mkt = kis.buy_stock_market_guarded(code, qty)
         elif hasattr(kis, "buy_stock_market"):
-            result_mkt = _with_retry(kis.buy_stock_market, code, qty)
+            result_mkt = kis.buy_stock_market(code, qty)
         else:
-            result_mkt = _with_retry(kis.buy_stock, code, qty)
+            result_mkt = kis.buy_stock(code, qty)
         logger.info("[BUY-MKT] %s qty=%s (from limit=%s) -> %s", code, qty, order_price, result_mkt)
         logger.info(
             "[ORDER_RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
