@@ -1736,6 +1736,19 @@ class KisAPI:
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
+                        if is_order_endpoint(url):
+                            # A valid KIS JSON body with rt_cd != 0 is explicit
+                            # rejection evidence, not a lost ACK. Never fence it
+                            # as UNRESOLVED_ACK and never auto-resubmit here.
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                                rt_cd,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
+                            return resp
                         if no_retry_inquire_investor and msg_cd == "EGW00201" and "초당" in str(body.get("msg1") or ""):
                             logger.warning(
                                 "[KR_FLOW][KIS_INVESTOR][RATE_LIMIT_FAIL_SOFT] code=%s action=impute_and_continue",
@@ -1784,6 +1797,16 @@ class KisAPI:
                         )
                         return resp
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        if is_order_endpoint(url):
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                                rt_cd,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
+                            return resp
                         if msg_cd == "EGW00201":
                             gate.set_global_cooldown(
                                 str(self.env or "practice"),
@@ -1823,6 +1846,16 @@ class KisAPI:
                         )
                         return resp
                     if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연", "초당")):
+                        if is_order_endpoint(url):
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s code=%s rt_cd=%s msg_cd=%s msg1=%s action=RETURN_RESPONSE",
+                                _endpoint_name(url),
+                                _extract_order_pdno_from_kwargs(kwargs),
+                                rt_cd,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
+                            return resp
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
                                 _endpoint_name(url),
