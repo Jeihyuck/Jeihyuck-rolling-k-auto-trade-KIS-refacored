@@ -40,6 +40,7 @@ from trader.config import (
     SUBJECT_FLOW_TIMEOUT_SEC,
     SUBJECT_FLOW_RETRY,
 )
+from trader.fills import append_fill  # legacy patch point; ACK paths must never call it
 from trader.db.engine import make_engine
 from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
