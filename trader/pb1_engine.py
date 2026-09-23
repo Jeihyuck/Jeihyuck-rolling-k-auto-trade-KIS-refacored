@@ -11456,6 +11456,18 @@ class PB1Engine:
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
+                raw_json={
+                    "source": "pb1_add_order_ack",
+                    "kis_response": resp if isinstance(resp, dict) else {},
+                },
+                fill_meta_json={
+                    **add_entry_meta,
+                    "fill_source": "ORDER_ACK_SYNTHETIC",
+                    "price_confirmed": False,
+                    "reconcile_required": True,
+                },
+                position_cycle_id=str(parent_cycle),
+                portfolio_epoch_id=str(parent_epoch),
             )
             logger.info(
                 "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
