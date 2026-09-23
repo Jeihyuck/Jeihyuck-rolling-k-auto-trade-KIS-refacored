@@ -9,7 +9,11 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Callable
 
-from trader.kis_wrapper import KisAPI, is_kr_order_submit_outcome_ambiguous
+from trader.kis_wrapper import (
+    KisAPI,
+    is_kr_order_submit_outcome_ambiguous,
+    kr_tick_remaining_sec,
+)
 
 from .accounting import apply_confirmed_fill
 from .config import InfiniteConfig
@@ -135,6 +139,23 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         return RunResult(Decision(Action.BLOCK, str(exc), next_status=Status.FROZEN), None)
     if not config.enabled:
         return RunResult(Decision(Action.WAIT, "KR_INF_FEATURE_DISABLED"), None)
+
+    remaining = kr_tick_remaining_sec()
+    min_remaining = max(
+        1.0,
+        float(os.getenv("KR_INF_MIN_REMAINING_SEC", "8.0") or "8.0"),
+    )
+    if remaining != float("inf") and remaining < min_remaining:
+        logger.warning(
+            "[KR_INF][TICK_BUDGET][DEFER] remaining=%.3f min_required=%.3f "
+            "action=SKIP_DB_AND_BROKER_WORK",
+            remaining,
+            min_remaining,
+        )
+        return RunResult(
+            Decision(Action.WAIT, "KR_INF_TICK_BUDGET_DEFERRED"),
+            None,
+        )
 
     executor = KISExecutor(kis, env, balance_snapshot=balance_snapshot)
     try:
