@@ -10,6 +10,7 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.db.schema import schema_for_engine
 from trader.kis_wrapper import KisAuthError, KisOrderOutcomeUnknown
 from trader.pb1_engine import PB1Engine
+from trader.reconcile_kis import _promote_open_buy_orders_from_holdings
 from trader.trade_plan import build_entry_exit_plan
 from trader.window_router import WindowDecision
 from tests.kr.test_kr_entry_authoritative_gate_state import _build_candidate
@@ -43,6 +44,20 @@ class AuthRejectThenAcceptBuyKis:
             "msg1": "accepted",
             "output": {"ODNO": f"RETRY-{code}-{qty}"},
         }
+
+class AckOnlyBuyKis:
+    def __init__(self) -> None:
+        self.buy_calls = 0
+
+    def buy_stock_limit(self, code: str, qty: int, price: float):
+        self.buy_calls += 1
+        return {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"ACK-{code}-{qty}"},
+        }
+
 
 class AmbiguousSellKis:
     def __init__(self) -> None:
@@ -184,6 +199,18 @@ def _prepare_parent_position(db):
         filled_at=datetime(2026, 9, 23, 12, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         order_id=root_order_id,
         account_id="acct",
+    )
+    positions.update_position_fields(
+        env="practice",
+        strategy="pb1_pullback_close",
+        sid=1,
+        mode=1,
+        code="005930",
+        fields={
+            "pyramid_level": 0,
+            "stop_price": 95.0,
+            "initial_stop": 95.0,
+        },
     )
     with db.connect() as conn:
         return dict(
@@ -333,4 +360,189 @@ def test_add_on_auth_reject_is_retryable_next_tick_with_new_key(monkeypatch):
         )
     assert len(rows) == 2
     assert rows[0]["client_order_key"] != rows[1]["client_order_key"]
-    assert rows[1]["status"] in {"ACKED", "FILLED"}
+    assert rows[1]["status"] == "ACKED"
+    with db.connect() as conn:
+        fill_count = conn.execute(sa.select(sa.func.count()).select_from(schema_for_engine(db).fills)).scalar_one()
+        stored = dict(
+            conn.execute(
+                sa.select(schema_for_engine(db).positions).where(
+                    schema_for_engine(db).positions.c.code == "005930"
+                )
+            ).mappings().one()
+        )
+    assert fill_count == 0
+    assert stored["qty"] == 10
+    assert int(stored["pyramid_level"] or 0) == 0
+    assert float(stored["stop_price"] or 0.0) == 95.0
+
+
+
+def _position_row(db):
+    with db.connect() as conn:
+        return dict(
+            conn.execute(
+                sa.select(schema_for_engine(db).positions).where(
+                    schema_for_engine(db).positions.c.code == "005930"
+                )
+            ).mappings().one()
+        )
+
+
+def _add_order_row(db):
+    with db.connect() as conn:
+        return dict(
+            conn.execute(
+                sa.select(schema_for_engine(db).orders)
+                .where(schema_for_engine(db).orders.c.stage == "PB1-ADD")
+                .order_by(schema_for_engine(db).orders.c.created_at.desc())
+            ).mappings().first()
+        )
+
+
+def _fill_count(db):
+    with db.connect() as conn:
+        return int(
+            conn.execute(
+                sa.select(sa.func.count()).select_from(schema_for_engine(db).fills)
+            ).scalar_one()
+        )
+
+
+def test_add_on_ack_only_does_not_create_fill_or_advance_stage(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    parent = _prepare_parent_position(db)
+    kis = AckOnlyBuyKis()
+
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+
+    order = _add_order_row(db)
+    stored = _position_row(db)
+    assert order["status"] == "ACKED"
+    assert kis.buy_calls == 1
+    assert _fill_count(db) == 0
+    assert stored["qty"] == 10
+    assert int(stored["pyramid_level"] or 0) == 0
+    assert float(stored["stop_price"] or 0.0) == 95.0
+    assert stored.get("last_add_price") in {None, 0, 0.0}
+
+
+def test_add_on_partial_then_full_reconcile_advances_stage_only_at_full_fill(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    parent = _prepare_parent_position(db)
+    kis = AckOnlyBuyKis()
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+
+    orders = OrdersRepo(db)
+    fills = FillsRepo(db)
+    positions = PositionsRepo(db)
+
+    # One of two shares filled at an implied 102.0. Physical qty changes,
+    # but pyramid stage/stop must remain unchanged.
+    partial = _promote_open_buy_orders_from_holdings(
+        env="practice",
+        strategy="pb1_pullback_close",
+        ctx_run_id=None,
+        tick_ts=datetime(2026, 9, 23, 13, 5, tzinfo=ZoneInfo("Asia/Seoul")),
+        holdings_rows=[{
+            "pdno": "005930",
+            "hldg_qty": "11",
+            "pchs_avg_pric": str((1000.0 + 102.0) / 11.0),
+        }],
+        orders_repo=orders,
+        fills_repo=fills,
+        positions_repo=positions,
+    )
+    stored_partial = _position_row(db)
+    order_partial = _add_order_row(db)
+    assert partial["fills"] == 1
+    assert order_partial["status"] == "PARTIAL_FILLED"
+    assert stored_partial["qty"] == 11
+    assert int(stored_partial["pyramid_level"] or 0) == 0
+    assert float(stored_partial["stop_price"] or 0.0) == 95.0
+
+    # Simulate process restart: new repo instances over the same durable DB.
+    orders = OrdersRepo(db)
+    fills = FillsRepo(db)
+    positions = PositionsRepo(db)
+    full = _promote_open_buy_orders_from_holdings(
+        env="practice",
+        strategy="pb1_pullback_close",
+        ctx_run_id=None,
+        tick_ts=datetime(2026, 9, 23, 13, 6, tzinfo=ZoneInfo("Asia/Seoul")),
+        holdings_rows=[{
+            "pdno": "005930",
+            "hldg_qty": "12",
+            "pchs_avg_pric": str((1000.0 + 204.0) / 12.0),
+        }],
+        orders_repo=orders,
+        fills_repo=fills,
+        positions_repo=positions,
+    )
+    stored_full = _position_row(db)
+    order_full = _add_order_row(db)
+    assert full["fills"] == 1
+    assert order_full["status"] == "FILLED"
+    assert stored_full["qty"] == 12
+    assert int(stored_full["pyramid_level"] or 0) == 1
+    assert abs(float(stored_full["last_add_price"]) - 102.0) < 1e-6
+    assert abs(float(stored_full["stop_price"]) - 99.5) < 1e-6
+    assert _fill_count(db) == 2
+
+
+def test_add_on_partial_then_cancel_preserves_actual_qty_without_stage_advance(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    parent = _prepare_parent_position(db)
+    kis = AckOnlyBuyKis()
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+
+    orders = OrdersRepo(db)
+    fills = FillsRepo(db)
+    positions = PositionsRepo(db)
+    _promote_open_buy_orders_from_holdings(
+        env="practice",
+        strategy="pb1_pullback_close",
+        ctx_run_id=None,
+        tick_ts=datetime(2026, 9, 23, 13, 5, tzinfo=ZoneInfo("Asia/Seoul")),
+        holdings_rows=[{
+            "pdno": "005930",
+            "hldg_qty": "11",
+            "pchs_avg_pric": str((1000.0 + 102.0) / 11.0),
+        }],
+        orders_repo=orders,
+        fills_repo=fills,
+        positions_repo=positions,
+    )
+
+    order = _add_order_row(db)
+    with db.begin() as conn:
+        conn.execute(
+            sa.update(schema_for_engine(db).orders)
+            .where(schema_for_engine(db).orders.c.order_id == order["order_id"])
+            .values(status="CANCELLED")
+        )
+
+    # Restart/reconcile after cancellation: no phantom second share and no
+    # pyramid-stage/stop mutation.
+    result = _promote_open_buy_orders_from_holdings(
+        env="practice",
+        strategy="pb1_pullback_close",
+        ctx_run_id=None,
+        tick_ts=datetime(2026, 9, 23, 13, 7, tzinfo=ZoneInfo("Asia/Seoul")),
+        holdings_rows=[{
+            "pdno": "005930",
+            "hldg_qty": "11",
+            "pchs_avg_pric": str((1000.0 + 102.0) / 11.0),
+        }],
+        orders_repo=OrdersRepo(db),
+        fills_repo=FillsRepo(db),
+        positions_repo=PositionsRepo(db),
+    )
+    stored = _position_row(db)
+    assert result["fills"] == 0
+    assert stored["qty"] == 11
+    assert int(stored["pyramid_level"] or 0) == 0
+    assert float(stored["stop_price"] or 0.0) == 95.0
+    assert _fill_count(db) == 1
