@@ -1050,12 +1050,21 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             _first_value(row, ["tot_ccld_qty", "cumulative_filled_qty"])
         )
         previous_confirmed_qty = max(0, _to_int(source_response.get("confirmed_fill_qty")) or 0)
+        previous_confirmed_notional = max(
+            0.0, _to_float(source_response.get("confirmed_fill_notional")) or 0.0
+        )
         if broker_cumulative_qty is not None:
             incremental_daily_qty = max(0, broker_cumulative_qty - previous_confirmed_qty)
             next_confirmed_qty = max(previous_confirmed_qty, broker_cumulative_qty)
         else:
             incremental_daily_qty = 0 if already_applied else int(filled_qty or 0)
             next_confirmed_qty = previous_confirmed_qty + incremental_daily_qty
+        next_confirmed_notional = previous_confirmed_notional
+        if incremental_daily_qty > 0 and filled_price is not None:
+            next_confirmed_notional = (
+                previous_confirmed_notional
+                + float(filled_price) * float(incremental_daily_qty)
+            )
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
@@ -1116,6 +1125,37 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     source_order.get("position_cycle_id"),
                     source_order.get("portfolio_epoch_id"),
                 )
+                is_pyramid_add = bool(
+                    str((source_order or {}).get("stage") or "").upper() == "PB1-ADD"
+                    or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
+                )
+                requested_buy_qty = int((source_order or {}).get("qty") or qty or 0)
+                if (
+                    is_pyramid_add
+                    and next_confirmed_qty >= requested_buy_qty > 0
+                ):
+                    stage_avg_fill_price = (
+                        next_confirmed_notional / float(next_confirmed_qty)
+                        if next_confirmed_notional > 0 and next_confirmed_qty > 0
+                        else float(filled_price or 0.0)
+                    )
+                    positions_repo.mark_pyramid_add_fill(
+                        env=env,
+                        strategy=str(source_order.get("strategy") or strategy),
+                        sid=int(source_order.get("sid") or 1),
+                        mode=int(source_order.get("mode") or 1),
+                        code=code,
+                        position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                        target_level=int(request_json.get("level") or 0),
+                        client_order_key=client_order_key,
+                        filled_qty=next_confirmed_qty,
+                        requested_qty=requested_buy_qty,
+                        fill_price=float(stage_avg_fill_price or 0.0),
+                        filled_at=order_time,
+                        pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
+                        pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                    )
             if incremental_daily_qty > 0:
                 fill_count += 1
                 filled_codes.append(code)
@@ -1143,6 +1183,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         **source_response,
                         **broker_row,
                         "confirmed_fill_qty": next_confirmed_qty,
+                        "confirmed_fill_notional": next_confirmed_notional,
                         "applied_broker_fill_ids": sorted(applied_fill_ids),
                         "source_order_id": (source_order or {}).get("order_id"),
                         "source_client_order_key": (source_order or {}).get("client_order_key"),
