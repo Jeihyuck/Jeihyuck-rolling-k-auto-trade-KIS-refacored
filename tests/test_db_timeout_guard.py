@@ -82,3 +82,13 @@ def test_safe_read_mappings_real_fail_closed_reraises(monkeypatch):
     exc = sa.exc.OperationalError("stmt", {}, Exception("statement timeout"))
     with pytest.raises(sa.exc.OperationalError):
         safe_read_mappings(_Engine(_Conn(fail=exc)), sa.text("select 1"), op_name="orders.get_open_orders", fail_open=False)
+
+
+def test_session_marker_read_uses_poison_safe_read_path():
+    from pathlib import Path
+    source = Path("trader/db/repos.py").read_text(encoding="utf-8")
+    start = source.index("    def get_today_session_marker_payload(")
+    end = source.index("    def has_today_session_marker(", start)
+    section = source[start:end]
+    assert "safe_read_mappings(" in section
+    assert 'isolation_level="AUTOCOMMIT"' not in section
