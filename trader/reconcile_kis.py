@@ -15,6 +15,7 @@ from trader.runtime_paths import runtime_root
 from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
                              ReconcileLogRepo, _assert_kr_buy_entry_contract)
 from trader.db.schema import schema_for_engine, uuid_value_for_url
+from trader.db.trading_epoch import active_trading_epoch_id
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -73,6 +74,56 @@ def _resolve_reconcile_run_id(engine, *candidates: str | None) -> str | None:
         [item[0] for item in normalized],
     )
     return None
+
+
+def _has_unresolved_broker_activity(*, engine, orders_repo: OrdersRepo, env: str, trade_date) -> bool:
+    """Fail closed when a recent broker submit has not reached terminal truth."""
+    open_states = {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
+    try:
+        rows = orders_repo.get_open_orders(env, trade_date=trade_date)
+        if any(str(row.get("status") or "").upper() in open_states for row in rows or []):
+            return True
+    except Exception as exc:
+        logger.warning(
+            "[RECONCILE][UNRESOLVED_ACTIVITY][ORDERS_LOOKUP_FAIL] err=%s action=FAIL_CLOSED",
+            exc,
+        )
+        return True
+
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(sa.text(
+                "SELECT to_regclass('public.kr_infinite_order_intents')"
+            )).scalar()
+            if exists:
+                epoch_id = active_trading_epoch_id(
+                    conn,
+                    env=env,
+                    account_id=get_account_key(env=env),
+                    required=False,
+                )
+                sql = """
+                    SELECT COUNT(*)
+                    FROM kr_infinite_order_intents
+                    WHERE trade_date=:trade_date
+                      AND status IN (
+                        'INTENT_CREATED','SUBMITTED','ACK','PENDING',
+                        'PARTIALLY_FILLED','RECONCILE_PENDING'
+                      )
+                """
+                params = {"trade_date": trade_date}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                if int(conn.execute(sa.text(sql), params).scalar() or 0) > 0:
+                    return True
+    except Exception as exc:
+        logger.warning(
+            "[RECONCILE][UNRESOLVED_ACTIVITY][KR_INF_LOOKUP_FAIL] err=%s action=FAIL_CLOSED",
+            exc,
+        )
+        return True
+    return False
 
 
 def _first_value(row: dict, keys: list[str]) -> Any:
@@ -1257,6 +1308,12 @@ def reconcile_kis(
     guard_result = None
     guard_reason = None
     allow_purge = None
+    unresolved_broker_activity = _has_unresolved_broker_activity(
+        engine=engine,
+        orders_repo=orders_repo,
+        env=env,
+        trade_date=tick_ts.date(),
+    )
     runtime_dir = Path(runtime_dir) if runtime_dir else runtime_root()
     allow_purge, guard_reason, guard_result = evaluate_stale_db_guard(
         runtime_dir=runtime_dir,
@@ -1272,6 +1329,13 @@ def reconcile_kis(
         logger.warning(
             "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=holdings_error err=%s",
             holdings_error,
+        )
+    if not holdings_rows and unresolved_broker_activity:
+        allow_purge = False
+        guard_reason = "unresolved_broker_activity"
+        logger.error(
+            "[RECONCILE][STALE_DB_GUARD] allow_purge=0 reason=unresolved_broker_activity "
+            "holdings=0 action=PRESERVE_DB_AND_BLOCK_DUPLICATE"
         )
     if allow_purge:
         logger.warning(
@@ -1303,6 +1367,7 @@ def reconcile_kis(
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
             "run_id": run_id,
@@ -1319,6 +1384,7 @@ def reconcile_kis(
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
         }
