@@ -4500,26 +4500,60 @@ class KisAPI:
                 except Exception as exc:
                     logger.warning("[ORDER_SENT][EVENT_FAIL] %s", exc)
 
-                # 네트워크/게이트웨이 재시도
+                # Only errors proven to occur before the broker HTTP boundary may
+                # be retried here. Once POST may have reached KIS, the economic
+                # order is fenced for reconciliation and is never re-submitted.
                 for attempt in range(1, 4):
                     try:
-                        # [CHG] 안전요청 사용
                         resp = self._safe_request(
                             "POST",
                             url,
                             headers=headers,
                             data=_json_dumps(body).encode("utf-8"),
                         )
-                        data = resp.json()
                     except Exception as e:
+                        if is_kr_order_submit_outcome_ambiguous(e):
+                            logger.critical(
+                                "[ORDER_SUBMIT_UNRESOLVED] code=%s side=%s tr_id=%s ord_dvsn=%s "
+                                "attempt=%s action=NO_RESUBMIT err=%s",
+                                body.get("PDNO"), "SELL" if is_sell else "BUY",
+                                tr_id, ord_dvsn, attempt, e,
+                            )
+                            raise
+                        if isinstance(e, (KisAuthError, KisPermanentError)):
+                            logger.error(
+                                "[ORDER_EXPLICIT_REJECT] code=%s side=%s tr_id=%s ord_dvsn=%s "
+                                "attempt=%s action=NO_RESUBMIT err=%s",
+                                body.get("PDNO"), "SELL" if is_sell else "BUY",
+                                tr_id, ord_dvsn, attempt, e,
+                            )
+                            raise
+                        if not isinstance(e, KisTemporaryError):
+                            raise
+                        # Classifier false + KisTemporaryError means the request
+                        # is proven pre-submit (deadline/gate/hashkey path).
+                        last_err = e
+                        if attempt >= 3:
+                            break
                         backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
-                        logger.error(
-                            f"[ORDER_NET_EX] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
-                            f"ex={e} → sleep {backoff:.2f}s"
+                        logger.warning(
+                            "[ORDER_PRE_SUBMIT_RETRY] code=%s side=%s tr_id=%s ord_dvsn=%s "
+                            "attempt=%s sleep=%.2f err=%s",
+                            body.get("PDNO"), "SELL" if is_sell else "BUY",
+                            tr_id, ord_dvsn, attempt, backoff, e,
                         )
                         time.sleep(backoff)
-                        last_err = e
                         continue
+
+                    try:
+                        data = resp.json()
+                    except Exception as json_err:
+                        raise KisOrderOutcomeUnknown(
+                            "KR_ORDER_RESPONSE_JSON_UNPARSEABLE_AFTER_POST "
+                            f"status={getattr(resp, 'status_code', None)} "
+                            f"tr_id={tr_id} ord_dvsn={ord_dvsn} "
+                            f"err={type(json_err).__name__}"
+                        ) from json_err
 
                     if resp.status_code == 200 and data.get("rt_cd") == "0":
                         logger.info(
@@ -4562,16 +4596,16 @@ class KisAPI:
 
                     msg_cd = data.get("msg_cd", "")
                     msg1 = data.get("msg1", "")
-                    # 게이트웨이/서버 에러류는 재시도
+                    # A valid broker response with rt_cd != 0 is explicit
+                    # rejection evidence. Do not transform gateway/business
+                    # rejects into another economic order (different TR/ORD_DVSN).
                     if msg_cd == "IGW00008" or "MCA" in msg1 or resp.status_code >= 500:
-                        backoff = min(0.6 * (1.7 ** (attempt - 1)), 5.0) + random.uniform(0, 0.35)
                         logger.error(
-                            f"[ORDER_FAIL_GATEWAY] tr_id={tr_id} ord_dvsn={ord_dvsn} attempt={attempt} "
-                            f"resp={data} → sleep {backoff:.2f}s"
+                            "[ORDER_FAIL_GATEWAY] code=%s tr_id=%s ord_dvsn=%s "
+                            "attempt=%s resp=%s action=NO_RESUBMIT",
+                            body.get("PDNO"), tr_id, ord_dvsn, attempt, data,
                         )
-                        time.sleep(backoff)
-                        last_err = data
-                        continue
+                        return data
 
                     logger.error(
                         "[ORDER_FAIL_BIZ] code=%s tr_id=%s ord_dvsn=%s msg_cd=%s msg1=%s resp=%s",
