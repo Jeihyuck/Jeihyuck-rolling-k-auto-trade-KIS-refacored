@@ -75,3 +75,85 @@ def test_unresolved_ack_blocks_empty_holdings_purge_without_db_lookup():
         env="practice",
         trade_date=date(2026, 9, 23),
     )
+
+
+def test_accepted_limit_buy_never_falls_back_to_second_market_order(monkeypatch):
+    from trader.execution import place_buy_with_fallback
+
+    monkeypatch.setattr("trader.execution.time.sleep", lambda *_args, **_kwargs: None)
+
+    class FakeKIS:
+        def __init__(self):
+            self.limit_calls = 0
+            self.market_calls = 0
+
+        def buy_stock_limit_guarded(self, code, qty, price):
+            self.limit_calls += 1
+            return {"rt_cd": "0", "msg_cd": "0", "msg1": "accepted", "output": {"ODNO": "O1"}}
+
+        def check_filled(self, _result):
+            return False
+
+        def buy_stock_market_guarded(self, code, qty):
+            self.market_calls += 1
+            return {"rt_cd": "0", "output": {"ODNO": "O2"}}
+
+        def get_current_price(self, code):
+            return 10000
+
+    kis = FakeKIS()
+    result = place_buy_with_fallback(kis, "000660", 1, 10000)
+
+    assert result["output"]["ODNO"] == "O1"
+    assert kis.limit_calls == 1
+    assert kis.market_calls == 0
+
+
+def test_explicit_limit_reject_never_falls_back_to_market(monkeypatch):
+    from trader.execution import place_buy_with_fallback
+
+    monkeypatch.setattr("trader.execution.time.sleep", lambda *_args, **_kwargs: None)
+
+    class FakeKIS:
+        def __init__(self):
+            self.market_calls = 0
+
+        def buy_stock_limit_guarded(self, code, qty, price):
+            return {"rt_cd": "1", "msg_cd": "BROKER_REJECT", "msg1": "rejected"}
+
+        def check_filled(self, _result):
+            return False
+
+        def buy_stock_market_guarded(self, code, qty):
+            self.market_calls += 1
+            return {"rt_cd": "0", "output": {"ODNO": "O2"}}
+
+        def get_current_price(self, code):
+            return 10000
+
+    kis = FakeKIS()
+    result = place_buy_with_fallback(kis, "000660", 1, 10000)
+
+    assert result["rt_cd"] == "1"
+    assert kis.market_calls == 0
+
+
+def test_sell_timeout_is_not_blindly_retried():
+    from trader.execution import _sell_once
+
+    class FakeKIS:
+        def __init__(self):
+            self.sell_calls = 0
+
+        def get_current_price(self, code):
+            return 10000
+
+        def sell_stock_market(self, code, qty):
+            self.sell_calls += 1
+            raise KisTemporaryError("ACK lost after POST")
+
+    kis = FakeKIS()
+    with pytest.raises(KisTemporaryError):
+        _sell_once(kis, "000660", 1, prefer_market=True)
+
+    assert kis.sell_calls == 1
