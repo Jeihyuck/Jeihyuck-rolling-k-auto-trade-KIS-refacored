@@ -342,3 +342,84 @@ def test_order_cash_explicit_gateway_reject_does_not_change_order_mode(monkeypat
     assert result["rt_cd"] == "1"
     assert result["msg_cd"] == "IGW00008"
     assert calls["n"] == 1
+
+
+def test_order_egw00201_business_reject_is_explicit_not_ambiguous(monkeypatch):
+    _configure_direct_order_http_test(monkeypatch)
+    api = KisAPI(kis_env="practice")
+    calls = {"n": 0}
+
+    class RateLimitRejectResponse:
+        status_code = 200
+        text = '{"rt_cd":"1","msg_cd":"EGW00201","msg1":"초당 거래건수 초과"}'
+
+        def json(self):
+            return {
+                "rt_cd": "1",
+                "msg_cd": "EGW00201",
+                "msg1": "초당 거래건수 초과",
+            }
+
+    def respond(*_args, **_kwargs):
+        calls["n"] += 1
+        return RateLimitRejectResponse()
+
+    monkeypatch.setattr(api.session, "request", respond)
+    response = api._safe_request(
+        "POST",
+        "https://openapivts.koreainvestment.com:29443/uapi/domestic-stock/v1/trading/order-cash",
+        headers={},
+        data=b"{}",
+        timeout=(0.05, 0.05),
+    )
+
+    assert calls["n"] == 1
+    assert response.json()["rt_cd"] == "1"
+    assert response.json()["msg_cd"] == "EGW00201"
+
+
+def test_explicit_rejected_buy_row_with_submitted_timestamp_does_not_fence_retry():
+    from trader.pb1_engine import PB1Engine
+
+    row = {
+        "status": "ERROR",
+        "submitted_at": "2026-09-23T13:00:00+09:00",
+        "acked_at": None,
+        "kis_odno": None,
+        "broker_order_id": None,
+        "response_json": {
+            "rt_cd": "1",
+            "msg_cd": "EGW00201",
+            "msg1": "초당 거래건수 초과",
+        },
+    }
+    assert PB1Engine._is_blocking_open_buy_row(row) is False
+
+
+def test_sell_auth_retry_reuses_wrapper_refreshed_token_without_second_refresh():
+    from trader.execution import _sell_once
+
+    class FakeKIS:
+        def __init__(self):
+            self.sell_calls = 0
+            self.refresh_calls = 0
+
+        def get_current_price(self, _code):
+            return 10000
+
+        def refresh_token(self):
+            self.refresh_calls += 1
+            raise AssertionError("_sell_once must not refresh token a second time")
+
+        def sell_stock_market(self, _code, _qty):
+            self.sell_calls += 1
+            if self.sell_calls == 1:
+                raise KisAuthError("HTTP 401 order auth rejection; wrapper already refreshed")
+            return {"rt_cd": "0", "output": {"ODNO": "SELL-RETRY-1"}}
+
+    kis = FakeKIS()
+    _, result = _sell_once(kis, "000660", 1, prefer_market=True)
+
+    assert result["rt_cd"] == "0"
+    assert kis.sell_calls == 2
+    assert kis.refresh_calls == 0
