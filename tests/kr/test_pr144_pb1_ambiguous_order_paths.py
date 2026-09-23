@@ -45,6 +45,27 @@ class AuthRejectThenAcceptBuyKis:
             "output": {"ODNO": f"RETRY-{code}-{qty}"},
         }
 
+class ExplicitRejectThenAcceptBuyKis:
+    def __init__(self) -> None:
+        self.buy_calls = 0
+
+    def buy_stock_limit(self, code: str, qty: int, price: float):
+        self.buy_calls += 1
+        if self.buy_calls == 1:
+            return {
+                "rt_cd": "1",
+                "msg_cd": "EGW00201",
+                "msg1": "초당 거래건수 초과",
+                "output": {},
+            }
+        return {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"RETRY-BIZ-{code}-{qty}"},
+        }
+
+
 class AckOnlyBuyKis:
     def __init__(self) -> None:
         self.buy_calls = 0
@@ -546,3 +567,39 @@ def test_add_on_partial_then_cancel_preserves_actual_qty_without_stage_advance(m
     assert int(stored["pyramid_level"] or 0) == 0
     assert float(stored["stop_price"] or 0.0) == 95.0
     assert _fill_count(db) == 1
+
+
+def test_add_on_explicit_business_reject_is_retryable_even_after_submitted_timestamp(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    parent = _prepare_parent_position(db)
+    kis = ExplicitRejectThenAcceptBuyKis()
+
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+    assert kis.buy_calls == 1
+
+    with db.connect() as conn:
+        first = dict(
+            conn.execute(
+                sa.select(schema_for_engine(db).orders)
+                .where(schema_for_engine(db).orders.c.stage == "PB1-ADD")
+            ).mappings().one()
+        )
+    assert first["status"] == "ERROR"
+    assert first["submitted_at"] is not None
+    assert first["response_json"]["rt_cd"] == "1"
+
+    _engine(db, kis)._place_add_on(parent, qty=2, price=101.0)
+    assert kis.buy_calls == 2
+
+    with db.connect() as conn:
+        rows = list(
+            conn.execute(
+                sa.select(schema_for_engine(db).orders)
+                .where(schema_for_engine(db).orders.c.stage == "PB1-ADD")
+                .order_by(schema_for_engine(db).orders.c.created_at)
+            ).mappings()
+        )
+    assert len(rows) == 2
+    assert rows[0]["client_order_key"] != rows[1]["client_order_key"]
+    assert rows[1]["status"] == "ACKED"
