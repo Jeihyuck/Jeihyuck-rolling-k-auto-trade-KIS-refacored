@@ -786,6 +786,9 @@ class USDataProvider:
                         "US", symbol, max_age_sec=ws_max_age, wait_sec=ws_wait
                     )
                 if ws_quote:
+                    if self._stage_cancelled():
+                        from trader.us.execution.kis_us_client import KisUSTemporaryError
+                        raise KisUSTemporaryError("entry stage cancelled after websocket quote")
                     data = {
                         "last": str(ws_quote.get("last") or "0"),
                         "open": "0",
@@ -937,6 +940,11 @@ class USDataProvider:
                         "duplicate_count": 0, "http_sync_attempted": False,
                         "http_sync_succeeded": False}
             audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+            if self._stage_cancelled():
+                return {"rows": [], "quality": "CANCELLED", "valid_bar_count": 0,
+                        "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
+                        "duplicate_count": 0, "http_sync_attempted": False,
+                        "http_sync_succeeded": False}
         except Exception as exc:
             logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
             return {"rows": [], "quality": "DB_ERROR", "valid_bar_count": 0, "db_latest": None, "expected_latest": None, "invalid_close_count": 0, "duplicate_count": 0, "http_sync_attempted": False, "http_sync_succeeded": False}
