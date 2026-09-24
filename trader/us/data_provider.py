@@ -645,6 +645,25 @@ class USDataProvider:
             self._client.bind_tick_context(self._tick_context)
         return self._client
 
+    def fork_for_stage(self, *, stage_deadline: float) -> "USDataProvider":
+        """Create a stage-isolated provider sharing tick caches but not the KIS client.
+
+        A timed-out entry worker must not keep extending the main provider's KIS
+        request budget or interfere with later broker routing.
+        """
+        fork = USDataProvider(
+            offline=self._offline,
+            cache_enabled=self._cache_enabled,
+            env=self._env,
+        )
+        fork._daily_cache = self._daily_cache
+        fork._price_cache = self._price_cache
+        fork._tick_context = self._tick_context
+        client = fork._get_client()
+        client._stage_deadline = float(stage_deadline)
+        client._stage_max_attempts = 1
+        return fork
+
     def _load_daily_prices_from_db(
         self, symbol: str, market: str = "US", days: int = 120
     ) -> list[dict]:
