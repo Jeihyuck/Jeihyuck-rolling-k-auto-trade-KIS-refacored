@@ -476,7 +476,6 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
 
 
 def _position_market_value_usd(position: dict) -> float:
-def _position_market_value_usd(position: dict) -> float:
     """Return the best available USD market value from DB or KIS balance rows."""
     for key in (
         "market_value_usd",
