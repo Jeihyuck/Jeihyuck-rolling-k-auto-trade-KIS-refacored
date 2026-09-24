@@ -112,4 +112,6 @@ def sync_profit_capture_stage_from_order(**event) -> None:
         str(event.get("trade_date") or ""), str(event.get("symbol") or ""), stage,
         position_lifecycle_id=lifecycle, order_key=key,
         broker_order_no=event.get("broker_order_no"), status=status,
+        qty=requested if requested > 0 else None,
+        filled_qty=filled if filled >= 0 else None,
     )
