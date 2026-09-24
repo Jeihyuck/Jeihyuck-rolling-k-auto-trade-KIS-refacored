@@ -2988,7 +2988,10 @@ def run_trade_tick(
                         _entry_cancel_event = Event()
                         _entry_stage_deadline = time.monotonic() + float(_entry_budget_sec)
                         _entry_provider = (
-                            provider.fork_for_stage(stage_deadline=_entry_stage_deadline)
+                            provider.fork_for_stage(
+                                stage_deadline=_entry_stage_deadline,
+                                cancel_event=_entry_cancel_event,
+                            )
                             if hasattr(provider, "fork_for_stage") else provider
                         )
                         entry_intents = run_entry_eval_with_timeout(
