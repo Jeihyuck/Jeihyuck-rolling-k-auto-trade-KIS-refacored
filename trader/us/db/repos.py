@@ -1939,7 +1939,8 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
             if trading_epoch_id:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at, trading_epoch_id, meta
+                           order_no, client_order_key, filled_at, trading_epoch_id,
+                           avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct, meta
                     FROM us_fills
                     WHERE trade_date=:td AND trading_epoch_id=:trading_epoch_id
                 """
@@ -1947,7 +1948,8 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
             else:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at, meta
+                           order_no, client_order_key, filled_at,
+                           avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct, meta
                     FROM us_fills
                     WHERE trade_date=:td
                 """
