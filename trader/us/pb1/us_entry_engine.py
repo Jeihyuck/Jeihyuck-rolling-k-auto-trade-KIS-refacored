@@ -1312,6 +1312,8 @@ def generate_entry_intents(
             "market_regime": intent.get("market_regime"),
         })
 
+        if _stop_if_cancelled("before_order_preflight"):
+            break
         if intent_acceptor is not None:
             decision = intent_acceptor(intent)
             if not getattr(decision, "allowed", bool(decision)):
@@ -1321,6 +1323,8 @@ def generate_entry_intents(
                     break
                 continue
             intent = getattr(decision, "resized_intent", None) or intent
+        if _stop_if_cancelled("before_intent_append"):
+            break
         logger.info(
             "[US_ENTRY_INTENT_CREATED] symbol=%s side=BUY qty=%s estimated_notional=%.4f position_action=%s",
             symbol,
