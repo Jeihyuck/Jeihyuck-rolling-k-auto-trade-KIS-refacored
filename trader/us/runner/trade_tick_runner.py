@@ -2999,11 +2999,23 @@ def run_trade_tick(
                                 len(eligible_watchlist_rows), len(preblocked_rows),
                             )
                     except concurrent.futures.TimeoutError:
-                        logger.error(
-                            "[US_ENTRY][EVAL][TIMEOUT] timeout_sec=%d",
-                            entry_eval_timeout_sec,
-                        )
-                        entry_eval_error_count += 1
+                        if entry_degraded_reason == "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET":
+                            logger.warning(
+                                "[US_ENTRY][EVAL][DEFERRED] budget_sec=%.3f configured_sec=%d remaining_sec=%.3f reserve_sec=%.3f",
+                                float(locals().get("_entry_budget_sec", 0.0)),
+                                entry_eval_timeout_sec,
+                                tick_context.remaining_sec(),
+                                resolve_us_execution_tail_reserve_sec(),
+                            )
+                        else:
+                            logger.error(
+                                "[US_ENTRY][EVAL][TIMEOUT] timeout_sec=%.3f configured_sec=%d remaining_sec=%.3f reserve_sec=%.3f",
+                                float(locals().get("_entry_budget_sec", entry_eval_timeout_sec)),
+                                entry_eval_timeout_sec,
+                                tick_context.remaining_sec(),
+                                resolve_us_execution_tail_reserve_sec(),
+                            )
+                            entry_eval_error_count += 1
                         entry_intents = []
                     except Exception as exc:
                         logger.error(
