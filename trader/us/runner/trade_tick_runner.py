@@ -71,7 +71,7 @@ def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = pool.submit(fn)
     try:
-        return future.result(timeout=max(0.001, float(timeout_sec)))
+        result = future.result(timeout=max(0.001, float(timeout_sec)))
     except concurrent.futures.TimeoutError:
         if cancel_event is not None and hasattr(cancel_event, "set"):
             cancel_event.set()
@@ -83,8 +83,8 @@ def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
             cancel_event.set()
         pool.shutdown(wait=False, cancel_futures=True)
         raise
-    else:
-        pool.shutdown(wait=False, cancel_futures=True)
+    pool.shutdown(wait=False, cancel_futures=True)
+    return result
 
 
 def should_fetch_fills_for_tick(*, tick_index: int, pending_order_count: int,
