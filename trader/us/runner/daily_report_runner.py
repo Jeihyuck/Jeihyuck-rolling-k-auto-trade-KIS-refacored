@@ -204,32 +204,42 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
             fill_key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
             matched_fills = buy_fills_by_key.get(fill_key) or []
             eod_price = _safe_number(pos.get("current_price"))
-            lot_qty = 0.0
-            lot_basis = 0.0
-            lot_pnl = 0.0
+            eod_qty = _safe_number(pos.get("qty")) or 0.0
+            pre_order_qty = _safe_number(audit.get("pre_order_holding_qty"))
+            raw_lot_qty = 0.0
+            raw_lot_basis = 0.0
             lot_source = "UNKNOWN"
             if eod_price is not None and matched_fills:
                 for fill in matched_fills:
                     qty = _safe_number(fill.get("qty")) or 0.0
                     price = _safe_number(fill.get("price_usd") or fill.get("price"))
                     if qty > 0 and price is not None:
-                        lot_qty += qty
-                        lot_basis += qty * price
-                        lot_pnl += qty * (eod_price - price)
-                if lot_qty > 0:
+                        raw_lot_qty += qty
+                        raw_lot_basis += qty * price
+                if raw_lot_qty > 0:
                     lot_source = "AUTHORITATIVE_KIS_BUY_FILL"
             elif eod_price is not None:
                 qty = _safe_number(audit.get("filled_qty")) or 0.0
                 price = _safe_number(audit.get("fill_price"))
                 if qty > 0 and price is not None:
-                    lot_qty = qty
-                    lot_basis = qty * price
-                    lot_pnl = qty * (eod_price - price)
+                    raw_lot_qty = qty
+                    raw_lot_basis = qty * price
                     lot_source = "ORDER_AUDIT_FILL_FALLBACK"
+
+            avg_buy_fill = (raw_lot_basis / raw_lot_qty) if raw_lot_qty > 0 else None
+            if pre_order_qty is not None:
+                attributable_open_qty = min(raw_lot_qty, max(0.0, eod_qty - pre_order_qty))
+            else:
+                attributable_open_qty = min(raw_lot_qty, eod_qty)
+            lot_qty = attributable_open_qty
+            lot_basis = (lot_qty * avg_buy_fill) if lot_qty > 0 and avg_buy_fill is not None else 0.0
+            lot_pnl = (lot_qty * (eod_price - avg_buy_fill)) if lot_qty > 0 and avg_buy_fill is not None and eod_price is not None else 0.0
 
             lot_pct = (lot_pnl / lot_basis) * 100.0 if lot_basis > 0 else None
             item.update({
+                "same_day_buy_filled_qty": raw_lot_qty if raw_lot_qty > 0 else None,
                 "same_day_buy_lot_qty": lot_qty if lot_qty > 0 else None,
+                "same_day_buy_lot_attribution": "NET_ADDED_OPEN_QTY_LIFO_BY_ORDER",
                 "same_day_buy_lot_cost_basis_usd": round(lot_basis, 4) if lot_basis > 0 else None,
                 "same_day_buy_lot_unrealized_pnl_usd": round(lot_pnl, 4) if lot_qty > 0 else None,
                 "same_day_buy_lot_unrealized_pnl_pct": round(lot_pct, 4) if lot_pct is not None else None,
