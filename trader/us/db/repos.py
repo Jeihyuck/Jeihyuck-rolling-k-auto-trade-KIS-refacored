@@ -2273,7 +2273,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
                 sql = """
-                    UPDATE us_positions SET qty=0,
+                    UPDATE us_positions SET qty=0, unrealized_pnl_usd=0,
                       meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
                         'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
                         'closed_at',NOW()::text,'close_source',CAST(:source AS text))
