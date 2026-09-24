@@ -508,6 +508,7 @@ def generate_entry_intents(
     available_new_slots: int | None = None,
     diagnostics: dict[str, Any] | None = None,
     intent_acceptor: Any | None = None,
+    cancel_event: Any | None = None,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -531,6 +532,18 @@ def generate_entry_intents(
     """
     from trader.us.symbols import resolve_exchange
     from trader.us.pb1.us_position_sizing import calc_position_size
+
+    def _entry_cancelled() -> bool:
+        return bool(cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set())
+
+    def _stop_if_cancelled(stage: str) -> bool:
+        if not _entry_cancelled():
+            return False
+        if diagnostics is not None:
+            diagnostics["cancelled"] = True
+            diagnostics["cancelled_stage"] = stage
+        logger.warning("[US_ENTRY][CANCELLED] stage=%s action=stop_entry_eval", stage)
+        return True
 
     if max_new_entries is None:
         max_new_entries = int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3"))
@@ -599,6 +612,8 @@ def generate_entry_intents(
     price_lookup_budget_exhausted = False
 
     for symbol in symbols:
+        if _stop_if_cancelled("phase1_symbol_loop"):
+            break
         # symbol이 str인지 확인
         if not isinstance(symbol, str):
             logger.error(
@@ -746,6 +761,8 @@ def generate_entry_intents(
         else:
             # Trade fallback must not call KIS dailyprice intraday. Use DB-only
             # completed daily if a USDataProvider supports it; otherwise skip.
+            if _stop_if_cancelled("fallback_daily_before_lookup"):
+                break
             try:
                 exchange = resolve_exchange(symbol)
                 if not hasattr(provider, "get_completed_daily_prices"):
@@ -869,6 +886,8 @@ def generate_entry_intents(
     # slot.  Evaluate the complete deterministic pool until N intents are
     # accepted or the pool is exhausted.
     for rank, (score, symbol, exchange, existing_price, entry_meta) in enumerate(candidates):
+        if _stop_if_cancelled("phase2_candidate_loop"):
+            break
         if added_count >= max_new_entries:
             break
         symbol_upper_for_capacity = str(symbol or "").upper().strip()
@@ -879,6 +898,8 @@ def generate_entry_intents(
             held_candidates_evaluated_for_add += 1
         # Price lookup (필요한 경우)
         if existing_price is None:
+            if _stop_if_cancelled("before_current_price_lookup"):
+                break
             price_lookup_attempted += 1
             if price_lookup_count >= max_total_lookup:
                 price_lookup_budget_exhausted = True
