@@ -82,7 +82,31 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
 """
 
 
-def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
+def _us_fills_has_realized_pnl_columns(conn: Any) -> bool:
+    """Whether optional migration-0044 realized-PnL columns exist."""
+    try:
+        result = conn.execute(text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='us_fills'
+              AND column_name IN ('avg_cost_at_sell','realized_pnl_usd','realized_pnl_pct')
+        """))
+        mappings = getattr(result, "mappings", None)
+        if callable(mappings):
+            rows = mappings().all()
+            names = {str(row.get("column_name") or "") for row in rows}
+        else:
+            fetchall = getattr(result, "fetchall", None)
+            rows = fetchall() if callable(fetchall) else []
+            names = {str(row[0]) for row in rows if row}
+        return {"avg_cost_at_sell","realized_pnl_usd","realized_pnl_pct"} <= names
+    except Exception as exc:
+        logger.warning("[US_FILLS][PNL_SCHEMA_CHECK_WARN] %s", exc)
+        return False
+
+
+def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True,
+                                   include_pnl_columns: bool = False):
     """Build the typed actual-fill update used by PostgreSQL reconciliation.
 
     psycopg3 must not receive JSONB object values as ``unknown`` parameters:
@@ -91,6 +115,13 @@ def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
     different SQLAlchemy/psycopg3 versions in production and repair jobs.
     """
     sql = _MARK_FILLED_BY_RECONCILE_SQL
+    if not include_pnl_columns:
+        sql = sql.replace(
+            "      avg_cost_at_sell = COALESCE(CAST(:avg_cost_at_sell AS numeric), avg_cost_at_sell),\n"
+            "      realized_pnl_usd = COALESCE(CAST(:realized_pnl_usd AS numeric), realized_pnl_usd),\n"
+            "      realized_pnl_pct = COALESCE(CAST(:realized_pnl_pct AS numeric), realized_pnl_pct),\n",
+            "",
+        )
     if not epoch_scoped:
         sql = sql.replace(
             """      AND (
