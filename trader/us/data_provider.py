@@ -812,6 +812,10 @@ class USDataProvider:
             except Exception as exc:
                 logger.warning("[US_KIS][WS_PRICE_FALLBACK] symbol=%s err=%s", symbol, exc)
 
+        if self._stage_cancelled():
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            raise KisUSTemporaryError("entry stage cancelled after websocket price lookup")
+
         # Cache hit
         if self._cache_enabled and cache_key in self._price_cache:
             self.stats["price_hit"] += 1
@@ -837,6 +841,9 @@ class USDataProvider:
             if ctx is not None:
                 ctx.count("quote_http_calls")
             result = self._get_client().get_us_price(symbol, exchange)
+            if self._stage_cancelled():
+                from trader.us.execution.kis_us_client import KisUSTemporaryError
+                raise KisUSTemporaryError("entry stage cancelled after KIS price lookup")
             output = result.get("output", {})
             quote_quality = str(result.get("_quote_quality") or "FRESH").upper()
             data = {
@@ -924,6 +931,11 @@ class USDataProvider:
         required = int(required_bars or int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
         try:
             rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+            if self._stage_cancelled():
+                return {"rows": [], "quality": "CANCELLED", "valid_bar_count": 0,
+                        "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
+                        "duplicate_count": 0, "http_sync_attempted": False,
+                        "http_sync_succeeded": False}
             audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
         except Exception as exc:
             logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
