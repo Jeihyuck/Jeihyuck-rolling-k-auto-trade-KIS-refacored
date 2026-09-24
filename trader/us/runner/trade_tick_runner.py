@@ -62,6 +62,31 @@ def budgeted_entry_timeout_sec(context: Any, configured_timeout_sec: float) -> f
     return max(0.0, min(float(configured_timeout_sec), remaining - reserve))
 
 
+def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
+    """Run entry evaluation without waiting for a timed-out worker to finish.
+
+    The caller must pass an isolated/stage-bounded provider to the worker.
+    Cooperative cancellation stops further candidate/KIS work after timeout.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn)
+    try:
+        return future.result(timeout=max(0.001, float(timeout_sec)))
+    except concurrent.futures.TimeoutError:
+        if cancel_event is not None and hasattr(cancel_event, "set"):
+            cancel_event.set()
+        future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    except Exception:
+        if cancel_event is not None and hasattr(cancel_event, "set"):
+            cancel_event.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def should_fetch_fills_for_tick(*, tick_index: int, pending_order_count: int,
                                 reconcile_only_until_clean: bool, interval_ticks: int = 3) -> bool:
     """Poll broker fills on first/periodic/recovery ticks or whenever an order is pending."""
@@ -2959,11 +2984,17 @@ def run_trade_tick(
                             logger.warning("[US_ENTRY][DEFER_BUDGET] remaining_sec=%.3f reserve_sec=%.3f action=NEXT_TICK",
                                            tick_context.remaining_sec(), resolve_us_execution_tail_reserve_sec())
                             raise concurrent.futures.TimeoutError("entry deferred to preserve execution tail")
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            fut = pool.submit(
-                                engine.evaluate_entries,
+                        from threading import Event
+                        _entry_cancel_event = Event()
+                        _entry_stage_deadline = time.monotonic() + float(_entry_budget_sec)
+                        _entry_provider = (
+                            provider.fork_for_stage(stage_deadline=_entry_stage_deadline)
+                            if hasattr(provider, "fork_for_stage") else provider
+                        )
+                        entry_intents = run_entry_eval_with_timeout(
+                            lambda: engine.evaluate_entries(
                                 None,
-                                provider,
+                                _entry_provider,
                                 sold_today,
                                 effective_budget,
                                 position_count,
@@ -2975,8 +3006,11 @@ def run_trade_tick(
                                 available_new_slots=available_new_slots,
                                 max_new_entries=_incremental_total_target,
                                 intent_acceptor=incremental_preflight_session.consider,
-                            )
-                            entry_intents = fut.result(timeout=_entry_budget_sec)
+                                cancel_event=_entry_cancel_event,
+                            ),
+                            timeout_sec=_entry_budget_sec,
+                            cancel_event=_entry_cancel_event,
+                        )
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
                         contract_integrity_blocks = [
                             item for item in (entry_generation_diagnostics.get("blocked") or [])
