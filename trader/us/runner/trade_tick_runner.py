@@ -2950,7 +2950,9 @@ def run_trade_tick(
                         tick_context.metrics["entry_budget_sec"] = _entry_budget_sec
                         tick_context.metrics["execution_tail_reserve_sec"] = resolve_us_execution_tail_reserve_sec()
                         tick_context.metrics["remaining_before_entry_eval_sec"] = tick_context.remaining_sec()
-                        if _entry_budget_sec < float(os.getenv("US_MIN_ENTRY_EVAL_BUDGET_SEC", "5") or 5):
+                        _configured_min_entry_budget = float(os.getenv("US_MIN_ENTRY_EVAL_BUDGET_SEC", "5") or 5)
+                        _required_entry_budget = min(float(entry_eval_timeout_sec), _configured_min_entry_budget)
+                        if _entry_budget_sec < _required_entry_budget:
                             entry_degraded = True
                             entry_degraded_reason = "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET"
                             entry_intents = []
