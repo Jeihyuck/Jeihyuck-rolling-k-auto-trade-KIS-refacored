@@ -336,8 +336,45 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
             if pct is not None:
                 authoritative_sell_pct[key] = pct
 
+    allocation_fill_rows = list(fill_rows or [])
+    observed_order_keys: set[str] = set()
+    for fill in allocation_fill_rows:
+        for candidate in (fill.get("client_order_key"), fill.get("order_no")):
+            if candidate:
+                observed_order_keys.add(str(candidate))
+
+    # If canonical fill rows are unavailable for an otherwise filled order,
+    # feed order-audit evidence into the same chronological ledger.  Do not
+    # fall back to independent per-BUY EOD caps, which can double-count shares.
+    for audit in order_audit or []:
+        side = str(audit.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
+        if not key or key in observed_order_keys:
+            continue
+        qty = _safe_number(audit.get("filled_qty")) or 0.0
+        price = _safe_number(audit.get("fill_price"))
+        if qty <= 0 or price is None:
+            continue
+        allocation_fill_rows.append({
+            "symbol": audit.get("symbol"),
+            "side": side,
+            "qty": qty,
+            "price_usd": price,
+            "client_order_key": key,
+            "filled_at": audit.get("filled_at") or audit.get("acknowledged_at") or audit.get("submitted_at") or "",
+            "meta": {
+                "is_synthetic": False,
+                "fill_evidence_type": "ORDER_AUDIT_FILL_FALLBACK",
+                "pre_order_holding_qty": audit.get("pre_order_holding_qty"),
+                "pre_order_position_qty": audit.get("pre_order_holding_qty"),
+            },
+        })
+        observed_order_keys.add(key)
+
     buy_allocations = _allocate_eod_same_day_buy_lots(
-        fill_rows=fill_rows or [],
+        fill_rows=allocation_fill_rows,
         positions=positions,
     )
 
