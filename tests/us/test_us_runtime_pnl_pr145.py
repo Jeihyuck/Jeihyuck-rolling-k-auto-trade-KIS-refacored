@@ -181,7 +181,7 @@ def test_trade_reason_pnl_summary_includes_sell_realized_and_buy_eod():
         (195.17 - 192.3156) * 17, abs=0.001
     )
     buy = next(x for x in summary["trade_details"] if x["symbol"] == "TEAM")
-    assert buy["eod_unrealized_pnl_pct"] == pytest.approx((195.17 / 192.3156 - 1) * 100, abs=0.001)
+    assert buy["same_day_buy_lot_unrealized_pnl_pct"] == pytest.approx((195.17 / 192.3156 - 1) * 100, abs=0.001)
 
 
 def test_execution_quantity_provenance_distinguishes_strategy_and_broker_resize():
@@ -264,3 +264,126 @@ def test_authoritative_partial_fill_recomputes_realized_pnl_on_cumulative_growth
     assert len(repos._MEM_FILLS) == 1
     assert repos._MEM_FILLS[0]["qty"] == 4
     assert repos._MEM_FILLS[0]["meta"]["realized_pnl_usd"] == pytest.approx(32.24)
+
+
+def test_entry_timeout_returns_without_waiting_for_stubborn_worker():
+    import threading
+    import time
+
+    from trader.us.runner.trade_tick_runner import run_entry_eval_with_timeout
+
+    cancel = threading.Event()
+
+    def stubborn():
+        time.sleep(0.25)
+        return ["late"]
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        run_entry_eval_with_timeout(stubborn, timeout_sec=0.02, cancel_event=cancel)
+    elapsed = time.monotonic() - started
+
+    assert cancel.is_set()
+    assert elapsed < 0.12
+
+
+def test_stage_provider_uses_isolated_kis_client_and_deadline():
+    import time
+
+    from trader.us.data_provider import USDataProvider
+
+    provider = USDataProvider(offline=True, cache_enabled=True, env="practice")
+    original_client = provider._get_client()
+    deadline = time.monotonic() + 1.0
+    fork = provider.fork_for_stage(stage_deadline=deadline)
+
+    assert fork is not provider
+    assert fork._get_client() is not original_client
+    assert fork._get_client()._stage_deadline == pytest.approx(deadline)
+    assert fork._get_client()._stage_max_attempts == 1
+
+
+def test_add_to_existing_reports_only_same_day_buy_lot_pnl():
+    from trader.us.runner.daily_report_runner import _build_trade_reason_pnl_summary
+
+    summary = _build_trade_reason_pnl_summary(
+        [
+            {
+                "symbol": "MSFT",
+                "side": "BUY",
+                "client_order_key": "MSFT-ADD-1",
+                "position_action": "ADD_TO_EXISTING_BUY",
+                "filled_qty": 2,
+                "fill_price": 100.0,
+            },
+        ],
+        [
+            {
+                "symbol": "MSFT",
+                "qty": 12,
+                "avg_cost": 90.0,
+                "current_px": 110.0,
+                "unrealized_pnl_usd": 240.0,
+                "meta": {"entry_reason": "ENTRY_MOMENTUM"},
+            },
+        ],
+        [
+            {
+                "symbol": "MSFT",
+                "side": "BUY",
+                "qty": 2,
+                "price_usd": 100.0,
+                "client_order_key": "MSFT-ADD-1",
+                "meta": {
+                    "is_synthetic": False,
+                    "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                },
+            },
+        ],
+    )
+
+    assert summary["position_pnl_snapshot"]["MSFT"]["unrealized_pnl_usd"] == pytest.approx(240.0)
+    assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(20.0)
+    assert summary["gross_trade_day_impact_usd"] == pytest.approx(20.0)
+
+    trade = summary["trade_details"][0]
+    assert trade["eod_position_unrealized_pnl_usd"] == pytest.approx(240.0)
+    assert trade["same_day_buy_lot_qty"] == pytest.approx(2.0)
+    assert trade["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(20.0)
+    assert trade["same_day_buy_lot_pnl_source"] == "AUTHORITATIVE_KIS_BUY_FILL"
+
+
+def test_cancelled_entry_engine_stops_before_provider_lookup(monkeypatch):
+    import threading
+
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    cancel = threading.Event()
+    cancel.set()
+
+    class Provider:
+        def get_current_price(self, *args, **kwargs):
+            raise AssertionError("provider lookup must not run after cancellation")
+
+    diagnostics = {}
+    result = generate_entry_intents(
+        tickers=None,
+        provider=Provider(),
+        sold_today=set(),
+        available_cash_usd=10000.0,
+        position_count=0,
+        capital_usd_cap=10000.0,
+        watchlist_entries=[{
+            "symbol": "MSFT",
+            "score_final": 0.8,
+            "exchange": "NASDAQ",
+            "entry_reason": "ENTRY_MOMENTUM",
+            "entry_style_selected": "pb1_momentum",
+        }],
+        current_position_symbols=set(),
+        diagnostics=diagnostics,
+        cancel_event=cancel,
+    )
+
+    assert result == []
+    assert diagnostics["cancelled"] is True
