@@ -437,6 +437,7 @@ def test_same_day_buy_lot_pnl_caps_to_net_added_open_qty_after_sell():
             "meta": {
                 "is_synthetic": False,
                 "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "pre_order_holding_qty": 10,
             },
         }],
     )
@@ -446,3 +447,126 @@ def test_same_day_buy_lot_pnl_caps_to_net_added_open_qty_after_sell():
     assert trade["same_day_buy_lot_qty"] == pytest.approx(1.0)
     assert trade["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(10.0)
     assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(10.0)
+
+
+def test_same_symbol_multiple_buys_partial_sell_allocates_eod_lots_once_fifo():
+    from trader.us.runner.daily_report_runner import _build_trade_reason_pnl_summary
+
+    summary = _build_trade_reason_pnl_summary(
+        [
+            {
+                "symbol": "XYZ", "side": "BUY",
+                "client_order_key": "XYZ-B1",
+                "filled_qty": 2, "fill_price": 100.0,
+            },
+            {
+                "symbol": "XYZ", "side": "BUY",
+                "client_order_key": "XYZ-B2",
+                "filled_qty": 3, "fill_price": 105.0,
+            },
+            {
+                "symbol": "XYZ", "side": "SELL",
+                "client_order_key": "XYZ-S1",
+                "filled_qty": 3, "fill_price": 110.0,
+                "gross_realized_pnl": 21.0,
+            },
+        ],
+        [{
+            "symbol": "XYZ",
+            "qty": 2,
+            "avg_cost": 105.0,
+            "current_px": 120.0,
+            "unrealized_pnl_usd": 30.0,
+        }],
+        [
+            {
+                "symbol": "XYZ", "side": "BUY", "qty": 2, "price_usd": 100.0,
+                "client_order_key": "XYZ-B1",
+                "filled_at": "2026-09-23T14:00:00+00:00",
+                "meta": {
+                    "is_synthetic": False,
+                    "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    "pre_order_position_qty": 0,
+                },
+            },
+            {
+                "symbol": "XYZ", "side": "BUY", "qty": 3, "price_usd": 105.0,
+                "client_order_key": "XYZ-B2",
+                "filled_at": "2026-09-23T14:05:00+00:00",
+                "meta": {
+                    "is_synthetic": False,
+                    "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    "pre_order_position_qty": 2,
+                },
+            },
+            {
+                "symbol": "XYZ", "side": "SELL", "qty": 3, "price_usd": 110.0,
+                "client_order_key": "XYZ-S1",
+                "filled_at": "2026-09-23T14:10:00+00:00",
+                "realized_pnl_usd": 21.0,
+                "meta": {
+                    "is_synthetic": False,
+                    "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    "pre_order_holding_qty": 5,
+                },
+            },
+        ],
+    )
+
+    buys = {
+        row["client_order_key"]: row
+        for row in summary["trade_details"]
+        if row["side"] == "BUY"
+    }
+    assert buys["XYZ-B1"]["same_day_buy_lot_qty"] is None
+    assert buys["XYZ-B1"]["same_day_buy_lot_unrealized_pnl_usd"] is None
+    assert buys["XYZ-B2"]["same_day_buy_lot_qty"] == pytest.approx(2.0)
+    assert buys["XYZ-B2"]["same_day_buy_lot_cost_basis_usd"] == pytest.approx(210.0)
+    assert buys["XYZ-B2"]["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(30.0)
+
+    assert summary["same_day_buy_lot_cost_basis_usd"] == pytest.approx(210.0)
+    assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(30.0)
+    assert summary["realized_pnl_usd"] == pytest.approx(21.0)
+    assert summary["gross_trade_day_impact_usd"] == pytest.approx(51.0)
+    assert summary["buy_lot_attribution"] == "SYMBOL_CHRONOLOGICAL_FIFO"
+
+
+def test_same_symbol_buy_sell_buy_respects_fill_time_order():
+    from trader.us.runner.daily_report_runner import _build_trade_reason_pnl_summary
+
+    summary = _build_trade_reason_pnl_summary(
+        [
+            {"symbol": "XYZ", "side": "BUY", "client_order_key": "B1", "filled_qty": 2, "fill_price": 100.0},
+            {"symbol": "XYZ", "side": "SELL", "client_order_key": "S1", "filled_qty": 1, "fill_price": 110.0},
+            {"symbol": "XYZ", "side": "BUY", "client_order_key": "B2", "filled_qty": 2, "fill_price": 105.0},
+        ],
+        [{"symbol": "XYZ", "qty": 3, "current_px": 120.0, "avg_cost": 103.3333}],
+        [
+            {
+                "symbol": "XYZ", "side": "BUY", "qty": 2, "price_usd": 100.0,
+                "client_order_key": "B1", "filled_at": "2026-09-23T14:00:00+00:00",
+                "meta": {"is_synthetic": False, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL", "pre_order_position_qty": 0},
+            },
+            {
+                "symbol": "XYZ", "side": "SELL", "qty": 1, "price_usd": 110.0,
+                "client_order_key": "S1", "filled_at": "2026-09-23T14:02:00+00:00",
+                "meta": {"is_synthetic": False, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL", "pre_order_holding_qty": 2},
+            },
+            {
+                "symbol": "XYZ", "side": "BUY", "qty": 2, "price_usd": 105.0,
+                "client_order_key": "B2", "filled_at": "2026-09-23T14:04:00+00:00",
+                "meta": {"is_synthetic": False, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL", "pre_order_position_qty": 1},
+            },
+        ],
+    )
+
+    buys = {
+        row["client_order_key"]: row
+        for row in summary["trade_details"]
+        if row["side"] == "BUY"
+    }
+    assert buys["B1"]["same_day_buy_lot_qty"] == pytest.approx(1.0)
+    assert buys["B1"]["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(20.0)
+    assert buys["B2"]["same_day_buy_lot_qty"] == pytest.approx(2.0)
+    assert buys["B2"]["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(30.0)
+    assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(50.0)
