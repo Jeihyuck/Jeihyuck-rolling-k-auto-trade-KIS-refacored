@@ -2979,6 +2979,7 @@ def mark_order_filled_by_reconcile(
                     "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
                     "cok": resolved_client_order_key, "ts": now_utc,
                     "meta": _json_param(fill_meta),
+                    "avg_cost_at_sell": fill_meta.get("cost_basis_price_usd"),
                     "realized_pnl_usd": fill_meta.get("realized_pnl_usd"),
                     "realized_pnl_pct": fill_meta.get("realized_pnl_pct"),
                     "idem": _us_fill_idempotency_key_text(fill, td),
@@ -2986,13 +2987,13 @@ def mark_order_filled_by_reconcile(
                 if order_epoch_id:
                     insert_params["trading_epoch_id"] = order_epoch_id
                     insert_sql = """INSERT INTO us_fills
-                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
-                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:realized_pnl_usd,:realized_pnl_pct,:idem)
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
                         ON CONFLICT (fill_idempotency_key) DO NOTHING"""
                 else:
                     insert_sql = """INSERT INTO us_fills
-                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
-                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:realized_pnl_usd,:realized_pnl_pct,:idem)
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
                         ON CONFLICT (fill_idempotency_key) DO NOTHING"""
                 conn.execute(text(insert_sql), insert_params)
             rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
