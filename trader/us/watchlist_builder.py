@@ -396,6 +396,7 @@ def build_us_watchlist(
                 "risk_score": risk_score,
             },
             "entry_style_selected": entry_style,
+            "entry_style_raw": entry_style,
         }
 
         scored_row = {
@@ -411,6 +412,7 @@ def build_us_watchlist(
             "breakout_score": breakout_score,
             "vcp_score": vcp_score,
             "entry_style_selected": entry_style,
+            "entry_style_raw": entry_style,
             "theme_cluster": theme_cluster,
             "rotation_regime": rotation_context.get("rotation_regime"),
             "reason_json": reason_json,
