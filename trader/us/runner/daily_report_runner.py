@@ -167,9 +167,32 @@ def _allocate_eod_same_day_buy_lots(
     allocations: dict[str, dict] = {}
     for symbol, fills in active_by_symbol.items():
         eod_qty = _safe_number((positions.get(symbol) or {}).get("qty")) or 0.0
+        fills = sorted(fills, key=_fill_event_sort_key)
         total_buy = sum((_safe_number(f.get("qty")) or 0.0) for f in fills if str(f.get("side") or "").upper() == "BUY")
         total_sell = sum((_safe_number(f.get("qty")) or 0.0) for f in fills if str(f.get("side") or "").upper() == "SELL")
-        opening_qty = max(0.0, eod_qty - total_buy + total_sell)
+
+        opening_qty_evidence = None
+        if fills:
+            first_meta_raw = fills[0].get("meta")
+            if isinstance(first_meta_raw, dict):
+                first_meta = first_meta_raw
+            elif isinstance(first_meta_raw, str):
+                try:
+                    first_meta = json.loads(first_meta_raw)
+                except Exception:
+                    first_meta = {}
+            else:
+                first_meta = {}
+            for key in ("pre_order_holding_qty", "pre_order_position_qty"):
+                value = _safe_number(first_meta.get(key))
+                if value is not None and value >= 0:
+                    opening_qty_evidence = value
+                    break
+        opening_qty = (
+            max(0.0, opening_qty_evidence)
+            if opening_qty_evidence is not None
+            else max(0.0, eod_qty - total_buy + total_sell)
+        )
 
         inventory: list[dict] = []
         if opening_qty > 0:
@@ -180,7 +203,7 @@ def _allocate_eod_same_day_buy_lots(
                 "price": None,
             })
 
-        for fill in sorted(fills, key=_fill_event_sort_key):
+        for fill in fills:
             side = str(fill.get("side") or "").upper()
             qty = _safe_number(fill.get("qty")) or 0.0
             if side == "BUY":
