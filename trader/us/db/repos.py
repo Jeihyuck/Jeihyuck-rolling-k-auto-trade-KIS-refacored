@@ -197,7 +197,7 @@ _US_DAILY_METRIC_FIELDS = (
     "daily_bar_count", "daily_metrics_as_of", "daily_metrics_source", "daily_history_quality",
     # Entry-decision provenance must survive Final30 -> locked DB -> live BUY.
     # Keep this aligned with trader.us.entry_exit_contract._PROVENANCE_FIELDS.
-    "entry_reason", "entry_style_selected", "entry_style", "entry_component",
+    "entry_reason", "entry_style_selected", "entry_style_raw", "entry_style", "entry_component",
     "entry_signal_type", "selected_reason",
     "breakout_score", "pullback_score", "momentum_score", "vcp_score",
     "agent_a_score", "agent_b_score", "rank_final30", "score_final",
