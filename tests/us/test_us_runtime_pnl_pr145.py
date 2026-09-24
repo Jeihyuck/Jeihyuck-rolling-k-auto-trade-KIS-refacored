@@ -182,3 +182,45 @@ def test_trade_reason_pnl_summary_includes_sell_realized_and_buy_eod():
     )
     buy = next(x for x in summary["trade_details"] if x["symbol"] == "TEAM")
     assert buy["eod_unrealized_pnl_pct"] == pytest.approx((195.17 / 192.3156 - 1) * 100, abs=0.001)
+
+
+def test_execution_quantity_provenance_distinguishes_strategy_and_broker_resize():
+    from trader.us.execution.order_router import annotate_execution_quantity_provenance
+
+    intent = {"meta": {"broker_cash_resized": True}}
+    out = annotate_execution_quantity_provenance(
+        intent, strategy_requested_qty=18, final_qty=17, price=193.9549
+    )
+    meta = out["meta"]
+    assert meta["strategy_requested_qty"] == 18
+    assert meta["execution_final_qty"] == 17
+    assert meta["execution_qty_changed"] is True
+    assert meta["execution_qty_change_reason"] == "BROKER_ORDERABLE_CASH_RESIZE"
+
+
+def test_authoritative_close_zeroes_stale_unrealized_pnl(monkeypatch):
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    repos._MEM_POSITIONS.append({
+        "as_of": "2026-09-23",
+        "symbol": "PLTR",
+        "exchange": "NASDAQ",
+        "qty": 10,
+        "avg_cost": 183.42,
+        "current_px": 191.87,
+        "unrealized_pnl_usd": 84.5,
+        "meta": {},
+    })
+    repos.save_position_snapshot(
+        [],
+        trade_date="2026-09-23",
+        balance_fetch_status="OK",
+        balance_parse_status="OK",
+        authoritative_positions=True,
+        preserve_previous_positions=False,
+    )
+    row = repos._MEM_POSITIONS[0]
+    assert row["qty"] == 0
+    assert row["unrealized_pnl_usd"] == 0.0
