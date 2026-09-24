@@ -406,3 +406,43 @@ def test_stage_provider_blocks_lookup_after_cancel():
 
     with pytest.raises(KisUSTemporaryError, match="entry stage cancelled"):
         fork.get_current_price("MSFT", "NASDAQ")
+
+
+def test_same_day_buy_lot_pnl_caps_to_net_added_open_qty_after_sell():
+    from trader.us.runner.daily_report_runner import _build_trade_reason_pnl_summary
+
+    summary = _build_trade_reason_pnl_summary(
+        [{
+            "symbol": "MSFT",
+            "side": "BUY",
+            "client_order_key": "MSFT-ADD-SELL",
+            "position_action": "ADD_TO_EXISTING_BUY",
+            "pre_order_holding_qty": 10,
+            "filled_qty": 2,
+            "fill_price": 100.0,
+        }],
+        [{
+            "symbol": "MSFT",
+            "qty": 11,
+            "avg_cost": 92.0,
+            "current_px": 110.0,
+            "unrealized_pnl_usd": 198.0,
+        }],
+        [{
+            "symbol": "MSFT",
+            "side": "BUY",
+            "qty": 2,
+            "price_usd": 100.0,
+            "client_order_key": "MSFT-ADD-SELL",
+            "meta": {
+                "is_synthetic": False,
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            },
+        }],
+    )
+
+    trade = summary["trade_details"][0]
+    assert trade["same_day_buy_filled_qty"] == pytest.approx(2.0)
+    assert trade["same_day_buy_lot_qty"] == pytest.approx(1.0)
+    assert trade["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(10.0)
+    assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(10.0)
