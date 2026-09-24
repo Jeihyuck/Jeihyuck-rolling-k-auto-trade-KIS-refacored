@@ -49,11 +49,17 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
       qty = CAST(:qty AS integer),
       price_usd = CAST(:price AS numeric),
       client_order_key = CAST(:cok AS text),
+      avg_cost_at_sell = COALESCE(CAST(:avg_cost_at_sell AS numeric), avg_cost_at_sell),
+      realized_pnl_usd = COALESCE(CAST(:realized_pnl_usd AS numeric), realized_pnl_usd),
+      realized_pnl_pct = COALESCE(CAST(:realized_pnl_pct AS numeric), realized_pnl_pct),
       meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
         'cumulative_filled_qty', CAST(:qty AS integer),
         'remaining_qty', CAST(:remaining AS integer),
         'requested_qty', CAST(:requested AS integer),
-        'observed_at', CAST(:ts AS text)
+        'observed_at', CAST(:ts AS text),
+        'cost_basis_price_usd', COALESCE(CAST(:avg_cost_at_sell AS numeric), NULL),
+        'realized_pnl_usd', COALESCE(CAST(:realized_pnl_usd AS numeric), NULL),
+        'realized_pnl_pct', COALESCE(CAST(:realized_pnl_pct AS numeric), NULL)
       )
     WHERE trade_date = CAST(:td AS date)
       AND order_no = CAST(:order_no AS text)
@@ -102,6 +108,9 @@ def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
         sa.bindparam("remaining", type_=sa.Integer()),
         sa.bindparam("requested", type_=sa.Integer()),
         sa.bindparam("ts", type_=sa.String()),
+        sa.bindparam("avg_cost_at_sell", type_=sa.Numeric()),
+        sa.bindparam("realized_pnl_usd", type_=sa.Numeric()),
+        sa.bindparam("realized_pnl_pct", type_=sa.Numeric()),
         sa.bindparam("td", type_=sa.Date()),
         sa.bindparam("order_no", type_=sa.String()),
         sa.bindparam("symbol", type_=sa.String()),
@@ -2804,6 +2813,10 @@ def mark_order_filled_by_reconcile(
                         f["client_order_key"] = cok or order.get("client_order_key") or f.get("client_order_key")
                         f["qty"] = observed_cumulative
                         f["price_usd"] = price
+                        f_meta = _actual_reconcile_fill_meta(
+                            source=source, side=side_u, qty=observed_cumulative,
+                            avg_price_usd=price, base_meta=f_meta,
+                        )
                         f_meta.update({"cumulative_filled_qty": observed_cumulative, "remaining_qty": remaining, "requested_qty": requested, "observed_at": now_utc})
                         f["meta"] = f_meta
         actual_exists = any(str(f.get("trade_date") or "") == td and on and str(f.get("order_no") or "") == on
@@ -2932,9 +2945,21 @@ def mark_order_filled_by_reconcile(
                 update_sql += " AND trading_epoch_id=:trading_epoch_id"
             conn.execute(text(update_sql), update_params)
             if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+                _cost_basis = _safe_float_meta(merged, [
+                    "cost_basis_price_usd", "pre_sell_avg_cost", "pre_sell_cost_basis_price_usd",
+                    "broker_avg_price", "avg_cost", "entry_price",
+                ])
+                _realized_pnl = None
+                _realized_pct = None
+                if side_u == "SELL" and _cost_basis and _cost_basis > 0 and price > 0:
+                    _realized_pnl = round((float(price) - float(_cost_basis)) * int(observed_cumulative), 4)
+                    _realized_pct = round(((float(price) - float(_cost_basis)) / float(_cost_basis)) * 100.0, 4)
                 mark_params = {
                     "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
                     "remaining": remaining, "requested": requested, "ts": now_utc,
+                    "avg_cost_at_sell": _cost_basis,
+                    "realized_pnl_usd": _realized_pnl,
+                    "realized_pnl_pct": _realized_pct,
                     "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
                 }
                 if order_epoch_id:
