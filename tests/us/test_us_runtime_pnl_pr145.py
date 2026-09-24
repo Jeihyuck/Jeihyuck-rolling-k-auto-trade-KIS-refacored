@@ -570,3 +570,50 @@ def test_same_symbol_buy_sell_buy_respects_fill_time_order():
     assert buys["B2"]["same_day_buy_lot_qty"] == pytest.approx(2.0)
     assert buys["B2"]["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(30.0)
     assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(50.0)
+
+
+def test_multiple_buys_partial_sell_fallback_audit_does_not_double_count():
+    from trader.us.runner.daily_report_runner import _build_trade_reason_pnl_summary
+
+    summary = _build_trade_reason_pnl_summary(
+        [
+            {
+                "symbol": "XYZ", "side": "BUY", "client_order_key": "FB-B1",
+                "filled_qty": 2, "fill_price": 100.0,
+                "filled_at": "2026-09-23T14:00:00+00:00",
+                "pre_order_holding_qty": 0,
+            },
+            {
+                "symbol": "XYZ", "side": "BUY", "client_order_key": "FB-B2",
+                "filled_qty": 3, "fill_price": 105.0,
+                "filled_at": "2026-09-23T14:05:00+00:00",
+                "pre_order_holding_qty": 2,
+            },
+            {
+                "symbol": "XYZ", "side": "SELL", "client_order_key": "FB-S1",
+                "filled_qty": 3, "fill_price": 110.0,
+                "filled_at": "2026-09-23T14:10:00+00:00",
+                "pre_order_holding_qty": 5,
+                "gross_realized_pnl": 21.0,
+            },
+        ],
+        [{
+            "symbol": "XYZ",
+            "qty": 2,
+            "avg_cost": 105.0,
+            "current_px": 120.0,
+            "unrealized_pnl_usd": 30.0,
+        }],
+        [],
+    )
+
+    buys = {
+        row["client_order_key"]: row
+        for row in summary["trade_details"]
+        if row["side"] == "BUY"
+    }
+    assert buys["FB-B1"]["same_day_buy_lot_qty"] is None
+    assert buys["FB-B2"]["same_day_buy_lot_qty"] == pytest.approx(2.0)
+    assert summary["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(30.0)
+    assert summary["realized_pnl_usd"] == pytest.approx(21.0)
+    assert summary["gross_trade_day_impact_usd"] == pytest.approx(51.0)
