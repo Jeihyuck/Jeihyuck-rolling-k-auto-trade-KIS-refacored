@@ -387,3 +387,22 @@ def test_cancelled_entry_engine_stops_before_provider_lookup(monkeypatch):
 
     assert result == []
     assert diagnostics["cancelled"] is True
+
+
+def test_stage_provider_blocks_lookup_after_cancel():
+    import threading
+    import time
+
+    from trader.us.data_provider import USDataProvider
+    from trader.us.execution.kis_us_client import KisUSTemporaryError
+
+    cancel = threading.Event()
+    provider = USDataProvider(offline=True, cache_enabled=True, env="practice")
+    fork = provider.fork_for_stage(
+        stage_deadline=time.monotonic() + 10.0,
+        cancel_event=cancel,
+    )
+    cancel.set()
+
+    with pytest.raises(KisUSTemporaryError, match="entry stage cancelled"):
+        fork.get_current_price("MSFT", "NASDAQ")
