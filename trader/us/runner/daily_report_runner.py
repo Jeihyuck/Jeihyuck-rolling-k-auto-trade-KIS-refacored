@@ -101,7 +101,11 @@ def _safe_number(value: object) -> float | None:
 
 def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list[dict],
                                     fill_rows: list[dict] | None = None) -> dict:
-    """Build auditable BUY/SELL reasons plus realized and EOD unrealized PnL."""
+    """Build auditable reasons plus realized PnL and same-day BUY-lot EOD PnL.
+
+    Whole-position unrealized PnL is kept separately.  This prevents an ADD_TO_EXISTING
+    BUY from making pre-existing inventory look like today's trading PnL.
+    """
     positions: dict[str, dict] = {}
     for row in position_rows or []:
         symbol = str(row.get("symbol") or row.get("pdno") or "").upper().strip()
@@ -122,12 +126,21 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
             "entry_reason": meta.get("entry_reason") or row.get("entry_reason"),
             "entry_strategy": meta.get("entry_strategy") or row.get("entry_strategy"),
         }
+
     authoritative_sell_pnl: dict[str, float] = {}
     authoritative_sell_pct: dict[str, float] = {}
+    buy_fills_by_key: dict[str, list[dict]] = {}
     for fill in fill_rows or []:
-        meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
-        if str(fill.get("side") or "").upper() != "SELL":
-            continue
+        raw_meta = fill.get("meta")
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str):
+            try:
+                meta = json.loads(raw_meta)
+            except Exception:
+                meta = {}
+        else:
+            meta = {}
         if meta.get("accounting_active") is False:
             continue
         if bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")):
@@ -135,22 +148,29 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
         evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
         if evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}:
             continue
+
+        side = str(fill.get("side") or "").upper()
         key = str(fill.get("client_order_key") or fill.get("order_no") or "")
-        pnl = _safe_number(fill.get("realized_pnl_usd"))
-        if pnl is None:
-            pnl = _safe_number(meta.get("realized_pnl_usd"))
-        pct = _safe_number(fill.get("realized_pnl_pct"))
-        if pct is None:
-            pct = _safe_number(meta.get("realized_pnl_pct"))
-        if key and pnl is not None:
-            authoritative_sell_pnl[key] = authoritative_sell_pnl.get(key, 0.0) + pnl
-            if pct is not None:
-                authoritative_sell_pct[key] = pct
+        if side == "SELL":
+            pnl = _safe_number(fill.get("realized_pnl_usd"))
+            if pnl is None:
+                pnl = _safe_number(meta.get("realized_pnl_usd"))
+            pct = _safe_number(fill.get("realized_pnl_pct"))
+            if pct is None:
+                pct = _safe_number(meta.get("realized_pnl_pct"))
+            if key and pnl is not None:
+                authoritative_sell_pnl[key] = authoritative_sell_pnl.get(key, 0.0) + pnl
+                if pct is not None:
+                    authoritative_sell_pct[key] = pct
+        elif side == "BUY" and key:
+            buy_fills_by_key.setdefault(key, []).append(fill)
 
     trades: list[dict] = []
     realized_total = 0.0
     realized_known = 0
-    buy_symbols: set[str] = set()
+    same_day_buy_lot_unrealized_total = 0.0
+    same_day_buy_lot_basis_total = 0.0
+
     for audit in order_audit or []:
         symbol = str(audit.get("symbol") or "").upper().strip()
         side = str(audit.get("side") or "").upper()
@@ -170,32 +190,72 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
                 realized_total += pnl
                 realized_known += 1
             item["pnl_kind"] = "REALIZED"
+
         elif side == "BUY":
             pos = positions.get(symbol) or {}
-            buy_symbols.add(symbol)
             item.update({
-                "eod_qty": pos.get("qty"), "eod_avg_cost": pos.get("avg_cost"),
+                "eod_position_qty": pos.get("qty"),
+                "eod_position_avg_cost": pos.get("avg_cost"),
                 "eod_price": pos.get("current_price"),
-                "eod_unrealized_pnl_usd": pos.get("unrealized_pnl_usd"),
-                "eod_unrealized_pnl_pct": pos.get("unrealized_pnl_pct"),
+                "eod_position_unrealized_pnl_usd": pos.get("unrealized_pnl_usd"),
+                "eod_position_unrealized_pnl_pct": pos.get("unrealized_pnl_pct"),
             })
-            item["pnl_kind"] = "UNREALIZED_EOD"
+
+            fill_key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
+            matched_fills = buy_fills_by_key.get(fill_key) or []
+            eod_price = _safe_number(pos.get("current_price"))
+            lot_qty = 0.0
+            lot_basis = 0.0
+            lot_pnl = 0.0
+            lot_source = "UNKNOWN"
+            if eod_price is not None and matched_fills:
+                for fill in matched_fills:
+                    qty = _safe_number(fill.get("qty")) or 0.0
+                    price = _safe_number(fill.get("price_usd") or fill.get("price"))
+                    if qty > 0 and price is not None:
+                        lot_qty += qty
+                        lot_basis += qty * price
+                        lot_pnl += qty * (eod_price - price)
+                if lot_qty > 0:
+                    lot_source = "AUTHORITATIVE_KIS_BUY_FILL"
+            elif eod_price is not None:
+                qty = _safe_number(audit.get("filled_qty")) or 0.0
+                price = _safe_number(audit.get("fill_price"))
+                if qty > 0 and price is not None:
+                    lot_qty = qty
+                    lot_basis = qty * price
+                    lot_pnl = qty * (eod_price - price)
+                    lot_source = "ORDER_AUDIT_FILL_FALLBACK"
+
+            lot_pct = (lot_pnl / lot_basis) * 100.0 if lot_basis > 0 else None
+            item.update({
+                "same_day_buy_lot_qty": lot_qty if lot_qty > 0 else None,
+                "same_day_buy_lot_cost_basis_usd": round(lot_basis, 4) if lot_basis > 0 else None,
+                "same_day_buy_lot_unrealized_pnl_usd": round(lot_pnl, 4) if lot_qty > 0 else None,
+                "same_day_buy_lot_unrealized_pnl_pct": round(lot_pct, 4) if lot_pct is not None else None,
+                "same_day_buy_lot_pnl_source": lot_source,
+                "pnl_kind": "SAME_DAY_BUY_LOT_UNREALIZED_EOD",
+            })
+            if lot_qty > 0:
+                same_day_buy_lot_unrealized_total += lot_pnl
+                same_day_buy_lot_basis_total += lot_basis
         trades.append(item)
-    new_buy_unrealized_total = 0.0
-    for symbol in buy_symbols:
-        value = _safe_number((positions.get(symbol) or {}).get("unrealized_pnl_usd"))
-        if value is not None:
-            new_buy_unrealized_total += value
+
+    same_day_buy_lot_pct = (
+        (same_day_buy_lot_unrealized_total / same_day_buy_lot_basis_total) * 100.0
+        if same_day_buy_lot_basis_total > 0 else None
+    )
     return {
         "accounting_basis": "gross_before_fees_unless_fees_available",
         "realized_pnl_usd": round(realized_total, 4),
         "realized_trade_count_with_pnl": realized_known,
-        "new_buy_symbols_eod_unrealized_pnl_usd": round(new_buy_unrealized_total, 4),
-        "gross_trade_day_impact_usd": round(realized_total + new_buy_unrealized_total, 4),
+        "same_day_buy_lot_unrealized_pnl_usd": round(same_day_buy_lot_unrealized_total, 4),
+        "same_day_buy_lot_cost_basis_usd": round(same_day_buy_lot_basis_total, 4),
+        "same_day_buy_lot_unrealized_pnl_pct": round(same_day_buy_lot_pct, 4) if same_day_buy_lot_pct is not None else None,
+        "gross_trade_day_impact_usd": round(realized_total + same_day_buy_lot_unrealized_total, 4),
         "trade_details": trades,
         "position_pnl_snapshot": positions,
     }
-
 
 def _position_market_value_usd(position: dict) -> float:
     """Return the best available USD market value from DB or KIS balance rows."""
@@ -1310,7 +1370,7 @@ def run_daily_report(
             report.get("order_audit") or [], _position_rows_for_pnl, _fill_rows_for_pnl
         )
         report["daily_realized_pnl_usd"] = report["trade_pnl_analysis"]["realized_pnl_usd"]
-        report["daily_new_buy_unrealized_pnl_usd"] = report["trade_pnl_analysis"]["new_buy_symbols_eod_unrealized_pnl_usd"]
+        report["daily_same_day_buy_lot_unrealized_pnl_usd"] = report["trade_pnl_analysis"]["same_day_buy_lot_unrealized_pnl_usd"]
         report["daily_gross_trade_impact_usd"] = report["trade_pnl_analysis"]["gross_trade_day_impact_usd"]
     except Exception as _trade_pnl_exc:
         logger.warning("[US_DAILY_REPORT][TRADE_PNL][WARN] %s", _trade_pnl_exc)
@@ -1395,14 +1455,14 @@ def run_daily_report(
     md_lines.extend([
         "## Trade Reason & PnL",
         f"- Realized PnL (gross): ${float(_trade_pnl.get('realized_pnl_usd') or 0):,.2f}",
-        f"- New-buy EOD unrealized PnL: ${float(_trade_pnl.get('new_buy_symbols_eod_unrealized_pnl_usd') or 0):,.2f}",
+        f"- Same-day BUY-lot EOD unrealized PnL: ${float(_trade_pnl.get('same_day_buy_lot_unrealized_pnl_usd') or 0):,.2f}",
         f"- Gross trade-day impact: ${float(_trade_pnl.get('gross_trade_day_impact_usd') or 0):,.2f}",
         "- Fees/taxes: excluded unless explicitly available in broker evidence",
         "",
     ])
     for _trade in _trade_pnl.get("trade_details") or []:
         _reason = _trade.get("reason") or _trade.get("strategy_reason") or _trade.get("entry_reason") or ""
-        _pnl = _trade.get("gross_realized_pnl") if str(_trade.get("side") or "").upper() == "SELL" else _trade.get("eod_unrealized_pnl_usd")
+        _pnl = _trade.get("gross_realized_pnl") if str(_trade.get("side") or "").upper() == "SELL" else _trade.get("same_day_buy_lot_unrealized_pnl_usd")
         md_lines.append(f"- {_trade.get('symbol','')} {_trade.get('side','')}: reason={_reason} filled_qty={_trade.get('filled_qty')} fill_price={_trade.get('fill_price')} pnl_usd={_pnl}")
     md_lines.append("")
 
