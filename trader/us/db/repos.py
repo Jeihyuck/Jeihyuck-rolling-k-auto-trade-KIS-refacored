@@ -1976,11 +1976,17 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             params = {"td": td}
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            pnl_select = (
+                ", avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct"
+                if pnl_columns_available else
+                ", NULL::numeric AS avg_cost_at_sell, NULL::numeric AS realized_pnl_usd, NULL::numeric AS realized_pnl_pct"
+            )
             if trading_epoch_id:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at, trading_epoch_id,
-                           avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct, meta
+                           order_no, client_order_key, filled_at, trading_epoch_id
+                """ + pnl_select + """, meta
                     FROM us_fills
                     WHERE trade_date=:td AND trading_epoch_id=:trading_epoch_id
                 """
@@ -1988,8 +1994,8 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
             else:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at,
-                           avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct, meta
+                           order_no, client_order_key, filled_at
+                """ + pnl_select + """, meta
                     FROM us_fills
                     WHERE trade_date=:td
                 """
