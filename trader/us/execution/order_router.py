@@ -820,6 +820,12 @@ def route_order(
     )
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
+    strategy_requested_qty = int(qty)
+    strategy_requested_notional_usd = float(intent.get("notional_usd") or (qty * price if price > 0 else 0.0))
+    intent.setdefault("meta", {})
+    if isinstance(intent.get("meta"), dict):
+        intent["meta"].setdefault("strategy_requested_qty", strategy_requested_qty)
+        intent["meta"].setdefault("strategy_requested_notional_usd", strategy_requested_notional_usd)
     from trader.us.execution.order_economics import normalize_order_intent_economics
     old_notional = intent.get("notional_usd")
     expected_notional = qty * price if price > 0 else float(old_notional or 0)
@@ -1444,6 +1450,23 @@ def route_order(
                     "pre_sell_position_source",
                     (_pos_for_guard.get("position_source") if "_pos_for_guard" in locals() else None) or "pre_sell_position_snapshot",
                 )
+
+    # Persist strategy-decision -> executable-attempt economics before the durable broker boundary.
+    intent.setdefault("meta", {})
+    if isinstance(intent.get("meta"), dict):
+        _exec_meta = intent["meta"]
+        _exec_meta["execution_final_qty"] = int(qty)
+        _exec_meta["execution_final_notional_usd"] = float(qty) * float(price)
+        _exec_meta["execution_qty_changed"] = bool(int(qty) != int(strategy_requested_qty))
+        if _exec_meta["execution_qty_changed"]:
+            if _exec_meta.get("broker_cash_resized"):
+                _exec_meta["execution_qty_change_reason"] = "BROKER_ORDERABLE_CASH_RESIZE"
+            elif _exec_meta.get("sell_qty_clamped"):
+                _exec_meta["execution_qty_change_reason"] = "BROKER_ORDERABLE_QTY_CLAMP"
+            else:
+                _exec_meta["execution_qty_change_reason"] = "ROUTER_EXECUTION_RESIZE"
+        else:
+            _exec_meta["execution_qty_change_reason"] = "UNCHANGED"
 
     # Last possible fence and durable write occur immediately before the API.
     if context is not None and not context.broker_submit_allowed():
