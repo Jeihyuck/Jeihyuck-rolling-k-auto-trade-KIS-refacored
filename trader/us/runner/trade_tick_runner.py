@@ -72,7 +72,7 @@ def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
     future = pool.submit(fn)
     try:
         result = future.result(timeout=max(0.001, float(timeout_sec)))
-    except concurrent.futures.TimeoutError:
+    except TimeoutError:
         if cancel_event is not None and hasattr(cancel_event, "set"):
             cancel_event.set()
         future.cancel()
