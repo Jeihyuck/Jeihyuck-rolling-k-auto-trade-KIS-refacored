@@ -39,6 +39,28 @@ logger = logging.getLogger(__name__)
 AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 
 
+def annotate_execution_quantity_provenance(intent: dict, *, strategy_requested_qty: int, final_qty: int, price: float) -> dict:
+    """Persist strategy-decision vs executable-attempt sizing without overwriting the original intent."""
+    intent = dict(intent)
+    meta = dict(intent.get("meta") or {})
+    meta.setdefault("strategy_requested_qty", int(strategy_requested_qty))
+    meta.setdefault("strategy_requested_notional_usd", float(strategy_requested_qty) * float(price))
+    meta["execution_final_qty"] = int(final_qty)
+    meta["execution_final_notional_usd"] = float(final_qty) * float(price)
+    meta["execution_qty_changed"] = bool(int(final_qty) != int(strategy_requested_qty))
+    if meta["execution_qty_changed"]:
+        if meta.get("broker_cash_resized"):
+            meta["execution_qty_change_reason"] = "BROKER_ORDERABLE_CASH_RESIZE"
+        elif meta.get("sell_qty_clamped"):
+            meta["execution_qty_change_reason"] = "BROKER_ORDERABLE_QTY_CLAMP"
+        else:
+            meta["execution_qty_change_reason"] = "ROUTER_EXECUTION_RESIZE"
+    else:
+        meta["execution_qty_change_reason"] = "UNCHANGED"
+    intent["meta"] = meta
+    return intent
+
+
 def resolve_entry_metadata_contract_reason(intent: dict, *, required: bool = False) -> str | None:
     """Validate classification metadata without treating explicit OTHER as missing."""
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
@@ -1452,21 +1474,9 @@ def route_order(
                 )
 
     # Persist strategy-decision -> executable-attempt economics before the durable broker boundary.
-    intent.setdefault("meta", {})
-    if isinstance(intent.get("meta"), dict):
-        _exec_meta = intent["meta"]
-        _exec_meta["execution_final_qty"] = int(qty)
-        _exec_meta["execution_final_notional_usd"] = float(qty) * float(price)
-        _exec_meta["execution_qty_changed"] = bool(int(qty) != int(strategy_requested_qty))
-        if _exec_meta["execution_qty_changed"]:
-            if _exec_meta.get("broker_cash_resized"):
-                _exec_meta["execution_qty_change_reason"] = "BROKER_ORDERABLE_CASH_RESIZE"
-            elif _exec_meta.get("sell_qty_clamped"):
-                _exec_meta["execution_qty_change_reason"] = "BROKER_ORDERABLE_QTY_CLAMP"
-            else:
-                _exec_meta["execution_qty_change_reason"] = "ROUTER_EXECUTION_RESIZE"
-        else:
-            _exec_meta["execution_qty_change_reason"] = "UNCHANGED"
+    intent = annotate_execution_quantity_provenance(
+        intent, strategy_requested_qty=strategy_requested_qty, final_qty=qty, price=price
+    )
 
     # Last possible fence and durable write occur immediately before the API.
     if context is not None and not context.broker_submit_allowed():
