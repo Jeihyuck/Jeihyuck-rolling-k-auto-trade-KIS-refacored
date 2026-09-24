@@ -99,7 +99,8 @@ def _safe_number(value: object) -> float | None:
         return None
 
 
-def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list[dict]) -> dict:
+def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list[dict],
+                                    fill_rows: list[dict] | None = None) -> dict:
     """Build auditable BUY/SELL reasons plus realized and EOD unrealized PnL."""
     positions: dict[str, dict] = {}
     for row in position_rows or []:
@@ -121,6 +122,31 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
             "entry_reason": meta.get("entry_reason") or row.get("entry_reason"),
             "entry_strategy": meta.get("entry_strategy") or row.get("entry_strategy"),
         }
+    authoritative_sell_pnl: dict[str, float] = {}
+    authoritative_sell_pct: dict[str, float] = {}
+    for fill in fill_rows or []:
+        meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
+        if str(fill.get("side") or "").upper() != "SELL":
+            continue
+        if meta.get("accounting_active") is False:
+            continue
+        if bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")):
+            continue
+        evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}:
+            continue
+        key = str(fill.get("client_order_key") or fill.get("order_no") or "")
+        pnl = _safe_number(fill.get("realized_pnl_usd"))
+        if pnl is None:
+            pnl = _safe_number(meta.get("realized_pnl_usd"))
+        pct = _safe_number(fill.get("realized_pnl_pct"))
+        if pct is None:
+            pct = _safe_number(meta.get("realized_pnl_pct"))
+        if key and pnl is not None:
+            authoritative_sell_pnl[key] = authoritative_sell_pnl.get(key, 0.0) + pnl
+            if pct is not None:
+                authoritative_sell_pct[key] = pct
+
     trades: list[dict] = []
     realized_total = 0.0
     realized_known = 0
@@ -130,7 +156,16 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
         side = str(audit.get("side") or "").upper()
         item = dict(audit)
         if side == "SELL":
-            pnl = _safe_number(audit.get("gross_realized_pnl"))
+            fill_key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
+            pnl = authoritative_sell_pnl.get(fill_key)
+            if pnl is None:
+                pnl = _safe_number(audit.get("gross_realized_pnl"))
+                item["pnl_source"] = "ORDER_AUDIT_RECONSTRUCTED" if pnl is not None else "UNKNOWN"
+            else:
+                item["pnl_source"] = "AUTHORITATIVE_KIS_FILL"
+                item["gross_realized_pnl"] = round(pnl, 4)
+                if fill_key in authoritative_sell_pct:
+                    item["return_rate_at_fill_pct"] = authoritative_sell_pct[fill_key]
             if pnl is not None:
                 realized_total += pnl
                 realized_known += 1
@@ -782,13 +817,17 @@ def run_daily_report(
         # DB queries
         try:
             try:
-                from trader.us.db.repos import load_locked_us_watchlist, load_positions, load_us_prep_status, load_us_daily_orders_for_report
+                from trader.us.db.repos import (
+                    load_locked_us_watchlist, load_positions, load_us_prep_status,
+                    load_us_daily_orders_for_report, load_today_fills,
+                )
             except Exception as exc:
                 logger.warning("[US_DAILY_REPORT][WARN] optional repo imports failed: %s", exc)
                 load_locked_us_watchlist = lambda _td: []
                 load_positions = lambda as_of=None: []
                 load_us_prep_status = lambda _td: None
                 load_us_daily_orders_for_report = lambda _td: []
+                load_today_fills = lambda _td: []
             try:
                 from trader.us.score_columns import collect_us_score_nonzero_stats
             except Exception:
@@ -915,6 +954,10 @@ def run_daily_report(
                                 "effective_capital_scale", "entry_style", "selected_reason", "risk_gate_result",
                                 "risk_gate_reason", "blocked_peer_count", "candidate_pool_rank", "watchlist_source",
                                 "price_source", "trend_state", "pnl_pct",
+                                "strategy_requested_qty", "strategy_requested_notional_usd",
+                                "execution_final_qty", "execution_final_notional_usd",
+                                "execution_qty_changed", "execution_qty_change_reason",
+                                "broker_orderable_cash_usd", "broker_cash_resized",
                             )},
                             "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
                             "canonical_order_no": meta.get("order_no_norm"),
@@ -1262,7 +1305,10 @@ def run_daily_report(
     # Canonical trade reason + PnL analysis for logs/mail.
     try:
         _position_rows_for_pnl = locals().get("canonical_positions") or locals().get("final_balance_positions") or []
-        report["trade_pnl_analysis"] = _build_trade_reason_pnl_summary(report.get("order_audit") or [], _position_rows_for_pnl)
+        _fill_rows_for_pnl = load_today_fills(trade_date) if not offline else []
+        report["trade_pnl_analysis"] = _build_trade_reason_pnl_summary(
+            report.get("order_audit") or [], _position_rows_for_pnl, _fill_rows_for_pnl
+        )
         report["daily_realized_pnl_usd"] = report["trade_pnl_analysis"]["realized_pnl_usd"]
         report["daily_new_buy_unrealized_pnl_usd"] = report["trade_pnl_analysis"]["new_buy_symbols_eod_unrealized_pnl_usd"]
         report["daily_gross_trade_impact_usd"] = report["trade_pnl_analysis"]["gross_trade_day_impact_usd"]
