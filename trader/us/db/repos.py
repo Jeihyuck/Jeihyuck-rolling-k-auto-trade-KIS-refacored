@@ -49,11 +49,17 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
       qty = CAST(:qty AS integer),
       price_usd = CAST(:price AS numeric),
       client_order_key = CAST(:cok AS text),
+      avg_cost_at_sell = COALESCE(CAST(:avg_cost_at_sell AS numeric), avg_cost_at_sell),
+      realized_pnl_usd = COALESCE(CAST(:realized_pnl_usd AS numeric), realized_pnl_usd),
+      realized_pnl_pct = COALESCE(CAST(:realized_pnl_pct AS numeric), realized_pnl_pct),
       meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
         'cumulative_filled_qty', CAST(:qty AS integer),
         'remaining_qty', CAST(:remaining AS integer),
         'requested_qty', CAST(:requested AS integer),
-        'observed_at', CAST(:ts AS text)
+        'observed_at', CAST(:ts AS text),
+        'cost_basis_price_usd', COALESCE(CAST(:avg_cost_at_sell AS numeric), NULL),
+        'realized_pnl_usd', COALESCE(CAST(:realized_pnl_usd AS numeric), NULL),
+        'realized_pnl_pct', COALESCE(CAST(:realized_pnl_pct AS numeric), NULL)
       )
     WHERE trade_date = CAST(:td AS date)
       AND order_no = CAST(:order_no AS text)
@@ -76,7 +82,31 @@ _MARK_FILLED_BY_RECONCILE_SQL = """
 """
 
 
-def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
+def _us_fills_has_realized_pnl_columns(conn: Any) -> bool:
+    """Whether optional migration-0044 realized-PnL columns exist."""
+    try:
+        result = conn.execute(text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='us_fills'
+              AND column_name IN ('avg_cost_at_sell','realized_pnl_usd','realized_pnl_pct')
+        """))
+        mappings = getattr(result, "mappings", None)
+        if callable(mappings):
+            rows = mappings().all()
+            names = {str(row.get("column_name") or "") for row in rows}
+        else:
+            fetchall = getattr(result, "fetchall", None)
+            rows = fetchall() if callable(fetchall) else []
+            names = {str(row[0]) for row in rows if row}
+        return {"avg_cost_at_sell","realized_pnl_usd","realized_pnl_pct"} <= names
+    except Exception as exc:
+        logger.warning("[US_FILLS][PNL_SCHEMA_CHECK_WARN] %s", exc)
+        return False
+
+
+def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True,
+                                   include_pnl_columns: bool = False):
     """Build the typed actual-fill update used by PostgreSQL reconciliation.
 
     psycopg3 must not receive JSONB object values as ``unknown`` parameters:
@@ -85,6 +115,13 @@ def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
     different SQLAlchemy/psycopg3 versions in production and repair jobs.
     """
     sql = _MARK_FILLED_BY_RECONCILE_SQL
+    if not include_pnl_columns:
+        sql = sql.replace(
+            "      avg_cost_at_sell = COALESCE(CAST(:avg_cost_at_sell AS numeric), avg_cost_at_sell),\n"
+            "      realized_pnl_usd = COALESCE(CAST(:realized_pnl_usd AS numeric), realized_pnl_usd),\n"
+            "      realized_pnl_pct = COALESCE(CAST(:realized_pnl_pct AS numeric), realized_pnl_pct),\n",
+            "",
+        )
     if not epoch_scoped:
         sql = sql.replace(
             """      AND (
@@ -102,6 +139,9 @@ def _mark_filled_by_reconcile_stmt(*, epoch_scoped: bool = True):
         sa.bindparam("remaining", type_=sa.Integer()),
         sa.bindparam("requested", type_=sa.Integer()),
         sa.bindparam("ts", type_=sa.String()),
+        sa.bindparam("avg_cost_at_sell", value=None, type_=sa.Numeric()),
+        sa.bindparam("realized_pnl_usd", value=None, type_=sa.Numeric()),
+        sa.bindparam("realized_pnl_pct", value=None, type_=sa.Numeric()),
         sa.bindparam("td", type_=sa.Date()),
         sa.bindparam("order_no", type_=sa.String()),
         sa.bindparam("symbol", type_=sa.String()),
@@ -1265,6 +1305,14 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
                                     position_lifecycle_id: str = "LEGACY") -> dict:
     raw = dict(state or {})
     meta = dict(raw.get("meta") or {})
+    # Historical rows may contain state nested back into meta on every reconcile.
+    # Flatten that accidental recursion once on read so repeated updates are size-stable.
+    _depth = 0
+    while isinstance(meta.get("meta"), dict) and _depth < 32:
+        nested = dict(meta.pop("meta") or {})
+        nested.update(meta)
+        meta = nested
+        _depth += 1
     out = {
         "trade_date": str(trade_date),
         "symbol": str(symbol or "").strip().upper(),
@@ -1363,6 +1411,7 @@ def mark_us_profit_capture_stage(
     status: str = "PENDING",
     position_lifecycle_id: str = "",
     broker_order_no: str | None = None,
+    filled_qty: int | None = None,
 ) -> None:
     """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
     sym = str(symbol or "").strip().upper()
@@ -1399,6 +1448,8 @@ def mark_us_profit_capture_stage(
     meta.update({"last_stage": stg, "last_status": status_upper})
     if qty is not None:
         meta[f"{stg}_qty"] = int(qty)
+    if filled_qty is not None:
+        meta[f"{stg}_filled_qty"] = max(int(meta.get(f"{stg}_filled_qty") or 0), int(filled_qty))
     if notional_usd is not None:
         meta[f"{stg}_notional_usd"] = float(notional_usd)
     existing["meta"] = meta
@@ -1925,10 +1976,17 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             params = {"td": td}
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            pnl_select = (
+                ", avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct"
+                if pnl_columns_available else
+                ", NULL::numeric AS avg_cost_at_sell, NULL::numeric AS realized_pnl_usd, NULL::numeric AS realized_pnl_pct"
+            )
             if trading_epoch_id:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at, trading_epoch_id, meta
+                           order_no, client_order_key, filled_at, trading_epoch_id
+                """ + pnl_select + """, meta
                     FROM us_fills
                     WHERE trade_date=:td AND trading_epoch_id=:trading_epoch_id
                 """
@@ -1936,7 +1994,8 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
             else:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at, meta
+                           order_no, client_order_key, filled_at
+                """ + pnl_select + """, meta
                     FROM us_fills
                     WHERE trade_date=:td
                 """
@@ -2123,6 +2182,8 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             for old in _MEM_POSITIONS:
                 if str(old.get("symbol") or "").upper() not in current:
                     old["qty"] = 0
+                    old["unrealized_pnl_usd"] = 0.0
+                    old["market_value_usd"] = 0.0
                     old.setdefault("meta", {}).update({"position_status": "CLOSED_BY_AUTHORITATIVE_BALANCE", "closed_at": now, "close_source": close_source})
         elif not preserve_previous_positions:
             _MEM_POSITIONS.clear()
@@ -2260,7 +2321,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
                 sql = """
-                    UPDATE us_positions SET qty=0,
+                    UPDATE us_positions SET qty=0, unrealized_pnl_usd=0,
                       meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
                         'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
                         'closed_at',NOW()::text,'close_source',CAST(:source AS text))
@@ -2456,6 +2517,37 @@ def _synthetic_reconcile_fill_meta(
         "cost_basis_price_usd",
         "pre_sell_avg_cost",
         "pre_sell_cost_basis_price_usd",
+    ])
+    if side.upper() == "SELL" and cost_basis and cost_basis > 0 and avg_price_usd > 0 and qty > 0:
+        realized = (float(avg_price_usd) - float(cost_basis)) * int(qty)
+        fill_meta.setdefault("cost_basis_price_usd", float(cost_basis))
+        fill_meta.setdefault("cost_basis_source", "pre_sell_position_snapshot")
+        fill_meta["realized_pnl_usd"] = round(realized, 4)
+        fill_meta["realized_pnl_pct"] = round(((float(avg_price_usd) - float(cost_basis)) / float(cost_basis)) * 100.0, 4)
+    return fill_meta
+
+
+def _actual_reconcile_fill_meta(
+    *,
+    source: str,
+    side: str,
+    qty: int,
+    avg_price_usd: float,
+    base_meta: dict | None,
+) -> dict:
+    """Enrich authoritative KIS fills with the same SELL cost-basis/PnL truth as synthetic evidence."""
+    fill_meta = _parse_json_meta(base_meta)
+    fill_meta.update({
+        "source": source,
+        "is_synthetic": False,
+    })
+    cost_basis = _safe_float_meta(fill_meta, [
+        "cost_basis_price_usd",
+        "pre_sell_avg_cost",
+        "pre_sell_cost_basis_price_usd",
+        "broker_avg_price",
+        "avg_cost",
+        "entry_price",
     ])
     if side.upper() == "SELL" and cost_basis and cost_basis > 0 and avg_price_usd > 0 and qty > 0:
         realized = (float(avg_price_usd) - float(cost_basis)) * int(qty)
@@ -2758,6 +2850,10 @@ def mark_order_filled_by_reconcile(
                         f["client_order_key"] = cok or order.get("client_order_key") or f.get("client_order_key")
                         f["qty"] = observed_cumulative
                         f["price_usd"] = price
+                        f_meta = _actual_reconcile_fill_meta(
+                            source=source, side=side_u, qty=observed_cumulative,
+                            avg_price_usd=price, base_meta=f_meta,
+                        )
                         f_meta.update({"cumulative_filled_qty": observed_cumulative, "remaining_qty": remaining, "requested_qty": requested, "observed_at": now_utc})
                         f["meta"] = f_meta
         actual_exists = any(str(f.get("trade_date") or "") == td and on and str(f.get("order_no") or "") == on
@@ -2768,7 +2864,8 @@ def mark_order_filled_by_reconcile(
         if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
             fill_delta = 0
         if fill_delta and not actual_exists:
-            fill_meta = ({**order_meta, "source": source, "is_synthetic": False, "fill_evidence_type": evidence}
+            fill_meta = (_actual_reconcile_fill_meta(source=source, side=side_u, qty=fill_delta,
+                         avg_price_usd=price, base_meta={**order_meta, "fill_evidence_type": evidence})
                          if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
                              client_order_key=cok, side=side_u, qty=fill_delta, avg_price_usd=price, base_meta=order_meta))
             fill_meta["cumulative_filled_qty"] = observed_cumulative
@@ -2885,15 +2982,31 @@ def mark_order_filled_by_reconcile(
                 update_sql += " AND trading_epoch_id=:trading_epoch_id"
             conn.execute(text(update_sql), update_params)
             if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+                _cost_basis = _safe_float_meta(merged, [
+                    "cost_basis_price_usd", "pre_sell_avg_cost", "pre_sell_cost_basis_price_usd",
+                    "broker_avg_price", "avg_cost", "entry_price",
+                ])
+                _realized_pnl = None
+                _realized_pct = None
+                if side_u == "SELL" and _cost_basis and _cost_basis > 0 and price > 0:
+                    _realized_pnl = round((float(price) - float(_cost_basis)) * int(observed_cumulative), 4)
+                    _realized_pct = round(((float(price) - float(_cost_basis)) / float(_cost_basis)) * 100.0, 4)
                 mark_params = {
                     "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
                     "remaining": remaining, "requested": requested, "ts": now_utc,
+                    "avg_cost_at_sell": _cost_basis,
+                    "realized_pnl_usd": _realized_pnl,
+                    "realized_pnl_pct": _realized_pct,
                     "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
                 }
                 if order_epoch_id:
                     mark_params["trading_epoch_id"] = order_epoch_id
+                pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
                 conn.execute(
-                    _mark_filled_by_reconcile_stmt(epoch_scoped=bool(order_epoch_id)),
+                    _mark_filled_by_reconcile_stmt(
+                        epoch_scoped=bool(order_epoch_id),
+                        include_pnl_columns=pnl_columns_available,
+                    ),
                     mark_params,
                 )
             fill_epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if order_epoch_id else ""
@@ -2913,8 +3026,9 @@ def mark_order_filled_by_reconcile(
             if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
                 fill_delta = 0
             if fill_delta and not actual:
-                fill_meta = ({**merged, "source": source, "is_synthetic": False,
-                              "fill_evidence_type": evidence, "cumulative_filled_qty": observed_cumulative}
+                fill_meta = (_actual_reconcile_fill_meta(source=source, side=side_u, qty=fill_delta,
+                              avg_price_usd=price, base_meta={**merged, "fill_evidence_type": evidence,
+                              "cumulative_filled_qty": observed_cumulative})
                              if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
                                 client_order_key=resolved_client_order_key, side=side_u, qty=fill_delta,
                                 avg_price_usd=price, base_meta={**merged, "cumulative_filled_qty": observed_cumulative}))
@@ -2931,19 +3045,35 @@ def mark_order_filled_by_reconcile(
                     "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
                     "cok": resolved_client_order_key, "ts": now_utc,
                     "meta": _json_param(fill_meta),
+                    "avg_cost_at_sell": fill_meta.get("cost_basis_price_usd"),
+                    "realized_pnl_usd": fill_meta.get("realized_pnl_usd"),
+                    "realized_pnl_pct": fill_meta.get("realized_pnl_pct"),
                     "idem": _us_fill_idempotency_key_text(fill, td),
                 }
+                pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
                 if order_epoch_id:
                     insert_params["trading_epoch_id"] = order_epoch_id
-                    insert_sql = """INSERT INTO us_fills
-                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
-                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
-                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                    if pnl_columns_available:
+                        insert_sql = """INSERT INTO us_fills
+                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
+                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                    else:
+                        insert_sql = """INSERT INTO us_fills
+                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
+                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
+                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
                 else:
-                    insert_sql = """INSERT INTO us_fills
-                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
-                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
-                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                    if pnl_columns_available:
+                        insert_sql = """INSERT INTO us_fills
+                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
+                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                    else:
+                        insert_sql = """INSERT INTO us_fills
+                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
+                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
                 conn.execute(text(insert_sql), insert_params)
             rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
             """ + fill_epoch_clause + """

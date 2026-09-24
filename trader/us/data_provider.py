@@ -618,6 +618,7 @@ class USDataProvider:
         self._daily_cache: dict = {}
         self._price_cache: dict = {}
         self._tick_context = None
+        self._stage_cancel_event = None
         self.stats = {
             "daily_hit": 0,
             "daily_miss": 0,
@@ -644,6 +645,30 @@ class USDataProvider:
         if self._tick_context is not None and hasattr(self._client, "bind_tick_context"):
             self._client.bind_tick_context(self._tick_context)
         return self._client
+
+    def _stage_cancelled(self) -> bool:
+        token = self._stage_cancel_event
+        return bool(token is not None and hasattr(token, "is_set") and token.is_set())
+
+    def fork_for_stage(self, *, stage_deadline: float, cancel_event: Any | None = None) -> "USDataProvider":
+        """Create a stage-isolated provider sharing tick caches but not the KIS client.
+
+        A timed-out entry worker must not keep extending the main provider's KIS
+        request budget or interfere with later broker routing.
+        """
+        fork = USDataProvider(
+            offline=self._offline,
+            cache_enabled=self._cache_enabled,
+            env=self._env,
+        )
+        fork._daily_cache = self._daily_cache
+        fork._price_cache = self._price_cache
+        fork._tick_context = self._tick_context
+        fork._stage_cancel_event = cancel_event
+        client = fork._get_client()
+        client._stage_deadline = float(stage_deadline)
+        client._stage_max_attempts = 1
+        return fork
 
     def _load_daily_prices_from_db(
         self, symbol: str, market: str = "US", days: int = 120
@@ -734,6 +759,9 @@ class USDataProvider:
 
     def get_current_price(self, symbol: str, exchange: str) -> dict:
         """현재가 조회 (KIS → DB stale fallback)."""
+        if self._stage_cancelled():
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            raise KisUSTemporaryError("entry stage cancelled before current-price lookup")
         cache_key = (symbol.upper(), exchange.upper())
         ctx = self._tick_context
         if ctx is not None:
@@ -758,6 +786,9 @@ class USDataProvider:
                         "US", symbol, max_age_sec=ws_max_age, wait_sec=ws_wait
                     )
                 if ws_quote:
+                    if self._stage_cancelled():
+                        from trader.us.execution.kis_us_client import KisUSTemporaryError
+                        raise KisUSTemporaryError("entry stage cancelled after websocket quote")
                     data = {
                         "last": str(ws_quote.get("last") or "0"),
                         "open": "0",
@@ -784,6 +815,10 @@ class USDataProvider:
             except Exception as exc:
                 logger.warning("[US_KIS][WS_PRICE_FALLBACK] symbol=%s err=%s", symbol, exc)
 
+        if self._stage_cancelled():
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            raise KisUSTemporaryError("entry stage cancelled after websocket price lookup")
+
         # Cache hit
         if self._cache_enabled and cache_key in self._price_cache:
             self.stats["price_hit"] += 1
@@ -809,6 +844,9 @@ class USDataProvider:
             if ctx is not None:
                 ctx.count("quote_http_calls")
             result = self._get_client().get_us_price(symbol, exchange)
+            if self._stage_cancelled():
+                from trader.us.execution.kis_us_client import KisUSTemporaryError
+                raise KisUSTemporaryError("entry stage cancelled after KIS price lookup")
             output = result.get("output", {})
             quote_quality = str(result.get("_quote_quality") or "FRESH").upper()
             data = {
@@ -834,6 +872,8 @@ class USDataProvider:
             from trader.us.execution.kis_us_client import KisUSTemporaryError
             
             if isinstance(exc, KisUSTemporaryError):
+                if self._stage_cancelled():
+                    raise
                 logger.warning(
                     "[US_DATA][FALLBACK_STALE] symbol=%s KIS failed, trying DB: %s",
                     symbol, exc
@@ -879,6 +919,11 @@ class USDataProvider:
         allow_http_sync: bool,
     ) -> dict:
         """DB-first completed US daily bars with structured quality metadata."""
+        if self._stage_cancelled():
+            return {"rows": [], "quality": "CANCELLED", "valid_bar_count": 0,
+                    "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
+                    "duplicate_count": 0, "http_sync_attempted": False,
+                    "http_sync_succeeded": False}
         from trader.us.db.price_daily_repo import (
             audit_us_daily_history,
             get_latest_us_daily_date,
@@ -889,7 +934,17 @@ class USDataProvider:
         required = int(required_bars or int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
         try:
             rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+            if self._stage_cancelled():
+                return {"rows": [], "quality": "CANCELLED", "valid_bar_count": 0,
+                        "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
+                        "duplicate_count": 0, "http_sync_attempted": False,
+                        "http_sync_succeeded": False}
             audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+            if self._stage_cancelled():
+                return {"rows": [], "quality": "CANCELLED", "valid_bar_count": 0,
+                        "db_latest": None, "expected_latest": None, "invalid_close_count": 0,
+                        "duplicate_count": 0, "http_sync_attempted": False,
+                        "http_sync_succeeded": False}
         except Exception as exc:
             logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
             return {"rows": [], "quality": "DB_ERROR", "valid_bar_count": 0, "db_latest": None, "expected_latest": None, "invalid_close_count": 0, "duplicate_count": 0, "http_sync_attempted": False, "http_sync_succeeded": False}
@@ -970,6 +1025,9 @@ class USDataProvider:
         전략 코드가 closes[-1]을 최신 가격으로 가정하므로 반드시 오름차순 반환.
         as_of_date가 있으면 KIS BYMD에 해당 날짜를 사용한다 (force_now 지원).
         """
+        if self._stage_cancelled():
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            raise KisUSTemporaryError("entry stage cancelled before daily-price lookup")
         logger.info(
             "[US_DATA_PROVIDER][GET_DAILY_PRICES] symbol=%s exchange=%s count=%s as_of_date=%s",
             symbol,
@@ -1011,6 +1069,8 @@ class USDataProvider:
             from trader.us.execution.kis_us_client import KisUSTemporaryError
             
             if isinstance(exc, KisUSTemporaryError):
+                if self._stage_cancelled():
+                    raise
                 logger.warning(
                     "[US_DATA][FALLBACK_DB] symbol=%s KIS failed, trying DB: %s",
                     symbol, exc

@@ -90,6 +90,391 @@ def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dic
             "error": "ERROR_MISSING_SELL_COST_BASIS" if missing_cost_basis else None}
 
 
+def _safe_number(value: object) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fill_event_sort_key(fill: dict) -> tuple:
+    """Stable chronological key for same-day fill allocation."""
+    raw_meta = fill.get("meta")
+    if isinstance(raw_meta, dict):
+        meta = raw_meta
+    elif isinstance(raw_meta, str):
+        try:
+            meta = json.loads(raw_meta)
+        except Exception:
+            meta = {}
+    else:
+        meta = {}
+    timestamp = str(
+        fill.get("filled_at")
+        or fill.get("observed_at")
+        or meta.get("observed_at")
+        or meta.get("order_timestamp")
+        or ""
+    )
+    return (
+        timestamp,
+        str(fill.get("order_no") or ""),
+        str(fill.get("client_order_key") or ""),
+        str(fill.get("side") or ""),
+    )
+
+
+def _allocate_eod_same_day_buy_lots(
+    *,
+    fill_rows: list[dict],
+    positions: dict[str, dict],
+) -> dict[str, dict]:
+    """Allocate EOD remaining inventory to same-day BUY fills once per symbol.
+
+    Reporting-only attribution uses FIFO over an inferred opening-position lot
+    followed by authoritative same-day fills in chronological order.  This
+    prevents multiple BUY orders from independently claiming the same EOD
+    shares after later SELLs.
+    """
+    active_by_symbol: dict[str, list[dict]] = {}
+    for fill in fill_rows or []:
+        raw_meta = fill.get("meta")
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str):
+            try:
+                meta = json.loads(raw_meta)
+            except Exception:
+                meta = {}
+        else:
+            meta = {}
+        if meta.get("accounting_active") is False:
+            continue
+        if bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")):
+            continue
+        evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}:
+            continue
+        symbol = str(fill.get("symbol") or "").upper().strip()
+        side = str(fill.get("side") or "").upper()
+        qty = _safe_number(fill.get("qty")) or 0.0
+        if not symbol or side not in {"BUY", "SELL"} or qty <= 0:
+            continue
+        active_by_symbol.setdefault(symbol, []).append(fill)
+
+    allocations: dict[str, dict] = {}
+    for symbol, fills in active_by_symbol.items():
+        eod_qty = _safe_number((positions.get(symbol) or {}).get("qty")) or 0.0
+        fills = sorted(fills, key=_fill_event_sort_key)
+        total_buy = sum((_safe_number(f.get("qty")) or 0.0) for f in fills if str(f.get("side") or "").upper() == "BUY")
+        total_sell = sum((_safe_number(f.get("qty")) or 0.0) for f in fills if str(f.get("side") or "").upper() == "SELL")
+
+        opening_qty_evidence = None
+        if fills:
+            first_meta_raw = fills[0].get("meta")
+            if isinstance(first_meta_raw, dict):
+                first_meta = first_meta_raw
+            elif isinstance(first_meta_raw, str):
+                try:
+                    first_meta = json.loads(first_meta_raw)
+                except Exception:
+                    first_meta = {}
+            else:
+                first_meta = {}
+            for key in ("pre_order_holding_qty", "pre_order_position_qty"):
+                value = _safe_number(first_meta.get(key))
+                if value is not None and value >= 0:
+                    opening_qty_evidence = value
+                    break
+        opening_qty = (
+            max(0.0, opening_qty_evidence)
+            if opening_qty_evidence is not None
+            else max(0.0, eod_qty - total_buy + total_sell)
+        )
+
+        inventory: list[dict] = []
+        if opening_qty > 0:
+            inventory.append({
+                "kind": "OPENING",
+                "remaining_qty": opening_qty,
+                "client_order_key": "",
+                "price": None,
+            })
+
+        for fill in fills:
+            side = str(fill.get("side") or "").upper()
+            qty = _safe_number(fill.get("qty")) or 0.0
+            if side == "BUY":
+                key = str(fill.get("client_order_key") or fill.get("order_no") or "")
+                price = _safe_number(fill.get("price_usd") or fill.get("price"))
+                inventory.append({
+                    "kind": "SAME_DAY_BUY",
+                    "remaining_qty": qty,
+                    "client_order_key": key,
+                    "price": price,
+                })
+                bucket = allocations.setdefault(key, {
+                    "symbol": symbol,
+                    "filled_qty": 0.0,
+                    "remaining_qty": 0.0,
+                    "remaining_cost_basis_usd": 0.0,
+                    "source": "AUTHORITATIVE_KIS_BUY_FILL_FIFO",
+                })
+                bucket["filled_qty"] += qty
+                continue
+
+            to_sell = qty
+            idx = 0
+            while to_sell > 1e-9 and idx < len(inventory):
+                lot = inventory[idx]
+                available = max(0.0, float(lot.get("remaining_qty") or 0.0))
+                if available <= 1e-9:
+                    idx += 1
+                    continue
+                consumed = min(available, to_sell)
+                lot["remaining_qty"] = available - consumed
+                to_sell -= consumed
+                if lot["remaining_qty"] <= 1e-9:
+                    idx += 1
+
+        # Reconcile reporting attribution to authoritative EOD qty if fill
+        # history contains unexpected gaps.  Never allocate more than EOD.
+        remaining_inventory_qty = sum(max(0.0, float(l.get("remaining_qty") or 0.0)) for l in inventory)
+        excess = max(0.0, remaining_inventory_qty - eod_qty)
+        if excess > 1e-9:
+            # Trim newest same-day lots first only as an integrity fallback;
+            # normal complete fill histories should require no trim.
+            for lot in reversed(inventory):
+                if excess <= 1e-9:
+                    break
+                available = max(0.0, float(lot.get("remaining_qty") or 0.0))
+                if available <= 1e-9:
+                    continue
+                cut = min(available, excess)
+                lot["remaining_qty"] = available - cut
+                excess -= cut
+
+        for lot in inventory:
+            if lot.get("kind") != "SAME_DAY_BUY":
+                continue
+            key = str(lot.get("client_order_key") or "")
+            if not key:
+                continue
+            remaining = max(0.0, float(lot.get("remaining_qty") or 0.0))
+            price = _safe_number(lot.get("price"))
+            bucket = allocations.setdefault(key, {
+                "symbol": symbol,
+                "filled_qty": 0.0,
+                "remaining_qty": 0.0,
+                "remaining_cost_basis_usd": 0.0,
+                "source": "AUTHORITATIVE_KIS_BUY_FILL_FIFO",
+            })
+            bucket["remaining_qty"] += remaining
+            if price is not None:
+                bucket["remaining_cost_basis_usd"] += remaining * price
+
+    return allocations
+
+
+def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list[dict],
+                                    fill_rows: list[dict] | None = None) -> dict:
+    """Build auditable reasons plus realized PnL and non-duplicated EOD BUY-lot PnL."""
+    positions: dict[str, dict] = {}
+    for row in position_rows or []:
+        symbol = str(row.get("symbol") or row.get("pdno") or "").upper().strip()
+        if not symbol:
+            continue
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        qty = _safe_number(row.get("qty") or row.get("holding_qty")) or 0.0
+        avg = _safe_number(row.get("avg_cost") or row.get("avg_price") or row.get("entry_price"))
+        px = _safe_number(row.get("current_px") or row.get("current_price") or row.get("current_price_usd") or row.get("last_price"))
+        unreal = _safe_number(row.get("unrealized_pnl_usd"))
+        if unreal is None and qty > 0 and avg and px:
+            unreal = (px - avg) * qty
+        unreal_pct = ((px / avg) - 1.0) * 100.0 if avg and px else None
+        positions[symbol] = {
+            "qty": qty, "avg_cost": avg, "current_price": px,
+            "unrealized_pnl_usd": round(unreal, 4) if unreal is not None else None,
+            "unrealized_pnl_pct": round(unreal_pct, 4) if unreal_pct is not None else None,
+            "entry_reason": meta.get("entry_reason") or row.get("entry_reason"),
+            "entry_strategy": meta.get("entry_strategy") or row.get("entry_strategy"),
+        }
+
+    authoritative_sell_pnl: dict[str, float] = {}
+    authoritative_sell_pct: dict[str, float] = {}
+    for fill in fill_rows or []:
+        raw_meta = fill.get("meta")
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str):
+            try:
+                meta = json.loads(raw_meta)
+            except Exception:
+                meta = {}
+        else:
+            meta = {}
+        if meta.get("accounting_active") is False:
+            continue
+        if bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")):
+            continue
+        evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}:
+            continue
+        if str(fill.get("side") or "").upper() != "SELL":
+            continue
+        key = str(fill.get("client_order_key") or fill.get("order_no") or "")
+        pnl = _safe_number(fill.get("realized_pnl_usd"))
+        if pnl is None:
+            pnl = _safe_number(meta.get("realized_pnl_usd"))
+        pct = _safe_number(fill.get("realized_pnl_pct"))
+        if pct is None:
+            pct = _safe_number(meta.get("realized_pnl_pct"))
+        if key and pnl is not None:
+            authoritative_sell_pnl[key] = authoritative_sell_pnl.get(key, 0.0) + pnl
+            if pct is not None:
+                authoritative_sell_pct[key] = pct
+
+    allocation_fill_rows = list(fill_rows or [])
+    observed_order_keys: set[str] = set()
+    for fill in allocation_fill_rows:
+        for candidate in (fill.get("client_order_key"), fill.get("order_no")):
+            if candidate:
+                observed_order_keys.add(str(candidate))
+
+    # If canonical fill rows are unavailable for an otherwise filled order,
+    # feed order-audit evidence into the same chronological ledger.  Do not
+    # fall back to independent per-BUY EOD caps, which can double-count shares.
+    for audit in order_audit or []:
+        side = str(audit.get("side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
+        if not key or key in observed_order_keys:
+            continue
+        qty = _safe_number(audit.get("filled_qty")) or 0.0
+        price = _safe_number(audit.get("fill_price"))
+        if qty <= 0 or price is None:
+            continue
+        allocation_fill_rows.append({
+            "symbol": audit.get("symbol"),
+            "side": side,
+            "qty": qty,
+            "price_usd": price,
+            "client_order_key": key,
+            "filled_at": audit.get("filled_at") or audit.get("acknowledged_at") or audit.get("submitted_at") or "",
+            "meta": {
+                "is_synthetic": False,
+                "fill_evidence_type": "ORDER_AUDIT_FILL_FALLBACK",
+                "pre_order_holding_qty": audit.get("pre_order_holding_qty"),
+                "pre_order_position_qty": audit.get("pre_order_holding_qty"),
+            },
+        })
+        observed_order_keys.add(key)
+
+    buy_allocations = _allocate_eod_same_day_buy_lots(
+        fill_rows=allocation_fill_rows,
+        positions=positions,
+    )
+
+    trades: list[dict] = []
+    realized_total = 0.0
+    realized_known = 0
+    same_day_buy_lot_unrealized_total = 0.0
+    same_day_buy_lot_basis_total = 0.0
+    consumed_buy_keys: set[str] = set()
+
+    for audit in order_audit or []:
+        symbol = str(audit.get("symbol") or "").upper().strip()
+        side = str(audit.get("side") or "").upper()
+        item = dict(audit)
+        if side == "SELL":
+            fill_key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
+            pnl = authoritative_sell_pnl.get(fill_key)
+            if pnl is None:
+                pnl = _safe_number(audit.get("gross_realized_pnl"))
+                item["pnl_source"] = "ORDER_AUDIT_RECONSTRUCTED" if pnl is not None else "UNKNOWN"
+            else:
+                item["pnl_source"] = "AUTHORITATIVE_KIS_FILL"
+                item["gross_realized_pnl"] = round(pnl, 4)
+                if fill_key in authoritative_sell_pct:
+                    item["return_rate_at_fill_pct"] = authoritative_sell_pct[fill_key]
+            if pnl is not None:
+                realized_total += pnl
+                realized_known += 1
+            item["pnl_kind"] = "REALIZED"
+
+        elif side == "BUY":
+            pos = positions.get(symbol) or {}
+            item.update({
+                "eod_position_qty": pos.get("qty"),
+                "eod_position_avg_cost": pos.get("avg_cost"),
+                "eod_price": pos.get("current_price"),
+                "eod_position_unrealized_pnl_usd": pos.get("unrealized_pnl_usd"),
+                "eod_position_unrealized_pnl_pct": pos.get("unrealized_pnl_pct"),
+            })
+
+            fill_key = str(audit.get("client_order_key") or audit.get("canonical_order_no") or audit.get("raw_order_no") or "")
+            allocation = buy_allocations.get(fill_key) or {}
+            duplicate_audit = bool(fill_key and fill_key in consumed_buy_keys)
+            if fill_key:
+                consumed_buy_keys.add(fill_key)
+            filled_qty = 0.0 if duplicate_audit else float(allocation.get("filled_qty") or 0.0)
+            lot_qty = 0.0 if duplicate_audit else float(allocation.get("remaining_qty") or 0.0)
+            lot_basis = 0.0 if duplicate_audit else float(allocation.get("remaining_cost_basis_usd") or 0.0)
+            eod_price = _safe_number(pos.get("current_price"))
+            lot_pnl = (lot_qty * eod_price - lot_basis) if lot_qty > 0 and eod_price is not None else 0.0
+            lot_pct = (lot_pnl / lot_basis) * 100.0 if lot_basis > 0 else None
+
+            # Legacy/order-audit fallback only when authoritative BUY fill rows
+            # are unavailable for this order.
+            lot_source = str(allocation.get("source") or "UNKNOWN")
+            if not allocation and eod_price is not None and not duplicate_audit:
+                fallback_qty = _safe_number(audit.get("filled_qty")) or 0.0
+                fallback_price = _safe_number(audit.get("fill_price"))
+                if fallback_qty > 0 and fallback_price is not None:
+                    max_open_qty = min(fallback_qty, _safe_number(pos.get("qty")) or 0.0)
+                    filled_qty = fallback_qty
+                    lot_qty = max_open_qty
+                    lot_basis = lot_qty * fallback_price
+                    lot_pnl = lot_qty * (eod_price - fallback_price)
+                    lot_pct = (lot_pnl / lot_basis) * 100.0 if lot_basis > 0 else None
+                    lot_source = "ORDER_AUDIT_FILL_FALLBACK"
+
+            item.update({
+                "same_day_buy_filled_qty": filled_qty if filled_qty > 0 else None,
+                "same_day_buy_lot_qty": lot_qty if lot_qty > 0 else None,
+                "same_day_buy_lot_attribution": "SYMBOL_CHRONOLOGICAL_FIFO",
+                "same_day_buy_lot_cost_basis_usd": round(lot_basis, 4) if lot_basis > 0 else None,
+                "same_day_buy_lot_unrealized_pnl_usd": round(lot_pnl, 4) if lot_qty > 0 else None,
+                "same_day_buy_lot_unrealized_pnl_pct": round(lot_pct, 4) if lot_pct is not None else None,
+                "same_day_buy_lot_pnl_source": lot_source,
+                "pnl_kind": "SAME_DAY_BUY_LOT_UNREALIZED_EOD",
+            })
+            if lot_qty > 0:
+                same_day_buy_lot_unrealized_total += lot_pnl
+                same_day_buy_lot_basis_total += lot_basis
+        trades.append(item)
+
+    same_day_buy_lot_pct = (
+        (same_day_buy_lot_unrealized_total / same_day_buy_lot_basis_total) * 100.0
+        if same_day_buy_lot_basis_total > 0 else None
+    )
+    return {
+        "accounting_basis": "gross_before_fees_unless_fees_available",
+        "buy_lot_attribution": "SYMBOL_CHRONOLOGICAL_FIFO",
+        "realized_pnl_usd": round(realized_total, 4),
+        "realized_trade_count_with_pnl": realized_known,
+        "same_day_buy_lot_unrealized_pnl_usd": round(same_day_buy_lot_unrealized_total, 4),
+        "same_day_buy_lot_cost_basis_usd": round(same_day_buy_lot_basis_total, 4),
+        "same_day_buy_lot_unrealized_pnl_pct": round(same_day_buy_lot_pct, 4) if same_day_buy_lot_pct is not None else None,
+        "gross_trade_day_impact_usd": round(realized_total + same_day_buy_lot_unrealized_total, 4),
+        "trade_details": trades,
+        "position_pnl_snapshot": positions,
+    }
+
+
 def _position_market_value_usd(position: dict) -> float:
     """Return the best available USD market value from DB or KIS balance rows."""
     for key in (
@@ -710,13 +1095,17 @@ def run_daily_report(
         # DB queries
         try:
             try:
-                from trader.us.db.repos import load_locked_us_watchlist, load_positions, load_us_prep_status, load_us_daily_orders_for_report
+                from trader.us.db.repos import (
+                    load_locked_us_watchlist, load_positions, load_us_prep_status,
+                    load_us_daily_orders_for_report, load_today_fills,
+                )
             except Exception as exc:
                 logger.warning("[US_DAILY_REPORT][WARN] optional repo imports failed: %s", exc)
                 load_locked_us_watchlist = lambda _td: []
                 load_positions = lambda as_of=None: []
                 load_us_prep_status = lambda _td: None
                 load_us_daily_orders_for_report = lambda _td: []
+                load_today_fills = lambda _td: []
             try:
                 from trader.us.score_columns import collect_us_score_nonzero_stats
             except Exception:
@@ -805,6 +1194,12 @@ def run_daily_report(
                             logger.error("[US_DAILY_REPORT][%s]", warning)
                         report.setdefault("order_audit", []).append({
                             "symbol": order.get("symbol"), "side": side,
+                            "strategy_owner": meta.get("strategy_owner") or order.get("strategy_owner"),
+                            "strategy": order.get("strategy") or meta.get("strategy"),
+                            "entry_reason": meta.get("entry_reason"),
+                            "entry_strategy": meta.get("entry_strategy"),
+                            "entry_signal_type": meta.get("entry_signal_type"),
+                            "position_action": meta.get("position_action"),
                             "strategy_reason": meta.get("reason") or order.get("reason"),
                             "reason": meta.get("reason") or order.get("reason"),
                             "exit_family": meta.get("exit_family"),
@@ -837,6 +1232,10 @@ def run_daily_report(
                                 "effective_capital_scale", "entry_style", "selected_reason", "risk_gate_result",
                                 "risk_gate_reason", "blocked_peer_count", "candidate_pool_rank", "watchlist_source",
                                 "price_source", "trend_state", "pnl_pct",
+                                "strategy_requested_qty", "strategy_requested_notional_usd",
+                                "execution_final_qty", "execution_final_notional_usd",
+                                "execution_qty_changed", "execution_qty_change_reason",
+                                "broker_orderable_cash_usd", "broker_cash_resized",
                             )},
                             "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
                             "canonical_order_no": meta.get("order_no_norm"),
@@ -1181,6 +1580,20 @@ def run_daily_report(
                     report["report_consistency"] = "OK"
             report["warnings"].append("OPEN_ORDER_PENDING_AT_CLOSE")
 
+    # Canonical trade reason + PnL analysis for logs/mail.
+    try:
+        _position_rows_for_pnl = locals().get("canonical_positions") or locals().get("final_balance_positions") or []
+        _fill_rows_for_pnl = load_today_fills(trade_date) if not offline else []
+        report["trade_pnl_analysis"] = _build_trade_reason_pnl_summary(
+            report.get("order_audit") or [], _position_rows_for_pnl, _fill_rows_for_pnl
+        )
+        report["daily_realized_pnl_usd"] = report["trade_pnl_analysis"]["realized_pnl_usd"]
+        report["daily_same_day_buy_lot_unrealized_pnl_usd"] = report["trade_pnl_analysis"]["same_day_buy_lot_unrealized_pnl_usd"]
+        report["daily_gross_trade_impact_usd"] = report["trade_pnl_analysis"]["gross_trade_day_impact_usd"]
+    except Exception as _trade_pnl_exc:
+        logger.warning("[US_DAILY_REPORT][TRADE_PNL][WARN] %s", _trade_pnl_exc)
+        report["trade_pnl_analysis"] = {"error": str(_trade_pnl_exc), "trade_details": []}
+
     # Budget cap
     try:
         from trader.us.budget import get_us_capital_usd_cap
@@ -1256,6 +1669,20 @@ def run_daily_report(
         f"> {report.get('environment_notice', '')}",
         "",
     ])
+    _trade_pnl = report.get("trade_pnl_analysis") or {}
+    md_lines.extend([
+        "## Trade Reason & PnL",
+        f"- Realized PnL (gross): ${float(_trade_pnl.get('realized_pnl_usd') or 0):,.2f}",
+        f"- Same-day BUY-lot EOD unrealized PnL: ${float(_trade_pnl.get('same_day_buy_lot_unrealized_pnl_usd') or 0):,.2f}",
+        f"- Gross trade-day impact: ${float(_trade_pnl.get('gross_trade_day_impact_usd') or 0):,.2f}",
+        "- Fees/taxes: excluded unless explicitly available in broker evidence",
+        "",
+    ])
+    for _trade in _trade_pnl.get("trade_details") or []:
+        _reason = _trade.get("reason") or _trade.get("strategy_reason") or _trade.get("entry_reason") or ""
+        _pnl = _trade.get("gross_realized_pnl") if str(_trade.get("side") or "").upper() == "SELL" else _trade.get("same_day_buy_lot_unrealized_pnl_usd")
+        md_lines.append(f"- {_trade.get('symbol','')} {_trade.get('side','')}: reason={_reason} filled_qty={_trade.get('filled_qty')} fill_price={_trade.get('fill_price')} pnl_usd={_pnl}")
+    md_lines.append("")
 
     if session:
         md_lines.append(f"**Session**: {session.upper()}")

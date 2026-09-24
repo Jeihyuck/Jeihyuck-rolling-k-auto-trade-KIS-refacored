@@ -50,6 +50,51 @@ def is_recoverable_order_route_budget_error(exc: BaseException) -> bool:
     )
 
 
+def resolve_us_execution_tail_reserve_sec() -> float:
+    """Seconds kept unavailable to non-critical work so broker routing/reconcile can finish."""
+    return max(20.0, float(os.getenv("US_EXECUTION_TAIL_RESERVE_SEC", "70") or 70.0))
+
+
+def budgeted_entry_timeout_sec(context: Any, configured_timeout_sec: float) -> float:
+    """Bound entry evaluation by the shared tick deadline while preserving execution tail."""
+    reserve = resolve_us_execution_tail_reserve_sec()
+    remaining = float(context.remaining_sec()) if context is not None else float(configured_timeout_sec)
+    return max(0.0, min(float(configured_timeout_sec), remaining - reserve))
+
+
+def run_entry_eval_with_timeout(fn, *, timeout_sec: float, cancel_event: Any):
+    """Run entry evaluation without waiting for a timed-out worker to finish.
+
+    The caller must pass an isolated/stage-bounded provider to the worker.
+    Cooperative cancellation stops further candidate/KIS work after timeout.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn)
+    try:
+        result = future.result(timeout=max(0.001, float(timeout_sec)))
+    except TimeoutError:
+        if cancel_event is not None and hasattr(cancel_event, "set"):
+            cancel_event.set()
+        future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    except Exception:
+        if cancel_event is not None and hasattr(cancel_event, "set"):
+            cancel_event.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=False, cancel_futures=True)
+    return result
+
+
+def should_fetch_fills_for_tick(*, tick_index: int, pending_order_count: int,
+                                reconcile_only_until_clean: bool, interval_ticks: int = 3) -> bool:
+    """Poll broker fills on first/periodic/recovery ticks or whenever an order is pending."""
+    idx = max(1, int(tick_index or 1))
+    interval = max(1, int(interval_ticks or 1))
+    return bool(reconcile_only_until_clean or pending_order_count > 0 or idx <= 1 or idx % interval == 0)
+
+
 def _audit_gate_value(intent: dict, *keys: str):
     """Return 1/0 only for explicit evidence; missing audit fields stay NA."""
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
@@ -1528,6 +1573,7 @@ def run_trade_tick(
     watchlist_timeout_sec = int(os.getenv("US_WATCHLIST_LOAD_TIMEOUT_SEC", "20"))
     entry_eval_timeout_sec = int(os.getenv("US_ENTRY_EVAL_TIMEOUT_SEC", "60"))
 
+    _cash_fetch_started = time.monotonic()
     if offline:
         available_cash_usd = 10000.0
     else:
@@ -1563,6 +1609,7 @@ def run_trade_tick(
                 except Exception as exc2:
                     logger.warning("[US_TICK][WARN] cash fetch failed: %s", exc2)
                     available_cash_usd = 0.0
+    tick_context.metrics["cash_fetch_ms"] = (time.monotonic() - _cash_fetch_started) * 1000.0
 
     budget = resolve_us_order_budget(available_cash_usd)
     effective_budget = budget["effective_order_budget_usd"]
@@ -1683,11 +1730,30 @@ def run_trade_tick(
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
     
     if not offline:
+        from trader.us.db.repos import load_pending_ack_orders, load_today_fills
+        try:
+            _pending_orders_for_fill_poll = load_pending_ack_orders(trade_date, env=env)
+        except Exception as _pending_poll_exc:
+            logger.warning("[US_FILLS][POLL_POLICY][PENDING_LOAD_WARN] error=%s", _pending_poll_exc)
+            _pending_orders_for_fill_poll = []
+        _fill_poll_interval = int(os.getenv("US_FILL_POLL_INTERVAL_TICKS", "3") or 3)
+        _should_fetch_fills = should_fetch_fills_for_tick(
+            tick_index=tick_index,
+            pending_order_count=len(_pending_orders_for_fill_poll),
+            reconcile_only_until_clean=reconcile_only_until_clean,
+            interval_ticks=_fill_poll_interval,
+        )
         _fill_fetch_started = time.monotonic()
         try:
             last_stage = "fills_fetch"
-            from trader.us.execution.fills import get_fills_today
-            fills_result = get_fills_today(provider=provider, signal_only=signal_only, trade_date=trade_date)
+            if not _should_fetch_fills:
+                fills_today = load_today_fills(trade_date) or []
+                fills_result = {"status": "SKIPPED_PERIODIC", "fills": fills_today}
+                logger.info("[US_FILLS][POLL_POLICY][SKIP] tick=%s pending=%d interval=%d cached_rows=%d",
+                            tick_index, len(_pending_orders_for_fill_poll), _fill_poll_interval, len(fills_today))
+            else:
+                from trader.us.execution.fills import get_fills_today
+                fills_result = get_fills_today(provider=provider, signal_only=signal_only, trade_date=trade_date)
             if fills_result["status"] == "CONTRACT_ERROR":
                 logger.error(
                     "[US_TICK][ERROR] fills fetch CONTRACT_ERROR: %s",
@@ -1702,7 +1768,7 @@ def run_trade_tick(
                 )
                 fills_warnings_count += 1
                 fills_temp_error = True
-            elif fills_result["status"] != "OK":
+            elif fills_result["status"] not in {"OK", "SKIPPED_PERIODIC"}:
                 logger.warning(
                     "[US_TICK][WARN] fills fetch failed: %s",
                     fills_result.get("error", "unknown")
@@ -2905,11 +2971,33 @@ def run_trade_tick(
                     engine = _get_strategy_engine(env=env, offline=offline)
                     try:
                         last_stage = "entry_eval"
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            fut = pool.submit(
-                                engine.evaluate_entries,
+                        _entry_budget_sec = budgeted_entry_timeout_sec(tick_context, entry_eval_timeout_sec)
+                        tick_context.metrics["entry_budget_sec"] = _entry_budget_sec
+                        tick_context.metrics["execution_tail_reserve_sec"] = resolve_us_execution_tail_reserve_sec()
+                        tick_context.metrics["remaining_before_entry_eval_sec"] = tick_context.remaining_sec()
+                        _configured_min_entry_budget = float(os.getenv("US_MIN_ENTRY_EVAL_BUDGET_SEC", "5") or 5)
+                        _required_entry_budget = min(float(entry_eval_timeout_sec), _configured_min_entry_budget)
+                        if _entry_budget_sec < _required_entry_budget:
+                            entry_degraded = True
+                            entry_degraded_reason = "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET"
+                            entry_intents = []
+                            logger.warning("[US_ENTRY][DEFER_BUDGET] remaining_sec=%.3f reserve_sec=%.3f action=NEXT_TICK",
+                                           tick_context.remaining_sec(), resolve_us_execution_tail_reserve_sec())
+                            raise concurrent.futures.TimeoutError("entry deferred to preserve execution tail")
+                        from threading import Event
+                        _entry_cancel_event = Event()
+                        _entry_stage_deadline = time.monotonic() + float(_entry_budget_sec)
+                        _entry_provider = (
+                            provider.fork_for_stage(
+                                stage_deadline=_entry_stage_deadline,
+                                cancel_event=_entry_cancel_event,
+                            )
+                            if hasattr(provider, "fork_for_stage") else provider
+                        )
+                        entry_intents = run_entry_eval_with_timeout(
+                            lambda: engine.evaluate_entries(
                                 None,
-                                provider,
+                                _entry_provider,
                                 sold_today,
                                 effective_budget,
                                 position_count,
@@ -2921,8 +3009,11 @@ def run_trade_tick(
                                 available_new_slots=available_new_slots,
                                 max_new_entries=_incremental_total_target,
                                 intent_acceptor=incremental_preflight_session.consider,
-                            )
-                            entry_intents = fut.result(timeout=entry_eval_timeout_sec)
+                                cancel_event=_entry_cancel_event,
+                            ),
+                            timeout_sec=_entry_budget_sec,
+                            cancel_event=_entry_cancel_event,
+                        )
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
                         contract_integrity_blocks = [
                             item for item in (entry_generation_diagnostics.get("blocked") or [])
@@ -2947,11 +3038,23 @@ def run_trade_tick(
                                 len(eligible_watchlist_rows), len(preblocked_rows),
                             )
                     except concurrent.futures.TimeoutError:
-                        logger.error(
-                            "[US_ENTRY][EVAL][TIMEOUT] timeout_sec=%d",
-                            entry_eval_timeout_sec,
-                        )
-                        entry_eval_error_count += 1
+                        if entry_degraded_reason == "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET":
+                            logger.warning(
+                                "[US_ENTRY][EVAL][DEFERRED] budget_sec=%.3f configured_sec=%d remaining_sec=%.3f reserve_sec=%.3f",
+                                float(locals().get("_entry_budget_sec", 0.0)),
+                                entry_eval_timeout_sec,
+                                tick_context.remaining_sec(),
+                                resolve_us_execution_tail_reserve_sec(),
+                            )
+                        else:
+                            logger.error(
+                                "[US_ENTRY][EVAL][TIMEOUT] timeout_sec=%.3f configured_sec=%d remaining_sec=%.3f reserve_sec=%.3f",
+                                float(locals().get("_entry_budget_sec", entry_eval_timeout_sec)),
+                                entry_eval_timeout_sec,
+                                tick_context.remaining_sec(),
+                                resolve_us_execution_tail_reserve_sec(),
+                            )
+                            entry_eval_error_count += 1
                         entry_intents = []
                     except Exception as exc:
                         logger.error(
@@ -3710,6 +3813,10 @@ def run_trade_tick(
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
         "balance_retry_calls": int(tick_context.counters.get("balance_retry_calls", 0)),
         "fill_fetch_ms": float(tick_context.metrics.get("fill_fetch_ms", 0)),
+        "cash_fetch_ms": float(tick_context.metrics.get("cash_fetch_ms", 0)),
+        "entry_budget_sec": float(tick_context.metrics.get("entry_budget_sec", 0)),
+        "execution_tail_reserve_sec": float(tick_context.metrics.get("execution_tail_reserve_sec", resolve_us_execution_tail_reserve_sec())),
+        "remaining_before_entry_eval_sec": float(tick_context.metrics.get("remaining_before_entry_eval_sec", 0)),
         "fill_fetch_logical_calls": int(tick_context.counters.get("fill_logical_calls", 0)),
         "fill_http_calls": int(tick_context.counters.get("fill_http_calls", 0)),
         "fill_retry_calls": int(tick_context.counters.get("fill_retry_calls", 0)),
