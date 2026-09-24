@@ -90,6 +90,78 @@ def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dic
             "error": "ERROR_MISSING_SELL_COST_BASIS" if missing_cost_basis else None}
 
 
+def _safe_number(value: object) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list[dict]) -> dict:
+    """Build auditable BUY/SELL reasons plus realized and EOD unrealized PnL."""
+    positions: dict[str, dict] = {}
+    for row in position_rows or []:
+        symbol = str(row.get("symbol") or row.get("pdno") or "").upper().strip()
+        if not symbol:
+            continue
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        qty = _safe_number(row.get("qty") or row.get("holding_qty")) or 0.0
+        avg = _safe_number(row.get("avg_cost") or row.get("avg_price") or row.get("entry_price"))
+        px = _safe_number(row.get("current_px") or row.get("current_price") or row.get("current_price_usd") or row.get("last_price"))
+        unreal = _safe_number(row.get("unrealized_pnl_usd"))
+        if unreal is None and qty > 0 and avg and px:
+            unreal = (px - avg) * qty
+        unreal_pct = ((px / avg) - 1.0) * 100.0 if avg and px else None
+        positions[symbol] = {
+            "qty": qty, "avg_cost": avg, "current_price": px,
+            "unrealized_pnl_usd": round(unreal, 4) if unreal is not None else None,
+            "unrealized_pnl_pct": round(unreal_pct, 4) if unreal_pct is not None else None,
+            "entry_reason": meta.get("entry_reason") or row.get("entry_reason"),
+            "entry_strategy": meta.get("entry_strategy") or row.get("entry_strategy"),
+        }
+    trades: list[dict] = []
+    realized_total = 0.0
+    realized_known = 0
+    buy_symbols: set[str] = set()
+    for audit in order_audit or []:
+        symbol = str(audit.get("symbol") or "").upper().strip()
+        side = str(audit.get("side") or "").upper()
+        item = dict(audit)
+        if side == "SELL":
+            pnl = _safe_number(audit.get("gross_realized_pnl"))
+            if pnl is not None:
+                realized_total += pnl
+                realized_known += 1
+            item["pnl_kind"] = "REALIZED"
+        elif side == "BUY":
+            pos = positions.get(symbol) or {}
+            buy_symbols.add(symbol)
+            item.update({
+                "eod_qty": pos.get("qty"), "eod_avg_cost": pos.get("avg_cost"),
+                "eod_price": pos.get("current_price"),
+                "eod_unrealized_pnl_usd": pos.get("unrealized_pnl_usd"),
+                "eod_unrealized_pnl_pct": pos.get("unrealized_pnl_pct"),
+            })
+            item["pnl_kind"] = "UNREALIZED_EOD"
+        trades.append(item)
+    new_buy_unrealized_total = 0.0
+    for symbol in buy_symbols:
+        value = _safe_number((positions.get(symbol) or {}).get("unrealized_pnl_usd"))
+        if value is not None:
+            new_buy_unrealized_total += value
+    return {
+        "accounting_basis": "gross_before_fees_unless_fees_available",
+        "realized_pnl_usd": round(realized_total, 4),
+        "realized_trade_count_with_pnl": realized_known,
+        "new_buy_symbols_eod_unrealized_pnl_usd": round(new_buy_unrealized_total, 4),
+        "gross_trade_day_impact_usd": round(realized_total + new_buy_unrealized_total, 4),
+        "trade_details": trades,
+        "position_pnl_snapshot": positions,
+    }
+
+
 def _position_market_value_usd(position: dict) -> float:
     """Return the best available USD market value from DB or KIS balance rows."""
     for key in (
@@ -805,6 +877,12 @@ def run_daily_report(
                             logger.error("[US_DAILY_REPORT][%s]", warning)
                         report.setdefault("order_audit", []).append({
                             "symbol": order.get("symbol"), "side": side,
+                            "strategy_owner": meta.get("strategy_owner") or order.get("strategy_owner"),
+                            "strategy": order.get("strategy") or meta.get("strategy"),
+                            "entry_reason": meta.get("entry_reason"),
+                            "entry_strategy": meta.get("entry_strategy"),
+                            "entry_signal_type": meta.get("entry_signal_type"),
+                            "position_action": meta.get("position_action"),
                             "strategy_reason": meta.get("reason") or order.get("reason"),
                             "reason": meta.get("reason") or order.get("reason"),
                             "exit_family": meta.get("exit_family"),
@@ -1181,6 +1259,17 @@ def run_daily_report(
                     report["report_consistency"] = "OK"
             report["warnings"].append("OPEN_ORDER_PENDING_AT_CLOSE")
 
+    # Canonical trade reason + PnL analysis for logs/mail.
+    try:
+        _position_rows_for_pnl = locals().get("canonical_positions") or locals().get("final_balance_positions") or []
+        report["trade_pnl_analysis"] = _build_trade_reason_pnl_summary(report.get("order_audit") or [], _position_rows_for_pnl)
+        report["daily_realized_pnl_usd"] = report["trade_pnl_analysis"]["realized_pnl_usd"]
+        report["daily_new_buy_unrealized_pnl_usd"] = report["trade_pnl_analysis"]["new_buy_symbols_eod_unrealized_pnl_usd"]
+        report["daily_gross_trade_impact_usd"] = report["trade_pnl_analysis"]["gross_trade_day_impact_usd"]
+    except Exception as _trade_pnl_exc:
+        logger.warning("[US_DAILY_REPORT][TRADE_PNL][WARN] %s", _trade_pnl_exc)
+        report["trade_pnl_analysis"] = {"error": str(_trade_pnl_exc), "trade_details": []}
+
     # Budget cap
     try:
         from trader.us.budget import get_us_capital_usd_cap
@@ -1256,6 +1345,20 @@ def run_daily_report(
         f"> {report.get('environment_notice', '')}",
         "",
     ])
+    _trade_pnl = report.get("trade_pnl_analysis") or {}
+    md_lines.extend([
+        "## Trade Reason & PnL",
+        f"- Realized PnL (gross): ${float(_trade_pnl.get('realized_pnl_usd') or 0):,.2f}",
+        f"- New-buy EOD unrealized PnL: ${float(_trade_pnl.get('new_buy_symbols_eod_unrealized_pnl_usd') or 0):,.2f}",
+        f"- Gross trade-day impact: ${float(_trade_pnl.get('gross_trade_day_impact_usd') or 0):,.2f}",
+        "- Fees/taxes: excluded unless explicitly available in broker evidence",
+        "",
+    ])
+    for _trade in _trade_pnl.get("trade_details") or []:
+        _reason = _trade.get("reason") or _trade.get("strategy_reason") or _trade.get("entry_reason") or ""
+        _pnl = _trade.get("gross_realized_pnl") if str(_trade.get("side") or "").upper() == "SELL" else _trade.get("eod_unrealized_pnl_usd")
+        md_lines.append(f"- {_trade.get('symbol','')} {_trade.get('side','')}: reason={_reason} filled_qty={_trade.get('filled_qty')} fill_price={_trade.get('fill_price')} pnl_usd={_pnl}")
+    md_lines.append("")
 
     if session:
         md_lines.append(f"**Session**: {session.upper()}")
