@@ -1202,6 +1202,12 @@ def generate_entry_intents(
             "block_stage": None,
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
+            "entry_style_raw": str(
+                (entry_meta or {}).get("entry_style_raw")
+                or (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or ""
+            ),
             "entry_style": str(
                 (entry_meta or {}).get("entry_style_selected")
                 or (entry_meta or {}).get("entry_style")
@@ -1243,7 +1249,13 @@ def generate_entry_intents(
                 "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
                 "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
                 "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
-                "entry_style": str(
+                "entry_style_raw": str(
+                (entry_meta or {}).get("entry_style_raw")
+                or (entry_meta or {}).get("entry_style_selected")
+                or (entry_meta or {}).get("entry_style")
+                or ""
+            ),
+            "entry_style": str(
                 (entry_meta or {}).get("entry_style_selected")
                 or (entry_meta or {}).get("entry_style")
                 or _resolve_entry_signal_type(entry_meta)
@@ -1292,6 +1304,7 @@ def generate_entry_intents(
         durable_meta = intent.setdefault("meta", {})
         durable_meta.update({
             "entry_style_selected": intent.get("entry_style_selected"),
+            "entry_style_raw": intent.get("entry_style_raw"),
             "entry_component": intent.get("entry_component"),
             "score_breakdown": intent.get("score_breakdown") or {},
             "reasons": intent.get("reasons") or [],
