@@ -224,3 +224,43 @@ def test_authoritative_close_zeroes_stale_unrealized_pnl(monkeypatch):
     row = repos._MEM_POSITIONS[0]
     assert row["qty"] == 0
     assert row["unrealized_pnl_usd"] == 0.0
+
+
+def test_authoritative_partial_fill_recomputes_realized_pnl_on_cumulative_growth(monkeypatch):
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    repos._MEM_ORDERS.append({
+        "trade_date": "2026-09-23",
+        "order_no": "PLTR-PARTIAL",
+        "client_order_key": "PLTR-PARTIAL",
+        "symbol": "PLTR",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty_requested": 4,
+        "qty_filled": 0,
+        "status": "ACK",
+        "meta": {"pre_sell_avg_cost": 183.42},
+    })
+    first = repos.mark_order_filled_by_reconcile(
+        order_no="PLTR-PARTIAL", client_order_key="PLTR-PARTIAL",
+        symbol="PLTR", side="SELL", filled_qty=2, requested_qty=4,
+        cumulative_filled_qty=2, avg_price_usd=191.48,
+        source="fills_by_order_no", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        trade_date="2026-09-23",
+    )
+    assert first["order_status"] == "PARTIALLY_FILLED"
+    assert repos._MEM_FILLS[0]["meta"]["realized_pnl_usd"] == pytest.approx(16.12)
+
+    second = repos.mark_order_filled_by_reconcile(
+        order_no="PLTR-PARTIAL", client_order_key="PLTR-PARTIAL",
+        symbol="PLTR", side="SELL", filled_qty=4, requested_qty=4,
+        cumulative_filled_qty=4, avg_price_usd=191.48,
+        source="fills_by_order_no", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        trade_date="2026-09-23",
+    )
+    assert second["order_status"] == "FILLED"
+    assert len(repos._MEM_FILLS) == 1
+    assert repos._MEM_FILLS[0]["qty"] == 4
+    assert repos._MEM_FILLS[0]["meta"]["realized_pnl_usd"] == pytest.approx(32.24)
