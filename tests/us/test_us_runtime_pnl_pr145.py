@@ -350,7 +350,7 @@ def test_add_to_existing_reports_only_same_day_buy_lot_pnl():
     assert trade["eod_position_unrealized_pnl_usd"] == pytest.approx(240.0)
     assert trade["same_day_buy_lot_qty"] == pytest.approx(2.0)
     assert trade["same_day_buy_lot_unrealized_pnl_usd"] == pytest.approx(20.0)
-    assert trade["same_day_buy_lot_pnl_source"] == "AUTHORITATIVE_KIS_BUY_FILL"
+    assert trade["same_day_buy_lot_pnl_source"] == "AUTHORITATIVE_KIS_BUY_FILL_FIFO"
 
 
 def test_cancelled_entry_engine_stops_before_provider_lookup(monkeypatch):
