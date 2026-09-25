@@ -50,7 +50,7 @@ def test_tqqq_terminal_broker_truth_is_applied_before_cancel():
         cancel_order=lambda **kw: cancel_calls.append(kw) or {"status": "ACK"},
         query_order=lambda **_kw: {
             "order_no": "old-18", "symbol": "TQQQ", "side": "BUY",
-            "status": "FILLED", "filled_qty": 3,
+            "status": "FILLED", "requested_qty": 3, "filled_qty": 3, "remaining_qty": 0,
         },
     )
     assert result["terminal"] == 1
