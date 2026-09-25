@@ -947,9 +947,18 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     fill_bearing_status = status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0
     if fill_bearing_status and broker_requested_raw not in (None, ""):
         if not broker_requested_valid or broker_requested_qty != int(requested_qty):
+            mismatch_reason = (
+                "cancel_full_fill_requested_qty_mismatch"
+                if (
+                    broker_reported_status == "CANCELLED"
+                    and int(filled_qty) == int(requested_qty)
+                    and int(remaining_qty) == 0
+                )
+                else "fill_requested_qty_mismatch"
+            )
             return {
                 "status": "BROKER_OBSERVATION_QUARANTINED",
-                "reason": "fill_requested_qty_mismatch",
+                "reason": mismatch_reason,
                 "local_requested_qty": int(requested_qty),
                 "broker_requested_qty": broker_requested_qty,
                 "broker_requested_raw": broker_requested_raw,
