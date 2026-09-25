@@ -248,6 +248,12 @@ class InfiniteRepository:
             return {"status": "PENDING"}
         requested = int(order.get("qty_requested") or order.get("qty") or 0)
         filled = int(observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0)
+        remaining_raw = observation.get("remaining_qty")
+        remaining = (
+            max(0, int(remaining_raw))
+            if remaining_raw not in (None, "")
+            else max(0, requested - filled)
+        )
         return apply_broker_order_observation(
             trade_date=str(order["trade_date"]),
             client_order_key=str(order["client_order_key"]),
@@ -257,7 +263,7 @@ class InfiniteRepository:
             side="BUY",
             requested_qty=requested,
             filled_qty=filled,
-            remaining_qty=max(0, requested - filled),
+            remaining_qty=remaining,
             broker_status=status,
             evidence_type=str(observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"),
             observed_at=observation.get("observed_at"),
