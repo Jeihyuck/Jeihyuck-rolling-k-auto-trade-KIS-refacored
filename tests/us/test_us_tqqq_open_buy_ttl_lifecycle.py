@@ -83,7 +83,9 @@ def test_tqqq_ttl_cancel_uses_original_order_identity():
         cancel=lambda **identity: cancel_calls.append(identity) or {"status": "ACK"},
         query=lambda **identity: query_calls.append(identity) or {"status": "OPEN"},
     )
-    assert cancel_calls == query_calls
+    assert len(cancel_calls) == 1
+    assert len(query_calls) == 2
+    assert cancel_calls[0] == query_calls[0] == query_calls[1]
     assert cancel_calls[0]["order_no"] == repo.orders[0]["order_no"]
     assert cancel_calls[0]["client_order_key"] == repo.orders[0]["client_order_key"]
 
