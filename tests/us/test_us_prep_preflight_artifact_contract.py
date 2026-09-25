@@ -131,7 +131,7 @@ def test_runtime_guard_fails_closed_on_unexpected_preflight_marker_type(tmp_path
 
 def test_preflight_exit_only_marker_write_is_atomic():
     script = Path("scripts/wsl/check-us-prep-before-am.sh").read_text(encoding="utf-8")
-    assert 'marker_tmp="${marker}.tmp.$$"' in script
+    assert 'marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"' in script
     assert 'cat > "$marker_tmp"' in script
     assert 'mv -f "$marker_tmp" "$marker"' in script
 
