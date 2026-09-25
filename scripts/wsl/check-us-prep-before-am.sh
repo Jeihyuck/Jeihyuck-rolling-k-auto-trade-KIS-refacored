@@ -91,7 +91,8 @@ PY
 if check; then rm -f "$marker"; exit 0; fi
 bash scripts/wsl/run-us-prep-recovery.sh || true
 if check; then rm -f "$marker"; exit 0; fi
-cat > "$marker" <<JSON
+marker_tmp="${marker}.tmp.$"
+cat > "$marker_tmp" <<JSON
 {
   "trade_date": "${trade_date}",
   "status": "EXIT_ONLY",
@@ -101,5 +102,6 @@ cat > "$marker" <<JSON
   "close_can_proceed": 1
 }
 JSON
+mv -f "$marker_tmp" "$marker"
 echo "[US_PREP_PREFLIGHT][EXIT_ONLY] trade_date=${trade_date}"
 exit 0
