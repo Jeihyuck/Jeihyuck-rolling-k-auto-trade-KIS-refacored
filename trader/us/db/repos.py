@@ -975,23 +975,26 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             observed_fill_price = 0.0
         fill_price = observed_fill_price
         fill_price_source = "broker_observation"
-        if status == "CANCELLED" and not (
-            math.isfinite(fill_price) and fill_price > 0
-        ):
+        if not (math.isfinite(fill_price) and fill_price > 0):
             if (
                 old_filled >= int(filled_qty)
                 and math.isfinite(old_avg_price)
                 and old_avg_price > 0
             ):
                 # No new cumulative quantity is being introduced; reuse the
-                # already-persisted actual order average price only in this
-                # idempotent terminalization case.
+                # already-persisted actual order average price only for an
+                # idempotent replay.  Any observation that introduces new
+                # filled quantity must carry a finite positive broker price.
                 fill_price = old_avg_price
                 fill_price_source = "persisted_order_avg_price"
             else:
                 return {
                     "status": "PENDING",
-                    "reason": "cancel_partial_fill_price_missing",
+                    "reason": (
+                        "cancel_partial_fill_price_missing"
+                        if status == "CANCELLED"
+                        else "broker_fill_price_missing"
+                    ),
                     "requires_reconcile": True,
                     "retry_order": False,
                     "entry_fence": True,
