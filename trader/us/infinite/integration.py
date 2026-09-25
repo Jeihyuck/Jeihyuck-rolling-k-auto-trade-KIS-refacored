@@ -57,6 +57,21 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
     def inc(name: str, amount: int = 1) -> None:
         result[name] = int(result.get(name, 0)) + int(amount)
 
+    def explicit_broker_filled_qty(observation: dict | None) -> int | None:
+        if not isinstance(observation, dict):
+            return None
+        if observation.get("filled_qty_present") is False:
+            return None
+        for key in ("filled_qty", "cumulative_filled_qty"):
+            raw_value = observation.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                return int(float(raw_value))
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def terminal_observation(order: dict, observation: dict | None) -> bool:
         if not isinstance(observation, dict):
             return False
@@ -71,14 +86,8 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             # not sufficient broker truth: the order may have partially filled
             # before the remainder was cancelled.  Keep it fenced until the
             # broker reports the fill quantity explicitly.
-            filled_raw = observation.get("filled_qty")
-            if filled_raw in (None, ""):
-                filled_raw = observation.get("cumulative_filled_qty")
-            if filled_raw in (None, ""):
-                return False
-            try:
-                filled = int(float(filled_raw))
-            except (TypeError, ValueError):
+            filled = explicit_broker_filled_qty(observation)
+            if filled is None:
                 return False
             requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
             if requested <= 0 or filled < 0 or filled > requested:
@@ -114,13 +123,10 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 observation.get("requested_qty") or observation.get("qty_requested")
                 or observation.get("qty") or 0
             ))
-            filled_raw = observation.get("filled_qty")
-            if filled_raw in (None, ""):
-                filled_raw = observation.get("cumulative_filled_qty")
+            filled = explicit_broker_filled_qty(observation)
             remaining_raw = observation.get("remaining_qty")
-            if filled_raw in (None, "") or remaining_raw in (None, ""):
+            if filled is None or remaining_raw in (None, ""):
                 return None
-            filled = int(float(filled_raw))
             remaining = int(float(remaining_raw))
         except (TypeError, ValueError):
             return None
@@ -183,13 +189,10 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 observation.get("requested_qty") or observation.get("qty_requested")
                 or observation.get("qty") or 0
             ))
-            filled_raw = observation.get("filled_qty")
-            if filled_raw in (None, ""):
-                filled_raw = observation.get("cumulative_filled_qty")
+            filled = explicit_broker_filled_qty(observation)
             remaining_raw = observation.get("remaining_qty")
-            if filled_raw in (None, "") or remaining_raw in (None, ""):
+            if filled is None or remaining_raw in (None, ""):
                 return None
-            filled = int(float(filled_raw))
             remaining = int(float(remaining_raw))
         except (TypeError, ValueError):
             return None
