@@ -930,6 +930,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         order_meta = {**_parse_json_meta(identity_rows[0].get("meta")), **meta_patch}
         old_status=str(identity_rows[0].get("status") or "ACK").upper()
         old_filled=int(identity_rows[0].get("qty_filled") or 0)
+        old_avg_price=float(identity_rows[0].get("avg_price_usd") or 0)
     else:
         with engine.connect() as conn:
             active_epoch_id = _active_us_epoch(conn)
@@ -940,18 +941,19 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                 {"td": td, "key": key, **epoch_params},
             ).mappings().first()
             state_row = conn.execute(
-                text("SELECT status,qty_filled,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                text("SELECT status,qty_filled,avg_price_usd,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
                 {"td": td, "key": key, **epoch_params},
             ).mappings().first()
         if not identity_row:
             return {"status": "ORDER_NOT_FOUND"}
         _assert_us_order_epoch(dict(identity_row), active_epoch_id)
         order_meta = {**_parse_json_meta(identity_row.get("meta")), **meta_patch}
-        old_status="ACK"; old_filled=0
+        old_status="ACK"; old_filled=0; old_avg_price=0.0
         if state_row:
             _assert_us_order_epoch(dict(state_row), active_epoch_id)
             old_status=str(state_row.get("status") or "ACK").upper()
             old_filled=int(state_row.get("qty_filled") or 0)
+            old_avg_price=float(state_row.get("avg_price_usd") or 0)
     terminal={"FILLED","CANCELLED","REJECTED","EXPIRED"}
     stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
     if stale:
@@ -959,16 +961,40 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0:
         # A cancellation may arrive as the first durable broker observation
         # after one or more executions.  Persist cumulative fill truth first,
-        # then apply the terminal CANCELLED status below.  Otherwise the order
-        # row can retain its ACK-time default qty_filled=0 and be misclassified
-        # as a zero-fill cancellation at close.
+        # then apply the terminal CANCELLED status below.  Never manufacture a
+        # zero-price actual fill: if this observation introduces new filled
+        # quantity it must also carry a usable execution price.
+        observed_fill_price = float(
+            (raw_row or {}).get("avg_price")
+            or (raw_row or {}).get("avg_price_usd")
+            or 0
+        )
+        fill_price = observed_fill_price
+        fill_price_source = "broker_observation"
+        if status == "CANCELLED" and fill_price <= 0:
+            if old_filled >= int(filled_qty) and old_avg_price > 0:
+                # No new cumulative quantity is being introduced; reuse the
+                # already-persisted actual order average price only in this
+                # idempotent terminalization case.
+                fill_price = old_avg_price
+                fill_price_source = "persisted_order_avg_price"
+            else:
+                return {
+                    "status": "PENDING",
+                    "reason": "cancel_partial_fill_price_missing",
+                    "requires_reconcile": True,
+                    "retry_order": False,
+                    "entry_fence": True,
+                    "observed_filled_qty": int(filled_qty),
+                    "persisted_filled_qty": old_filled,
+                }
         result = mark_order_filled_by_reconcile(
             order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
             filled_qty=filled_qty, requested_qty=requested_qty,
             cumulative_filled_qty=filled_qty,
-            avg_price_usd=float((raw_row or {}).get("avg_price") or 0),
+            avg_price_usd=fill_price,
             source="broker_order_observation", evidence_type=evidence_type,
-            trade_date=td, meta=meta_patch,
+            trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
         )
         if result.get("status") != "OK": return result
     if status not in {"PARTIALLY_FILLED", "FILLED"}:
