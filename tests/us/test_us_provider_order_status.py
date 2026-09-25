@@ -47,3 +47,28 @@ def test_cancelled_partial_fill_preserves_explicit_fill_provenance():
     assert normalized["filled_qty"] == 1
     assert normalized["remaining_qty"] == 0
 
+def test_invalid_fill_quantity_is_raw_present_but_not_valid_terminal_evidence(monkeypatch):
+    raw = {
+        "odno": "O-BAD-FILL",
+        "pdno": "TQQQ",
+        "sll_buy_dvsn_cd": "02",
+        "ord_qty": "2",
+        "ft_ccld_qty": "bad",
+        "nccs_qty": "0",
+        "status": "CANCELLED",
+    }
+    normalized = normalize_us_order_status_row(raw)
+    assert normalized["normalization_result"] == "quarantined"
+    assert normalized["filter_reason"] == "invalid_filled_qty"
+    assert normalized["filled_qty_raw_present"] is True
+    assert normalized["filled_qty_present"] is False
+    assert normalized["filled_qty"] is None
+
+    provider = USDataProvider(offline=False)
+    monkeypatch.setattr(provider, "get_today_orders", lambda _trade_date: [normalized])
+    exact = provider.get_fills_by_order_no("O-BAD-FILL", "TQQQ", "2026-09-24")
+    assert exact["normalization_result"] == "quarantined"
+    assert exact["filled_qty_present"] is False
+    assert exact["filled_qty"] is None
+    assert exact["cumulative_filled_qty"] is None
+
