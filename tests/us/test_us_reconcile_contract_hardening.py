@@ -215,3 +215,101 @@ def test_close_reconcile_position_persist_error_is_error(tmp_path, monkeypatch):
     assert result["status"] == "ERROR"
     assert result["reconcile_status"] == "POSITION_PERSIST_ERROR"
     assert result["report_consistency"] == "FAILED"
+
+def test_ack_reconcile_quarantines_fill_when_broker_requested_qty_differs(monkeypatch):
+    from trader.us.execution import reconcile
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    assert repos.save_order_ack(
+        {
+            "client_order_key": "CK-MISMATCH",
+            "symbol": "AMD",
+            "exchange": "NASDAQ",
+            "side": "SELL",
+            "qty_requested": 2,
+            "order_no": "O-MISMATCH",
+            "status": "ACK",
+            "meta": {"pre_order_position_qty": 2},
+        },
+        "2026-09-24",
+    )
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {"positions": []}
+
+        def get_fills_by_order_no(self, *, order_no, symbol, trade_date):
+            return {
+                "status": "CANCELLED",
+                "requested_qty": 3,
+                "filled_qty": 2,
+                "cumulative_filled_qty": 2,
+                "remaining_qty": 0,
+                "avg_price": 100.0,
+                "symbol": "AMD",
+                "side": "SELL",
+                "order_no": "O-MISMATCH",
+            }
+
+    result = reconcile.reconcile_ack_orders_with_balance(
+        provider=Provider(),
+        trade_date="2026-09-24",
+        env="practice",
+    )
+
+    assert result["confirmed_count"] == 0
+    assert result["failed_count"] == 1
+    assert result["unresolved_count"] == 1
+    assert repos._MEM_ORDERS[0]["status"] == "ACK"
+    assert repos._MEM_ORDERS[0]["qty_filled"] == 0
+    assert repos._MEM_FILLS == []
+
+
+def test_apply_broker_observation_quarantines_filled_request_identity_mismatch(monkeypatch):
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    assert repos.save_order_ack(
+        {
+            "client_order_key": "CK-DIRECT-MISMATCH",
+            "symbol": "AMD",
+            "exchange": "NASDAQ",
+            "side": "SELL",
+            "qty_requested": 2,
+            "order_no": "O-DIRECT-MISMATCH",
+            "status": "ACK",
+        },
+        "2026-09-24",
+    )
+
+    applied = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key="CK-DIRECT-MISMATCH",
+        raw_order_no="O-DIRECT-MISMATCH",
+        canonical_order_no="O-DIRECT-MISMATCH",
+        symbol="AMD",
+        side="SELL",
+        requested_qty=2,
+        filled_qty=2,
+        remaining_qty=0,
+        broker_status="FILLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row={
+            "status": "CANCELLED",
+            "requested_qty": 3,
+            "filled_qty": 2,
+            "remaining_qty": 0,
+            "avg_price": 100.0,
+        },
+    )
+
+    assert applied["status"] == "BROKER_OBSERVATION_QUARANTINED"
+    assert applied["reason"] == "fill_requested_qty_mismatch"
+    assert applied["local_requested_qty"] == 2
+    assert applied["broker_requested_qty"] == 3
+    assert repos._MEM_ORDERS[0]["status"] == "ACK"
+    assert repos._MEM_FILLS == []
+
