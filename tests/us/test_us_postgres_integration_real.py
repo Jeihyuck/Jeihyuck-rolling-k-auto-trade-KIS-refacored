@@ -321,6 +321,7 @@ def test_real_postgres_cancelled_partial_fill_normalize_persist_close_chain(pg_e
         "sll_buy_dvsn_cd": "02",
         "ord_qty": "2",
         "ft_ccld_qty": "1",
+        "ft_ccld_unpr3": "77.25",
         "nccs_qty": "0",
         "status": "CANCELLED",
     })
@@ -349,17 +350,78 @@ def test_real_postgres_cancelled_partial_fill_normalize_persist_close_chain(pg_e
             FROM us_orders
             WHERE client_order_key='TQQQ-PARTIAL-CANCEL'
         """)).mappings().one())
-        fill_qty = conn.execute(text("""
-            SELECT COALESCE(SUM(qty),0)
+        fill_row = conn.execute(text("""
+            SELECT COALESCE(SUM(qty),0) AS qty,
+                   COALESCE(MAX(price_usd),0) AS price
             FROM us_fills
             WHERE client_order_key='TQQQ-PARTIAL-CANCEL'
               AND COALESCE((meta->>'accounting_active')::boolean,true)
-        """)).scalar_one()
+        """)).mappings().one()
 
     assert row["status"] == "CANCELLED"
     assert row["qty_filled"] == 1
-    assert fill_qty == 1
+    assert fill_row["qty"] == 1
+    assert float(fill_row["price"]) == 77.25
     assert _explicit_order_filled_qty(row) == 1
+
+
+def test_real_postgres_partial_fill_cancel_without_price_stays_unresolved(pg_engine):
+    from sqlalchemy import text
+    from trader.us.data_provider import normalize_us_order_status_row
+    import trader.us.db.repos as repos
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             avg_price_usd,order_no,status,meta)
+            VALUES ('2026-09-24','TQQQ-PARTIAL-NO-PRICE','TQQQ','NASDAQ','BUY',
+                    2,0,NULL,'PARTIAL-NO-PRICE-1','ACK','{}'::jsonb)"""))
+
+    observation = normalize_us_order_status_row({
+        "odno": "PARTIAL-NO-PRICE-1",
+        "pdno": "TQQQ",
+        "sll_buy_dvsn_cd": "02",
+        "ord_qty": "2",
+        "ft_ccld_qty": "1",
+        "nccs_qty": "0",
+        "status": "CANCELLED",
+    })
+    assert observation["filled_qty"] == 1
+    assert observation["avg_price"] == 0
+
+    applied = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key="TQQQ-PARTIAL-NO-PRICE",
+        raw_order_no="PARTIAL-NO-PRICE-1",
+        canonical_order_no="PARTIAL-NO-PRICE-1",
+        symbol="TQQQ",
+        side="BUY",
+        requested_qty=2,
+        filled_qty=observation["filled_qty"],
+        remaining_qty=observation["remaining_qty"],
+        broker_status=observation["status"],
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row=observation,
+    )
+    assert applied["status"] == "PENDING"
+    assert applied["reason"] == "cancel_partial_fill_price_missing"
+
+    with pg_engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd
+            FROM us_orders
+            WHERE client_order_key='TQQQ-PARTIAL-NO-PRICE'
+        """)).mappings().one()
+        fill_count = conn.execute(text("""
+            SELECT COUNT(*)
+            FROM us_fills
+            WHERE client_order_key='TQQQ-PARTIAL-NO-PRICE'
+        """)).scalar_one()
+
+    assert row["status"] == "ACK"
+    assert row["qty_filled"] == 0
+    assert row["avg_price_usd"] is None
+    assert fill_count == 0
 
 
 def test_real_postgres_missing_fill_cancel_is_not_terminalized(pg_engine):
