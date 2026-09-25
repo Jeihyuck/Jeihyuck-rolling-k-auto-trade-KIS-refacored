@@ -24,6 +24,17 @@ def pg_engine(monkeypatch):
         conn.exec_driver_sql(open("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0047_us_order_events_profit_lifecycle.sql", encoding="utf-8").read())
+        # Production has migration 0052's unified trading-epoch columns.  This
+        # focused US fixture does not create the KR/state tables required to
+        # execute the entire 0052 script, so mirror the US ALTERs that current
+        # repository code reads.
+        for table in (
+            "us_order_intents", "us_orders", "us_fills", "us_positions",
+            "us_order_events", "us_profit_capture_lifecycle",
+        ):
+            conn.exec_driver_sql(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+            )
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
     yield engine
     engine.dispose()
