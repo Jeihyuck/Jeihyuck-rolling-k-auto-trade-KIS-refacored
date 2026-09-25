@@ -163,6 +163,7 @@ def test_us_live_provenance_validator_rejects_db_row_without_style():
 
     broken = _simulate_postgres_watchlist_row()
     broken["meta"].pop("entry_style_selected", None)
+    broken["meta"].pop("entry_style_raw", None)
     result = validate_us_entry_provenance_contract([broken])
     assert result["ok"] is False
     assert result["invalid_count"] == 1
