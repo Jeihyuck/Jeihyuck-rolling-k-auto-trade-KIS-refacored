@@ -1,6 +1,7 @@
 from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
 from trader.us.runner.daily_report_runner import (
     _canonical_source_summary,
+    _explicit_order_filled_qty,
     classify_close_order_reconcile_summary,
     reconcile_order_sources,
 )
@@ -68,11 +69,11 @@ def test_cancelled_ack_is_removed_from_active_close_source_counts():
         fills=5,
         balance_confirmed=0,
         router_summary=6,
-        canceled_orders=1,
+        zero_fill_canceled_orders=1,
     )
     assert result["raw_db_orders"] == 6
     assert result["raw_router_summary"] == 6
-    assert result["canceled_orders"] == 1
+    assert result["zero_fill_canceled_orders"] == 1
     assert result["db_orders"] == 5
     assert result["router_summary"] == 5
     assert result["fills"] == 5
@@ -87,12 +88,54 @@ def test_cancelled_ack_is_removed_from_canonical_close_consistency():
         final_positions=20,
         open_position_symbols=["TQQQ"],
         router_summary=6,
-        canceled_orders=1,
+        zero_fill_canceled_orders=1,
     )
     assert result["raw_db_orders"] == 6
-    assert result["canceled_orders"] == 1
+    assert result["zero_fill_canceled_orders"] == 1
     assert result["source_counts"]["db_orders"] == 5
     assert result["source_counts"]["router_session_summary"] == 5
     assert result["source_counts"]["kis_fills_inquire_ccnl"] == 5
     assert "db_orders_fills_mismatch" not in result["inconsistencies"]
     assert result["report_consistency"] == "OK"
+
+
+def test_partial_fill_cancel_is_not_subtracted_from_active_close_ack_counts():
+    assert _explicit_order_filled_qty({"status": "CANCELLED", "qty_filled": 1}) == 1
+
+    result = reconcile_order_sources(
+        db_orders=6,
+        fills=6,
+        balance_confirmed=0,
+        router_summary=6,
+        zero_fill_canceled_orders=0,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["zero_fill_canceled_orders"] == 0
+    assert result["db_orders"] == 6
+    assert result["router_summary"] == 6
+    assert result["fills"] == 6
+    assert result["broker_reconciled"] is True
+    assert "SOURCE_MISMATCH" not in result["warnings"]
+
+
+def test_partial_fill_cancel_is_not_subtracted_from_canonical_close_consistency():
+    result = _canonical_source_summary(
+        db_orders=6,
+        fills=6,
+        final_positions=20,
+        open_position_symbols=["TQQQ"],
+        router_summary=6,
+        zero_fill_canceled_orders=0,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["zero_fill_canceled_orders"] == 0
+    assert result["source_counts"]["db_orders"] == 6
+    assert result["source_counts"]["router_session_summary"] == 6
+    assert result["source_counts"]["kis_fills_inquire_ccnl"] == 6
+    assert "db_orders_fills_mismatch" not in result["inconsistencies"]
+    assert result["report_consistency"] == "OK"
+
+
+def test_cancel_with_missing_fill_qty_is_not_eligible_for_zero_fill_subtraction():
+    assert _explicit_order_filled_qty({"status": "CANCELLED", "qty_filled": None}) is None
+    assert _explicit_order_filled_qty({"status": "CANCELLED"}) is None
