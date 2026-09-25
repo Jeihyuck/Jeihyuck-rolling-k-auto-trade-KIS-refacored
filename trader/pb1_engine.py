@@ -7005,6 +7005,7 @@ class PB1Engine:
                 "entry_reason": resolved_entry_reason,
                 "entry_style_selected": normalized_entry_style,
                 "entry_decision_family": identity["entry_decision_family"],
+                "entry_trigger_policy": cf.features.get("entry_trigger_policy") or "NONE",
                 "entry_component": cf.features.get("entry_component") or cf.features.get("entry_signal") or normalized_entry_style,
                 "entry_signal_score": score_lookup.get(resolved_entry_reason),
                 "score_final_at_entry": cf.features.get("score_final") or cf.features.get("final_score") or cf.features.get("score"),
@@ -7094,6 +7095,8 @@ class PB1Engine:
             "entry_thesis": plan_dict.get("entry_thesis"),
             "entry_style_selected": plan_dict.get("entry_style_selected"),
             "entry_reason": plan_dict.get("entry_reason"),
+            "entry_decision_family": cf.features.get("entry_decision_family"),
+            "entry_trigger_policy": cf.features.get("entry_trigger_policy") or "NONE",
             "trade_horizon": plan_dict.get("trade_horizon"),
             "exit_policy_family": plan_dict.get("exit_policy_family"),
             "eod_action": plan_dict.get("eod_action"),
@@ -10194,9 +10197,24 @@ class PB1Engine:
         )
         style = str(raw_style or "").upper()
         family = str(raw_family or "").upper()
-        pullback_ok = bool(features.get("pullback_ok") or features.get("pullback_pass") or style == "PULLBACK" or family == "ENTRY_PULLBACK")
-        breakout_ok = bool(trigger_ok or features.get("breakout_ok") or features.get("breakout_pass") or style == "BREAKOUT" or family == "ENTRY_BREAKOUT")
-        momentum_ok = bool(features.get("momentum_ok") or features.get("momentum_pass") or style == "MOMENTUM" or family == "ENTRY_MOMENTUM")
+
+        # Final30 setup identity is authoritative once it is a known family.
+        # A live breakout trigger is execution evidence, not permission to
+        # rewrite MOMENTUM/PULLBACK into BREAKOUT before the frozen BUY
+        # EntryExitPlan is created.
+        normalized_style = self._normalize_entry_reason(style)
+        if normalized_style == "ENTRY_PULLBACK":
+            return "PULLBACK", "ENTRY_PULLBACK", "PULLBACK_OVERRIDE"
+        if normalized_style == "ENTRY_BREAKOUT":
+            return "BREAKOUT", "ENTRY_BREAKOUT", "BREAKOUT_TRIGGER"
+        if normalized_style == "ENTRY_MOMENTUM":
+            return "MOMENTUM", "ENTRY_MOMENTUM", "MOMENTUM_CONTINUATION"
+
+        # Legacy/incomplete candidates may not carry a valid Final30 style.
+        # Preserve the old evidence-based fallback only for those cases.
+        pullback_ok = bool(features.get("pullback_ok") or features.get("pullback_pass") or family == "ENTRY_PULLBACK")
+        breakout_ok = bool(trigger_ok or features.get("breakout_ok") or features.get("breakout_pass") or family == "ENTRY_BREAKOUT")
+        momentum_ok = bool(features.get("momentum_ok") or features.get("momentum_pass") or family == "ENTRY_MOMENTUM")
         if pullback_ok:
             return "PULLBACK", "ENTRY_PULLBACK", "PULLBACK_OVERRIDE"
         if breakout_ok:

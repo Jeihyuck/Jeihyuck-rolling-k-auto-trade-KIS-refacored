@@ -15,3 +15,21 @@ def test_jnj_pb1_metadata_and_scores_survive_explanation():
     assert explanation["entry_style_selected"] == "ENTRY_PULLBACK"
     assert explanation["score_breakdown"]["pullback_score"] == pytest.approx(.9)
     assert explanation["score_breakdown"]["momentum_score"] == pytest.approx(.4167)
+
+def test_momentum_pullback_is_a_pullback_contract_subtype_without_losing_raw_identity():
+    row = {
+        "symbol": "MSFT",
+        "entry_style_selected": "momentum_pullback",
+        "entry_style_raw": "momentum_pullback",
+        "momentum_score": 0.82,
+        "pullback_score": 0.78,
+        "breakout_score": 0.20,
+        "score_final": 0.80,
+    }
+    assert normalize_us_entry_style(row["entry_style_selected"]) == "ENTRY_PULLBACK"
+    assert _resolve_entry_signal_type(row) == "pullback"
+
+    explanation = build_us_entry_explanation("MSFT", row, "BUY")
+    assert explanation["entry_style_selected"] == "ENTRY_PULLBACK"
+    assert row["entry_style_raw"] == "momentum_pullback"
+

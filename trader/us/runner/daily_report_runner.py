@@ -721,15 +721,65 @@ def _load_contract_status_snapshot(trade_date: str) -> dict:
         "pinned_trade_block_reason": str(effective.get("trade_block_reason") or "") if effective else None,
     }
 
+def _explicit_order_filled_qty(order: dict) -> int | None:
+    """Return explicit fill truth, preferring the latest broker evidence.
+
+    us_orders.qty_filled has an ACK-time default of zero.  For CANCELLED rows
+    that default must not outrank a later broker observation, especially when
+    the cancellation itself reported a partial cumulative fill or explicitly
+    omitted the fill field.
+    """
+    meta = order.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    broker_row = meta.get("broker_raw_row") if isinstance(meta, dict) else None
+    if isinstance(broker_row, str):
+        try:
+            broker_row = json.loads(broker_row)
+        except Exception:
+            broker_row = None
+    if isinstance(broker_row, dict):
+        if broker_row.get("filled_qty_present") is False:
+            return None
+        for key in ("filled_qty", "cumulative_filled_qty"):
+            raw = broker_row.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                qty = int(float(raw))
+            except (TypeError, ValueError):
+                return None
+            return qty if qty >= 0 else None
+
+    for key in ("qty_filled", "filled_qty", "cumulative_filled_qty"):
+        raw = order.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            qty = int(float(raw))
+        except (TypeError, ValueError):
+            return None
+        return qty if qty >= 0 else None
+    return None
+
+
 def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int,
-                            canceled_orders: int = 0, broker_pending: int = 0,
+                            zero_fill_canceled_orders: int = 0, broker_pending: int = 0,
                             fills_query_ok: bool = True, balance_snapshot_ok: bool = True) -> dict:
-    active_db_orders = max(0, int(db_orders or 0) - int(canceled_orders or 0))
+    canceled = max(0, int(zero_fill_canceled_orders or 0))
+    active_db_orders = max(0, int(db_orders or 0) - canceled)
+    # router_summary may be session-scoped while cancellations are counted over
+    # the full trade day.  Never subtract day-wide cancellations from a
+    # session-scoped router count at this generic boundary.
+    active_router_summary = max(0, int(router_summary or 0))
     sources = {
         "db_orders": active_db_orders,
         "fills": int(fills or 0),
         "balance_confirmed": int(balance_confirmed or 0),
-        "router_summary": int(router_summary or 0),
+        "router_summary": active_router_summary,
     }
 
 
@@ -762,7 +812,9 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
         "fill_api_count": sources["fills"],
         "balance_confirmed_count": sources["balance_confirmed"],
         "warnings": warnings,
-        "canceled_orders": int(canceled_orders or 0),
+        "zero_fill_canceled_orders": canceled,
+        "raw_db_orders": int(db_orders or 0),
+        "raw_router_summary": int(router_summary or 0),
         "consistency": consistency,
         "broker_reconciled": broker_reconciled,
     }
@@ -807,12 +859,14 @@ def _session_summary_paths(report_base: str, trade_date: str, session: str | Non
     )
 
 
-def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: int, open_position_symbols: list, router_summary: int) -> dict:
+def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: int, open_position_symbols: list,
+                              router_summary: int, zero_fill_canceled_orders: int = 0) -> dict:
+    canceled = max(0, int(zero_fill_canceled_orders or 0))
     sources = {
         "kis_fills_inquire_ccnl": int(fills or 0),
         "kis_final_balance_positions": int(final_positions or 0),
-        "db_orders": int(db_orders or 0),
-        "router_session_summary": int(router_summary or 0),
+        "db_orders": max(0, int(db_orders or 0) - canceled),
+        "router_session_summary": max(0, int(router_summary or 0)),
     }
     inconsistencies: list[str] = []
     if sources["db_orders"] and sources["kis_fills_inquire_ccnl"] and sources["db_orders"] != sources["kis_fills_inquire_ccnl"]:
@@ -826,6 +880,9 @@ def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: in
         "canonical_order_source": "kis_fills_inquire_ccnl" if sources["kis_fills_inquire_ccnl"] else ("db_orders" if sources["db_orders"] else "router_session_summary"),
         "canonical_position_source": "kis_final_balance",
         "source_counts": sources,
+        "raw_db_orders": int(db_orders or 0),
+        "raw_router_session_summary": int(router_summary or 0),
+        "zero_fill_canceled_orders": canceled,
         "inconsistencies": inconsistencies,
         "report_consistency": "REPORT_INCONSISTENT" if inconsistencies else "OK",
     }
@@ -892,6 +949,10 @@ def run_daily_report(
         "orders_blocked": 0,
         "orders_rejected": 0,
         "orders_rejected_total": 0,
+        "orders_cancelled_total": 0,
+        "orders_zero_fill_cancelled_total": 0,
+        "orders_partial_fill_cancelled_total": 0,
+        "orders_unknown_fill_cancelled_total": 0,
         "orders_unresolved_total": 0,
         "orders_submitted": 0,
         "broker_fill_confirmed": 0,
@@ -1288,6 +1349,21 @@ def run_daily_report(
                             report["broker_orderable_qty_blocks"] += 1
                         elif status == "BLOCKED":
                             report["orders_blocked"] += 1
+                        elif status in {"CANCELLED", "CANCELED"}:
+                            # CANCELLED is a terminal state of an accepted broker
+                            # order.  Count it in the raw ACK population first;
+                            # reconciliation below removes only explicit zero-fill
+                            # cancellations.  Partial-fill cancellations must
+                            # remain because they still contribute executions.
+                            report["orders_ack_total"] += 1
+                            report["orders_cancelled_total"] += 1
+                            cancel_filled_qty = _explicit_order_filled_qty(order)
+                            if cancel_filled_qty is None:
+                                report["orders_unknown_fill_cancelled_total"] += 1
+                            elif cancel_filled_qty == 0:
+                                report["orders_zero_fill_cancelled_total"] += 1
+                            else:
+                                report["orders_partial_fill_cancelled_total"] += 1
                         elif status == "REJECTED":
                             report["orders_rejected"] += 1
                             report["orders_rejected_total"] += 1
@@ -1445,13 +1521,18 @@ def run_daily_report(
             db_ack = int(report.get("orders_ack", 0) or 0)
             fill_count = int(report.get("fills", 0) or 0)
             balance_confirmed = load_balance_confirmed_count(trade_date)
-            router_summary = load_router_summary_ack_count(trade_date, session=session)
+            router_summary_loaded = load_router_summary_ack_count(trade_date, session=session)
+            router_summary = int(router_summary_loaded or 0)
+            router_summary_scope = str(getattr(router_summary_loaded, "scope", "unknown") or "unknown")
+            router_summary_source_path = str(getattr(router_summary_loaded, "source_path", "") or "")
             schedule_fallback = load_schedule_health_fallback(trade_date, session=session)
             if schedule_fallback:
                 _apply_regime_session_summary(report, schedule_fallback)
             if router_summary == 0 and int(schedule_fallback.get("orders_ack") or 0) > 0:
                 report["warnings"].append("SOURCE_MISMATCH_ROUTER_SUMMARY_ZERO_USING_SCHEDULE_HEALTH")
                 router_summary = int(schedule_fallback.get("orders_ack") or 0)
+                router_summary_scope = str(schedule_fallback.get("_scope") or "daily")
+                router_summary_source_path = str(schedule_fallback.get("_source_path") or "")
                 report["orders_ack"] = max(db_ack, router_summary)
                 report["orders_ack_total"] = max(db_ack, router_summary)
                 report["buy_notional_routed"] = max(float(report.get("buy_notional_routed") or 0.0), float(schedule_fallback.get("buy_notional_routed") or 0.0))
@@ -1462,8 +1543,40 @@ def run_daily_report(
                 report["notional_total_source_note"] = "buy_notional_total/sell_notional_total synchronized from routed fallback; prefer *_routed fields"
                 report["deprecated_notional_total_fields"] = ["buy_notional_total", "sell_notional_total"]
                 db_ack = int(report.get("orders_ack") or 0)
-            report["source_numbers"] = {"db_orders": db_ack, "kis_fills": fill_count, "router_session_summary": router_summary, "schedule_health_fallback": schedule_fallback, "final_balance_positions": int(report.get("positions", 0) or 0)}
-            reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)
+            zero_fill_canceled_orders = int(report.get("orders_zero_fill_cancelled_total") or 0)
+            partial_fill_canceled_orders = int(report.get("orders_partial_fill_cancelled_total") or 0)
+            unknown_fill_canceled_orders = int(report.get("orders_unknown_fill_cancelled_total") or 0)
+            active_db_ack = max(0, db_ack - zero_fill_canceled_orders)
+            router_summary_is_session_scoped = router_summary_scope == "session"
+            active_router_summary = (
+                max(0, router_summary)
+                if router_summary_is_session_scoped
+                else max(0, router_summary - zero_fill_canceled_orders)
+            )
+            router_summary_for_daily_compare = (
+                0 if router_summary_is_session_scoped else active_router_summary
+            )
+            report["source_numbers"] = {
+                "db_orders": db_ack,
+                "db_orders_active": active_db_ack,
+                "canceled_orders_total": int(report.get("orders_cancelled_total") or 0),
+                "zero_fill_canceled_orders": zero_fill_canceled_orders,
+                "partial_fill_canceled_orders": partial_fill_canceled_orders,
+                "unknown_fill_canceled_orders": unknown_fill_canceled_orders,
+                "kis_fills": fill_count,
+                "router_session_summary": router_summary,
+                "router_session_summary_active": active_router_summary,
+                "router_summary_scope": router_summary_scope,
+                "router_summary_source_path": router_summary_source_path,
+                "router_summary_used_for_daily_compare": router_summary_for_daily_compare,
+                "schedule_health_fallback": schedule_fallback,
+                "final_balance_positions": int(report.get("positions", 0) or 0),
+            }
+            reconciled = reconcile_order_sources(
+                db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed,
+                router_summary=router_summary_for_daily_compare,
+                zero_fill_canceled_orders=zero_fill_canceled_orders,
+            )
             # Canonical daily counts come from US order rows for submitted/ACK and unique fills for executions.
             report["orders_ack"] = db_ack
             report["orders_ack_total"] = db_ack
@@ -1493,7 +1606,8 @@ def run_daily_report(
                 fills=fill_count,
                 final_positions=int(report.get("positions", 0) or 0),
                 open_position_symbols=report.get("open_position_symbols") or [],
-                router_summary=router_summary,
+                router_summary=router_summary_for_daily_compare,
+                zero_fill_canceled_orders=zero_fill_canceled_orders,
             )
             if report["canonical_sources"].get("report_consistency") == "REPORT_INCONSISTENT":
                 report["warnings"].append("REPORT_INCONSISTENT:" + ",".join(report["canonical_sources"].get("inconsistencies") or []))
@@ -1788,6 +1902,10 @@ def run_daily_report(
         f"| daily_orders_submitted_total | {report.get('daily_orders_submitted_total', 0)} |",
         f"| orders_ack_total | {report.get('orders_ack_total', 0)} |",
         f"| orders_rejected_total | {report.get('orders_rejected_total', 0)} |",
+        f"| orders_cancelled_total | {report.get('orders_cancelled_total', 0)} |",
+        f"| orders_zero_fill_cancelled_total | {report.get('orders_zero_fill_cancelled_total', 0)} |",
+        f"| orders_partial_fill_cancelled_total | {report.get('orders_partial_fill_cancelled_total', 0)} |",
+        f"| orders_unknown_fill_cancelled_total | {report.get('orders_unknown_fill_cancelled_total', 0)} |",
         f"| orders_unresolved_total | {report.get('orders_unresolved_total', 0)} |",
         f"| buy_notional_total | {report.get('buy_notional_total', 0)} |",
         f"| sell_notional_total | {report.get('sell_notional_total', 0)} |",
@@ -2141,6 +2259,14 @@ def load_balance_confirmed_count(trade_date: str) -> int:
     return int(os.getenv("US_DAILY_BALANCE_CONFIRMED_COUNT", "0") or 0) if os.getenv("PYTEST_CURRENT_TEST") else 0
 
 
+class _ScopedAckCount(int):
+    def __new__(cls, value: int, *, scope: str, source_path: str):
+        obj = int.__new__(cls, int(value or 0))
+        obj.scope = str(scope or "unknown")
+        obj.source_path = str(source_path or "")
+        return obj
+
+
 def load_schedule_health_fallback(trade_date: str, session: str | None = None) -> dict:
     path = os.path.abspath(f"reports/us_schedule_health/{trade_date}.json")
     if not os.path.exists(path):
@@ -2148,11 +2274,19 @@ def load_schedule_health_fallback(trade_date: str, session: str | None = None) -
     try:
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
-        candidates = []
+        candidates: list[tuple[dict | None, str, str]] = []
         if session:
-            candidates.extend([payload.get(session), (payload.get("sessions") or {}).get(session), (payload.get("session_aggregate") or {}).get(session)])
-        candidates.extend([payload.get("aggregate"), payload.get("totals"), payload])
-        for row in candidates:
+            candidates.extend([
+                (payload.get(session), "session", f"top.{session}"),
+                ((payload.get("sessions") or {}).get(session), "session", f"sessions.{session}"),
+                ((payload.get("session_aggregate") or {}).get(session), "session", f"session_aggregate.{session}"),
+            ])
+        candidates.extend([
+            (payload.get("aggregate"), "daily", "aggregate"),
+            (payload.get("totals"), "daily", "totals"),
+            (payload, "daily", "root"),
+        ])
+        for row, scope, source_key in candidates:
             if isinstance(row, dict) and any(k in row for k in ("orders_ack", "fills_count", "buy_notional_routed", "sell_notional_routed")):
                 return {
                     "orders_ack": int(row.get("orders_ack") or row.get("ack") or 0),
@@ -2165,6 +2299,9 @@ def load_schedule_health_fallback(trade_date: str, session: str | None = None) -
                     "sector_cap_enforced": row.get("sector_cap_enforced"),
                     "blocked_entry_reason_counts": row.get("blocked_entry_reason_counts") or {},
                     "trade_block_reason": row.get("trade_block_reason"),
+                    "_scope": scope,
+                    "_source_path": path,
+                    "_source_key": source_key,
                 }
     except Exception as exc:
         logger.warning("[US_DAILY_REPORT][SCHEDULE_HEALTH_FALLBACK][WARN] path=%s err=%s", path, exc)
@@ -2172,24 +2309,39 @@ def load_schedule_health_fallback(trade_date: str, session: str | None = None) -
 
 
 def load_router_summary_ack_count(trade_date: str, session: str | None = None) -> int:
-    """Read order-router summary artifacts instead of production env vars."""
-    candidates = [
-        f"runtime/us/order_router_summary/{trade_date}/{session or 'all'}.json",
-        f"runtime/us/order_router_summary/{trade_date}/latest.json",
-        "runtime/us/order_router_summary/latest.json",
-        "runtime/us_order_router_summary.json",
-    ]
-    for raw in candidates:
+    """Read router ACK count and retain the scope of the artifact actually loaded."""
+    candidates: list[tuple[str, str]] = []
+    if session:
+        candidates.append((f"runtime/us/order_router_summary/{trade_date}/{session}.json", "session"))
+    else:
+        candidates.append((f"runtime/us/order_router_summary/{trade_date}/all.json", "daily"))
+    candidates.extend([
+        (f"runtime/us/order_router_summary/{trade_date}/latest.json", "daily"),
+        ("runtime/us/order_router_summary/latest.json", "daily"),
+        ("runtime/us_order_router_summary.json", "daily"),
+    ])
+    for raw, default_scope in candidates:
         path = os.path.abspath(raw)
         if not os.path.exists(path):
             continue
         try:
             with open(path, encoding="utf-8") as f:
                 payload = json.load(f)
-            return int(payload.get("orders_ack") or payload.get("ack") or payload.get("acked") or 0)
+            explicit_scope = str(payload.get("scope") or "").strip().lower()
+            scope = explicit_scope if explicit_scope in {"session", "daily"} else default_scope
+            if scope == "daily" and session:
+                payload_session = str(payload.get("session") or "").strip().lower()
+                if payload_session and payload_session == str(session).strip().lower():
+                    scope = "session"
+            return _ScopedAckCount(
+                int(payload.get("orders_ack") or payload.get("ack") or payload.get("acked") or 0),
+                scope=scope,
+                source_path=path,
+            )
         except Exception as exc:
             logger.warning("[US_DAILY_REPORT][WARN] router summary load failed path=%s err=%s", path, exc)
-    return int(os.getenv("US_DAILY_ROUTER_ACK_COUNT", "0") or 0) if os.getenv("PYTEST_CURRENT_TEST") else 0
+    fallback = int(os.getenv("US_DAILY_ROUTER_ACK_COUNT", "0") or 0) if os.getenv("PYTEST_CURRENT_TEST") else 0
+    return _ScopedAckCount(fallback, scope="unknown", source_path="env_or_none")
 
 
 def main() -> None:

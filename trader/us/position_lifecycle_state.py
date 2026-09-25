@@ -20,7 +20,7 @@ _ENTRY_POLICY_FIELDS = (
     "book", "horizon", "exit_policy", "entry_strategy",
     "entry_signal_type", "partial_exit_allowed",
     "entry_exit_contract", "entry_exit_contract_sha256", "entry_exit_contract_version",
-    "entry_reason", "entry_style_selected", "entry_component",
+    "entry_reason", "entry_style_selected", "entry_style_raw", "entry_component",
     "reasons", "filters_passed", "score_breakdown", "explanation_quality",
 )
 

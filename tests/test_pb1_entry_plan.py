@@ -1,3 +1,5 @@
+import pytest
+
 from trader.pb1_engine import CandidateFeature, PB1Engine
 
 
@@ -83,3 +85,119 @@ def test_entry_stage_not_close_for_am_pm():
 
     engine.window_internal = "afternoon"
     assert engine._entry_stage_name() == "PB1-PM"
+
+@pytest.mark.parametrize(
+    ("style", "trigger_ok", "decision_family", "expected_trigger_policy"),
+    [
+        ("PULLBACK", False, "ENTRY_PULLBACK_OVERRIDE", "PULLBACK_OVERRIDE"),
+        ("PULLBACK", True, "ENTRY_BREAKOUT_CONFIRMED", "PULLBACK_OVERRIDE"),
+        ("BREAKOUT", False, "ENTRY_BREAKOUT", "BREAKOUT_TRIGGER"),
+        ("BREAKOUT", True, "ENTRY_BREAKOUT_CONFIRMED", "BREAKOUT_TRIGGER"),
+        ("MOMENTUM", False, "ENTRY_MOMENTUM_CONTINUATION", "MOMENTUM_CONTINUATION"),
+        ("MOMENTUM", True, "ENTRY_BREAKOUT_CONFIRMED", "MOMENTUM_CONTINUATION"),
+    ],
+)
+def test_final30_setup_identity_survives_live_trigger(style, trigger_ok, decision_family, expected_trigger_policy):
+    engine = make_engine()
+    family = f"ENTRY_{style}"
+    cf = CandidateFeature(
+        code="005930",
+        market="J",
+        features={
+            "close": 100000.0,
+            "order_price": 100000.0,
+            "entry_price": 100000.0,
+            "stop_price": 95000.0,
+            "initial_stop": 95000.0,
+            "score": 90.0,
+            "entry_style_selected": style,
+            "entry_reason": family,
+            "entry_decision_family": decision_family,
+            "entry_trigger_policy": "BREAKOUT_CONFIRMED" if trigger_ok else "SETUP_OVERRIDE",
+            "breakout_score": 80.0,
+            "pullback_score": 80.0,
+            "momentum_score": 80.0,
+            "pivot": 99000.0,
+        },
+        setup_ok=True,
+        reasons=[],
+        mode=1,
+        mode_reasons=["pb1_from_final30"],
+    )
+    cf.planned_qty = 1
+
+    plan = engine._build_entry_plan(
+        cf,
+        entry_price=100000.0,
+        order_price=100000.0,
+        stop_price=95000.0,
+        trigger_ok=trigger_ok,
+        trigger_info={"reason": "breakout_confirmed" if trigger_ok else "not_confirmed"},
+        entry_mode="OR",
+        stage="PB1-AM",
+        price_source="test",
+    )
+
+    assert plan["entry_style"] == style
+    assert plan["entry_family"] == family
+    assert plan["entry_reason"] == family
+    assert plan["trigger_policy"] == expected_trigger_policy
+    assert cf.features["entry_style_selected"] == style
+    assert cf.features["entry_reason"] == family
+    assert cf.features["entry_decision_family"] == decision_family
+
+    prepared = engine._prepare_entry_exit_plan(cf, entry_price_for_plan=100000.0)
+    assert prepared is not None
+    frozen, entry_meta = prepared
+    assert frozen["entry_style_selected"] == family
+    assert frozen["entry_reason"] == family
+    assert entry_meta["entry_decision_family"] == decision_family
+    assert entry_meta["entry_trigger_policy"] == ("BREAKOUT_CONFIRMED" if trigger_ok else "SETUP_OVERRIDE")
+
+
+def test_momentum_breakout_confirmation_keeps_momentum_frozen_sell_plan():
+    engine = make_engine()
+    cf = CandidateFeature(
+        code="005930",
+        market="J",
+        features={
+            "close": 100000.0,
+            "order_price": 100000.0,
+            "entry_price": 100000.0,
+            "stop_price": 95000.0,
+            "initial_stop": 95000.0,
+            "score": 90.0,
+            "entry_style_selected": "MOMENTUM",
+            "entry_reason": "ENTRY_MOMENTUM",
+            "entry_decision_family": "ENTRY_BREAKOUT_CONFIRMED",
+            "entry_trigger_policy": "BREAKOUT_CONFIRMED",
+            "momentum_score": 90.0,
+        },
+        setup_ok=True,
+        reasons=[],
+        mode=1,
+        mode_reasons=["pb1_from_final30"],
+    )
+    cf.planned_qty = 1
+
+    engine._build_entry_plan(
+        cf,
+        entry_price=100000.0,
+        order_price=100000.0,
+        stop_price=95000.0,
+        trigger_ok=True,
+        trigger_info={"reason": "breakout_confirmed"},
+        entry_mode="OR",
+        stage="PB1-AM",
+        price_source="test",
+    )
+    frozen, entry_meta = engine._prepare_entry_exit_plan(cf, entry_price_for_plan=100000.0)
+
+    assert frozen["entry_style_selected"] == "ENTRY_MOMENTUM"
+    assert frozen["entry_reason"] == "ENTRY_MOMENTUM"
+    assert frozen["entry_thesis"] == "MOMENTUM_RECLAIM"
+    assert frozen["trade_horizon"] == "DAY_TRADE"
+    assert frozen["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+    assert entry_meta["entry_decision_family"] == "ENTRY_BREAKOUT_CONFIRMED"
+    assert entry_meta["entry_trigger_policy"] == "BREAKOUT_CONFIRMED"
+

@@ -1,5 +1,10 @@
 from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
-from trader.us.runner.daily_report_runner import classify_close_order_reconcile_summary
+from trader.us.runner.daily_report_runner import (
+    _canonical_source_summary,
+    _explicit_order_filled_qty,
+    classify_close_order_reconcile_summary,
+    reconcile_order_sources,
+)
 from trader.us.runner.trade_tick_runner import classify_ack_reconcile_gate
 
 
@@ -56,3 +61,124 @@ def test_tick_gate_true_unresolved_requires_manual_reconcile():
     assert result["allow_new_orders"] is False
     assert result["reason"] == "unresolved_ack_error"
     assert result["manual_reconcile_required"] == 1
+
+
+def test_cancelled_ack_is_removed_from_active_close_source_counts():
+    result = reconcile_order_sources(
+        db_orders=6,
+        fills=5,
+        balance_confirmed=0,
+        router_summary=0,
+        zero_fill_canceled_orders=1,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["raw_router_summary"] == 0
+    assert result["zero_fill_canceled_orders"] == 1
+    assert result["db_orders"] == 5
+    assert result["router_summary"] == 0
+    assert result["fills"] == 5
+    assert result["broker_reconciled"] is True
+    assert "SOURCE_MISMATCH_ACK_EXISTS_FILL_MISSING" not in result["warnings"]
+
+
+def test_cancelled_ack_is_removed_from_canonical_close_consistency():
+    result = _canonical_source_summary(
+        db_orders=6,
+        fills=5,
+        final_positions=20,
+        open_position_symbols=["TQQQ"],
+        router_summary=0,
+        zero_fill_canceled_orders=1,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["zero_fill_canceled_orders"] == 1
+    assert result["source_counts"]["db_orders"] == 5
+    assert result["source_counts"]["router_session_summary"] == 0
+    assert result["source_counts"]["kis_fills_inquire_ccnl"] == 5
+    assert "db_orders_fills_mismatch" not in result["inconsistencies"]
+    assert result["report_consistency"] == "OK"
+
+
+def test_partial_fill_cancel_is_not_subtracted_from_active_close_ack_counts():
+    assert _explicit_order_filled_qty({"status": "CANCELLED", "qty_filled": 1}) == 1
+
+    result = reconcile_order_sources(
+        db_orders=6,
+        fills=6,
+        balance_confirmed=0,
+        router_summary=6,
+        zero_fill_canceled_orders=0,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["zero_fill_canceled_orders"] == 0
+    assert result["db_orders"] == 6
+    assert result["router_summary"] == 6
+    assert result["fills"] == 6
+    assert result["broker_reconciled"] is True
+    assert "SOURCE_MISMATCH" not in result["warnings"]
+
+
+def test_partial_fill_cancel_is_not_subtracted_from_canonical_close_consistency():
+    result = _canonical_source_summary(
+        db_orders=6,
+        fills=6,
+        final_positions=20,
+        open_position_symbols=["TQQQ"],
+        router_summary=6,
+        zero_fill_canceled_orders=0,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["zero_fill_canceled_orders"] == 0
+    assert result["source_counts"]["db_orders"] == 6
+    assert result["source_counts"]["router_session_summary"] == 6
+    assert result["source_counts"]["kis_fills_inquire_ccnl"] == 6
+    assert "db_orders_fills_mismatch" not in result["inconsistencies"]
+    assert result["report_consistency"] == "OK"
+
+
+def test_cancel_with_missing_fill_qty_is_not_eligible_for_zero_fill_subtraction():
+    assert _explicit_order_filled_qty({"status": "CANCELLED", "qty_filled": None}) is None
+    assert _explicit_order_filled_qty({"status": "CANCELLED"}) is None
+
+def test_close_fill_classifier_prefers_broker_partial_fill_over_stale_db_zero():
+    row = {
+        "status": "CANCELLED",
+        "qty_filled": 0,
+        "meta": {
+            "broker_raw_row": {
+                "filled_qty_present": True,
+                "filled_qty": 1,
+                "cumulative_filled_qty": 1,
+                "remaining_qty": 0,
+            }
+        },
+    }
+    assert _explicit_order_filled_qty(row) == 1
+
+
+def test_close_fill_classifier_does_not_turn_broker_missing_fill_into_zero():
+    row = {
+        "status": "CANCELLED",
+        "qty_filled": 0,
+        "meta": {
+            "broker_raw_row": {
+                "filled_qty_present": False,
+                "filled_qty": None,
+                "remaining_qty": 0,
+            }
+        },
+    }
+    assert _explicit_order_filled_qty(row) is None
+
+def test_day_wide_zero_fill_cancel_does_not_reduce_session_router_count():
+    result = reconcile_order_sources(
+        db_orders=3,
+        fills=2,
+        balance_confirmed=0,
+        router_summary=2,
+        zero_fill_canceled_orders=1,
+    )
+    assert result["db_orders"] == 2
+    assert result["raw_router_summary"] == 2
+    assert result["router_summary"] == 2
+

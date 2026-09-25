@@ -317,7 +317,7 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     # while live PB1 consumes canonical top-level fields. Promote the immutable
     # decision fields without fabricating or remapping the strategy.
     provenance_fields = (
-        "entry_reason", "entry_style_selected", "entry_style", "entry_component",
+        "entry_reason", "entry_style_selected", "entry_style_raw", "entry_style", "entry_component",
         "entry_signal_type", "selected_reason",
         "reasons", "filters_passed", "score_breakdown", "explanation_quality",
         "rank_final30", "agent_a_score", "agent_b_score",
@@ -390,9 +390,11 @@ def inspect_us_entry_provenance(row: dict) -> dict:
     sources = []
     for label, value in (
         ("top.entry_style_selected", src.get("entry_style_selected")),
+        ("top.entry_style_raw", src.get("entry_style_raw")),
         ("top.entry_style", src.get("entry_style")),
         ("top.entry_signal_type", src.get("entry_signal_type")),
         ("meta.entry_style_selected", meta.get("entry_style_selected")),
+        ("meta.entry_style_raw", meta.get("entry_style_raw")),
         ("meta.entry_style", meta.get("entry_style")),
         ("meta.entry_signal_type", meta.get("entry_signal_type")),
     ):

@@ -57,6 +57,57 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
     def inc(name: str, amount: int = 1) -> None:
         result[name] = int(result.get(name, 0)) + int(amount)
 
+    def explicit_broker_filled_qty(observation: dict | None) -> int | None:
+        if not isinstance(observation, dict):
+            return None
+        if observation.get("filled_qty_present") is False:
+            return None
+        for key in ("filled_qty", "cumulative_filled_qty"):
+            raw_value = observation.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                return int(float(raw_value))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def explicit_broker_requested_qty(observation: dict | None) -> int | None:
+        if not isinstance(observation, dict):
+            return None
+        for key in ("requested_qty", "qty_requested", "qty"):
+            raw_value = observation.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                return int(float(raw_value))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def effective_terminal_status(order: dict, observation: dict | None) -> str:
+        if not isinstance(observation, dict):
+            return ""
+        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if status != "CANCELLED":
+            return status
+        try:
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            observed_requested = explicit_broker_requested_qty(observation)
+            filled = explicit_broker_filled_qty(observation)
+            remaining_raw = observation.get("remaining_qty")
+            if (
+                requested > 0
+                and observed_requested == requested
+                and filled == requested
+                and remaining_raw not in (None, "")
+                and int(float(remaining_raw)) == 0
+            ):
+                return "FILLED"
+        except (TypeError, ValueError):
+            return status
+        return status
+
     def terminal_observation(order: dict, observation: dict | None) -> bool:
         if not isinstance(observation, dict):
             return False
@@ -66,6 +117,48 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         observed_symbol = str(observation.get("symbol") or "").upper()
         observed_side = str(observation.get("side") or "").upper()
         status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if status == "CANCELLED":
+            # A terminal cancel must still belong to this exact requested
+            # quantity.  Otherwise a broker row for a different request can be
+            # misapplied to the local order, including a full-fill/cancel race.
+            filled = explicit_broker_filled_qty(observation)
+            observed_requested = explicit_broker_requested_qty(observation)
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            if (
+                filled is None
+                or observed_requested is None
+                or requested <= 0
+                or observed_requested != requested
+                or filled < 0
+                or filled > requested
+            ):
+                return False
+        if status == "FILLED":
+            # FILLED is terminal only with internally consistent broker quantity
+            # evidence for this exact local request.  A status string alone, or
+            # a broker row whose requested quantity belongs to another order,
+            # must never promote this order to a completed fill.
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            observed_requested = explicit_broker_requested_qty(observation)
+            filled = explicit_broker_filled_qty(observation)
+            remaining_raw = observation.get("remaining_qty")
+            if (
+                requested <= 0
+                or observed_requested is None
+                or filled is None
+                or remaining_raw in (None, "")
+            ):
+                return False
+            try:
+                remaining = int(float(remaining_raw))
+            except (TypeError, ValueError):
+                return False
+            if (
+                observed_requested != requested
+                or filled != observed_requested
+                or remaining != 0
+            ):
+                return False
         return bool(
             order_no and observed_order_no == order_no
             and observed_symbol == "TQQQ"
@@ -97,13 +190,10 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 observation.get("requested_qty") or observation.get("qty_requested")
                 or observation.get("qty") or 0
             ))
-            filled_raw = observation.get("filled_qty")
-            if filled_raw in (None, ""):
-                filled_raw = observation.get("cumulative_filled_qty")
+            filled = explicit_broker_filled_qty(observation)
             remaining_raw = observation.get("remaining_qty")
-            if filled_raw in (None, "") or remaining_raw in (None, ""):
+            if filled is None or remaining_raw in (None, ""):
                 return None
-            filled = int(float(filled_raw))
             remaining = int(float(remaining_raw))
         except (TypeError, ValueError):
             return None
@@ -118,6 +208,80 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             "requested_qty": requested,
             "filled_qty": filled,
             "remaining_qty": remaining,
+        }
+
+    def cancel_ack_zero_remaining_terminal(order: dict, observation: dict | None) -> dict | None:
+        """Prove a cancelled zero-fill TQQQ BUY without guessing.
+
+        KIS practice cancellation returns a separate cancel ACK (for example
+        msg_cd=40630000) while the original order row can remain status-less
+        with requested_qty unchanged and remaining_qty=0.  A cancel ACK alone
+        is not terminal evidence.  Require the durable cancel ACK plus exact
+        original-order identity plus broker-observed zero fill/zero remaining.
+        Partial-fill cancellations stay fenced for a stronger reconciliation
+        path rather than being collapsed into a zero-fill cancellation.
+        """
+        if not isinstance(observation, dict):
+            return None
+        meta = order_meta(order)
+        cancel_result = meta.get("tqqq_ttl_cancel_result")
+        if not isinstance(cancel_result, dict):
+            return None
+        rt_cd = str(cancel_result.get("rt_cd") or "")
+        msg_cd = str(cancel_result.get("msg_cd") or "")
+        msg1 = str(cancel_result.get("msg1") or "")
+        cancel_ack_ok = bool(
+            rt_cd == "0"
+            and (
+                msg_cd == "40630000"
+                or "취소주문이 완료" in msg1
+                or "cancel order" in msg1.lower() and "complete" in msg1.lower()
+            )
+        )
+        if not cancel_ack_ok:
+            return None
+
+        from trader.us.utils.order_no import normalize_us_order_no
+        expected_order_no = normalize_us_order_no(str(order.get("order_no") or ""))
+        observed_order_no = normalize_us_order_no(str(observation.get("order_no") or ""))
+        if not expected_order_no or observed_order_no != expected_order_no:
+            return None
+        if str(observation.get("symbol") or "").upper() != "TQQQ":
+            return None
+        if str(observation.get("side") or "").upper() != "BUY":
+            return None
+        try:
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            observed_requested = int(float(
+                observation.get("requested_qty") or observation.get("qty_requested")
+                or observation.get("qty") or 0
+            ))
+            filled = explicit_broker_filled_qty(observation)
+            remaining_raw = observation.get("remaining_qty")
+            if filled is None or remaining_raw in (None, ""):
+                return None
+            remaining = int(float(remaining_raw))
+        except (TypeError, ValueError):
+            return None
+        if requested <= 0 or observed_requested != requested:
+            return None
+        if filled != 0 or remaining != 0:
+            return None
+
+        output = cancel_result.get("output") if isinstance(cancel_result.get("output"), dict) else {}
+        return {
+            **observation,
+            "order_no": str(order.get("order_no") or ""),
+            "symbol": "TQQQ",
+            "side": "BUY",
+            "status": "CANCELLED",
+            "requested_qty": requested,
+            "filled_qty": 0,
+            "cumulative_filled_qty": 0,
+            "remaining_qty": 0,
+            "evidence_type": "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+            "cancel_broker_order_no": str(output.get("ODNO") or ""),
+            "observed_at": observation.get("observed_at") or now.astimezone(timezone.utc).isoformat(),
         }
 
     def maybe_escalate(order: dict, *, trigger: str) -> bool:
@@ -137,6 +301,142 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 reason="TQQQ_TTL_UNRESOLVED",
             )
         return True
+
+    def safe_mark_first_unresolved(order: dict, *, reason: str, trigger: str) -> None:
+        """Metadata liveness writes are best-effort and must not abort reconciliation."""
+        try:
+            mark_first_unresolved(repository, order, when=now, reason=reason)
+        except Exception as exc:
+            inc("pending_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][PENDING_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s stage=mark_first_unresolved error=%s",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+
+    def safe_pending_bookkeeping(order: dict, *, reason: str, trigger: str) -> None:
+        """Best-effort liveness bookkeeping must never abort later TTL orders."""
+        safe_mark_first_unresolved(order, reason=reason, trigger=trigger)
+        try:
+            maybe_escalate(order, trigger=trigger)
+        except Exception as exc:
+            inc("pending_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][PENDING_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s stage=maybe_escalate error=%s",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+
+    def safe_mark_cancel_attempt(order: dict, *, payload: dict, trigger: str) -> bool:
+        """Persist cancel metadata or return False without leaking in-memory ACK state."""
+        before_meta = dict(order_meta(order))
+        try:
+            mark_cancel_attempt(repository, order, when=now, result=payload)
+            return True
+        except Exception as exc:
+            order["meta"] = before_meta
+            inc("cancel_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][CANCEL_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s error=%s action=continue_ttl_scan",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+            return False
+
+    def safe_maybe_escalate(order: dict, *, trigger: str) -> None:
+        try:
+            maybe_escalate(order, trigger=trigger)
+        except Exception as exc:
+            inc("pending_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][PENDING_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s stage=maybe_escalate error=%s",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+
+    def durable_terminal_after_exception(order: dict, observation: dict) -> bool:
+        loader = getattr(repository, "load_order_lifecycle_state", None)
+        if not callable(loader):
+            return False
+        try:
+            durable = loader(order)
+        except Exception as exc:
+            logger.warning(
+                "[TQQQ_INF][TTL_RECONCILE][DURABLE_REREAD_WARN] "
+                "order_no=%s key=%s error=%s",
+                order.get("order_no"), order.get("client_order_key"), exc,
+            )
+            return False
+        if not isinstance(durable, dict):
+            return False
+        durable_status = str(durable.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        expected_status = effective_terminal_status(order, observation)
+        if durable_status != expected_status or durable_status not in _TQQQ_TTL_TERMINAL_STATUSES:
+            return False
+        expected_filled = explicit_broker_filled_qty(observation)
+        if expected_filled is not None:
+            try:
+                if int(durable.get("qty_filled") or 0) < int(expected_filled):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def persist_terminal_or_pending(
+        order: dict,
+        observation: dict,
+        *,
+        trigger: str,
+        success_counter: str | None = None,
+    ) -> bool:
+        try:
+            applied = repository.apply_ttl_terminal_observation(order, observation)
+        except Exception as exc:
+            if durable_terminal_after_exception(order, observation):
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_RECOVERED] "
+                    "order_no=%s key=%s trigger=%s error=%s "
+                    "action=accept_durable_terminal_state",
+                    order.get("order_no"), order.get("client_order_key"), trigger, exc,
+                )
+                inc("terminal_persist_recovered")
+                if success_counter:
+                    inc(success_counter)
+                result["terminal"] += 1
+                return True
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_EXCEPTION] "
+                "order_no=%s key=%s trigger=%s error=%s action=keep_pending_and_escalate",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+            applied = {
+                "status": "PENDING",
+                "reason": "terminal_persist_exception",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        applied_status = str((applied or {}).get("status") or "").upper()
+        if applied_status == "OK":
+            if success_counter:
+                inc(success_counter)
+            result["terminal"] += 1
+            return True
+        reason = str((applied or {}).get("reason") or applied_status or "UNKNOWN")
+        logger.warning(
+            "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_PENDING] "
+            "order_no=%s key=%s trigger=%s persist_status=%s reason=%s "
+            "action=keep_pending_and_escalate",
+            order.get("order_no"), order.get("client_order_key"), trigger,
+            applied_status or "UNKNOWN", reason,
+        )
+        inc("terminal_persist_pending")
+        safe_pending_bookkeeping(
+            order,
+            reason=f"TERMINAL_PERSIST_{reason}",
+            trigger=trigger,
+        )
+        result["pending"] += 1
+        return False
 
     for order in expired:
         order_no = str(order.get("order_no") or "")
@@ -158,14 +458,30 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][QUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                 order_no, client_order_key, exc,
             )
-            mark_first_unresolved(repository, order, when=now, reason="QUERY_ERROR")
-            maybe_escalate(order, trigger="query_error")
+            safe_pending_bookkeeping(order, reason="QUERY_ERROR", trigger="query_error")
             result["pending"] += 1
             continue
 
         if terminal_observation(order, observation):
-            repository.apply_ttl_terminal_observation(order, observation)
-            result["terminal"] += 1
+            persist_terminal_or_pending(
+                order, observation, trigger="initial_terminal_observation",
+            )
+            continue
+
+        cancel_terminal = cancel_ack_zero_remaining_terminal(order, observation)
+        if cancel_terminal is not None:
+            logger.warning(
+                "[TQQQ_INF][TTL_RECONCILE][CANCEL_CONFIRMED] "
+                "order_no=%s key=%s cancel_order_no=%s filled=0 remaining=0 "
+                "evidence=%s action=terminalize_cancelled",
+                order_no, client_order_key, cancel_terminal.get("cancel_broker_order_no"),
+                cancel_terminal.get("evidence_type"),
+            )
+            persist_terminal_or_pending(
+                order, cancel_terminal,
+                trigger="cancel_confirmed_initial",
+                success_counter="cancel_confirmed",
+            )
             continue
 
         specific_evidence = exact_order_fill_evidence(order, observation)
@@ -209,20 +525,63 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][BALANCE_CONFLICT] order_no=%s key=%s detail=%s action=keep_fenced",
                 order_no, client_order_key, balance_result,
             )
-            mark_first_unresolved(repository, order, when=now, reason="BALANCE_DELTA_CONFLICT")
+            safe_mark_first_unresolved(
+                order, reason="BALANCE_DELTA_CONFLICT", trigger="balance_delta_conflict",
+            )
 
         meta = order_meta(order)
         if meta.get("tqqq_ttl_cancel_requested_at") or meta.get("manual_reconcile_required"):
-            mark_first_unresolved(repository, order, when=now, reason="NON_TERMINAL_AFTER_CANCEL")
-            maybe_escalate(order, trigger="non_terminal_after_cancel")
+            safe_pending_bookkeeping(
+                order, reason="NON_TERMINAL_AFTER_CANCEL", trigger="non_terminal_after_cancel",
+            )
             result["pending"] += 1
             continue
 
-        mark_first_unresolved(repository, order, when=now, reason="TTL_NON_TERMINAL")
+        safe_mark_first_unresolved(
+            order, reason="TTL_NON_TERMINAL", trigger="ttl_non_terminal",
+        )
         try:
             cancel_result = cancel_order(**identity) or {}
-            mark_cancel_attempt(repository, order, when=now, result=cancel_result)
+            cancel_ack_durable = safe_mark_cancel_attempt(
+                order,
+                payload=cancel_result,
+                trigger="cancel_ack",
+            )
             result["cancel_requested"] += 1
+            try:
+                retry_observation = query_order(**identity) or {}
+            except Exception as retry_exc:
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][REQUERY_AFTER_CANCEL_ACK_WARN] "
+                    "order_no=%s key=%s error=%s action=keep_pending",
+                    order_no, client_order_key, retry_exc,
+                )
+            else:
+                if terminal_observation(order, retry_observation):
+                    persist_terminal_or_pending(
+                        order, retry_observation,
+                        trigger="post_cancel_ack_terminal_observation",
+                    )
+                    continue
+                cancel_terminal = (
+                    cancel_ack_zero_remaining_terminal(order, retry_observation)
+                    if cancel_ack_durable
+                    else None
+                )
+                if cancel_terminal is not None:
+                    logger.warning(
+                        "[TQQQ_INF][TTL_RECONCILE][CANCEL_CONFIRMED] "
+                        "order_no=%s key=%s cancel_order_no=%s filled=0 remaining=0 "
+                        "evidence=%s action=terminalize_cancelled",
+                        order_no, client_order_key, cancel_terminal.get("cancel_broker_order_no"),
+                        cancel_terminal.get("evidence_type"),
+                    )
+                    persist_terminal_or_pending(
+                        order, cancel_terminal,
+                        trigger="post_cancel_ack_zero_fill_terminal",
+                        success_counter="cancel_confirmed",
+                    )
+                    continue
         except Exception as exc:
             inc("cancel_attempted")
             error_text = str(exc)
@@ -230,9 +589,15 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][CANCEL_WARN] order_no=%s key=%s error=%s action=persist_attempt_and_requery_original_order",
                 order_no, client_order_key, error_text,
             )
-            mark_cancel_attempt(repository, order, when=now, result={
-                "status": "ERROR", "error_type": type(exc).__name__, "error": error_text,
-            })
+            safe_mark_cancel_attempt(
+                order,
+                payload={
+                    "status": "ERROR",
+                    "error_type": type(exc).__name__,
+                    "error": error_text,
+                },
+                trigger="cancel_exception",
+            )
             try:
                 retry_observation = query_order(**identity) or {}
             except Exception as retry_exc:
@@ -240,12 +605,14 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                     "[TQQQ_INF][TTL_RECONCILE][REQUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                     order_no, client_order_key, retry_exc,
                 )
-                maybe_escalate(order, trigger="cancel_error_requery_error")
+                safe_maybe_escalate(order, trigger="cancel_error_requery_error")
                 result["pending"] += 1
                 continue
             if terminal_observation(order, retry_observation):
-                repository.apply_ttl_terminal_observation(order, retry_observation)
-                result["terminal"] += 1
+                persist_terminal_or_pending(
+                    order, retry_observation,
+                    trigger="cancel_error_requery_terminal_observation",
+                )
                 continue
             historical_expiry = historical_zero_fill_not_live_expiry(
                 order,
@@ -261,11 +628,13 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                     order_no, client_order_key, historical_expiry.get("requested_qty"),
                     historical_expiry.get("evidence_type"),
                 )
-                repository.apply_ttl_terminal_observation(order, historical_expiry)
-                inc("historical_expired")
-                result["terminal"] += 1
+                persist_terminal_or_pending(
+                    order, historical_expiry,
+                    trigger="historical_zero_fill_expiry",
+                    success_counter="historical_expired",
+                )
                 continue
-            maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
+            safe_maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
 
         result["pending"] += 1
     return result

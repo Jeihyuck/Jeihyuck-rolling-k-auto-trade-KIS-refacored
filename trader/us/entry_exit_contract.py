@@ -14,7 +14,7 @@ from typing import Any
 US_ENTRY_EXIT_CONTRACT_VERSION = "us_entry_exit_contract_v2"
 
 _PROVENANCE_FIELDS = (
-    "entry_reason", "entry_style_selected", "entry_component", "entry_signal_type",
+    "entry_reason", "entry_style_selected", "entry_style_raw", "entry_component", "entry_signal_type",
     "reasons", "filters_passed", "score_breakdown", "explanation_quality",
     "rank_final30", "score_final", "trend_score", "theme_cluster", "sector",
     "industry", "market_state", "market_regime", "rotation_regime",

@@ -14,6 +14,7 @@ def _simulate_postgres_watchlist_row():
         "score": 0.92,
         "score_final": 0.92,
         "entry_style_selected": "pb1_pullback",
+        "entry_style_raw": "pb1_pullback",
         "pullback_score": 0.81,
         "breakout_score": 0.12,
         "momentum_score": 0.43,
@@ -63,6 +64,7 @@ def test_us_final30_db_reload_preserves_provenance_and_creates_live_buy(monkeypa
     canonical = canonicalize_us_watchlist_row(db_row)
 
     assert canonical["entry_style_selected"] == "pb1_pullback"
+    assert canonical["entry_style_raw"] == "pb1_pullback"
     assert canonical["pullback_score"] == 0.81
     assert canonical["reasons"] == ["ENTRY_PULLBACK"]
     assert validate_us_entry_provenance_contract([db_row])["ok"] is True
@@ -106,11 +108,62 @@ def test_us_final30_db_reload_preserves_provenance_and_creates_live_buy(monkeypa
     assert routed["intent"]["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
 
 
+def test_us_momentum_pullback_db_to_buy_contract_preserves_raw_subtype(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.score_columns import canonicalize_us_watchlist_row, validate_us_entry_provenance_contract
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+    from trader.us.execution.order_router import route_order
+
+    _entry_test_env(monkeypatch)
+    db_row = _simulate_postgres_watchlist_row()
+    db_row["meta"]["entry_style_selected"] = "momentum_pullback"
+    db_row["meta"]["entry_style_raw"] = "momentum_pullback"
+    db_row["meta"]["momentum_score"] = 0.82
+    db_row["meta"]["pullback_score"] = 0.78
+
+    assert validate_us_entry_provenance_contract([db_row])["ok"] is True
+    canonical = canonicalize_us_watchlist_row(db_row)
+    assert canonical["entry_style_selected"] == "momentum_pullback"
+    assert canonical["entry_style_raw"] == "momentum_pullback"
+
+    diagnostics = {}
+    intents = generate_entry_intents(
+        tickers=None,
+        provider=_EntryProvider(),
+        sold_today=set(),
+        available_cash_usd=10000.0,
+        position_count=0,
+        capital_usd_cap=10000.0,
+        now=datetime(2026, 9, 18, 10, 5, tzinfo=ZoneInfo("America/New_York")),
+        max_new_entries=1,
+        watchlist_entries=[canonical],
+        current_position_symbols=set(),
+        diagnostics=diagnostics,
+    )
+    assert len(intents) == 1
+    assert intents[0]["entry_style_raw"] == "momentum_pullback"
+    assert intents[0]["entry_style_selected"] == "ENTRY_PULLBACK"
+    assert intents[0]["entry_signal_type"] == "pullback"
+
+    routed = route_order(
+        intents[0],
+        signal_only=True,
+        current_position_symbols=set(),
+        allowed_symbols={"AAPL"},
+    )
+    assert routed["status"] == "SIGNAL_ONLY"
+    contract = routed["intent"]["meta"]["entry_exit_contract"]
+    assert contract["entry_provenance"]["entry_style_raw"] == "momentum_pullback"
+    assert contract["entry_provenance"]["entry_style_selected"] == "ENTRY_PULLBACK"
+    assert contract["strategy_owner"] == "US_STANDARD"
+
+
 def test_us_live_provenance_validator_rejects_db_row_without_style():
     from trader.us.score_columns import validate_us_entry_provenance_contract
 
     broken = _simulate_postgres_watchlist_row()
     broken["meta"].pop("entry_style_selected", None)
+    broken["meta"].pop("entry_style_raw", None)
     result = validate_us_entry_provenance_contract([broken])
     assert result["ok"] is False
     assert result["invalid_count"] == 1
@@ -461,6 +514,19 @@ def test_us_corrupted_style_is_rejected_by_preflight_and_live_engine(monkeypatch
     blocked = diagnostics.get("blocked") or []
     assert any(item.get("reason") == "ENTRY_EXPLAIN_CONTRACT_ERROR" for item in blocked)
     assert any(item.get("contract_reason") == "entry_style_invalid_source" for item in blocked)
+
+
+def test_us_conflicting_raw_subtype_and_canonical_family_fails_closed():
+    from trader.us.score_columns import validate_us_entry_provenance_contract
+
+    conflict = _simulate_postgres_watchlist_row()
+    conflict["meta"]["entry_style_selected"] = "pb1_pullback"
+    conflict["meta"]["entry_style_raw"] = "breakout"
+
+    result = validate_us_entry_provenance_contract([conflict])
+    assert result["ok"] is False
+    assert result["invalid"][0]["reason"] == "entry_style_conflict"
+    assert sorted(result["invalid"][0]["conflicts"]) == ["ENTRY_BREAKOUT", "ENTRY_PULLBACK"]
 
 
 def test_us_conflicting_top_and_meta_styles_fail_closed_in_preflight_and_live(monkeypatch):

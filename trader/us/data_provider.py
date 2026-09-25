@@ -520,8 +520,15 @@ def normalize_us_order_status_row(row: dict) -> dict:
     requested_raw = _get_first_valid(
         row, ("requested_qty", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"), None
     )
-    filled_raw = _get_first_valid(
-        row, ("filled_qty", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty"), None
+    fill_qty_keys = ("filled_qty", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty")
+    filled_qty_raw_present = any(
+        key in row and row.get(key) not in (None, "")
+        for key in fill_qty_keys
+    )
+    filled_raw = _get_first_valid(row, fill_qty_keys, None)
+    filled_qty_present = bool(
+        filled_qty_raw_present
+        and _is_valid_nonnegative_integral_qty(filled_raw)
     )
     remaining_raw = _get_first_valid(
         row, ("remaining_qty", "nccs_qty", "rmn_qty"), None
@@ -537,16 +544,21 @@ def normalize_us_order_status_row(row: dict) -> dict:
             break
 
     requested = _safe_int(requested_raw, 0)
-    filled = _safe_int(filled_raw, 0)
-    remaining = _safe_int(remaining_raw, 0) if remaining_raw is not None else max(0, requested - filled)
+    filled = _safe_int(filled_raw, 0) if filled_qty_present else None
+    filled_for_status = int(filled or 0)
+    remaining = (
+        _safe_int(remaining_raw, 0)
+        if remaining_raw is not None
+        else max(0, requested - filled_for_status)
+    )
     raw_status = str(_get_first_valid(row, ("status", "ord_dvsn_name", "ord_sttus", "rjct_rson"), "") or "").upper()
     if "REJECT" in raw_status or "거부" in raw_status:
         status = "REJECTED"
     elif "CANCEL" in raw_status or "취소" in raw_status:
         status = "CANCELLED"
-    elif requested and filled >= requested:
+    elif requested and filled_for_status >= requested:
         status = "FILLED"
-    elif filled > 0:
+    elif filled_for_status > 0:
         status = "PARTIALLY_FILLED"
     elif requested > 0 and remaining > 0:
         status = "OPEN"
@@ -583,7 +595,11 @@ def normalize_us_order_status_row(row: dict) -> dict:
     return {
         "order_no": order_no, "raw_order_no": order_no,
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
-        "requested_qty": requested, "filled_qty": filled, "remaining_qty": remaining,
+        "requested_qty": requested,
+        "filled_qty": filled,
+        "filled_qty_raw_present": bool(filled_qty_raw_present),
+        "filled_qty_present": bool(filled_qty_present),
+        "remaining_qty": remaining,
         "status": status,
         "trade_date": trade_date_raw,
         "exchange": str(_get_first_valid(row, ("exchange", "ovrs_excg_cd", "OVRS_EXCG_CD"), "") or ""),
@@ -1231,19 +1247,51 @@ class USDataProvider:
         if not matches:
             return None
         def _observed(row: dict) -> str:
-            return str(row.get("observed_at") or row.get("updated_at") or row.get("order_timestamp") or row.get("order_time") or "")
+            return str(
+                row.get("observed_at")
+                or row.get("updated_at")
+                or row.get("order_timestamp")
+                or row.get("submitted_at_utc")
+                or row.get("order_time")
+                or ""
+            )
+
+        def _explicit_fill(row: dict) -> int | None:
+            # Production-normalized rows explicitly mark invalid schemas as
+            # quarantined.  Legacy/test callers may provide already-normalized
+            # snapshots without this marker, so only an explicit quarantine
+            # disqualifies broker fill evidence.
+            if str(row.get("normalization_result") or "").lower() == "quarantined":
+                return None
+            if row.get("filled_qty_present") is False:
+                return None
+            for key in ("filled_qty", "cumulative_filled_qty"):
+                raw_value = row.get(key)
+                if raw_value in (None, ""):
+                    continue
+                return _safe_int(raw_value, 0)
+            return None
+
         best = matches[0]
         conflict = False
         for row in matches[1:]:
-            row_qty = _safe_int(row.get("filled_qty") or row.get("cumulative_filled_qty") or 0)
-            best_qty = _safe_int(best.get("filled_qty") or best.get("cumulative_filled_qty") or 0)
-            if row_qty > best_qty or (row_qty == best_qty and _observed(row) >= _observed(best)):
+            row_qty = _explicit_fill(row)
+            best_qty = _explicit_fill(best)
+            if row_qty is not None and best_qty is None:
                 best = row
-            elif _observed(row) > _observed(best) and row_qty < best_qty:
-                conflict = True
+            elif row_qty is not None and best_qty is not None:
+                if row_qty > best_qty or (row_qty == best_qty and _observed(row) >= _observed(best)):
+                    best = row
+                elif _observed(row) > _observed(best) and row_qty < best_qty:
+                    conflict = True
+            elif row_qty is None and best_qty is None and _observed(row) >= _observed(best):
+                best = row
+
         out = dict(best)
-        out["filled_qty"] = _safe_int(best.get("filled_qty") or best.get("cumulative_filled_qty") or 0)
-        out["cumulative_filled_qty"] = out["filled_qty"]
+        explicit_filled = _explicit_fill(best)
+        out["filled_qty_present"] = explicit_filled is not None
+        out["filled_qty"] = explicit_filled
+        out["cumulative_filled_qty"] = explicit_filled
         out["avg_price"] = _safe_float(best.get("avg_price") or best.get("avg_price_usd") or 0.0)
         if conflict:
             out["status"] = "EVIDENCE_QUANTITY_REGRESSION"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from datetime import date, datetime, timezone
@@ -197,7 +198,7 @@ _US_DAILY_METRIC_FIELDS = (
     "daily_bar_count", "daily_metrics_as_of", "daily_metrics_source", "daily_history_quality",
     # Entry-decision provenance must survive Final30 -> locked DB -> live BUY.
     # Keep this aligned with trader.us.entry_exit_contract._PROVENANCE_FIELDS.
-    "entry_reason", "entry_style_selected", "entry_style", "entry_component",
+    "entry_reason", "entry_style_selected", "entry_style_raw", "entry_style", "entry_component",
     "entry_signal_type", "selected_reason",
     "breakout_score", "pullback_score", "momentum_score", "vcp_score",
     "agent_a_score", "agent_b_score", "rank_final30", "score_final",
@@ -920,9 +921,80 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
     if int(filled_qty) < 0 or int(filled_qty) > int(requested_qty):
         return {"status":"BROKER_OBSERVATION_QUARANTINED","reason":"cumulative_filled_qty_out_of_range"}
+    broker_reported_status = status
+
+    # Any fill-bearing broker observation that carries its own requested
+    # quantity must agree with the durable local order identity.  This guard is
+    # intentionally broader than CANCELLED handling because ACK reconciliation
+    # can normalize a positive broker row to FILLED before it reaches here.
+    broker_requested_raw = None
+    for key_name in ("requested_qty", "qty_requested", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"):
+        candidate = (raw_row or {}).get(key_name)
+        if candidate not in (None, ""):
+            broker_requested_raw = candidate
+            break
+    broker_requested_qty = None
+    broker_requested_valid = broker_requested_raw in (None, "")
+    if broker_requested_raw not in (None, ""):
+        try:
+            broker_requested_num = float(broker_requested_raw)
+            if math.isfinite(broker_requested_num) and broker_requested_num >= 0 and broker_requested_num.is_integer():
+                broker_requested_qty = int(broker_requested_num)
+                broker_requested_valid = True
+        except (TypeError, ValueError):
+            broker_requested_valid = False
+
+    fill_bearing_status = status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0
+    if fill_bearing_status and broker_requested_raw not in (None, ""):
+        if not broker_requested_valid or broker_requested_qty != int(requested_qty):
+            mismatch_reason = (
+                "cancel_full_fill_requested_qty_mismatch"
+                if (
+                    broker_reported_status == "CANCELLED"
+                    and int(filled_qty) == int(requested_qty)
+                    and int(remaining_qty) == 0
+                )
+                else "fill_requested_qty_mismatch"
+            )
+            return {
+                "status": "BROKER_OBSERVATION_QUARANTINED",
+                "reason": mismatch_reason,
+                "local_requested_qty": int(requested_qty),
+                "broker_requested_qty": broker_requested_qty,
+                "broker_requested_raw": broker_requested_raw,
+                "broker_reported_status": broker_reported_status,
+                "retry_order": False,
+                "entry_fence": True,
+            }
+
+    if (
+        status == "CANCELLED"
+        and int(requested_qty) > 0
+        and int(filled_qty) == int(requested_qty)
+        and int(remaining_qty) == 0
+    ):
+        # Cancel/fill race normalization requires strong broker request
+        # identity even when the upstream reconciler already classifies the
+        # economic result as a full fill.
+        if broker_requested_qty != int(requested_qty):
+            return {
+                "status": "BROKER_OBSERVATION_QUARANTINED",
+                "reason": "cancel_full_fill_requested_qty_mismatch",
+                "local_requested_qty": int(requested_qty),
+                "broker_requested_qty": broker_requested_qty,
+                "retry_order": False,
+                "entry_fence": True,
+            }
+        # The entire broker-requested quantity executed before the cancel won
+        # the race.  Durable order state, lifecycle event, and return value all
+        # describe the terminal economic state: FILLED.
+        status = "FILLED"
     meta_patch = {"order_no_raw": str(raw_order_no), "order_no_norm": str(canonical_order_no),
                   "remaining_qty": int(remaining_qty), "broker_observed_at": observed_at,
                   "broker_raw_row": raw_row or {}, "fill_evidence_type": evidence_type}
+    if broker_reported_status != status:
+        meta_patch["broker_reported_status"] = broker_reported_status
+        meta_patch["terminal_status_normalized_from"] = broker_reported_status
     engine = _get_engine_or_none()
     if engine is None:
         identity_rows = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
@@ -930,6 +1002,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         order_meta = {**_parse_json_meta(identity_rows[0].get("meta")), **meta_patch}
         old_status=str(identity_rows[0].get("status") or "ACK").upper()
         old_filled=int(identity_rows[0].get("qty_filled") or 0)
+        old_avg_price=float(identity_rows[0].get("avg_price_usd") or 0)
     else:
         with engine.connect() as conn:
             active_epoch_id = _active_us_epoch(conn)
@@ -940,33 +1013,89 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                 {"td": td, "key": key, **epoch_params},
             ).mappings().first()
             state_row = conn.execute(
-                text("SELECT status,qty_filled,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                text("SELECT status,qty_filled,avg_price_usd,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
                 {"td": td, "key": key, **epoch_params},
             ).mappings().first()
         if not identity_row:
             return {"status": "ORDER_NOT_FOUND"}
         _assert_us_order_epoch(dict(identity_row), active_epoch_id)
         order_meta = {**_parse_json_meta(identity_row.get("meta")), **meta_patch}
-        old_status="ACK"; old_filled=0
+        old_status="ACK"; old_filled=0; old_avg_price=0.0
         if state_row:
             _assert_us_order_epoch(dict(state_row), active_epoch_id)
             old_status=str(state_row.get("status") or "ACK").upper()
             old_filled=int(state_row.get("qty_filled") or 0)
+            old_avg_price=float(state_row.get("avg_price_usd") or 0)
     terminal={"FILLED","CANCELLED","REJECTED","EXPIRED"}
-    stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
+    cancel_full_fill_correction = bool(
+        old_status == "CANCELLED"
+        and broker_reported_status == "CANCELLED"
+        and status == "FILLED"
+        and broker_requested_valid
+        and broker_requested_qty == int(requested_qty)
+        and int(filled_qty) == int(requested_qty)
+        and int(remaining_qty) == 0
+    )
+    terminal_status_conflict = (
+        old_status in terminal
+        and status != old_status
+        and not cancel_full_fill_correction
+    )
+    stale = terminal_status_conflict or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
     if stale:
         return {"status":"OK","order_status":old_status,"observation_ignored":"ORDER_OBSERVATION_IGNORED_STALE"}
-    if status in {"PARTIALLY_FILLED", "FILLED"} and int(filled_qty) > 0:
+    if status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0:
+        # A cancellation may arrive as the first durable broker observation
+        # after one or more executions.  Persist cumulative fill truth first,
+        # then apply the terminal CANCELLED status below.  Never manufacture a
+        # zero-price actual fill: if this observation introduces new filled
+        # quantity it must also carry a usable execution price.
+        try:
+            observed_fill_price = float(
+                (raw_row or {}).get("avg_price")
+                or (raw_row or {}).get("avg_price_usd")
+                or 0
+            )
+        except (TypeError, ValueError):
+            observed_fill_price = 0.0
+        fill_price = observed_fill_price
+        fill_price_source = "broker_observation"
+        if not (math.isfinite(fill_price) and fill_price > 0):
+            if (
+                old_filled >= int(filled_qty)
+                and math.isfinite(old_avg_price)
+                and old_avg_price > 0
+            ):
+                # No new cumulative quantity is being introduced; reuse the
+                # already-persisted actual order average price only for an
+                # idempotent replay.  Any observation that introduces new
+                # filled quantity must carry a finite positive broker price.
+                fill_price = old_avg_price
+                fill_price_source = "persisted_order_avg_price"
+            else:
+                return {
+                    "status": "PENDING",
+                    "reason": (
+                        "cancel_partial_fill_price_missing"
+                        if status == "CANCELLED"
+                        else "broker_fill_price_missing"
+                    ),
+                    "requires_reconcile": True,
+                    "retry_order": False,
+                    "entry_fence": True,
+                    "observed_filled_qty": int(filled_qty),
+                    "persisted_filled_qty": old_filled,
+                }
         result = mark_order_filled_by_reconcile(
             order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
             filled_qty=filled_qty, requested_qty=requested_qty,
             cumulative_filled_qty=filled_qty,
-            avg_price_usd=float((raw_row or {}).get("avg_price") or 0),
+            avg_price_usd=fill_price,
             source="broker_order_observation", evidence_type=evidence_type,
-            trade_date=td, meta=meta_patch,
+            trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
         )
         if result.get("status") != "OK": return result
-    else:
+    if status not in {"PARTIALLY_FILLED", "FILLED"}:
         if engine is None:
             matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
             if len(matches) != 1: return {"status": "ORDER_IDENTITY_NOT_UNIQUE"}
@@ -974,7 +1103,9 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             from trader.us.execution.order_identity import assert_same_identity
             assert_same_identity(order, {"trade_date": td, "symbol": symbol, "side": side,
                                          "exchange": order.get("exchange"), "meta": order.get("meta")})
-            order["status"] = status
+            if not (str(order.get("status") or "").upper() == "FILLED" and status == "CANCELLED"):
+                order["status"] = status
+            order["qty_filled"] = max(int(order.get("qty_filled") or 0), int(filled_qty))
             order["order_no"] = order.get("order_no") or raw_order_no
             order["meta"] = {**_parse_json_meta(order.get("meta")), **meta_patch}
             order_meta = order["meta"]
@@ -995,9 +1126,10 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
                     WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
                     ELSE :status END,
+                    qty_filled=GREATEST(qty_filled,:filled),
                     order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
                     WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
-                    {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta),
+                    {"status": status, "filled": int(filled_qty), "ono": raw_order_no, "meta": _json_param(order_meta),
                      "td": td, "key": key, **epoch_params})
                 if int(result.rowcount or 0) != 1:
                     return {"status": "ORDER_NOT_FOUND"}

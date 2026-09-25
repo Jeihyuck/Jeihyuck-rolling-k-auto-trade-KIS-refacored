@@ -170,6 +170,27 @@ class InfiniteRepository:
                 params["epoch_id"] = epoch_id
             return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
 
+    def load_order_lifecycle_state(self, order: dict) -> dict | None:
+        """Re-read the exact durable order row after an ambiguous persistence exception."""
+        trade_date = str(order.get("trade_date") or "")
+        key = str(order.get("client_order_key") or "")
+        if not trade_date or not key:
+            return None
+        with self.engine.connect() as conn:
+            epoch_id = self._epoch_id(conn)
+            sql = """
+                SELECT * FROM us_orders
+                WHERE trade_date=CAST(:trade_date AS date)
+                  AND client_order_key=:key
+                  AND symbol='TQQQ' AND side='BUY'
+            """
+            params = {"trade_date": trade_date, "key": key}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            row = conn.execute(text(sql), params).mappings().first()
+        return dict(row) if row is not None else None
+
     def load_expired_open_buy_orders(self, *, now: datetime, ttl_seconds: int,
                                      symbol: str = "TQQQ") -> list[dict]:
         """Return only this sleeve's unresolved BUYs whose broker TTL elapsed."""
@@ -247,7 +268,32 @@ class InfiniteRepository:
         if status not in {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}:
             return {"status": "PENDING"}
         requested = int(order.get("qty_requested") or order.get("qty") or 0)
-        filled = int(observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0)
+        if status == "CANCELLED" and observation.get("filled_qty_present") is False:
+            return {"status": "PENDING", "reason": "cancel_fill_qty_missing"}
+        filled_raw = observation.get("filled_qty")
+        if filled_raw in (None, ""):
+            filled_raw = observation.get("cumulative_filled_qty")
+        if status == "CANCELLED" and filled_raw in (None, ""):
+            return {"status": "PENDING", "reason": "cancel_fill_qty_missing"}
+        filled = int(float(filled_raw)) if filled_raw not in (None, "") else 0
+        remaining_raw = observation.get("remaining_qty")
+        remaining = (
+            max(0, int(remaining_raw))
+            if remaining_raw not in (None, "")
+            else max(0, requested - filled)
+        )
+        terminal_evidence_type = str(
+            observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"
+        )
+        accounting_evidence_type = (
+            "KIS_ORDER_CUMULATIVE_ACTUAL"
+            if filled > 0
+            else terminal_evidence_type
+        )
+        raw_observation = {
+            **observation,
+            "terminal_evidence_type": terminal_evidence_type,
+        }
         return apply_broker_order_observation(
             trade_date=str(order["trade_date"]),
             client_order_key=str(order["client_order_key"]),
@@ -257,11 +303,11 @@ class InfiniteRepository:
             side="BUY",
             requested_qty=requested,
             filled_qty=filled,
-            remaining_qty=max(0, requested - filled),
+            remaining_qty=remaining,
             broker_status=status,
-            evidence_type=str(observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"),
+            evidence_type=accounting_evidence_type,
             observed_at=observation.get("observed_at"),
-            raw_row=observation,
+            raw_row=raw_observation,
         )
 
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:

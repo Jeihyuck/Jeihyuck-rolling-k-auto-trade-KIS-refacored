@@ -102,7 +102,7 @@ def normalize_us_entry_style(value: Any) -> str:
         return "ENTRY_BREAKOUT"
     
     # Pullback 계열
-    if raw in {"ENTRY_PULLBACK", "PULLBACK", "ENTRY_PULLBACK_OVERRIDE", "PULLBACK_REVERSAL"}:
+    if raw in {"ENTRY_PULLBACK", "PULLBACK", "ENTRY_PULLBACK_OVERRIDE", "PULLBACK_REVERSAL", "MOMENTUM_PULLBACK"}:
         return "ENTRY_PULLBACK"
     
     # Momentum 계열
