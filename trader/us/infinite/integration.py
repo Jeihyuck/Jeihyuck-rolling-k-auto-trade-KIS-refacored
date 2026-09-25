@@ -275,17 +275,21 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 order.get("order_no"), order.get("client_order_key"), trigger, exc,
             )
 
-    def safe_mark_cancel_attempt(order: dict, *, payload: dict, trigger: str) -> None:
-        """Cancel-attempt metadata is best-effort and must not abort the TTL scan."""
+    def safe_mark_cancel_attempt(order: dict, *, payload: dict, trigger: str) -> bool:
+        """Persist cancel metadata or return False without leaking in-memory ACK state."""
+        before_meta = dict(order_meta(order))
         try:
             mark_cancel_attempt(repository, order, when=now, result=payload)
+            return True
         except Exception as exc:
+            order["meta"] = before_meta
             inc("cancel_bookkeeping_error")
             logger.exception(
                 "[TQQQ_INF][TTL_RECONCILE][CANCEL_BOOKKEEPING_WARN] "
                 "order_no=%s key=%s trigger=%s error=%s action=continue_ttl_scan",
                 order.get("order_no"), order.get("client_order_key"), trigger, exc,
             )
+            return False
 
     def safe_maybe_escalate(order: dict, *, trigger: str) -> None:
         try:
@@ -486,7 +490,7 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         )
         try:
             cancel_result = cancel_order(**identity) or {}
-            safe_mark_cancel_attempt(
+            cancel_ack_durable = safe_mark_cancel_attempt(
                 order,
                 payload=cancel_result,
                 trigger="cancel_ack",
@@ -507,7 +511,11 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                         trigger="post_cancel_ack_terminal_observation",
                     )
                     continue
-                cancel_terminal = cancel_ack_zero_remaining_terminal(order, retry_observation)
+                cancel_terminal = (
+                    cancel_ack_zero_remaining_terminal(order, retry_observation)
+                    if cancel_ack_durable
+                    else None
+                )
                 if cancel_terminal is not None:
                     logger.warning(
                         "[TQQQ_INF][TTL_RECONCILE][CANCEL_CONFIRMED] "
