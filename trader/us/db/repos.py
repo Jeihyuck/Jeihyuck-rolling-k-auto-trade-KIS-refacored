@@ -922,28 +922,51 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if int(filled_qty) < 0 or int(filled_qty) > int(requested_qty):
         return {"status":"BROKER_OBSERVATION_QUARANTINED","reason":"cumulative_filled_qty_out_of_range"}
     broker_reported_status = status
+
+    # Any fill-bearing broker observation that carries its own requested
+    # quantity must agree with the durable local order identity.  This guard is
+    # intentionally broader than CANCELLED handling because ACK reconciliation
+    # can normalize a positive broker row to FILLED before it reaches here.
+    broker_requested_raw = None
+    for key_name in ("requested_qty", "qty_requested", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"):
+        candidate = (raw_row or {}).get(key_name)
+        if candidate not in (None, ""):
+            broker_requested_raw = candidate
+            break
+    broker_requested_qty = None
+    broker_requested_valid = broker_requested_raw in (None, "")
+    if broker_requested_raw not in (None, ""):
+        try:
+            broker_requested_num = float(broker_requested_raw)
+            if math.isfinite(broker_requested_num) and broker_requested_num >= 0 and broker_requested_num.is_integer():
+                broker_requested_qty = int(broker_requested_num)
+                broker_requested_valid = True
+        except (TypeError, ValueError):
+            broker_requested_valid = False
+
+    fill_bearing_status = status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0
+    if fill_bearing_status and broker_requested_raw not in (None, ""):
+        if not broker_requested_valid or broker_requested_qty != int(requested_qty):
+            return {
+                "status": "BROKER_OBSERVATION_QUARANTINED",
+                "reason": "fill_requested_qty_mismatch",
+                "local_requested_qty": int(requested_qty),
+                "broker_requested_qty": broker_requested_qty,
+                "broker_requested_raw": broker_requested_raw,
+                "broker_reported_status": broker_reported_status,
+                "retry_order": False,
+                "entry_fence": True,
+            }
+
     if (
         status == "CANCELLED"
         and int(requested_qty) > 0
         and int(filled_qty) == int(requested_qty)
         and int(remaining_qty) == 0
     ):
-        # Cancel/fill race normalization is only safe when the broker row itself
-        # reports the same requested quantity as the local durable order.
-        broker_requested_raw = None
-        for key_name in ("requested_qty", "qty_requested", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"):
-            candidate = (raw_row or {}).get(key_name)
-            if candidate not in (None, ""):
-                broker_requested_raw = candidate
-                break
-        try:
-            broker_requested_qty = (
-                int(float(broker_requested_raw))
-                if broker_requested_raw not in (None, "")
-                else None
-            )
-        except (TypeError, ValueError):
-            broker_requested_qty = None
+        # Cancel/fill race normalization requires strong broker request
+        # identity even when the upstream reconciler already classifies the
+        # economic result as a full fill.
         if broker_requested_qty != int(requested_qty):
             return {
                 "status": "BROKER_OBSERVATION_QUARANTINED",
