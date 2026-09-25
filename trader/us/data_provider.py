@@ -521,11 +521,15 @@ def normalize_us_order_status_row(row: dict) -> dict:
         row, ("requested_qty", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"), None
     )
     fill_qty_keys = ("filled_qty", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty")
-    filled_qty_present = any(
+    filled_qty_raw_present = any(
         key in row and row.get(key) not in (None, "")
         for key in fill_qty_keys
     )
     filled_raw = _get_first_valid(row, fill_qty_keys, None)
+    filled_qty_present = bool(
+        filled_qty_raw_present
+        and _is_valid_nonnegative_integral_qty(filled_raw)
+    )
     remaining_raw = _get_first_valid(
         row, ("remaining_qty", "nccs_qty", "rmn_qty"), None
     )
@@ -593,6 +597,7 @@ def normalize_us_order_status_row(row: dict) -> dict:
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
         "requested_qty": requested,
         "filled_qty": filled,
+        "filled_qty_raw_present": bool(filled_qty_raw_present),
         "filled_qty_present": bool(filled_qty_present),
         "remaining_qty": remaining,
         "status": status,
@@ -1252,6 +1257,8 @@ class USDataProvider:
             )
 
         def _explicit_fill(row: dict) -> int | None:
+            if str(row.get("normalization_result") or "") != "normalized":
+                return None
             if row.get("filled_qty_present") is False:
                 return None
             for key in ("filled_qty", "cumulative_filled_qty"):
