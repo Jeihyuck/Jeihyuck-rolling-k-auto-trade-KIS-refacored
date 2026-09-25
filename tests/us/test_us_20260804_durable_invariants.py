@@ -93,7 +93,7 @@ def test_full_fill_cancel_race_persists_and_emits_filled(monkeypatch):
         broker_status="CANCELLED",
         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
         observed_at=None,
-        raw_row={"avg_price": 101.5, "status": "CANCELLED"},
+        raw_row={"avg_price": 101.5, "status": "CANCELLED", "requested_qty": 2},
     )
 
     assert result["status"] == "OK"
@@ -104,3 +104,36 @@ def test_full_fill_cancel_race_persists_and_emits_filled(monkeypatch):
     assert ("ORDER_FILLED", "FILLED") in events
     assert not any(event_type == "ORDER_CANCELLED" for event_type, _ in events)
 
+
+
+def test_full_fill_cancel_request_mismatch_is_quarantined(monkeypatch):
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    repos._MEM_ORDERS.append(_order("ACK", 0))
+
+    result = repos.apply_broker_order_observation(
+        trade_date="2026-08-04",
+        client_order_key="K",
+        raw_order_no="40991",
+        canonical_order_no="40991",
+        symbol="JPM",
+        side="SELL",
+        requested_qty=2,
+        filled_qty=2,
+        remaining_qty=0,
+        broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        observed_at=None,
+        raw_row={
+            "avg_price": 101.5,
+            "status": "CANCELLED",
+            "requested_qty": 3,
+            "filled_qty": 2,
+            "remaining_qty": 0,
+        },
+    )
+
+    assert result["status"] == "BROKER_OBSERVATION_QUARANTINED"
+    assert result["reason"] == "cancel_full_fill_requested_qty_mismatch"
+    assert repos._MEM_ORDERS[0]["status"] == "ACK"
+    assert repos._MEM_ORDERS[0]["qty_filled"] == 0
