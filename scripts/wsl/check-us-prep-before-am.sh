@@ -13,6 +13,8 @@ source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
+source "$SCRIPT_DIR/resolve-nullim-python.sh"
+PYTHON_BIN="$(nullim_resolve_python "$APP_DIR")"
 NULLIM_WRAPPER="${BASH_SOURCE[0]}"
 export WSL_RUN_MARKET="US"
 export MARKET="US"
@@ -26,7 +28,7 @@ if [[ -n "${US_TRADE_DATE:-}" ]]; then
   trade_date="${US_TRADE_DATE}"
 elif [[ -n "${US_FORCE_NOW:-}" ]]; then
   export FORCE_NOW_INPUT="${US_FORCE_NOW}"
-  trade_date="$(python - <<'PYDATE'
+  trade_date="$("$PYTHON_BIN" - <<'PYDATE'
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import os
@@ -36,8 +38,9 @@ PYDATE
 else
   trade_date="$(TZ=America/New_York date +%F)"
 fi
+marker="runtime/health/us-prep-missing-${trade_date}.json"
 check() {
-python - "$trade_date" <<'PY'
+"$PYTHON_BIN" - "$trade_date" <<'PY'
 import sys
 trade_date=sys.argv[1]
 artifact_ok=False
@@ -85,10 +88,10 @@ except Exception as exc:
 raise SystemExit(0 if artifact_ok and db_ok else 1)
 PY
 }
-if check; then exit 0; fi
+if check; then rm -f "$marker"; exit 0; fi
 bash scripts/wsl/run-us-prep-recovery.sh || true
-if check; then exit 0; fi
-cat > "runtime/health/us-prep-missing-${trade_date}.json" <<JSON
+if check; then rm -f "$marker"; exit 0; fi
+cat > "$marker" <<JSON
 {
   "trade_date": "${trade_date}",
   "status": "EXIT_ONLY",
