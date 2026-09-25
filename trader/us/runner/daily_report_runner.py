@@ -1548,7 +1548,11 @@ def run_daily_report(
             unknown_fill_canceled_orders = int(report.get("orders_unknown_fill_cancelled_total") or 0)
             active_db_ack = max(0, db_ack - zero_fill_canceled_orders)
             router_summary_is_session_scoped = router_summary_scope == "session"
-            active_router_summary = max(0, router_summary)
+            active_router_summary = (
+                max(0, router_summary)
+                if router_summary_is_session_scoped
+                else max(0, router_summary - zero_fill_canceled_orders)
+            )
             router_summary_for_daily_compare = (
                 0 if router_summary_is_session_scoped else active_router_summary
             )
