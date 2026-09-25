@@ -91,7 +91,7 @@ PY
 if check; then rm -f "$marker"; exit 0; fi
 bash scripts/wsl/run-us-prep-recovery.sh || true
 if check; then rm -f "$marker"; exit 0; fi
-marker_tmp="${marker}.tmp.$"
+marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
 cat > "$marker_tmp" <<JSON
 {
   "trade_date": "${trade_date}",
