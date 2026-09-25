@@ -319,3 +319,35 @@ def test_explicit_partial_fill_cancel_terminal_preserves_fill_evidence():
     assert result["terminal"] == 1
     assert repo.orders[0]["status"] == "CANCELLED"
     assert repo.terminal_observations[0][1]["filled_qty"] == 1
+
+def test_invalid_normalized_cancel_fill_never_terminalizes_tqqq():
+    from trader.us.data_provider import normalize_us_order_status_row
+
+    order = _order(
+        status="ACK",
+        meta={
+            "tqqq_ttl_cancel_requested_at": NOW.isoformat(),
+            "tqqq_ttl_cancel_result": _sep24_cancel_ack(),
+        },
+    )
+    repo = _Repository([order])
+    observation = normalize_us_order_status_row({
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "requested_qty": 2,
+        "filled_qty": "bad",
+        "remaining_qty": 0,
+        "status": "CANCELLED",
+    })
+    assert observation["normalization_result"] == "quarantined"
+    assert observation["filled_qty_raw_present"] is True
+    assert observation["filled_qty_present"] is False
+
+    result = _run(repo, query=lambda **_: observation)
+
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert repo.orders[0]["status"] == "ACK"
+    assert repo.terminal_observations == []
+
