@@ -832,6 +832,54 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
     from trader.us.path_contract import load_us_prep_contract
 
     contract = load_us_prep_contract(trade_date)
+
+    # The WSL AM preflight performs an additional DB provenance check that is
+    # intentionally stricter than the artifact-only runtime contract.  When it
+    # writes EXIT_ONLY, the trading session must consume that durable decision
+    # instead of silently re-enabling entries from the runtime prep contract.
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        marker_path = _Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
+        if marker_path.exists():
+            marker = _json.loads(marker_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(marker, dict)
+                and str(marker.get("trade_date") or "") == trade_date
+                and str(marker.get("status") or "").upper() == "EXIT_ONLY"
+                and not bool(marker.get("entry_can_proceed", 0))
+            ):
+                logger.error(
+                    "[US_PREP_GUARD][PREFLIGHT_EXIT_ONLY] trade_date=%s reason=%s "
+                    "entry=BLOCK exit=ALLOW close=ALLOW",
+                    trade_date, marker.get("reason"),
+                )
+                return {
+                    "ok": True,
+                    "guard_state": "PREFLIGHT_EXIT_ONLY",
+                    "session_can_run": True,
+                    "trade_can_proceed": True,
+                    "entry_can_proceed": False,
+                    "exit_can_proceed": bool(marker.get("exit_can_proceed", 1)),
+                    "close_can_proceed": bool(marker.get("close_can_proceed", 1)),
+                    "new_buy_budget": 0,
+                    "reason": str(marker.get("reason") or "prep_preflight_exit_only"),
+                    "entry_block_reasons": [str(marker.get("reason") or "prep_preflight_exit_only")],
+                    "primary_entry_block_reason": str(marker.get("reason") or "prep_preflight_exit_only"),
+                    "contract": contract or {},
+                    "source": "am_preflight_health",
+                    "prep_status": (contract or {}).get("status"),
+                    "trade_block_reason": str(marker.get("reason") or "prep_preflight_exit_only"),
+                    "final30_scored_count": int((contract or {}).get("final30_scored_count", 0) or 0),
+                    "score_nonzero_count": int((contract or {}).get("score_nonzero_count", 0) or 0),
+                    "final30_trade_ready": bool((contract or {}).get("final30_trade_ready", False)),
+                }
+    except Exception as marker_exc:
+        logger.warning(
+            "[US_PREP_GUARD][PREFLIGHT_MARKER_WARN] trade_date=%s err=%s action=continue_runtime_guard",
+            trade_date, marker_exc,
+        )
+
     if contract is None:
         logger.warning("[US_PREP_GUARD][CONTRACT_MISSING][DB_FALLBACK] trade_date=%s", trade_date)
         return _check_us_prep_guard_from_db(trade_date)
