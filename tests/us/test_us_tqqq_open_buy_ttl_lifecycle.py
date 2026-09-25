@@ -405,3 +405,73 @@ def test_terminal_persistence_exception_is_pending_not_terminal():
         "TERMINAL_PERSIST_terminal_persist_exception"
     )
 
+def test_terminal_persist_exception_accepts_durable_terminal_state():
+    class CommitThenJournalFailRepository(_Repository):
+        def apply_ttl_terminal_observation(self, order, observation):
+            self.terminal_observations.append((order, observation))
+            order["status"] = observation["status"]
+            order["qty_filled"] = observation["filled_qty"]
+            raise RuntimeError("journal append failed after durable commit")
+
+        def load_order_lifecycle_state(self, order):
+            return dict(order)
+
+    repo = CommitThenJournalFailRepository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 2,
+        "filled_qty": 1,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+
+    assert result["terminal"] == 1
+    assert result["pending"] == 0
+    assert result["terminal_persist_recovered"] == 1
+    assert repo.orders[0]["status"] == "CANCELLED"
+    assert repo.orders[0]["qty_filled"] == 1
+
+
+def test_terminal_persist_bookkeeping_failure_does_not_abort_later_orders(monkeypatch):
+    import trader.us.infinite.integration as integration
+
+    first = _order(
+        order_no="broker-order-1",
+        client_order_key="TQQQ_INF_V3:cycle-a:2026-09-05:BUY:1",
+    )
+    second = _order(
+        order_no="broker-order-2",
+        client_order_key="TQQQ_INF_V3:cycle-a:2026-09-05:BUY:2",
+    )
+    repo = _Repository([first, second], terminal_result={
+        "status": "PENDING",
+        "reason": "database_unavailable",
+    })
+
+    monkeypatch.setattr(
+        integration,
+        "mark_first_unresolved",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    result = _run(repo, query=lambda **identity: {
+        "order_no": identity["order_no"],
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 2,
+        "filled_qty": 1,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+
+    assert result["expired"] == 2
+    assert result["terminal"] == 0
+    assert result["pending"] == 2
+    assert result["terminal_persist_pending"] == 2
+    assert result["pending_bookkeeping_error"] >= 2
+    assert len(repo.terminal_observations) == 2
+
