@@ -928,10 +928,34 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         and int(filled_qty) == int(requested_qty)
         and int(remaining_qty) == 0
     ):
-        # Cancel/fill race: the broker reported a cancellation after the whole
-        # requested quantity had already executed.  Durable order state,
-        # lifecycle event, and return value must all describe the actual
-        # terminal economic state: FILLED.
+        # Cancel/fill race normalization is only safe when the broker row itself
+        # reports the same requested quantity as the local durable order.
+        broker_requested_raw = None
+        for key_name in ("requested_qty", "qty_requested", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"):
+            candidate = (raw_row or {}).get(key_name)
+            if candidate not in (None, ""):
+                broker_requested_raw = candidate
+                break
+        try:
+            broker_requested_qty = (
+                int(float(broker_requested_raw))
+                if broker_requested_raw not in (None, "")
+                else None
+            )
+        except (TypeError, ValueError):
+            broker_requested_qty = None
+        if broker_requested_qty != int(requested_qty):
+            return {
+                "status": "BROKER_OBSERVATION_QUARANTINED",
+                "reason": "cancel_full_fill_requested_qty_mismatch",
+                "local_requested_qty": int(requested_qty),
+                "broker_requested_qty": broker_requested_qty,
+                "retry_order": False,
+                "entry_fence": True,
+            }
+        # The entire broker-requested quantity executed before the cancel won
+        # the race.  Durable order state, lifecycle event, and return value all
+        # describe the terminal economic state: FILLED.
         status = "FILLED"
     meta_patch = {"order_no_raw": str(raw_order_no), "order_no_norm": str(canonical_order_no),
                   "remaining_qty": int(remaining_qty), "broker_observed_at": observed_at,
