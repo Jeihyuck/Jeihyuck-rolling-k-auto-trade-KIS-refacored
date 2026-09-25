@@ -956,7 +956,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
     if stale:
         return {"status":"OK","order_status":old_status,"observation_ignored":"ORDER_OBSERVATION_IGNORED_STALE"}
-    if status in {"PARTIALLY_FILLED", "FILLED"} and int(filled_qty) > 0:
+    if status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0:
+        # A cancellation may arrive as the first durable broker observation
+        # after one or more executions.  Persist cumulative fill truth first,
+        # then apply the terminal CANCELLED status below.  Otherwise the order
+        # row can retain its ACK-time default qty_filled=0 and be misclassified
+        # as a zero-fill cancellation at close.
         result = mark_order_filled_by_reconcile(
             order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
             filled_qty=filled_qty, requested_qty=requested_qty,
@@ -966,7 +971,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             trade_date=td, meta=meta_patch,
         )
         if result.get("status") != "OK": return result
-    else:
+    if status not in {"PARTIALLY_FILLED", "FILLED"}:
         if engine is None:
             matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
             if len(matches) != 1: return {"status": "ORDER_IDENTITY_NOT_UNIQUE"}
@@ -974,7 +979,9 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             from trader.us.execution.order_identity import assert_same_identity
             assert_same_identity(order, {"trade_date": td, "symbol": symbol, "side": side,
                                          "exchange": order.get("exchange"), "meta": order.get("meta")})
-            order["status"] = status
+            if not (str(order.get("status") or "").upper() == "FILLED" and status == "CANCELLED"):
+                order["status"] = status
+            order["qty_filled"] = max(int(order.get("qty_filled") or 0), int(filled_qty))
             order["order_no"] = order.get("order_no") or raw_order_no
             order["meta"] = {**_parse_json_meta(order.get("meta")), **meta_patch}
             order_meta = order["meta"]
@@ -995,9 +1002,10 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
                     WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
                     ELSE :status END,
+                    qty_filled=GREATEST(qty_filled,:filled),
                     order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
                     WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
-                    {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta),
+                    {"status": status, "filled": int(filled_qty), "ono": raw_order_no, "meta": _json_param(order_meta),
                      "td": td, "key": key, **epoch_params})
                 if int(result.rowcount or 0) != 1:
                     return {"status": "ORDER_NOT_FOUND"}
