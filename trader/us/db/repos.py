@@ -921,9 +921,24 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
     if int(filled_qty) < 0 or int(filled_qty) > int(requested_qty):
         return {"status":"BROKER_OBSERVATION_QUARANTINED","reason":"cumulative_filled_qty_out_of_range"}
+    broker_reported_status = status
+    if (
+        status == "CANCELLED"
+        and int(requested_qty) > 0
+        and int(filled_qty) == int(requested_qty)
+        and int(remaining_qty) == 0
+    ):
+        # Cancel/fill race: the broker reported a cancellation after the whole
+        # requested quantity had already executed.  Durable order state,
+        # lifecycle event, and return value must all describe the actual
+        # terminal economic state: FILLED.
+        status = "FILLED"
     meta_patch = {"order_no_raw": str(raw_order_no), "order_no_norm": str(canonical_order_no),
                   "remaining_qty": int(remaining_qty), "broker_observed_at": observed_at,
                   "broker_raw_row": raw_row or {}, "fill_evidence_type": evidence_type}
+    if broker_reported_status != status:
+        meta_patch["broker_reported_status"] = broker_reported_status
+        meta_patch["terminal_status_normalized_from"] = broker_reported_status
     engine = _get_engine_or_none()
     if engine is None:
         identity_rows = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
