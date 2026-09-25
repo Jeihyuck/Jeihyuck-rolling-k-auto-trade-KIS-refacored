@@ -313,3 +313,123 @@ def test_apply_broker_observation_quarantines_filled_request_identity_mismatch(m
     assert repos._MEM_ORDERS[0]["status"] == "ACK"
     assert repos._MEM_FILLS == []
 
+def test_full_fill_correction_supersedes_prior_zero_fill_cancel(monkeypatch):
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    assert repos.save_order_ack(
+        {
+            "client_order_key": "CK-CANCEL-CORRECT",
+            "symbol": "AMD",
+            "exchange": "NASDAQ",
+            "side": "BUY",
+            "qty_requested": 2,
+            "order_no": "O-CANCEL-CORRECT",
+            "status": "ACK",
+        },
+        "2026-09-24",
+    )
+
+    cancelled = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key="CK-CANCEL-CORRECT",
+        raw_order_no="O-CANCEL-CORRECT",
+        canonical_order_no="O-CANCEL-CORRECT",
+        symbol="AMD",
+        side="BUY",
+        requested_qty=2,
+        filled_qty=0,
+        remaining_qty=0,
+        broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row={
+            "status": "CANCELLED",
+            "requested_qty": 2,
+            "filled_qty": 0,
+            "remaining_qty": 0,
+        },
+    )
+    assert cancelled["status"] == "OK"
+    assert cancelled["order_status"] == "CANCELLED"
+    assert repos._MEM_ORDERS[0]["status"] == "CANCELLED"
+    assert repos._MEM_ORDERS[0]["qty_filled"] == 0
+    assert repos._MEM_FILLS == []
+
+    corrected = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key="CK-CANCEL-CORRECT",
+        raw_order_no="O-CANCEL-CORRECT",
+        canonical_order_no="O-CANCEL-CORRECT",
+        symbol="AMD",
+        side="BUY",
+        requested_qty=2,
+        filled_qty=2,
+        remaining_qty=0,
+        broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row={
+            "status": "CANCELLED",
+            "requested_qty": 2,
+            "filled_qty": 2,
+            "cumulative_filled_qty": 2,
+            "remaining_qty": 0,
+            "avg_price": 100.0,
+        },
+    )
+
+    assert corrected["status"] == "OK"
+    assert corrected["order_status"] == "FILLED"
+    assert repos._MEM_ORDERS[0]["status"] == "FILLED"
+    assert repos._MEM_ORDERS[0]["qty_filled"] == 2
+    assert len(repos._MEM_FILLS) == 1
+    assert repos._MEM_FILLS[0]["qty"] == 2
+    assert repos._MEM_FILLS[0]["price_usd"] == 100.0
+
+
+def test_unvalidated_terminal_transition_still_cannot_supersede_cancel(monkeypatch):
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    assert repos.save_order_ack(
+        {
+            "client_order_key": "CK-CANCEL-STAYS",
+            "symbol": "AMD",
+            "exchange": "NASDAQ",
+            "side": "BUY",
+            "qty_requested": 2,
+            "order_no": "O-CANCEL-STAYS",
+            "status": "CANCELLED",
+            "qty_filled": 0,
+        },
+        "2026-09-24",
+    )
+
+    result = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key="CK-CANCEL-STAYS",
+        raw_order_no="O-CANCEL-STAYS",
+        canonical_order_no="O-CANCEL-STAYS",
+        symbol="AMD",
+        side="BUY",
+        requested_qty=2,
+        filled_qty=2,
+        remaining_qty=0,
+        broker_status="FILLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row={
+            "status": "FILLED",
+            "requested_qty": 2,
+            "filled_qty": 2,
+            "remaining_qty": 0,
+            "avg_price": 100.0,
+        },
+    )
+
+    assert result["status"] == "OK"
+    assert result["order_status"] == "CANCELLED"
+    assert result["observation_ignored"] == "ORDER_OBSERVATION_IGNORED_STALE"
+    assert repos._MEM_ORDERS[0]["status"] == "CANCELLED"
+    assert repos._MEM_FILLS == []
+
