@@ -475,3 +475,89 @@ def test_terminal_persist_bookkeeping_failure_does_not_abort_later_orders(monkey
     assert result["pending_bookkeeping_error"] >= 2
     assert len(repo.terminal_observations) == 2
 
+def test_filled_status_without_explicit_fill_qty_is_not_terminal():
+    repo = _Repository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "FILLED",
+        "requested_qty": 2,
+        "remaining_qty": 0,
+    })
+    assert result["terminal"] == 0
+    assert repo.orders[0]["status"] == "OPEN"
+
+
+def test_filled_status_with_partial_qty_is_not_terminal():
+    repo = _Repository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "FILLED",
+        "requested_qty": 2,
+        "filled_qty": 1,
+        "remaining_qty": 0,
+    })
+    assert result["terminal"] == 0
+    assert repo.orders[0]["status"] == "OPEN"
+
+
+def test_filled_status_requires_full_qty_and_zero_remaining():
+    repo = _Repository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "FILLED",
+        "requested_qty": 2,
+        "filled_qty": 2,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+    assert result["terminal"] == 1
+    assert repo.orders[0]["status"] == "FILLED"
+
+
+def test_query_error_bookkeeping_failure_does_not_abort_later_orders(monkeypatch):
+    import trader.us.infinite.integration as integration
+
+    first = _order(
+        order_no="query-error-order",
+        client_order_key="TQQQ_INF_V3:cycle-a:2026-09-05:BUY:query-error",
+    )
+    second = _order(
+        order_no="filled-order",
+        client_order_key="TQQQ_INF_V3:cycle-a:2026-09-05:BUY:filled",
+    )
+    repo = _Repository([first, second])
+
+    monkeypatch.setattr(
+        integration,
+        "mark_first_unresolved",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    def query(**identity):
+        if identity["order_no"] == "query-error-order":
+            raise RuntimeError("broker query failed")
+        return {
+            "order_no": identity["order_no"],
+            "symbol": "TQQQ",
+            "side": "BUY",
+            "status": "FILLED",
+            "requested_qty": 2,
+            "filled_qty": 2,
+            "remaining_qty": 0,
+            "avg_price": 77.25,
+        }
+
+    result = _run(repo, query=query)
+
+    assert result["expired"] == 2
+    assert result["pending"] == 1
+    assert result["terminal"] == 1
+    assert result["pending_bookkeeping_error"] >= 1
+    assert second["status"] == "FILLED"
+
