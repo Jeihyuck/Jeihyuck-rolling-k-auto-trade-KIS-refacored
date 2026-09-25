@@ -261,6 +261,18 @@ class InfiniteRepository:
             if remaining_raw not in (None, "")
             else max(0, requested - filled)
         )
+        terminal_evidence_type = str(
+            observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"
+        )
+        accounting_evidence_type = (
+            "KIS_ORDER_CUMULATIVE_ACTUAL"
+            if filled > 0
+            else terminal_evidence_type
+        )
+        raw_observation = {
+            **observation,
+            "terminal_evidence_type": terminal_evidence_type,
+        }
         return apply_broker_order_observation(
             trade_date=str(order["trade_date"]),
             client_order_key=str(order["client_order_key"]),
@@ -272,9 +284,9 @@ class InfiniteRepository:
             filled_qty=filled,
             remaining_qty=remaining,
             broker_status=status,
-            evidence_type=str(observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"),
+            evidence_type=accounting_evidence_type,
             observed_at=observation.get("observed_at"),
-            raw_row=observation,
+            raw_row=raw_observation,
         )
 
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
