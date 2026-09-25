@@ -841,9 +841,8 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
     from pathlib import Path as _Path
     marker_path = _Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
 
-    def _preflight_exit_only(reason: str, marker: dict | None = None) -> dict:
-        marker = marker if isinstance(marker, dict) else {}
-        resolved_reason = str(reason or marker.get("reason") or "prep_preflight_exit_only")
+    def _preflight_exit_only(reason: str) -> dict:
+        resolved_reason = str(reason or "prep_preflight_exit_only")
         logger.error(
             "[US_PREP_GUARD][PREFLIGHT_EXIT_ONLY] trade_date=%s reason=%s "
             "entry=BLOCK exit=ALLOW close=ALLOW",
@@ -855,8 +854,8 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
             "session_can_run": True,
             "trade_can_proceed": True,
             "entry_can_proceed": False,
-            "exit_can_proceed": bool(marker.get("exit_can_proceed", 1)),
-            "close_can_proceed": bool(marker.get("close_can_proceed", 1)),
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
             "new_buy_budget": 0,
             "reason": resolved_reason,
             "entry_block_reasons": [resolved_reason],
@@ -882,15 +881,21 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
             return _preflight_exit_only("prep_preflight_marker_invalid")
         if not isinstance(marker, dict):
             return _preflight_exit_only("prep_preflight_marker_invalid_type")
-        if str(marker.get("trade_date") or "") != trade_date:
-            return _preflight_exit_only("prep_preflight_marker_trade_date_mismatch", marker)
-        if (
-            str(marker.get("status") or "").upper() == "EXIT_ONLY"
-            and not bool(marker.get("entry_can_proceed", 0))
-        ):
-            return _preflight_exit_only(
-                str(marker.get("reason") or "prep_preflight_exit_only"), marker
-            )
+        canonical_marker = bool(
+            str(marker.get("trade_date") or "") == trade_date
+            and marker.get("status") == "EXIT_ONLY"
+            and type(marker.get("entry_can_proceed")) is int
+            and marker.get("entry_can_proceed") == 0
+            and type(marker.get("exit_can_proceed")) is int
+            and marker.get("exit_can_proceed") == 1
+            and type(marker.get("close_can_proceed")) is int
+            and marker.get("close_can_proceed") == 1
+            and isinstance(marker.get("reason"), str)
+            and bool(marker.get("reason").strip())
+        )
+        if not canonical_marker:
+            return _preflight_exit_only("prep_preflight_marker_invalid_schema")
+        return _preflight_exit_only(str(marker["reason"]))
 
     if contract is None:
         logger.warning("[US_PREP_GUARD][CONTRACT_MISSING][DB_FALLBACK] trade_date=%s", trade_date)
