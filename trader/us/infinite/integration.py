@@ -235,6 +235,55 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             )
         return True
 
+    def safe_pending_bookkeeping(order: dict, *, reason: str, trigger: str) -> None:
+        """Best-effort liveness bookkeeping must never abort later TTL orders."""
+        try:
+            mark_first_unresolved(repository, order, when=now, reason=reason)
+        except Exception as exc:
+            inc("pending_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][PENDING_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s stage=mark_first_unresolved error=%s",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+        try:
+            maybe_escalate(order, trigger=trigger)
+        except Exception as exc:
+            inc("pending_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][PENDING_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s stage=maybe_escalate error=%s",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+
+    def durable_terminal_after_exception(order: dict, observation: dict) -> bool:
+        loader = getattr(repository, "load_order_lifecycle_state", None)
+        if not callable(loader):
+            return False
+        try:
+            durable = loader(order)
+        except Exception as exc:
+            logger.warning(
+                "[TQQQ_INF][TTL_RECONCILE][DURABLE_REREAD_WARN] "
+                "order_no=%s key=%s error=%s",
+                order.get("order_no"), order.get("client_order_key"), exc,
+            )
+            return False
+        if not isinstance(durable, dict):
+            return False
+        durable_status = str(durable.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        expected_status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if durable_status != expected_status or durable_status not in _TQQQ_TTL_TERMINAL_STATUSES:
+            return False
+        expected_filled = explicit_broker_filled_qty(observation)
+        if expected_filled is not None:
+            try:
+                if int(durable.get("qty_filled") or 0) < int(expected_filled):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
     def persist_terminal_or_pending(
         order: dict,
         observation: dict,
@@ -245,6 +294,18 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         try:
             applied = repository.apply_ttl_terminal_observation(order, observation)
         except Exception as exc:
+            if durable_terminal_after_exception(order, observation):
+                logger.warning(
+                    "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_RECOVERED] "
+                    "order_no=%s key=%s trigger=%s error=%s "
+                    "action=accept_durable_terminal_state",
+                    order.get("order_no"), order.get("client_order_key"), trigger, exc,
+                )
+                inc("terminal_persist_recovered")
+                if success_counter:
+                    inc(success_counter)
+                result["terminal"] += 1
+                return True
             logger.exception(
                 "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_EXCEPTION] "
                 "order_no=%s key=%s trigger=%s error=%s action=keep_pending_and_escalate",
@@ -271,11 +332,11 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             applied_status or "UNKNOWN", reason,
         )
         inc("terminal_persist_pending")
-        mark_first_unresolved(
-            repository, order, when=now,
+        safe_pending_bookkeeping(
+            order,
             reason=f"TERMINAL_PERSIST_{reason}",
+            trigger=trigger,
         )
-        maybe_escalate(order, trigger=trigger)
         result["pending"] += 1
         return False
 
