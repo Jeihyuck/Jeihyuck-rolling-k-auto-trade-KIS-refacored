@@ -668,3 +668,49 @@ def test_real_postgres_partial_cancel_rejects_nonfinite_fill_price(pg_engine, ba
     assert row["avg_price_usd"] is None
     assert fill_count == 0
 
+@pytest.mark.parametrize("bad_price", ["NaN", "Infinity", "-Infinity"])
+def test_real_postgres_full_fill_rejects_nonfinite_fill_price(pg_engine, bad_price):
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+
+    key = "FULL-NONFINITE-" + bad_price.replace("-", "NEG").replace("Infinity", "INF").replace("NaN", "NAN")
+    order_no = key + "-ORDER"
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             avg_price_usd,order_no,status,meta)
+            VALUES ('2026-09-24',:key,'AAPL','NASDAQ','BUY',
+                    1,0,NULL,:order_no,'ACK','{}'::jsonb)"""),
+            {"key": key, "order_no": order_no})
+
+    result = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key=key,
+        raw_order_no=order_no,
+        canonical_order_no=order_no,
+        symbol="AAPL",
+        side="BUY",
+        requested_qty=1,
+        filled_qty=1,
+        remaining_qty=0,
+        broker_status="FILLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row={"avg_price": bad_price},
+    )
+    assert result["status"] == "PENDING"
+    assert result["reason"] == "broker_fill_price_missing"
+
+    with pg_engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd
+            FROM us_orders WHERE client_order_key=:key
+        """), {"key": key}).mappings().one()
+        fill_count = conn.execute(text("""
+            SELECT COUNT(*) FROM us_fills WHERE client_order_key=:key
+        """), {"key": key}).scalar_one()
+
+    assert row["status"] == "ACK"
+    assert row["qty_filled"] == 0
+    assert row["avg_price_usd"] is None
+    assert fill_count == 0
+
