@@ -314,6 +314,7 @@ def test_explicit_partial_fill_cancel_terminal_preserves_fill_evidence():
         "requested_qty": 2,
         "filled_qty": 1,
         "remaining_qty": 0,
+        "avg_price": 77.25,
     })
 
     assert result["terminal"] == 1
