@@ -105,7 +105,7 @@ def test_tqqq_broker_confirmed_cancel_terminalizes_order():
     repo = _Repository()
     result = _run(repo, query=lambda **_: {
         "order_no": "original-broker-order", "symbol": "TQQQ", "side": "BUY",
-        "status": "CANCELLED", "filled_qty": 0,
+        "status": "CANCELLED", "requested_qty": 2, "filled_qty": 0,
     })
     assert result["terminal"] == 1
     assert repo.orders[0]["status"] == "CANCELLED"
@@ -683,3 +683,52 @@ def test_filled_observation_with_mismatched_broker_request_stays_fenced():
     assert repo.orders[0]["status"] == "OPEN"
     assert repo.terminal_observations == []
 
+
+
+def test_cancelled_observation_with_mismatched_broker_request_stays_fenced():
+    repo = _Repository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 3,
+        "filled_qty": 2,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert repo.orders[0]["status"] == "OPEN"
+    assert repo.terminal_observations == []
+
+
+def test_post_commit_recovery_uses_effective_filled_status_for_full_fill_cancel():
+    class FullFillCommitThenJournalFailRepository(_Repository):
+        def apply_ttl_terminal_observation(self, order, observation):
+            self.terminal_observations.append((order, observation))
+            order["status"] = "FILLED"
+            order["qty_filled"] = observation["filled_qty"]
+            raise RuntimeError("journal append failed after durable full-fill commit")
+
+        def load_order_lifecycle_state(self, order):
+            return dict(order)
+
+    repo = FullFillCommitThenJournalFailRepository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 2,
+        "filled_qty": 2,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+
+    assert result["terminal"] == 1
+    assert result["pending"] == 0
+    assert result["terminal_persist_recovered"] == 1
+    assert repo.orders[0]["status"] == "FILLED"
+    assert repo.orders[0]["qty_filled"] == 2
