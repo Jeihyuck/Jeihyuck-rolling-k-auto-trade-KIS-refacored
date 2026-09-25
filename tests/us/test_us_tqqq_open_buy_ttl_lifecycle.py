@@ -274,6 +274,8 @@ def test_repository_preserves_broker_zero_remaining_for_cancel(monkeypatch):
 
 
 def test_cancel_ack_zero_remaining_without_explicit_fill_qty_stays_fenced():
+    from trader.us.data_provider import normalize_us_order_status_row
+
     order = _order(
         status="ACK",
         meta={
@@ -282,8 +284,16 @@ def test_cancel_ack_zero_remaining_without_explicit_fill_qty_stays_fenced():
         },
     )
     repo = _Repository([order])
-    observation = _sep24_zero_remaining()
-    observation.pop("filled_qty")
+    observation = normalize_us_order_status_row({
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "requested_qty": 2,
+        "remaining_qty": 0,
+        "status": "CANCELLED",
+    })
+    assert observation["filled_qty"] is None
+    assert observation["filled_qty_present"] is False
 
     result = _run(repo, query=lambda **_: observation)
 
