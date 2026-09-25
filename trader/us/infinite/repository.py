@@ -247,7 +247,14 @@ class InfiniteRepository:
         if status not in {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}:
             return {"status": "PENDING"}
         requested = int(order.get("qty_requested") or order.get("qty") or 0)
-        filled = int(observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0)
+        if status == "CANCELLED" and observation.get("filled_qty_present") is False:
+            return {"status": "PENDING", "reason": "cancel_fill_qty_missing"}
+        filled_raw = observation.get("filled_qty")
+        if filled_raw in (None, ""):
+            filled_raw = observation.get("cumulative_filled_qty")
+        if status == "CANCELLED" and filled_raw in (None, ""):
+            return {"status": "PENDING", "reason": "cancel_fill_qty_missing"}
+        filled = int(float(filled_raw)) if filled_raw not in (None, "") else 0
         remaining_raw = observation.get("remaining_qty")
         remaining = (
             max(0, int(remaining_raw))
