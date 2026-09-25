@@ -1347,6 +1347,12 @@ def run_daily_report(
                         elif status == "BLOCKED":
                             report["orders_blocked"] += 1
                         elif status in {"CANCELLED", "CANCELED"}:
+                            # CANCELLED is a terminal state of an accepted broker
+                            # order.  Count it in the raw ACK population first;
+                            # reconciliation below removes only explicit zero-fill
+                            # cancellations.  Partial-fill cancellations must
+                            # remain because they still contribute executions.
+                            report["orders_ack_total"] += 1
                             report["orders_cancelled_total"] += 1
                             cancel_filled_qty = _explicit_order_filled_qty(order)
                             if cancel_filled_qty is None:
