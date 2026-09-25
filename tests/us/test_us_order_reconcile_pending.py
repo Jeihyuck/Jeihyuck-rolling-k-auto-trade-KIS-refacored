@@ -68,14 +68,14 @@ def test_cancelled_ack_is_removed_from_active_close_source_counts():
         db_orders=6,
         fills=5,
         balance_confirmed=0,
-        router_summary=6,
+        router_summary=0,
         zero_fill_canceled_orders=1,
     )
     assert result["raw_db_orders"] == 6
-    assert result["raw_router_summary"] == 6
+    assert result["raw_router_summary"] == 0
     assert result["zero_fill_canceled_orders"] == 1
     assert result["db_orders"] == 5
-    assert result["router_summary"] == 5
+    assert result["router_summary"] == 0
     assert result["fills"] == 5
     assert result["broker_reconciled"] is True
     assert "SOURCE_MISMATCH_ACK_EXISTS_FILL_MISSING" not in result["warnings"]
@@ -87,13 +87,13 @@ def test_cancelled_ack_is_removed_from_canonical_close_consistency():
         fills=5,
         final_positions=20,
         open_position_symbols=["TQQQ"],
-        router_summary=6,
+        router_summary=0,
         zero_fill_canceled_orders=1,
     )
     assert result["raw_db_orders"] == 6
     assert result["zero_fill_canceled_orders"] == 1
     assert result["source_counts"]["db_orders"] == 5
-    assert result["source_counts"]["router_session_summary"] == 5
+    assert result["source_counts"]["router_session_summary"] == 0
     assert result["source_counts"]["kis_fills_inquire_ccnl"] == 5
     assert "db_orders_fills_mismatch" not in result["inconsistencies"]
     assert result["report_consistency"] == "OK"
@@ -169,4 +169,16 @@ def test_close_fill_classifier_does_not_turn_broker_missing_fill_into_zero():
         },
     }
     assert _explicit_order_filled_qty(row) is None
+
+def test_day_wide_zero_fill_cancel_does_not_reduce_session_router_count():
+    result = reconcile_order_sources(
+        db_orders=3,
+        fills=2,
+        balance_confirmed=0,
+        router_summary=2,
+        zero_fill_canceled_orders=1,
+    )
+    assert result["db_orders"] == 2
+    assert result["raw_router_summary"] == 2
+    assert result["router_summary"] == 2
 
