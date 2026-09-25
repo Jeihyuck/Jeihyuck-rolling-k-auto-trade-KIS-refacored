@@ -131,3 +131,49 @@ def test_daily_report_fallback_counts_partial_cancel_in_raw_ack_population(monke
     assert report["canonical_sources"]["source_counts"]["kis_fills_inquire_ccnl"] == 1
     assert "db_orders_fills_mismatch" not in report["canonical_sources"]["inconsistencies"]
 
+def test_close_session_router_count_not_reduced_by_am_zero_fill_cancel(monkeypatch, tmp_path):
+    from trader.us.execution import order_journal
+
+    rows = [
+        {
+            "status": "CANCELLED", "side": "BUY", "symbol": "A",
+            "qty_filled": 0, "client_order_key": "AM-CANCEL",
+            "meta": {"broker_raw_row": {
+                "filled_qty_present": True, "filled_qty": 0, "remaining_qty": 0,
+            }},
+        },
+        {"status": "FILLED", "side": "BUY", "symbol": "B", "qty_filled": 1, "client_order_key": "CLOSE-1", "meta": {}},
+        {"status": "FILLED", "side": "SELL", "symbol": "C", "qty_filled": 1, "client_order_key": "CLOSE-2", "meta": {}},
+    ]
+    monkeypatch.setattr(repos, "load_us_daily_orders_for_report", lambda _td: rows)
+    monkeypatch.setattr(order_journal, "aggregate_order_events", lambda _td: {
+        "orders_sent_total": 0, "orders_ack_total": 0,
+    })
+    monkeypatch.setattr(drr, "load_us_fills_breakdown", lambda _td: {
+        "fills_count": 2,
+        "real_broker_buys": 1,
+        "real_broker_sells": 1,
+        "synthetic_reconcile_buys": 0,
+        "synthetic_reconcile_sells": 0,
+        "real_broker_buy_notional": 100.0,
+        "real_broker_sell_notional": 100.0,
+    })
+    monkeypatch.setattr(drr, "load_balance_confirmed_count", lambda _td: 0)
+    monkeypatch.setattr(drr, "load_router_summary_ack_count", lambda _td, session=None: 2)
+    monkeypatch.chdir(tmp_path)
+
+    report = drr.run_daily_report(
+        env="practice", session="close", trade_date="2026-09-24", offline=False,
+    )["report"]
+
+    assert report["source_numbers"]["db_orders"] == 3
+    assert report["source_numbers"]["db_orders_active"] == 2
+    assert report["source_numbers"]["router_session_summary"] == 2
+    assert report["source_numbers"]["router_session_summary_active"] == 2
+    assert report["source_numbers"]["router_summary_scope"] == "session"
+    assert report["source_numbers"]["router_summary_used_for_daily_compare"] == 0
+    assert report["canonical_sources"]["source_counts"]["db_orders"] == 2
+    assert report["canonical_sources"]["source_counts"]["kis_fills_inquire_ccnl"] == 2
+    assert report["canonical_sources"]["source_counts"]["router_session_summary"] == 0
+    assert "db_orders_fills_mismatch" not in report["canonical_sources"]["inconsistencies"]
+
