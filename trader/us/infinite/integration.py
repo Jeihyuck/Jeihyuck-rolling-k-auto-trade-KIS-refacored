@@ -66,6 +66,23 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         observed_symbol = str(observation.get("symbol") or "").upper()
         observed_side = str(observation.get("side") or "").upper()
         status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if status == "CANCELLED":
+            # A terminal cancel without an explicit cumulative fill quantity is
+            # not sufficient broker truth: the order may have partially filled
+            # before the remainder was cancelled.  Keep it fenced until the
+            # broker reports the fill quantity explicitly.
+            filled_raw = observation.get("filled_qty")
+            if filled_raw in (None, ""):
+                filled_raw = observation.get("cumulative_filled_qty")
+            if filled_raw in (None, ""):
+                return False
+            try:
+                filled = int(float(filled_raw))
+            except (TypeError, ValueError):
+                return False
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            if requested <= 0 or filled < 0 or filled > requested:
+                return False
         return bool(
             order_no and observed_order_no == order_no
             and observed_symbol == "TQQQ"
@@ -166,12 +183,14 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 observation.get("requested_qty") or observation.get("qty_requested")
                 or observation.get("qty") or 0
             ))
-            filled = int(float(
-                observation.get("filled_qty")
-                if observation.get("filled_qty") not in (None, "")
-                else observation.get("cumulative_filled_qty") or 0
-            ))
-            remaining = int(float(observation.get("remaining_qty")))
+            filled_raw = observation.get("filled_qty")
+            if filled_raw in (None, ""):
+                filled_raw = observation.get("cumulative_filled_qty")
+            remaining_raw = observation.get("remaining_qty")
+            if filled_raw in (None, "") or remaining_raw in (None, ""):
+                return None
+            filled = int(float(filled_raw))
+            remaining = int(float(remaining_raw))
         except (TypeError, ValueError):
             return None
         if requested <= 0 or observed_requested != requested:
