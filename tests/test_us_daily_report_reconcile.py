@@ -77,3 +77,57 @@ def test_daily_report_does_not_count_balance_confirmed_as_broker_sent(monkeypatc
     assert report['orders_balance_confirmed_total'] == 2
     assert report['orders_sent_total'] == 2
     assert report['orders_ack'] == 2
+
+def test_daily_report_fallback_counts_partial_cancel_in_raw_ack_population(monkeypatch, tmp_path):
+    from trader.us.execution import order_journal
+
+    partial_cancel = {
+        "status": "CANCELLED",
+        "side": "BUY",
+        "symbol": "TQQQ",
+        "qty_requested": 2,
+        "qty_filled": 1,
+        "order_no": "PARTIAL-CANCEL",
+        "client_order_key": "PARTIAL-CANCEL-KEY",
+        "meta": {
+            "broker_raw_row": {
+                "filled_qty_raw_present": True,
+                "filled_qty_present": True,
+                "filled_qty": 1,
+                "cumulative_filled_qty": 1,
+                "remaining_qty": 0,
+            }
+        },
+    }
+    monkeypatch.setattr(repos, "load_us_daily_orders_for_report", lambda _td: [partial_cancel])
+    monkeypatch.setattr(order_journal, "aggregate_order_events", lambda _td: {
+        "orders_sent_total": 0,
+        "orders_ack_total": 0,
+    })
+    monkeypatch.setattr(drr, "load_us_fills_breakdown", lambda _td: {
+        "fills_count": 1,
+        "real_broker_buys": 1,
+        "real_broker_sells": 0,
+        "synthetic_reconcile_buys": 0,
+        "synthetic_reconcile_sells": 0,
+        "real_broker_buy_notional": 100.0,
+        "real_broker_sell_notional": 0.0,
+    })
+    monkeypatch.setattr(drr, "load_balance_confirmed_count", lambda _td: 0)
+    monkeypatch.setattr(drr, "load_router_summary_ack_count", lambda _td, session=None: 1)
+    monkeypatch.chdir(tmp_path)
+
+    report = drr.run_daily_report(
+        env="practice", session="close", trade_date="2026-09-24", offline=False,
+    )["report"]
+
+    assert report["orders_ack_total"] == 1
+    assert report["orders_cancelled_total"] == 1
+    assert report["orders_partial_fill_cancelled_total"] == 1
+    assert report["orders_zero_fill_cancelled_total"] == 0
+    assert report["source_numbers"]["db_orders"] == 1
+    assert report["source_numbers"]["db_orders_active"] == 1
+    assert report["canonical_sources"]["source_counts"]["db_orders"] == 1
+    assert report["canonical_sources"]["source_counts"]["kis_fills_inquire_ccnl"] == 1
+    assert "db_orders_fills_mismatch" not in report["canonical_sources"]["inconsistencies"]
+
