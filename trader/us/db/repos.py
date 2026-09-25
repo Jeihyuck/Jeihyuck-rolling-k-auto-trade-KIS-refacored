@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from datetime import date, datetime, timezone
@@ -964,15 +965,24 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         # then apply the terminal CANCELLED status below.  Never manufacture a
         # zero-price actual fill: if this observation introduces new filled
         # quantity it must also carry a usable execution price.
-        observed_fill_price = float(
-            (raw_row or {}).get("avg_price")
-            or (raw_row or {}).get("avg_price_usd")
-            or 0
-        )
+        try:
+            observed_fill_price = float(
+                (raw_row or {}).get("avg_price")
+                or (raw_row or {}).get("avg_price_usd")
+                or 0
+            )
+        except (TypeError, ValueError):
+            observed_fill_price = 0.0
         fill_price = observed_fill_price
         fill_price_source = "broker_observation"
-        if status == "CANCELLED" and fill_price <= 0:
-            if old_filled >= int(filled_qty) and old_avg_price > 0:
+        if status == "CANCELLED" and not (
+            math.isfinite(fill_price) and fill_price > 0
+        ):
+            if (
+                old_filled >= int(filled_qty)
+                and math.isfinite(old_avg_price)
+                and old_avg_price > 0
+            ):
                 # No new cumulative quantity is being introduced; reuse the
                 # already-persisted actual order average price only in this
                 # idempotent terminalization case.
