@@ -149,3 +149,123 @@ def test_tqqq_production_callbacks_cancel_and_requery_same_broker_identity():
     assert calls["query"] == [{
         "order_no": "original-broker-order", "symbol": "TQQQ", "trade_date": "2026-09-08",
     }]
+
+
+def _sep24_cancel_ack():
+    return {
+        "rt_cd": "0",
+        "msg_cd": "40630000",
+        "msg1": "모의투자 취소주문이 완료 되었습니다.",
+        "output": {"ODNO": "0000001518", "ORD_TMD": "230935"},
+    }
+
+
+def _sep24_zero_remaining(order_no="original-broker-order"):
+    return {
+        "order_no": order_no,
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "ACK_PENDING",
+        "requested_qty": 2,
+        "filled_qty": 0,
+        "remaining_qty": 0,
+    }
+
+
+def test_sep24_cancel_ack_plus_exact_zero_remaining_terminalizes_next_tick():
+    order = _order(
+        status="ACK",
+        meta={
+            "tqqq_ttl_cancel_requested_at": NOW.isoformat(),
+            "tqqq_ttl_cancel_result": _sep24_cancel_ack(),
+        },
+    )
+    repo = _Repository([order])
+    result = _run(repo, query=lambda **_: _sep24_zero_remaining())
+
+    assert result["terminal"] == 1
+    assert result["pending"] == 0
+    assert result["cancel_confirmed"] == 1
+    assert repo.orders[0]["status"] == "CANCELLED"
+    assert repo.terminal_observations[0][1]["evidence_type"] == "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING"
+    assert repo.terminal_observations[0][1]["cancel_broker_order_no"] == "0000001518"
+
+
+def test_sep24_successful_cancel_requeries_and_terminalizes_same_tick():
+    repo = _Repository()
+    observations = iter([
+        {
+            "order_no": "original-broker-order", "symbol": "TQQQ", "side": "BUY",
+            "status": "OPEN", "requested_qty": 2, "filled_qty": 0, "remaining_qty": 2,
+        },
+        _sep24_zero_remaining(),
+    ])
+
+    result = _run(
+        repo,
+        cancel=lambda **_: _sep24_cancel_ack(),
+        query=lambda **_: next(observations),
+    )
+
+    assert result["cancel_requested"] == 1
+    assert result["terminal"] == 1
+    assert result["pending"] == 0
+    assert repo.orders[0]["status"] == "CANCELLED"
+
+
+def test_zero_remaining_without_explicit_kis_cancel_ack_stays_fenced():
+    repo = _Repository()
+    observations = iter([
+        {
+            "order_no": "original-broker-order", "symbol": "TQQQ", "side": "BUY",
+            "status": "OPEN", "requested_qty": 2, "filled_qty": 0, "remaining_qty": 2,
+        },
+        _sep24_zero_remaining(),
+    ])
+    result = _run(
+        repo,
+        cancel=lambda **_: {"status": "ACK"},
+        query=lambda **_: next(observations),
+    )
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert repo.orders[0]["status"] == "OPEN"
+
+
+def test_cancel_ack_with_wrong_original_order_identity_stays_fenced():
+    order = _order(
+        status="ACK",
+        meta={
+            "tqqq_ttl_cancel_requested_at": NOW.isoformat(),
+            "tqqq_ttl_cancel_result": _sep24_cancel_ack(),
+        },
+    )
+    repo = _Repository([order])
+    result = _run(repo, query=lambda **_: _sep24_zero_remaining("different-order"))
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert repo.orders[0]["status"] == "ACK"
+
+
+def test_repository_preserves_broker_zero_remaining_for_cancel(monkeypatch):
+    captured = {}
+
+    def apply(**kwargs):
+        captured.update(kwargs)
+        return {"status": "OK", "order_status": "CANCELLED"}
+
+    monkeypatch.setattr("trader.us.db.repos.apply_broker_order_observation", apply)
+    from trader.us.infinite.repository import InfiniteRepository
+
+    repository = object.__new__(InfiniteRepository)
+    result = repository.apply_ttl_terminal_observation(
+        _order(status="ACK"),
+        {
+            **_sep24_zero_remaining(),
+            "status": "CANCELLED",
+            "evidence_type": "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        },
+    )
+    assert result["status"] == "OK"
+    assert captured["remaining_qty"] == 0
+    assert captured["filled_qty"] == 0
