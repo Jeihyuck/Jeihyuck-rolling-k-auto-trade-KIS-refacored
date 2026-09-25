@@ -242,7 +242,20 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         trigger: str,
         success_counter: str | None = None,
     ) -> bool:
-        applied = repository.apply_ttl_terminal_observation(order, observation)
+        try:
+            applied = repository.apply_ttl_terminal_observation(order, observation)
+        except Exception as exc:
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_EXCEPTION] "
+                "order_no=%s key=%s trigger=%s error=%s action=keep_pending_and_escalate",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+            applied = {
+                "status": "PENDING",
+                "reason": "terminal_persist_exception",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
         applied_status = str((applied or {}).get("status") or "").upper()
         if applied_status == "OK":
             if success_counter:
