@@ -139,3 +139,34 @@ def test_partial_fill_cancel_is_not_subtracted_from_canonical_close_consistency(
 def test_cancel_with_missing_fill_qty_is_not_eligible_for_zero_fill_subtraction():
     assert _explicit_order_filled_qty({"status": "CANCELLED", "qty_filled": None}) is None
     assert _explicit_order_filled_qty({"status": "CANCELLED"}) is None
+
+def test_close_fill_classifier_prefers_broker_partial_fill_over_stale_db_zero():
+    row = {
+        "status": "CANCELLED",
+        "qty_filled": 0,
+        "meta": {
+            "broker_raw_row": {
+                "filled_qty_present": True,
+                "filled_qty": 1,
+                "cumulative_filled_qty": 1,
+                "remaining_qty": 0,
+            }
+        },
+    }
+    assert _explicit_order_filled_qty(row) == 1
+
+
+def test_close_fill_classifier_does_not_turn_broker_missing_fill_into_zero():
+    row = {
+        "status": "CANCELLED",
+        "qty_filled": 0,
+        "meta": {
+            "broker_raw_row": {
+                "filled_qty_present": False,
+                "filled_qty": None,
+                "remaining_qty": 0,
+            }
+        },
+    }
+    assert _explicit_order_filled_qty(row) is None
+
