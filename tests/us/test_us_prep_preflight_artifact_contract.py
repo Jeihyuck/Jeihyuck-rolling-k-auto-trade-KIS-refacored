@@ -135,3 +135,98 @@ def test_preflight_exit_only_marker_write_is_atomic():
     assert 'cat > "$marker_tmp"' in script
     assert 'mv -f "$marker_tmp" "$marker"' in script
 
+def test_runtime_guard_rejects_noncanonical_marker_status(tmp_path, monkeypatch):
+    import json
+    from trader.us import prep_contract
+
+    monkeypatch.chdir(tmp_path)
+    marker_dir = tmp_path / "runtime" / "health"
+    marker_dir.mkdir(parents=True)
+    trade_date = "2026-09-24"
+    (marker_dir / f"us-prep-missing-{trade_date}.json").write_text(
+        json.dumps({
+            "trade_date": trade_date,
+            "status": "EXIT_ONY",
+            "reason": "typo",
+            "entry_can_proceed": 0,
+            "exit_can_proceed": 1,
+            "close_can_proceed": 1,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "trader.us.path_contract.load_us_prep_contract",
+        lambda _td: _trade_ready_contract(trade_date),
+    )
+
+    guard = prep_contract.check_us_prep_guard(trade_date, session="am")
+    assert guard["guard_state"] == "PREFLIGHT_EXIT_ONLY"
+    assert guard["reason"] == "prep_preflight_marker_invalid_schema"
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert guard["close_can_proceed"] is True
+
+
+def test_runtime_guard_rejects_string_permission_marker(tmp_path, monkeypatch):
+    import json
+    from trader.us import prep_contract
+
+    monkeypatch.chdir(tmp_path)
+    marker_dir = tmp_path / "runtime" / "health"
+    marker_dir.mkdir(parents=True)
+    trade_date = "2026-09-24"
+    (marker_dir / f"us-prep-missing-{trade_date}.json").write_text(
+        json.dumps({
+            "trade_date": trade_date,
+            "status": "EXIT_ONLY",
+            "reason": "bad_type",
+            "entry_can_proceed": "0",
+            "exit_can_proceed": 1,
+            "close_can_proceed": 1,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "trader.us.path_contract.load_us_prep_contract",
+        lambda _td: _trade_ready_contract(trade_date),
+    )
+
+    guard = prep_contract.check_us_prep_guard(trade_date, session="am")
+    assert guard["guard_state"] == "PREFLIGHT_EXIT_ONLY"
+    assert guard["reason"] == "prep_preflight_marker_invalid_schema"
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert guard["close_can_proceed"] is True
+
+
+def test_invalid_marker_never_controls_exit_or_close_permissions(tmp_path, monkeypatch):
+    import json
+    from trader.us import prep_contract
+
+    monkeypatch.chdir(tmp_path)
+    marker_dir = tmp_path / "runtime" / "health"
+    marker_dir.mkdir(parents=True)
+    trade_date = "2026-09-24"
+    (marker_dir / f"us-prep-missing-{trade_date}.json").write_text(
+        json.dumps({
+            "trade_date": "2026-09-23",
+            "status": "EXIT_ONLY",
+            "reason": "stale_corrupt",
+            "entry_can_proceed": 0,
+            "exit_can_proceed": 0,
+            "close_can_proceed": 0,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "trader.us.path_contract.load_us_prep_contract",
+        lambda _td: _trade_ready_contract(trade_date),
+    )
+
+    guard = prep_contract.check_us_prep_guard(trade_date, session="close")
+    assert guard["guard_state"] == "PREFLIGHT_EXIT_ONLY"
+    assert guard["reason"] == "prep_preflight_marker_invalid_schema"
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert guard["close_can_proceed"] is True
+
