@@ -93,19 +93,37 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             if requested <= 0 or filled < 0 or filled > requested:
                 return False
         if status == "FILLED":
-            # FILLED is terminal only with complete broker quantity evidence.
-            # A status string alone must never promote a missing/partial fill to
-            # a completed order.
+            # FILLED is terminal only with internally consistent broker quantity
+            # evidence for this exact local request.  A status string alone, or
+            # a broker row whose requested quantity belongs to another order,
+            # must never promote this order to a completed fill.
             requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            observed_requested_raw = (
+                observation.get("requested_qty")
+                if observation.get("requested_qty") not in (None, "")
+                else observation.get("qty_requested")
+                if observation.get("qty_requested") not in (None, "")
+                else observation.get("qty")
+            )
             filled = explicit_broker_filled_qty(observation)
             remaining_raw = observation.get("remaining_qty")
-            if requested <= 0 or filled is None or remaining_raw in (None, ""):
+            if (
+                requested <= 0
+                or observed_requested_raw in (None, "")
+                or filled is None
+                or remaining_raw in (None, "")
+            ):
                 return False
             try:
+                observed_requested = int(float(observed_requested_raw))
                 remaining = int(float(remaining_raw))
             except (TypeError, ValueError):
                 return False
-            if filled != requested or remaining != 0:
+            if (
+                observed_requested != requested
+                or filled != observed_requested
+                or remaining != 0
+            ):
                 return False
         return bool(
             order_no and observed_order_no == order_no
