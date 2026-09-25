@@ -156,9 +156,20 @@ def _exact_zero_fill_observation(order: dict, observation: dict | None) -> bool:
     observed_requested = _int_value(
         observation.get("requested_qty") or observation.get("qty_requested") or observation.get("qty"), 0
     )
-    observed_filled = _int_value(
-        observation.get("filled_qty") or observation.get("cumulative_filled_qty"), 0
-    )
+    if observation.get("filled_qty_present") is False:
+        return False
+    filled_raw = observation.get("filled_qty")
+    if filled_raw in (None, ""):
+        filled_raw = observation.get("cumulative_filled_qty")
+    if filled_raw in (None, ""):
+        return False
+    try:
+        observed_filled_float = float(str(filled_raw).replace(",", ""))
+        if observed_filled_float < 0 or not observed_filled_float.is_integer():
+            return False
+        observed_filled = int(observed_filled_float)
+    except (TypeError, ValueError):
+        return False
     remaining_raw = observation.get("remaining_qty")
     observed_remaining = (
         _int_value(remaining_raw, 0)
