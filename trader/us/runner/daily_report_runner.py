@@ -771,7 +771,10 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
                             fills_query_ok: bool = True, balance_snapshot_ok: bool = True) -> dict:
     canceled = max(0, int(zero_fill_canceled_orders or 0))
     active_db_orders = max(0, int(db_orders or 0) - canceled)
-    active_router_summary = max(0, int(router_summary or 0) - canceled)
+    # router_summary may be session-scoped while cancellations are counted over
+    # the full trade day.  Never subtract day-wide cancellations from a
+    # session-scoped router count at this generic boundary.
+    active_router_summary = max(0, int(router_summary or 0))
     sources = {
         "db_orders": active_db_orders,
         "fills": int(fills or 0),
@@ -863,7 +866,7 @@ def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: in
         "kis_fills_inquire_ccnl": int(fills or 0),
         "kis_final_balance_positions": int(final_positions or 0),
         "db_orders": max(0, int(db_orders or 0) - canceled),
-        "router_session_summary": max(0, int(router_summary or 0) - canceled),
+        "router_session_summary": max(0, int(router_summary or 0)),
     }
     inconsistencies: list[str] = []
     if sources["db_orders"] and sources["kis_fills_inquire_ccnl"] and sources["db_orders"] != sources["kis_fills_inquire_ccnl"]:
@@ -1539,7 +1542,11 @@ def run_daily_report(
             partial_fill_canceled_orders = int(report.get("orders_partial_fill_cancelled_total") or 0)
             unknown_fill_canceled_orders = int(report.get("orders_unknown_fill_cancelled_total") or 0)
             active_db_ack = max(0, db_ack - zero_fill_canceled_orders)
-            active_router_summary = max(0, router_summary - zero_fill_canceled_orders)
+            router_summary_is_session_scoped = bool(session)
+            active_router_summary = max(0, router_summary)
+            router_summary_for_daily_compare = (
+                0 if router_summary_is_session_scoped else active_router_summary
+            )
             report["source_numbers"] = {
                 "db_orders": db_ack,
                 "db_orders_active": active_db_ack,
@@ -1550,12 +1557,15 @@ def run_daily_report(
                 "kis_fills": fill_count,
                 "router_session_summary": router_summary,
                 "router_session_summary_active": active_router_summary,
+                "router_summary_scope": "session" if router_summary_is_session_scoped else "daily",
+                "router_summary_used_for_daily_compare": router_summary_for_daily_compare,
                 "schedule_health_fallback": schedule_fallback,
                 "final_balance_positions": int(report.get("positions", 0) or 0),
             }
             reconciled = reconcile_order_sources(
                 db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed,
-                router_summary=router_summary, zero_fill_canceled_orders=zero_fill_canceled_orders,
+                router_summary=router_summary_for_daily_compare,
+                zero_fill_canceled_orders=zero_fill_canceled_orders,
             )
             # Canonical daily counts come from US order rows for submitted/ACK and unique fills for executions.
             report["orders_ack"] = db_ack
@@ -1586,7 +1596,7 @@ def run_daily_report(
                 fills=fill_count,
                 final_positions=int(report.get("positions", 0) or 0),
                 open_position_symbols=report.get("open_position_symbols") or [],
-                router_summary=router_summary,
+                router_summary=router_summary_for_daily_compare,
                 zero_fill_canceled_orders=zero_fill_canceled_orders,
             )
             if report["canonical_sources"].get("report_consistency") == "REPORT_INCONSISTENT":
