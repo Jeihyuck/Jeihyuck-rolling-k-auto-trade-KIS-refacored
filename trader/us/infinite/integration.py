@@ -92,6 +92,21 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
             if requested <= 0 or filled < 0 or filled > requested:
                 return False
+        if status == "FILLED":
+            # FILLED is terminal only with complete broker quantity evidence.
+            # A status string alone must never promote a missing/partial fill to
+            # a completed order.
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            filled = explicit_broker_filled_qty(observation)
+            remaining_raw = observation.get("remaining_qty")
+            if requested <= 0 or filled is None or remaining_raw in (None, ""):
+                return False
+            try:
+                remaining = int(float(remaining_raw))
+            except (TypeError, ValueError):
+                return False
+            if filled != requested or remaining != 0:
+                return False
         return bool(
             order_no and observed_order_no == order_no
             and observed_symbol == "TQQQ"
@@ -235,8 +250,8 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             )
         return True
 
-    def safe_pending_bookkeeping(order: dict, *, reason: str, trigger: str) -> None:
-        """Best-effort liveness bookkeeping must never abort later TTL orders."""
+    def safe_mark_first_unresolved(order: dict, *, reason: str, trigger: str) -> None:
+        """Metadata liveness writes are best-effort and must not abort reconciliation."""
         try:
             mark_first_unresolved(repository, order, when=now, reason=reason)
         except Exception as exc:
@@ -246,6 +261,10 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "order_no=%s key=%s trigger=%s stage=mark_first_unresolved error=%s",
                 order.get("order_no"), order.get("client_order_key"), trigger, exc,
             )
+
+    def safe_pending_bookkeeping(order: dict, *, reason: str, trigger: str) -> None:
+        """Best-effort liveness bookkeeping must never abort later TTL orders."""
+        safe_mark_first_unresolved(order, reason=reason, trigger=trigger)
         try:
             maybe_escalate(order, trigger=trigger)
         except Exception as exc:
@@ -360,8 +379,7 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][QUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                 order_no, client_order_key, exc,
             )
-            mark_first_unresolved(repository, order, when=now, reason="QUERY_ERROR")
-            maybe_escalate(order, trigger="query_error")
+            safe_pending_bookkeeping(order, reason="QUERY_ERROR", trigger="query_error")
             result["pending"] += 1
             continue
 
@@ -428,16 +446,21 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][BALANCE_CONFLICT] order_no=%s key=%s detail=%s action=keep_fenced",
                 order_no, client_order_key, balance_result,
             )
-            mark_first_unresolved(repository, order, when=now, reason="BALANCE_DELTA_CONFLICT")
+            safe_mark_first_unresolved(
+                order, reason="BALANCE_DELTA_CONFLICT", trigger="balance_delta_conflict",
+            )
 
         meta = order_meta(order)
         if meta.get("tqqq_ttl_cancel_requested_at") or meta.get("manual_reconcile_required"):
-            mark_first_unresolved(repository, order, when=now, reason="NON_TERMINAL_AFTER_CANCEL")
-            maybe_escalate(order, trigger="non_terminal_after_cancel")
+            safe_pending_bookkeeping(
+                order, reason="NON_TERMINAL_AFTER_CANCEL", trigger="non_terminal_after_cancel",
+            )
             result["pending"] += 1
             continue
 
-        mark_first_unresolved(repository, order, when=now, reason="TTL_NON_TERMINAL")
+        safe_mark_first_unresolved(
+            order, reason="TTL_NON_TERMINAL", trigger="ttl_non_terminal",
+        )
         try:
             cancel_result = cancel_order(**identity) or {}
             mark_cancel_attempt(repository, order, when=now, result=cancel_result)
