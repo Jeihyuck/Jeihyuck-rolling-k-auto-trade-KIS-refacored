@@ -1027,7 +1027,21 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             old_filled=int(state_row.get("qty_filled") or 0)
             old_avg_price=float(state_row.get("avg_price_usd") or 0)
     terminal={"FILLED","CANCELLED","REJECTED","EXPIRED"}
-    stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
+    cancel_full_fill_correction = bool(
+        old_status == "CANCELLED"
+        and broker_reported_status == "CANCELLED"
+        and status == "FILLED"
+        and broker_requested_valid
+        and broker_requested_qty == int(requested_qty)
+        and int(filled_qty) == int(requested_qty)
+        and int(remaining_qty) == 0
+    )
+    terminal_status_conflict = (
+        old_status in terminal
+        and status != old_status
+        and not cancel_full_fill_correction
+    )
+    stale = terminal_status_conflict or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
     if stale:
         return {"status":"OK","order_status":old_status,"observation_ignored":"ORDER_OBSERVATION_IGNORED_STALE"}
     if status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0:
