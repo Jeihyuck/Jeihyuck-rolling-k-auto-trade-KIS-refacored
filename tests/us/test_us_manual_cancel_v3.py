@@ -23,10 +23,10 @@ def test_manual_cancel_is_terminal_and_not_unresolved(monkeypatch):
 
 def test_canceled_order_db_fill_mismatch_is_warning_not_failure():
     result = reconcile_order_sources(db_orders=2, fills=1, balance_confirmed=1, router_summary=1,
-                                     canceled_orders=1, broker_pending=0,
+                                     zero_fill_canceled_orders=1, broker_pending=0,
                                      fills_query_ok=True, balance_snapshot_ok=True)
     assert result["db_orders"] == 1
-    assert result["canceled_orders"] == 1
+    assert result["zero_fill_canceled_orders"] == 1
     assert result["consistency"] in {"BROKER_RECONCILED", "OK", "OK_WITH_WARNINGS"}
 
 
