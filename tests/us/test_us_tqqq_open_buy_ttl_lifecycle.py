@@ -665,3 +665,21 @@ def test_cancel_ack_bookkeeping_failure_cannot_terminalize_from_in_memory_meta(m
     assert "tqqq_ttl_cancel_result" not in repo.orders[0]["meta"]
     assert repo.terminal_observations == []
 
+def test_filled_observation_with_mismatched_broker_request_stays_fenced():
+    repo = _Repository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "FILLED",
+        "requested_qty": 3,
+        "filled_qty": 2,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert repo.orders[0]["status"] == "OPEN"
+    assert repo.terminal_observations == []
+
