@@ -170,6 +170,27 @@ class InfiniteRepository:
                 params["epoch_id"] = epoch_id
             return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
 
+    def load_order_lifecycle_state(self, order: dict) -> dict | None:
+        """Re-read the exact durable order row after an ambiguous persistence exception."""
+        trade_date = str(order.get("trade_date") or "")
+        key = str(order.get("client_order_key") or "")
+        if not trade_date or not key:
+            return None
+        with self.engine.connect() as conn:
+            epoch_id = self._epoch_id(conn)
+            sql = """
+                SELECT * FROM us_orders
+                WHERE trade_date=CAST(:trade_date AS date)
+                  AND client_order_key=:key
+                  AND symbol='TQQQ' AND side='BUY'
+            """
+            params = {"trade_date": trade_date, "key": key}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            row = conn.execute(text(sql), params).mappings().first()
+        return dict(row) if row is not None else None
+
     def load_expired_open_buy_orders(self, *, now: datetime, ttl_seconds: int,
                                      symbol: str = "TQQQ") -> list[dict]:
         """Return only this sleeve's unresolved BUYs whose broker TTL elapsed."""
