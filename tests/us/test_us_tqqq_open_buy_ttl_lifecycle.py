@@ -628,3 +628,40 @@ def test_cancel_error_bookkeeping_failures_do_not_abort_later_expired_orders(mon
     assert result["pending_bookkeeping_error"] >= 1
     assert second["status"] == "FILLED"
 
+def test_cancel_ack_bookkeeping_failure_cannot_terminalize_from_in_memory_meta(monkeypatch):
+    import trader.us.infinite.integration as integration
+
+    repo = _Repository()
+    observations = iter([
+        {
+            "order_no": "original-broker-order",
+            "symbol": "TQQQ",
+            "side": "BUY",
+            "status": "OPEN",
+            "requested_qty": 2,
+            "filled_qty": 0,
+            "remaining_qty": 2,
+        },
+        _sep24_zero_remaining(),
+    ])
+
+    monkeypatch.setattr(
+        integration,
+        "mark_cancel_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cancel ACK db write failed")),
+    )
+
+    result = _run(
+        repo,
+        cancel=lambda **_: _sep24_cancel_ack(),
+        query=lambda **_: next(observations),
+    )
+
+    assert result["cancel_requested"] == 1
+    assert result["cancel_bookkeeping_error"] == 1
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert repo.orders[0]["status"] == "OPEN"
+    assert "tqqq_ttl_cancel_result" not in repo.orders[0]["meta"]
+    assert repo.terminal_observations == []
+
