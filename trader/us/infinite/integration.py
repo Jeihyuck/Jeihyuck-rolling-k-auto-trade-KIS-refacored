@@ -275,6 +275,29 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 order.get("order_no"), order.get("client_order_key"), trigger, exc,
             )
 
+    def safe_mark_cancel_attempt(order: dict, *, payload: dict, trigger: str) -> None:
+        """Cancel-attempt metadata is best-effort and must not abort the TTL scan."""
+        try:
+            mark_cancel_attempt(repository, order, when=now, result=payload)
+        except Exception as exc:
+            inc("cancel_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][CANCEL_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s error=%s action=continue_ttl_scan",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+
+    def safe_maybe_escalate(order: dict, *, trigger: str) -> None:
+        try:
+            maybe_escalate(order, trigger=trigger)
+        except Exception as exc:
+            inc("pending_bookkeeping_error")
+            logger.exception(
+                "[TQQQ_INF][TTL_RECONCILE][PENDING_BOOKKEEPING_WARN] "
+                "order_no=%s key=%s trigger=%s stage=maybe_escalate error=%s",
+                order.get("order_no"), order.get("client_order_key"), trigger, exc,
+            )
+
     def durable_terminal_after_exception(order: dict, observation: dict) -> bool:
         loader = getattr(repository, "load_order_lifecycle_state", None)
         if not callable(loader):
@@ -463,7 +486,11 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         )
         try:
             cancel_result = cancel_order(**identity) or {}
-            mark_cancel_attempt(repository, order, when=now, result=cancel_result)
+            safe_mark_cancel_attempt(
+                order,
+                payload=cancel_result,
+                trigger="cancel_ack",
+            )
             result["cancel_requested"] += 1
             try:
                 retry_observation = query_order(**identity) or {}
@@ -502,9 +529,15 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 "[TQQQ_INF][TTL_RECONCILE][CANCEL_WARN] order_no=%s key=%s error=%s action=persist_attempt_and_requery_original_order",
                 order_no, client_order_key, error_text,
             )
-            mark_cancel_attempt(repository, order, when=now, result={
-                "status": "ERROR", "error_type": type(exc).__name__, "error": error_text,
-            })
+            safe_mark_cancel_attempt(
+                order,
+                payload={
+                    "status": "ERROR",
+                    "error_type": type(exc).__name__,
+                    "error": error_text,
+                },
+                trigger="cancel_exception",
+            )
             try:
                 retry_observation = query_order(**identity) or {}
             except Exception as retry_exc:
@@ -512,7 +545,7 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                     "[TQQQ_INF][TTL_RECONCILE][REQUERY_WARN] order_no=%s key=%s error=%s action=keep_pending",
                     order_no, client_order_key, retry_exc,
                 )
-                maybe_escalate(order, trigger="cancel_error_requery_error")
+                safe_maybe_escalate(order, trigger="cancel_error_requery_error")
                 result["pending"] += 1
                 continue
             if terminal_observation(order, retry_observation):
@@ -541,7 +574,7 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                     success_counter="historical_expired",
                 )
                 continue
-            maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
+            safe_maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
 
         result["pending"] += 1
     return result
