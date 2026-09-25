@@ -561,3 +561,70 @@ def test_query_error_bookkeeping_failure_does_not_abort_later_orders(monkeypatch
     assert result["pending_bookkeeping_error"] >= 1
     assert second["status"] == "FILLED"
 
+def test_cancel_error_bookkeeping_failures_do_not_abort_later_expired_orders(monkeypatch):
+    import trader.us.infinite.integration as integration
+
+    first = _order(
+        order_no="cancel-error-order",
+        client_order_key="TQQQ_INF_V3:cycle-a:2026-09-05:BUY:cancel-error",
+        meta={"tqqq_ttl_first_unresolved_at": "2026-09-05T13:00:00+00:00"},
+    )
+    second = _order(
+        order_no="filled-after-cancel-error",
+        client_order_key="TQQQ_INF_V3:cycle-a:2026-09-05:BUY:filled-after",
+    )
+    repo = _Repository([first, second])
+
+    monkeypatch.setattr(
+        integration,
+        "mark_cancel_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cancel metadata db unavailable")),
+    )
+    monkeypatch.setattr(
+        integration,
+        "mark_manual_reconcile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("escalation metadata db unavailable")),
+    )
+
+    query_calls = {}
+
+    def query(**identity):
+        order_no = identity["order_no"]
+        query_calls[order_no] = query_calls.get(order_no, 0) + 1
+        if order_no == "cancel-error-order":
+            if query_calls[order_no] == 1:
+                return {
+                    "order_no": order_no,
+                    "symbol": "TQQQ",
+                    "side": "BUY",
+                    "status": "OPEN",
+                    "requested_qty": 2,
+                    "filled_qty": 0,
+                    "remaining_qty": 2,
+                }
+            raise RuntimeError("broker requery failed")
+        return {
+            "order_no": order_no,
+            "symbol": "TQQQ",
+            "side": "BUY",
+            "status": "FILLED",
+            "requested_qty": 2,
+            "filled_qty": 2,
+            "remaining_qty": 0,
+            "avg_price": 77.25,
+        }
+
+    def cancel(**identity):
+        if identity["order_no"] == "cancel-error-order":
+            raise RuntimeError("cancel endpoint failed")
+        return {"status": "ACK"}
+
+    result = _run(repo, cancel=cancel, query=query)
+
+    assert result["expired"] == 2
+    assert result["pending"] == 1
+    assert result["terminal"] == 1
+    assert result["cancel_bookkeeping_error"] >= 1
+    assert result["pending_bookkeeping_error"] >= 1
+    assert second["status"] == "FILLED"
+
