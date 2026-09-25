@@ -365,6 +365,83 @@ def test_real_postgres_cancelled_partial_fill_normalize_persist_close_chain(pg_e
     assert _explicit_order_filled_qty(row) == 1
 
 
+def test_real_postgres_tqqq_cancel_reprices_cumulative_actual_fill(pg_engine):
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+    from trader.us.data_provider import normalize_us_order_status_row
+    from trader.us.infinite.repository import InfiniteRepository
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             avg_price_usd,order_no,status,meta)
+            VALUES ('2026-09-24','TQQQ-CUMULATIVE-CANCEL','TQQQ','NASDAQ','BUY',
+                    2,0,NULL,'CUM-CANCEL-1','ACK','{}'::jsonb)"""))
+
+    first = repos.mark_order_filled_by_reconcile(
+        order_no="CUM-CANCEL-1",
+        client_order_key="TQQQ-CUMULATIVE-CANCEL",
+        symbol="TQQQ",
+        side="BUY",
+        filled_qty=1,
+        requested_qty=2,
+        cumulative_filled_qty=1,
+        avg_price_usd=70.0,
+        source="fills_by_order_no",
+        trade_date="2026-09-24",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+    )
+    assert first["status"] == "OK"
+
+    observation = normalize_us_order_status_row({
+        "odno": "CUM-CANCEL-1",
+        "pdno": "TQQQ",
+        "sll_buy_dvsn_cd": "02",
+        "ord_qty": "2",
+        "ft_ccld_qty": "2",
+        "ft_ccld_unpr3": "75.0",
+        "nccs_qty": "0",
+        "status": "CANCELLED",
+    })
+    repo = InfiniteRepository(pg_engine)
+    applied = repo.apply_ttl_terminal_observation(
+        {
+            "trade_date": "2026-09-24",
+            "client_order_key": "TQQQ-CUMULATIVE-CANCEL",
+            "order_no": "CUM-CANCEL-1",
+            "symbol": "TQQQ",
+            "side": "BUY",
+            "qty_requested": 2,
+        },
+        observation,
+    )
+    assert applied["status"] == "OK"
+
+    with pg_engine.begin() as conn:
+        order = conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd
+            FROM us_orders
+            WHERE client_order_key='TQQQ-CUMULATIVE-CANCEL'
+        """)).mappings().one()
+        fills = conn.execute(text("""
+            SELECT qty,price_usd,meta
+            FROM us_fills
+            WHERE client_order_key='TQQQ-CUMULATIVE-CANCEL'
+              AND COALESCE((meta->>'accounting_active')::boolean,true)
+            ORDER BY id
+        """)).mappings().all()
+
+    assert order["status"] == "CANCELLED"
+    assert order["qty_filled"] == 2
+    assert float(order["avg_price_usd"]) == 75.0
+    assert sum(int(row["qty"]) for row in fills) == 2
+    assert sum(float(row["qty"]) * float(row["price_usd"]) for row in fills) == 150.0
+    assert any(
+        str((row["meta"] or {}).get("fill_evidence_type") or "") == "KIS_ORDER_CUMULATIVE_ACTUAL"
+        for row in fills
+    )
+
+
 def test_real_postgres_partial_fill_cancel_without_price_stays_unresolved(pg_engine):
     from sqlalchemy import text
     from trader.us.data_provider import normalize_us_order_status_row
@@ -421,6 +498,64 @@ def test_real_postgres_partial_fill_cancel_without_price_stays_unresolved(pg_eng
     assert row["status"] == "ACK"
     assert row["qty_filled"] == 0
     assert row["avg_price_usd"] is None
+    assert fill_count == 0
+
+
+@pytest.mark.parametrize("bad_price", ["NaN", "Infinity"])
+def test_real_postgres_nonfinite_partial_cancel_price_stays_unresolved(pg_engine, bad_price):
+    from sqlalchemy import text
+    from trader.us.data_provider import normalize_us_order_status_row
+    import trader.us.db.repos as repos
+
+    suffix = "NAN" if bad_price == "NaN" else "INF"
+    key = f"TQQQ-NONFINITE-{suffix}"
+    order_no = f"NONFINITE-{suffix}-1"
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             avg_price_usd,order_no,status,meta)
+            VALUES ('2026-09-24',:key,'TQQQ','NASDAQ','BUY',
+                    2,0,NULL,:order_no,'ACK','{}'::jsonb)"""),
+            {"key": key, "order_no": order_no})
+
+    observation = normalize_us_order_status_row({
+        "odno": order_no,
+        "pdno": "TQQQ",
+        "sll_buy_dvsn_cd": "02",
+        "ord_qty": "2",
+        "ft_ccld_qty": "1",
+        "ft_ccld_unpr3": bad_price,
+        "nccs_qty": "0",
+        "status": "CANCELLED",
+    })
+    applied = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key=key,
+        raw_order_no=order_no,
+        canonical_order_no=order_no,
+        symbol="TQQQ",
+        side="BUY",
+        requested_qty=2,
+        filled_qty=1,
+        remaining_qty=0,
+        broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row=observation,
+    )
+    assert applied["status"] == "PENDING"
+    assert applied["reason"] == "cancel_partial_fill_price_missing"
+
+    with pg_engine.begin() as conn:
+        order = conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd
+            FROM us_orders WHERE client_order_key=:key
+        """), {"key": key}).mappings().one()
+        fill_count = conn.execute(text("""
+            SELECT COUNT(*) FROM us_fills WHERE client_order_key=:key
+        """), {"key": key}).scalar_one()
+    assert order["status"] == "ACK"
+    assert order["qty_filled"] == 0
+    assert order["avg_price_usd"] is None
     assert fill_count == 0
 
 
