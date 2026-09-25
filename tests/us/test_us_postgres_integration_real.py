@@ -376,7 +376,7 @@ def test_real_postgres_tqqq_cancel_reprices_cumulative_actual_fill(pg_engine):
             (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
              avg_price_usd,order_no,status,meta)
             VALUES ('2026-09-24','TQQQ-CUMULATIVE-CANCEL','TQQQ','NASDAQ','BUY',
-                    2,0,NULL,'CUM-CANCEL-1','ACK','{}'::jsonb)"""))
+                    3,0,NULL,'CUM-CANCEL-1','ACK','{}'::jsonb)"""))
 
     first = repos.mark_order_filled_by_reconcile(
         order_no="CUM-CANCEL-1",
@@ -384,7 +384,7 @@ def test_real_postgres_tqqq_cancel_reprices_cumulative_actual_fill(pg_engine):
         symbol="TQQQ",
         side="BUY",
         filled_qty=1,
-        requested_qty=2,
+        requested_qty=3,
         cumulative_filled_qty=1,
         avg_price_usd=70.0,
         source="fills_by_order_no",
@@ -397,7 +397,7 @@ def test_real_postgres_tqqq_cancel_reprices_cumulative_actual_fill(pg_engine):
         "odno": "CUM-CANCEL-1",
         "pdno": "TQQQ",
         "sll_buy_dvsn_cd": "02",
-        "ord_qty": "2",
+        "ord_qty": "3",
         "ft_ccld_qty": "2",
         "ft_ccld_unpr3": "75.0",
         "nccs_qty": "0",
@@ -411,7 +411,7 @@ def test_real_postgres_tqqq_cancel_reprices_cumulative_actual_fill(pg_engine):
             "order_no": "CUM-CANCEL-1",
             "symbol": "TQQQ",
             "side": "BUY",
-            "qty_requested": 2,
+            "qty_requested": 3,
         },
         observation,
     )
