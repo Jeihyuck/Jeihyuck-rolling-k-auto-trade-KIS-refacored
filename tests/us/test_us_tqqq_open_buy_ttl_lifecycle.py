@@ -21,10 +21,11 @@ def _order(**extra):
 
 
 class _Repository:
-    def __init__(self, orders=None):
+    def __init__(self, orders=None, terminal_result=None):
         self.orders = list(orders or [_order()])
         self.cancel_requests = []
         self.terminal_observations = []
+        self.terminal_result = terminal_result
 
     def load_expired_open_buy_orders(self, **kwargs):
         assert kwargs["symbol"] == "TQQQ"
@@ -36,8 +37,10 @@ class _Repository:
 
     def apply_ttl_terminal_observation(self, order, observation):
         self.terminal_observations.append((order, observation))
-        order["status"] = observation["status"]
-        return {"status": "OK"}
+        result = self.terminal_result or {"status": "OK"}
+        if str(result.get("status") or "").upper() == "OK":
+            order["status"] = observation["status"]
+        return result
 
 
 def _run(repo, *, cancel=lambda **_: {"status": "ACK"}, query=lambda **_: {"status": "OPEN"}):
@@ -351,4 +354,28 @@ def test_invalid_normalized_cancel_fill_never_terminalizes_tqqq():
     assert result["pending"] == 1
     assert repo.orders[0]["status"] == "ACK"
     assert repo.terminal_observations == []
+
+def test_terminal_observation_persistence_pending_is_not_counted_terminal():
+    repo = _Repository(terminal_result={
+        "status": "PENDING",
+        "reason": "cancel_partial_fill_price_missing",
+    })
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 2,
+        "filled_qty": 1,
+        "remaining_qty": 0,
+        "avg_price": 0,
+    })
+
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert result["terminal_persist_pending"] == 1
+    assert repo.orders[0]["status"] == "OPEN"
+    assert repo.orders[0]["meta"]["tqqq_ttl_last_unresolved_reason"] == (
+        "TERMINAL_PERSIST_cancel_partial_fill_price_missing"
+    )
 
