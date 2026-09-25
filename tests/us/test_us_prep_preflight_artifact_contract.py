@@ -62,3 +62,76 @@ def test_runtime_guard_consumes_durable_preflight_exit_only(tmp_path, monkeypatc
     assert guard["exit_can_proceed"] is True
     assert guard["close_can_proceed"] is True
     assert guard["source"] == "am_preflight_health"
+
+def _trade_ready_contract(trade_date: str) -> dict:
+    return {
+        "trade_date": trade_date,
+        "status": "OK_WITH_WARNINGS",
+        "trade_can_proceed": 1,
+        "entry_can_proceed": 1,
+        "exit_can_proceed": 1,
+        "close_can_proceed": 1,
+        "final30_scored_count": 30,
+        "score_nonzero_count": 30,
+        "final30_trade_ready": True,
+    }
+
+
+def test_runtime_guard_fails_closed_on_truncated_preflight_marker(tmp_path, monkeypatch):
+    from trader.us import prep_contract
+
+    monkeypatch.chdir(tmp_path)
+    marker_dir = tmp_path / "runtime" / "health"
+    marker_dir.mkdir(parents=True)
+    trade_date = "2026-09-24"
+    (marker_dir / f"us-prep-missing-{trade_date}.json").write_text(
+        '{"trade_date":"2026-09-24","status":"EXIT_ONLY"',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "trader.us.path_contract.load_us_prep_contract",
+        lambda _td: _trade_ready_contract(trade_date),
+    )
+
+    guard = prep_contract.check_us_prep_guard(trade_date, session="am")
+
+    assert guard["ok"] is True
+    assert guard["guard_state"] == "PREFLIGHT_EXIT_ONLY"
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert guard["close_can_proceed"] is True
+    assert guard["new_buy_budget"] == 0
+    assert guard["reason"] == "prep_preflight_marker_invalid"
+    assert guard["source"] == "am_preflight_health"
+
+
+def test_runtime_guard_fails_closed_on_unexpected_preflight_marker_type(tmp_path, monkeypatch):
+    from trader.us import prep_contract
+
+    monkeypatch.chdir(tmp_path)
+    marker_dir = tmp_path / "runtime" / "health"
+    marker_dir.mkdir(parents=True)
+    trade_date = "2026-09-24"
+    (marker_dir / f"us-prep-missing-{trade_date}.json").write_text(
+        '[]',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "trader.us.path_contract.load_us_prep_contract",
+        lambda _td: _trade_ready_contract(trade_date),
+    )
+
+    guard = prep_contract.check_us_prep_guard(trade_date, session="am")
+
+    assert guard["guard_state"] == "PREFLIGHT_EXIT_ONLY"
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert guard["reason"] == "prep_preflight_marker_invalid_type"
+
+
+def test_preflight_exit_only_marker_write_is_atomic():
+    script = Path("scripts/wsl/check-us-prep-before-am.sh").read_text(encoding="utf-8")
+    assert 'marker_tmp="${marker}.tmp.$$"' in script
+    assert 'cat > "$marker_tmp"' in script
+    assert 'mv -f "$marker_tmp" "$marker"' in script
+
