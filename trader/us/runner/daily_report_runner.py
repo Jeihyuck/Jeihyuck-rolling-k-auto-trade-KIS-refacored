@@ -724,12 +724,14 @@ def _load_contract_status_snapshot(trade_date: str) -> dict:
 def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int,
                             canceled_orders: int = 0, broker_pending: int = 0,
                             fills_query_ok: bool = True, balance_snapshot_ok: bool = True) -> dict:
-    active_db_orders = max(0, int(db_orders or 0) - int(canceled_orders or 0))
+    canceled = max(0, int(canceled_orders or 0))
+    active_db_orders = max(0, int(db_orders or 0) - canceled)
+    active_router_summary = max(0, int(router_summary or 0) - canceled)
     sources = {
         "db_orders": active_db_orders,
         "fills": int(fills or 0),
         "balance_confirmed": int(balance_confirmed or 0),
-        "router_summary": int(router_summary or 0),
+        "router_summary": active_router_summary,
     }
 
 
@@ -762,7 +764,9 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
         "fill_api_count": sources["fills"],
         "balance_confirmed_count": sources["balance_confirmed"],
         "warnings": warnings,
-        "canceled_orders": int(canceled_orders or 0),
+        "canceled_orders": canceled,
+        "raw_db_orders": int(db_orders or 0),
+        "raw_router_summary": int(router_summary or 0),
         "consistency": consistency,
         "broker_reconciled": broker_reconciled,
     }
@@ -807,12 +811,14 @@ def _session_summary_paths(report_base: str, trade_date: str, session: str | Non
     )
 
 
-def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: int, open_position_symbols: list, router_summary: int) -> dict:
+def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: int, open_position_symbols: list,
+                              router_summary: int, canceled_orders: int = 0) -> dict:
+    canceled = max(0, int(canceled_orders or 0))
     sources = {
         "kis_fills_inquire_ccnl": int(fills or 0),
         "kis_final_balance_positions": int(final_positions or 0),
-        "db_orders": int(db_orders or 0),
-        "router_session_summary": int(router_summary or 0),
+        "db_orders": max(0, int(db_orders or 0) - canceled),
+        "router_session_summary": max(0, int(router_summary or 0) - canceled),
     }
     inconsistencies: list[str] = []
     if sources["db_orders"] and sources["kis_fills_inquire_ccnl"] and sources["db_orders"] != sources["kis_fills_inquire_ccnl"]:
@@ -826,6 +832,9 @@ def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: in
         "canonical_order_source": "kis_fills_inquire_ccnl" if sources["kis_fills_inquire_ccnl"] else ("db_orders" if sources["db_orders"] else "router_session_summary"),
         "canonical_position_source": "kis_final_balance",
         "source_counts": sources,
+        "raw_db_orders": int(db_orders or 0),
+        "raw_router_session_summary": int(router_summary or 0),
+        "canceled_orders": canceled,
         "inconsistencies": inconsistencies,
         "report_consistency": "REPORT_INCONSISTENT" if inconsistencies else "OK",
     }
@@ -892,6 +901,7 @@ def run_daily_report(
         "orders_blocked": 0,
         "orders_rejected": 0,
         "orders_rejected_total": 0,
+        "orders_cancelled_total": 0,
         "orders_unresolved_total": 0,
         "orders_submitted": 0,
         "broker_fill_confirmed": 0,
@@ -1288,6 +1298,8 @@ def run_daily_report(
                             report["broker_orderable_qty_blocks"] += 1
                         elif status == "BLOCKED":
                             report["orders_blocked"] += 1
+                        elif status in {"CANCELLED", "CANCELED"}:
+                            report["orders_cancelled_total"] += 1
                         elif status == "REJECTED":
                             report["orders_rejected"] += 1
                             report["orders_rejected_total"] += 1
@@ -1462,8 +1474,23 @@ def run_daily_report(
                 report["notional_total_source_note"] = "buy_notional_total/sell_notional_total synchronized from routed fallback; prefer *_routed fields"
                 report["deprecated_notional_total_fields"] = ["buy_notional_total", "sell_notional_total"]
                 db_ack = int(report.get("orders_ack") or 0)
-            report["source_numbers"] = {"db_orders": db_ack, "kis_fills": fill_count, "router_session_summary": router_summary, "schedule_health_fallback": schedule_fallback, "final_balance_positions": int(report.get("positions", 0) or 0)}
-            reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)
+            canceled_orders = int(report.get("orders_cancelled_total") or 0)
+            active_db_ack = max(0, db_ack - canceled_orders)
+            active_router_summary = max(0, router_summary - canceled_orders)
+            report["source_numbers"] = {
+                "db_orders": db_ack,
+                "db_orders_active": active_db_ack,
+                "canceled_orders": canceled_orders,
+                "kis_fills": fill_count,
+                "router_session_summary": router_summary,
+                "router_session_summary_active": active_router_summary,
+                "schedule_health_fallback": schedule_fallback,
+                "final_balance_positions": int(report.get("positions", 0) or 0),
+            }
+            reconciled = reconcile_order_sources(
+                db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed,
+                router_summary=router_summary, canceled_orders=canceled_orders,
+            )
             # Canonical daily counts come from US order rows for submitted/ACK and unique fills for executions.
             report["orders_ack"] = db_ack
             report["orders_ack_total"] = db_ack
@@ -1494,6 +1521,7 @@ def run_daily_report(
                 final_positions=int(report.get("positions", 0) or 0),
                 open_position_symbols=report.get("open_position_symbols") or [],
                 router_summary=router_summary,
+                canceled_orders=canceled_orders,
             )
             if report["canonical_sources"].get("report_consistency") == "REPORT_INCONSISTENT":
                 report["warnings"].append("REPORT_INCONSISTENT:" + ",".join(report["canonical_sources"].get("inconsistencies") or []))
@@ -1788,6 +1816,7 @@ def run_daily_report(
         f"| daily_orders_submitted_total | {report.get('daily_orders_submitted_total', 0)} |",
         f"| orders_ack_total | {report.get('orders_ack_total', 0)} |",
         f"| orders_rejected_total | {report.get('orders_rejected_total', 0)} |",
+        f"| orders_cancelled_total | {report.get('orders_cancelled_total', 0)} |",
         f"| orders_unresolved_total | {report.get('orders_unresolved_total', 0)} |",
         f"| buy_notional_total | {report.get('buy_notional_total', 0)} |",
         f"| sell_notional_total | {report.get('sell_notional_total', 0)} |",
