@@ -271,3 +271,41 @@ def test_repository_preserves_broker_zero_remaining_for_cancel(monkeypatch):
     assert result["status"] == "OK"
     assert captured["remaining_qty"] == 0
     assert captured["filled_qty"] == 0
+
+
+def test_cancel_ack_zero_remaining_without_explicit_fill_qty_stays_fenced():
+    order = _order(
+        status="ACK",
+        meta={
+            "tqqq_ttl_cancel_requested_at": NOW.isoformat(),
+            "tqqq_ttl_cancel_result": _sep24_cancel_ack(),
+        },
+    )
+    repo = _Repository([order])
+    observation = _sep24_zero_remaining()
+    observation.pop("filled_qty")
+
+    result = _run(repo, query=lambda **_: observation)
+
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert result.get("cancel_confirmed", 0) == 0
+    assert repo.orders[0]["status"] == "ACK"
+    assert repo.terminal_observations == []
+
+
+def test_explicit_partial_fill_cancel_terminal_preserves_fill_evidence():
+    repo = _Repository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 2,
+        "filled_qty": 1,
+        "remaining_qty": 0,
+    })
+
+    assert result["terminal"] == 1
+    assert repo.orders[0]["status"] == "CANCELLED"
+    assert repo.terminal_observations[0][1]["filled_qty"] == 1
