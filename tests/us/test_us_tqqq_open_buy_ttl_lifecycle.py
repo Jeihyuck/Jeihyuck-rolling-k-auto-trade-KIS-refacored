@@ -379,3 +379,29 @@ def test_terminal_observation_persistence_pending_is_not_counted_terminal():
         "TERMINAL_PERSIST_cancel_partial_fill_price_missing"
     )
 
+def test_terminal_persistence_exception_is_pending_not_terminal():
+    class ExplodingRepository(_Repository):
+        def apply_ttl_terminal_observation(self, order, observation):
+            self.terminal_observations.append((order, observation))
+            raise RuntimeError("database write failed")
+
+    repo = ExplodingRepository()
+    result = _run(repo, query=lambda **_: {
+        "order_no": "original-broker-order",
+        "symbol": "TQQQ",
+        "side": "BUY",
+        "status": "CANCELLED",
+        "requested_qty": 2,
+        "filled_qty": 1,
+        "remaining_qty": 0,
+        "avg_price": 77.25,
+    })
+
+    assert result["terminal"] == 0
+    assert result["pending"] == 1
+    assert result["terminal_persist_pending"] == 1
+    assert repo.orders[0]["status"] == "OPEN"
+    assert repo.orders[0]["meta"]["tqqq_ttl_last_unresolved_reason"] == (
+        "TERMINAL_PERSIST_terminal_persist_exception"
+    )
+
