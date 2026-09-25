@@ -722,7 +722,38 @@ def _load_contract_status_snapshot(trade_date: str) -> dict:
     }
 
 def _explicit_order_filled_qty(order: dict) -> int | None:
-    """Return broker/persisted fill qty only when the row reports it explicitly."""
+    """Return explicit fill truth, preferring the latest broker evidence.
+
+    us_orders.qty_filled has an ACK-time default of zero.  For CANCELLED rows
+    that default must not outrank a later broker observation, especially when
+    the cancellation itself reported a partial cumulative fill or explicitly
+    omitted the fill field.
+    """
+    meta = order.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    broker_row = meta.get("broker_raw_row") if isinstance(meta, dict) else None
+    if isinstance(broker_row, str):
+        try:
+            broker_row = json.loads(broker_row)
+        except Exception:
+            broker_row = None
+    if isinstance(broker_row, dict):
+        if broker_row.get("filled_qty_present") is False:
+            return None
+        for key in ("filled_qty", "cumulative_filled_qty"):
+            raw = broker_row.get(key)
+            if raw in (None, ""):
+                continue
+            try:
+                qty = int(float(raw))
+            except (TypeError, ValueError):
+                return None
+            return qty if qty >= 0 else None
+
     for key in ("qty_filled", "filled_qty", "cumulative_filled_qty"):
         raw = order.get(key)
         if raw in (None, ""):
