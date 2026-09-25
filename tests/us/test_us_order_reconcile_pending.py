@@ -1,5 +1,9 @@
 from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
-from trader.us.runner.daily_report_runner import classify_close_order_reconcile_summary
+from trader.us.runner.daily_report_runner import (
+    _canonical_source_summary,
+    classify_close_order_reconcile_summary,
+    reconcile_order_sources,
+)
 from trader.us.runner.trade_tick_runner import classify_ack_reconcile_gate
 
 
@@ -56,3 +60,39 @@ def test_tick_gate_true_unresolved_requires_manual_reconcile():
     assert result["allow_new_orders"] is False
     assert result["reason"] == "unresolved_ack_error"
     assert result["manual_reconcile_required"] == 1
+
+
+def test_cancelled_ack_is_removed_from_active_close_source_counts():
+    result = reconcile_order_sources(
+        db_orders=6,
+        fills=5,
+        balance_confirmed=0,
+        router_summary=6,
+        canceled_orders=1,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["raw_router_summary"] == 6
+    assert result["canceled_orders"] == 1
+    assert result["db_orders"] == 5
+    assert result["router_summary"] == 5
+    assert result["fills"] == 5
+    assert result["broker_reconciled"] is True
+    assert "SOURCE_MISMATCH_ACK_EXISTS_FILL_MISSING" not in result["warnings"]
+
+
+def test_cancelled_ack_is_removed_from_canonical_close_consistency():
+    result = _canonical_source_summary(
+        db_orders=6,
+        fills=5,
+        final_positions=20,
+        open_position_symbols=["TQQQ"],
+        router_summary=6,
+        canceled_orders=1,
+    )
+    assert result["raw_db_orders"] == 6
+    assert result["canceled_orders"] == 1
+    assert result["source_counts"]["db_orders"] == 5
+    assert result["source_counts"]["router_session_summary"] == 5
+    assert result["source_counts"]["kis_fills_inquire_ccnl"] == 5
+    assert "db_orders_fills_mismatch" not in result["inconsistencies"]
+    assert result["report_consistency"] == "OK"
