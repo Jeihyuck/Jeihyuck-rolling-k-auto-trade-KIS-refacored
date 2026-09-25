@@ -1257,7 +1257,11 @@ class USDataProvider:
             )
 
         def _explicit_fill(row: dict) -> int | None:
-            if str(row.get("normalization_result") or "") != "normalized":
+            # Production-normalized rows explicitly mark invalid schemas as
+            # quarantined.  Legacy/test callers may provide already-normalized
+            # snapshots without this marker, so only an explicit quarantine
+            # disqualifies broker fill evidence.
+            if str(row.get("normalization_result") or "").lower() == "quarantined":
                 return None
             if row.get("filled_qty_present") is False:
                 return None
