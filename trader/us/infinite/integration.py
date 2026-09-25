@@ -235,6 +235,37 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             )
         return True
 
+    def persist_terminal_or_pending(
+        order: dict,
+        observation: dict,
+        *,
+        trigger: str,
+        success_counter: str | None = None,
+    ) -> bool:
+        applied = repository.apply_ttl_terminal_observation(order, observation)
+        applied_status = str((applied or {}).get("status") or "").upper()
+        if applied_status == "OK":
+            if success_counter:
+                inc(success_counter)
+            result["terminal"] += 1
+            return True
+        reason = str((applied or {}).get("reason") or applied_status or "UNKNOWN")
+        logger.warning(
+            "[TQQQ_INF][TTL_RECONCILE][TERMINAL_PERSIST_PENDING] "
+            "order_no=%s key=%s trigger=%s persist_status=%s reason=%s "
+            "action=keep_pending_and_escalate",
+            order.get("order_no"), order.get("client_order_key"), trigger,
+            applied_status or "UNKNOWN", reason,
+        )
+        inc("terminal_persist_pending")
+        mark_first_unresolved(
+            repository, order, when=now,
+            reason=f"TERMINAL_PERSIST_{reason}",
+        )
+        maybe_escalate(order, trigger=trigger)
+        result["pending"] += 1
+        return False
+
     for order in expired:
         order_no = str(order.get("order_no") or "")
         client_order_key = str(order.get("client_order_key") or "")
@@ -261,8 +292,9 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             continue
 
         if terminal_observation(order, observation):
-            repository.apply_ttl_terminal_observation(order, observation)
-            result["terminal"] += 1
+            persist_terminal_or_pending(
+                order, observation, trigger="initial_terminal_observation",
+            )
             continue
 
         cancel_terminal = cancel_ack_zero_remaining_terminal(order, observation)
@@ -274,9 +306,11 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 order_no, client_order_key, cancel_terminal.get("cancel_broker_order_no"),
                 cancel_terminal.get("evidence_type"),
             )
-            repository.apply_ttl_terminal_observation(order, cancel_terminal)
-            inc("cancel_confirmed")
-            result["terminal"] += 1
+            persist_terminal_or_pending(
+                order, cancel_terminal,
+                trigger="cancel_confirmed_initial",
+                success_counter="cancel_confirmed",
+            )
             continue
 
         specific_evidence = exact_order_fill_evidence(order, observation)
@@ -344,8 +378,10 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 )
             else:
                 if terminal_observation(order, retry_observation):
-                    repository.apply_ttl_terminal_observation(order, retry_observation)
-                    result["terminal"] += 1
+                    persist_terminal_or_pending(
+                        order, retry_observation,
+                        trigger="post_cancel_ack_terminal_observation",
+                    )
                     continue
                 cancel_terminal = cancel_ack_zero_remaining_terminal(order, retry_observation)
                 if cancel_terminal is not None:
@@ -356,9 +392,11 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                         order_no, client_order_key, cancel_terminal.get("cancel_broker_order_no"),
                         cancel_terminal.get("evidence_type"),
                     )
-                    repository.apply_ttl_terminal_observation(order, cancel_terminal)
-                    inc("cancel_confirmed")
-                    result["terminal"] += 1
+                    persist_terminal_or_pending(
+                        order, cancel_terminal,
+                        trigger="post_cancel_ack_zero_fill_terminal",
+                        success_counter="cancel_confirmed",
+                    )
                     continue
         except Exception as exc:
             inc("cancel_attempted")
@@ -381,8 +419,10 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 result["pending"] += 1
                 continue
             if terminal_observation(order, retry_observation):
-                repository.apply_ttl_terminal_observation(order, retry_observation)
-                result["terminal"] += 1
+                persist_terminal_or_pending(
+                    order, retry_observation,
+                    trigger="cancel_error_requery_terminal_observation",
+                )
                 continue
             historical_expiry = historical_zero_fill_not_live_expiry(
                 order,
@@ -398,9 +438,11 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                     order_no, client_order_key, historical_expiry.get("requested_qty"),
                     historical_expiry.get("evidence_type"),
                 )
-                repository.apply_ttl_terminal_observation(order, historical_expiry)
-                inc("historical_expired")
-                result["terminal"] += 1
+                persist_terminal_or_pending(
+                    order, historical_expiry,
+                    trigger="historical_zero_fill_expiry",
+                    success_counter="historical_expired",
+                )
                 continue
             maybe_escalate(order, trigger="cancel_error_requery_non_terminal")
 
