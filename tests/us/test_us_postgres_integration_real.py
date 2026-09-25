@@ -605,3 +605,66 @@ def test_real_postgres_missing_fill_cancel_is_not_terminalized(pg_engine):
     assert row["status"] == "ACK"
     assert row["qty_filled"] == 0
 
+@pytest.mark.parametrize("bad_price", ["NaN", "Infinity", "-Infinity"])
+def test_real_postgres_partial_cancel_rejects_nonfinite_fill_price(pg_engine, bad_price):
+    from sqlalchemy import text
+    from trader.us.data_provider import normalize_us_order_status_row
+    import trader.us.db.repos as repos
+
+    key = "TQQQ-NONFINITE-" + bad_price.replace("-", "NEG").replace("Infinity", "INF").replace("NaN", "NAN")
+    order_no = key + "-ORDER"
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             avg_price_usd,order_no,status,meta)
+            VALUES ('2026-09-24',:key,'TQQQ','NASDAQ','BUY',
+                    2,0,NULL,:order_no,'ACK','{}'::jsonb)"""),
+            {"key": key, "order_no": order_no})
+
+    observation = normalize_us_order_status_row({
+        "odno": order_no,
+        "pdno": "TQQQ",
+        "sll_buy_dvsn_cd": "02",
+        "ord_qty": "2",
+        "ft_ccld_qty": "1",
+        "ft_ccld_unpr3": bad_price,
+        "nccs_qty": "0",
+        "status": "CANCELLED",
+    })
+    assert observation["filled_qty"] == 1
+
+    applied = repos.apply_broker_order_observation(
+        trade_date="2026-09-24",
+        client_order_key=key,
+        raw_order_no=order_no,
+        canonical_order_no=order_no,
+        symbol="TQQQ",
+        side="BUY",
+        requested_qty=2,
+        filled_qty=observation["filled_qty"],
+        remaining_qty=observation["remaining_qty"],
+        broker_status=observation["status"],
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row=observation,
+    )
+    assert applied["status"] == "PENDING"
+    assert applied["reason"] == "cancel_partial_fill_price_missing"
+
+    with pg_engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd
+            FROM us_orders
+            WHERE client_order_key=:key
+        """), {"key": key}).mappings().one()
+        fill_count = conn.execute(text("""
+            SELECT COUNT(*)
+            FROM us_fills
+            WHERE client_order_key=:key
+        """), {"key": key}).scalar_one()
+
+    assert row["status"] == "ACK"
+    assert row["qty_filled"] == 0
+    assert row["avg_price_usd"] is None
+    assert fill_count == 0
+
