@@ -72,6 +72,42 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
                 return None
         return None
 
+    def explicit_broker_requested_qty(observation: dict | None) -> int | None:
+        if not isinstance(observation, dict):
+            return None
+        for key in ("requested_qty", "qty_requested", "qty"):
+            raw_value = observation.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                return int(float(raw_value))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def effective_terminal_status(order: dict, observation: dict | None) -> str:
+        if not isinstance(observation, dict):
+            return ""
+        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if status != "CANCELLED":
+            return status
+        try:
+            requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
+            observed_requested = explicit_broker_requested_qty(observation)
+            filled = explicit_broker_filled_qty(observation)
+            remaining_raw = observation.get("remaining_qty")
+            if (
+                requested > 0
+                and observed_requested == requested
+                and filled == requested
+                and remaining_raw not in (None, "")
+                and int(float(remaining_raw)) == 0
+            ):
+                return "FILLED"
+        except (TypeError, ValueError):
+            return status
+        return status
+
     def terminal_observation(order: dict, observation: dict | None) -> bool:
         if not isinstance(observation, dict):
             return False
@@ -82,15 +118,20 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         observed_side = str(observation.get("side") or "").upper()
         status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
         if status == "CANCELLED":
-            # A terminal cancel without an explicit cumulative fill quantity is
-            # not sufficient broker truth: the order may have partially filled
-            # before the remainder was cancelled.  Keep it fenced until the
-            # broker reports the fill quantity explicitly.
+            # A terminal cancel must still belong to this exact requested
+            # quantity.  Otherwise a broker row for a different request can be
+            # misapplied to the local order, including a full-fill/cancel race.
             filled = explicit_broker_filled_qty(observation)
-            if filled is None:
-                return False
+            observed_requested = explicit_broker_requested_qty(observation)
             requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
-            if requested <= 0 or filled < 0 or filled > requested:
+            if (
+                filled is None
+                or observed_requested is None
+                or requested <= 0
+                or observed_requested != requested
+                or filled < 0
+                or filled > requested
+            ):
                 return False
         if status == "FILLED":
             # FILLED is terminal only with internally consistent broker quantity
@@ -98,24 +139,17 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
             # a broker row whose requested quantity belongs to another order,
             # must never promote this order to a completed fill.
             requested = int(float(order.get("qty_requested") or order.get("qty") or 0))
-            observed_requested_raw = (
-                observation.get("requested_qty")
-                if observation.get("requested_qty") not in (None, "")
-                else observation.get("qty_requested")
-                if observation.get("qty_requested") not in (None, "")
-                else observation.get("qty")
-            )
+            observed_requested = explicit_broker_requested_qty(observation)
             filled = explicit_broker_filled_qty(observation)
             remaining_raw = observation.get("remaining_qty")
             if (
                 requested <= 0
-                or observed_requested_raw in (None, "")
+                or observed_requested is None
                 or filled is None
                 or remaining_raw in (None, "")
             ):
                 return False
             try:
-                observed_requested = int(float(observed_requested_raw))
                 remaining = int(float(remaining_raw))
             except (TypeError, ValueError):
                 return False
@@ -336,7 +370,7 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         if not isinstance(durable, dict):
             return False
         durable_status = str(durable.get("status") or "").upper().replace("CANCELED", "CANCELLED")
-        expected_status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        expected_status = effective_terminal_status(order, observation)
         if durable_status != expected_status or durable_status not in _TQQQ_TTL_TERMINAL_STATUSES:
             return False
         expected_filled = explicit_broker_filled_qty(observation)
