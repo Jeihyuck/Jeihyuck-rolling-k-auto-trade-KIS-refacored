@@ -7,6 +7,7 @@ import pytest
 
 from trader.kr.runtime_integrity_20260928 import (
     _build_balance_cache_guard,
+    _build_balance_invalidate_guard,
     _build_hard_timeout_runner,
     _build_reconcile_guard,
     _build_runs_finish_guard,
@@ -15,7 +16,7 @@ from trader.kr.runtime_integrity_20260928 import (
 
 
 def test_post_order_force_true_balance_is_reused_by_unresolved_reconcile(monkeypatch):
-    """Replay broker_truth_hardening: force=True balance -> reconcile_kis(snapshot)."""
+    """Replay broker_truth_hardening: post-order invalidate -> force=True -> reconcile."""
     monkeypatch.setenv("KR_BROKER_TRUTH_FORCED_SNAPSHOT_MAX_AGE_SEC", "10")
     snapshot = {
         "output1": [{"pdno": "028050", "hldg_qty": "21"}],
@@ -46,8 +47,14 @@ def test_post_order_force_true_balance_is_reused_by_unresolved_reconcile(monkeyp
         observed.update(kwargs)
         return {"ok": True}
 
+    Kis.invalidate_balance_cache = _build_balance_invalidate_guard(
+        Kis.invalidate_balance_cache
+    )
     kis = Kis()
     guarded_balance = _build_balance_cache_guard(original_balance)
+
+    # Exact production sequence from broker_truth_hardening after broker submit.
+    kis.invalidate_balance_cache(reason="post_pb1_tick_broker_truth")
     fresh = guarded_balance(kis, force=True)
     guarded_reconcile = _build_reconcile_guard(
         original_reconcile,
@@ -62,11 +69,55 @@ def test_post_order_force_true_balance_is_reused_by_unresolved_reconcile(monkeyp
 
     assert balance_calls == [True]
     assert observed["balance_snapshot"] is snapshot
-    assert kis.invalidations == []
+    assert kis.invalidations == ["post_pb1_tick_broker_truth"]
+
+
+def test_generic_force_true_snapshot_is_not_post_order_certified():
+    """A pre-order or unrelated force=True read must not bypass unresolved fencing."""
+    snapshot = {
+        "output1": [{"pdno": "028050", "hldg_qty": "0"}],
+        "output2": {},
+    }
+    observed: dict = {}
+
+    class Kis:
+        def __init__(self):
+            self._balance_cache = None
+            self._balance_cache_at = None
+            self.invalidations: list[str] = []
+
+        def invalidate_balance_cache(self, *, reason: str, codes=None):
+            del codes
+            self.invalidations.append(reason)
+
+    def original_balance(self, force=False, *, return_source=False, return_raw=False):
+        del self, force, return_source, return_raw
+        return snapshot
+
+    def original_reconcile(*args, **kwargs):
+        del args
+        observed.update(kwargs)
+        return {"ok": True}
+
+    kis = Kis()
+    generic_forced = _build_balance_cache_guard(original_balance)(kis, force=True)
+    guarded_reconcile = _build_reconcile_guard(
+        original_reconcile,
+        unresolved_probe=lambda engine, env: True,
+    )
+    guarded_reconcile(
+        engine=object(),
+        kis=kis,
+        env="practice",
+        balance_snapshot=generic_forced,
+    )
+
+    assert observed["balance_snapshot"] is None
+    assert kis.invalidations == ["kr_p0_unresolved_broker_activity"]
 
 
 def test_unresolved_reconcile_still_discards_unproven_snapshot():
-    """Only the proven force=True object may bypass the stale-snapshot fence."""
+    """Only the certified post-order force=True object may bypass the stale fence."""
     stale = {
         "output1": [{"pdno": "028050", "hldg_qty": "0"}],
         "output2": {},
