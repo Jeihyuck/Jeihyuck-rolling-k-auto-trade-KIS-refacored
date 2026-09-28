@@ -114,3 +114,9 @@ def install_legacy_pb1_runtime_guards() -> None:
     # watchdog contracts wrap every earlier KR implementation guard without
     # changing any strategy-policy decision.
     install_kr_20260928_runtime_integrity()
+    # pb1_runner imports reconcile_kis by value.  Rebind that alias after the
+    # Sep-28 wrapper is installed so the initial per-tick reconciliation cannot
+    # bypass the unresolved-broker fresh-balance contract.
+    import trader.reconcile_kis as _kr_reconcile
+    import trader.pb1_runner as _kr_pb1_runner
+    _kr_pb1_runner.reconcile_kis = _kr_reconcile.reconcile_kis
