@@ -4,6 +4,7 @@ import os
 import signal
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -138,6 +139,11 @@ def test_session_start_balance_precheck_is_one_shot(monkeypatch):
     assert guarded(loop_mode=True) == "ok"
     assert os.getenv("KR_BALANCE_PRECHECK_PATH") is None
     assert len(calls) == 2
+
+
+def test_pb1_runner_reconcile_alias_is_rebound_after_sep28_guard_install():
+    source = Path("trader/__init__.py").read_text(encoding="utf-8")
+    assert "_kr_pb1_runner.reconcile_kis = _kr_reconcile.reconcile_kis" in source
 
 
 @pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="SIGALRM watchdog requires POSIX setitimer")
