@@ -1,12 +1,14 @@
 """KR P0 runtime integrity guards for the 2026-09-28 broker-truth incident.
 
 Implementation-only: this module does not alter PB1 entry/exit/sizing/TP policy
-or KR Infinite ownership.  It hardens four runtime contracts:
+or KR Infinite ownership.  It hardens six runtime contracts:
 
 * the session-start balance snapshot is one-shot inside the PB1 loop;
 * configured balance-cache TTLs are actually enforced;
 * unresolved broker activity never trusts a caller-supplied stale snapshot;
-* the per-tick SIGALRM watchdog cannot be swallowed by ``except Exception``.
+* a just-fetched ``force=True`` KIS balance is reused instead of queried twice;
+* the per-tick SIGALRM watchdog cannot be swallowed by ``except Exception``;
+* a watchdog timeout finalizes the exact per-tick DB run before recovery.
 
 The KR package imports its legacy guards from two shapes: the sanctioned
 ``trade_session_runner`` calls them before importing ``pb1_runner``, while some
@@ -22,6 +24,8 @@ import logging
 import os
 import signal
 import sys
+import threading
+import time as time_mod
 from datetime import datetime
 from typing import Any, Callable
 
@@ -29,6 +33,7 @@ logger = logging.getLogger(__name__)
 _SAFE_INSTALLED = False
 _PB1_INSTALLED = False
 _INSTALLING = False
+_TICK_RUN_STATE = threading.local()
 
 
 class _HardTickAbort(BaseException):
@@ -61,6 +66,39 @@ def _cache_age_sec(cache_at: Any) -> float | None:
         return None
 
 
+def _extract_balance_snapshot(result: Any) -> dict[str, Any] | None:
+    """Return the balance mapping from every supported get_balance_cached shape."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, (tuple, list)) and result and isinstance(result[0], dict):
+        return result[0]
+    return None
+
+
+def _remember_forced_balance_snapshot(kis: Any, result: Any) -> None:
+    snapshot = _extract_balance_snapshot(result)
+    if snapshot is None:
+        return
+    try:
+        setattr(kis, "_kr_p0_last_forced_balance_snapshot_id", id(snapshot))
+        setattr(kis, "_kr_p0_last_forced_balance_at_monotonic", time_mod.monotonic())
+    except Exception:
+        return
+
+
+def _is_recent_forced_balance_snapshot(kis: Any, snapshot: Any) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    try:
+        snapshot_id = int(getattr(kis, "_kr_p0_last_forced_balance_snapshot_id", 0) or 0)
+        fetched_at = float(getattr(kis, "_kr_p0_last_forced_balance_at_monotonic", 0.0) or 0.0)
+        max_age = max(0.1, _env_float("KR_BROKER_TRUTH_FORCED_SNAPSHOT_MAX_AGE_SEC", 10.0))
+        age = time_mod.monotonic() - fetched_at
+    except Exception:
+        return False
+    return bool(snapshot_id == id(snapshot) and fetched_at > 0.0 and 0.0 <= age <= max_age)
+
+
 def _build_balance_cache_guard(original: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(original)
     def guarded(
@@ -90,12 +128,15 @@ def _build_balance_cache_guard(original: Callable[..., Any]) -> Callable[..., An
                     setattr(self, "_balance_cache_at", None)
             finally:
                 effective_force = True
-        return original(
+        result = original(
             self,
             force=effective_force,
             return_source=return_source,
             return_raw=return_raw,
         )
+        if effective_force:
+            _remember_forced_balance_snapshot(self, result)
+        return result
 
     return guarded
 
@@ -144,25 +185,33 @@ def _build_reconcile_guard(
             or "practice"
         ).lower()
         if engine is not None and kis is not None and probe(engine, env):
-            if kwargs.get("balance_snapshot") is not None:
-                logger.warning(
+            injected_snapshot = kwargs.get("balance_snapshot")
+            if _is_recent_forced_balance_snapshot(kis, injected_snapshot):
+                logger.info(
                     "[KR_P0][BROKER_TRUTH_REFRESH] env=%s reason=UNRESOLVED_BROKER_ACTIVITY "
-                    "action=discard_injected_snapshot",
+                    "source=RECENT_FORCE_TRUE action=reuse_forced_snapshot",
                     env,
                 )
-            try:
-                invalidate = getattr(kis, "invalidate_balance_cache", None)
-                if callable(invalidate):
-                    invalidate(reason="kr_p0_unresolved_broker_activity")
-            except Exception as exc:
-                logger.warning(
-                    "[KR_P0][BALANCE_INVALIDATE_FAIL] env=%s err_type=%s action=continue_force_path",
-                    env,
-                    type(exc).__name__,
-                )
-            # The canonical reconciler already calls get_balance_cached(force=True)
-            # when no snapshot is supplied.  Do not duplicate broker I/O here.
-            kwargs["balance_snapshot"] = None
+            else:
+                if injected_snapshot is not None:
+                    logger.warning(
+                        "[KR_P0][BROKER_TRUTH_REFRESH] env=%s reason=UNRESOLVED_BROKER_ACTIVITY "
+                        "action=discard_injected_snapshot",
+                        env,
+                    )
+                try:
+                    invalidate = getattr(kis, "invalidate_balance_cache", None)
+                    if callable(invalidate):
+                        invalidate(reason="kr_p0_unresolved_broker_activity")
+                except Exception as exc:
+                    logger.warning(
+                        "[KR_P0][BALANCE_INVALIDATE_FAIL] env=%s err_type=%s action=continue_force_path",
+                        env,
+                        type(exc).__name__,
+                    )
+                # The canonical reconciler already calls get_balance_cached(force=True)
+                # when no snapshot is supplied.  Do not duplicate broker I/O here.
+                kwargs["balance_snapshot"] = None
         return original(*args, **kwargs)
 
     return guarded
@@ -189,6 +238,90 @@ def _build_run_once_precheck_guard(original: Callable[..., Any]) -> Callable[...
     return guarded
 
 
+def _reset_tick_run_capture(*, enabled: bool = False) -> None:
+    _TICK_RUN_STATE.capture = bool(enabled)
+    _TICK_RUN_STATE.repo = None
+    _TICK_RUN_STATE.run_id = None
+    _TICK_RUN_STATE.finalized = False
+
+
+def _build_runs_start_guard(original: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original)
+    def guarded(self, *args: Any, **kwargs: Any):
+        run_id = original(self, *args, **kwargs)
+        if bool(getattr(_TICK_RUN_STATE, "capture", False)):
+            strategy = str(kwargs.get("strategy") or "").strip().lower()
+            if strategy == "pb1_pullback_close" and not getattr(_TICK_RUN_STATE, "run_id", None):
+                _TICK_RUN_STATE.repo = self
+                _TICK_RUN_STATE.run_id = str(run_id)
+                _TICK_RUN_STATE.finalized = False
+                logger.info(
+                    "[KR_P0][TICK_RUN_TRACK] run_id=%s strategy=%s action=track",
+                    run_id,
+                    strategy,
+                )
+        return run_id
+
+    return guarded
+
+
+def _build_runs_finish_guard(original: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original)
+    def guarded(self, run_id: Any, *args: Any, **kwargs: Any):
+        result = original(self, run_id, *args, **kwargs)
+        tracked = str(getattr(_TICK_RUN_STATE, "run_id", "") or "")
+        if bool(getattr(_TICK_RUN_STATE, "capture", False)) and tracked == str(run_id):
+            _TICK_RUN_STATE.finalized = True
+        return result
+
+    return guarded
+
+
+def _finalize_tracked_tick_run_on_timeout(*, last_stage: str) -> None:
+    repo = getattr(_TICK_RUN_STATE, "repo", None)
+    run_id = str(getattr(_TICK_RUN_STATE, "run_id", "") or "")
+    finalized = bool(getattr(_TICK_RUN_STATE, "finalized", False))
+    if repo is None or not run_id or finalized:
+        return
+    try:
+        repo.finish_run(
+            run_id,
+            status="RECOVERABLE_DB_TIMEOUT",
+            notes="TICK_TIMEOUT_KRX",
+        )
+        _TICK_RUN_STATE.finalized = True
+        logger.warning(
+            "[KR_P0][TICK_TIMEOUT_RUN_FINALIZED] run_id=%s status=RECOVERABLE_DB_TIMEOUT "
+            "reason=TICK_TIMEOUT_KRX last_stage=%s",
+            run_id,
+            last_stage,
+        )
+    except Exception as exc:
+        logger.error(
+            "[KR_P0][TICK_TIMEOUT_RUN_FINALIZE_FAIL] run_id=%s last_stage=%s err_type=%s err=%s",
+            run_id,
+            last_stage,
+            type(exc).__name__,
+            exc,
+        )
+        try:
+            mark_abandoned = getattr(repo, "mark_run_abandoned", None)
+            if callable(mark_abandoned):
+                mark_abandoned(
+                    run_id,
+                    reason="tick_timeout_finalize_fallback:TICK_TIMEOUT_KRX",
+                    status="RECOVERABLE_DB_TIMEOUT",
+                )
+                _TICK_RUN_STATE.finalized = True
+        except Exception as fallback_exc:
+            logger.error(
+                "[KR_P0][TICK_TIMEOUT_RUN_FINALIZE_FALLBACK_FAIL] run_id=%s err_type=%s err=%s",
+                run_id,
+                type(fallback_exc).__name__,
+                fallback_exc,
+            )
+
+
 def _build_hard_timeout_runner(timeout_error_cls: type[BaseException]) -> Callable[..., Any]:
     def hardened(*, timeout_sec: int | float, call: Callable[[], Any]):
         if float(timeout_sec) <= 0:
@@ -205,12 +338,19 @@ def _build_hard_timeout_runner(timeout_error_cls: type[BaseException]) -> Callab
             )
 
         prev = signal.getsignal(signal.SIGALRM)
+        _reset_tick_run_capture(enabled=True)
         try:
             signal.signal(signal.SIGALRM, _alarm_handler)
             signal.setitimer(signal.ITIMER_REAL, float(timeout_sec))
             try:
                 return call()
             except _HardTickAbort as exc:
+                # The alarm is one-shot, but cancel it explicitly before the DB
+                # terminal write so run finalization cannot be interrupted by the
+                # watchdog that is currently being handled.
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                last_stage = str(os.getenv("PB1_LAST_STAGE") or "unknown")
+                _finalize_tracked_tick_run_on_timeout(last_stage=last_stage)
                 # Translate only after the entire tick stack has unwound past all
                 # broad ``except Exception`` fail-soft handlers.  The existing
                 # outer PB1 loop can then keep its TickTimeoutError recovery path.
@@ -218,6 +358,7 @@ def _build_hard_timeout_runner(timeout_error_cls: type[BaseException]) -> Callab
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, prev)
+            _reset_tick_run_capture(enabled=False)
 
     return hardened
 
@@ -228,6 +369,7 @@ def _install_safe_guards() -> None:
         return
 
     from trader.kis_wrapper import KisAPI
+    from trader.db.repos import RunsRepo
     import trader.reconcile_kis as rk
 
     if not getattr(KisAPI, "_kr_p0_balance_ttl_installed", False):
@@ -237,6 +379,11 @@ def _install_safe_guards() -> None:
     if not getattr(rk, "_kr_p0_unresolved_refresh_installed", False):
         rk.reconcile_kis = _build_reconcile_guard(rk.reconcile_kis)
         rk._kr_p0_unresolved_refresh_installed = True
+
+    if not getattr(RunsRepo, "_kr_p0_tick_run_tracking_installed", False):
+        RunsRepo.start_run = _build_runs_start_guard(RunsRepo.start_run)
+        RunsRepo.finish_run = _build_runs_finish_guard(RunsRepo.finish_run)
+        RunsRepo._kr_p0_tick_run_tracking_installed = True
 
     _SAFE_INSTALLED = True
 
@@ -310,7 +457,8 @@ def install_kr_20260928_runtime_integrity() -> None:
         _PB1_INSTALLED = True
         logger.info(
             "[KR_P0][20260928][INSTALLED] balance_ttl=1 precheck_one_shot=1 "
-            "unresolved_force_refresh=1 watchdog_escape=1"
+            "unresolved_force_refresh=1 forced_snapshot_reuse=1 watchdog_escape=1 "
+            "timeout_run_finalize=1"
         )
     finally:
         _INSTALLING = False
