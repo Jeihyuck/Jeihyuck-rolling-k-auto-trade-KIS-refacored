@@ -1,12 +1,19 @@
-"""KR P0 runtime integrity guards for 2026-09-28 broker-truth incident.
+"""KR P0 runtime integrity guards for the 2026-09-28 broker-truth incident.
 
-This module is intentionally implementation-only.  It does not alter PB1 entry,
-exit, sizing, TP, or KR Infinite policy.  The guards close four runtime gaps:
+Implementation-only: this module does not alter PB1 entry/exit/sizing/TP policy
+or KR Infinite ownership.  It hardens four runtime contracts:
 
-* session-start balance snapshots are one-shot in the PB1 loop;
-* wrapper balance cache TTLs are actually enforced;
-* unresolved broker activity invalidates caller-supplied balance snapshots;
+* the session-start balance snapshot is one-shot inside the PB1 loop;
+* configured balance-cache TTLs are actually enforced;
+* unresolved broker activity never trusts a caller-supplied stale snapshot;
 * the per-tick SIGALRM watchdog cannot be swallowed by ``except Exception``.
+
+The KR package imports its legacy guards from two shapes: the sanctioned
+``trade_session_runner`` calls them before importing ``pb1_runner``, while some
+tests import ``pb1_runner`` directly and therefore call the installer from a
+partially initialised module.  The installer below is deliberately re-entrant:
+KIS/reconcile guards may be installed immediately, while PB1 function wrapping
+is deferred until ``run_once`` and the watchdog function actually exist.
 """
 from __future__ import annotations
 
@@ -14,11 +21,14 @@ import functools
 import logging
 import os
 import signal
+import sys
 from datetime import datetime
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
-_INSTALLED = False
+_SAFE_INSTALLED = False
+_PB1_INSTALLED = False
+_INSTALLING = False
 
 
 class _HardTickAbort(BaseException):
@@ -127,7 +137,12 @@ def _build_reconcile_guard(
     def guarded(*args: Any, **kwargs: Any):
         engine = kwargs.get("engine")
         kis = kwargs.get("kis")
-        env = str(kwargs.get("env") or os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").lower()
+        env = str(
+            kwargs.get("env")
+            or os.getenv("STRATEGY_ENV")
+            or os.getenv("KIS_ENV")
+            or "practice"
+        ).lower()
         if engine is not None and kis is not None and probe(engine, env):
             if kwargs.get("balance_snapshot") is not None:
                 logger.warning(
@@ -197,7 +212,8 @@ def _build_hard_timeout_runner(timeout_error_cls: type[BaseException]) -> Callab
                 return call()
             except _HardTickAbort as exc:
                 # Translate only after the entire tick stack has unwound past all
-                # broad ``except Exception`` fail-soft handlers.
+                # broad ``except Exception`` fail-soft handlers.  The existing
+                # outer PB1 loop can then keep its TickTimeoutError recovery path.
                 raise timeout_error_cls(str(exc)) from None
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
@@ -206,15 +222,13 @@ def _build_hard_timeout_runner(timeout_error_cls: type[BaseException]) -> Callab
     return hardened
 
 
-def install_kr_20260928_runtime_integrity() -> None:
-    """Install the Sep-28 P0 guards once, after the existing KR hardening layers."""
-    global _INSTALLED
-    if _INSTALLED:
+def _install_safe_guards() -> None:
+    global _SAFE_INSTALLED
+    if _SAFE_INSTALLED:
         return
 
     from trader.kis_wrapper import KisAPI
     import trader.reconcile_kis as rk
-    import trader.pb1_runner as pb1_runner
 
     if not getattr(KisAPI, "_kr_p0_balance_ttl_installed", False):
         KisAPI.get_balance_cached = _build_balance_cache_guard(KisAPI.get_balance_cached)
@@ -224,18 +238,79 @@ def install_kr_20260928_runtime_integrity() -> None:
         rk.reconcile_kis = _build_reconcile_guard(rk.reconcile_kis)
         rk._kr_p0_unresolved_refresh_installed = True
 
-    if not getattr(pb1_runner, "_kr_p0_precheck_one_shot_installed", False):
-        pb1_runner.run_once = _build_run_once_precheck_guard(pb1_runner.run_once)
-        pb1_runner._kr_p0_precheck_one_shot_installed = True
+    _SAFE_INSTALLED = True
 
-    if not getattr(pb1_runner, "_kr_p0_uncatchable_watchdog_installed", False):
-        pb1_runner._run_once_with_hard_timeout = _build_hard_timeout_runner(
-            pb1_runner.TickTimeoutError
-        )
-        pb1_runner._kr_p0_uncatchable_watchdog_installed = True
 
-    _INSTALLED = True
-    logger.info(
-        "[KR_P0][20260928][INSTALLED] balance_ttl=1 precheck_one_shot=1 "
-        "unresolved_force_refresh=1 watchdog_escape=1"
+def _pb1_module_ready(module: Any) -> bool:
+    return bool(
+        module is not None
+        and callable(getattr(module, "run_once", None))
+        and callable(getattr(module, "_run_once_with_hard_timeout", None))
+        and isinstance(getattr(module, "TickTimeoutError", None), type)
     )
+
+
+def install_kr_20260928_runtime_integrity() -> None:
+    """Install Sep-28 P0 guards without circular-importing ``pb1_runner``.
+
+    The sanctioned KR session entrypoint calls legacy guard installation before
+    importing pb1_runner.  In that case this function imports pb1_runner while
+    ``_INSTALLING`` is set; the recursive call made at pb1_runner's module top is
+    ignored, the module finishes defining its functions, and wrapping happens
+    here.  Conversely, direct test imports arrive with a partially initialised
+    pb1_runner already in ``sys.modules``; those calls install the safe KIS/
+    reconcile layer and defer PB1 function wrapping instead of dereferencing
+    missing attributes.
+    """
+    global _PB1_INSTALLED, _INSTALLING
+    if _PB1_INSTALLED or _INSTALLING:
+        return
+
+    _INSTALLING = True
+    try:
+        _install_safe_guards()
+
+        pb1_runner = sys.modules.get("trader.pb1_runner")
+        if pb1_runner is not None and not _pb1_module_ready(pb1_runner):
+            logger.info(
+                "[KR_P0][20260928][DEFER_PB1_WRAP] reason=PARTIAL_PB1_IMPORT "
+                "safe_guards=1 action=wait_for_sanctioned_kr_entrypoint"
+            )
+            return
+
+        if pb1_runner is None:
+            # Called from trade_session_runner (the production KR entrypoint).
+            # Its import of pb1_runner recursively calls the legacy installer;
+            # _INSTALLING above makes that recursive Sep-28 install a no-op.
+            import trader.pb1_runner as pb1_runner
+
+        if not _pb1_module_ready(pb1_runner):
+            logger.warning(
+                "[KR_P0][20260928][DEFER_PB1_WRAP] reason=PB1_NOT_READY_AFTER_IMPORT "
+                "safe_guards=1"
+            )
+            return
+
+        if not getattr(pb1_runner, "_kr_p0_precheck_one_shot_installed", False):
+            pb1_runner.run_once = _build_run_once_precheck_guard(pb1_runner.run_once)
+            pb1_runner._kr_p0_precheck_one_shot_installed = True
+
+        if not getattr(pb1_runner, "_kr_p0_uncatchable_watchdog_installed", False):
+            pb1_runner._run_once_with_hard_timeout = _build_hard_timeout_runner(
+                pb1_runner.TickTimeoutError
+            )
+            pb1_runner._kr_p0_uncatchable_watchdog_installed = True
+
+        # pb1_runner imports reconcile_kis by value.  Rebind after the safe
+        # module wrapper exists so its first per-tick reconciliation cannot
+        # bypass the unresolved-broker refresh contract.
+        import trader.reconcile_kis as rk
+        pb1_runner.reconcile_kis = rk.reconcile_kis
+
+        _PB1_INSTALLED = True
+        logger.info(
+            "[KR_P0][20260928][INSTALLED] balance_ttl=1 precheck_one_shot=1 "
+            "unresolved_force_refresh=1 watchdog_escape=1"
+        )
+    finally:
+        _INSTALLING = False
