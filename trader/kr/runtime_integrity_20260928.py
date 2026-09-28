@@ -6,7 +6,7 @@ or KR Infinite ownership.  It hardens six runtime contracts:
 * the session-start balance snapshot is one-shot inside the PB1 loop;
 * configured balance-cache TTLs are actually enforced;
 * unresolved broker activity never trusts a caller-supplied stale snapshot;
-* a just-fetched ``force=True`` KIS balance is reused instead of queried twice;
+* a certified post-order ``force=True`` KIS balance is reused instead of queried twice;
 * the per-tick SIGALRM watchdog cannot be swallowed by ``except Exception``;
 * a watchdog timeout finalizes the exact per-tick DB run before recovery.
 
@@ -75,13 +75,39 @@ def _extract_balance_snapshot(result: Any) -> dict[str, Any] | None:
     return None
 
 
-def _remember_forced_balance_snapshot(kis: Any, result: Any) -> None:
+def _build_balance_invalidate_guard(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Certify only the invalidation issued by the post-order broker-truth path."""
+    @functools.wraps(original)
+    def guarded(self, *args: Any, **kwargs: Any):
+        reason = str(kwargs.get("reason") or "").strip()
+        result = original(self, *args, **kwargs)
+        if reason == "post_pb1_tick_broker_truth":
+            try:
+                setattr(self, "_kr_p0_expect_post_broker_forced_balance", True)
+            except Exception:
+                pass
+        return result
+
+    return guarded
+
+
+def _remember_forced_balance_snapshot(
+    kis: Any,
+    result: Any,
+    *,
+    certified_post_broker: bool,
+) -> None:
     snapshot = _extract_balance_snapshot(result)
     if snapshot is None:
         return
     try:
         setattr(kis, "_kr_p0_last_forced_balance_snapshot_id", id(snapshot))
         setattr(kis, "_kr_p0_last_forced_balance_at_monotonic", time_mod.monotonic())
+        setattr(
+            kis,
+            "_kr_p0_last_forced_balance_certified_post_broker",
+            bool(certified_post_broker),
+        )
     except Exception:
         return
 
@@ -92,11 +118,19 @@ def _is_recent_forced_balance_snapshot(kis: Any, snapshot: Any) -> bool:
     try:
         snapshot_id = int(getattr(kis, "_kr_p0_last_forced_balance_snapshot_id", 0) or 0)
         fetched_at = float(getattr(kis, "_kr_p0_last_forced_balance_at_monotonic", 0.0) or 0.0)
+        certified = bool(
+            getattr(kis, "_kr_p0_last_forced_balance_certified_post_broker", False)
+        )
         max_age = max(0.1, _env_float("KR_BROKER_TRUTH_FORCED_SNAPSHOT_MAX_AGE_SEC", 10.0))
         age = time_mod.monotonic() - fetched_at
     except Exception:
         return False
-    return bool(snapshot_id == id(snapshot) and fetched_at > 0.0 and 0.0 <= age <= max_age)
+    return bool(
+        certified
+        and snapshot_id == id(snapshot)
+        and fetched_at > 0.0
+        and 0.0 <= age <= max_age
+    )
 
 
 def _build_balance_cache_guard(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -128,6 +162,19 @@ def _build_balance_cache_guard(original: Callable[..., Any]) -> Callable[..., An
                     setattr(self, "_balance_cache_at", None)
             finally:
                 effective_force = True
+
+        certified_post_broker = bool(
+            effective_force
+            and getattr(self, "_kr_p0_expect_post_broker_forced_balance", False)
+        )
+        if effective_force:
+            # Consume the one-shot certification before broker I/O.  If the
+            # request fails, a later unrelated force=True read cannot inherit it.
+            try:
+                setattr(self, "_kr_p0_expect_post_broker_forced_balance", False)
+            except Exception:
+                pass
+
         result = original(
             self,
             force=effective_force,
@@ -135,7 +182,11 @@ def _build_balance_cache_guard(original: Callable[..., Any]) -> Callable[..., An
             return_raw=return_raw,
         )
         if effective_force:
-            _remember_forced_balance_snapshot(self, result)
+            _remember_forced_balance_snapshot(
+                self,
+                result,
+                certified_post_broker=certified_post_broker,
+            )
         return result
 
     return guarded
@@ -189,7 +240,7 @@ def _build_reconcile_guard(
             if _is_recent_forced_balance_snapshot(kis, injected_snapshot):
                 logger.info(
                     "[KR_P0][BROKER_TRUTH_REFRESH] env=%s reason=UNRESOLVED_BROKER_ACTIVITY "
-                    "source=RECENT_FORCE_TRUE action=reuse_forced_snapshot",
+                    "source=CERTIFIED_POST_BROKER_FORCE_TRUE action=reuse_forced_snapshot",
                     env,
                 )
             else:
@@ -372,6 +423,12 @@ def _install_safe_guards() -> None:
     from trader.db.repos import RunsRepo
     import trader.reconcile_kis as rk
 
+    if not getattr(KisAPI, "_kr_p0_balance_invalidate_certifier_installed", False):
+        KisAPI.invalidate_balance_cache = _build_balance_invalidate_guard(
+            KisAPI.invalidate_balance_cache
+        )
+        KisAPI._kr_p0_balance_invalidate_certifier_installed = True
+
     if not getattr(KisAPI, "_kr_p0_balance_ttl_installed", False):
         KisAPI.get_balance_cached = _build_balance_cache_guard(KisAPI.get_balance_cached)
         KisAPI._kr_p0_balance_ttl_installed = True
@@ -457,8 +514,8 @@ def install_kr_20260928_runtime_integrity() -> None:
         _PB1_INSTALLED = True
         logger.info(
             "[KR_P0][20260928][INSTALLED] balance_ttl=1 precheck_one_shot=1 "
-            "unresolved_force_refresh=1 forced_snapshot_reuse=1 watchdog_escape=1 "
-            "timeout_run_finalize=1"
+            "unresolved_force_refresh=1 certified_forced_snapshot_reuse=1 "
+            "watchdog_escape=1 timeout_run_finalize=1"
         )
     finally:
         _INSTALLING = False
