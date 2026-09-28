@@ -75,6 +75,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     from trader.kr.broker_truth_pending_fill_fence import install_pending_fill_application_fence
     from trader.kr.runtime_integrity_20260915 import install_kr_20260915_runtime_integrity
     from trader.kr.runtime_integrity_20260917 import install_kr_20260917_runtime_integrity
+    from trader.kr.runtime_integrity_20260928 import install_kr_20260928_runtime_integrity
 
     _install_broker_truth_repo_engine_binding()
     install_kr_broker_truth_runtime_guards()
@@ -109,3 +110,7 @@ def install_legacy_pb1_runtime_guards() -> None:
     # quantity reconciliation is allowed to overwrite the DB quantity.  This is
     # a narrow fill-application fence, not a blanket open-order block.
     install_pending_fill_application_fence()
+    # Sep-28 incident hardening is deliberately last so its freshness and
+    # watchdog contracts wrap every earlier KR implementation guard without
+    # changing any strategy-policy decision.
+    install_kr_20260928_runtime_integrity()
