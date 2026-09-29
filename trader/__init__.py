@@ -68,6 +68,7 @@ def install_legacy_pb1_runtime_guards() -> None:
         from trader.kr.runtime_integrity_20260928 import install_kr_20260928_runtime_integrity
         from trader.kr.runtime_integrity_20260929 import install_kr_20260929_runtime_integrity
         from trader.kr.runtime_integrity_20260929_review import install_kr_20260929_review_guards
+        from trader.kr.runtime_integrity_20260929_log_review import install_kr_20260929_log_review_guards
 
         _install_broker_truth_repo_engine_binding()
         install_kr_broker_truth_runtime_guards()
@@ -87,6 +88,11 @@ def install_legacy_pb1_runtime_guards() -> None:
         # partial first page, or isolated continuation page can never overwrite a
         # previously authoritative complete negative-proof snapshot.
         install_kr_20260929_review_guards()
+        # Full-session log review found the actual late-BUY failure one boundary
+        # earlier, at hashkey, plus a date-object repository exception that made
+        # PR147 force broker refresh every tick.  Install these compatibility
+        # fences last so they protect the complete KR execution path.
+        install_kr_20260929_log_review_guards()
 
         import trader.reconcile_kis as _kr_reconcile
         import trader.pb1_runner as _kr_pb1_runner
