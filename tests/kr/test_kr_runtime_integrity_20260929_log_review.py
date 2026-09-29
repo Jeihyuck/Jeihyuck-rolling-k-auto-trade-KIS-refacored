@@ -183,6 +183,14 @@ def test_typed_meta_restore_clears_policy_missing_and_restores_exact_entry_ts():
             )
         )
 
+    # SQLite strips timezone offsets from DateTime(timezone=True). The recovery
+    # contract is to copy the exact timestamp *as durably read from the source
+    # order lifecycle*, not to invent/re-attach a timezone that the DB discarded.
+    with engine.connect() as conn:
+        durable_source_ts = conn.execute(
+            sa.select(schema.orders.c.acked_at).where(schema.orders.c.order_id == order_id)
+        ).scalar_one()
+
     restored = fix._typed_restore_entry_meta_for_promoted_positions(
         env="practice",
         strategy="pb1_pullback_close",
@@ -200,4 +208,4 @@ def test_typed_meta_restore_clears_policy_missing_and_restores_exact_entry_ts():
     assert row["trade_horizon"] == "SWING"
     assert row["exit_policy_family"] == "SWING_STAGED_EXIT"
     assert row["policy_source"] == "style_mapping"
-    assert row["entry_ts"] == order_ts.isoformat()
+    assert row["entry_ts"] == durable_source_ts.isoformat()
