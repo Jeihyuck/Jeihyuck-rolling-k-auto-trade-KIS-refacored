@@ -9,8 +9,8 @@ visible in the earlier DB-only incident review:
 * `OrdersRepo.get_open_orders(..., trade_date=<date>)` enters a broken legacy
   branch (local ``datetime`` shadowing / undefined ``dtime``).  PR147's
   unresolved probe then fails closed on every tick and unnecessarily forces a
-  fresh KIS balance.  Normalize date/datetime inputs to the already-supported
-  ISO-string path before entering the legacy method.
+  fresh KIS balance.  Bypass that branch and filter the already epoch-scoped
+  open rows by explicit KST trade date.
 * the legacy promoted-position metadata restore issues untyped CASE bind
   parameters that PostgreSQL rejects with `AmbiguousParameter`.  Replace that
   runtime helper with SQLAlchemy typed reads/updates while preserving the same
@@ -27,6 +27,7 @@ import logging
 import math
 import os
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
 
@@ -36,6 +37,7 @@ from trader.kis_wrapper import KisAPI, KisTemporaryError, kr_tick_remaining_sec
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -83,23 +85,50 @@ def _build_buy_pipeline_budget_guard(original: Callable[..., Any]) -> Callable[.
     return guarded
 
 
-def _normalize_trade_date_arg(value: Any) -> Any:
-    # OrdersRepo's string branch is authoritative and already supported.  Route
-    # date/datetime values through it to avoid the legacy date-object branch.
+def _target_trade_date(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
     if isinstance(value, datetime):
-        return value.date().isoformat()
+        if value.tzinfo is not None:
+            return value.astimezone(_KST).date()
+        return value.date()
     if isinstance(value, date):
-        return value.isoformat()
-    return value
+        return value
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except Exception:
+        return None
+
+
+def _created_trade_date_kst(value: Any) -> date | None:
+    if value is None:
+        return None
+    parsed = value if isinstance(value, datetime) else None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_KST)
+    return parsed.astimezone(_KST).date()
 
 
 def _build_get_open_orders_trade_date_guard(original: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(original)
     def guarded(self, env: str, *args: Any, **kwargs: Any):
-        if "trade_date" in kwargs:
-            kwargs = dict(kwargs)
-            kwargs["trade_date"] = _normalize_trade_date_arg(kwargs.get("trade_date"))
-        return original(self, env, *args, **kwargs)
+        target = _target_trade_date(kwargs.get("trade_date"))
+        if target is None:
+            return original(self, env, *args, **kwargs)
+
+        # The underlying no-date/include_stale path still applies environment,
+        # status and active-epoch scoping.  Only the broken legacy day-boundary
+        # branch is bypassed; KST date filtering is then explicit and testable.
+        call_kwargs = dict(kwargs)
+        call_kwargs.pop("trade_date", None)
+        call_kwargs["include_stale"] = True
+        rows = original(self, env, *args, **call_kwargs) or []
+        return [row for row in rows if _created_trade_date_kst(row.get("created_at")) == target]
 
     return guarded
 
@@ -277,5 +306,5 @@ def install_kr_20260929_log_review_guards() -> None:
     _INSTALLED = True
     logger.info(
         "[KR_P0][20260929_LOG_REVIEW][INSTALLED] pre_hashkey_buy_budget=1 "
-        "orders_trade_date_normalization=1 typed_meta_restore=1"
+        "orders_trade_date_kst_filter=1 typed_meta_restore=1"
     )
