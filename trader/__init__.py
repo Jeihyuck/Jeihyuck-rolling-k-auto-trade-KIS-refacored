@@ -18,14 +18,7 @@ def _kr_imports_disabled_for_us() -> bool:
 
 
 def _install_broker_truth_repo_engine_binding() -> None:
-    """Ensure the KR post-tick broker-truth guard can reach the PB1 DB engine.
-
-    PB1Engine owns repository objects, while the SQLAlchemy engine normally lives
-    on those repositories rather than on PB1Engine itself.  The hardening guard
-    intentionally accepts an engine-like PB1 object, so bind the repository
-    engine onto the live instance immediately before the post-tick guard runs.
-    This is KR-only and does not alter strategy or order decisions.
-    """
+    """Ensure the KR post-tick broker-truth guard can reach the PB1 DB engine."""
     import trader.kr.broker_truth_hardening as broker_truth
 
     if getattr(broker_truth, "_repo_engine_binding_installed", False):
@@ -50,15 +43,7 @@ def _install_broker_truth_repo_engine_binding() -> None:
 
 
 def install_legacy_pb1_runtime_guards() -> None:
-    """Install legacy PB1 guards from a KR execution entry point only.
-
-    This delayed import preserves the legacy KR runner behaviour while keeping
-    lightweight US helpers such as ``python -m trader.us.session_lock`` fully
-    independent from Korean credentials and providers.  The re-entry fence is
-    needed because the Sep-28 P0 layer may import ``pb1_runner`` from the
-    sanctioned KR entrypoint; pb1_runner itself calls this function at module
-    import time.
-    """
+    """Install legacy PB1 guards from a KR execution entry point only."""
     global _LEGACY_GUARDS_INSTALLING
     if _kr_imports_disabled_for_us() or _LEGACY_GUARDS_INSTALLING:
         return
@@ -69,9 +54,6 @@ def install_legacy_pb1_runtime_guards() -> None:
 
         _install_pb1_engine_runtime_guards()
 
-        # Broker truth hardening is intentionally installed from the same KR-only
-        # entry point.  It closes ACK->FILL->POSITION lifecycle gaps without
-        # importing any Korean execution code into the US-only process path.
         from trader.kr.broker_truth_hardening import install_kr_broker_truth_runtime_guards
         from trader.kr.broker_truth_review_fixes import install_review_feedback_guards
         from trader.kr.broker_truth_sell_fixes import install_sell_fill_guard
@@ -85,50 +67,27 @@ def install_legacy_pb1_runtime_guards() -> None:
         from trader.kr.runtime_integrity_20260917 import install_kr_20260917_runtime_integrity
         from trader.kr.runtime_integrity_20260928 import install_kr_20260928_runtime_integrity
         from trader.kr.runtime_integrity_20260929 import install_kr_20260929_runtime_integrity
+        from trader.kr.runtime_integrity_20260929_review import install_kr_20260929_review_guards
 
         _install_broker_truth_repo_engine_binding()
         install_kr_broker_truth_runtime_guards()
         install_review_feedback_guards()
-        # Installed after the reviewed BUY linker so SELL execution accounting is
-        # atomic with the exact lifecycle.
         install_sell_fill_guard()
-        # Preserve reconciliation watermarks and upgrade BUY attribution with
-        # retry-safe, atomic position application.
         install_final_review_guards()
-        # Close the Sep-15 production gaps only after the canonical broker-truth
-        # guards are installed.  This adds no strategy-policy changes.
         install_kr_20260915_runtime_integrity()
-        # Sep-17 production replay exposed DB JSON read-back, stale imported-age,
-        # and direct-import verifier binding gaps left after PR131.  Install this
-        # implementation-only layer after the Sep-15 guards so the live PB1 binding
-        # and durable DB contract use the same verifier.
         install_kr_20260917_runtime_integrity()
-        # Compatibility/observability repair runs after the canonical atomic guard.
-        # It mirrors legacy evidence and entry_ts without controlling idempotency.
         install_buy_observability_compat()
-        # Durable order-owned BUY fills are retried across trade dates, closing the
-        # post-midnight crash/restart window.  Install its safety selector after the
-        # wrapper so CLOSED/superseded lifecycles can never be resurrected.
         install_historical_buy_retry()
         install_historical_retry_safety()
-        # Recover prior-day fills that were durably persisted by daily-ccld but
-        # crashed before order attribution. Exact trade-date + ODNO matching is
-        # required; BUYs flow into the owned-BUY retry and SELLs are applied atomically.
         install_cross_date_unowned_retry()
-        # A confirmed fill must reach its exact lifecycle before stale-position
-        # quantity reconciliation is allowed to overwrite the DB quantity.  This is
-        # a narrow fill-application fence, not a blanket open-order block.
         install_pending_fill_application_fence()
-        # Sep-28 incident hardening owns freshness and watchdog semantics.
         install_kr_20260928_runtime_integrity()
-        # Sep-29 convergence is layered after Sep-28 so late BUY submit prevention,
-        # negative broker-truth convergence, and exact cross-day contract recovery
-        # see the same fresh/certified balance contract.  It does not change PB1
-        # thresholds, sizing, exits, or KR Infinite ownership.
         install_kr_20260929_runtime_integrity()
-        # pb1_runner imports reconcile_kis by value.  Rebind that alias after all
-        # KR reconcile wrappers are installed so the per-tick path cannot bypass
-        # either Sep-28 freshness or Sep-29 convergence.
+        # Final review fence must be outermost around daily-ccld so a diagnostic,
+        # partial first page, or isolated continuation page can never overwrite a
+        # previously authoritative complete negative-proof snapshot.
+        install_kr_20260929_review_guards()
+
         import trader.reconcile_kis as _kr_reconcile
         import trader.pb1_runner as _kr_pb1_runner
         _kr_pb1_runner.reconcile_kis = _kr_reconcile.reconcile_kis
