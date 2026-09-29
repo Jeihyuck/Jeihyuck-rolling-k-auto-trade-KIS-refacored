@@ -107,13 +107,15 @@ def test_trade_date_filter_uses_explicit_kst_day_and_preserves_other_filters():
     assert captured["code"] == "039030"
 
 
-def test_typed_meta_restore_clears_policy_missing_without_raw_case_binds():
+def test_typed_meta_restore_clears_policy_missing_and_restores_exact_entry_ts():
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
     position_id = str(uuid4())
+    order_id = str(uuid4())
     cycle_id = str(uuid4())
     epoch_id = str(uuid4())
+    order_ts = datetime(2026, 9, 28, 0, 33, 4, tzinfo=timezone.utc)
     meta = {
         "book": "SWING_BOOK",
         "trade_horizon": "SWING_CARRY",
@@ -138,17 +140,46 @@ def test_typed_meta_restore_clears_policy_missing_without_raw_case_binds():
                 strategy="pb1_pullback_close",
                 sid=1,
                 mode=1,
-                code="000660",
+                code="028050",
                 market="KOSPI",
-                qty=1,
-                avg_buy_price=1844000.0,
+                qty=21,
+                avg_buy_price=49350.0,
                 status="OPEN",
+                entry_ts=None,
                 entry_thesis="POLICY_MISSING",
                 exit_policy_family="POLICY_MISSING",
                 policy_source="missing",
                 entry_meta_json=meta,
                 entry_exit_plan_json={},
                 position_meta={},
+            )
+        )
+        conn.execute(
+            sa.insert(schema.orders).values(
+                order_id=order_id,
+                position_cycle_id=cycle_id,
+                portfolio_epoch_id=epoch_id,
+                env="practice",
+                strategy="pb1_pullback_close",
+                sid=1,
+                mode=1,
+                code="028050",
+                market="KOSPI",
+                side="BUY",
+                ord_type="LIMIT",
+                qty=21,
+                price=49400.0,
+                stage="PB1-AM",
+                client_order_key="practice:pb1_pullback_am:2026-09-28:028050:test",
+                status="ACKED",
+                kis_odno="0000010034",
+                broker_order_id="0000010034",
+                request_json={},
+                response_json={"rt_cd": "0"},
+                entry_meta_json=meta,
+                created_at=order_ts,
+                submitted_at=order_ts,
+                acked_at=order_ts,
             )
         )
 
@@ -169,3 +200,4 @@ def test_typed_meta_restore_clears_policy_missing_without_raw_case_binds():
     assert row["trade_horizon"] == "SWING"
     assert row["exit_policy_family"] == "SWING_STAGED_EXIT"
     assert row["policy_source"] == "style_mapping"
+    assert row["entry_ts"] == order_ts.isoformat()
