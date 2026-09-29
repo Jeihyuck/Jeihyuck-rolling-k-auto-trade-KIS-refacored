@@ -18,6 +18,10 @@ visible in the earlier DB-only incident review:
   parameters that PostgreSQL rejects with `AmbiguousParameter`. Replace that
   runtime helper with SQLAlchemy typed reads/updates while preserving the same
   fail-closed provenance rule: IMPORTED/RECOVERY cycles are never symbol-matched.
+* when a SYSTEM PB1 position already has exact same-cycle/same-portfolio-epoch
+  BUY provenance but `entry_ts` is missing, restore only that timestamp from
+  the exact order lifecycle. This fixes holding-age/time-stop provenance without
+  attaching policy by symbol.
 
 No PB1 strategy policy, sizing, exits, or KR Infinite ownership is changed.
 """
@@ -228,6 +232,15 @@ def _resolved_entry_meta(position: dict[str, Any], order_meta: Any) -> dict[str,
     return {}
 
 
+def _entry_ts_text(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    text = str(value).strip()
+    return text or None
+
+
 def _typed_restore_entry_meta_for_promoted_positions(
     *,
     env: str,
@@ -270,8 +283,13 @@ def _typed_restore_entry_meta_for_promoted_positions(
             if not cycle or not epoch:
                 continue
 
-            order_meta = conn.execute(
-                sa.select(schema.orders.c.entry_meta_json)
+            order_row = conn.execute(
+                sa.select(
+                    schema.orders.c.entry_meta_json,
+                    schema.orders.c.acked_at,
+                    schema.orders.c.submitted_at,
+                    schema.orders.c.created_at,
+                )
                 .where(
                     sa.and_(
                         schema.orders.c.env == env,
@@ -285,7 +303,8 @@ def _typed_restore_entry_meta_for_promoted_positions(
                 )
                 .order_by(schema.orders.c.created_at.desc())
                 .limit(1)
-            ).scalar()
+            ).mappings().first()
+            order_meta = order_row.get("entry_meta_json") if order_row else None
             meta = _resolved_entry_meta(position, order_meta)
             if not meta:
                 values: dict[str, Any] = {}
@@ -344,6 +363,16 @@ def _typed_restore_entry_meta_for_promoted_positions(
             if meta.get("force_eod_close") is not None:
                 values["force_eod_close"] = bool(meta.get("force_eod_close"))
 
+            if not str(position.get("entry_ts") or "").strip() and order_row:
+                source_entry_ts = (
+                    order_row.get("acked_at")
+                    or order_row.get("submitted_at")
+                    or order_row.get("created_at")
+                )
+                source_entry_ts_text = _entry_ts_text(source_entry_ts)
+                if source_entry_ts_text:
+                    values["entry_ts"] = source_entry_ts_text
+
             result = conn.execute(
                 sa.update(schema.positions)
                 .where(
@@ -359,11 +388,12 @@ def _typed_restore_entry_meta_for_promoted_positions(
             if int(result.rowcount or 0) == 1:
                 restored += 1
                 logger.info(
-                    "[RECONCILE][META_RESTORE][OK_TYPED] env=%s code=%s horizon=%s source=%s",
+                    "[RECONCILE][META_RESTORE][OK_TYPED] env=%s code=%s horizon=%s source=%s entry_ts_restored=%s",
                     env,
                     position.get("code"),
                     meta.get("trade_horizon"),
                     position_meta.get("meta_source"),
+                    int("entry_ts" in values),
                 )
     return restored
 
@@ -404,5 +434,5 @@ def install_kr_20260929_log_review_guards() -> None:
     logger.info(
         "[KR_P0][20260929_LOG_REVIEW][INSTALLED] pre_hashkey_buy_budget=1 "
         "hashkey_pre_submit_classification=1 pb1_owner_scoped_budget=1 "
-        "orders_trade_date_kst_filter=1 typed_meta_restore=1"
+        "orders_trade_date_kst_filter=1 typed_meta_restore=1 exact_entry_ts_restore=1"
     )
