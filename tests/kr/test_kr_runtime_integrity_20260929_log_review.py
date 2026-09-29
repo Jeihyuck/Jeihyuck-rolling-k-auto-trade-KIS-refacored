@@ -168,7 +168,7 @@ def test_typed_meta_restore_clears_policy_missing_and_restores_exact_entry_ts():
                 side="BUY",
                 ord_type="LIMIT",
                 qty=21,
-                price=49400.0,
+                limit_price=49400.0,
                 stage="PB1-AM",
                 client_order_key="practice:pb1_pullback_am:2026-09-28:028050:test",
                 status="ACKED",
