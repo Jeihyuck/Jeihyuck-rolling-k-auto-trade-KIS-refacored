@@ -179,7 +179,7 @@ def test_same_day_unresolved_requires_two_distinct_negative_proofs(monkeypatch):
     )
     assert same["terminalized"] == []
 
-    kis._kr_20260929_daily_ccld_snapshot["captured_mono"] = fix.time.monotonic() + 0.001
+    kis._kr_20260929_daily_ccld_snapshot["captured_mono"] = fix.time.monotonic() - 0.001
     second = fix._terminalize_unresolved_orders(
         engine=engine,
         kis=kis,
