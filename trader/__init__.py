@@ -84,6 +84,7 @@ def install_legacy_pb1_runtime_guards() -> None:
         from trader.kr.runtime_integrity_20260915 import install_kr_20260915_runtime_integrity
         from trader.kr.runtime_integrity_20260917 import install_kr_20260917_runtime_integrity
         from trader.kr.runtime_integrity_20260928 import install_kr_20260928_runtime_integrity
+        from trader.kr.runtime_integrity_20260929 import install_kr_20260929_runtime_integrity
 
         _install_broker_truth_repo_engine_binding()
         install_kr_broker_truth_runtime_guards()
@@ -118,15 +119,16 @@ def install_legacy_pb1_runtime_guards() -> None:
         # quantity reconciliation is allowed to overwrite the DB quantity.  This is
         # a narrow fill-application fence, not a blanket open-order block.
         install_pending_fill_application_fence()
-        # Sep-28 incident hardening is deliberately last so its freshness and
-        # watchdog contracts wrap every earlier KR implementation guard without
-        # changing any strategy-policy decision.
+        # Sep-28 incident hardening owns freshness and watchdog semantics.
         install_kr_20260928_runtime_integrity()
-        # pb1_runner imports reconcile_kis by value.  Rebind that alias after the
-        # Sep-28 wrapper is installed so the initial per-tick reconciliation cannot
-        # bypass the unresolved-broker fresh-balance contract.  Assignment is safe
-        # even during a direct partial pb1_runner import; its later from-import will
-        # pick up the same hardened module function.
+        # Sep-29 convergence is layered after Sep-28 so late BUY submit prevention,
+        # negative broker-truth convergence, and exact cross-day contract recovery
+        # see the same fresh/certified balance contract.  It does not change PB1
+        # thresholds, sizing, exits, or KR Infinite ownership.
+        install_kr_20260929_runtime_integrity()
+        # pb1_runner imports reconcile_kis by value.  Rebind that alias after all
+        # KR reconcile wrappers are installed so the per-tick path cannot bypass
+        # either Sep-28 freshness or Sep-29 convergence.
         import trader.reconcile_kis as _kr_reconcile
         import trader.pb1_runner as _kr_pb1_runner
         _kr_pb1_runner.reconcile_kis = _kr_reconcile.reconcile_kis
