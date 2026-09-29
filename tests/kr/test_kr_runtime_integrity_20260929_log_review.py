@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -66,3 +67,67 @@ def test_trade_date_datetime_is_reduced_to_date_string():
     value = datetime(2026, 9, 29, 13, 2, 0)
     assert guarded(SimpleNamespace(), "practice", trade_date=value) == []
     assert captured["trade_date"] == "2026-09-29"
+
+
+def test_typed_meta_restore_clears_policy_missing_without_raw_case_binds():
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    position_id = str(uuid4())
+    cycle_id = str(uuid4())
+    epoch_id = str(uuid4())
+    meta = {
+        "book": "SWING_BOOK",
+        "trade_horizon": "SWING_CARRY",
+        "entry_thesis": "PULLBACK_CONTINUATION",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+        "eod_action": "CARRY_IF_NO_EXIT_SIGNAL",
+        "force_eod_close": False,
+        "policy_source": "style_mapping",
+        "policy_version": "pb1_entry_exit_plan_v1",
+        "entry_reason": "ENTRY_PULLBACK",
+        "entry_style_selected": "ENTRY_PULLBACK",
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(schema.positions).values(
+                position_id=position_id,
+                position_cycle_id=cycle_id,
+                portfolio_epoch_id=epoch_id,
+                opened_at=now_kst(),
+                position_origin="SYSTEM",
+                env="practice",
+                strategy="pb1_pullback_close",
+                sid=1,
+                mode=1,
+                code="000660",
+                market="KOSPI",
+                qty=1,
+                avg_buy_price=1844000.0,
+                status="OPEN",
+                entry_thesis="POLICY_MISSING",
+                exit_policy_family="POLICY_MISSING",
+                policy_source="missing",
+                entry_meta_json=meta,
+                entry_exit_plan_json={},
+                position_meta={},
+            )
+        )
+
+    restored = fix._typed_restore_entry_meta_for_promoted_positions(
+        env="practice",
+        strategy="pb1_pullback_close",
+        engine=engine,
+        orders_repo=None,
+        positions_repo=None,
+        ledger_repo=None,
+    )
+    assert restored == 1
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.select(schema.positions).where(schema.positions.c.position_id == position_id)
+        ).mappings().one()
+    assert row["entry_thesis"] == "PULLBACK_CONTINUATION"
+    assert row["trade_horizon"] == "SWING"
+    assert row["exit_policy_family"] == "SWING_STAGED_EXIT"
+    assert row["policy_source"] == "style_mapping"
