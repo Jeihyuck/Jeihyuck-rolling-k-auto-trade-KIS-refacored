@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -42,31 +42,34 @@ def test_pre_hashkey_buy_budget_allows_buy_with_tail_budget(monkeypatch):
     assert calls == [("047050", 20, 56900)]
 
 
-def test_get_open_orders_date_object_is_normalized_to_supported_string_path():
+def test_get_open_orders_date_object_bypasses_broken_legacy_branch():
     engine = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(engine).metadata.create_all(engine)
     repo = OrdersRepo(engine)
     guarded = fix._build_get_open_orders_trade_date_guard(OrdersRepo.get_open_orders)
 
-    # Regression for 2026-09-29 logs:
-    # _has_unresolved_broker_activity passes now_kst().date().  The legacy
-    # date-object path raises before issuing the query; the ISO-string path is
-    # already supported by OrdersRepo and must simply return an empty list here.
+    # Regression for 2026-09-29 logs: _has_unresolved_broker_activity passes a
+    # Python date.  The wrapper must avoid OrdersRepo's legacy date-object branch.
     rows = guarded(repo, "practice", trade_date=now_kst().date())
     assert rows == []
 
 
-def test_trade_date_datetime_is_reduced_to_date_string():
+def test_trade_date_filter_uses_explicit_kst_day_and_preserves_other_filters():
     captured = {}
 
     def original(self, env, *args, **kwargs):
         captured.update(kwargs)
-        return []
+        return [
+            {"code": "039030", "created_at": datetime(2026, 9, 29, 0, 33, tzinfo=timezone.utc)},
+            {"code": "OLD", "created_at": datetime(2026, 9, 28, 0, 33, tzinfo=timezone.utc)},
+        ]
 
     guarded = fix._build_get_open_orders_trade_date_guard(original)
-    value = datetime(2026, 9, 29, 13, 2, 0)
-    assert guarded(SimpleNamespace(), "practice", trade_date=value) == []
-    assert captured["trade_date"] == "2026-09-29"
+    rows = guarded(SimpleNamespace(), "practice", trade_date=datetime(2026, 9, 29, 13, 2), code="039030")
+    assert [row["code"] for row in rows] == ["039030"]
+    assert "trade_date" not in captured
+    assert captured["include_stale"] is True
+    assert captured["code"] == "039030"
 
 
 def test_typed_meta_restore_clears_policy_missing_without_raw_case_binds():
