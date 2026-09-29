@@ -42,6 +42,41 @@ def test_pre_hashkey_buy_budget_allows_buy_with_tail_budget(monkeypatch):
     assert calls == [("047050", 20, 56900)]
 
 
+def test_pb1_20s_pre_hashkey_budget_does_not_override_kr_infinite_owner(monkeypatch):
+    calls = []
+
+    def original(self, code, qty, price):
+        calls.append((code, qty, price))
+        return {"rt_cd": "0"}
+
+    # KR_INFINITE owns 122630 and already has KR_INF_MIN_REMAINING_SEC (8s).
+    # At 10s, PB1's 20s protection must not silently change that sleeve policy.
+    monkeypatch.setattr(fix, "kr_tick_remaining_sec", lambda *_args, **_kwargs: 10.0)
+    guarded = fix._build_buy_pipeline_budget_guard(original)
+    assert guarded(SimpleNamespace(_kr_stage_deadline=None), "122630", 6, 115000)["rt_cd"] == "0"
+    assert calls == [("122630", 6, 115000)]
+
+
+def test_hashkey_budget_exhaustion_is_always_classified_pre_submit():
+    def original(self, body):
+        raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_RETRY")
+
+    guarded = fix._build_hashkey_pre_submit_classification_guard(original)
+    with pytest.raises(KisTemporaryError, match="HASHKEY_PRE_SUBMIT") as caught:
+        guarded(SimpleNamespace(), {"PDNO": "039030"})
+    assert is_kr_order_submit_outcome_ambiguous(caught.value) is False
+
+
+def test_order_endpoint_20s_gate_is_owner_scoped_away_from_kr_infinite():
+    def original(url, kwargs):
+        return url.endswith("/uapi/domestic-stock/v1/trading/order-cash")
+
+    guarded = fix._build_owner_scoped_buy_order_predicate(original)
+    url = "https://openapivts.koreainvestment.com:29443/uapi/domestic-stock/v1/trading/order-cash"
+    assert guarded(url, {"data": b'{"PDNO":"039030"}'}) is True
+    assert guarded(url, {"data": b'{"PDNO":"122630"}'}) is False
+
+
 def test_get_open_orders_date_object_bypasses_broken_legacy_branch():
     engine = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(engine).metadata.create_all(engine)
@@ -49,7 +84,7 @@ def test_get_open_orders_date_object_bypasses_broken_legacy_branch():
     guarded = fix._build_get_open_orders_trade_date_guard(OrdersRepo.get_open_orders)
 
     # Regression for 2026-09-29 logs: _has_unresolved_broker_activity passes a
-    # Python date.  The wrapper must avoid OrdersRepo's legacy date-object branch.
+    # Python date. The wrapper must avoid OrdersRepo's legacy date-object branch.
     rows = guarded(repo, "practice", trade_date=now_kst().date())
     assert rows == []
 
