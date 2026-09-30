@@ -39,14 +39,8 @@ def _extract_price(quote: dict) -> float:
         return 0.0
 
 
-def validate_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
-    if not code:
-        return False, "missing_code"
-    code = str(code).zfill(6)
-    try:
-        quote = kis.get_quote_safe(code, diag_mode=True)
-    except Exception as exc:  # pragma: no cover - external failure
-        return False, f"quote_fail:{exc}"
+def validate_tradeable_quote(quote: Any) -> tuple[bool, str]:
+    """Validate one already-acquired quote without performing any new KIS I/O."""
     if not isinstance(quote, dict):
         return False, "quote_missing"
     rt_cd = quote.get("rt_cd")
@@ -59,6 +53,17 @@ def validate_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
     if _extract_price(quote) <= 0:
         return False, "price_unavailable"
     return True, "ok"
+
+
+def validate_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
+    if not code:
+        return False, "missing_code"
+    code = str(code).zfill(6)
+    try:
+        quote = kis.get_quote_safe(code, diag_mode=True)
+    except Exception as exc:  # pragma: no cover - external failure
+        return False, f"quote_fail:{exc}"
+    return validate_tradeable_quote(quote)
 
 
 def validate_listed_and_tradeable(kis: KisAPI, code: str) -> tuple[bool, str]:
