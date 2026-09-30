@@ -9,6 +9,7 @@ import pytest
 
 from trader.cache_ttl import PRICE_SNAPSHOT_TTL_SEC, price_cache
 from trader.kr import runtime_integrity_20260930 as fix
+from trader.kr import runtime_integrity_20260930_freshness_review as freshness_fix
 from trader.universe.validation import validate_tradeable_quote
 
 
@@ -20,18 +21,12 @@ class FakeKis:
         self.safe_calls = 0
 
     def get_price_snapshot(self, code, market="J"):
-        # The final Sep-30 source-time review intentionally bypasses this outer
-        # cache path for strict BUY freshness. Keep the method only to prove it
-        # is not used by the final production contract.
         self.snapshot_calls += 1
         return dict(self.quote)
 
     def get_price_quote(self, code, *, diag_mode=False, attempts=2):
         self.rest_calls += 1
         quote = dict(self.quote)
-        # Production get_price_quote writes the direct REST result into the
-        # inner two-second cache. The freshness review recovers source time as
-        # expires_at - PRICE_SNAPSHOT_TTL_SEC, so mirror that contract here.
         price_cache.cache[("inquire-price", str(code).zfill(6))] = (
             quote,
             time.time() + float(PRICE_SNAPSHOT_TTL_SEC),
@@ -63,9 +58,35 @@ class FakeEngine:
         raise AssertionError("pretrade must not rewrite durable order economics")
 
 
+class NoWsService:
+    """Deterministic no-stream service so this file never relies on import order/network state."""
+
+    def subscribe_kr(self, code):
+        return None
+
+    def get_fresh_quote(self, market, code, *, max_age_sec):
+        return None
+
+    def wait_for_fresh_quote(self, market, code, *, max_age_sec, wait_sec):
+        return None
+
+
 @pytest.fixture(autouse=True)
-def _clear_inner_price_cache():
+def _isolated_sep30_contract(monkeypatch):
+    """Install the final source-time resolver explicitly for every test in this file."""
     price_cache.cache.clear()
+    monkeypatch.setattr(
+        fix,
+        "_resolve_authoritative_pretrade_quote",
+        freshness_fix._resolve_authoritative_pretrade_quote_strict,
+    )
+    no_ws = NoWsService()
+    monkeypatch.setattr(
+        freshness_fix.kis_wrapper_module,
+        "get_kis_ws_price_service",
+        lambda: no_ws,
+    )
+    monkeypatch.setenv("KIS_WS_INITIAL_WAIT_SEC", "0")
     yield
     price_cache.cache.clear()
 
@@ -88,6 +109,15 @@ def _call_pretrade(guard, engine, *, code="078340", side="BUY", price=10000.0):
     )
 
 
+def _clear_session_aliases(monkeypatch):
+    for name in ("PB1_SESSION_KIND", "PB1_SESSION", "WSL_RUN_SESSION"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_fixture_installs_final_source_time_resolver_explicitly():
+    assert fix._resolve_authoritative_pretrade_quote is freshness_fix._resolve_authoritative_pretrade_quote_strict
+
+
 def test_tradeable_quote_validation_is_pure_and_preserves_halt_guard():
     assert validate_tradeable_quote({"prpr": 10000.0}) == (True, "ok")
     assert validate_tradeable_quote({"prpr": 10000.0, "halted": "Y"}) == (False, "halted:halted")
@@ -102,7 +132,6 @@ def test_pb1_buy_pretrade_uses_source_time_proven_path_and_never_get_quote_safe(
     guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
 
     assert _call_pretrade(guard, engine) is True
-    # The final review no longer trusts get_price_snapshot's outer cache time.
     assert kis.snapshot_calls == 0
     assert kis.rest_calls == 1
     assert kis.safe_calls == 0
@@ -139,8 +168,6 @@ def test_pretrade_keeps_rest_cache_inside_five_second_freshness(monkeypatch):
 
 def test_missing_canonical_price_fails_closed_and_writes_retryable_skip(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
-    # A source-time-proven REST response with no positive price must still be
-    # classified as price_unavailable and fail closed before broker submit.
     kis = FakeKis({"rt_cd": "0"})
     engine = FakeEngine(kis)
     guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
@@ -199,10 +226,11 @@ def test_non_buy_and_kr_infinite_keep_existing_owner_paths():
     assert len(called) == 2
 
 
-def test_am_pm_budget_contract_upgrades_legacy_values_and_preserves_pr148_reserves(monkeypatch):
-    monkeypatch.setenv("PB1_SESSION", "afternoon")
+def test_github_am_session_kind_applies_180_200_budget(monkeypatch):
+    _clear_session_aliases(monkeypatch)
+    monkeypatch.setenv("PB1_SESSION_KIND", "am")
     monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "90")
-    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "105")
+    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "75")
     monkeypatch.delenv("KR_POST_ENGINE_RESERVE_SEC", raising=False)
     monkeypatch.delenv("KR_ORDER_SUBMIT_MIN_REMAINING_SEC", raising=False)
 
@@ -214,8 +242,33 @@ def test_am_pm_budget_contract_upgrades_legacy_values_and_preserves_pr148_reserv
     assert os.environ["KR_ORDER_SUBMIT_MIN_REMAINING_SEC"] == "20"
 
 
+def test_github_afternoon_session_kind_applies_180_200_budget(monkeypatch):
+    _clear_session_aliases(monkeypatch)
+    monkeypatch.setenv("PB1_SESSION_KIND", "afternoon")
+    monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "90")
+    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "75")
+
+    fix._apply_live_session_budget_contract()
+
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "180"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
+
+
+def test_legacy_pb1_session_alias_still_applies_budget(monkeypatch):
+    _clear_session_aliases(monkeypatch)
+    monkeypatch.setenv("PB1_SESSION", "afternoon")
+    monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "90")
+    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "105")
+
+    fix._apply_live_session_budget_contract()
+
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "180"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
+
+
 def test_explicit_operator_budget_override_is_preserved(monkeypatch):
-    monkeypatch.setenv("PB1_SESSION", "am")
+    _clear_session_aliases(monkeypatch)
+    monkeypatch.setenv("PB1_SESSION_KIND", "am")
     monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "210")
     monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "230")
     monkeypatch.setenv("KR_POST_ENGINE_RESERVE_SEC", "25")
@@ -229,8 +282,10 @@ def test_explicit_operator_budget_override_is_preserved(monkeypatch):
     assert os.environ["KR_ORDER_SUBMIT_MIN_REMAINING_SEC"] == "22"
 
 
-def test_close_budget_is_not_rewritten(monkeypatch):
-    monkeypatch.setenv("PB1_SESSION", "close")
+def test_session_kind_close_wins_over_legacy_am_alias_and_is_not_rewritten(monkeypatch):
+    _clear_session_aliases(monkeypatch)
+    monkeypatch.setenv("PB1_SESSION_KIND", "close")
+    monkeypatch.setenv("PB1_SESSION", "am")
     monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "45")
     monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "30")
 
