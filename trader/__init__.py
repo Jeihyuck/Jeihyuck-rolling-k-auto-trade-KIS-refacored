@@ -70,6 +70,7 @@ def install_legacy_pb1_runtime_guards() -> None:
         from trader.kr.runtime_integrity_20260929_review import install_kr_20260929_review_guards
         from trader.kr.runtime_integrity_20260929_log_review import install_kr_20260929_log_review_guards
         from trader.kr.runtime_integrity_20260929_side_proof import install_kr_20260929_side_proof_guard
+        from trader.kr.runtime_integrity_20260930 import install_kr_20260930_runtime_integrity
 
         _install_broker_truth_repo_engine_binding()
         install_kr_broker_truth_runtime_guards()
@@ -97,6 +98,11 @@ def install_legacy_pb1_runtime_guards() -> None:
         # Cross-day contract recovery requires explicit broker-side BUY evidence.
         # Missing/unknown side values must fail closed rather than be inferred.
         install_kr_20260929_side_proof_guard()
+        # Sep-30 liveness guard intentionally installs after PR148: the existing
+        # 20s pre-submit/post-engine safety fences remain authoritative while
+        # PB1 BUY pretrade shares the canonical price snapshot and AM/PM receive
+        # the expanded tick container.
+        install_kr_20260930_runtime_integrity()
 
         import trader.reconcile_kis as _kr_reconcile
         import trader.pb1_runner as _kr_pb1_runner
