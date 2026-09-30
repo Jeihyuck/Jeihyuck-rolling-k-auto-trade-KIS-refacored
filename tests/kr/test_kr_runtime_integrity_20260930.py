@@ -5,6 +5,9 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
+from trader.cache_ttl import PRICE_SNAPSHOT_TTL_SEC, price_cache
 from trader.kr import runtime_integrity_20260930 as fix
 from trader.universe.validation import validate_tradeable_quote
 
@@ -13,11 +16,27 @@ class FakeKis:
     def __init__(self, quote=None):
         self.quote = quote if quote is not None else {"prpr": 10000.0, "ask": 10010.0}
         self.snapshot_calls = 0
+        self.rest_calls = 0
         self.safe_calls = 0
 
     def get_price_snapshot(self, code, market="J"):
+        # The final Sep-30 source-time review intentionally bypasses this outer
+        # cache path for strict BUY freshness. Keep the method only to prove it
+        # is not used by the final production contract.
         self.snapshot_calls += 1
         return dict(self.quote)
+
+    def get_price_quote(self, code, *, diag_mode=False, attempts=2):
+        self.rest_calls += 1
+        quote = dict(self.quote)
+        # Production get_price_quote writes the direct REST result into the
+        # inner two-second cache. The freshness review recovers source time as
+        # expires_at - PRICE_SNAPSHOT_TTL_SEC, so mirror that contract here.
+        price_cache.cache[("inquire-price", str(code).zfill(6))] = (
+            quote,
+            time.time() + float(PRICE_SNAPSHOT_TTL_SEC),
+        )
+        return quote
 
     def get_quote_safe(self, *args, **kwargs):
         self.safe_calls += 1
@@ -42,6 +61,13 @@ class FakeEngine:
     def _calc_order_price(self, code, quote, daily_close):
         self.calc_calls += 1
         raise AssertionError("pretrade must not rewrite durable order economics")
+
+
+@pytest.fixture(autouse=True)
+def _clear_inner_price_cache():
+    price_cache.cache.clear()
+    yield
+    price_cache.cache.clear()
 
 
 def _never_original(*args, **kwargs):
@@ -69,14 +95,16 @@ def test_tradeable_quote_validation_is_pure_and_preserves_halt_guard():
     assert validate_tradeable_quote({}) == (False, "price_unavailable")
 
 
-def test_pb1_buy_pretrade_uses_exactly_one_canonical_snapshot_and_never_get_quote_safe(monkeypatch):
+def test_pb1_buy_pretrade_uses_source_time_proven_path_and_never_get_quote_safe(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
     kis = FakeKis()
     engine = FakeEngine(kis)
     guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
 
     assert _call_pretrade(guard, engine) is True
-    assert kis.snapshot_calls == 1
+    # The final review no longer trusts get_price_snapshot's outer cache time.
+    assert kis.snapshot_calls == 0
+    assert kis.rest_calls == 1
     assert kis.safe_calls == 0
     assert engine.calc_calls == 0
 
@@ -111,12 +139,15 @@ def test_pretrade_keeps_rest_cache_inside_five_second_freshness(monkeypatch):
 
 def test_missing_canonical_price_fails_closed_and_writes_retryable_skip(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
-    kis = FakeKis({})
+    # A source-time-proven REST response with no positive price must still be
+    # classified as price_unavailable and fail closed before broker submit.
+    kis = FakeKis({"rt_cd": "0"})
     engine = FakeEngine(kis)
     guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
 
     assert _call_pretrade(guard, engine) is False
-    assert kis.snapshot_calls == 1
+    assert kis.snapshot_calls == 0
+    assert kis.rest_calls == 1
     assert kis.safe_calls == 0
     assert engine.ledger
     assert engine.ledger[-1]["reasons"] == ["pretrade:price_unavailable"]
@@ -130,6 +161,8 @@ def test_pretrade_never_reprices_or_resizes_durable_buy_intent(monkeypatch):
 
     assert _call_pretrade(guard, engine, price=10000.0) is True
     assert engine.calc_calls == 0
+    assert kis.snapshot_calls == 0
+    assert kis.rest_calls == 1
     assert kis.safe_calls == 0
 
 
