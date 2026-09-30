@@ -126,8 +126,9 @@ set -e
 
 # A preflight may have written EXIT_ONLY while a genuine recovery PREP was still
 # STARTED. Remove that marker only after this PREP has finished successfully and
-# the canonical artifact proves a same-day effective contract. Entry policy is
-# not changed; an entry-blocked OK_WITH_WARNINGS_* contract remains entry-blocked.
+# both the canonical artifact and DB locked-watchlist provenance prove the live
+# contract. Entry policy is not changed; entry-blocked OK_WITH_WARNINGS_* stays
+# entry-blocked according to its own split permissions.
 if [[ "$prep_rc" == 0 ]]; then
   set +e
   "$PYTHON_BIN" - "$NULLIM_TRADE_DATE" <<'PY' >> "$LOG_FILE" 2>&1
@@ -135,10 +136,22 @@ import sys
 from pathlib import Path
 trade_date = sys.argv[1]
 from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
-from trader.us.prep_effective import is_effective_prep_contract
+from trader.us.prep_effective import is_effective_prep_contract, is_effective_prep_status
+from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+from trader.us.score_columns import validate_us_entry_provenance_contract
 contract = load_us_prep_contract(trade_date) or {}
-rows = load_us_final30_scored(trade_date) or []
-if not is_effective_prep_contract(contract, rows, trade_date=trade_date, min_rows=10):
+artifact_rows = load_us_final30_scored(trade_date) or []
+if not is_effective_prep_contract(contract, artifact_rows, trade_date=trade_date, min_rows=10):
+    raise SystemExit(1)
+prep = load_latest_us_prep_status(trade_date) or {}
+locked_rows = load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
+provenance = validate_us_entry_provenance_contract(locked_rows)
+db_ok = is_effective_prep_status(prep.get("status")) and len(locked_rows) >= 10 and provenance.get("ok") is True
+if not db_ok:
+    print(
+        "[US_PREP][POST_COMPLETE_CONTRACT_CHECK] status=DB_PROVENANCE_NOT_EFFECTIVE "
+        f"prep_status={prep.get('status')} locked={len(locked_rows)} provenance_ok={provenance.get('ok')}"
+    )
     raise SystemExit(1)
 marker = Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
 if marker.exists():
