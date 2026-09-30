@@ -308,6 +308,25 @@ def _apply_live_session_budget_contract() -> None:
     )
 
 
+def _build_session_aware_pb1_engine_init(original: Callable[..., None]) -> Callable[..., None]:
+    """Refresh the budget after the session runner has populated PB1_SESSION.
+
+    ``trade_session_runner`` installs KR runtime guards while the module is being
+    imported, before a direct CLI ``--session am|afternoon`` has been copied into
+    the session environment.  The guard install is intentionally one-shot, so
+    the early no-session pass cannot be relied on for CLI execution.  PB1Engine
+    construction happens after the runner has fixed the session; refreshing the
+    idempotent budget contract here closes that ordering gap without changing
+    close-session budgets or explicit operator overrides.
+    """
+    @functools.wraps(original)
+    def guarded(self, *args, **kwargs):
+        _apply_live_session_budget_contract()
+        return original(self, *args, **kwargs)
+
+    return guarded
+
+
 def install_kr_20260930_runtime_integrity() -> None:
     """Install after PR148 runtime guards; strategy-owner policy is unchanged."""
     global _INSTALLED
@@ -317,6 +336,12 @@ def install_kr_20260930_runtime_integrity() -> None:
     _apply_live_session_budget_contract()
 
     import trader.pb1_engine as pb1_engine
+
+    if not getattr(pb1_engine.PB1Engine, "_kr_p1_20260930_session_budget_refresh_installed", False):
+        pb1_engine.PB1Engine.__init__ = _build_session_aware_pb1_engine_init(
+            pb1_engine.PB1Engine.__init__
+        )
+        pb1_engine.PB1Engine._kr_p1_20260930_session_budget_refresh_installed = True
 
     if not getattr(pb1_engine.PB1Engine, "_kr_p1_20260930_pretrade_quote_installed", False):
         pb1_engine.PB1Engine._pretrade_check = _build_pb1_pretrade_canonical_quote_guard(
