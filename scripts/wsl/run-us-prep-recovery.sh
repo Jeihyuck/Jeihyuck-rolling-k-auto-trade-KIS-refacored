@@ -54,18 +54,6 @@ export US_PREP_RECOVERY_RUN="${US_PREP_RECOVERY_RUN:-1}"
 export US_ALLOW_DEGRADED_IN_TRADE="${US_ALLOW_DEGRADED_IN_TRADE:-1}"
 export US_WSL_RECOVERY_SOURCE="scheduler-pre-am-recovery"
 
-# Preserve the existing single-owner/shared-lock handoff contract, but do not
-# exec: after a genuine recovery completes we must clear any EXIT_ONLY marker
-# that an overlapping preflight may have written while the recovery was STARTED.
-set +e
-bash scripts/wsl/run-us-prep.sh
-prep_rc=$?
-set -e
-if [[ "$prep_rc" == 0 ]] && is_effective_prep; then
-  marker="runtime/health/us-prep-missing-${NULLIM_TRADE_DATE}.json"
-  if [[ -f "$marker" ]]; then
-    rm -f "$marker"
-    echo "[US_PREP_RECOVERY][CLEAR_STALE_EXIT_ONLY] trade_date=${NULLIM_TRADE_DATE} marker=$marker"
-  fi
-fi
-exit "$prep_rc"
+# Preserve the single-owner/shared-lock process handoff.  run-us-prep.sh owns
+# post-PREP effective-contract cleanup, including stale EXIT_ONLY marker removal.
+exec bash scripts/wsl/run-us-prep.sh
