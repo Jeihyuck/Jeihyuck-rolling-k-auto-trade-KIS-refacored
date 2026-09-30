@@ -341,7 +341,7 @@ def test_sep29_fast_dip_operational_block_never_reaches_router(monkeypatch):
 
     assert result["decision"].action.value == "BUY"
     assert result["decision"].reason == "FAST_DIP_ADD_BUY"
-    assert result["status"] == "BLOCK"
+    assert result["status"] == "WAIT"
     assert result["reason"] == "SESSION_SAFE_DEGRADED"
     assert routed == []
 
