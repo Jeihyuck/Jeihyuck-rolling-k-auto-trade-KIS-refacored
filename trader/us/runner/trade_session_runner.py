@@ -4,12 +4,12 @@
 AM / Afternoon session 동안 trade tick을 반복 실행한다.
 
 CLI:
-  python -m trader.us.runner.trade_session_runner \\
-    --session am \\
-    --env practice \\
-    --max-minutes 180 \\
-    --interval-sec 300 \\
-    [--offline] \\
+  python -m trader.us.runner.trade_session_runner \
+    --session am \
+    --env practice \
+    --max-minutes 180 \
+    --interval-sec 300 \
+    [--offline] \
     [--force-now 2026-01-02T09:35:00-05:00]
 """
 from __future__ import annotations
@@ -1143,6 +1143,7 @@ def run_trade_session(
 
         # ── Tick loop (try/finally로 감싸서 report를 항상 작성) ───────────────────
         from trader.us.runner.trade_tick_runner import load_watchlist_from_artifact, run_trade_tick
+        from trader.us.runner.tick_entry_permission import resolve_shared_tick_entry_evaluation_permission
 
         prep_status_cache: dict | None = None
         locked_watchlist_cache: list[dict] | None = None
@@ -1292,7 +1293,11 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
-                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)) and not timeout_entry_block and session_execution_mode == "NORMAL",
+                            entry_can_proceed=resolve_shared_tick_entry_evaluation_permission(
+                                prep_guard_result,
+                                timeout_entry_block=timeout_entry_block,
+                                session_execution_mode=session_execution_mode,
+                            ),
                             exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
                             session_run_id=session_run_id,
                             session_generation=session_generation,
