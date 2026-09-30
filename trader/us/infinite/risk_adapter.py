@@ -21,6 +21,63 @@ CANONICAL_MARKET_STATES = {
     "DEFENSE_CRASH_REBOUND",
 }
 
+# These reasons belong to the standard PB1/FinalN entry policy.  They may stop
+# US_STANDARD BUYs, but they are not an operational kill-switch for the
+# separately-owned TQQQ_INFINITE sleeve.  The Infinite sleeve still has to pass
+# its own structural regime, quote/context, broker-balance, pending-order, cash,
+# opening-window and router/risk gates.
+TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS = frozenset({
+    "sector_cap_violation_block",
+    "cluster_cap_contract_failed",
+    "risk_off_entry_block",
+    "allow_new_buy_false",
+    "final30_empty",
+    "final30_below_absolute_min",
+    "final30_underfilled_regime_block",
+    "score_contract_failed",
+    "validation_failed",
+    "volume_missing_provider_entry_block",
+})
+
+
+def apply_tqqq_runtime_entry_override(overlay: dict | None) -> tuple[bool, str]:
+    """Release only PB1-owned entry blocks for a healthy TQQQ sleeve context.
+
+    ``run_sleeve`` historically reads ``overlay['entry_can_proceed']`` after the
+    TQQQ strategy has already made its own decision.  That field is shared with
+    PB1 and therefore can be false for a perfectly valid TQQQ Fast-Dip BUY.
+    Mutating the same overlay here keeps the existing integration call-site
+    intact while preserving fail-closed behavior for unknown/operational blocks.
+    """
+    if not isinstance(overlay, dict):
+        return False, "overlay_missing"
+    if bool(overlay.get("entry_can_proceed", True)):
+        return False, "entry_already_allowed"
+
+    block_reason = str(
+        overlay.get("trade_block_reason")
+        or overlay.get("degraded_reason")
+        or overlay.get("entry_block_reason")
+        or ""
+    ).strip().lower()
+    if block_reason not in TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS:
+        return False, block_reason or "unknown_runtime_entry_block"
+
+    # A PB1-only reason may be bypassed only when the Infinite sleeve's own
+    # market/quote context is healthy and exit/reconcile liveness is intact.
+    context_quality = str(overlay.get("tqqq_context_quality") or "").strip().lower()
+    quote_stale = bool(overlay.get("tqqq_quote_stale", False))
+    exit_can_proceed = bool(overlay.get("exit_can_proceed", True))
+    hard_failure = bool(overlay.get("hard_system_failure", False))
+    reconcile_block = bool(overlay.get("reconcile_entry_block", False))
+    if context_quality != "ok" or quote_stale or not exit_can_proceed or hard_failure or reconcile_block:
+        return False, "tqqq_operational_safety_not_proven"
+
+    overlay["entry_can_proceed"] = True
+    overlay["tqqq_runtime_entry_override"] = True
+    overlay["tqqq_runtime_entry_override_reason"] = block_reason
+    return True, block_reason
+
 
 def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]:
     """Resolve labels into (regime, multiplier, reserve permission, entry, reason).
@@ -29,6 +86,7 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     Only the policy-state machine may mutate ``InfiniteState.reserve_unlocked``.
     """
     o = overlay or {}
+    apply_tqqq_runtime_entry_override(o)
     raw_state = str(o.get("market_state") or "").upper()
     raw_regime = str(o.get("market_regime") or "").upper()
     combined = {raw_state, raw_regime}
