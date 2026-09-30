@@ -9,7 +9,7 @@ from trader.universe.validation import validate_tradeable_quote
 
 class FakeKis:
     def __init__(self, quote=None):
-        self.quote = quote or {"prpr": 10000.0, "ask": 10010.0}
+        self.quote = quote if quote is not None else {"prpr": 10000.0, "ask": 10010.0}
         self.snapshot_calls = 0
         self.safe_calls = 0
 
@@ -39,16 +39,14 @@ class FakeEngine:
 
     def _calc_order_price(self, code, quote, daily_close):
         self.calc_calls += 1
-        ask = float((quote or {}).get("ask") or 0.0)
-        prpr = float((quote or {}).get("prpr") or 0.0)
-        return (ask or prpr or None), "ask" if ask else "prpr"
+        raise AssertionError("pretrade must not rewrite durable order economics")
 
 
 def _never_original(*args, **kwargs):
     raise AssertionError("original BUY pretrade must not reacquire a quote")
 
 
-def _call_pretrade(guard, engine, *, code="078340", side="BUY"):
+def _call_pretrade(guard, engine, *, code="078340", side="BUY", price=10000.0):
     return guard(
         engine,
         code=code,
@@ -56,7 +54,7 @@ def _call_pretrade(guard, engine, *, code="078340", side="BUY"):
         mode=1,
         side=side,
         qty=10,
-        price=10000.0,
+        price=price,
         client_order_key="test-key",
         stage="PB1-AM",
     )
@@ -79,7 +77,7 @@ def test_fresh_shared_snapshot_reused_without_second_quote_request(monkeypatch):
     assert _call_pretrade(guard, engine) is True
     assert kis.snapshot_calls == 0
     assert kis.safe_calls == 0
-    assert engine.calc_calls == 1
+    assert engine.calc_calls == 0
 
 
 def test_stale_shared_snapshot_refreshes_once_via_canonical_snapshot_not_get_quote_safe(monkeypatch):
@@ -96,12 +94,12 @@ def test_stale_shared_snapshot_refreshes_once_via_canonical_snapshot_not_get_quo
     assert _call_pretrade(guard, engine) is True
     assert kis.snapshot_calls == 1
     assert kis.safe_calls == 0
+    assert engine.calc_calls == 0
 
 
 def test_missing_refreshed_price_fails_closed_and_writes_retryable_skip(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "0.1")
     kis = FakeKis({})
-    kis.quote = {}
     engine = FakeEngine(kis)
     guard = fix._build_pb1_pretrade_shared_quote_guard(_never_original)
 
@@ -112,38 +110,16 @@ def test_missing_refreshed_price_fails_closed_and_writes_retryable_skip(monkeypa
     assert engine.ledger[-1]["reasons"] == ["pretrade:price_unavailable"]
 
 
-def test_refreshed_limit_can_only_reduce_never_raise_strategy_limit(monkeypatch):
+def test_pretrade_never_reprices_or_resizes_durable_buy_intent(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
-    kis = FakeKis()
-    seen = []
+    kis = FakeKis({"prpr": 9000.0, "ask": 9010.0})
+    fix._remember_quote(kis, "078340", kis.quote, source="get_price_snapshot")
+    engine = FakeEngine(kis)
+    guard = fix._build_pb1_pretrade_shared_quote_guard(_never_original)
 
-    def original(_self, pdno, qty, price):
-        seen.append((pdno, qty, price))
-        return {"rt_cd": "0"}
-
-    wrapped = fix._build_pb1_limit_buy_quote_cap(original)
-
-    fix._set_pending_buy(
-        kis=kis,
-        code="078340",
-        stage="PB1-AM",
-        quote_source="shared_snapshot",
-        quote_age=0.0,
-        candidate_limit=9900.0,
-    )
-    wrapped(kis, "078340", 10, 10000)
-    assert seen[-1][2] <= 10000
-
-    fix._set_pending_buy(
-        kis=kis,
-        code="078340",
-        stage="PB1-AM",
-        quote_source="shared_snapshot",
-        quote_age=0.0,
-        candidate_limit=10100.0,
-    )
-    wrapped(kis, "078340", 10, 10000)
-    assert seen[-1][2] == 10000
+    assert _call_pretrade(guard, engine, price=10000.0) is True
+    assert engine.calc_calls == 0
+    assert kis.safe_calls == 0
 
 
 def test_non_buy_and_kr_infinite_keep_existing_owner_paths():
@@ -173,6 +149,21 @@ def test_am_pm_budget_contract_upgrades_legacy_values_and_preserves_pr148_reserv
     assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
     assert os.environ["KR_POST_ENGINE_RESERVE_SEC"] == "20"
     assert os.environ["KR_ORDER_SUBMIT_MIN_REMAINING_SEC"] == "20"
+
+
+def test_explicit_operator_budget_override_is_preserved(monkeypatch):
+    monkeypatch.setenv("PB1_SESSION", "am")
+    monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "210")
+    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "230")
+    monkeypatch.setenv("KR_POST_ENGINE_RESERVE_SEC", "25")
+    monkeypatch.setenv("KR_ORDER_SUBMIT_MIN_REMAINING_SEC", "22")
+
+    fix._apply_live_session_budget_contract()
+
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "210"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "230"
+    assert os.environ["KR_POST_ENGINE_RESERVE_SEC"] == "25"
+    assert os.environ["KR_ORDER_SUBMIT_MIN_REMAINING_SEC"] == "22"
 
 
 def test_close_budget_is_not_rewritten(monkeypatch):
