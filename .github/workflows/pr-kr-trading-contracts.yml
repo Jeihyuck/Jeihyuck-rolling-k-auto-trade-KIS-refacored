@@ -89,6 +89,7 @@ jobs:
         run: |
           pytest tests/kr/test_kr_runtime_integrity_20260930.py -q
           pytest tests/kr/test_kr_runtime_integrity_20260930_freshness_review.py -q
+          pytest tests/kr/test_kr_runtime_integrity_20260930_cli_session_budget.py -q
 
       - name: New KR regime tests
         run: |
