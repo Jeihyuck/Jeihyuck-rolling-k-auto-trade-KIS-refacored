@@ -86,7 +86,7 @@ def classify_rotation_regime(returns: dict[str, dict[int, float]], ai_basket_3d:
         regime = "RISK_OFF"
     elif r("QQQ", 3) < spy3 and r("SMH", 3) < spy3 - 0.01 and ai_basket_3d < spy3 - 0.015 and strong_rotation:
         regime = "AI_OFF_ROTATION"
-    elif rel.get("QQQ", 0.0) > 0 and rel.get("SMH", 3) < 999999 and rel.get("SMH", 0.0) > 0.01 and ai_basket_3d > spy3:
+    elif rel.get("QQQ", 0.0) > 0 and rel.get("SMH", 0.0) > 0.01 and ai_basket_3d > spy3:
         regime = "AI_ON"
     elif spy3 > 0 and sum(1 for s in ["QQQ", "DIA", "IWM", "RSP", "XLI", "XLF", "XLV"] if r(s, 3) > 0) >= 5:
         regime = "BROAD_UP"
