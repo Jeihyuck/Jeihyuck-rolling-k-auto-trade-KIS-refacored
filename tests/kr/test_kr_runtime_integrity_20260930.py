@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
+from types import SimpleNamespace
 
 from trader.kr import runtime_integrity_20260930 as fix
 from trader.universe.validation import validate_tradeable_quote
@@ -67,29 +69,11 @@ def test_tradeable_quote_validation_is_pure_and_preserves_halt_guard():
     assert validate_tradeable_quote({}) == (False, "price_unavailable")
 
 
-def test_fresh_shared_snapshot_reused_without_second_quote_request(monkeypatch):
+def test_pb1_buy_pretrade_uses_exactly_one_canonical_snapshot_and_never_get_quote_safe(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
     kis = FakeKis()
-    fix._remember_quote(kis, "078340", {"prpr": 10000.0, "ask": 10010.0}, source="get_price_snapshot")
     engine = FakeEngine(kis)
-    guard = fix._build_pb1_pretrade_shared_quote_guard(_never_original)
-
-    assert _call_pretrade(guard, engine) is True
-    assert kis.snapshot_calls == 0
-    assert kis.safe_calls == 0
-    assert engine.calc_calls == 0
-
-
-def test_stale_shared_snapshot_refreshes_once_via_canonical_snapshot_not_get_quote_safe(monkeypatch):
-    monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "0.1")
-    kis = FakeKis({"prpr": 9900.0, "ask": 9910.0})
-    fix._quote_cache(kis)["078340"] = {
-        "quote": {"prpr": 10000.0, "ask": 10010.0},
-        "captured_monotonic": time.monotonic() - 1.0,
-        "source": "get_price_snapshot",
-    }
-    engine = FakeEngine(kis)
-    guard = fix._build_pb1_pretrade_shared_quote_guard(_never_original)
+    guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
 
     assert _call_pretrade(guard, engine) is True
     assert kis.snapshot_calls == 1
@@ -97,11 +81,39 @@ def test_stale_shared_snapshot_refreshes_once_via_canonical_snapshot_not_get_quo
     assert engine.calc_calls == 0
 
 
-def test_missing_refreshed_price_fails_closed_and_writes_retryable_skip(monkeypatch):
-    monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "0.1")
+def test_pretrade_evicts_only_rest_cache_older_than_five_seconds(monkeypatch):
+    monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
+    key = ("J", "078340")
+    fake_cache = SimpleNamespace(
+        cache={key: SimpleNamespace(ts=time.time() - 10.0, data={"prpr": 10000.0})},
+        lock=threading.Lock(),
+    )
+    monkeypatch.setattr(fix.kis_wrapper_module, "_price_cache", fake_cache)
+
+    age = fix._evict_stale_canonical_rest_cache("078340")
+
+    assert age is not None and age >= 9.0
+    assert key not in fake_cache.cache
+
+
+def test_pretrade_keeps_rest_cache_inside_five_second_freshness(monkeypatch):
+    monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
+    key = ("J", "078340")
+    row = SimpleNamespace(ts=time.time() - 1.0, data={"prpr": 10000.0})
+    fake_cache = SimpleNamespace(cache={key: row}, lock=threading.Lock())
+    monkeypatch.setattr(fix.kis_wrapper_module, "_price_cache", fake_cache)
+
+    age = fix._evict_stale_canonical_rest_cache("078340")
+
+    assert age is not None and age < 5.0
+    assert fake_cache.cache[key] is row
+
+
+def test_missing_canonical_price_fails_closed_and_writes_retryable_skip(monkeypatch):
+    monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
     kis = FakeKis({})
     engine = FakeEngine(kis)
-    guard = fix._build_pb1_pretrade_shared_quote_guard(_never_original)
+    guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
 
     assert _call_pretrade(guard, engine) is False
     assert kis.snapshot_calls == 1
@@ -113,9 +125,8 @@ def test_missing_refreshed_price_fails_closed_and_writes_retryable_skip(monkeypa
 def test_pretrade_never_reprices_or_resizes_durable_buy_intent(monkeypatch):
     monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "5")
     kis = FakeKis({"prpr": 9000.0, "ask": 9010.0})
-    fix._remember_quote(kis, "078340", kis.quote, source="get_price_snapshot")
     engine = FakeEngine(kis)
-    guard = fix._build_pb1_pretrade_shared_quote_guard(_never_original)
+    guard = fix._build_pb1_pretrade_canonical_quote_guard(_never_original)
 
     assert _call_pretrade(guard, engine, price=10000.0) is True
     assert engine.calc_calls == 0
@@ -129,7 +140,7 @@ def test_non_buy_and_kr_infinite_keep_existing_owner_paths():
         called.append(kwargs)
         return True
 
-    guard = fix._build_pb1_pretrade_shared_quote_guard(original)
+    guard = fix._build_pb1_pretrade_canonical_quote_guard(original)
     engine = FakeEngine(FakeKis())
     assert _call_pretrade(guard, engine, side="SELL") is True
     assert _call_pretrade(guard, engine, code="122630", side="BUY") is True
