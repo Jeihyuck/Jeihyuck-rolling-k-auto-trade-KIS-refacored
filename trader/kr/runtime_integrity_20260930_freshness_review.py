@@ -14,9 +14,15 @@ Freshness authority:
 * WebSocket: ``received_at`` (or ``age_sec`` derived from it) from the KIS WS
   service, with the exact PB1 pretrade max-age passed to both get/wait calls.
 * REST: the insertion time of the inner ``price_cache`` row, derived from its
-  expiry timestamp minus ``PRICE_SNAPSHOT_TTL_SEC``.  ``get_price_quote`` is the
-  direct REST path and writes that inner cache only when the quote is acquired.
+  expiry timestamp minus ``PRICE_SNAPSHOT_TTL_SEC``.
 * The outer ``_price_cache`` timestamp is never accepted as source provenance.
+
+``KisAPI.get_price_quote`` is itself WS-first.  Before using it as the governed
+REST/cache fallback, this guard removes only the target symbol's WS cache row
+when that row is already older than the stricter PB1 pretrade age.  This avoids
+a stale-under-strict-but-fresh-under-default (for example 1.2s vs 1s/5s) WS row
+masking an otherwise available REST refresh.  A newly arrived WS quote is still
+accepted only after the same source-time validation.
 
 If source time cannot be proven, or if it exceeds the configured maximum age,
 new BUY is deferred before broker submit.
@@ -25,7 +31,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from typing import Any
 
@@ -170,6 +175,49 @@ def _evict_inner_cache_if_not_fresh(code: Any, *, max_age_sec: float, now_ts: fl
     )
 
 
+def _evict_ws_cache_if_not_fresh(code: Any, *, max_age_sec: float, now_ts: float | None = None) -> bool:
+    """Remove only a stale-under-strict target WS row before REST fallback.
+
+    ``get_price_quote`` also checks WebSocket using the general KR WS age.  When
+    PB1 requests a stricter age (for example 1s while the general setting is
+    5s), leaving a 1.2s row in the service would make that fallback return the
+    same stale-under-strict WS quote instead of progressing to REST.  Touch only
+    the exact symbol, under the service lock, and only when its received_at is
+    provably older than the strict threshold.
+    """
+    normalized = _normalize_code(code)
+    try:
+        service = kis_wrapper_module.get_kis_ws_price_service()
+        lock = getattr(service, "_lock", None)
+        quotes = getattr(service, "_quotes", None)
+        if lock is None or not isinstance(quotes, dict):
+            return False
+        key = ("KR", normalized)
+        now_value = time.time() if now_ts is None else float(now_ts)
+        with lock:
+            current = quotes.get(key)
+            if current is None:
+                return False
+            received_at = _finite_epoch(getattr(current, "received_at", None))
+            if received_at is None:
+                return False
+            age = max(0.0, now_value - received_at)
+            if age <= max(0.05, float(max_age_sec)):
+                return False
+            if quotes.get(key) is current:
+                quotes.pop(key, None)
+        logger.info(
+            "[KR_P1][FRESHNESS][WS_CACHE_EVICT] code=%s source_age_sec=%.3f max_age_sec=%.3f",
+            normalized,
+            age,
+            max(0.05, float(max_age_sec)),
+        )
+        return True
+    except Exception:
+        logger.exception("[KR_P1][FRESHNESS][WS_CACHE_EVICT_FAIL] code=%s", normalized)
+        return False
+
+
 def _strict_ws_quote(code: Any, *, max_age_sec: float) -> tuple[dict[str, Any] | None, str]:
     normalized = _normalize_code(code)
     try:
@@ -210,10 +258,13 @@ def _strict_rest_quote(kis: Any, code: Any, *, max_age_sec: float) -> tuple[dict
     normalized = _normalize_code(code)
 
     # The outer cache timestamp can be newer than the market-data source. Never
-    # let it authorize strict pretrade.  The inner cache, in contrast, exposes
-    # expiry and therefore lets us recover its original REST acquisition time.
+    # let it authorize strict pretrade. The inner cache exposes expiry and thus
+    # lets us recover the direct REST acquisition time. Also remove a target WS
+    # row already known to be too old for the stricter PB1 contract so the
+    # WS-first get_price_quote fallback can actually progress to REST.
     _evict_outer_cache(normalized)
     _evict_inner_cache_if_not_fresh(normalized, max_age_sec=max_age_sec)
+    _evict_ws_cache_if_not_fresh(normalized, max_age_sec=max_age_sec)
 
     try:
         quote = kis.get_price_quote(normalized, diag_mode=False, attempts=2)
@@ -222,10 +273,28 @@ def _strict_rest_quote(kis: Any, code: Any, *, max_age_sec: float) -> tuple[dict
     if not isinstance(quote, dict) or not quote:
         return None, "rest_quote_missing"
 
+    # A fresh WS quote may arrive between strict WS miss and this fallback. If
+    # get_price_quote returns it, preserve and validate its original received_at
+    # rather than incorrectly treating it as REST.
+    source_ts = _quote_source_ts(quote)
+    raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+    looks_like_ws = (
+        quote.get("received_at") is not None
+        or raw.get("received_at") is not None
+        or "WEBSOCKET" in str(quote.get("source") or raw.get("source") or "").upper()
+    )
+    if looks_like_ws and source_ts is not None:
+        checked, reason = _validate_source_freshness(
+            quote,
+            max_age_sec=max_age_sec,
+            source_kind="KIS_WEBSOCKET",
+        )
+        return checked, reason
+
     source_ts = _inner_cache_source_ts(normalized)
     if source_ts is None:
-        # A successful REST quote without its inner acquisition timestamp cannot
-        # prove freshness.  Do not substitute call-return/cache insertion time.
+        # A successful non-WS quote without its inner acquisition timestamp
+        # cannot prove freshness. Never substitute call-return/cache time.
         return None, "quote_freshness_unknown"
 
     enriched = dict(quote)
