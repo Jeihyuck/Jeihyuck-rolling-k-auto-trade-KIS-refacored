@@ -21,6 +21,49 @@ CANONICAL_MARKET_STATES = {
     "DEFENSE_CRASH_REBOUND",
 }
 
+TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS = frozenset({
+    "sector_cap_violation_block",
+    "cluster_cap_contract_failed",
+    "risk_off_entry_block",
+    "allow_new_buy_false",
+    "final30_empty",
+    "final30_below_absolute_min",
+    "final30_underfilled_regime_block",
+    "score_contract_failed",
+    "validation_failed",
+    "volume_missing_provider_entry_block",
+})
+
+
+def apply_tqqq_runtime_entry_override(overlay: dict | None) -> tuple[bool, str]:
+    """Release only PB1-owned entry blocks for a healthy TQQQ sleeve context."""
+    if not isinstance(overlay, dict):
+        return False, "overlay_missing"
+    if bool(overlay.get("entry_can_proceed", True)):
+        return False, "entry_already_allowed"
+
+    block_reason = str(
+        overlay.get("trade_block_reason")
+        or overlay.get("degraded_reason")
+        or overlay.get("entry_block_reason")
+        or ""
+    ).strip().lower()
+    if block_reason not in TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS:
+        return False, block_reason or "unknown_runtime_entry_block"
+
+    context_quality = str(overlay.get("tqqq_context_quality") or "").strip().lower()
+    quote_stale = bool(overlay.get("tqqq_quote_stale", False))
+    exit_can_proceed = bool(overlay.get("exit_can_proceed", True))
+    hard_failure = bool(overlay.get("hard_system_failure", False))
+    reconcile_block = bool(overlay.get("reconcile_entry_block", False))
+    if context_quality != "ok" or quote_stale or not exit_can_proceed or hard_failure or reconcile_block:
+        return False, "tqqq_operational_safety_not_proven"
+
+    overlay["entry_can_proceed"] = True
+    overlay["tqqq_runtime_entry_override"] = True
+    overlay["tqqq_runtime_entry_override_reason"] = block_reason
+    return True, block_reason
+
 
 def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]:
     """Resolve labels into (regime, multiplier, reserve permission, entry, reason).
@@ -29,6 +72,7 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     Only the policy-state machine may mutate ``InfiniteState.reserve_unlocked``.
     """
     o = overlay or {}
+    apply_tqqq_runtime_entry_override(o)
     raw_state = str(o.get("market_state") or "").upper()
     raw_regime = str(o.get("market_regime") or "").upper()
     combined = {raw_state, raw_regime}
