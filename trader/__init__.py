@@ -71,6 +71,7 @@ def install_legacy_pb1_runtime_guards() -> None:
         from trader.kr.runtime_integrity_20260929_log_review import install_kr_20260929_log_review_guards
         from trader.kr.runtime_integrity_20260929_side_proof import install_kr_20260929_side_proof_guard
         from trader.kr.runtime_integrity_20260930 import install_kr_20260930_runtime_integrity
+        from trader.kr.runtime_integrity_20260930_freshness_review import install_kr_20260930_freshness_review
 
         _install_broker_truth_repo_engine_binding()
         install_kr_broker_truth_runtime_guards()
@@ -103,6 +104,11 @@ def install_legacy_pb1_runtime_guards() -> None:
         # PB1 BUY pretrade shares the canonical price snapshot and AM/PM receive
         # the expanded tick container.
         install_kr_20260930_runtime_integrity()
+        # The first Sep-30 patch still treated an outer cache insertion timestamp
+        # as freshness evidence.  Install the source-time review last so PB1 BUY
+        # validates WS received_at / REST inner-cache acquisition time under one
+        # exact max-age contract before crossing the broker boundary.
+        install_kr_20260930_freshness_review()
 
         import trader.reconcile_kis as _kr_reconcile
         import trader.pb1_runner as _kr_pb1_runner
