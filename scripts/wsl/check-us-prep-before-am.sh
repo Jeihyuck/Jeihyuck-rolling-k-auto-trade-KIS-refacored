@@ -43,16 +43,17 @@ check() {
 "$PYTHON_BIN" - "$trade_date" <<'PY'
 import sys
 trade_date=sys.argv[1]
+from trader.us.prep_effective import is_effective_prep_contract, is_effective_prep_status
 artifact_ok=False
 try:
     # Canonical artifact remains runtime/us/watchlist/<trade_date>/final30_scored.json.
-    # The DB provenance check below is an additional live-contract gate, not a
-    # replacement for the canonical PREP artifact contract.
+    # Entry-blocked OK_WITH_WARNINGS_* states are still completed PREP contracts;
+    # preflight must not convert them into EXIT_ONLY solely because of status text.
     from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
     contract = load_us_prep_contract(trade_date) or {}
     rows = load_us_final30_scored(trade_date) or []
     status = str(contract.get('status') or '').upper()
-    artifact_ok = status in {'OK', 'OK_WITH_WARNINGS'} and len(rows) >= 10
+    artifact_ok = is_effective_prep_contract(contract, rows, trade_date=trade_date, min_rows=10)
     if artifact_ok:
         print('OK artifact final30_scored_count=%d prep_status=%s' % (len(rows), status))
     else:
@@ -68,7 +69,7 @@ try:
     rows=load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
     provenance=validate_us_entry_provenance_contract(rows)
     db_ok = (
-        prep.get('status') in {'OK','OK_WITH_WARNINGS'}
+        is_effective_prep_status(prep.get('status'))
         and len(rows) >= 10
         and provenance.get('ok') is True
     )
