@@ -133,6 +133,25 @@ def test_pretrade_never_reprices_or_resizes_durable_buy_intent(monkeypatch):
     assert kis.safe_calls == 0
 
 
+def test_legacy_adapter_without_snapshot_method_delegates_existing_validator():
+    class LegacyAdapter:
+        pass
+
+    called = []
+
+    def original(self, **kwargs):
+        called.append(kwargs)
+        return True
+
+    guard = fix._build_pb1_pretrade_canonical_quote_guard(original)
+    engine = FakeEngine(LegacyAdapter())
+
+    assert _call_pretrade(guard, engine) is True
+    assert len(called) == 1
+    assert called[0]["code"] == "078340"
+    assert called[0]["side"] == "BUY"
+
+
 def test_non_buy_and_kr_infinite_keep_existing_owner_paths():
     called = []
 
