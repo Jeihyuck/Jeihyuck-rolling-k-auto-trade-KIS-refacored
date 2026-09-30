@@ -82,6 +82,13 @@ export US_RUN_SOURCE="${US_RUN_SOURCE:-WINDOWS_SCHEDULE}"
 export WSL_RUN_MARKET="US"
 export WSL_RUN_SESSION="prep"
 
+# PREP scans a large candidate universe and must not own the shared realtime
+# KIS WebSocket/AppKey.  Current-price lookups keep their existing REST/DB
+# fallback path; only the process-local realtime subscription service is off.
+# Trade sessions retain the repository default (WebSocket-first).
+export KIS_WS_PRICE_ENABLED="0"
+echo "[US_PREP][WS_OWNERSHIP] websocket_enabled=0 owner=TRADE_ONLY fallback=REST_DB" >> "$LOG_FILE"
+
 export TRADING_REGION="${TRADING_REGION:-US}"
 export US_AGENT_ENABLED="${US_AGENT_ENABLED:-1}"
 export US_PAPER_TRADING_ENABLED="${US_PAPER_TRADING_ENABLED:-1}"
