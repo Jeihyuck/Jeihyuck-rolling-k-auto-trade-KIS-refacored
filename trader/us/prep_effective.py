@@ -17,6 +17,29 @@ def is_effective_prep_status(status: object) -> bool:
     return text == "OK" or text == "OK_WITH_WARNINGS" or text.startswith("OK_WITH_WARNINGS_")
 
 
+def locked_rows_match_prep_run(
+    prep: dict[str, Any] | None,
+    rows: Sequence[Any] | None,
+) -> bool:
+    """Bind the DB locked watchlist to the PREP run that claims completion.
+
+    Same-day rows from an older PREP must never validate a newer completed PREP.
+    Every locked row is therefore required to carry the exact completed run_id.
+    Missing/blank run ids fail closed.
+    """
+    if not isinstance(prep, dict):
+        return False
+    expected_run_id = str(prep.get("run_id") or "").strip()
+    if not expected_run_id or not rows:
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("run_id") or "").strip() != expected_run_id:
+            return False
+    return True
+
+
 def is_effective_prep_contract(
     contract: dict[str, Any] | None,
     rows: Sequence[Any] | None,
