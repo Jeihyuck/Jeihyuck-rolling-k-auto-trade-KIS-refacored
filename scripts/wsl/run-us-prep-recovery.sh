@@ -44,9 +44,10 @@ PY
 # A completed same-day PREP is the effective contract. Never create a newer
 # STARTED recovery row over an already valid contract merely because a caller
 # asks recovery to run again. Entry-blocked OK_WITH_WARNINGS_* contracts are
-# still effective because exit/close liveness remains valid.
+# still effective because exit/close liveness remains valid. Do not clear an
+# existing preflight EXIT_ONLY marker here; only the full artifact+DB provenance
+# check may remove that fail-closed decision.
 if is_effective_prep; then
-  rm -f "runtime/health/us-prep-missing-${NULLIM_TRADE_DATE}.json"
   exit 0
 fi
 
@@ -55,5 +56,5 @@ export US_ALLOW_DEGRADED_IN_TRADE="${US_ALLOW_DEGRADED_IN_TRADE:-1}"
 export US_WSL_RECOVERY_SOURCE="scheduler-pre-am-recovery"
 
 # Preserve the single-owner/shared-lock process handoff.  run-us-prep.sh owns
-# post-PREP effective-contract cleanup, including stale EXIT_ONLY marker removal.
+# post-PREP validated cleanup, including stale EXIT_ONLY marker removal.
 exec bash scripts/wsl/run-us-prep.sh
