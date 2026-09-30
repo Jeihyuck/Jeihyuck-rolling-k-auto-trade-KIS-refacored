@@ -12,14 +12,9 @@ from typing import Any
 
 
 def is_effective_prep_status(status: object) -> bool:
-    """Return True for completed non-fatal PREP statuses.
-
-    Current production statuses intentionally include several
-    ``OK_WITH_WARNINGS_*`` variants.  Treat the OK prefix as the stable status
-    family instead of enumerating every suffix in scheduler/control-plane code.
-    """
+    """Return True only for completed non-fatal PREP status families."""
     text = str(status or "").strip().upper()
-    return bool(text) and text.startswith("OK")
+    return text == "OK" or text == "OK_WITH_WARNINGS" or text.startswith("OK_WITH_WARNINGS_")
 
 
 def is_effective_prep_contract(
