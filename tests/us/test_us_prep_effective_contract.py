@@ -59,8 +59,11 @@ def test_effective_contract_rejects_score_or_date_mismatch():
 def test_recovery_and_preflight_use_shared_effective_contract_helper():
     recovery = Path("scripts/wsl/run-us-prep-recovery.sh").read_text(encoding="utf-8")
     preflight = Path("scripts/wsl/check-us-prep-before-am.sh").read_text(encoding="utf-8")
+    prep = Path("scripts/wsl/run-us-prep.sh").read_text(encoding="utf-8")
     assert "is_effective_prep_contract" in recovery
     assert "is_effective_prep_contract" in preflight
+    assert "is_effective_prep_contract" in prep
     assert "status in {\"OK\", \"OK_WITH_WARNINGS\"}" not in recovery
     assert "status in {'OK', 'OK_WITH_WARNINGS'}" not in preflight
-    assert "CLEAR_STALE_EXIT_ONLY" in recovery
+    assert "exec bash scripts/wsl/run-us-prep.sh" in recovery
+    assert "CLEAR_STALE_EXIT_ONLY" in prep
