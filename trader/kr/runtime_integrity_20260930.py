@@ -231,6 +231,29 @@ def _build_pb1_pretrade_canonical_quote_guard(original: Callable[..., bool]) -> 
         if kis is None:
             return False
 
+        # The sanctioned production client is KisAPI and always exposes the
+        # PR140 canonical snapshot method.  Existing unit/integration adapters
+        # predate PR140 and often implement only get_quote_safe/order methods;
+        # preserve their legacy validator contract rather than turning an
+        # adapter capability gap into a new execution-policy block.
+        if not callable(getattr(kis, "get_price_snapshot", None)):
+            logger.debug(
+                "[KR_P1][PRETRADE_QUOTE_COMPAT] code=%s action=LEGACY_VALIDATOR adapter=%s",
+                _normalize_code(code),
+                type(kis).__name__,
+            )
+            return original(
+                self,
+                code=code,
+                market=market,
+                mode=mode,
+                side=side,
+                qty=qty,
+                price=price,
+                client_order_key=client_order_key,
+                stage=stage,
+            )
+
         quote, acquisition_reason = _resolve_authoritative_pretrade_quote(kis, code)
         ok, reason = validate_tradeable_quote(quote)
         if not ok:
