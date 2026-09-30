@@ -97,9 +97,6 @@ def _evict_stale_canonical_rest_cache(code: Any, *, market: str = "J") -> float 
             if cache.get(key) is row:
                 cache.pop(key, None)
     except Exception:
-        # If safe eviction itself is uncertain, fail closed later by allowing
-        # the canonical acquisition/validation path to decide. Do not fabricate
-        # a fresh timestamp.
         logger.exception("[KR_P1][PRETRADE_CACHE_EVICT_FAIL] code=%s", key[1])
         return age
 
@@ -119,9 +116,6 @@ def _resolve_authoritative_pretrade_quote(
     normalized = _normalize_code(code)
     _evict_stale_canonical_rest_cache(normalized, market="J")
 
-    # Exactly one canonical market-data acquisition. get_price_snapshot() is
-    # PR140's WS-first path; if fresh WS is absent it falls back to the governed
-    # symbol-scoped REST cache/request path.
     try:
         quote = kis.get_price_snapshot(normalized, market="J")
     except Exception as exc:
@@ -196,9 +190,6 @@ def _build_pb1_pretrade_canonical_quote_guard(original: Callable[..., bool]) -> 
                 stage=stage,
             )
 
-        # Current PB1 pretrade has policy/live-gate checks before its legacy
-        # validate_tradeable() call. Preserve those exactly by letting the
-        # original return when any gate is active.
         gate_fn = getattr(self, "_order_precheck_gate_reasons", None)
         if callable(gate_fn):
             try:
@@ -231,11 +222,6 @@ def _build_pb1_pretrade_canonical_quote_guard(original: Callable[..., bool]) -> 
         if kis is None:
             return False
 
-        # The sanctioned production client is KisAPI and always exposes the
-        # PR140 canonical snapshot method.  Existing unit/integration adapters
-        # predate PR140 and often implement only get_quote_safe/order methods;
-        # preserve their legacy validator contract rather than turning an
-        # adapter capability gap into a new execution-policy block.
         if not callable(getattr(kis, "get_price_snapshot", None)):
             logger.debug(
                 "[KR_P1][PRETRADE_QUOTE_COMPAT] code=%s action=LEGACY_VALIDATOR adapter=%s",
@@ -277,9 +263,6 @@ def _build_pb1_pretrade_canonical_quote_guard(original: Callable[..., bool]) -> 
             )
             return False
 
-        # Do not mutate price/qty here. The durable BUY intent was already
-        # persisted by PB1 before pretrade, so rewriting broker economics here
-        # would violate the immutable order contract.
         logger.info(
             "[KR_P1][PRETRADE_QUOTE_OK] code=%s durable_price_unchanged=%s",
             _normalize_code(code),
@@ -291,12 +274,18 @@ def _build_pb1_pretrade_canonical_quote_guard(original: Callable[..., bool]) -> 
 
 
 def _apply_live_session_budget_contract() -> None:
-    session = str(os.getenv("PB1_SESSION") or os.getenv("WSL_RUN_SESSION") or "").strip().lower()
+    # PB1_SESSION_KIND is the canonical session variable used by the GitHub
+    # trade-am / trade-afternoon workflows and by PB1 runner routing. Keep the
+    # older aliases only as fallbacks for Windows/WSL compatibility.
+    session = str(
+        os.getenv("PB1_SESSION_KIND")
+        or os.getenv("PB1_SESSION")
+        or os.getenv("WSL_RUN_SESSION")
+        or ""
+    ).strip().lower()
     if session not in {"am", "afternoon", "pm"}:
         return
 
-    # Upgrade only known legacy/default values so an explicit operator override
-    # remains respected. The production AM/PM WSL wrappers currently export 90.
     timeout_raw = str(os.getenv("PB1_TICK_HARD_TIMEOUT_SEC") or "").strip()
     if timeout_raw in {"", "90", "90.0"}:
         os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] = "180"
@@ -305,7 +294,6 @@ def _apply_live_session_budget_contract() -> None:
     if min_budget_raw in {"", "75", "75.0", "105", "105.0"}:
         os.environ["PB1_MIN_TICK_BUDGET_SEC"] = "200"
 
-    # PR148 safety reserves remain explicit and unchanged.
     os.environ.setdefault("KR_POST_ENGINE_RESERVE_SEC", "20")
     os.environ.setdefault("KR_ORDER_SUBMIT_MIN_REMAINING_SEC", "20")
 
