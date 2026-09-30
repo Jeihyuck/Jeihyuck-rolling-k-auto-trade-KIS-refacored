@@ -85,6 +85,11 @@ jobs:
           pytest tests/test_live_gate_refresh_order.py -q
           pytest tests/test_pb1_volume_config_unified.py -q
 
+      - name: Sep-30 isolated liveness and freshness contracts
+        run: |
+          pytest tests/kr/test_kr_runtime_integrity_20260930.py -q
+          pytest tests/kr/test_kr_runtime_integrity_20260930_freshness_review.py -q
+
       - name: New KR regime tests
         run: |
           pytest tests/kr/test_kr_regime.py -q
