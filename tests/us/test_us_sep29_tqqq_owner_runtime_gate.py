@@ -125,13 +125,25 @@ def test_stale_tqqq_quote_cannot_bypass_pb1_gate():
     assert overlay["entry_can_proceed"] is False
 
 
-def test_session_policy_only_block_allows_owner_specific_tick_evaluation():
+def test_session_policy_only_block_does_not_promote_shared_pb1_permission():
     assert resolve_shared_tick_entry_evaluation_permission(
         _guard(), timeout_entry_block=False, session_execution_mode="NORMAL"
+    ) is False
+
+
+def test_authoritative_guard_entry_allowed_keeps_shared_permission_true():
+    assert resolve_shared_tick_entry_evaluation_permission(
+        _guard(
+            guard_state="OK",
+            entry_can_proceed=True,
+            trade_block_reason="",
+        ),
+        timeout_entry_block=False,
+        session_execution_mode="NORMAL",
     ) is True
 
 
-def test_preflight_exit_only_never_promotes_tqqq_evaluation():
+def test_preflight_exit_only_never_promotes_shared_entry():
     assert resolve_shared_tick_entry_evaluation_permission(
         _guard(
             guard_state="PREFLIGHT_EXIT_ONLY",
@@ -142,7 +154,7 @@ def test_preflight_exit_only_never_promotes_tqqq_evaluation():
     ) is False
 
 
-def test_revision_mismatch_never_promotes_tqqq_without_validated_recovery():
+def test_revision_mismatch_never_promotes_blocked_shared_permission():
     assert resolve_shared_tick_entry_evaluation_permission(
         _guard(run_revision_mismatch=True),
         timeout_entry_block=False,
@@ -152,15 +164,27 @@ def test_revision_mismatch_never_promotes_tqqq_without_validated_recovery():
         _guard(run_revision_mismatch=True, revision_mismatch_recovery_allowed=True),
         timeout_entry_block=False,
         session_execution_mode="NORMAL",
+    ) is False
+    assert resolve_shared_tick_entry_evaluation_permission(
+        _guard(
+            guard_state="OK",
+            entry_can_proceed=True,
+            trade_block_reason="",
+            run_revision_mismatch=True,
+            revision_mismatch_recovery_allowed=True,
+        ),
+        timeout_entry_block=False,
+        session_execution_mode="NORMAL",
     ) is True
 
 
 def test_safe_degraded_and_timeout_remain_global_buy_fences():
+    allowed_guard = _guard(guard_state="OK", entry_can_proceed=True, trade_block_reason="")
     assert resolve_shared_tick_entry_evaluation_permission(
-        _guard(), timeout_entry_block=False, session_execution_mode="SAFE_DEGRADED"
+        allowed_guard, timeout_entry_block=False, session_execution_mode="SAFE_DEGRADED"
     ) is False
     assert resolve_shared_tick_entry_evaluation_permission(
-        _guard(), timeout_entry_block=True, session_execution_mode="NORMAL"
+        allowed_guard, timeout_entry_block=True, session_execution_mode="NORMAL"
     ) is False
 
 
@@ -177,8 +201,8 @@ def test_unknown_or_noncanonical_degraded_reason_remains_fail_closed():
     ) is False
 
 
-def test_live_session_runner_wires_policy_only_guard_as_tick_evaluation_permission(monkeypatch, tmp_path):
-    """The production session caller must no longer collapse PB1 policy into global safety."""
+def test_live_session_runner_keeps_pb1_blocked_when_db_cache_is_stale_allowed(monkeypatch, tmp_path):
+    """Latest artifact guard block must win over an older DB entry-allowed cache."""
     from trader.us.runner.trade_session_runner import run_trade_session
 
     seen: dict = {}
@@ -223,12 +247,20 @@ def test_live_session_runner_wires_policy_only_guard_as_tick_evaluation_permissi
         "trader.us.run_manifest.verify_run_revision",
         lambda *a, **k: {"ok": True, "entry_can_proceed": True, "expected_revision": "current-sha"},
     )
+    # Simulate the P1 review case: DB still exposes an older entry-allowed PREP.
     monkeypatch.setattr(
         "trader.us.db.repos.load_latest_us_prep_status",
         lambda *a, **k: {
-            "status": "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP",
-            "run_id": "prep-sep29",
-            "result": {"trade_block_reason": "sector_cap_violation_block"},
+            "status": "OK",
+            "run_id": "older-db-prep",
+            "result": {
+                "entry_can_proceed": 1,
+                "trade_can_proceed": 1,
+                "final30_trade_ready": True,
+                "cluster_contract_ok": True,
+                "cap_violations": [],
+                "trade_block_reason": "",
+            },
         },
     )
     monkeypatch.setattr(
@@ -256,9 +288,9 @@ def test_live_session_runner_wires_policy_only_guard_as_tick_evaluation_permissi
         return {
             "status": "OK",
             "last_stage": "done",
-            "prep_status": "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP",
+            "prep_status": "OK",
             "locked_watchlist_count": 28,
-            "entry_eval_status": "BLOCKED_BY_PB1_POLICY",
+            "entry_eval_status": "BLOCKED_BY_AUTHORITATIVE_GUARD",
             "entry_intents": 0,
             "exit_intents": 0,
             "orders_sent": 0,
@@ -282,16 +314,18 @@ def test_live_session_runner_wires_policy_only_guard_as_tick_evaluation_permissi
         force_now="2026-09-29T10:06:00-04:00",
     )
 
-    assert seen["entry_can_proceed"] is True
+    assert seen["entry_can_proceed"] is False
     assert seen["exit_can_proceed"] is True
 
 
-def test_sep29_fast_dip_reaches_router_after_owner_permission_split(monkeypatch):
+def test_sep29_fast_dip_reaches_router_via_tqqq_owner_override(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
 
     routed: list[dict] = []
-    overlay = _overlay(entry_can_proceed=True)
+    # Shared PB1 permission stays False. The dedicated Infinite sleeve releases
+    # only the canonical PB1 policy block in its own overlay.
+    overlay = _overlay(entry_can_proceed=False, trade_block_reason="sector_cap_violation_block")
     result = run_sleeve(
         positions=[{
             "symbol": "TQQQ",
@@ -346,10 +380,7 @@ def test_sep29_fast_dip_operational_block_never_reaches_router(monkeypatch):
     assert routed == []
 
 
-def test_session_runner_source_uses_split_permission_helper():
+def test_session_runner_source_uses_authoritative_shared_permission_helper():
     src = Path("trader/us/runner/trade_session_runner.py").read_text(encoding="utf-8")
     assert "resolve_shared_tick_entry_evaluation_permission" in src
-    assert (
-        'entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)) '
-        'and not timeout_entry_block and session_execution_mode == "NORMAL"'
-    ) not in src
+    assert "entry_can_proceed=resolve_shared_tick_entry_evaluation_permission" in src
