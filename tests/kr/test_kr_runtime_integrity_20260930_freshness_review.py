@@ -30,6 +30,40 @@ class FakeWsService:
         return None
 
 
+class CacheAwareWsService:
+    """Small production-shape cache proving strict eviction before REST fallback."""
+
+    def __init__(self, code: str, *, source_age_sec: float):
+        self._lock = threading.Lock()
+        self._quotes = {
+            ("KR", code): SimpleNamespace(received_at=time.time() - float(source_age_sec))
+        }
+        self.subscriptions: list[str] = []
+        self.get_max_ages: list[float] = []
+
+    def subscribe_kr(self, code: str) -> None:
+        self.subscriptions.append(code)
+
+    def get_fresh_quote(self, market: str, code: str, *, max_age_sec: float):
+        self.get_max_ages.append(float(max_age_sec))
+        row = self._quotes.get((market, code))
+        if row is None:
+            return None
+        age = max(0.0, time.time() - float(row.received_at))
+        if age > float(max_age_sec):
+            return None
+        return {
+            "prpr": 10000.0,
+            "last": 10000.0,
+            "received_at": float(row.received_at),
+            "age_sec": age,
+            "source": "KIS_WEBSOCKET",
+        }
+
+    def wait_for_fresh_quote(self, market: str, code: str, *, max_age_sec: float, wait_sec: float):
+        return self.get_fresh_quote(market, code, max_age_sec=max_age_sec)
+
+
 class FakeRestKis:
     """Mimic get_price_quote's inner two-second TTL cache before HTTP."""
 
@@ -119,6 +153,26 @@ def test_ws_return_older_than_strict_contract_cannot_authorize_buy(monkeypatch):
     assert reason.startswith("quote_stale:")
     assert service.get_max_ages == [1.0]
     assert kis.calls == 1
+
+
+def test_strict_stale_ws_cache_is_removed_so_fresh_rest_can_be_used(monkeypatch):
+    monkeypatch.setenv("KR_PB1_PRETRADE_QUOTE_MAX_AGE_SEC", "1")
+    monkeypatch.setenv("KIS_WS_FRESH_MAX_AGE_SEC_KR", "5")
+    code = "078340"
+    service = CacheAwareWsService(code, source_age_sec=1.2)
+    monkeypatch.setattr(fix.kis_wrapper_module, "get_kis_ws_price_service", lambda: service)
+    kis = FakeRestKis({"prpr": 10020.0}, http_source_age_sec=0.0)
+
+    quote, reason = fix._resolve_authoritative_pretrade_quote_strict(kis, code)
+
+    assert reason == "ok"
+    assert quote is not None
+    assert quote["prpr"] == 10020.0
+    assert quote["_source_kind"] == "KIS_REST"
+    assert quote["_source_age_sec"] < 1.0
+    assert service.get_max_ages == [1.0]
+    assert ("KR", code) not in service._quotes
+    assert kis.http_calls == 1
 
 
 def test_ws_quote_without_source_time_fails_closed_when_rest_unavailable(monkeypatch):
