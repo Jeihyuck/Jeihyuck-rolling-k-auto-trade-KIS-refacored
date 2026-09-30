@@ -25,22 +25,28 @@ deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 mkdir -p runtime runtime/locks runtime/health
 
-# A completed same-day PREP is the effective contract. Never create a newer
-# STARTED recovery row over an already valid contract merely because a caller
-# asks recovery to run again.
-if python - "$NULLIM_TRADE_DATE" <<'PY'
+is_effective_prep() {
+python - "$NULLIM_TRADE_DATE" <<'PY'
 import sys
 trade_date = sys.argv[1]
 from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
+from trader.us.prep_effective import is_effective_prep_contract
 contract = load_us_prep_contract(trade_date) or {}
 rows = load_us_final30_scored(trade_date) or []
 status = str(contract.get("status") or "").upper()
-if status in {"OK", "OK_WITH_WARNINGS"} and len(rows) >= 10:
+if is_effective_prep_contract(contract, rows, trade_date=trade_date, min_rows=10):
     print(f"[US_PREP_RECOVERY][SKIP_EFFECTIVE_PREP] trade_date={trade_date} status={status} final30={len(rows)}")
     raise SystemExit(0)
 raise SystemExit(1)
 PY
-then
+}
+
+# A completed same-day PREP is the effective contract. Never create a newer
+# STARTED recovery row over an already valid contract merely because a caller
+# asks recovery to run again. Entry-blocked OK_WITH_WARNINGS_* contracts are
+# still effective because exit/close liveness remains valid.
+if is_effective_prep; then
+  rm -f "runtime/health/us-prep-missing-${NULLIM_TRADE_DATE}.json"
   exit 0
 fi
 
@@ -48,5 +54,18 @@ export US_PREP_RECOVERY_RUN="${US_PREP_RECOVERY_RUN:-1}"
 export US_ALLOW_DEGRADED_IN_TRADE="${US_ALLOW_DEGRADED_IN_TRADE:-1}"
 export US_WSL_RECOVERY_SOURCE="scheduler-pre-am-recovery"
 
-# Preserve the existing single-owner/shared-lock handoff contract.
-exec bash scripts/wsl/run-us-prep.sh
+# Preserve the existing single-owner/shared-lock handoff contract, but do not
+# exec: after a genuine recovery completes we must clear any EXIT_ONLY marker
+# that an overlapping preflight may have written while the recovery was STARTED.
+set +e
+bash scripts/wsl/run-us-prep.sh
+prep_rc=$?
+set -e
+if [[ "$prep_rc" == 0 ]] && is_effective_prep; then
+  marker="runtime/health/us-prep-missing-${NULLIM_TRADE_DATE}.json"
+  if [[ -f "$marker" ]]; then
+    rm -f "$marker"
+    echo "[US_PREP_RECOVERY][CLEAR_STALE_EXIT_ONLY] trade_date=${NULLIM_TRADE_DATE} marker=$marker"
+  fi
+fi
+exit "$prep_rc"
