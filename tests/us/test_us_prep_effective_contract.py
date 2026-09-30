@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from trader.us.prep_effective import is_effective_prep_contract, is_effective_prep_status
+from trader.us.prep_effective import (
+    is_effective_prep_contract,
+    is_effective_prep_status,
+    locked_rows_match_prep_run,
+)
 
 
 @pytest.mark.parametrize(
@@ -39,6 +43,13 @@ def _contract(status="OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP", **extra):
     }
 
 
+def _locked_rows(run_id: str, count: int = 28):
+    return [
+        {"symbol": f"S{i}", "score_final": 1.0, "run_id": run_id}
+        for i in range(count)
+    ]
+
+
 def test_entry_blocked_warning_contract_still_prevents_recovery_rerun():
     rows = [{"symbol": f"S{i}", "score_final": 1.0} for i in range(28)]
     assert is_effective_prep_contract(
@@ -56,6 +67,29 @@ def test_effective_contract_rejects_score_or_date_mismatch():
     )
 
 
+def test_completed_prep_cannot_reuse_older_same_day_locked_rows_after_save_failure():
+    """New PREP completion + old locked rows must preserve EXIT_ONLY fail-closed."""
+    completed_prep = {
+        "run_id": "prep-new",
+        "status": "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP",
+    }
+    assert locked_rows_match_prep_run(completed_prep, _locked_rows("prep-old")) is False
+    assert locked_rows_match_prep_run(completed_prep, _locked_rows("prep-new")) is True
+
+
+def test_locked_watchlist_run_binding_rejects_mixed_or_missing_run_ids():
+    completed_prep = {"run_id": "prep-new", "status": "OK"}
+    mixed = _locked_rows("prep-new", 10)
+    mixed[-1]["run_id"] = "prep-old"
+    missing = _locked_rows("prep-new", 10)
+    missing[-1].pop("run_id")
+
+    assert locked_rows_match_prep_run(completed_prep, mixed) is False
+    assert locked_rows_match_prep_run(completed_prep, missing) is False
+    assert locked_rows_match_prep_run({"status": "OK"}, _locked_rows("prep-new", 10)) is False
+    assert locked_rows_match_prep_run(completed_prep, []) is False
+
+
 def test_recovery_and_preflight_use_shared_effective_contract_helper():
     recovery = Path("scripts/wsl/run-us-prep-recovery.sh").read_text(encoding="utf-8")
     preflight = Path("scripts/wsl/check-us-prep-before-am.sh").read_text(encoding="utf-8")
@@ -63,6 +97,7 @@ def test_recovery_and_preflight_use_shared_effective_contract_helper():
     assert "is_effective_prep_contract" in recovery
     assert "is_effective_prep_contract" in preflight
     assert "is_effective_prep_contract" in prep
+    assert "locked_rows_match_prep_run" in prep
     assert "status in {\"OK\", \"OK_WITH_WARNINGS\"}" not in recovery
     assert "status in {'OK', 'OK_WITH_WARNINGS'}" not in preflight
     assert "exec bash scripts/wsl/run-us-prep.sh" in recovery
