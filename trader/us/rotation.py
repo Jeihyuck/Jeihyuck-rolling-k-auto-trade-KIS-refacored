@@ -86,7 +86,7 @@ def classify_rotation_regime(returns: dict[str, dict[int, float]], ai_basket_3d:
         regime = "RISK_OFF"
     elif r("QQQ", 3) < spy3 and r("SMH", 3) < spy3 - 0.01 and ai_basket_3d < spy3 - 0.015 and strong_rotation:
         regime = "AI_OFF_ROTATION"
-    elif rel.get("QQQ", 0.0) > 0 and rel.get("SMH", 0.0) > 0.01 and ai_basket_3d > spy3:
+    elif rel.get("QQQ", 0.0) > 0 and rel.get("SMH", 3) < 999999 and rel.get("SMH", 0.0) > 0.01 and ai_basket_3d > spy3:
         regime = "AI_ON"
     elif spy3 > 0 and sum(1 for s in ["QQQ", "DIA", "IWM", "RSP", "XLI", "XLF", "XLV"] if r(s, 3) > 0) >= 5:
         regime = "BROAD_UP"
@@ -108,12 +108,37 @@ def cluster_caps_for_regime(regime: str) -> dict[str, Any]:
     return {"SINGLE_CLUSTER": 0.30, "AI_TECH_COMBINED": 0.40, "CASH_MIN": 0.05}
 
 
+def _position_market_value_usd(position: dict) -> float:
+    """Resolve market value across authoritative KIS and persisted DB shapes."""
+    for key in ("market_value_usd", "market_value", "eval_amount_usd"):
+        try:
+            value = float(position.get(key) or 0.0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        qty = int(float(position.get("qty") or position.get("quantity") or position.get("holding_qty") or position.get("holdings_qty") or 0))
+    except (TypeError, ValueError):
+        qty = 0
+    if qty <= 0:
+        return 0.0
+    for key in ("last_price", "current_price", "current_price_usd", "current_px", "price", "avg_cost", "avg_price_usd", "entry_price"):
+        try:
+            price = float(position.get(key) or 0.0)
+            if price > 0:
+                return price * qty
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
 def compute_cluster_exposure(positions: list[dict], equity: float | None = None) -> dict[str, dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {"cluster_market_value": 0.0, "cluster_unrealized_pnl": 0.0, "cluster_1d_pnl": 0.0})
     for p in positions or []:
         c = theme_cluster_for(str(p.get("symbol") or p.get("code") or ""), p)
         b = buckets[c]
-        b["cluster_market_value"] += float(p.get("market_value_usd") or p.get("market_value") or p.get("eval_amount_usd") or 0.0)
+        b["cluster_market_value"] += _position_market_value_usd(p)
         b["cluster_unrealized_pnl"] += float(p.get("unrealized_pnl") or p.get("unrealized_pnl_usd") or 0.0)
         b["cluster_1d_pnl"] += float(p.get("pnl_1d") or p.get("day_pnl") or p.get("pnl_1d_usd") or 0.0)
     total = float(equity or 0.0) or sum(v["cluster_market_value"] for v in buckets.values()) or 1.0
