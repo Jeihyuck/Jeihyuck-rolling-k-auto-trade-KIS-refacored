@@ -1,4 +1,4 @@
-"""KR PB1 Sep-30 liveness fixes: shared pretrade quote + budget contract.
+"""KR PB1 Sep-30 liveness fixes: canonical pretrade quote + budget contract.
 
 This module closes two implementation gaps observed on 2026-09-30 without
 changing PB1 entry thresholds, sizing, exit policy, durable order economics, or
@@ -8,11 +8,13 @@ KR_INFINITE ownership.
    but raises the legacy 90s tick ceiling to 180s and requires 200s remaining
    before starting a new tick near the session end.
 2. PB1 BUY pretrade no longer uses the independent ``get_quote_safe`` path.
-   It reuses the canonical ``get_price_snapshot`` result when still fresh, or
-   refreshes exactly once through that same WS-first/REST-fallback path. The
-   acquired quote is used only to validate current tradeability; the already
-   persisted strategy-generated order price and quantity are never rewritten.
+   Immediately before pretrade validation it discards only a REST price-cache
+   row older than the existing 5s KR freshness contract, then calls the PR140
+   canonical ``get_price_snapshot`` path exactly once. That path is WebSocket
+   first and uses governed REST only when a fresh stream/cache is unavailable.
 
+The acquired quote is used only to validate current tradeability. The already
+persisted strategy-generated order price and quantity are never rewritten.
 Protective SELL routing and KR_INFINITE (122630) stay on their existing paths.
 """
 from __future__ import annotations
@@ -23,6 +25,7 @@ import os
 import time
 from typing import Any, Callable
 
+import trader.kis_wrapper as kis_wrapper_module
 from trader.kis_wrapper import KisAPI
 from trader.universe.validation import validate_tradeable_quote
 
@@ -58,83 +61,78 @@ def _pretrade_quote_max_age_sec() -> float:
     return min(requested, ws_bound)
 
 
-def _quote_cache(kis: Any) -> dict[str, dict[str, Any]]:
-    cache = getattr(kis, "_kr_pb1_pretrade_quote_cache", None)
+def _evict_stale_canonical_rest_cache(code: Any, *, market: str = "J") -> float | None:
+    """Drop only this symbol's REST cache when older than the pretrade contract.
+
+    PR140's canonical get_price_snapshot() checks fresh WebSocket data before
+    consulting the REST cache. Its generic REST cache TTL defaults to 15s,
+    while live-order pretrade freshness is 5s. Evicting an older row here makes
+    the subsequent single canonical call either obtain a fresh WS quote, use a
+    <=5s cached REST quote, perform governed REST, or fail closed.
+    """
+    cache_obj = getattr(kis_wrapper_module, "_price_cache", None)
+    cache = getattr(cache_obj, "cache", None)
     if not isinstance(cache, dict):
-        cache = {}
-        try:
-            setattr(kis, "_kr_pb1_pretrade_quote_cache", cache)
-        except Exception:
-            pass
-    return cache
+        return None
 
-
-def _remember_quote(kis: Any, code: Any, quote: Any, *, source: str) -> None:
-    """Remember only a currently tradeable canonical snapshot."""
-    normalized = _normalize_code(code)
-    if not normalized or not isinstance(quote, dict):
-        return
-    ok, _reason = validate_tradeable_quote(quote)
-    if not ok:
-        return
-    _quote_cache(kis)[normalized] = {
-        "quote": dict(quote),
-        "captured_monotonic": time.monotonic(),
-        "source": str(source or "unknown"),
-    }
-
-
-def _fresh_cached_quote(kis: Any, code: Any) -> tuple[dict[str, Any] | None, str, float | None]:
-    normalized = _normalize_code(code)
-    item = _quote_cache(kis).get(normalized) or {}
-    quote = item.get("quote")
-    captured = item.get("captured_monotonic")
-    if not isinstance(quote, dict) or captured is None:
-        return None, "cache_miss", None
+    key = (str(market or "J"), _normalize_code(code))
+    row = cache.get(key)
+    if row is None:
+        return None
     try:
-        age = max(0.0, time.monotonic() - float(captured))
+        age = max(0.0, time.time() - float(getattr(row, "ts")))
     except Exception:
-        return None, "cache_invalid", None
-    if age > _pretrade_quote_max_age_sec():
-        return None, "cache_stale", age
-    ok, reason = validate_tradeable_quote(quote)
-    if not ok:
-        return None, f"cache_invalid:{reason}", age
-    return dict(quote), str(item.get("source") or "shared_snapshot"), age
+        age = float("inf")
+    if age <= _pretrade_quote_max_age_sec():
+        return age
 
+    lock = getattr(cache_obj, "lock", None)
+    try:
+        if lock is not None:
+            with lock:
+                current = cache.get(key)
+                if current is row:
+                    cache.pop(key, None)
+        else:
+            if cache.get(key) is row:
+                cache.pop(key, None)
+    except Exception:
+        # If safe eviction itself is uncertain, fail closed later by allowing
+        # the canonical acquisition/validation path to decide. Do not fabricate
+        # a fresh timestamp.
+        logger.exception("[KR_P1][PRETRADE_CACHE_EVICT_FAIL] code=%s", key[1])
+        return age
 
-def _build_price_snapshot_capture(original: Callable[..., Any]) -> Callable[..., Any]:
-    @functools.wraps(original)
-    def captured(self, code: Any, *args: Any, **kwargs: Any):
-        quote = original(self, code, *args, **kwargs)
-        _remember_quote(self, code, quote, source="get_price_snapshot")
-        return quote
-
-    return captured
+    logger.info(
+        "[KR_P1][PRETRADE_CACHE_EVICT] code=%s age_sec=%.3f max_age_sec=%.3f",
+        key[1],
+        age,
+        _pretrade_quote_max_age_sec(),
+    )
+    return age
 
 
 def _resolve_authoritative_pretrade_quote(
     kis: Any,
     code: Any,
-) -> tuple[dict[str, Any] | None, str, float | None, str]:
-    cached, source, age = _fresh_cached_quote(kis, code)
-    if cached is not None:
-        return cached, source, age, "ok"
+) -> tuple[dict[str, Any] | None, str]:
+    normalized = _normalize_code(code)
+    _evict_stale_canonical_rest_cache(normalized, market="J")
 
-    # PR140 made get_price_snapshot the canonical KR WS-first -> governed REST
-    # fallback path. Reuse it instead of the legacy independent
-    # get_quote_safe(diag_mode=True) pretrade fetch.
+    # Exactly one canonical market-data acquisition. get_price_snapshot() is
+    # PR140's WS-first path; if fresh WS is absent it falls back to the governed
+    # symbol-scoped REST cache/request path.
     try:
-        quote = kis.get_price_snapshot(_normalize_code(code), market="J")
+        quote = kis.get_price_snapshot(normalized, market="J")
     except Exception as exc:
-        return None, "refresh_failed", None, f"quote_fail:{exc}"
+        return None, f"quote_fail:{exc}"
     if not isinstance(quote, dict):
-        return None, "refresh_missing", None, "quote_missing"
+        return None, "quote_missing"
+
     ok, reason = validate_tradeable_quote(quote)
     if not ok:
-        return quote, "refresh_invalid", 0.0, reason
-    _remember_quote(kis, code, quote, source="pretrade_refresh")
-    return dict(quote), "pretrade_refresh", 0.0, "ok"
+        return quote, reason
+    return quote, "ok"
 
 
 def _append_pretrade_skip(
@@ -170,7 +168,7 @@ def _append_pretrade_skip(
         logger.exception("[PB1][LEDGER][PRETRADE_SKIP_FAIL] code=%s", display_code)
 
 
-def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Callable[..., bool]:
+def _build_pb1_pretrade_canonical_quote_guard(original: Callable[..., bool]) -> Callable[..., bool]:
     """Replace only PB1-standard BUY quote acquisition; preserve all other gates."""
     @functools.wraps(original)
     def guarded(
@@ -233,7 +231,7 @@ def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Cal
         if kis is None:
             return False
 
-        quote, source, age, acquisition_reason = _resolve_authoritative_pretrade_quote(kis, code)
+        quote, acquisition_reason = _resolve_authoritative_pretrade_quote(kis, code)
         ok, reason = validate_tradeable_quote(quote)
         if not ok:
             reason = acquisition_reason if acquisition_reason != "ok" else reason
@@ -250,9 +248,8 @@ def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Cal
                 reason=reason,
             )
             logger.warning(
-                "[KR_P1][PRETRADE_QUOTE_DEFER] code=%s source=%s reason=%s action=NO_BROKER_SUBMIT",
+                "[KR_P1][PRETRADE_QUOTE_DEFER] code=%s reason=%s action=NO_BROKER_SUBMIT",
                 _normalize_code(code),
-                source,
                 reason,
             )
             return False
@@ -261,10 +258,8 @@ def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Cal
         # persisted by PB1 before pretrade, so rewriting broker economics here
         # would violate the immutable order contract.
         logger.info(
-            "[KR_P1][PRETRADE_QUOTE_OK] code=%s source=%s age_sec=%s durable_price_unchanged=%s",
+            "[KR_P1][PRETRADE_QUOTE_OK] code=%s durable_price_unchanged=%s",
             _normalize_code(code),
-            source,
-            "NA" if age is None else f"{age:.3f}",
             price,
         )
         return True
@@ -312,12 +307,8 @@ def install_kr_20260930_runtime_integrity() -> None:
 
     import trader.pb1_engine as pb1_engine
 
-    if not getattr(KisAPI, "_kr_p1_20260930_snapshot_capture_installed", False):
-        KisAPI.get_price_snapshot = _build_price_snapshot_capture(KisAPI.get_price_snapshot)
-        KisAPI._kr_p1_20260930_snapshot_capture_installed = True
-
     if not getattr(pb1_engine.PB1Engine, "_kr_p1_20260930_pretrade_quote_installed", False):
-        pb1_engine.PB1Engine._pretrade_check = _build_pb1_pretrade_shared_quote_guard(
+        pb1_engine.PB1Engine._pretrade_check = _build_pb1_pretrade_canonical_quote_guard(
             pb1_engine.PB1Engine._pretrade_check
         )
         pb1_engine.PB1Engine._kr_p1_20260930_pretrade_quote_installed = True
