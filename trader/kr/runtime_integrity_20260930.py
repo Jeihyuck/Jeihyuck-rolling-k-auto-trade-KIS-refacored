@@ -1,17 +1,17 @@
 """KR PB1 Sep-30 liveness fixes: shared pretrade quote + budget contract.
 
 This module closes two implementation gaps observed on 2026-09-30 without
-changing PB1 entry thresholds, sizing, exit policy, or KR_INFINITE ownership.
+changing PB1 entry thresholds, sizing, exit policy, durable order economics, or
+KR_INFINITE ownership.
 
 1. AM/afternoon PB1 keeps the PR148 20s pre-submit and 20s post-engine reserves,
    but raises the legacy 90s tick ceiling to 180s and requires 200s remaining
    before starting a new tick near the session end.
 2. PB1 BUY pretrade no longer uses the independent ``get_quote_safe`` path.
    It reuses the canonical ``get_price_snapshot`` result when still fresh, or
-   refreshes exactly once through that same WS-first/REST-fallback path.  The
-   exact quote used for tradeability validation is also used to derive a
-   conservative refreshed limit cap.  A refreshed cap may lower a BUY limit,
-   but can never raise the original strategy-generated limit or order notional.
+   refreshes exactly once through that same WS-first/REST-fallback path. The
+   acquired quote is used only to validate current tradeability; the already
+   persisted strategy-generated order price and quantity are never rewritten.
 
 Protective SELL routing and KR_INFINITE (122630) stay on their existing paths.
 """
@@ -19,19 +19,15 @@ from __future__ import annotations
 
 import functools
 import logging
-import math
 import os
-import threading
 import time
 from typing import Any, Callable
 
 from trader.kis_wrapper import KisAPI
-from trader.kr_price_utils import normalize_kr_order_price
 from trader.universe.validation import validate_tradeable_quote
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
-_STATE = threading.local()
 
 
 def _env_float(name: str, default: float) -> float:
@@ -74,6 +70,7 @@ def _quote_cache(kis: Any) -> dict[str, dict[str, Any]]:
 
 
 def _remember_quote(kis: Any, code: Any, quote: Any, *, source: str) -> None:
+    """Remember only a currently tradeable canonical snapshot."""
     normalized = _normalize_code(code)
     if not normalized or not isinstance(quote, dict):
         return
@@ -116,7 +113,10 @@ def _build_price_snapshot_capture(original: Callable[..., Any]) -> Callable[...,
     return captured
 
 
-def _resolve_authoritative_pretrade_quote(kis: Any, code: Any) -> tuple[dict[str, Any] | None, str, float | None, str]:
+def _resolve_authoritative_pretrade_quote(
+    kis: Any,
+    code: Any,
+) -> tuple[dict[str, Any] | None, str, float | None, str]:
     cached, source, age = _fresh_cached_quote(kis, code)
     if cached is not None:
         return cached, source, age, "ok"
@@ -135,37 +135,6 @@ def _resolve_authoritative_pretrade_quote(kis: Any, code: Any) -> tuple[dict[str
         return quote, "refresh_invalid", 0.0, reason
     _remember_quote(kis, code, quote, source="pretrade_refresh")
     return dict(quote), "pretrade_refresh", 0.0, "ok"
-
-
-def _clear_pending_buy() -> None:
-    _STATE.pending_pb1_buy = None
-
-
-def _set_pending_buy(*, kis: Any, code: Any, stage: str, quote_source: str, quote_age: float | None, candidate_limit: float | None) -> None:
-    _STATE.pending_pb1_buy = {
-        "kis_id": id(kis),
-        "code": _normalize_code(code),
-        "stage": str(stage or ""),
-        "created_monotonic": time.monotonic(),
-        "quote_source": str(quote_source or "unknown"),
-        "quote_age_sec": quote_age,
-        "candidate_limit": float(candidate_limit) if candidate_limit not in (None, "") else None,
-    }
-
-
-def _pending_buy_for(kis: Any, code: Any) -> dict[str, Any] | None:
-    pending = getattr(_STATE, "pending_pb1_buy", None)
-    if not isinstance(pending, dict):
-        return None
-    if pending.get("kis_id") != id(kis) or pending.get("code") != _normalize_code(code):
-        return None
-    try:
-        age = max(0.0, time.monotonic() - float(pending.get("created_monotonic") or 0.0))
-    except Exception:
-        return None
-    if age > _pretrade_quote_max_age_sec():
-        return None
-    return pending
 
 
 def _append_pretrade_skip(
@@ -202,6 +171,7 @@ def _append_pretrade_skip(
 
 
 def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Callable[..., bool]:
+    """Replace only PB1-standard BUY quote acquisition; preserve all other gates."""
     @functools.wraps(original)
     def guarded(
         self,
@@ -228,10 +198,9 @@ def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Cal
                 stage=stage,
             )
 
-        _clear_pending_buy()
-
-        # Preserve all existing live-gate/order-precheck policy. The original
-        # returns before market-data I/O when these reasons are present.
+        # Current PB1 pretrade has policy/live-gate checks before its legacy
+        # validate_tradeable() call. Preserve those exactly by letting the
+        # original return when any gate is active.
         gate_fn = getattr(self, "_order_precheck_gate_reasons", None)
         if callable(gate_fn):
             try:
@@ -288,80 +257,17 @@ def _build_pb1_pretrade_shared_quote_guard(original: Callable[..., bool]) -> Cal
             )
             return False
 
-        candidate_limit: float | None = None
-        calc = getattr(self, "_calc_order_price", None)
-        if callable(calc):
-            try:
-                candidate_limit, _candidate_source = calc(_normalize_code(code), quote, None)
-                if candidate_limit is not None:
-                    candidate_limit = float(candidate_limit)
-                    if not math.isfinite(candidate_limit) or candidate_limit <= 0:
-                        candidate_limit = None
-            except Exception:
-                logger.exception("[KR_P1][PRETRADE_LIMIT_REFRESH_FAIL] code=%s", _normalize_code(code))
-                candidate_limit = None
-
-        _set_pending_buy(
-            kis=kis,
-            code=code,
-            stage=stage,
-            quote_source=source,
-            quote_age=age,
-            candidate_limit=candidate_limit,
-        )
+        # Do not mutate price/qty here. The durable BUY intent was already
+        # persisted by PB1 before pretrade, so rewriting broker economics here
+        # would violate the immutable order contract.
         logger.info(
-            "[KR_P1][PRETRADE_QUOTE_OK] code=%s source=%s age_sec=%s candidate_limit=%s",
+            "[KR_P1][PRETRADE_QUOTE_OK] code=%s source=%s age_sec=%s durable_price_unchanged=%s",
             _normalize_code(code),
             source,
             "NA" if age is None else f"{age:.3f}",
-            "NA" if candidate_limit is None else f"{candidate_limit:.2f}",
+            price,
         )
         return True
-
-    return guarded
-
-
-def _build_pb1_limit_buy_quote_cap(original: Callable[..., Any]) -> Callable[..., Any]:
-    @functools.wraps(original)
-    def guarded(self, pdno: str, qty: int, price: int, *args: Any, **kwargs: Any):
-        final_price: int | float = price
-        pending = _pending_buy_for(self, pdno)
-        try:
-            if pending is not None:
-                candidate = pending.get("candidate_limit")
-                try:
-                    original_norm, _ = normalize_kr_order_price(float(price or 0), side="BUY")
-                except Exception:
-                    original_norm = 0
-                try:
-                    candidate_norm, _ = normalize_kr_order_price(float(candidate or 0), side="BUY")
-                except Exception:
-                    candidate_norm = 0
-                if original_norm > 0 and candidate_norm > 0:
-                    # Never raise the strategy-generated BUY limit/notional.
-                    final_price = min(original_norm, candidate_norm)
-                    logger.info(
-                        "[KR_P1][BUY_LIMIT_SHARED_QUOTE] code=%s original=%s refreshed=%s final=%s source=%s",
-                        _normalize_code(pdno),
-                        original_norm,
-                        candidate_norm,
-                        final_price,
-                        pending.get("quote_source"),
-                    )
-            return original(self, pdno, qty, final_price, *args, **kwargs)
-        finally:
-            _clear_pending_buy()
-
-    return guarded
-
-
-def _build_pb1_market_buy_context_clear(original: Callable[..., Any]) -> Callable[..., Any]:
-    @functools.wraps(original)
-    def guarded(self, pdno: str, qty: int, *args: Any, **kwargs: Any):
-        try:
-            return original(self, pdno, qty, *args, **kwargs)
-        finally:
-            _clear_pending_buy()
 
     return guarded
 
@@ -371,8 +277,8 @@ def _apply_live_session_budget_contract() -> None:
     if session not in {"am", "afternoon", "pm"}:
         return
 
-    # Upgrade only known legacy/default values so explicit operator overrides
-    # remain respected.
+    # Upgrade only known legacy/default values so an explicit operator override
+    # remains respected. The production AM/PM WSL wrappers currently export 90.
     timeout_raw = str(os.getenv("PB1_TICK_HARD_TIMEOUT_SEC") or "").strip()
     if timeout_raw in {"", "90", "90.0"}:
         os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] = "180"
@@ -415,10 +321,5 @@ def install_kr_20260930_runtime_integrity() -> None:
             pb1_engine.PB1Engine._pretrade_check
         )
         pb1_engine.PB1Engine._kr_p1_20260930_pretrade_quote_installed = True
-
-    if not getattr(KisAPI, "_kr_p1_20260930_buy_limit_quote_cap_installed", False):
-        KisAPI.buy_stock_limit = _build_pb1_limit_buy_quote_cap(KisAPI.buy_stock_limit)
-        KisAPI.buy_stock_market = _build_pb1_market_buy_context_clear(KisAPI.buy_stock_market)
-        KisAPI._kr_p1_20260930_buy_limit_quote_cap_installed = True
 
     _INSTALLED = True
