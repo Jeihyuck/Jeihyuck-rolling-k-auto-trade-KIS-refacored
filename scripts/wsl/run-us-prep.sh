@@ -27,7 +27,7 @@ deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-mkdir -p runtime runtime/locks
+mkdir -p runtime runtime/locks runtime/health
 
 if [[ -f .env ]]; then
   set -a
@@ -119,4 +119,37 @@ if [[ "${US_OFFLINE:-0}" == "1" ]]; then
   cmd+=(--offline)
 fi
 
+set +e
 "${cmd[@]}" >> "$LOG_FILE" 2>&1
+prep_rc=$?
+set -e
+
+# A preflight may have written EXIT_ONLY while a genuine recovery PREP was still
+# STARTED. Remove that marker only after this PREP has finished successfully and
+# the canonical artifact proves a same-day effective contract. Entry policy is
+# not changed; an entry-blocked OK_WITH_WARNINGS_* contract remains entry-blocked.
+if [[ "$prep_rc" == 0 ]]; then
+  set +e
+  "$PYTHON_BIN" - "$NULLIM_TRADE_DATE" <<'PY' >> "$LOG_FILE" 2>&1
+import sys
+from pathlib import Path
+trade_date = sys.argv[1]
+from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
+from trader.us.prep_effective import is_effective_prep_contract
+contract = load_us_prep_contract(trade_date) or {}
+rows = load_us_final30_scored(trade_date) or []
+if not is_effective_prep_contract(contract, rows, trade_date=trade_date, min_rows=10):
+    raise SystemExit(1)
+marker = Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
+if marker.exists():
+    marker.unlink()
+    print(f"[US_PREP][CLEAR_STALE_EXIT_ONLY] trade_date={trade_date} marker={marker}")
+raise SystemExit(0)
+PY
+  cleanup_rc=$?
+  set -e
+  if [[ "$cleanup_rc" != 0 ]]; then
+    echo "[US_PREP][POST_COMPLETE_CONTRACT_CHECK] status=NOT_EFFECTIVE marker_preserved=1" >> "$LOG_FILE"
+  fi
+fi
+exit "$prep_rc"
