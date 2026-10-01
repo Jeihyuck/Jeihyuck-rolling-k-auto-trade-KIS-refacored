@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def _safe_float(value: Any, default: float | None = None) -> float | None:
     """안전한 float 변환. 변환 불가 시 default 반환."""
     if value is None:
@@ -51,7 +50,6 @@ def _normalize_symbol(symbol: Any) -> str:
 # ---------------------------------------------------------------------------
 # Entry price resolution helpers
 # ---------------------------------------------------------------------------
-
 def _resolve_entry_price_from_position(pos: dict) -> tuple[float | None, str]:
     """position dict에서 직접 entry_price 추출.
 
@@ -139,7 +137,6 @@ def _resolve_entry_price_from_pnl_rate(pos: dict) -> tuple[float | None, str]:
 # ---------------------------------------------------------------------------
 # DB-backed fallbacks (us_positions / us_fills)
 # ---------------------------------------------------------------------------
-
 def _resolve_from_us_positions_db(
     symbol: str,
     as_of: str | None,
@@ -179,7 +176,6 @@ def _resolve_from_us_fills_db(
 # ---------------------------------------------------------------------------
 # Single position enrichment
 # ---------------------------------------------------------------------------
-
 def _enrich_single_position(
     pos: dict,
     *,
@@ -187,8 +183,8 @@ def _enrich_single_position(
 ) -> dict:
     """단일 position의 entry_price를 표준 contract로 채운다.
 
-    이미 유효한 entry_price가 있으면 그대로 반환.
-    없으면 순서대로 fallback을 시도한다.
+    이미 유효한 entry_price가 있으면 그대로 유지하되 lifecycle timing은
+    항상 복원한다. 없으면 순서대로 fallback을 시도한다.
     """
     symbol = _normalize_symbol(pos.get("symbol", ""))
     exchange = str(pos.get("exchange") or "NASDAQ").strip() or "NASDAQ"
@@ -205,25 +201,17 @@ def _enrich_single_position(
             "entry_price_source": "qty_zero",
         }
 
-    # 이미 entry_price 있으면 source만 보정
+    # 기존 entry price/source가 있어도 여기서 return하지 않는다. DB position
+    # fast path 역시 cross-day lifecycle timing 복원을 반드시 거쳐야 한다.
     existing_ep = _safe_float(pos.get("entry_price"))
     existing_src = pos.get("entry_price_source") or ""
-    if existing_ep is not None and existing_ep > 0 and existing_src:
-        return {
-            **pos,
-            "symbol": symbol,
-            "exchange": exchange,
-            "qty": qty,
-            "entry_price": existing_ep,
-            "pnl_input_ok": True,
-        }
+    ep: float | None = existing_ep if existing_ep is not None and existing_ep > 0 and existing_src else None
+    src: str = str(existing_src) if ep is not None else ""
 
     # --- Resolution chain ---
-    ep: float | None = None
-    src: str = ""
-
     # 1-5: position 필드 직접
-    ep, src = _resolve_entry_price_from_position(pos)
+    if ep is None:
+        ep, src = _resolve_entry_price_from_position(pos)
 
     # 6: buy_amount_usd / qty
     if ep is None:
@@ -315,7 +303,6 @@ def _enrich_single_position(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 def enrich_us_positions_for_exit(
     positions: list[dict],
     *,
