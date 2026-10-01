@@ -131,16 +131,15 @@ export US_EARLY_BLOCK_ENTRY_WHEN_MAX_POSITIONS="${US_EARLY_BLOCK_ENTRY_WHEN_MAX_
 export US_SESSION_INTERVAL_SEC="${US_SESSION_INTERVAL_SEC:-300}"
 export US_WATCHLIST_LOAD_TIMEOUT_SEC="${US_WATCHLIST_LOAD_TIMEOUT_SEC:-20}"
 export US_ENTRY_EVAL_TIMEOUT_SEC="${US_ENTRY_EVAL_TIMEOUT_SEC:-120}"
-# Preserve the historical default token for compatibility, then migrate only
-# that legacy/default value. Explicit non-240 operator overrides are untouched.
+# Preserve the historical default token for compatibility.  Only the complete
+# legacy pair is migrated; if either value is a non-240 operator override,
+# leave both effective values alone so trade_session_runner's max() respects it.
 export US_TICK_TIMEOUT_SEC="${US_TICK_TIMEOUT_SEC:-240}"
 export US_TICK_TIMEOUT_MIN_SEC="${US_TICK_TIMEOUT_MIN_SEC:-240}"
 # Sep-30 live logs showed 209-237s of mandatory pre-entry work. The 240s
 # watchdog left <70s execution-tail reserve on every post-open completed tick.
-if [[ "${US_TICK_TIMEOUT_SEC}" == "240" ]]; then
+if [[ "${US_TICK_TIMEOUT_SEC}" == "240" && "${US_TICK_TIMEOUT_MIN_SEC}" == "240" ]]; then
   export US_TICK_TIMEOUT_SEC="360"
-fi
-if [[ "${US_TICK_TIMEOUT_MIN_SEC}" == "240" ]]; then
   export US_TICK_TIMEOUT_MIN_SEC="360"
 fi
 
