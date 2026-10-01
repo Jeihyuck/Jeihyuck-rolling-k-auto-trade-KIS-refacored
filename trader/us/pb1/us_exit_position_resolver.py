@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 def _safe_float(value: Any, default: float | None = None) -> float | None:
     """안전한 float 변환. 변환 불가 시 default 반환."""
     if value is None:
@@ -51,7 +50,6 @@ def _normalize_symbol(symbol: Any) -> str:
 # ---------------------------------------------------------------------------
 # Entry price resolution helpers
 # ---------------------------------------------------------------------------
-
 def _resolve_entry_price_from_position(pos: dict) -> tuple[float | None, str]:
     """position dict에서 직접 entry_price 추출.
 
@@ -139,7 +137,6 @@ def _resolve_entry_price_from_pnl_rate(pos: dict) -> tuple[float | None, str]:
 # ---------------------------------------------------------------------------
 # DB-backed fallbacks (us_positions / us_fills)
 # ---------------------------------------------------------------------------
-
 def _resolve_from_us_positions_db(
     symbol: str,
     as_of: str | None,
@@ -179,7 +176,6 @@ def _resolve_from_us_fills_db(
 # ---------------------------------------------------------------------------
 # Single position enrichment
 # ---------------------------------------------------------------------------
-
 def _enrich_single_position(
     pos: dict,
     *,
@@ -187,8 +183,8 @@ def _enrich_single_position(
 ) -> dict:
     """단일 position의 entry_price를 표준 contract로 채운다.
 
-    이미 유효한 entry_price가 있으면 그대로 반환.
-    없으면 순서대로 fallback을 시도한다.
+    이미 유효한 entry_price가 있으면 그대로 유지하되 lifecycle timing은
+    항상 복원한다. 없으면 순서대로 fallback을 시도한다.
     """
     symbol = _normalize_symbol(pos.get("symbol", ""))
     exchange = str(pos.get("exchange") or "NASDAQ").strip() or "NASDAQ"
@@ -205,25 +201,17 @@ def _enrich_single_position(
             "entry_price_source": "qty_zero",
         }
 
-    # 이미 entry_price 있으면 source만 보정
+    # 기존 entry price/source가 있어도 여기서 return하지 않는다. DB position
+    # fast path 역시 cross-day lifecycle timing 복원을 반드시 거쳐야 한다.
     existing_ep = _safe_float(pos.get("entry_price"))
     existing_src = pos.get("entry_price_source") or ""
-    if existing_ep is not None and existing_ep > 0 and existing_src:
-        return {
-            **pos,
-            "symbol": symbol,
-            "exchange": exchange,
-            "qty": qty,
-            "entry_price": existing_ep,
-            "pnl_input_ok": True,
-        }
+    ep: float | None = existing_ep if existing_ep is not None and existing_ep > 0 and existing_src else None
+    src: str = str(existing_src) if ep is not None else ""
 
     # --- Resolution chain ---
-    ep: float | None = None
-    src: str = ""
-
     # 1-5: position 필드 직접
-    ep, src = _resolve_entry_price_from_position(pos)
+    if ep is None:
+        ep, src = _resolve_entry_price_from_position(pos)
 
     # 6: buy_amount_usd / qty
     if ep is None:
@@ -268,21 +256,29 @@ def _enrich_single_position(
             pos.get("pnl_rate"),
         )
 
-    # high-watermark fallback priority: persisted lifecycle > position fields > current/entry.
+    # Persisted lifecycle timing and high-watermark are independent authorities.
+    # Restore timing even when a historical row lacks a high-watermark value.
     try:
         from trader.us.db.repos import load_latest_us_position_risk_state
         latest = load_latest_us_position_risk_state(symbol, trade_date) if trade_date else {}
         lifecycle = ((latest.get("state") or {}).get("lifecycle") or {}) if isinstance(latest.get("state"), dict) else {}
-        hwm = _safe_float(lifecycle.get("high_watermark"))
-        if hwm is not None and hwm > 0:
-            enriched["high_watermark"] = hwm
-            enriched["max_price"] = hwm
-            enriched["high_watermark_source"] = "us_position_risk_state"
+        if lifecycle:
             enriched["position_lifecycle_id"] = lifecycle.get("lifecycle_id") or enriched.get("position_lifecycle_id")
             enriched["opened_trade_date"] = lifecycle.get("opened_trade_date") or enriched.get("opened_trade_date")
             enriched["opened_at"] = lifecycle.get("opened_at") or enriched.get("opened_at")
             enriched["opened_at_source"] = lifecycle.get("opened_at_source") or enriched.get("opened_at_source")
             enriched["holding_trade_days"] = lifecycle.get("holding_trade_days") or enriched.get("holding_trade_days")
+            # `us_positions.created_at` is a durable row timestamp, not the BUY
+            # lifecycle start. The exit router checks `entry_time` first, so bind
+            # it to the authoritative lifecycle/fill timestamp.
+            if lifecycle.get("opened_at"):
+                enriched["entry_time"] = lifecycle.get("opened_at")
+                enriched["entry_time_source"] = lifecycle.get("opened_at_source") or "us_position_risk_state"
+        hwm = _safe_float(lifecycle.get("high_watermark"))
+        if hwm is not None and hwm > 0:
+            enriched["high_watermark"] = hwm
+            enriched["max_price"] = hwm
+            enriched["high_watermark_source"] = "us_position_risk_state"
     except Exception as exc:
         logger.debug("[US_EXIT_RESOLVER][HWM_FAIL] symbol=%s err=%s", symbol, exc)
     if not enriched.get("max_price") and not enriched.get("high_watermark"):
@@ -307,7 +303,6 @@ def _enrich_single_position(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 def enrich_us_positions_for_exit(
     positions: list[dict],
     *,
