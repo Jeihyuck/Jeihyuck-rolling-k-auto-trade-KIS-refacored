@@ -72,6 +72,10 @@ def test_cross_day_lifecycle_time_beats_same_day_position_row_created_at(monkeyp
             {
                 "symbol": "LITE",
                 "qty": 1,
+                # Reconcile-skip DB rows already carry a resolved price/source;
+                # this used to trigger the early return before lifecycle timing.
+                "entry_price": 949.55,
+                "entry_price_source": "us_positions_avg_cost",
                 "avg_cost": 949.55,
                 "current_px": 969.0483,
                 # This is the persisted row creation/update lineage, not the BUY.
@@ -84,6 +88,7 @@ def test_cross_day_lifecycle_time_beats_same_day_position_row_created_at(monkeyp
 
     assert meta["ok"] == 1
     position = rows[0]
+    assert position["entry_price_source"] == "us_positions_avg_cost"
     assert position["opened_at"] == opened_at
     assert position["entry_time"] == opened_at
     assert position["entry_time_source"] == "confirmed_buy_fill"
