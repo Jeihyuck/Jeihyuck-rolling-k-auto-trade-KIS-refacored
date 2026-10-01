@@ -283,6 +283,14 @@ def _enrich_single_position(
             enriched["opened_at"] = lifecycle.get("opened_at") or enriched.get("opened_at")
             enriched["opened_at_source"] = lifecycle.get("opened_at_source") or enriched.get("opened_at_source")
             enriched["holding_trade_days"] = lifecycle.get("holding_trade_days") or enriched.get("holding_trade_days")
+            # `us_positions.created_at` is a durable row timestamp, not the BUY
+            # lifecycle start.  The exit router checks `entry_time` before
+            # `created_at`, so bind it explicitly to the authoritative persisted
+            # lifecycle.  This prevents reconcile-skip ticks from treating an
+            # old holding as a same-day position.
+            if lifecycle.get("opened_at"):
+                enriched["entry_time"] = lifecycle.get("opened_at")
+                enriched["entry_time_source"] = lifecycle.get("opened_at_source") or "us_position_risk_state"
     except Exception as exc:
         logger.debug("[US_EXIT_RESOLVER][HWM_FAIL] symbol=%s err=%s", symbol, exc)
     if not enriched.get("max_price") and not enriched.get("high_watermark"):
