@@ -118,8 +118,16 @@ export US_EARLY_BLOCK_ENTRY_WHEN_MAX_POSITIONS="${US_EARLY_BLOCK_ENTRY_WHEN_MAX_
 export US_SESSION_INTERVAL_SEC="${US_SESSION_INTERVAL_SEC:-300}"
 export US_WATCHLIST_LOAD_TIMEOUT_SEC="${US_WATCHLIST_LOAD_TIMEOUT_SEC:-20}"
 export US_ENTRY_EVAL_TIMEOUT_SEC="${US_ENTRY_EVAL_TIMEOUT_SEC:-120}"
-export US_TICK_TIMEOUT_SEC="${US_TICK_TIMEOUT_SEC:-240}"
-export US_TICK_TIMEOUT_MIN_SEC="${US_TICK_TIMEOUT_MIN_SEC:-240}"
+# Sep-30 live logs showed 209-237s of mandatory pre-entry work.  The legacy
+# 240s watchdog left <70s execution-tail reserve on every post-open tick and
+# starved PB1 entry evaluation.  Upgrade only the documented legacy/default
+# value; an explicit non-legacy operator override remains authoritative.
+if [[ -z "${US_TICK_TIMEOUT_SEC:-}" || "${US_TICK_TIMEOUT_SEC}" == "240" ]]; then
+  export US_TICK_TIMEOUT_SEC="360"
+fi
+if [[ -z "${US_TICK_TIMEOUT_MIN_SEC:-}" || "${US_TICK_TIMEOUT_MIN_SEC}" == "240" ]]; then
+  export US_TICK_TIMEOUT_MIN_SEC="360"
+fi
 
 # US account capital / capital deployment
 export US_PAPER_MAX_CAPITAL_KRW="${US_PAPER_MAX_CAPITAL_KRW:-300000000}"
