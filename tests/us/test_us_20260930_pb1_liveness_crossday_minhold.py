@@ -17,18 +17,22 @@ def test_sep30_legacy_tick_budget_upgrade_preserves_execution_tail(monkeypatch):
     monkeypatch.setenv("US_EXECUTION_TAIL_RESERVE_SEC", "70")
 
     # Sep-30 completed ticks reached entry with 0~51s left under the 240s
-    # watchdog.  The AM/afternoon legacy upgrade adds 120s without changing
+    # watchdog. The AM/afternoon legacy upgrade adds 120s without changing
     # the 70s broker/execution tail reserve or the 120s configured entry cap.
     assert budgeted_entry_timeout_sec(Ctx(120.0), 120.0) == 50.0
     assert budgeted_entry_timeout_sec(Ctx(171.0), 120.0) == 101.0
 
 
-def test_wsl_am_afternoon_upgrade_only_legacy_240_timeout_contract():
+def test_wsl_am_afternoon_upgrade_only_complete_legacy_240_pair():
+    joint_guard = 'if [[ "${US_TICK_TIMEOUT_SEC}" == "240" && "${US_TICK_TIMEOUT_MIN_SEC}" == "240" ]]; then'
     for path in (Path("scripts/wsl/run-us-am.sh"), Path("scripts/wsl/run-us-afternoon.sh")):
         text = path.read_text(encoding="utf-8")
-        assert '"${US_TICK_TIMEOUT_SEC}" == "240"' in text
+        # Preserve the historical default token required by older deployment
+        # contracts, then migrate only when both effective values are legacy.
+        assert 'US_TICK_TIMEOUT_SEC="${US_TICK_TIMEOUT_SEC:-240}"' in text
+        assert 'US_TICK_TIMEOUT_MIN_SEC="${US_TICK_TIMEOUT_MIN_SEC:-240}"' in text
+        assert joint_guard in text
         assert 'export US_TICK_TIMEOUT_SEC="360"' in text
-        assert '"${US_TICK_TIMEOUT_MIN_SEC}" == "240"' in text
         assert 'export US_TICK_TIMEOUT_MIN_SEC="360"' in text
         # Do not weaken the entry timeout or execution-tail policy in wrappers.
         assert 'US_ENTRY_EVAL_TIMEOUT_SEC="${US_ENTRY_EVAL_TIMEOUT_SEC:-120}"' in text
@@ -36,6 +40,7 @@ def test_wsl_am_afternoon_upgrade_only_legacy_240_timeout_contract():
     close = Path("scripts/wsl/run-us-close.sh").read_text(encoding="utf-8")
     assert 'US_TICK_TIMEOUT_SEC="${US_TICK_TIMEOUT_SEC:-240}"' in close
     assert 'US_TICK_TIMEOUT_MIN_SEC="${US_TICK_TIMEOUT_MIN_SEC:-240}"' in close
+    assert joint_guard not in close
 
 
 def test_cross_day_lifecycle_time_beats_same_day_position_row_created_at(monkeypatch):
