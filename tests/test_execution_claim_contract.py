@@ -140,6 +140,163 @@ def test_partial_cancel_preserves_cumulative_fill_and_only_remaining_target():
     assert repo.get(identity).cumulative_filled_qty == 4
 
 
+def test_entry_retry_reuses_partial_action_across_dates_and_only_remaining_qty():
+    _, repo = _repo()
+    lifecycle = "PB1_ENTRY:strategy:KR:1:sample-symbol"
+    first = _identity(stage="BUY_ENTRY:PB1:attempt-1", lifecycle=lifecycle)
+    assert repo.acquire(first, attempt_id="entry-1", requested_qty=10).acquired
+    repo.record_observation(
+        first,
+        attempt_id="entry-1",
+        state="CANCELLED_PARTIAL_FILL",
+        cumulative_filled_qty=3,
+        authoritative=True,
+    )
+
+    next_day = SemanticActionIdentity(
+        env=first.env,
+        account_id=first.account_id,
+        market=first.market,
+        trading_epoch_id=first.trading_epoch_id,
+        strategy_owner=first.strategy_owner,
+        lifecycle_id=first.lifecycle_id,
+        action="BUY_ENTRY:PB1:attempt-2",
+        trade_date=date(2026, 10, 5),
+    )
+    prior_action = repo.find_retryable_action(
+        next_day,
+        action_prefix="BUY_ENTRY:PB1",
+    )
+
+    assert prior_action == first.action.upper()
+    stale_worker = repo.acquire(
+        next_day,
+        attempt_id="stale-entry-worker",
+        requested_qty=10,
+        fresh_validation=True,
+        retry_action_prefix="BUY_ENTRY:PB1",
+    )
+    assert not stale_worker.acquired
+    assert stale_worker.reason == "retryable_lifecycle_action_exists"
+    retry = SemanticActionIdentity(
+        env=next_day.env,
+        account_id=next_day.account_id,
+        market=next_day.market,
+        trading_epoch_id=next_day.trading_epoch_id,
+        strategy_owner=next_day.strategy_owner,
+        lifecycle_id=next_day.lifecycle_id,
+        action=prior_action,
+        trade_date=next_day.trade_date,
+    )
+    assert repo.acquire(
+        retry,
+        attempt_id="entry-2",
+        requested_qty=7,
+        fresh_validation=True,
+    ).acquired
+
+
+def test_new_entry_generation_is_blocked_while_previous_submit_is_unresolved():
+    _, repo = _repo()
+    lifecycle = "PB1_ENTRY:strategy:KR:1:sample-symbol"
+    first = _identity(stage="BUY_ENTRY:PB1:attempt-1", lifecycle=lifecycle)
+    assert repo.acquire(first, attempt_id="entry-1", requested_qty=10).acquired
+    repo.record_observation(
+        first,
+        attempt_id="entry-1",
+        state="UNRESOLVED",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+
+    next_generation = SemanticActionIdentity(
+        env=first.env,
+        account_id=first.account_id,
+        market=first.market,
+        trading_epoch_id=first.trading_epoch_id,
+        strategy_owner=first.strategy_owner,
+        lifecycle_id=lifecycle,
+        action="BUY_ENTRY:PB1:attempt-2",
+        trade_date=date(2026, 10, 5),
+    )
+    assert repo.find_retryable_action(
+        next_generation,
+        action_prefix="BUY_ENTRY:PB1",
+    ) is None
+    blocked = repo.acquire(
+        next_generation,
+        attempt_id="entry-2",
+        requested_qty=10,
+        fresh_validation=True,
+    )
+    assert not blocked.acquired
+    assert blocked.reason == "unresolved_lifecycle_action"
+
+
+def test_orders_repo_reuses_retryable_entry_action_across_trade_dates():
+    from trader.account_state import get_account_key
+    from trader.db.repos import OrdersRepo
+    from trader.db.schema import schema_for_engine
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    env = "practice"
+    account_id = get_account_key(env=env)
+    epoch_id = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(
+            schema.trading_epochs.insert().values(
+                trading_epoch_id=epoch_id,
+                env=env,
+                account_id=account_id,
+                status="ACTIVE",
+                reason="unit test",
+            )
+        )
+
+    orders_repo = OrdersRepo(engine)
+    lifecycle = "PB1_ENTRY:strategy:KR:1:sample-symbol"
+    first_identity, first_claim = orders_repo.claim_execution_action(
+        env=env,
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=lifecycle,
+        action="BUY_ENTRY:PB1",
+        trade_date=date(2026, 10, 2),
+        attempt_id="pb1-entry-1",
+        requested_qty=10,
+        client_order_key="entry-2026-10-02",
+        fresh_validation=True,
+        retry_action_prefix="BUY_ENTRY:PB1",
+    )
+    assert first_claim.acquired
+    orders_repo.record_execution_claim_for_order(
+        "entry-2026-10-02",
+        state="CANCELLED_PARTIAL_FILL",
+        cumulative_filled_qty=3,
+        authoritative=True,
+    )
+
+    next_identity, retry_claim = orders_repo.claim_execution_action(
+        env=env,
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=lifecycle,
+        action="BUY_ENTRY:PB1",
+        trade_date=date(2026, 10, 5),
+        attempt_id="pb1-entry-2",
+        requested_qty=7,
+        client_order_key="entry-2026-10-05",
+        fresh_validation=True,
+        retry_action_prefix="BUY_ENTRY:PB1",
+    )
+
+    assert retry_claim.acquired
+    assert next_identity.action == first_identity.action
+    assert next_identity.action_key == first_identity.action_key
+
+
 def test_unresolved_sell_stage_blocks_overlapping_emergency_until_broker_truth():
     _, repo = _repo()
     lifecycle = "cycle-sell-overlap"

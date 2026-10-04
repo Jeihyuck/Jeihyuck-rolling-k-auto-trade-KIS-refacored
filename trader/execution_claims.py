@@ -111,6 +111,7 @@ class DurableExecutionClaimRepo:
         requested_qty: int,
         fresh_validation: bool = False,
         client_order_key: str | None = None,
+        retry_action_prefix: str | None = None,
     ) -> ExecutionClaim:
         qty = int(requested_qty)
         if qty <= 0 or not str(attempt_id or "").strip():
@@ -157,6 +158,35 @@ class DurableExecutionClaimRepo:
                     signed=True,
                 )
                 conn.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_id)))
+            if retry_action_prefix:
+                prefix = str(retry_action_prefix).strip().upper()
+                retryable_sibling = conn.execute(
+                    sa.select(action.c.action_key)
+                    .where(
+                        action.c.action_key != key,
+                        action.c.env == identity.env.strip().lower(),
+                        action.c.account_id == identity.account_id.strip(),
+                        action.c.market == identity.market.strip().upper(),
+                        action.c.trading_epoch_id == identity.trading_epoch_id.strip(),
+                        action.c.strategy_owner == identity.strategy_owner.strip().upper(),
+                        action.c.lifecycle_id == identity.lifecycle_id.strip(),
+                        sa.or_(
+                            action.c.action == prefix,
+                            sa.func.substr(action.c.action, 1, len(prefix) + 1)
+                            == f"{prefix}:",
+                        ),
+                        action.c.action_state.in_(
+                            ("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")
+                        ),
+                        action.c.active_attempt_id.is_(None),
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+                if retryable_sibling is not None:
+                    self._record_conflict(conn, str(retryable_sibling))
+                    return ExecutionClaim(
+                        False, key, reason="retryable_lifecycle_action_exists",
+                    )
             active_sibling = conn.execute(
                 sa.select(action.c.action_key)
                 .where(
@@ -409,6 +439,40 @@ class DurableExecutionClaimRepo:
     @staticmethod
     def _action_key(identity: SemanticActionIdentity | str) -> str:
         return identity.action_key if isinstance(identity, SemanticActionIdentity) else str(identity)
+
+    def find_retryable_action(
+        self,
+        identity: SemanticActionIdentity,
+        *,
+        action_prefix: str,
+    ) -> str | None:
+        prefix = str(action_prefix or "").strip().upper()
+        if not prefix:
+            raise ValueError("retryable action lookup requires an action prefix")
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                sa.select(self.actions.c.action)
+                .where(
+                    self.actions.c.env == identity.env.strip().lower(),
+                    self.actions.c.account_id == identity.account_id.strip(),
+                    self.actions.c.market == identity.market.strip().upper(),
+                    self.actions.c.trading_epoch_id == identity.trading_epoch_id.strip(),
+                    self.actions.c.strategy_owner == identity.strategy_owner.strip().upper(),
+                    self.actions.c.lifecycle_id == identity.lifecycle_id.strip(),
+                    sa.or_(
+                        self.actions.c.action == prefix,
+                        sa.func.substr(self.actions.c.action, 1, len(prefix) + 1)
+                        == f"{prefix}:",
+                    ),
+                    self.actions.c.action_state.in_(
+                        ("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")
+                    ),
+                    self.actions.c.active_attempt_id.is_(None),
+                )
+                .order_by(self.actions.c.updated_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        return str(row) if row is not None else None
 
     def get(self, identity: SemanticActionIdentity | str) -> ExecutionClaimSnapshot:
         key = self._action_key(identity)

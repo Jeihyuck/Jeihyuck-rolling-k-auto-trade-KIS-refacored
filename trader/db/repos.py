@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 import hashlib
 import json
@@ -2873,6 +2874,7 @@ class OrdersRepo:
         requested_qty: int,
         client_order_key: str,
         fresh_validation: bool,
+        retry_action_prefix: str | None = None,
     ):
         from trader.account_state import get_account_key, resolve_env_name
         from trader.db.trading_epoch import active_trading_epoch_id
@@ -2890,15 +2892,26 @@ class OrdersRepo:
             trading_epoch_id=str(epoch_id),
             strategy_owner=strategy_owner,
             lifecycle_id=str(lifecycle_id),
-            action=str(action),
+            action=str(action).strip().upper(),
             trade_date=trade_date,
         )
+        if retry_action_prefix:
+            prefix = str(retry_action_prefix).strip().upper()
+            retryable_action = self._execution_claim_repo.find_retryable_action(
+                identity,
+                action_prefix=prefix,
+            )
+            identity = replace(
+                identity,
+                action=retryable_action or f"{prefix}:{uuid4()}".upper(),
+            )
         claim = self._execution_claim_repo.acquire(
             identity,
             attempt_id=attempt_id,
             requested_qty=requested_qty,
             client_order_key=client_order_key,
             fresh_validation=fresh_validation,
+            retry_action_prefix=retry_action_prefix,
         )
         return identity, claim
 

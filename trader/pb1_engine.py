@@ -10362,6 +10362,7 @@ class PB1Engine:
         lifecycle_id: str,
         action: str,
         requested_qty: int,
+        retry_action_prefix: str | None = None,
     ):
         claim_day = self._today
         if isinstance(claim_day, datetime):
@@ -10379,6 +10380,7 @@ class PB1Engine:
             requested_qty=requested_qty,
             client_order_key=client_order_key,
             fresh_validation=True,
+            retry_action_prefix=retry_action_prefix,
         )
 
     def _record_pb1_submit_observation(
@@ -10983,12 +10985,13 @@ class PB1Engine:
                 lifecycle_id=str(
                     entry_meta.get("position_lifecycle_id")
                     or cf.features.get("position_lifecycle_id")
-                    or cf.client_order_key
-                    or effective_client_order_key
-                    or ""
+                    or (
+                        f"PB1_ENTRY:{self.STRATEGY_NAME}:{cf.market}:{cf.mode}:{cf.code}"
+                    )
                 ),
                 action=f"BUY_ENTRY:{stage}",
                 requested_qty=int(qty or 0),
+                retry_action_prefix=f"BUY_ENTRY:{stage}",
             )
         except Exception as claim_exc:
             logger.exception(
@@ -12028,12 +12031,11 @@ class PB1Engine:
                 lifecycle_id=str(
                     entry_meta.get("position_lifecycle_id")
                     or cf.features.get("position_lifecycle_id")
-                    or cf.client_order_key
-                    or effective_client_order_key
-                    or ""
+                    or f"PB1_ENTRY:{self.STRATEGY_NAME}:{cf.market}:{cf.mode}:{cf.code}"
                 ),
                 action=f"BUY_CLOSE_ENTRY:{stage}",
                 requested_qty=int(cf.planned_qty or 0),
+                retry_action_prefix=f"BUY_CLOSE_ENTRY:{stage}",
             )
         except Exception:
             logger.exception("[PB1][CLOSE_ENTRY][EXECUTION_CLAIM_FAIL] key=%s",
