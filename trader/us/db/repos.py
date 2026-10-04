@@ -357,6 +357,68 @@ def _get_engine_or_none():
         return None
 
 
+def _execution_claim_repo():
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US_EXECUTION_CLAIM_DB_UNAVAILABLE")
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    return DurableExecutionClaimRepo(engine, us_execution_claims, us_execution_attempts)
+
+
+def claim_execution_action(identity: Any, *, attempt_id: str, requested_qty: int,
+                           fresh_validation: bool = False,
+                           client_order_key: str | None = None):
+    return _execution_claim_repo().acquire(
+        identity, attempt_id=attempt_id, requested_qty=requested_qty,
+        fresh_validation=fresh_validation, client_order_key=client_order_key,
+    )
+
+
+def record_execution_action_observation(identity: Any, *, attempt_id: str, state: str,
+                                        cumulative_filled_qty: int | None,
+                                        authoritative: bool):
+    return _execution_claim_repo().record_observation(
+        identity, attempt_id=attempt_id, state=state,
+        cumulative_filled_qty=cumulative_filled_qty,
+        authoritative=authoritative,
+    )
+
+
+def record_execution_action_observation_by_key(action_key: str, *, attempt_id: str, state: str,
+                                              cumulative_filled_qty: int | None,
+                                              authoritative: bool):
+    return record_execution_action_observation(
+        action_key, attempt_id=attempt_id, state=state,
+        cumulative_filled_qty=cumulative_filled_qty,
+        authoritative=authoritative,
+    )
+
+
+def record_execution_action_observation_for_client_order_key(
+    client_order_key: str, *, state: str, cumulative_filled_qty: int | None,
+    authoritative: bool,
+):
+    repo = _execution_claim_repo()
+    attempt = repo.find_attempt_for_client_order_key(client_order_key)
+    if attempt is None:
+        raise LookupError(f"execution claim attempt not found for client order key {client_order_key}")
+    action_key, attempt_id = attempt
+    return repo.record_observation(
+        action_key, attempt_id=attempt_id, state=state,
+        cumulative_filled_qty=cumulative_filled_qty,
+        authoritative=authoritative,
+    )
+
+
+def release_execution_action_before_submit(identity: Any, *, attempt_id: str) -> None:
+    _execution_claim_repo().release_before_submit(identity, attempt_id=attempt_id)
+
+
+def load_execution_claim_health() -> dict[str, int]:
+    return _execution_claim_repo().health()
+
+
 def _epoch_enforced() -> bool:
     from trader.db.trading_epoch import trading_epoch_enforced
     return trading_epoch_enforced()
@@ -1150,7 +1212,58 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         "submit_attempt_id": order_meta.get("submit_attempt_id"), "symbol": symbol,
         "side": side, "qty": requested_qty, "meta": order_meta},
         broker_order_no=raw_order_no, broker_status=status)
-    return {"status": "OK", "order_status": status}
+    claim_update_error = None
+    action_key = str(order_meta.get("execution_action_key") or "")
+    attempt_id = str(order_meta.get("submit_attempt_id") or "")
+    if action_key and attempt_id:
+        broker_fill_raw = next(
+            (
+                (raw_row or {}).get(name)
+                for name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
+                if (raw_row or {}).get(name) not in (None, "")
+            ),
+            None,
+        )
+        observation_qty = int(filled_qty) if broker_fill_raw is not None or int(filled_qty) > 0 else None
+        authoritative = status == "REJECTED" and int(filled_qty) == 0
+        if status == "CANCELLED":
+            authoritative = bool(
+                broker_requested_valid
+                and broker_requested_qty == int(requested_qty)
+                and broker_fill_raw is not None
+                and observation_qty is not None
+            )
+        claim_state = {
+            "ACK": "ACKED",
+            "OPEN": "ACKED",
+            "PARTIALLY_FILLED": "PARTIALLY_FILLED",
+            "FILLED": "FILLED",
+            "REJECTED": "REJECTED_EXPLICIT" if authoritative else "UNRESOLVED",
+            "CANCELLED": "CANCELLED",
+            "EXPIRED": "UNRESOLVED",
+        }[status]
+        if claim_state == "REJECTED_EXPLICIT":
+            observation_qty = 0
+        try:
+            record_execution_action_observation_by_key(
+                action_key, attempt_id=attempt_id, state=claim_state,
+                cumulative_filled_qty=observation_qty,
+                authoritative=authoritative,
+            )
+        except Exception as exc:
+            claim_update_error = str(exc)
+            logger.exception(
+                "[US_ORDER][EXECUTION_CLAIM][RECONCILE_UPDATE_FAILED] action_key=%s status=%s",
+                action_key, status,
+            )
+    result = {"status": "OK", "order_status": status}
+    if claim_update_error:
+        result.update({
+            "execution_claim_update_error": claim_update_error,
+            "requires_reconcile": True,
+            "retry_order": False,
+        })
+    return result
 
 
 def save_order_reject(order_result: dict, trade_date: str | None = None) -> bool:

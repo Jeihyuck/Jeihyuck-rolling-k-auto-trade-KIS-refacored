@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     action_key TEXT NOT NULL REFERENCES execution_claims(action_key),
     attempt_no INTEGER NOT NULL,
     requested_qty INTEGER NOT NULL CHECK (requested_qty > 0),
+    client_order_key TEXT,
     cumulative_filled_qty INTEGER,
     attempt_state TEXT NOT NULL,
     authoritative BOOLEAN NOT NULL DEFAULT FALSE,
@@ -33,6 +34,8 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
 
 CREATE INDEX IF NOT EXISTS ix_execution_claims_state
     ON execution_claims(action_state, updated_at);
+CREATE INDEX IF NOT EXISTS ix_execution_attempts_client_key
+    ON execution_attempts(client_order_key);
 
 CREATE TABLE IF NOT EXISTS us_execution_claims (
     action_key TEXT PRIMARY KEY,
@@ -59,6 +62,7 @@ CREATE TABLE IF NOT EXISTS us_execution_attempts (
     action_key TEXT NOT NULL REFERENCES us_execution_claims(action_key),
     attempt_no INTEGER NOT NULL,
     requested_qty INTEGER NOT NULL CHECK (requested_qty > 0),
+    client_order_key TEXT,
     cumulative_filled_qty INTEGER,
     attempt_state TEXT NOT NULL,
     authoritative BOOLEAN NOT NULL DEFAULT FALSE,
@@ -69,3 +73,5 @@ CREATE TABLE IF NOT EXISTS us_execution_attempts (
 
 CREATE INDEX IF NOT EXISTS ix_us_execution_claims_state
     ON us_execution_claims(action_state, updated_at);
+CREATE INDEX IF NOT EXISTS ix_us_execution_attempts_client_key
+    ON us_execution_attempts(client_order_key);

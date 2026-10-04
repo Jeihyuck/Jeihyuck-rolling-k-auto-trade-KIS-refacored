@@ -345,6 +345,57 @@ def _is_cash_insufficient_reject(msg: str) -> bool:
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
 
 
+def _semantic_action_identity(intent: dict, *, account_env: str):
+    from datetime import date
+    import hashlib
+    from trader.account_state import get_account_key
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.repos import _active_us_epoch
+
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    lifecycle_id = (
+        intent.get("position_lifecycle_id")
+        or meta.get("position_lifecycle_id")
+        or intent.get("position_cycle_id")
+        or meta.get("position_cycle_id")
+    )
+    side = str(intent.get("side") or "").upper()
+    if not lifecycle_id and side == "BUY":
+        lifecycle_id = f"ENTRY:{intent.get('client_order_key') or intent.get('order_key') or ''}"
+    if not lifecycle_id:
+        raise ValueError("semantic action requires a position lifecycle identity")
+    epoch_id = meta.get("trading_epoch_id") or intent.get("trading_epoch_id") or _active_us_epoch(required=True)
+    if not epoch_id:
+        raise RuntimeError("semantic action requires an active trading epoch")
+    action = (
+        meta.get("semantic_action")
+        or intent.get("semantic_action")
+        or meta.get("profit_capture_stage")
+        or intent.get("profit_capture_stage")
+        or intent.get("stage")
+        or intent.get("reason")
+        or meta.get("reason")
+        or ("ENTRY" if side == "BUY" else "")
+    )
+    if not action:
+        raise ValueError("semantic action stage is required")
+    try:
+        trade_date = date.fromisoformat(str(intent.get("trade_date") or ""))
+    except ValueError:
+        trade_date = None
+    account_hash = hashlib.sha256(get_account_key(env=account_env).encode("utf-8")).hexdigest()
+    return SemanticActionIdentity(
+        env=account_env,
+        account_id=account_hash,
+        market="US",
+        trading_epoch_id=str(epoch_id),
+        strategy_owner=str(intent.get("strategy_owner") or meta.get("strategy_owner") or ""),
+        lifecycle_id=str(lifecycle_id),
+        action=str(action),
+        trade_date=trade_date,
+    )
+
+
 def _cash_tick_key(trade_date: str | None, intent: dict | None = None) -> str:
     meta = (intent or {}).get("meta") if isinstance(intent, dict) else {}
     meta = meta if isinstance(meta, dict) else {}
@@ -572,18 +623,36 @@ _SEMANTIC_SELL_FAMILIES = frozenset({"DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRI
     "CLUSTER_EXPOSURE_TRIM", "PROFIT_CAPTURE", "TREND_EXIT", "TQQQ_INFINITE_TP"})
 
 
+def _semantic_sell_identity_stage(intent: dict, meta: dict, reason: str) -> tuple[str, str]:
+    family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in reason), reason)
+    stage = str(
+        meta.get("profit_capture_stage")
+        or intent.get("profit_capture_stage")
+        or meta.get("semantic_action")
+        or intent.get("semantic_action")
+        or ""
+    ).strip().upper()
+    if not stage:
+        import re
+        match = re.search(r"(?:^|_)(TP[1-3])(?:_|$)", reason)
+        if match:
+            stage = match.group(1)
+    return family, stage
+
+
 def same_day_semantic_sell_exists(intent: dict) -> bool:
     """Fence an economic SELL attempt independently of client-order-key retries."""
     if os.getenv("US_ALLOW_REPEAT_SEMANTIC_SELL", "0") == "1" or str(intent.get("side") or "").upper() != "SELL":
         return False
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
     reason = str(intent.get("reason") or meta.get("reason") or "").upper()
-    family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in reason), reason)
+    family, stage = _semantic_sell_identity_stage(intent, meta, reason)
     if family not in _SEMANTIC_SELL_FAMILIES:
         return False
     wanted = (str(intent.get("symbol") or "").upper(), "SELL",
               str(intent.get("strategy_owner") or meta.get("strategy_owner") or meta.get("book") or "").upper(),
-              family, str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or meta.get("cycle_id") or ""))
+              family, stage,
+              str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or meta.get("cycle_id") or ""))
     from trader.us.db.repos import load_us_daily_orders_for_report
     try:
         rows = load_us_daily_orders_for_report(str(intent.get("trade_date") or ""))
@@ -595,10 +664,20 @@ def same_day_semantic_sell_exists(intent: dict) -> bool:
     for row in rows:
         row_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
         row_reason = str(row.get("reason") or row_meta.get("reason") or "").upper()
-        row_family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in row_reason), row_reason)
+        row_family, row_stage = _semantic_sell_identity_stage(row, row_meta, row_reason)
+        row_status = str(row.get("status") or "").upper()
+        if row_status in {"REJECTED", "REJECTED_EXPLICIT"}:
+            continue
+        if (
+            row_status in {"CANCELLED", "CANCELED", "CANCELLED_ZERO_FILL"}
+            and row_meta.get("cancel_authoritative") is True
+            and int(row.get("qty_filled") or row_meta.get("cumulative_filled_qty") or 0) == 0
+        ):
+            continue
         actual = (str(row.get("symbol") or "").upper(), str(row.get("side") or "").upper(),
                   str(row.get("strategy_owner") or row_meta.get("strategy_owner") or row_meta.get("book") or "").upper(),
-                  row_family, str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
+                  row_family, row_stage,
+                  str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
         if actual == wanted:
             return True
     return False
@@ -1499,12 +1578,69 @@ def route_order(
         append_order_event("ORDER_FENCED", intent, context=context, broker_status="ORDER_FENCED_BEFORE_BROKER_SUBMIT")
         return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
                 "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+    try:
+        claim_identity = _semantic_action_identity(intent, account_env=account_env)
+        from trader.us.db.repos import claim_execution_action, record_execution_action_observation
+        claim = claim_execution_action(
+            claim_identity,
+            attempt_id=intent["submit_attempt_id"],
+            requested_qty=qty,
+            fresh_validation=True,
+            client_order_key=str(order_key or ""),
+        )
+        if not claim.acquired:
+            logger.error(
+                "[US_ORDER][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
+                claim.action_key, claim.reason,
+            )
+            return {
+                "status": "ORDER_FENCED_UNRESOLVED_ACTION",
+                "reason": claim.reason,
+                "execution_action_key": claim.action_key,
+                "broker_submit": False,
+                "retry_order": False,
+                "requires_reconcile": True,
+                "intent": intent,
+            }
+        intent.setdefault("meta", {})["execution_action_key"] = claim.action_key
+    except Exception as exc:
+        logger.critical("[US_ORDER][EXECUTION_CLAIM][UNAVAILABLE] broker_submit=blocked err=%s", exc)
+        return {
+            "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
+            "reason": "execution_claim_unavailable",
+            "execution_integrity_error": str(exc),
+            "broker_submit": False,
+            "retry_order": False,
+            "intent": intent,
+        }
+
+    def _record_claim_observation(state: str, filled_qty: int | None, *, authoritative: bool) -> None:
+        try:
+            record_execution_action_observation(
+                claim_identity, attempt_id=intent["submit_attempt_id"],
+                state=state, cumulative_filled_qty=filled_qty,
+                authoritative=authoritative,
+            )
+        except Exception:
+            logger.exception(
+                "[US_ORDER][EXECUTION_CLAIM][OBSERVATION_FAILED] action_key=%s state=%s",
+                claim.action_key, state,
+            )
+
     from trader.us.execution.order_journal import append_order_event
     try:
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
     except Exception as exc:
+        try:
+            from trader.us.db.repos import release_execution_action_before_submit
+            release_execution_action_before_submit(
+                claim_identity, attempt_id=intent["submit_attempt_id"],
+            )
+        except Exception:
+            logger.exception("[US_ORDER][EXECUTION_CLAIM][PRE_SUBMIT_RELEASE_FAILED] action_key=%s", claim.action_key)
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
         return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
+    _record_claim_observation("SUBMITTED", None, authoritative=False)
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
     logger.info(
         "[US_ORDER_SUBMIT_ATTEMPT] symbol=%s side=%s qty=%s limit_price=%.4f notional=%.4f",
@@ -1553,6 +1689,7 @@ def route_order(
         deterministic = is_no_balance_sell_reject(msg) or _is_cash_insufficient_reject(msg) or any(token in msg.lower() for token in ("invalid quantity", "invalid price", "업무 거절", "주문 불가"))
         if not deterministic:
             append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response={"error": msg})
+            _record_claim_observation("UNRESOLVED", None, authoritative=False)
             return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "reason": msg, "kis_ack": False,
                     "broker_submit": True, "retry_order": False, "requires_reconcile": True,
                     "submit_attempt_id": intent["submit_attempt_id"], "intent": intent}
@@ -1570,6 +1707,7 @@ def route_order(
         }
         _persist_with_trade_date(save_order_reject, reject_result)
         append_order_event("ORDER_REJECTED", intent, context=context, broker_status="REJECTED", raw_response={"reason": msg})
+        _record_claim_observation("REJECTED_EXPLICIT", 0, authoritative=True)
         if order_key:
             mark_order_intent_rejected(order_key, reason=msg)
         return {
@@ -1590,10 +1728,12 @@ def route_order(
     except Exception as exc:
         logger.error("[US_ORDER][ACK_PARSE_FAILED] symbol=%s err=%s", symbol, exc)
         append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
+        _record_claim_observation("UNRESOLVED", None, authoritative=False)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
                 "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
     if not order_no:
         append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
+        _record_claim_observation("UNRESOLVED", None, authoritative=False)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
                 "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
     try:
@@ -1604,6 +1744,7 @@ def route_order(
         return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,
                 "broker_submit": True, "retry_order": False, "requires_reconcile": True,
                 "order_no": order_no, "intent": intent}
+    _record_claim_observation("ACKED", None, authoritative=False)
     logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
     if context is not None:
         context.invalidate_after_order(symbol)

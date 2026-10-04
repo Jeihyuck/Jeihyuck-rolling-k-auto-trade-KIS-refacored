@@ -42,12 +42,14 @@ def build_execution_claim_tables(
         sa.Column("action_key", sa.String(64), sa.ForeignKey(f"{action_name}.action_key"), nullable=False),
         sa.Column("attempt_no", sa.Integer, nullable=False),
         sa.Column("requested_qty", sa.Integer, nullable=False),
+        sa.Column("client_order_key", sa.String),
         sa.Column("cumulative_filled_qty", sa.Integer),
         sa.Column("attempt_state", sa.String, nullable=False),
         sa.Column("authoritative", sa.Boolean, nullable=False, server_default=sa.text("false")),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.UniqueConstraint("action_key", "attempt_no", name=f"uq_{attempt_name}_action_attempt"),
+        sa.Index(f"ix_{attempt_name}_client_key", "client_order_key"),
     )
     return actions, attempts
 
@@ -106,6 +108,7 @@ class DurableExecutionClaimRepo:
         attempt_id: str,
         requested_qty: int,
         fresh_validation: bool = False,
+        client_order_key: str | None = None,
     ) -> ExecutionClaim:
         qty = int(requested_qty)
         if qty <= 0 or not str(attempt_id or "").strip():
@@ -141,7 +144,7 @@ class DurableExecutionClaimRepo:
             ).scalar_one_or_none()
             if created is not None:
                 self._insert_attempt(
-                    conn, attempt, key, attempt_id, 1, qty,
+                    conn, attempt, key, attempt_id, 1, qty, client_order_key,
                 )
                 return ExecutionClaim(True, key, attempt_id)
 
@@ -153,7 +156,7 @@ class DurableExecutionClaimRepo:
             if row["active_attempt_id"]:
                 self._record_conflict(conn, key)
                 return ExecutionClaim(False, key, reason="unresolved_attempt_active")
-            if row["action_state"] not in {"RETRYABLE", "PARTIALLY_SATISFIED"}:
+            if row["action_state"] not in {"OPEN", "RETRYABLE", "PARTIALLY_SATISFIED"}:
                 self._record_conflict(conn, key)
                 return ExecutionClaim(False, key, reason="action_not_retryable")
             if not fresh_validation:
@@ -172,7 +175,7 @@ class DurableExecutionClaimRepo:
                 .where(
                     action.c.action_key == key,
                     action.c.active_attempt_id.is_(None),
-                    action.c.action_state.in_(("RETRYABLE", "PARTIALLY_SATISFIED")),
+                    action.c.action_state.in_(("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")),
                     action.c.remaining_target_qty == qty,
                 )
                 .values(
@@ -190,20 +193,21 @@ class DurableExecutionClaimRepo:
                 self._record_conflict(conn, key)
                 return ExecutionClaim(False, key, reason="claim_race_lost")
             self._insert_attempt(
-                conn, attempt, key, attempt_id, attempt_no, qty,
+                conn, attempt, key, attempt_id, attempt_no, qty, client_order_key,
             )
             return ExecutionClaim(True, key, attempt_id)
 
     @staticmethod
     def _insert_attempt(
         conn: Any, attempts: sa.Table, key: str, attempt_id: str, attempt_no: int,
-        qty: int,
+        qty: int, client_order_key: str | None,
     ) -> None:
         conn.execute(sa.insert(attempts).values(
             attempt_id=attempt_id,
             action_key=key,
             attempt_no=attempt_no,
             requested_qty=qty,
+            client_order_key=str(client_order_key) if client_order_key else None,
             cumulative_filled_qty=None,
             attempt_state="CREATED",
             authoritative=False,
@@ -223,7 +227,7 @@ class DurableExecutionClaimRepo:
 
     def record_observation(
         self,
-        identity: SemanticActionIdentity,
+        identity: SemanticActionIdentity | str,
         *,
         attempt_id: str,
         state: str,
@@ -240,7 +244,7 @@ class DurableExecutionClaimRepo:
         observed_qty = None if cumulative_filled_qty is None else int(cumulative_filled_qty)
         if observed_qty is not None and observed_qty < 0:
             raise ValueError("cumulative fill quantity cannot be negative")
-        key = identity.action_key
+        key = self._action_key(identity)
         actions, attempts = self.actions, self.attempts
         with self.engine.begin() as conn:
             action_row = conn.execute(
@@ -326,10 +330,49 @@ class DurableExecutionClaimRepo:
             )
         return self.get(identity)
 
-    def get(self, identity: SemanticActionIdentity) -> ExecutionClaimSnapshot:
+    def release_before_submit(
+        self, identity: SemanticActionIdentity, *, attempt_id: str,
+    ) -> None:
+        key = identity.action_key
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                sa.update(self.actions)
+                .where(
+                    self.actions.c.action_key == key,
+                    self.actions.c.active_attempt_id == str(attempt_id),
+                    self.actions.c.action_state == "IN_FLIGHT",
+                )
+                .values(
+                    active_attempt_id=None,
+                    action_state="OPEN",
+                    cumulative_filled_qty=self.actions.c.filled_qty_before_attempt,
+                    remaining_target_qty=(
+                        self.actions.c.target_qty - self.actions.c.filled_qty_before_attempt
+                    ),
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("execution claim could not be released before submit")
+            conn.execute(
+                sa.update(self.attempts)
+                .where(self.attempts.c.attempt_id == str(attempt_id))
+                .values(
+                    attempt_state="ABANDONED_PRE_SUBMIT",
+                    authoritative=True,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+
+    @staticmethod
+    def _action_key(identity: SemanticActionIdentity | str) -> str:
+        return identity.action_key if isinstance(identity, SemanticActionIdentity) else str(identity)
+
+    def get(self, identity: SemanticActionIdentity | str) -> ExecutionClaimSnapshot:
+        key = self._action_key(identity)
         with self.engine.connect() as conn:
             row = conn.execute(
-                sa.select(self.actions).where(self.actions.c.action_key == identity.action_key)
+                sa.select(self.actions).where(self.actions.c.action_key == key)
             ).mappings().one_or_none()
         if row is None:
             raise RuntimeError("semantic action not found")
@@ -346,6 +389,16 @@ class DurableExecutionClaimRepo:
             active_attempt_id=row["active_attempt_id"],
             trade_date=row["trade_date"],
         )
+
+    def find_attempt_for_client_order_key(self, client_order_key: str) -> tuple[str, str] | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                sa.select(self.attempts.c.action_key, self.attempts.c.attempt_id)
+                .where(self.attempts.c.client_order_key == str(client_order_key))
+                .order_by(self.attempts.c.attempt_no.desc())
+                .limit(1)
+            ).first()
+        return (str(row[0]), str(row[1])) if row else None
 
     def health(self) -> dict[str, int]:
         with self.engine.connect() as conn:
