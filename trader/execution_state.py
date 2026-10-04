@@ -24,6 +24,7 @@ class SemanticActionIdentity:
     lifecycle_id: str
     action: str
     trade_date: date | None = None
+    action_instance: str | None = None
 
     def __post_init__(self) -> None:
         required = (
@@ -44,6 +45,11 @@ class SemanticActionIdentity:
             "lifecycle_id": self.lifecycle_id.strip(),
             "action": self.action.strip().upper(),
         }
+        if self.action_instance is not None:
+            instance = str(self.action_instance).strip()
+            if not instance:
+                raise ValueError("semantic action instance must be non-empty")
+            payload["action_instance"] = instance
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

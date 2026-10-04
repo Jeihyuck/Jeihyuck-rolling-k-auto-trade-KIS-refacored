@@ -61,6 +61,7 @@ def _route_fixture(
     fail_submit: bool = False,
     reject_once: bool = False,
     engine=None,
+    production_identity: bool = False,
 ):
     from trader.us.execution import order_router
 
@@ -73,15 +74,29 @@ def _route_fixture(
 
     monkeypatch.setattr(order_router, "same_day_semantic_sell_exists", lambda _intent: False)
     monkeypatch.setattr(
+        "trader.us.db.repos.has_same_day_exit",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
         "trader.us.execution.order_identity.normalize_and_validate_order_identity",
         lambda intent, _context: intent,
     )
-    monkeypatch.setattr(
-        order_router, "_semantic_action_identity",
-        lambda intent, *, account_env: _identity(
-            str(intent["trade_date"]), str(intent.get("semantic_action") or "ENTRY"),
-        ),
-    )
+    if production_identity:
+        monkeypatch.setattr(
+            "trader.account_state.get_account_key",
+            lambda **_kwargs: "route-test-account",
+        )
+        monkeypatch.setattr(
+            "trader.us.db.repos._active_us_epoch",
+            lambda *_args, **_kwargs: "route-test-epoch",
+        )
+    else:
+        monkeypatch.setattr(
+            order_router, "_semantic_action_identity",
+            lambda intent, *, account_env: _identity(
+                str(intent["trade_date"]), str(intent.get("semantic_action") or "ENTRY"),
+            ),
+        )
     monkeypatch.setattr(order_router, "canonical_order_risk_check", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
     monkeypatch.setattr(order_router, "assert_order_allowed", lambda *_args, **_kwargs: None)
@@ -118,6 +133,58 @@ def _route_fixture(
         lambda response: response.get("order_no", "ROUTE-ORDER-1"),
     )
     return engine, claim_repo, broker
+
+
+def _defense_intent(trade_date: str, reason: str, *, order_key: str) -> dict:
+    from trader.us.market_state_overlay import build_defense_trim_intents
+
+    market_state = (
+        "DEFENSE_CRASH" if reason == "DEFENSE_CRASH_TRIM" else "DEFENSE_RISK_OFF"
+    )
+    intent = build_defense_trim_intents(
+        [{
+            "symbol": "TEST_SYMBOL",
+            "qty": 10,
+            "orderable_qty": 10,
+            "current_price": 10.0,
+            "avg_price": 10.0,
+            "sector": "AI_SEMI",
+            "exchange": "NASDAQ",
+            "position_lifecycle_id": "route-test-lifecycle",
+        }],
+        {"market_state": market_state},
+        trade_date=trade_date,
+    )[0]
+    intent.update({
+        "client_order_key": order_key,
+        "strategy_owner": "US_STANDARD",
+        "holding_qty": 10,
+        "available_qty": 10,
+        "sellable_qty": 10,
+    })
+    return intent
+
+
+def _reconcile_route_fill(repos, intent: dict, broker, *, trade_date: str) -> None:
+    order_no = f"ROUTE-ORDER-{broker.calls}"
+    repos.apply_broker_order_observation(
+        trade_date=trade_date,
+        client_order_key=intent["client_order_key"],
+        raw_order_no=order_no,
+        canonical_order_no=order_no,
+        symbol=intent["symbol"],
+        side="SELL",
+        requested_qty=intent["qty"],
+        filled_qty=intent["qty"],
+        remaining_qty=0,
+        broker_status="FILLED",
+        evidence_type="KIS_ORDER_STATUS",
+        raw_row={
+            "requested_qty": intent["qty"],
+            "filled_qty": intent["qty"],
+            "avg_price": 10.0,
+        },
+    )
 
 
 def _intent(
@@ -418,6 +485,125 @@ def test_route_filled_tp1_leaves_tp2_and_tp3_eligible(monkeypatch):
         assert reconciled.get("order_status") == "FILLED", reconciled
         assert claim_repo.get(_identity("2026-10-02", stage)).action_state == "SATISFIED"
 
+    assert broker.calls == 3
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ("DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM"),
+)
+def test_completed_defense_trim_is_same_day_deduped_but_repeats_next_day(
+    monkeypatch, reason,
+):
+    from trader.us.db import repos
+    from trader.us.execution.order_router import _semantic_action_identity
+
+    save_ack = repos.save_order_ack
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, production_identity=True,
+    )
+    repos = _enable_in_memory_reconciliation(monkeypatch, claim_repo, save_ack)
+    suffix = reason.lower()
+    first = _defense_intent(
+        "2026-10-02", reason, order_key=f"defense-day-one-{suffix}",
+    )
+
+    assert route_order(first, kis_client=broker)["status"] == "ACK"
+    action_identity = _semantic_action_identity(first, account_env="practice")
+    assert action_identity.action_instance == "2026-10-02"
+    assert claim_repo.get(action_identity).action_instance == "2026-10-02"
+    _reconcile_route_fill(repos, first, broker, trade_date="2026-10-02")
+
+    duplicate = _defense_intent(
+        "2026-10-02", reason, order_key=f"defense-same-day-duplicate-{suffix}",
+    )
+    assert route_order(duplicate, kis_client=broker)["status"] == (
+        "ORDER_FENCED_UNRESOLVED_ACTION"
+    )
+    assert broker.calls == 1
+
+    next_day = _defense_intent(
+        "2026-10-05", reason, order_key=f"defense-next-day-{suffix}",
+    )
+    assert route_order(next_day, kis_client=broker)["status"] == "ACK"
+    next_identity = _semantic_action_identity(next_day, account_env="practice")
+    assert next_identity.action_key != action_identity.action_key
+    assert claim_repo.get(next_identity).action_instance == "2026-10-05"
+    assert broker.calls == 2
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ("DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM"),
+)
+def test_unresolved_defense_instance_fences_same_and_later_dates_and_emergency(
+    monkeypatch, reason,
+):
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, fail_submit=True, production_identity=True,
+    )
+    first = _defense_intent("2026-10-02", reason, order_key="defense-uncertain")
+
+    assert route_order(first, kis_client=broker)["status"] == (
+        "BROKER_SUBMIT_RESULT_UNKNOWN"
+    )
+    same_day = _defense_intent(
+        "2026-10-02", reason, order_key="defense-duplicate",
+    )
+    assert route_order(same_day, kis_client=broker)["status"] == (
+        "ORDER_FENCED_UNRESOLVED_ACTION"
+    )
+    next_day = _defense_intent(
+        "2026-10-05", reason, order_key="defense-next-day-uncertain",
+    )
+    assert route_order(next_day, kis_client=broker)["status"] == (
+        "ORDER_FENCED_UNRESOLVED_ACTION"
+    )
+
+    emergency = _intent(
+        "2026-10-05", qty=2, action="HARD_STOP",
+        client_order_key="emergency-while-defense-uncertain", side="SELL",
+    )
+    assert route_order(emergency, kis_client=broker)["status"] == (
+        "ORDER_FENCED_UNRESOLVED_ACTION"
+    )
+    assert broker.calls == 1
+    assert claim_repo.health()["unresolved_execution_actions"] == 1
+
+
+def test_satisfied_tp1_stays_one_shot_across_dates_while_tp2_tp3_remain_distinct(
+    monkeypatch,
+):
+    from trader.us.db import repos
+    from trader.us.execution.order_router import _semantic_action_identity
+
+    save_ack = repos.save_order_ack
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, production_identity=True,
+    )
+    repos = _enable_in_memory_reconciliation(monkeypatch, claim_repo, save_ack)
+
+    tp1 = _intent(
+        "2026-10-02", action="TP1", client_order_key="tp1-first", side="SELL",
+    )
+    assert route_order(tp1, kis_client=broker)["status"] == "ACK"
+    assert _semantic_action_identity(tp1, account_env="practice").action_instance is None
+    _reconcile_route_fill(repos, tp1, broker, trade_date="2026-10-02")
+
+    repeated_tp1 = _intent(
+        "2026-10-05", action="TP1", client_order_key="tp1-next-date", side="SELL",
+    )
+    assert route_order(repeated_tp1, kis_client=broker)["status"] == (
+        "ORDER_FENCED_UNRESOLVED_ACTION"
+    )
+
+    for stage in ("TP2", "TP3"):
+        intent = _intent(
+            "2026-10-05", action=stage, client_order_key=f"{stage.lower()}-later",
+            side="SELL",
+        )
+        assert route_order(intent, kis_client=broker)["status"] == "ACK"
+        _reconcile_route_fill(repos, intent, broker, trade_date="2026-10-05")
     assert broker.calls == 3
 
 

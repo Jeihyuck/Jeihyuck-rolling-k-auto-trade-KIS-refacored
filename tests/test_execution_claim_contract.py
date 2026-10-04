@@ -53,6 +53,33 @@ def test_semantic_identity_is_date_independent_but_owner_lifecycle_and_stage_spe
     ).action_key
 
 
+def test_action_instances_are_opt_in_and_keep_one_shot_actions_date_independent():
+    first = _identity(stage="DEFENSE_RISK_OFF_TRIM", lifecycle="cycle-defense")
+    repeated = SemanticActionIdentity(
+        env=first.env,
+        account_id=first.account_id,
+        market=first.market,
+        trading_epoch_id=first.trading_epoch_id,
+        strategy_owner=first.strategy_owner,
+        lifecycle_id=first.lifecycle_id,
+        action=first.action,
+        trade_date=date(2026, 10, 5),
+        action_instance="2026-10-05",
+    )
+    assert first.action_key != repeated.action_key
+    assert repeated.action_instance == "2026-10-05"
+    assert _identity(stage="TP1", lifecycle="cycle-defense").action_key == SemanticActionIdentity(
+        env=first.env,
+        account_id=first.account_id,
+        market=first.market,
+        trading_epoch_id=first.trading_epoch_id,
+        strategy_owner=first.strategy_owner,
+        lifecycle_id=first.lifecycle_id,
+        action="TP1",
+        trade_date=date(2026, 10, 5),
+    ).action_key
+
+
 def test_unresolved_claim_persists_across_trade_date_and_process_restart():
     engine, repo = _repo()
     identity = _identity(lifecycle="cycle-1")

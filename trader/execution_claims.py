@@ -27,6 +27,7 @@ def build_execution_claim_tables(
         sa.Column("strategy_owner", sa.String, nullable=False),
         sa.Column("lifecycle_id", sa.String, nullable=False),
         sa.Column("action", sa.String, nullable=False),
+        sa.Column("action_instance", sa.String),
         sa.Column("target_qty", sa.Integer, nullable=False),
         sa.Column("cumulative_filled_qty", sa.Integer),
         sa.Column("remaining_target_qty", sa.Integer),
@@ -73,6 +74,7 @@ class ExecutionClaimSnapshot:
     remaining_target_qty: int | None
     active_attempt_id: str | None
     trade_date: date | None
+    action_instance: str | None = None
 
 
 class DurableExecutionClaimRepo:
@@ -129,6 +131,7 @@ class DurableExecutionClaimRepo:
             "strategy_owner": identity.strategy_owner.strip().upper(),
             "lifecycle_id": identity.lifecycle_id.strip(),
             "action": identity.action.strip().upper(),
+            "action_instance": identity.action_instance,
             "target_qty": qty,
             "cumulative_filled_qty": 0,
             "remaining_target_qty": qty,
@@ -494,6 +497,7 @@ class DurableExecutionClaimRepo:
             ),
             active_attempt_id=row["active_attempt_id"],
             trade_date=row["trade_date"],
+            action_instance=row["action_instance"],
         )
 
     def find_attempt_for_client_order_key(self, client_order_key: str) -> tuple[str, str] | None:

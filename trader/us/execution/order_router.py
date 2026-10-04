@@ -393,6 +393,7 @@ def _semantic_action_identity(intent: dict, *, account_env: str):
         lifecycle_id=str(lifecycle_id),
         action=str(action),
         trade_date=trade_date,
+        action_instance=_semantic_action_instance(intent, meta, str(action), trade_date),
     )
 
 
@@ -621,6 +622,9 @@ def _pending_sell_qty_for_symbol(symbol: str, trade_date: str | None) -> int:
 
 _SEMANTIC_SELL_FAMILIES = frozenset({"DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM",
     "CLUSTER_EXPOSURE_TRIM", "PROFIT_CAPTURE", "TREND_EXIT", "TQQQ_INFINITE_TP"})
+_TRADE_DATE_REPEATABLE_SELL_ACTIONS = frozenset({
+    "DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM",
+})
 
 
 def _semantic_sell_identity_stage(intent: dict, meta: dict, reason: str) -> tuple[str, str]:
@@ -638,6 +642,25 @@ def _semantic_sell_identity_stage(intent: dict, meta: dict, reason: str) -> tupl
         if match:
             stage = match.group(1)
     return family, stage
+
+
+def _semantic_action_instance(
+    intent: dict, meta: dict, action: str, trade_date: date | None,
+) -> str | None:
+    if str(intent.get("side") or "").upper() != "SELL":
+        return None
+    labels = {
+        str(value or "").strip().upper()
+        for value in (
+            intent.get("reason"), meta.get("reason"),
+            intent.get("exit_family"), meta.get("exit_family"), action,
+        )
+    }
+    if not labels.intersection(_TRADE_DATE_REPEATABLE_SELL_ACTIONS):
+        return None
+    if trade_date is None:
+        raise ValueError("repeatable defense action requires a valid trade date")
+    return trade_date.isoformat()
 
 
 def same_day_semantic_sell_exists(intent: dict) -> bool:
