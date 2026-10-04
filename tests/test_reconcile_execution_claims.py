@@ -152,6 +152,7 @@ def test_reconcile_observation_persistence_failure_degrades_health_and_keeps_cla
         "request_json": {},
         "response_json": {},
     }
+    failed_observations = []
 
     class OrdersRepoWithClaimFailure:
         def get_order_by_kis_odno(self, _env, _order_no):
@@ -161,6 +162,7 @@ def test_reconcile_observation_persistence_failure_degrades_health_and_keeps_cla
             return None
 
         def record_execution_claim_for_order(self, _key, **_kwargs):
+            failed_observations.append(_kwargs)
             raise OSError("execution claim ledger write failed")
 
         def execution_claim_health(self):
@@ -206,6 +208,9 @@ def test_reconcile_observation_persistence_failure_degrades_health_and_keeps_cla
     assert result["degraded"] == "execution_claim_observation_failed"
     assert result["execution_claim_observation_failures"] == 1
     assert result["execution_claim_health"]["integrity_status"] == "DEGRADED"
+    assert failed_observations[0]["state"] == "CANCELLED"
+    assert failed_observations[0]["cumulative_filled_qty"] is None
+    assert failed_observations[0]["authoritative"] is False
     assert claims.get(identity).action_state == "IN_FLIGHT"
     assert not claims.acquire(
         identity, attempt_id="attempt-2", requested_qty=5,

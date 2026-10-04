@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date
 
 import sqlalchemy as sa
@@ -12,6 +13,7 @@ from trader.kr.infinite.models import (
     Status,
 )
 from trader.kr.infinite.repository import InfiniteRepository
+from trader.kr.infinite.executor import KISExecutor
 from trader.db.schema import schema_for_engine
 
 
@@ -146,3 +148,34 @@ def test_explicit_cumulative_zero_is_preserved_for_cancel(monkeypatch):
     _persist(repo, intent, state, "EXPIRED", 0)
 
     assert claims.get(identity).action_state == "RETRYABLE"
+
+
+def test_broker_row_without_fill_quantity_stays_fenced_through_executor(monkeypatch):
+    _engine, repo, claims, identity, intent, state = _repository(monkeypatch)
+
+    class FakeKis:
+        def inquire_daily_ccld(self, **_kwargs):
+            return {
+                "rt_cd": "0",
+                "output1": [{
+                    "odno": "broker-order-1",
+                    "ord_stat_cd": "CANCELLED",
+                }],
+            }
+
+    intent = replace(intent, broker_order_id="broker-order-1")
+    observed = KISExecutor(FakeKis(), "practice").order_state(intent, DAY)
+
+    assert observed.status == "RECONCILE_PENDING"
+    assert observed.filled_qty is None
+    repo.persist_reconciliation(state, [(intent, observed)])
+    with _engine.connect() as conn:
+        persisted_qty = conn.execute(
+            text("SELECT filled_qty FROM kr_infinite_order_intents WHERE id=1")
+        ).scalar_one()
+    assert persisted_qty is None
+    assert claims.get(identity).action_state == "UNCERTAIN"
+    assert not claims.acquire(
+        identity, attempt_id="attempt-2", requested_qty=5,
+        fresh_validation=True, client_order_key="order-2",
+    ).acquired

@@ -316,9 +316,13 @@ class InfiniteRepository:
         with self.engine.begin() as conn:
             epoch_id = self._epoch_id(conn, required=True)
             for intent, broker in updates:
+                previous_qty = int(intent.filled_qty or 0)
+                qty = broker.filled_qty if broker.filled_qty is not None else (
+                    previous_qty if previous_qty > 0 else None
+                )
                 conn.execute(text("""UPDATE kr_infinite_order_intents SET status=:status,filled_qty=:qty,
                     filled_notional_krw=:notional,filled_avg_price=:average,updated_at=NOW() WHERE id=:id"""),
-                    {"status": broker.status, "qty": broker.filled_qty, "notional": broker.filled_notional_krw,
+                    {"status": broker.status, "qty": qty, "notional": broker.filled_notional_krw,
                      "average": broker.filled_avg_price, "id": intent.id})
             self._save_state(conn, state, epoch_id=epoch_id)
         terminal_fill_states = {"FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
@@ -339,12 +343,19 @@ class InfiniteRepository:
                 claim_state = "UNRESOLVED"
             else:
                 claim_state = "ACKED"
-            qty = int(broker.filled_qty or 0) if status in terminal_fill_states else None
+            qty = broker.filled_qty if status in terminal_fill_states else None
+            authoritative = status == "REJECTED" or (
+                status in {"FILLED", "PARTIALLY_FILLED"} and qty is not None
+            )
+            if status in {"CANCELLED", "EXPIRED"}:
+                authoritative = broker.filled_qty is not None
+            if status in {"FILLED", "PARTIALLY_FILLED"} and qty is None:
+                claim_state = "UNRESOLVED"
             self.record_execution_claim_for_order(
                 intent.idempotency_key,
                 state=claim_state,
                 cumulative_filled_qty=qty,
-                authoritative=status in terminal_fill_states,
+                authoritative=authoritative,
             )
 
     def save_state(self, state: State) -> None:

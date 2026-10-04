@@ -505,7 +505,7 @@ def test_old_zero_fill_day_order_expires_and_does_not_fence_new_decision(armed_p
     assert any(i.trade_date == DAY and i.id != intent.id for i in repo.intents[1:])
 
 
-def test_old_zero_fill_day_order_missing_from_successful_broker_history_expires(armed_practice_env):
+def test_old_zero_fill_day_order_missing_from_history_stays_fenced_without_fill_evidence(armed_practice_env):
     old_day = date(2026, 8, 13)
     intent = OrderIntent(
         1, "KRINF-20260801-owned", old_day, "SELL_PARTIAL", "old-missing", 50,
@@ -522,8 +522,9 @@ def test_old_zero_fill_day_order_missing_from_successful_broker_history_expires(
         trade_date=DAY, kis_env="practice",
     )
 
-    assert repo.intents[0].status == "EXPIRED"
-    assert result.decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}
+    assert repo.intents[0].status == "RECONCILE_PENDING"
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "KR_INF_PROFIT_SELL_PENDING"
 
 
 def test_old_partial_fill_missing_from_history_stays_fenced_for_manual_reconcile(armed_practice_env):
