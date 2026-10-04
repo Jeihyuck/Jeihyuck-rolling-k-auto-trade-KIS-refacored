@@ -1,46 +1,71 @@
-# US Daily Report - 2026-01-02
+# US Daily Report - 2026-05-01
 
 ## Required Fields
 
-- trade_date: 2026-01-02
-- branch: dual-agent
-- commit_sha: test-sha
-- run_id: 25718405741
-- github_run_id: 25718405741
-- github_run_attempt: 0
-- sha: test-sha
-- workflow: US Trade AM
+- trade_date: 2026-05-01
+- branch: stabilize/01-execution-state-contract-20261004
+- commit_sha: 0a46f607f104ae195b370301ece52722c5e21486
+- run_id: 37214235102
+- github_run_id: 37214235102
+- github_run_attempt: 1
+- sha: 0a46f607f104ae195b370301ece52722c5e21486
+- workflow: dynamic/copilot-swe-agent/copilot
 - session: am
-- session_id: am-25718405741
-- event_name: workflow_dispatch
-- actor: codespace
+- session_id: am-37214235102
+- event_name: dynamic
+- actor: copilot-swe-agent[bot]
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-08-07T04:47:20.664114Z
-- started_at_et: 2026-08-07T00:47:20.602590-04:00
-- started_at_kst: 2026-08-07T13:47:20.664114+09:00
-- ended_at_utc: 2026-08-07T04:47:20.664114Z
-- ended_at_et: 2026-08-07T00:47:20.664092-04:00
-- ended_at_kst: 2026-08-07T13:47:20.664114+09:00
-- wall_elapsed_sec: 0.05
+- started_at_utc: 2026-10-04T16:11:44.455561Z
+- started_at_et: 2026-10-04T12:11:44.442823-04:00
+- started_at_kst: 2026-10-05T01:11:44.455561+09:00
+- ended_at_utc: 2026-10-04T16:11:44.455561Z
+- ended_at_et: 2026-10-04T12:11:44.455550-04:00
+- ended_at_kst: 2026-10-05T01:11:44.455561+09:00
+- wall_elapsed_sec: 0.01
 - code_version_source: github_actions
-- dry_run: True
-- kis_order_allowed: 0
+- dry_run: False
+- kis_order_allowed: 1
 - prep_status: UNKNOWN
 - prep_run_id: 
 - score_nonzero_count: 0
 - locked_watchlist_count: 0
 - locked_watchlist_count_source: default_zero
-- entry_eval_status: DEGRADED
-- entry_error_type: DAILY_NOTIONAL_UNAVAILABLE
-- entry_error_message: DAILY_NOTIONAL_UNAVAILABLE
+- entry_eval_status: UNKNOWN
+- entry_error_type: 
+- entry_error_message: 
 - entry_intents: 0
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: order_route
+- last_stage: tick_10
 - final_status: OK_WITH_WARNINGS
-- reason: force_now_single_tick
+- reason: max_ticks
+- session_orders_sent: 0
+- session_orders_ack: 0
+- session_orders_rejected: 0
+- session_fills_count: 0
+- cumulative_fills_count: 0
+- daily_cumulative_fills_count: 0
+- session_buy_notional_routed: 0.0
+- daily_buy_notional_filled: 0.0
+- daily_order_audit_buy_notional: 0.0
+- entry_candidate_notional_evaluated: 0.0
+- entry_intent_notional_before_risk: 0.0
+- entry_intent_notional_after_risk: 0.0
+- orders_submitted_notional: 0.0
+- orders_acknowledged_notional: 0.0
+- fills_confirmed_notional: 0.0
+- no_new_orders_reason: 
+- daily_buy_limit_usd: 0.0
+- daily_buy_notional_filled_usd: 0.0
+- daily_buy_budget_remaining_usd: 0.0
+- daily_notional_exceeded_block_count: 0
+- daily_notional_exceeded_block_symbols: {}
+- kis_temp_error_raw_log_count: 0
+- kis_temp_error_sequence_count: 0
+- kis_temp_error_by_endpoint: {}
+- order_submit_temp_error_count: 0
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 
@@ -63,17 +88,17 @@
 - total_order_notional_routed: 0.0
 - buy_daily_notional_after_routing: 0.0
 - sell_notional_does_not_consume_buy_budget: 0
-- ack_reconcile_before_route_status: SKIP
-- ack_reconcile_after_route_status: SKIP
+- ack_reconcile_before_route_status: 
+- ack_reconcile_after_route_status: 
 - ack_reconcile_after_route_unresolved_count: 0
 - ack_pending_reconcile_count: 0
 - broker_ack_only_unresolved: 0
 - sell_decisions_detail: []
 - market_regime: NEUTRAL
-- capital_scale: 0.5
-- sector_cap_enforced: True
-- trade_block_reason: DAILY_NOTIONAL_UNAVAILABLE
-- blocked_entry_reason_counts: {'DAILY_NOTIONAL_UNAVAILABLE': 1}
+- capital_scale: 1.0
+- sector_cap_enforced: False
+- trade_block_reason: 
+- blocked_entry_reason_counts: {}
 
 ## Broker/Reconcile Classification
 - 실제 MTS 신규 매수: 0건
