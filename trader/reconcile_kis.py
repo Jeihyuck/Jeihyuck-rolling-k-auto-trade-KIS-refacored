@@ -152,6 +152,51 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
+def _record_execution_claim_observation(
+    *,
+    orders_repo: OrdersRepo,
+    source_order: dict | None,
+    broker_status: str,
+    cumulative_filled_qty: int | None,
+    requested_qty: int | None,
+) -> None:
+    if not source_order:
+        return
+    status = str(broker_status or "").strip().upper()
+    filled_qty = cumulative_filled_qty
+    authoritative = False
+    if status in {"REJECTED", "REJECT"} and filled_qty == 0:
+        claim_state = "REJECTED_EXPLICIT"
+        authoritative = True
+    elif status in {"CANCELLED", "CANCELED", "CANCEL"}:
+        claim_state = "CANCELLED"
+        authoritative = filled_qty is not None
+    elif filled_qty is not None and requested_qty and filled_qty >= requested_qty:
+        claim_state = "FILLED"
+        authoritative = True
+    elif filled_qty is not None and filled_qty > 0:
+        claim_state = "PARTIALLY_FILLED"
+        authoritative = True
+    elif status in {"ACK", "ACKED", "SUBMITTED", "PENDING", "ACCEPTED"}:
+        claim_state = "ACKED"
+    else:
+        claim_state = "UNRESOLVED"
+    try:
+        orders_repo.record_execution_claim_for_order(
+            str(source_order.get("client_order_key") or ""),
+            state=claim_state,
+            cumulative_filled_qty=filled_qty,
+            authoritative=authoritative,
+        )
+    except LookupError:
+        return
+    except Exception:
+        logger.exception(
+            "[RECONCILE][EXECUTION_CLAIM][OBSERVATION_FAILED] key=%s state=%s",
+            source_order.get("client_order_key"), claim_state,
+        )
+
+
 def _parse_date_time(row: dict) -> datetime:
     date_raw = _first_value(row, ["ord_dt", "trd_dt", "ccld_dt", "ord_date", "date"])
     time_raw = _first_value(row, ["ord_tmd", "trd_tmd", "ccld_tmd", "ord_time", "time"])
@@ -1068,6 +1113,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 previous_confirmed_notional
                 + float(filled_price) * float(incremental_daily_qty)
             )
+        claim_filled_qty = broker_cumulative_qty
+        if claim_filled_qty is None and filled_qty is not None:
+            claim_filled_qty = previous_confirmed_qty + int(filled_qty or 0)
+        elif claim_filled_qty is None and previous_confirmed_qty > 0:
+            claim_filled_qty = previous_confirmed_qty
+        _record_execution_claim_observation(
+            orders_repo=orders_repo,
+            source_order=source_order,
+            broker_status=status,
+            cumulative_filled_qty=claim_filled_qty,
+            requested_qty=_to_int((source_order or {}).get("qty")) or qty,
+        )
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
@@ -1506,4 +1563,18 @@ def reconcile_kis(
     # authoritative view so post-tick policy/health checks do not fall back to
     # the stale balance snapshot captured near the beginning of the tick.
     reconcile_result["_final_holdings_rows"] = list(holdings_rows)
+    try:
+        reconcile_result["execution_claim_health"] = {
+            "available": True,
+            **orders_repo.execution_claim_health(),
+        }
+    except Exception as exc:
+        logger.error(
+            "[RECONCILE][EXECUTION_CLAIM][HEALTH_UNAVAILABLE] err=%s",
+            exc,
+        )
+        reconcile_result["execution_claim_health"] = {
+            "available": False,
+            "error": type(exc).__name__,
+        }
     return reconcile_result

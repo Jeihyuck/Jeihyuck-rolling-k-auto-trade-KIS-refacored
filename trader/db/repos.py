@@ -2893,13 +2893,14 @@ class OrdersRepo:
             action=str(action),
             trade_date=trade_date,
         )
-        return self._execution_claim_repo.acquire(
+        claim = self._execution_claim_repo.acquire(
             identity,
             attempt_id=attempt_id,
             requested_qty=requested_qty,
             client_order_key=client_order_key,
             fresh_validation=fresh_validation,
         )
+        return identity, claim
 
     def record_execution_claim_for_order(
         self,
@@ -2925,6 +2926,15 @@ class OrdersRepo:
 
     def execution_claim_health(self) -> dict[str, int]:
         return self._execution_claim_repo.health()
+
+    def release_execution_claim_before_submit_for_order(self, client_order_key: str) -> None:
+        attempt = self._execution_claim_repo.find_attempt_for_client_order_key(client_order_key)
+        if attempt is None:
+            raise LookupError(
+                f"execution claim attempt not found for client order key {client_order_key}"
+            )
+        action_key, attempt_id = attempt
+        self._execution_claim_repo.release_before_submit(action_key, attempt_id=attempt_id)
 
     def _read_mappings_with_guard(
         self,

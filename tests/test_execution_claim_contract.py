@@ -140,6 +140,40 @@ def test_partial_cancel_preserves_cumulative_fill_and_only_remaining_target():
     assert repo.get(identity).cumulative_filled_qty == 4
 
 
+def test_unresolved_sell_stage_blocks_overlapping_emergency_until_broker_truth():
+    _, repo = _repo()
+    lifecycle = "cycle-sell-overlap"
+    tp1 = _identity(stage="TP1", lifecycle=lifecycle)
+    emergency = _identity(stage="EMERGENCY_EXIT", lifecycle=lifecycle)
+
+    assert repo.acquire(tp1, attempt_id="tp1-attempt", requested_qty=5).acquired
+    repo.record_observation(
+        tp1,
+        attempt_id="tp1-attempt",
+        state="UNRESOLVED",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+    blocked = repo.acquire(
+        emergency, attempt_id="emergency-blocked", requested_qty=5,
+        fresh_validation=True,
+    )
+    assert not blocked.acquired
+    assert blocked.reason == "unresolved_lifecycle_action"
+
+    repo.record_observation(
+        tp1,
+        attempt_id="tp1-attempt",
+        state="FILLED",
+        cumulative_filled_qty=2,
+        authoritative=True,
+    )
+    assert repo.acquire(
+        emergency, attempt_id="emergency-after-truth", requested_qty=3,
+        fresh_validation=True,
+    ).acquired
+
+
 def test_two_workers_cannot_claim_the_same_action_in_postgresql():
     url = os.getenv("PBCORE_TEST_POSTGRES_URL")
     if not url:

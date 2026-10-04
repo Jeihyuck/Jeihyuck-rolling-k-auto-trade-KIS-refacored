@@ -10,6 +10,7 @@ import subprocess
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
+from uuid import uuid4
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List
@@ -10354,6 +10355,53 @@ class PB1Engine:
         except Exception as exc:
             logger.exception("[FORCE_BUY][ERROR] code=%s error=%s", code, exc)
 
+    def _claim_pb1_submit_action(
+        self,
+        *,
+        client_order_key: str,
+        lifecycle_id: str,
+        action: str,
+        requested_qty: int,
+    ):
+        claim_day = self._today
+        if isinstance(claim_day, datetime):
+            claim_day = claim_day.date()
+        elif not isinstance(claim_day, date):
+            claim_day = date.fromisoformat(str(claim_day)[:10])
+        return self.orders_repo.claim_execution_action(
+            env=self.env,
+            market="KR",
+            strategy_owner="PB1",
+            lifecycle_id=lifecycle_id,
+            action=action,
+            trade_date=claim_day,
+            attempt_id=str(uuid4()),
+            requested_qty=requested_qty,
+            client_order_key=client_order_key,
+            fresh_validation=True,
+        )
+
+    def _record_pb1_submit_observation(
+        self,
+        client_order_key: str,
+        *,
+        state: str,
+        filled_qty: int | None,
+        authoritative: bool,
+    ) -> None:
+        try:
+            self.orders_repo.record_execution_claim_for_order(
+                client_order_key,
+                state=state,
+                cumulative_filled_qty=filled_qty,
+                authoritative=authoritative,
+            )
+        except Exception:
+            logger.exception(
+                "[PB1][EXECUTION_CLAIM][OBSERVATION_FAILED] key=%s state=%s",
+                client_order_key, state,
+            )
+
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
         ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
         if not ownership_ok:
@@ -10929,6 +10977,48 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        try:
+            claim_identity, claim = self._claim_pb1_submit_action(
+                client_order_key=effective_client_order_key or "",
+                lifecycle_id=str(
+                    entry_meta.get("position_lifecycle_id")
+                    or cf.features.get("position_lifecycle_id")
+                    or cf.client_order_key
+                    or effective_client_order_key
+                    or ""
+                ),
+                action=f"BUY_ENTRY:{stage}",
+                requested_qty=int(qty or 0),
+            )
+        except Exception as claim_exc:
+            logger.exception(
+                "[PB1][ENTRY][EXECUTION_CLAIM_FAIL] code=%s key=%s",
+                display_code, effective_client_order_key,
+            )
+            status["failed"] = 1
+            status["skipped"] = 1
+            status["skipped_reason"] = "EXECUTION_CLAIM_UNAVAILABLE"
+            status["submit_terminal_status"] = "EXECUTION_CLAIM_UNAVAILABLE"
+            try:
+                self.orders_repo.mark_error(
+                    self.env,
+                    effective_client_order_key or "",
+                    {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE", "msg1": str(claim_exc),
+                     "broker_submit": False},
+                )
+            except Exception:
+                logger.exception("[PB1][ENTRY][EXECUTION_CLAIM_ORDER_MARK_FAIL] key=%s",
+                                 effective_client_order_key)
+            return status
+        if not claim.acquired:
+            logger.error(
+                "[PB1][ENTRY][EXECUTION_CLAIM_BLOCK] code=%s action_key=%s reason=%s",
+                display_code, claim.action_key, claim.reason,
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
+            status["submit_terminal_status"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
+            return status
         status["submit_attempted"] = 1
         logger.info(
             "[ORDER][API_CALL][START] code=%s qty=%s price=%.0f order_type=%s client_order_key=%s",
@@ -11002,6 +11092,12 @@ class PB1Engine:
                     },
                     submitted_qty=submitted_qty,
                 )
+                self._record_pb1_submit_observation(
+                    effective_client_order_key or "",
+                    state="UNRESOLVED",
+                    filled_qty=None,
+                    authoritative=False,
+                )
                 self._append_ledger_event(
                     event_type="ORDER_SUBMIT_UNRESOLVED",
                     code=cf.code, market=cf.market, mode=cf.mode, side="BUY",
@@ -11027,6 +11123,13 @@ class PB1Engine:
                     "broker_submit": False,
                 },
             )
+            try:
+                self.orders_repo.release_execution_claim_before_submit_for_order(
+                    effective_client_order_key or "",
+                )
+            except Exception:
+                logger.exception("[PB1][ENTRY][EXECUTION_CLAIM_RELEASE_FAIL] key=%s",
+                                 effective_client_order_key)
             status["rejected"] = 1
             status["submit_terminal_status"] = "NO_API_CALL"
             status["terminal_event"] = "API_RESULT"
@@ -11035,6 +11138,27 @@ class PB1Engine:
             execution_meta = resp.get("_order_execution") if isinstance(resp.get("_order_execution"), dict) else {}
             submitted_qty = int(execution_meta.get("submitted_qty") or submitted_qty)
         broker_ack = bool(is_order_accepted(resp, kis_env=self.env))
+        if broker_ack:
+            self._record_pb1_submit_observation(
+                effective_client_order_key or "",
+                state="ACKED",
+                filled_qty=None,
+                authoritative=False,
+            )
+        elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
+            self._record_pb1_submit_observation(
+                effective_client_order_key or "",
+                state="REJECTED_EXPLICIT",
+                filled_qty=0,
+                authoritative=True,
+            )
+        else:
+            self._record_pb1_submit_observation(
+                effective_client_order_key or "",
+                state="UNRESOLVED",
+                filled_qty=None,
+                authoritative=False,
+            )
         if broker_ack:
             self._append_ledger_event(
                 event_type="BROKER_ACK_RECEIVED",
@@ -11379,6 +11503,30 @@ class PB1Engine:
             stage="PB1-ADD",
         ):
             return
+        try:
+            _, claim = self._claim_pb1_submit_action(
+                client_order_key=client_key,
+                lifecycle_id=str(parent_cycle),
+                action=f"BUY_ADD:{pyramid_level + 1}",
+                requested_qty=int(qty or 0),
+            )
+        except Exception:
+            logger.exception("[PB1][ADD][EXECUTION_CLAIM_FAIL] code=%s key=%s", code, client_key)
+            self.orders_repo.mark_error(
+                self.env, client_key,
+                {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE", "broker_submit": False},
+            )
+            return
+        if not claim.acquired:
+            logger.error(
+                "[PB1][ADD][EXECUTION_CLAIM_BLOCK] code=%s action_key=%s reason=%s",
+                code, claim.action_key, claim.reason,
+            )
+            self.orders_repo.mark_error(
+                self.env, client_key,
+                {"rt_cd": "EXECUTION_ACTION_ALREADY_CLAIMED", "broker_submit": False},
+            )
+            return
         emit_event(
             as_of=self._today,
             event="ORDER_SUBMIT",
@@ -11413,6 +11561,9 @@ class PB1Engine:
                     },
                     submitted_qty=int(qty or 0),
                 )
+                self._record_pb1_submit_observation(
+                    client_key, state="UNRESOLVED", filled_qty=None, authoritative=False,
+                )
                 self._append_ledger_event(
                     event_type="ORDER_SUBMIT_UNRESOLVED",
                     code=code,
@@ -11442,10 +11593,26 @@ class PB1Engine:
                     "broker_submit": False,
                 },
             )
+            try:
+                self.orders_repo.release_execution_claim_before_submit_for_order(client_key)
+            except Exception:
+                logger.exception("[PB1][ADD][EXECUTION_CLAIM_RELEASE_FAIL] key=%s", client_key)
             return
 
         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        if ok:
+            self._record_pb1_submit_observation(
+                client_key, state="ACKED", filled_qty=None, authoritative=False,
+            )
+        elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
+            self._record_pb1_submit_observation(
+                client_key, state="REJECTED_EXPLICIT", filled_qty=0, authoritative=True,
+            )
+        else:
+            self._record_pb1_submit_observation(
+                client_key, state="UNRESOLVED", filled_qty=None, authoritative=False,
+            )
         logger.info(
             "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
             code,
@@ -11855,6 +12022,38 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        try:
+            _, claim = self._claim_pb1_submit_action(
+                client_order_key=effective_client_order_key or "",
+                lifecycle_id=str(
+                    entry_meta.get("position_lifecycle_id")
+                    or cf.features.get("position_lifecycle_id")
+                    or cf.client_order_key
+                    or effective_client_order_key
+                    or ""
+                ),
+                action=f"BUY_CLOSE_ENTRY:{stage}",
+                requested_qty=int(cf.planned_qty or 0),
+            )
+        except Exception:
+            logger.exception("[PB1][CLOSE_ENTRY][EXECUTION_CLAIM_FAIL] key=%s",
+                             effective_client_order_key)
+            self.orders_repo.mark_error(
+                self.env, effective_client_order_key or "",
+                {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE", "broker_submit": False},
+            )
+            status["failed"] = 1
+            status["skipped"] = 1
+            status["skipped_reason"] = "EXECUTION_CLAIM_UNAVAILABLE"
+            return status
+        if not claim.acquired:
+            logger.error(
+                "[PB1][CLOSE_ENTRY][EXECUTION_CLAIM_BLOCK] action_key=%s reason=%s",
+                claim.action_key, claim.reason,
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
+            return status
         self._append_ledger_event(
             event_type="ORDER_INTENT",
             code=cf.code,
@@ -11924,6 +12123,12 @@ class PB1Engine:
                     },
                     submitted_qty=submitted_qty,
                 )
+                self._record_pb1_submit_observation(
+                    effective_client_order_key or "",
+                    state="UNRESOLVED",
+                    filled_qty=None,
+                    authoritative=False,
+                )
                 self._append_ledger_event(
                     event_type="ORDER_SUBMIT_UNRESOLVED",
                     code=cf.code,
@@ -11954,6 +12159,13 @@ class PB1Engine:
                     "broker_submit": False,
                 },
             )
+            try:
+                self.orders_repo.release_execution_claim_before_submit_for_order(
+                    effective_client_order_key or "",
+                )
+            except Exception:
+                logger.exception("[PB1][CLOSE_ENTRY][EXECUTION_CLAIM_RELEASE_FAIL] key=%s",
+                                 effective_client_order_key)
             status["rejected"] = 1
             status["submit_terminal_status"] = "NO_API_CALL"
             status["terminal_event"] = "API_RESULT"
@@ -11986,6 +12198,27 @@ class PB1Engine:
             payload_json={"entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
         )
         ok = bool(is_order_accepted(resp, kis_env=self.env))
+        if ok:
+            self._record_pb1_submit_observation(
+                effective_client_order_key or "",
+                state="ACKED",
+                filled_qty=None,
+                authoritative=False,
+            )
+        elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
+            self._record_pb1_submit_observation(
+                effective_client_order_key or "",
+                state="REJECTED_EXPLICIT",
+                filled_qty=0,
+                authoritative=True,
+            )
+        else:
+            self._record_pb1_submit_observation(
+                effective_client_order_key or "",
+                state="UNRESOLVED",
+                filled_qty=None,
+                authoritative=False,
+            )
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
@@ -13537,6 +13770,50 @@ class PB1Engine:
                 logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
+        try:
+            _, claim = self._claim_pb1_submit_action(
+                client_order_key=client_key,
+                lifecycle_id=lifecycle_id,
+                action=f"SELL:{reason_family}:{stage}",
+                requested_qty=int(orderable_qty or 0),
+            )
+        except Exception:
+            logger.exception("[PB1][EXIT][EXECUTION_CLAIM_FAIL] code=%s key=%s",
+                             code, client_key)
+            self.orders_repo.mark_error(
+                self.env, client_key,
+                {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE", "broker_submit": False},
+            )
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
+                    fields={"position_meta": {f"kr_{profit_capture_stage}_pending": False}},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
+            exit_eval_payload["order_result"] = "EXECUTION_CLAIM_UNAVAILABLE"
+            exit_eval_payload["order_skip_reasons"] = ["EXECUTION_CLAIM_UNAVAILABLE"]
+            return exit_eval_payload
+        if not claim.acquired:
+            logger.error(
+                "[PB1][EXIT][EXECUTION_CLAIM_BLOCK] code=%s action_key=%s reason=%s",
+                code, claim.action_key, claim.reason,
+            )
+            self.orders_repo.mark_error(
+                self.env, client_key,
+                {"rt_cd": "EXECUTION_ACTION_ALREADY_CLAIMED", "broker_submit": False},
+            )
+            if profit_capture_stage:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
+                    fields={"position_meta": {f"kr_{profit_capture_stage}_pending": False}},
+                    position_cycle_id=str(pos.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or ""),
+                )
+            exit_eval_payload["order_result"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
+            exit_eval_payload["order_skip_reasons"] = ["EXECUTION_ACTION_ALREADY_CLAIMED"]
+            return exit_eval_payload
+
         exit_eval_payload["submit_attempted"] = 1
         emit_event(
             as_of=self._today,
@@ -13572,6 +13849,9 @@ class PB1Engine:
                         "reconcile_required": True,
                     },
                     submitted_qty=requested_qty,
+                )
+                self._record_pb1_submit_observation(
+                    client_key, state="UNRESOLVED", filled_qty=None, authoritative=False,
                 )
                 exit_eval_payload["submitted"] = 0
                 exit_eval_payload["reconcile_required"] = 1
@@ -13615,6 +13895,10 @@ class PB1Engine:
                     "broker_submit": False,
                 },
             )
+            try:
+                self.orders_repo.release_execution_claim_before_submit_for_order(client_key)
+            except Exception:
+                logger.exception("[PB1][EXIT][EXECUTION_CLAIM_RELEASE_FAIL] key=%s", client_key)
             if profit_capture_stage:
                 self.positions_repo.update_position_fields(
                     env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
@@ -13644,6 +13928,18 @@ class PB1Engine:
             submitted_qty=submitted_qty,
         )
         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        if ok:
+            self._record_pb1_submit_observation(
+                client_key, state="ACKED", filled_qty=None, authoritative=False,
+            )
+        elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
+            self._record_pb1_submit_observation(
+                client_key, state="REJECTED_EXPLICIT", filled_qty=0, authoritative=True,
+            )
+        else:
+            self._record_pb1_submit_observation(
+                client_key, state="UNRESOLVED", filled_qty=None, authoritative=False,
+            )
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None

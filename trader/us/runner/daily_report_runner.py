@@ -1138,6 +1138,21 @@ def run_daily_report(
         "entry_block_source": "",
         "entry_block_root_cause": "",
     }
+    if offline:
+        report["execution_claim_health"] = {"available": False, "reason": "offline_mode"}
+    else:
+        try:
+            from trader.us.db.repos import load_execution_claim_health
+            report["execution_claim_health"] = {
+                "available": True,
+                **load_execution_claim_health(),
+            }
+        except Exception as exc:
+            logger.error("[US_DAILY_REPORT][EXECUTION_CLAIM_HEALTH_UNAVAILABLE] err=%s", exc)
+            report["execution_claim_health"] = {
+                "available": False,
+                "error": type(exc).__name__,
+            }
 
     contract_snapshot = _load_contract_status_snapshot(trade_date)
     report["pinned_contract_status"] = contract_snapshot.get("pinned_contract_status")

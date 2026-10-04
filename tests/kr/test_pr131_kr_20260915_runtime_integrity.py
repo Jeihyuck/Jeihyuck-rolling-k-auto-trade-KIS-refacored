@@ -213,6 +213,7 @@ def test_kr_infinite_historical_zero_fill_pending_expires_then_tp2_rearms(monkey
     from trader.kr.infinite.models import Action, OrderIntent, State, Status
     from trader.kr.infinite.repository import InfiniteRepository
     from trader.kr.infinite.runner import run_once
+    from trader.execution_claims import ExecutionClaim
 
     day = date(2026, 9, 15)
     old_day = date(2026, 9, 14)
@@ -258,6 +259,7 @@ def test_kr_infinite_historical_zero_fill_pending_expires_then_tp2_rearms(monkey
                 broker_order_id="OLD-TP2", status="SUBMITTED",
                 metadata={"pre_order_holding_qty": 3, "pre_order_avg_price": 98000.0},
             )]
+            self.claim_observations = []
 
         def ensure_schema(self):
             return None
@@ -275,6 +277,12 @@ def test_kr_infinite_historical_zero_fill_pending_expires_then_tp2_rearms(monkey
 
         def save_state(self, state):
             self.state = state
+
+        def claim_submit(self, **kwargs):
+            return object(), ExecutionClaim(True, "action-key", "attempt-1")
+
+        def record_execution_claim_observation(self, identity, **observation):
+            self.claim_observations.append(observation)
 
         def create_intent(self, state, decision, trade_date, market_state):
             if decision.idempotency_key in self.intent_keys():
@@ -320,3 +328,4 @@ def test_kr_infinite_historical_zero_fill_pending_expires_then_tp2_rearms(monkey
     assert result.decision.reason == "TAKE_PROFIT_TP2"
     assert result.submitted
     assert kis.sell_calls == [3]
+    assert [observation["state"] for observation in repo.claim_observations] == ["ACKED"]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
@@ -137,6 +139,46 @@ class DurableExecutionClaimRepo:
             "claim_conflicts": 0,
         }
         with self.engine.begin() as conn:
+            if conn.dialect.name == "postgresql":
+                scope = json.dumps(
+                    (
+                        identity.env.strip().lower(),
+                        identity.account_id.strip(),
+                        identity.market.strip().upper(),
+                        identity.trading_epoch_id.strip(),
+                        identity.strategy_owner.strip().upper(),
+                        identity.lifecycle_id.strip(),
+                    ),
+                    separators=(",", ":"),
+                )
+                lock_id = int.from_bytes(
+                    hashlib.sha256(scope.encode("utf-8")).digest()[:8],
+                    byteorder="big",
+                    signed=True,
+                )
+                conn.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_id)))
+            active_sibling = conn.execute(
+                sa.select(action.c.action_key)
+                .where(
+                    action.c.action_key != key,
+                    action.c.env == identity.env.strip().lower(),
+                    action.c.account_id == identity.account_id.strip(),
+                    action.c.market == identity.market.strip().upper(),
+                    action.c.trading_epoch_id == identity.trading_epoch_id.strip(),
+                    action.c.strategy_owner == identity.strategy_owner.strip().upper(),
+                    action.c.lifecycle_id == identity.lifecycle_id.strip(),
+                    sa.or_(
+                        action.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
+                        action.c.active_attempt_id.is_not(None),
+                    ),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if active_sibling is not None:
+                self._record_conflict(conn, str(active_sibling))
+                return ExecutionClaim(
+                    False, key, reason="unresolved_lifecycle_action",
+                )
             insert_action = self._insert(conn, action, base)
             created = conn.execute(
                 insert_action.on_conflict_do_nothing(index_elements=[action.c.action_key])
@@ -405,7 +447,13 @@ class DurableExecutionClaimRepo:
             values = conn.execute(
                 sa.select(
                     sa.func.sum(sa.case(
-                        (self.actions.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")), 1),
+                        (
+                            sa.or_(
+                                self.actions.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
+                                self.actions.c.active_attempt_id.is_not(None),
+                            ),
+                            1,
+                        ),
                         else_=0,
                     )),
                     sa.func.sum(self.actions.c.claim_conflicts),
