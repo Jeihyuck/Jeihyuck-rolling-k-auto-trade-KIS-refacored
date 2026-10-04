@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import sqlalchemy as sa
 
+from trader.account_state import get_account_key
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.kis_wrapper import KisAuthError, KisOrderOutcomeUnknown
@@ -203,7 +204,7 @@ def _prepare_parent_position(db):
             "entry_style_selected": "ENTRY_PULLBACK",
         },
         status="ACKED",
-        account_id="acct",
+        account_id=get_account_key(env="practice"),
     )
     assert created
     positions.apply_fill(
@@ -220,7 +221,7 @@ def _prepare_parent_position(db):
         tax=0.0,
         filled_at=datetime(2026, 9, 23, 12, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         order_id=root_order_id,
-        account_id="acct",
+        account_id=get_account_key(env="practice"),
     )
     positions.update_position_fields(
         env="practice",
@@ -278,7 +279,7 @@ def test_tp_sell_unresolved_ack_keeps_pending_and_blocks_restart_resubmit(monkey
     persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
         env="practice",
         strategy="pb1_pullback_close",
-        account_id="practice:unknown",
+        account_id=get_account_key(env="practice"),
         sid=1,
         mode=1,
         code="067290",

@@ -403,9 +403,9 @@ class DurableExecutionClaimRepo:
         return self.get(identity)
 
     def release_before_submit(
-        self, identity: SemanticActionIdentity, *, attempt_id: str,
+        self, identity: SemanticActionIdentity | str, *, attempt_id: str,
     ) -> None:
-        key = identity.action_key
+        key = identity.action_key if isinstance(identity, SemanticActionIdentity) else str(identity)
         with self.engine.begin() as conn:
             result = conn.execute(
                 sa.update(self.actions)

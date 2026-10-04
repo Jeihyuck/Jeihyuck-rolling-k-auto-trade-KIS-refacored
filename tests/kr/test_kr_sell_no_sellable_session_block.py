@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 import sqlalchemy as sa
 
+from trader.account_state import get_account_key
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
@@ -41,9 +42,13 @@ def _make_engine(
     window_name: str = "day",
     phase: str = "manage",
     now_kst_value: datetime | None = None,
+    seed_active_test_epoch: bool = True,
 ) -> tuple[PB1Engine, FakeKis]:
     db = db or sa.create_engine("sqlite:///:memory:")
-    create_schema_with_active_test_epoch(db)
+    if seed_active_test_epoch:
+        create_schema_with_active_test_epoch(db)
+    else:
+        schema_for_engine(db).metadata.create_all(db)
     kis = kis or FakeKis()
     engine = PB1Engine(
         universe_repo=_NoopUniverseRepo(),
@@ -77,7 +82,7 @@ def test_sell_ack_survives_new_pb1_engine_instance(monkeypatch) -> None:
                              "pchs_avg_pric": "271660"}], "output2": [{"ord_psbl_cash": "0"}]}
     positions = PositionsRepo(db)
     persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
-        env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
+        env="practice", strategy="pb1_pullback_close", account_id=get_account_key(env="practice"),
         sid=1, mode=1, code="010060", market="J", qty=14, avg_price=271660,
     )
     assert created
@@ -117,7 +122,7 @@ def test_three_pb1_engines_reuse_one_persisted_imported_cycle():
                      "pchs_avg_pric": "271660", "prpr": "267000"}]
     cycles = []
     for _ in range(3):
-        engine, _ = _make_engine(db, kis)
+        engine, _ = _make_engine(db, kis, seed_active_test_epoch=False)
         ledger = PositionsRepo(db).list_positions_by_codes(
             env="practice", strategy="pb1_pullback_close", codes=["010060"])
         contexts = engine._build_holding_contexts_from_balance_rows(balance_rows, ledger)
@@ -362,7 +367,7 @@ def test_kr_pb1_sell_accepted_blocks_same_cycle_resubmit(monkeypatch) -> None:
                              "pchs_avg_pric": "271660"}], "output2": [{"ord_psbl_cash": "0"}]}
     positions = PositionsRepo(db)
     persisted, _ = positions.get_or_create_imported_cycle_for_kis_holding(
-        env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
+        env="practice", strategy="pb1_pullback_close", account_id=get_account_key(env="practice"),
         sid=1, mode=1, code="010060", market="J", qty=14, avg_price=271660,
     )
     pos = _pos(code="010060", qty=14, kis_qty=14, orderable_qty=14)
@@ -584,11 +589,10 @@ def test_profitable_policy_missing_adoption_uses_fill_driven_tp1_not_generic_swi
     monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
     monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
     db = sa.create_engine("sqlite:///:memory:")
-    schema = schema_for_engine(db)
-    schema.metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     positions = PositionsRepo(db)
     persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
-        env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
+        env="practice", strategy="pb1_pullback_close", account_id=get_account_key(env="practice"),
         sid=1, mode=1, code="067290", market="J", qty=20, avg_price=100.0,
     )
     assert created
@@ -638,7 +642,7 @@ def test_jw_pharma_verified_adoption_close_submits_real_tp1_quantity(monkeypatch
     create_schema_with_active_test_epoch(db)
     positions = PositionsRepo(db)
     persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
-        env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
+        env="practice", strategy="pb1_pullback_close", account_id=get_account_key(env="practice"),
         sid=1, mode=1, code="067290", market="J", qty=593, avg_price=2358.671,
     )
     assert created

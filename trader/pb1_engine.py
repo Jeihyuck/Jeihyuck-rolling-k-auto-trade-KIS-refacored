@@ -12033,9 +12033,9 @@ class PB1Engine:
                     or cf.features.get("position_lifecycle_id")
                     or f"PB1_ENTRY:{self.STRATEGY_NAME}:{cf.market}:{cf.mode}:{cf.code}"
                 ),
-                action=f"BUY_CLOSE_ENTRY:{stage}",
+                action="BUY_CLOSE_ENTRY:PB1-CLOSE",
                 requested_qty=int(cf.planned_qty or 0),
-                retry_action_prefix=f"BUY_CLOSE_ENTRY:{stage}",
+                retry_action_prefix="BUY_CLOSE_ENTRY:PB1-CLOSE",
             )
         except Exception:
             logger.exception("[PB1][CLOSE_ENTRY][EXECUTION_CLAIM_FAIL] key=%s",
