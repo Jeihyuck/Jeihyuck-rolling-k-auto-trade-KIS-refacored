@@ -65,6 +65,11 @@ jobs:
           set -euo pipefail
           python -m pytest tests/test_unified_trading_epoch_postgres.py -q
 
+      - name: Verify durable execution claims on PostgreSQL 16
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_execution_claim_contract.py tests/test_reconcile_execution_claims.py -q
+
       - name: Verify US order-fill epoch lineage on PostgreSQL 16
         run: |
           set -euo pipefail
