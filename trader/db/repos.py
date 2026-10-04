@@ -2855,6 +2855,76 @@ class OrdersRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
         self._last_read_fail_open_op: str | None = None
+        from trader.execution_claims import DurableExecutionClaimRepo
+        self._execution_claim_repo = DurableExecutionClaimRepo(
+            engine, self._schema.execution_claims, self._schema.execution_attempts,
+        )
+
+    def claim_execution_action(
+        self,
+        *,
+        env: str,
+        market: str,
+        strategy_owner: str,
+        lifecycle_id: str,
+        action: str,
+        trade_date: date | None,
+        attempt_id: str,
+        requested_qty: int,
+        client_order_key: str,
+        fresh_validation: bool,
+    ):
+        from trader.account_state import get_account_key, resolve_env_name
+        from trader.db.trading_epoch import active_trading_epoch_id
+        from trader.execution_state import SemanticActionIdentity
+
+        env = resolve_env_name(env)
+        account_key = get_account_key(env=env)
+        epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=account_key, required=True,
+        )
+        identity = SemanticActionIdentity(
+            env=env,
+            account_id=hashlib.sha256(account_key.encode("utf-8")).hexdigest(),
+            market=market,
+            trading_epoch_id=str(epoch_id),
+            strategy_owner=strategy_owner,
+            lifecycle_id=str(lifecycle_id),
+            action=str(action),
+            trade_date=trade_date,
+        )
+        return self._execution_claim_repo.acquire(
+            identity,
+            attempt_id=attempt_id,
+            requested_qty=requested_qty,
+            client_order_key=client_order_key,
+            fresh_validation=fresh_validation,
+        )
+
+    def record_execution_claim_for_order(
+        self,
+        client_order_key: str,
+        *,
+        state: str,
+        cumulative_filled_qty: int | None,
+        authoritative: bool,
+    ):
+        attempt = self._execution_claim_repo.find_attempt_for_client_order_key(client_order_key)
+        if attempt is None:
+            raise LookupError(
+                f"execution claim attempt not found for client order key {client_order_key}"
+            )
+        action_key, attempt_id = attempt
+        return self._execution_claim_repo.record_observation(
+            action_key,
+            attempt_id=attempt_id,
+            state=state,
+            cumulative_filled_qty=cumulative_filled_qty,
+            authoritative=authoritative,
+        )
+
+    def execution_claim_health(self) -> dict[str, int]:
+        return self._execution_claim_repo.health()
 
     def _read_mappings_with_guard(
         self,

@@ -5,6 +5,7 @@ import pytest
 
 from trader.kr.infinite.config import InfiniteConfig
 from trader.kr.infinite.models import Action, OrderIntent, State, Status
+from trader.execution_claims import ExecutionClaim
 from trader.kr.infinite.runner import run_once
 from trader.kis_wrapper import KisTemporaryError
 
@@ -68,6 +69,14 @@ class FakeRepository:
                                         decision.idempotency_key, decision.qty, unit_sequence=state.units_used + 1))
         return True
 
+    def claim_submit(self, **kwargs):
+        self.events.append("claim")
+        attempt_id = f"attempt-{len(self.events)}"
+        return object(), ExecutionClaim(True, "action-key", attempt_id)
+
+    def record_execution_claim_observation(self, identity, **kwargs):
+        self.events.append(("claim_observation", kwargs["state"]))
+
     def mark_submitted(self, key, order_id):
         self.intents = [replace(item, broker_order_id=order_id, status="SUBMITTED") if item.idempotency_key == key else item for item in self.intents]
 
@@ -120,9 +129,28 @@ def test_intent_is_persisted_before_submit(armed_practice_env):
     original = kis.buy_stock_limit
     def checked(*args):
         assert repo.intents
+        repo.events.append("submit")
         return original(*args)
     kis.buy_stock_limit = checked
     run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert repo.events.index("claim") < repo.events.index("submit")
+
+
+def test_existing_semantic_claim_blocks_broker_submit(armed_practice_env):
+    class ClaimedRepository(FakeRepository):
+        def claim_submit(self, **kwargs):
+            self.events.append("claim")
+            return object(), ExecutionClaim(False, "action-key", reason="unresolved_action")
+
+    kis, repo = FakeKIS(), ClaimedRepository()
+    result = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+
+    assert result.decision.reason == "KR_INF_EXECUTION_ACTION_CLAIMED"
+    assert not kis.orders
+    assert "claim" in repo.events
 
 
 def test_ambiguous_submit_is_fenced_and_cycle_is_not_recreated(armed_practice_env):
