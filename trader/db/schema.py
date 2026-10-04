@@ -48,6 +48,8 @@ class SchemaTables:
     job_checkpoints: sa.Table
     derived_minervini: sa.Table
     derived_flow: sa.Table
+    execution_claims: sa.Table
+    execution_attempts: sa.Table
     uses_native_uuid: bool
 
 
@@ -451,6 +453,11 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Index("ix_job_checkpoints_updated", "updated_ts"),
     )
 
+    from trader.execution_claims import build_execution_claim_tables
+    execution_claims, execution_attempts = build_execution_claim_tables(
+        metadata, "execution_claims", "execution_attempts",
+    )
+
     return SchemaTables(
         database_url=database_url,
         metadata=metadata,
@@ -470,6 +477,8 @@ def _build_schema(database_url: str) -> SchemaTables:
         job_checkpoints=job_checkpoints,
         derived_minervini=derived_minervini,
         derived_flow=derived_flow,
+        execution_claims=execution_claims,
+        execution_attempts=execution_attempts,
         uses_native_uuid=uses_native_uuid,
     )
 

@@ -584,19 +584,23 @@ def same_day_semantic_sell_exists(intent: dict) -> bool:
     wanted = (str(intent.get("symbol") or "").upper(), "SELL",
               str(intent.get("strategy_owner") or meta.get("strategy_owner") or meta.get("book") or "").upper(),
               family, str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or meta.get("cycle_id") or ""))
+    from trader.us.db.repos import load_us_daily_orders_for_report
     try:
-        from trader.us.db.repos import load_us_daily_orders_for_report
-        for row in load_us_daily_orders_for_report(str(intent.get("trade_date") or "")) or []:
-            row_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-            row_reason = str(row.get("reason") or row_meta.get("reason") or "").upper()
-            row_family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in row_reason), row_reason)
-            actual = (str(row.get("symbol") or "").upper(), str(row.get("side") or "").upper(),
-                      str(row.get("strategy_owner") or row_meta.get("strategy_owner") or row_meta.get("book") or "").upper(),
-                      row_family, str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
-            if actual == wanted:
-                return True
-    except Exception as exc:
-        logger.warning("[US_ORDER][SEMANTIC_FENCE][WARN] symbol=%s err=%s", wanted[0], exc)
+        rows = load_us_daily_orders_for_report(str(intent.get("trade_date") or ""))
+    except Exception:
+        logger.exception("[US_ORDER][SEMANTIC_FENCE][LEDGER_UNAVAILABLE] symbol=%s", wanted[0])
+        raise
+    if rows is None:
+        raise RuntimeError("semantic SELL ledger lookup returned no result")
+    for row in rows:
+        row_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_reason = str(row.get("reason") or row_meta.get("reason") or "").upper()
+        row_family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in row_reason), row_reason)
+        actual = (str(row.get("symbol") or "").upper(), str(row.get("side") or "").upper(),
+                  str(row.get("strategy_owner") or row_meta.get("strategy_owner") or row_meta.get("book") or "").upper(),
+                  row_family, str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
+        if actual == wanted:
+            return True
     return False
 
 def _validate_take_profit_with_fresh_broker_position(
@@ -827,10 +831,21 @@ def route_order(
         })
         intent["meta"] = meta
 
-    if same_day_semantic_sell_exists(intent):
-        logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
-        return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
-                "broker_submit": False, "intent": intent}
+    try:
+        if same_day_semantic_sell_exists(intent):
+            logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
+            return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
+                    "broker_submit": False, "intent": intent}
+    except Exception as exc:
+        logger.critical("[US_ORDER][SEMANTIC_FENCE][FAIL_CLOSED] symbol=%s err=%s", symbol, exc)
+        return {
+            "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
+            "reason": "semantic_sell_duplicate_lookup_failed",
+            "execution_integrity_error": str(exc),
+            "broker_submit": False,
+            "retry_order": False,
+            "intent": intent,
+        }
     is_tqqq_infinite = (
         symbol_upper == TQQQ_SYMBOL
         and intent.get("strategy_owner") == TQQQ_OWNER
