@@ -1614,18 +1614,22 @@ def route_order(
             "intent": intent,
         }
 
-    def _record_claim_observation(state: str, filled_qty: int | None, *, authoritative: bool) -> None:
+    def _record_claim_observation(
+        state: str, filled_qty: int | None, *, authoritative: bool,
+    ) -> str | None:
         try:
             record_execution_action_observation(
                 claim_identity, attempt_id=intent["submit_attempt_id"],
                 state=state, cumulative_filled_qty=filled_qty,
                 authoritative=authoritative,
             )
-        except Exception:
+            return None
+        except Exception as exc:
             logger.exception(
                 "[US_ORDER][EXECUTION_CLAIM][OBSERVATION_FAILED] action_key=%s state=%s",
                 claim.action_key, state,
             )
+            return f"{type(exc).__name__}: {exc}"
 
     from trader.us.execution.order_journal import append_order_event
     try:
@@ -1640,7 +1644,6 @@ def route_order(
             logger.exception("[US_ORDER][EXECUTION_CLAIM][PRE_SUBMIT_RELEASE_FAILED] action_key=%s", claim.action_key)
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
         return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
-    _record_claim_observation("SUBMITTED", None, authoritative=False)
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
     logger.info(
         "[US_ORDER_SUBMIT_ATTEMPT] symbol=%s side=%s qty=%s limit_price=%.4f notional=%.4f",
@@ -1656,12 +1659,71 @@ def route_order(
     # KIS 주문 성공 후 DB 저장 실패는 REJECT가 아니라 ACK_DB_FAILED이다.
     order_no: str | None = None
     resp: Any = None
+    from trader.us.execution.kis_us_client import KisUSPreSubmitError
+
+    def _mark_broker_submit_boundary() -> None:
+        observation_error = _record_claim_observation(
+            "SUBMITTED", None, authoritative=False,
+        )
+        if observation_error:
+            raise KisUSPreSubmitError(
+                f"CLAIM_OBSERVATION_FAILED_BEFORE_HTTP: {observation_error}"
+            )
+
+    set_submit_boundary = getattr(kis_client, "set_before_order_http", None)
+    clear_submit_boundary = getattr(kis_client, "clear_before_order_http", None)
     try:
+        if callable(set_submit_boundary):
+            set_submit_boundary(_mark_broker_submit_boundary)
+        else:
+            _mark_broker_submit_boundary()
         if side == "BUY":
             resp = kis_client.place_us_buy_order(symbol, exchange, qty, price)
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
     except Exception as exc:
+        if isinstance(exc, KisUSPreSubmitError):
+            integrity_error = str(exc)
+            try:
+                append_order_event(
+                    "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
+                    broker_status="PRE_SUBMIT_FAILURE",
+                    raw_response={"error": integrity_error},
+                )
+            except Exception as journal_exc:
+                integrity_error = f"{integrity_error}; abort journal failed: {journal_exc}"
+                logger.exception("[US_ORDER][PRE_IO_ABORT_JOURNAL_FAILED] action_key=%s", claim.action_key)
+            requires_reconcile = False
+            try:
+                from trader.us.db.repos import release_execution_action_before_submit
+                release_execution_action_before_submit(
+                    claim_identity, attempt_id=intent["submit_attempt_id"],
+                )
+            except Exception as release_exc:
+                requires_reconcile = True
+                integrity_error = f"{integrity_error}; claim release failed: {release_exc}"
+                logger.exception(
+                    "[US_ORDER][EXECUTION_CLAIM][PRE_IO_RELEASE_FAILED] action_key=%s",
+                    claim.action_key,
+                )
+            return {
+                "status": (
+                    "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED"
+                    if "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP" in str(exc)
+                    else "BROKER_SUBMIT_PRE_IO_FAILED"
+                ),
+                "reason": (
+                    "submitted_state_persistence_failed_before_broker_io"
+                    if "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP" in str(exc)
+                    else "broker_request_not_sent"
+                ),
+                "execution_integrity_error": integrity_error,
+                "execution_action_key": claim.action_key,
+                "broker_submit": False,
+                "retry_order": not requires_reconcile,
+                "requires_reconcile": requires_reconcile,
+                "intent": intent,
+            }
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
         msg = str(exc)
         if side == "SELL" and (is_no_balance_sell_reject(msg) or "잔고내역" in msg):
@@ -1689,10 +1751,11 @@ def route_order(
         deterministic = is_no_balance_sell_reject(msg) or _is_cash_insufficient_reject(msg) or any(token in msg.lower() for token in ("invalid quantity", "invalid price", "업무 거절", "주문 불가"))
         if not deterministic:
             append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response={"error": msg})
-            _record_claim_observation("UNRESOLVED", None, authoritative=False)
+            observation_error = _record_claim_observation("UNRESOLVED", None, authoritative=False)
             return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "reason": msg, "kis_ack": False,
                     "broker_submit": True, "retry_order": False, "requires_reconcile": True,
-                    "submit_attempt_id": intent["submit_attempt_id"], "intent": intent}
+                    "submit_attempt_id": intent["submit_attempt_id"],
+                    "execution_integrity_error": observation_error, "intent": intent}
         if side == "BUY" and _is_cash_insufficient_reject(msg):
             _CASH_EXHAUSTED_TICKS.add(_cash_tick_key(trade_date, intent))
             logger.error("[US_ORDER][CASH_EXHAUSTED] env=%s symbol=%s reason=broker_orderable_cash_insufficient cash_exhausted=1", account_env, symbol)
@@ -1707,9 +1770,20 @@ def route_order(
         }
         _persist_with_trade_date(save_order_reject, reject_result)
         append_order_event("ORDER_REJECTED", intent, context=context, broker_status="REJECTED", raw_response={"reason": msg})
-        _record_claim_observation("REJECTED_EXPLICIT", 0, authoritative=True)
+        observation_error = _record_claim_observation("REJECTED_EXPLICIT", 0, authoritative=True)
         if order_key:
             mark_order_intent_rejected(order_key, reason=msg)
+        if observation_error:
+            return {
+                "status": "REJECT_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED",
+                "reason": msg,
+                "execution_integrity_error": observation_error,
+                "kis_ack": False,
+                "broker_submit": True,
+                "retry_order": False,
+                "requires_reconcile": True,
+                "intent": intent,
+            }
         return {
             "status": "REJECT",
             "reason": msg,
@@ -1719,6 +1793,15 @@ def route_order(
             "cash_exhausted": bool(side == "BUY" and _is_cash_insufficient_reject(msg)),
             "intent": intent,
         }
+    finally:
+        if callable(clear_submit_boundary):
+            try:
+                clear_submit_boundary()
+            except Exception:
+                logger.exception(
+                    "[US_ORDER][SUBMIT_BOUNDARY_CLEAR_FAILED] action_key=%s",
+                    claim.action_key,
+                )
 
     # A broker response means submission occurred. Parsing/audit failures are
     # unresolved ACK states and must never enter broker rejection handling.
@@ -1728,14 +1811,16 @@ def route_order(
     except Exception as exc:
         logger.error("[US_ORDER][ACK_PARSE_FAILED] symbol=%s err=%s", symbol, exc)
         append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
-        _record_claim_observation("UNRESOLVED", None, authoritative=False)
+        observation_error = _record_claim_observation("UNRESOLVED", None, authoritative=False)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
-                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp,
+                "execution_integrity_error": observation_error, "intent": intent}
     if not order_no:
         append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
-        _record_claim_observation("UNRESOLVED", None, authoritative=False)
+        observation_error = _record_claim_observation("UNRESOLVED", None, authoritative=False)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
-                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp,
+                "execution_integrity_error": observation_error, "intent": intent}
     try:
         append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no,
                            broker_status="ACK", raw_response=resp)
@@ -1744,7 +1829,7 @@ def route_order(
         return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,
                 "broker_submit": True, "retry_order": False, "requires_reconcile": True,
                 "order_no": order_no, "intent": intent}
-    _record_claim_observation("ACKED", None, authoritative=False)
+    observation_error = _record_claim_observation("ACKED", None, authoritative=False)
     logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
     if context is not None:
         context.invalidate_after_order(symbol)
@@ -1790,6 +1875,22 @@ def route_order(
     ack_db_saved = False
     try:
         ack_db_saved = bool(_persist_with_trade_date(save_order_ack, ack_result))
+        if ack_db_saved and observation_error:
+            return {
+                "status": "ACK_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "order_no": order_no,
+                "response": resp,
+                "intent": intent,
+                "kis_ack": True,
+                "ack_db_saved": True,
+                "broker_submit": True,
+                "retry_order": False,
+                "requires_reconcile": True,
+                "execution_integrity_error": observation_error,
+            }
         if ack_db_saved:
             logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
     except Exception:
