@@ -10390,7 +10390,8 @@ class PB1Engine:
         state: str,
         filled_qty: int | None,
         authoritative: bool,
-    ) -> None:
+        integrity_status: dict[str, Any] | None = None,
+    ) -> str | None:
         try:
             self.orders_repo.record_execution_claim_for_order(
                 client_order_key,
@@ -10398,11 +10399,21 @@ class PB1Engine:
                 cumulative_filled_qty=filled_qty,
                 authoritative=authoritative,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[PB1][EXECUTION_CLAIM][OBSERVATION_FAILED] key=%s state=%s",
                 client_order_key, state,
             )
+            error = f"execution claim observation failed for {state}: {exc}"
+            if integrity_status is not None:
+                integrity_status["reconcile_required"] = 1
+                integrity_status["execution_integrity_error"] = error
+                integrity_status["submit_terminal_status"] = (
+                    "EXECUTION_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED"
+                )
+                integrity_status["terminal_event"] = "ORDER_SUBMIT_UNRESOLVED"
+            return error
+        return None
 
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
         ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
@@ -11100,6 +11111,7 @@ class PB1Engine:
                     state="UNRESOLVED",
                     filled_qty=None,
                     authoritative=False,
+                    integrity_status=status,
                 )
                 self._append_ledger_event(
                     event_type="ORDER_SUBMIT_UNRESOLVED",
@@ -11147,6 +11159,7 @@ class PB1Engine:
                 state="ACKED",
                 filled_qty=None,
                 authoritative=False,
+                integrity_status=status,
             )
         elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
             self._record_pb1_submit_observation(
@@ -11154,6 +11167,7 @@ class PB1Engine:
                 state="REJECTED_EXPLICIT",
                 filled_qty=0,
                 authoritative=True,
+                integrity_status=status,
             )
         else:
             self._record_pb1_submit_observation(
@@ -11161,6 +11175,7 @@ class PB1Engine:
                 state="UNRESOLVED",
                 filled_qty=None,
                 authoritative=False,
+                integrity_status=status,
             )
         if broker_ack:
             self._append_ledger_event(
@@ -11343,6 +11358,11 @@ class PB1Engine:
                 response=resp if isinstance(resp, dict) else None,
             )
             status["terminal_event"] = "API_RESULT"
+        if status.get("execution_integrity_error"):
+            status["submit_terminal_status"] = (
+                "EXECUTION_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED"
+            )
+            status["terminal_event"] = "ORDER_SUBMIT_UNRESOLVED"
         return status
 
     def _place_add_on(self, pos: dict, *, qty: int, price: float) -> None:
@@ -12130,6 +12150,7 @@ class PB1Engine:
                     state="UNRESOLVED",
                     filled_qty=None,
                     authoritative=False,
+                    integrity_status=status,
                 )
                 self._append_ledger_event(
                     event_type="ORDER_SUBMIT_UNRESOLVED",
@@ -12206,6 +12227,7 @@ class PB1Engine:
                 state="ACKED",
                 filled_qty=None,
                 authoritative=False,
+                integrity_status=status,
             )
         elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
             self._record_pb1_submit_observation(
@@ -12213,6 +12235,7 @@ class PB1Engine:
                 state="REJECTED_EXPLICIT",
                 filled_qty=0,
                 authoritative=True,
+                integrity_status=status,
             )
         else:
             self._record_pb1_submit_observation(
@@ -12220,6 +12243,7 @@ class PB1Engine:
                 state="UNRESOLVED",
                 filled_qty=None,
                 authoritative=False,
+                integrity_status=status,
             )
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
@@ -12319,6 +12343,11 @@ class PB1Engine:
                 response=resp if isinstance(resp, dict) else None,
             )
             status["terminal_event"] = "API_RESULT"
+        if status.get("execution_integrity_error"):
+            status["submit_terminal_status"] = (
+                "EXECUTION_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED"
+            )
+            status["terminal_event"] = "ORDER_SUBMIT_UNRESOLVED"
         return status
 
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> dict[str, Any] | None:
@@ -13854,6 +13883,7 @@ class PB1Engine:
                 )
                 self._record_pb1_submit_observation(
                     client_key, state="UNRESOLVED", filled_qty=None, authoritative=False,
+                    integrity_status=exit_eval_payload,
                 )
                 exit_eval_payload["submitted"] = 0
                 exit_eval_payload["reconcile_required"] = 1
@@ -13933,14 +13963,17 @@ class PB1Engine:
         if ok:
             self._record_pb1_submit_observation(
                 client_key, state="ACKED", filled_qty=None, authoritative=False,
+                integrity_status=exit_eval_payload,
             )
         elif isinstance(resp, dict) and str(resp.get("rt_cd") or "").strip() not in {"", "0"}:
             self._record_pb1_submit_observation(
                 client_key, state="REJECTED_EXPLICIT", filled_qty=0, authoritative=True,
+                integrity_status=exit_eval_payload,
             )
         else:
             self._record_pb1_submit_observation(
                 client_key, state="UNRESOLVED", filled_qty=None, authoritative=False,
+                integrity_status=exit_eval_payload,
             )
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
