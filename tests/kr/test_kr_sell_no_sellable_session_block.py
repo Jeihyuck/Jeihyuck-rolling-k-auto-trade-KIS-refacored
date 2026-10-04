@@ -7,6 +7,7 @@ import sqlalchemy as sa
 
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
+from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 from trader.pb1_engine import PB1Engine
 from trader.window_router import WindowDecision
 from trader.execution_state import exit_stage_for_reason
@@ -42,7 +43,7 @@ def _make_engine(
     now_kst_value: datetime | None = None,
 ) -> tuple[PB1Engine, FakeKis]:
     db = db or sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     kis = kis or FakeKis()
     engine = PB1Engine(
         universe_repo=_NoopUniverseRepo(),
@@ -70,7 +71,7 @@ def _make_engine(
 def test_sell_ack_survives_new_pb1_engine_instance(monkeypatch) -> None:
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     kis = FakeKis()
     balance = {"output1": [{"pdno": "010060", "hldg_qty": "14", "ord_psbl_qty": "14",
                              "pchs_avg_pric": "271660"}], "output2": [{"ord_psbl_cash": "0"}]}
@@ -134,7 +135,7 @@ def test_changing_full_exit_reason_cannot_bypass_durable_guard():
     assert exit_stage_for_reason("TRAIL_STOP_HIT") == "FULL_EXIT"
     assert exit_stage_for_reason("MA20_BREAK") == "FULL_EXIT"
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     repo = OrdersRepo(db)
     repo.create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
@@ -153,7 +154,7 @@ def test_changing_full_exit_reason_cannot_bypass_durable_guard():
 
 def test_filled_tp1_allows_tp2_or_emergency_full_exit_with_fresh_remaining_balance():
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
@@ -173,7 +174,7 @@ def test_filled_tp1_allows_tp2_or_emergency_full_exit_with_fresh_remaining_balan
 @pytest.mark.parametrize("status", ["REJECTED", "ACKED", "UNRESOLVED_ACK"])
 def test_unconfirmed_tp1_never_unlocks_tp2(status):
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
@@ -190,7 +191,7 @@ def test_unconfirmed_tp1_never_unlocks_tp2(status):
 @pytest.mark.parametrize("status", ["PARTIAL_FILLED", "FILLED"])
 def test_confirmed_tp1_with_fresh_remaining_balance_unlocks_tp2(status):
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
@@ -206,7 +207,7 @@ def test_confirmed_tp1_with_fresh_remaining_balance_unlocks_tp2(status):
 
 def test_failed_tp1_does_not_block_protective_full_exit():
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
@@ -230,7 +231,7 @@ def test_production_partial_reason_stage_mapping_and_reason_family():
 
 def test_profit_protect_fill_allows_later_emergency_full_exit():
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
@@ -249,7 +250,7 @@ def test_profit_protect_fill_allows_later_emergency_full_exit():
 def _hard_stop_after_prior_partial(monkeypatch, *, prior_stage: str, prior_status: str):
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
@@ -355,7 +356,7 @@ def test_sell_accepted_in_session_prevents_resubmit() -> None:
 def test_kr_pb1_sell_accepted_blocks_same_cycle_resubmit(monkeypatch) -> None:
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     kis = FakeKis()
     balance = {"output1": [{"pdno": "010060", "hldg_qty": "14", "ord_psbl_qty": "14",
                              "pchs_avg_pric": "271660"}], "output2": [{"ord_psbl_cash": "0"}]}
@@ -634,7 +635,7 @@ def test_jw_pharma_verified_adoption_close_submits_real_tp1_quantity(monkeypatch
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     monkeypatch.setenv("KR_PROFIT_CAPTURE_ENABLE", "1")
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     positions = PositionsRepo(db)
     persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
         env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
@@ -769,7 +770,7 @@ def test_created_sell_intent_retries_with_new_key_and_fresh_baseline(monkeypatch
     """A pre-submit CREATED row must not starve a later protective SELL."""
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     balance = {"output1": [{"pdno": "003550", "hldg_qty": "11", "ord_psbl_qty": "11",
                              "pchs_avg_pric": "111400"}], "output2": [{}]}
     engine, kis = _make_engine(db, FakeKis(), balance)
@@ -807,7 +808,7 @@ def test_explicit_broker_rejection_can_retry_sell_with_new_key(monkeypatch) -> N
     """Confirmed rejection is terminal evidence, so a later SELL may retry safely."""
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     balance = {"output1": [{"pdno": "005830", "hldg_qty": "7", "ord_psbl_qty": "7",
                              "pchs_avg_pric": "10000"}], "output2": [{}]}
     engine, kis = _make_engine(db, FakeKis(), balance)
@@ -844,7 +845,7 @@ def test_ambiguous_sell_error_remains_fenced_against_duplicate_submit(monkeypatc
     """Lost/unknown broker ACK must never be retried just because status is ERROR."""
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     balance = {"output1": [{"pdno": "005830", "hldg_qty": "7", "ord_psbl_qty": "7",
                              "pchs_avg_pric": "10000"}], "output2": [{}]}
     engine, kis = _make_engine(db, FakeKis(), balance)

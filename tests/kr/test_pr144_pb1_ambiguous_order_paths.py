@@ -14,6 +14,7 @@ from trader.reconcile_kis import _promote_open_buy_orders_from_holdings
 from trader.trade_plan import build_entry_exit_plan
 from trader.window_router import WindowDecision
 from tests.kr.test_kr_entry_authoritative_gate_state import _build_candidate
+from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
 class AmbiguousBuyKis:
@@ -116,7 +117,7 @@ def _engine(db, kis, *, phase: str = "entry", window_name: str = "day", balance_
 
 def _new_db():
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     return db
 
 

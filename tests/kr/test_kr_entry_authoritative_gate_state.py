@@ -5,6 +5,7 @@ import sqlalchemy as sa
 
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
+from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 from trader.pb1_engine import CandidateFeature, PB1Engine
 from trader.window_router import WindowDecision
 
@@ -20,7 +21,7 @@ class FakeKis:
 
 def _make_engine() -> PB1Engine:
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     return PB1Engine(
         universe_repo=object(),
         orders_repo=OrdersRepo(db),
