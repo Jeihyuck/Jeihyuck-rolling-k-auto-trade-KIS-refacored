@@ -3,29 +3,29 @@
 ## Required Fields
 
 - trade_date: 2026-05-01
-- branch: stabilize/01-execution-state-contract-20261004
-- commit_sha: 0a46f607f104ae195b370301ece52722c5e21486
-- run_id: 37214235102
-- github_run_id: 37214235102
-- github_run_attempt: 1
-- sha: 0a46f607f104ae195b370301ece52722c5e21486
-- workflow: dynamic/copilot-swe-agent/copilot
+- branch: dual-agent
+- commit_sha: test-sha
+- run_id: 25718405741
+- github_run_id: 25718405741
+- github_run_attempt: 0
+- sha: test-sha
+- workflow: US Trade AM
 - session: am
-- session_id: am-37214235102
-- event_name: dynamic
-- actor: copilot-swe-agent[bot]
+- session_id: am-25718405741
+- event_name: workflow_dispatch
+- actor: codespace
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-10-04T16:11:44.455561Z
-- started_at_et: 2026-10-04T12:11:44.442823-04:00
-- started_at_kst: 2026-10-05T01:11:44.455561+09:00
-- ended_at_utc: 2026-10-04T16:11:44.455561Z
-- ended_at_et: 2026-10-04T12:11:44.455550-04:00
-- ended_at_kst: 2026-10-05T01:11:44.455561+09:00
-- wall_elapsed_sec: 0.01
+- started_at_utc: 2026-08-07T04:47:20.427929Z
+- started_at_et: 2026-08-07T00:47:20.408924-04:00
+- started_at_kst: 2026-08-07T13:47:20.427929+09:00
+- ended_at_utc: 2026-08-07T04:47:20.427929Z
+- ended_at_et: 2026-08-07T00:47:20.427909-04:00
+- ended_at_kst: 2026-08-07T13:47:20.427929+09:00
+- wall_elapsed_sec: 0.0
 - code_version_source: github_actions
-- dry_run: False
-- kis_order_allowed: 1
+- dry_run: True
+- kis_order_allowed: 0
 - prep_status: UNKNOWN
 - prep_run_id: 
 - score_nonzero_count: 0
@@ -38,34 +38,9 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_10
-- final_status: OK_WITH_WARNINGS
-- reason: max_ticks
-- session_orders_sent: 0
-- session_orders_ack: 0
-- session_orders_rejected: 0
-- session_fills_count: 0
-- cumulative_fills_count: 0
-- daily_cumulative_fills_count: 0
-- session_buy_notional_routed: 0.0
-- daily_buy_notional_filled: 0.0
-- daily_order_audit_buy_notional: 0.0
-- entry_candidate_notional_evaluated: 0.0
-- entry_intent_notional_before_risk: 0.0
-- entry_intent_notional_after_risk: 0.0
-- orders_submitted_notional: 0.0
-- orders_acknowledged_notional: 0.0
-- fills_confirmed_notional: 0.0
-- no_new_orders_reason: 
-- daily_buy_limit_usd: 0.0
-- daily_buy_notional_filled_usd: 0.0
-- daily_buy_budget_remaining_usd: 0.0
-- daily_notional_exceeded_block_count: 0
-- daily_notional_exceeded_block_symbols: {}
-- kis_temp_error_raw_log_count: 0
-- kis_temp_error_sequence_count: 0
-- kis_temp_error_by_endpoint: {}
-- order_submit_temp_error_count: 0
+- last_stage: tick_1
+- final_status: OK
+- reason: force_now_single_tick
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 

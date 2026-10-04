@@ -144,6 +144,38 @@ def test_regular_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeyp
     assert second["terminal_event"] == "FINAL_SKIP"
 
 
+def test_kr_claim_observation_failure_is_visible_and_keeps_submit_fence(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    kis = AckOnlyBuyKis()
+    record_observation = OrdersRepo.record_execution_claim_for_order
+
+    def fail_ack_observation(self, client_order_key, **kwargs):
+        if kwargs.get("state") == "ACKED":
+            raise OSError("execution claim store unavailable after broker ACK")
+        return record_observation(self, client_order_key, **kwargs)
+
+    monkeypatch.setattr(OrdersRepo, "record_execution_claim_for_order", fail_ack_observation)
+    candidate = _build_candidate("018260")
+    candidate.client_order_key = "kr-claim-observation-failure"
+
+    first = _engine(db, kis)._place_entry(candidate)
+    health = OrdersRepo(db).execution_claim_health()
+
+    assert kis.buy_calls == 1
+    assert first["reconcile_required"] == 1
+    assert first["execution_integrity_error"]
+    assert health["unresolved_execution_actions"] == 1
+
+    retry = _build_candidate("018260")
+    retry.client_order_key = "kr-claim-observation-failure-retry"
+    second = _engine(db, kis)._place_entry(retry)
+
+    assert second["submit_terminal_status"] == "EXECUTION_ACTION_ALREADY_CLAIMED"
+    assert kis.buy_calls == 1
+    assert OrdersRepo(db).execution_claim_health()["unresolved_execution_actions"] == 1
+
+
 def test_close_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeypatch):
     monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
     db = _new_db()
