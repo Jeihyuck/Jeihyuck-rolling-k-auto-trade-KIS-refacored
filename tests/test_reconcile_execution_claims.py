@@ -1,4 +1,7 @@
-from trader.reconcile_kis import _record_execution_claim_observation
+from trader.reconcile_kis import (
+    _execution_claim_health,
+    _record_execution_claim_observation,
+)
 
 
 class RecordingOrdersRepo:
@@ -68,3 +71,14 @@ def test_reconcile_records_authoritative_partial_fill_and_zero_fill_cancel():
             },
         ),
     ]
+
+
+def test_claim_ledger_failure_is_exposed_as_unavailable_health():
+    class UnavailableOrdersRepo:
+        def execution_claim_health(self):
+            raise RuntimeError("ledger unavailable")
+
+    assert _execution_claim_health(UnavailableOrdersRepo()) == {
+        "available": False,
+        "error": "RuntimeError",
+    }

@@ -197,6 +197,17 @@ def _record_execution_claim_observation(
         )
 
 
+def _execution_claim_health(orders_repo: OrdersRepo) -> dict[str, Any]:
+    try:
+        return {"available": True, **orders_repo.execution_claim_health()}
+    except Exception as exc:
+        logger.error(
+            "[RECONCILE][EXECUTION_CLAIM][HEALTH_UNAVAILABLE] err=%s",
+            exc,
+        )
+        return {"available": False, "error": type(exc).__name__}
+
+
 def _parse_date_time(row: dict) -> datetime:
     date_raw = _first_value(row, ["ord_dt", "trd_dt", "ccld_dt", "ord_date", "date"])
     time_raw = _first_value(row, ["ord_tmd", "trd_tmd", "ccld_tmd", "ord_time", "time"])
@@ -1563,18 +1574,5 @@ def reconcile_kis(
     # authoritative view so post-tick policy/health checks do not fall back to
     # the stale balance snapshot captured near the beginning of the tick.
     reconcile_result["_final_holdings_rows"] = list(holdings_rows)
-    try:
-        reconcile_result["execution_claim_health"] = {
-            "available": True,
-            **orders_repo.execution_claim_health(),
-        }
-    except Exception as exc:
-        logger.error(
-            "[RECONCILE][EXECUTION_CLAIM][HEALTH_UNAVAILABLE] err=%s",
-            exc,
-        )
-        reconcile_result["execution_claim_health"] = {
-            "available": False,
-            "error": type(exc).__name__,
-        }
+    reconcile_result["execution_claim_health"] = _execution_claim_health(orders_repo)
     return reconcile_result

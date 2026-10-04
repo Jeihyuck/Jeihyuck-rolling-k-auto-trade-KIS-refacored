@@ -153,6 +153,24 @@ def test_existing_semantic_claim_blocks_broker_submit(armed_practice_env):
     assert "claim" in repo.events
 
 
+def test_claim_ledger_failure_blocks_before_broker_submit(armed_practice_env):
+    class UnavailableClaimRepository(FakeRepository):
+        def claim_submit(self, **kwargs):
+            self.events.append("claim")
+            raise RuntimeError("execution claim store unavailable")
+
+    kis, repo = FakeKIS(fill_qty=100), UnavailableClaimRepository()
+    result = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+
+    assert result.decision.action == Action.BLOCK
+    assert "execution claim store unavailable" in result.decision.reason
+    assert not kis.orders
+    assert "claim" in repo.events
+
+
 def test_ambiguous_submit_is_fenced_and_cycle_is_not_recreated(armed_practice_env):
     class AmbiguousKIS(FakeKIS):
         def buy_stock_limit(self, symbol, qty, price):
