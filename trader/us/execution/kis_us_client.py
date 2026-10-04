@@ -151,7 +151,7 @@ class KisUSClientError(Exception):
     """KIS US API 오류."""
 
 
-class KisUSPreSubmitError(KisUSClientError):
+class KisUSPreSubmitError(KisUSClientError, RuntimeError):
     """Known failure before the order HTTP request could have reached KIS."""
 
 
