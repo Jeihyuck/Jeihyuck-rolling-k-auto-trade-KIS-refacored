@@ -200,7 +200,7 @@ def test_reconcile_observation_persistence_failure_degrades_health_and_keeps_cla
         env="practice",
         strategy="pb1_pullback_close",
         started_at=datetime(2026, 10, 2, 12),
-        dry_run=False,
+        dry_run=True,
     )
     result = reconcile_today(engine=engine, kis=FakeKis(), ctx=ctx)
 
