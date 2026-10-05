@@ -23,6 +23,16 @@ def _patch_entry_db(monkeypatch, pos):
 
 def _run_entry(monkeypatch, pos, price=110.0):
     from trader.us.pb1.us_entry_engine import generate_entry_intents
+    pos = {
+        symbol: {
+            **position,
+            "position_lifecycle_id": position.get(
+                "position_lifecycle_id",
+                f"test-position-lifecycle:{symbol}",
+            ),
+        }
+        for symbol, position in pos.items()
+    }
     monkeypatch.setenv("US_MIN_ENTRY_SCORE", "0.01")
     monkeypatch.setenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")
     monkeypatch.setenv("US_ALLOW_ADD_TO_EXISTING", "1")

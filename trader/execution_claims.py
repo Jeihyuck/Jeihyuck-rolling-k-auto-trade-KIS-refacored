@@ -449,12 +449,27 @@ class DurableExecutionClaimRepo:
         *,
         action_prefix: str,
     ) -> str | None:
+        retryable = self.find_retryable_action_instance(
+            identity,
+            action_prefix=action_prefix,
+        )
+        return retryable[0] if retryable is not None else None
+
+    def find_retryable_action_instance(
+        self,
+        identity: SemanticActionIdentity,
+        *,
+        action_prefix: str,
+    ) -> tuple[str, str | None] | None:
         prefix = str(action_prefix or "").strip().upper()
         if not prefix:
             raise ValueError("retryable action lookup requires an action prefix")
         with self.engine.connect() as conn:
             row = conn.execute(
-                sa.select(self.actions.c.action)
+                sa.select(
+                    self.actions.c.action,
+                    self.actions.c.action_instance,
+                )
                 .where(
                     self.actions.c.env == identity.env.strip().lower(),
                     self.actions.c.account_id == identity.account_id.strip(),
@@ -474,8 +489,13 @@ class DurableExecutionClaimRepo:
                 )
                 .order_by(self.actions.c.updated_at.desc())
                 .limit(1)
-            ).scalar_one_or_none()
-        return str(row) if row is not None else None
+            ).one_or_none()
+        if row is None:
+            return None
+        return (
+            str(row.action),
+            str(row.action_instance) if row.action_instance is not None else None,
+        )
 
     def get(self, identity: SemanticActionIdentity | str) -> ExecutionClaimSnapshot:
         key = self._action_key(identity)

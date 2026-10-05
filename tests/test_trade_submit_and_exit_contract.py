@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import logging
@@ -156,6 +157,68 @@ def test_retryable_existing_intent_uses_retry_key_and_submits(monkeypatch, caplo
     assert "[ORDER][API_REQUEST] code=141080" in caplog.text
     assert "[ORDER][API_RESULT] code=141080" in caplog.text
     assert "[ORDER][FINAL_SKIP] code=141080" not in caplog.text
+
+
+def test_pb1_place_entry_persists_new_entry_generation(monkeypatch):
+    db_engine = _new_db_engine()
+    now_kst = datetime(2026, 3, 25, 14, 0, tzinfo=KST)
+    engine, _orders_repo, _fills_repo, _positions_repo, _ledger_repo = _make_engine(
+        db_engine=db_engine,
+        now_kst=now_kst,
+        dry_run=False,
+        intended_live=True,
+        kis=FakeKis(),
+    )
+    from trader.account_state import get_account_key
+
+    schema = schema_for_engine(db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            schema.trading_epochs.insert().values(
+                trading_epoch_id=str(uuid4()),
+                env=engine.env,
+                account_id=get_account_key(env=engine.env),
+                status="ACTIVE",
+                reason="PB1 production entry generation regression",
+            )
+        )
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    engine._buyable_gate_context = {
+        "141080": {
+            "holding_qty": 0,
+            "today_buy_exists": False,
+            "today_submit_exists": False,
+            "today_fill_exists": False,
+            "open_order_exists": False,
+            "cooldown_active": False,
+            "last_buy_event_at": None,
+            "last_fill_event_at": None,
+            "last_order_submit_at": None,
+        }
+    }
+
+    candidate = _make_candidate("pb1-entry-generation")
+    candidate.features.update({
+        "risk_passed": True,
+        "sizing_passed": True,
+        "risk_reasons": ["ok"],
+        "sizing_reason": "ok",
+        "planned_qty": 1,
+    })
+    status = engine._place_entry(candidate)
+
+    assert status["api_submitted"] == 1
+    with db_engine.connect() as conn:
+        claim = conn.execute(
+            sa.select(
+                schema.execution_claims.c.lifecycle_id,
+                schema.execution_claims.c.action_instance,
+            )
+        ).mappings().one()
+    assert claim["lifecycle_id"] == (
+        f"PB1_ENTRY:{engine.STRATEGY_NAME}:KOSDAQ:1:141080"
+    )
+    assert claim["action_instance"].startswith("ENTRY_GENERATION:")
 
 
 def test_run_exit_always_logs_ma_values_for_holdings(caplog):

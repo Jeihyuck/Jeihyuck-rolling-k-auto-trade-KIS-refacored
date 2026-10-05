@@ -2875,6 +2875,7 @@ class OrdersRepo:
         client_order_key: str,
         fresh_validation: bool,
         retry_action_prefix: str | None = None,
+        entry_generation: bool = False,
     ):
         from trader.account_state import get_account_key, resolve_env_name
         from trader.db.trading_epoch import active_trading_epoch_id
@@ -2895,7 +2896,28 @@ class OrdersRepo:
             action=str(action).strip().upper(),
             trade_date=trade_date,
         )
-        if retry_action_prefix:
+        if entry_generation:
+            if not retry_action_prefix:
+                raise ValueError("entry generation requires a retry action prefix")
+            prefix = str(retry_action_prefix).strip().upper()
+            retryable_generation = self._execution_claim_repo.find_retryable_action_instance(
+                identity,
+                action_prefix=prefix,
+            )
+            if retryable_generation is not None:
+                retryable_action, retryable_instance = retryable_generation
+                identity = replace(
+                    identity,
+                    action=retryable_action,
+                    action_instance=retryable_instance,
+                )
+            else:
+                identity = replace(
+                    identity,
+                    action=prefix,
+                    action_instance=f"ENTRY_GENERATION:{uuid4()}",
+                )
+        elif retry_action_prefix:
             prefix = str(retry_action_prefix).strip().upper()
             retryable_action = self._execution_claim_repo.find_retryable_action(
                 identity,

@@ -10363,6 +10363,7 @@ class PB1Engine:
         action: str,
         requested_qty: int,
         retry_action_prefix: str | None = None,
+        entry_generation: bool = False,
     ):
         claim_day = self._today
         if isinstance(claim_day, datetime):
@@ -10381,6 +10382,7 @@ class PB1Engine:
             client_order_key=client_order_key,
             fresh_validation=True,
             retry_action_prefix=retry_action_prefix,
+            entry_generation=entry_generation,
         )
 
     def _record_pb1_submit_observation(
@@ -11003,6 +11005,7 @@ class PB1Engine:
                 action=f"BUY_ENTRY:{stage}",
                 requested_qty=int(qty or 0),
                 retry_action_prefix=f"BUY_ENTRY:{stage}",
+                entry_generation=True,
             )
         except Exception as claim_exc:
             logger.exception(

@@ -841,6 +841,22 @@ def test_generated_us_standard_entry_allows_later_instance_after_terminal_fill(m
     assert broker.calls == 2
 
 
+def test_generated_us_standard_entry_explicit_reject_retries_same_daily_instance(monkeypatch):
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, reject_once=True, production_identity=True,
+    )
+    rejected_intent = _generated_pb1_buy(monkeypatch, trading_day="2026-10-02")
+    rejected = route_order(rejected_intent, kis_client=broker)
+    retry_intent = _generated_pb1_buy(monkeypatch, trading_day="2026-10-02")
+    retried = route_order(retry_intent, kis_client=broker)
+
+    assert rejected["status"] == "REJECT"
+    assert retried["status"] == "ACK"
+    assert rejected_intent["action_instance"] == retry_intent["action_instance"]
+    assert broker.calls == 2
+    assert claim_repo.health()["unresolved_execution_actions"] == 1
+
+
 def test_generated_add_buy_inherits_held_position_lifecycle(monkeypatch):
     _route_fixture(monkeypatch, production_identity=True)
     intent = _generated_pb1_buy(
