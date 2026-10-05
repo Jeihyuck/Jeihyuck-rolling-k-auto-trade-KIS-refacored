@@ -324,6 +324,151 @@ def test_orders_repo_reuses_retryable_entry_action_across_trade_dates():
     assert next_identity.action_key == first_identity.action_key
 
 
+def _kr_orders_repo_for_entry_generation():
+    from trader.account_state import get_account_key
+    from trader.db.repos import OrdersRepo
+    from trader.db.schema import schema_for_engine
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    env = "practice"
+    account_id = get_account_key(env=env)
+    with engine.begin() as conn:
+        conn.execute(
+            schema.trading_epochs.insert().values(
+                trading_epoch_id=str(uuid4()),
+                env=env,
+                account_id=account_id,
+                status="ACTIVE",
+                reason="PB1 entry generation regression",
+            )
+        )
+    return engine, OrdersRepo(engine)
+
+
+def _claim_kr_pb1_entry_generation(
+    orders_repo, *, lifecycle: str, trade_day: date, order_key: str, qty: int = 5,
+):
+    return orders_repo.claim_execution_action(
+        env="practice",
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=lifecycle,
+        action="BUY_ENTRY:PB1:INITIAL",
+        trade_date=trade_day,
+        attempt_id=f"attempt-{order_key}",
+        requested_qty=qty,
+        client_order_key=order_key,
+        fresh_validation=True,
+        retry_action_prefix="BUY_ENTRY:PB1:INITIAL",
+        entry_generation=True,
+    )
+
+
+def test_kr_pb1_initial_entry_unresolved_generation_fences_next_date():
+    engine, orders_repo = _kr_orders_repo_for_entry_generation()
+    lifecycle = "PB1_ENTRY:strategy:KR:mode:SAMPLE_CODE"
+    first_identity, first_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle=lifecycle,
+        trade_day=date(2026, 10, 2),
+        order_key="pb1-entry-day-one",
+    )
+    assert first_claim.acquired
+    assert first_identity.action_instance
+    orders_repo.record_execution_claim_for_order(
+        "pb1-entry-day-one",
+        state="UNRESOLVED",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+
+    next_identity, next_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle=lifecycle,
+        trade_day=date(2026, 10, 5),
+        order_key="pb1-entry-day-two",
+    )
+    assert next_identity.lifecycle_id == first_identity.lifecycle_id
+    assert not next_claim.acquired
+    assert next_claim.reason == "unresolved_lifecycle_action"
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "filled_qty"),
+    (("REJECTED_EXPLICIT", 0), ("CANCELLED", 0)),
+)
+def test_kr_pb1_reject_or_zero_cancel_retry_reuses_entry_generation(
+    terminal_state, filled_qty,
+):
+    engine, orders_repo = _kr_orders_repo_for_entry_generation()
+    lifecycle = "PB1_ENTRY:strategy:KR:mode:SAMPLE_CODE"
+    first_identity, first_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle=lifecycle,
+        trade_day=date(2026, 10, 2),
+        order_key="pb1-entry-retry-first",
+    )
+    assert first_claim.acquired
+    orders_repo.record_execution_claim_for_order(
+        "pb1-entry-retry-first",
+        state=terminal_state,
+        cumulative_filled_qty=filled_qty,
+        authoritative=True,
+    )
+
+    retry_identity, retry_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle=lifecycle,
+        trade_day=date(2026, 10, 5),
+        order_key="pb1-entry-retry-second",
+    )
+    assert retry_claim.acquired
+    assert retry_identity.action_instance == first_identity.action_instance
+    assert retry_identity.action_key == first_identity.action_key
+    engine.dispose()
+
+
+def test_kr_pb1_terminal_entry_advances_generation_and_code_scopes_are_independent():
+    engine, orders_repo = _kr_orders_repo_for_entry_generation()
+    first_lifecycle = "PB1_ENTRY:strategy:KR:mode:SAMPLE_CODE"
+    first_identity, first_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle=first_lifecycle,
+        trade_day=date(2026, 10, 2),
+        order_key="pb1-entry-terminal-first",
+    )
+    assert first_claim.acquired
+    orders_repo.record_execution_claim_for_order(
+        "pb1-entry-terminal-first",
+        state="FILLED",
+        cumulative_filled_qty=5,
+        authoritative=True,
+    )
+
+    next_identity, next_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle=first_lifecycle,
+        trade_day=date(2026, 10, 5),
+        order_key="pb1-entry-terminal-next-generation",
+    )
+    assert next_claim.acquired
+    assert next_identity.lifecycle_id == first_identity.lifecycle_id
+    assert next_identity.action_instance != first_identity.action_instance
+
+    other_identity, other_claim = _claim_kr_pb1_entry_generation(
+        orders_repo,
+        lifecycle="PB1_ENTRY:strategy:KR:mode:OTHER_SAMPLE_CODE",
+        trade_day=date(2026, 10, 2),
+        order_key="pb1-entry-other-code",
+    )
+    assert other_claim.acquired
+    assert other_identity.lifecycle_id != first_identity.lifecycle_id
+    engine.dispose()
+
+
 def test_unresolved_sell_stage_blocks_overlapping_emergency_until_broker_truth():
     _, repo = _repo()
     lifecycle = "cycle-sell-overlap"

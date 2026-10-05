@@ -10,7 +10,7 @@ import pytest
 from trader.execution_claims import DurableExecutionClaimRepo
 from trader.execution_state import SemanticActionIdentity
 from trader.us.db.execution_claim_schema import metadata as claim_metadata, us_execution_claims
-from trader.us.execution.order_router import route_order
+from trader.us.execution.order_router import _semantic_action_identity, route_order
 from trader.us.execution.kis_us_client import KisUSPreSubmitError
 
 
@@ -118,6 +118,7 @@ def _route_fixture(
         "trader.us.db.repos.load_us_positions_by_symbols",
         lambda *_args, **_kwargs: {},
     )
+    monkeypatch.setattr(order_router, "_get_broker_orderable_cash", lambda *_args, **_kwargs: 1_000_000.0)
     monkeypatch.setattr("trader.us.db.repos.save_order_intent", lambda *_args, **_kwargs: True)
     monkeypatch.setattr("trader.us.db.repos.save_order_ack", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
@@ -728,6 +729,151 @@ def test_sell_without_source_lifecycle_fails_closed_without_synthesizing(monkeyp
     assert result["reason"] == "position_lifecycle_identity_missing"
     assert result["broker_submit"] is False
     assert broker.calls == 0
+
+
+def _generated_pb1_buy(monkeypatch, *, trading_day: str, symbol: str = "ENTRY_CASE_A",
+                       held: bool = False):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trader.us.db import repos
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
+    monkeypatch.setattr(repos, "has_pending_order_for_symbol_side", lambda **_kwargs: False)
+    monkeypatch.setattr(repos, "has_position", lambda _symbol: False)
+    monkeypatch.setattr(repos, "load_today_order_keys", lambda **_kwargs: set())
+    monkeypatch.setattr(
+        repos, "load_us_positions_by_symbols",
+        lambda _symbols, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "trader.us.pb1.us_entry_engine._load_held_position_snapshot",
+        lambda *_args, **_kwargs: {
+            "qty": 2, "avg_price": 90.0, "current_price": 100.0,
+            "market_value_usd": 200.0, "current_weight": 0.01,
+            "position_lifecycle_id": "held-source-lifecycle",
+        },
+    )
+
+    class _Provider:
+        def get_current_price(self, _symbol, _exchange):
+            return {"last": 100.0}
+
+    intents = generate_entry_intents(
+        tickers=None,
+        provider=_Provider(),
+        sold_today=set(),
+        available_cash_usd=10_000.0,
+        position_count=int(held),
+        capital_usd_cap=20_000.0,
+        now=datetime.fromisoformat(f"{trading_day}T12:00:00-04:00").astimezone(
+            ZoneInfo("America/New_York")
+        ),
+        max_new_entries=1,
+        watchlist_entries=[{
+            "symbol": symbol,
+            "exchange": "NASDAQ",
+            "score": 0.8,
+            "score_final": 0.8,
+            "entry_style_selected": "ENTRY_PULLBACK",
+            "current_price": 100.0,
+        }],
+        current_position_symbols={symbol} if held else set(),
+    )
+    assert len(intents) == 1
+    return intents[0]
+
+
+def test_generated_us_standard_entry_keeps_unresolved_identity_across_dates(monkeypatch):
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, fail_submit=True, production_identity=True,
+    )
+    first = _generated_pb1_buy(monkeypatch, trading_day="2026-10-02")
+    first_result = route_order(first, kis_client=broker)
+    routed_first = first_result.get("intent") or first
+    routed_first.setdefault("strategy_owner", "US_STANDARD")
+    first_identity = _semantic_action_identity(routed_first, account_env="practice")
+
+    next_day = _generated_pb1_buy(monkeypatch, trading_day="2026-10-05")
+    next_result = route_order(next_day, kis_client=broker)
+    routed_next = next_result.get("intent") or next_day
+    routed_next.setdefault("strategy_owner", "US_STANDARD")
+    next_identity = _semantic_action_identity(routed_next, account_env="practice")
+
+    assert first_result["status"] == "BROKER_SUBMIT_RESULT_UNKNOWN"
+    assert first_identity.lifecycle_id == "ENTRY:US_STANDARD:ENTRY_CASE_A"
+    assert next_identity.lifecycle_id == first_identity.lifecycle_id
+    assert first_identity.action_instance == "2026-10-02"
+    assert next_identity.action_instance == "2026-10-05"
+    assert next_result["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert claim_repo.health()["unresolved_execution_actions"] == 1
+    assert broker.calls == 1
+
+
+def test_generated_us_standard_entry_allows_later_instance_after_terminal_fill(monkeypatch):
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, production_identity=True,
+    )
+    first = _generated_pb1_buy(monkeypatch, trading_day="2026-10-02")
+    first_result = route_order(first, kis_client=broker)
+    assert first_result["status"] == "ACK"
+    routed_first = first_result.get("intent") or first
+    routed_first.setdefault("strategy_owner", "US_STANDARD")
+    first_identity = _semantic_action_identity(routed_first, account_env="practice")
+    first_claim = claim_repo.get(first_identity)
+    claim_repo.record_observation(
+        first_identity,
+        attempt_id=first_claim.active_attempt_id,
+        state="FILLED",
+        cumulative_filled_qty=int(first["qty"]),
+        authoritative=True,
+    )
+
+    next_day = _generated_pb1_buy(monkeypatch, trading_day="2026-10-05")
+    next_result = route_order(next_day, kis_client=broker)
+    routed_next = next_result.get("intent") or next_day
+    routed_next.setdefault("strategy_owner", "US_STANDARD")
+    next_identity = _semantic_action_identity(routed_next, account_env="practice")
+    assert next_identity.lifecycle_id == first_identity.lifecycle_id
+    assert next_identity.action_instance != first_identity.action_instance
+    assert next_result["status"] == "ACK"
+    assert broker.calls == 2
+
+
+def test_generated_add_buy_inherits_held_position_lifecycle(monkeypatch):
+    _route_fixture(monkeypatch, production_identity=True)
+    intent = _generated_pb1_buy(
+        monkeypatch, trading_day="2026-10-02", held=True,
+    )
+
+    assert intent["position_action"] == "ADD_TO_EXISTING_BUY"
+    assert intent["position_lifecycle_id"] == "held-source-lifecycle"
+    assert intent["meta"]["position_lifecycle_id"] == "held-source-lifecycle"
+
+
+def test_generated_us_standard_entries_for_distinct_symbols_have_distinct_scopes(monkeypatch):
+    _engine, _claim_repo, broker = _route_fixture(
+        monkeypatch, fail_submit=True, production_identity=True,
+    )
+    first = _generated_pb1_buy(monkeypatch, trading_day="2026-10-02")
+    second = _generated_pb1_buy(
+        monkeypatch, trading_day="2026-10-02", symbol="ENTRY_CASE_B",
+    )
+
+    first_result = route_order(first, kis_client=broker)
+    second_result = route_order(second, kis_client=broker)
+    routed_first = first_result.get("intent") or first
+    routed_second = second_result.get("intent") or second
+    routed_first.setdefault("strategy_owner", "US_STANDARD")
+    routed_second.setdefault("strategy_owner", "US_STANDARD")
+    first_identity = _semantic_action_identity(routed_first, account_env="practice")
+    second_identity = _semantic_action_identity(routed_second, account_env="practice")
+    assert first_identity.lifecycle_id == "ENTRY:US_STANDARD:ENTRY_CASE_A"
+    assert second_identity.lifecycle_id == "ENTRY:US_STANDARD:ENTRY_CASE_B"
+    assert first_identity.action_key != second_identity.action_key
+    assert first_result["status"] == second_result["status"] == "BROKER_SUBMIT_RESULT_UNKNOWN"
+    assert broker.calls == 2
 
 
 @pytest.mark.parametrize(
