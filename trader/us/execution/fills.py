@@ -22,6 +22,14 @@ def _first_nonblank(row: dict, *keys: str) -> str:
     return ""
 
 
+def _trade_date_key(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        return str(value.isoformat())
+    return str(value).strip()
+
+
 def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> str:
     date_text = str(date_value or "").replace("-", "").strip()
     time_text = ""
@@ -94,7 +102,16 @@ def get_fills_today(
 
     try:
         ctx = getattr(provider, "_tick_context", None)
-        if ctx is not None and ctx.fills_snapshot_at is not None:
+        context_trade_date = _trade_date_key(getattr(ctx, "trade_date", None))
+        requested_trade_date = _trade_date_key(trade_date) or context_trade_date
+        same_context_date = (
+            not context_trade_date or requested_trade_date == context_trade_date
+        )
+        if (
+            ctx is not None
+            and ctx.fills_snapshot_at is not None
+            and same_context_date
+        ):
             ctx.count("fill_logical_calls")
             ctx.count("fill_cache_hits")
             return {"status": "OK", "fills": list(ctx.fills_snapshot), "error": None, "error_type": None}
@@ -201,7 +218,7 @@ def get_fills_today(
                 "raw": row,
             })
         logger.info("[US_FILLS][OK] count=%d", len(fills))
-        if ctx is not None:
+        if ctx is not None and same_context_date:
             ctx.fills_snapshot = list(fills)
             ctx.fills_snapshot_at = __import__("time").monotonic()
             ctx.metrics["fill_fetch_ms"] = float(ctx.metrics.get("fill_fetch_ms", 0.0)) + (__import__("time").monotonic() - started) * 1000.0
