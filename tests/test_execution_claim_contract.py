@@ -115,6 +115,53 @@ def test_unknown_fill_stays_unknown_and_is_visible_in_claim_health():
     assert repo.health()["execution_claim_conflicts"] == 1
 
 
+def test_execution_claim_health_can_be_scoped_to_market():
+    engine, repo = _repo()
+    kr_identity = SemanticActionIdentity(
+        env="practice", account_id="test-account", market="KR",
+        trading_epoch_id="epoch-test", strategy_owner="PB1",
+        lifecycle_id="kr-cycle", action="SELL:TP1",
+    )
+    us_identity = _identity(lifecycle="us-cycle")
+    assert repo.acquire(kr_identity, attempt_id="kr-attempt", requested_qty=1).acquired
+    assert repo.acquire(us_identity, attempt_id="us-attempt", requested_qty=1).acquired
+
+    assert repo.health(market="KR")["unresolved_execution_actions"] == 1
+    assert repo.health(market="US")["unresolved_execution_actions"] == 1
+
+
+def test_unresolved_reconcile_error_remains_fenced_across_restart_and_trade_date():
+    engine, repo = _repo()
+    identity = _identity(stage="SELL:TRAIL_STOP_HIT:FULL_EXIT", lifecycle="kr-reconcile-error")
+    assert repo.acquire(identity, attempt_id="attempt-1", requested_qty=3).acquired
+    repo.record_observation(
+        identity,
+        attempt_id="attempt-1",
+        state="RECONCILE_ERROR",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+
+    restarted = DurableExecutionClaimRepo(engine, us_execution_claims)
+    next_day = SemanticActionIdentity(
+        env=identity.env,
+        account_id=identity.account_id,
+        market=identity.market,
+        trading_epoch_id=identity.trading_epoch_id,
+        strategy_owner=identity.strategy_owner,
+        lifecycle_id=identity.lifecycle_id,
+        action=identity.action,
+        trade_date=date(2026, 10, 5),
+    )
+    assert restarted.get(next_day).action_state == "UNCERTAIN"
+    assert not restarted.acquire(
+        next_day,
+        attempt_id="attempt-2",
+        requested_qty=3,
+        fresh_validation=True,
+    ).acquired
+
+
 def test_explicit_reject_and_authoritative_zero_fill_cancel_are_retryable_only_after_validation():
     engine, repo = _repo()
     rejected_identity = _identity(lifecycle="cycle-reject")
@@ -165,6 +212,130 @@ def test_partial_cancel_preserves_cumulative_fill_and_only_remaining_target():
         cumulative_filled_qty=1, authoritative=True,
     )
     assert repo.get(identity).cumulative_filled_qty == 4
+
+
+def test_cancel_after_full_cumulative_fill_satisfies_exit_action():
+    _, repo = _repo()
+    identity = _identity(stage="SELL:PROFIT_CAPTURE:TP1", lifecycle="cycle-filled-cancel")
+    assert repo.acquire(identity, attempt_id="filled-cancel", requested_qty=4).acquired
+
+    repo.record_observation(
+        identity,
+        attempt_id="filled-cancel",
+        state="CANCELLED_PARTIAL_FILL",
+        cumulative_filled_qty=4,
+        authoritative=True,
+    )
+
+    snapshot = repo.get(identity)
+    assert snapshot.action_state == "SATISFIED"
+    assert snapshot.active_attempt_id is None
+    assert snapshot.cumulative_filled_qty == 4
+    assert snapshot.remaining_target_qty == 0
+    assert not repo.acquire(
+        identity,
+        attempt_id="filled-cancel-retry",
+        requested_qty=1,
+        fresh_validation=True,
+        allow_partial_retry=True,
+    ).acquired
+
+
+def test_semantic_sell_retry_can_reserve_only_a_validated_subset_of_remaining_target():
+    _, repo = _repo()
+    identity = _identity(stage="SELL:PROFIT_CAPTURE:TP1", lifecycle="cycle-partial-sell")
+    assert repo.acquire(identity, attempt_id="sell-1", requested_qty=10).acquired
+    repo.record_observation(
+        identity,
+        attempt_id="sell-1",
+        state="CANCELLED_PARTIAL_FILL",
+        cumulative_filled_qty=3,
+        authoritative=True,
+    )
+
+    retry = repo.acquire(
+        identity,
+        attempt_id="sell-2",
+        requested_qty=4,
+        fresh_validation=True,
+        allow_partial_retry=True,
+    )
+    assert retry.acquired
+    repo.record_observation(
+        identity,
+        attempt_id="sell-2",
+        state="PARTIALLY_FILLED",
+        cumulative_filled_qty=2,
+        authoritative=True,
+    )
+
+    snapshot = repo.get(identity)
+    assert snapshot.cumulative_filled_qty == 5
+    assert snapshot.remaining_target_qty == 5
+
+
+def test_completed_tp1_does_not_block_distinct_tp2_action():
+    _, repo = _repo()
+    lifecycle = "cycle-staged-sell"
+    tp1 = _identity(stage="SELL:PROFIT_CAPTURE:TP1", lifecycle=lifecycle)
+    tp2 = _identity(stage="SELL:PROFIT_CAPTURE:TP2", lifecycle=lifecycle)
+
+    assert repo.acquire(tp1, attempt_id="tp1", requested_qty=4).acquired
+    repo.record_observation(
+        tp1,
+        attempt_id="tp1",
+        state="FILLED",
+        cumulative_filled_qty=4,
+        authoritative=True,
+    )
+    assert repo.acquire(
+        tp2,
+        attempt_id="tp2",
+        requested_qty=3,
+        fresh_validation=True,
+    ).acquired
+
+
+def test_completed_tp2_does_not_block_distinct_tp3_action():
+    _, repo = _repo()
+    lifecycle = "cycle-three-stage-sell"
+    tp1 = _identity(stage="SELL:PROFIT_CAPTURE:TP1", lifecycle=lifecycle)
+    tp2 = _identity(stage="SELL:PROFIT_CAPTURE:TP2", lifecycle=lifecycle)
+    tp3 = _identity(stage="SELL:PROFIT_CAPTURE:TP3", lifecycle=lifecycle)
+
+    assert repo.acquire(tp1, attempt_id="tp1", requested_qty=4).acquired
+    repo.record_observation(
+        tp1, attempt_id="tp1", state="FILLED",
+        cumulative_filled_qty=4, authoritative=True,
+    )
+    assert repo.acquire(
+        tp2, attempt_id="tp2", requested_qty=3, fresh_validation=True,
+    ).acquired
+    repo.record_observation(
+        tp2, attempt_id="tp2", state="FILLED",
+        cumulative_filled_qty=3, authoritative=True,
+    )
+    assert repo.acquire(
+        tp3, attempt_id="tp3", requested_qty=2, fresh_validation=True,
+    ).acquired
+
+
+def test_kr_pb1_and_infinite_owners_do_not_block_each_other():
+    _, repo = _repo()
+    common = {
+        "env": "practice",
+        "account_id": "test-account",
+        "market": "KR",
+        "trading_epoch_id": "epoch-test",
+        "lifecycle_id": "shared-symbol-cycle",
+        "action": "SELL:PROFIT_CAPTURE:TP1",
+        "trade_date": date(2026, 10, 2),
+    }
+    pb1 = SemanticActionIdentity(strategy_owner="PB1", **common)
+    infinite = SemanticActionIdentity(strategy_owner="KR_INFINITE", **common)
+
+    assert repo.acquire(pb1, attempt_id="pb1-sell", requested_qty=2).acquired
+    assert repo.acquire(infinite, attempt_id="infinite-sell", requested_qty=2).acquired
 
 
 def test_entry_retry_reuses_partial_action_across_dates_and_only_remaining_qty():

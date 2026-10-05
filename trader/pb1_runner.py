@@ -5643,7 +5643,7 @@ def run_once(
                     kis=kis_obj,
                     ctx=ctx,
                 ) or {}
-                reconcile_ok_local = True
+                reconcile_ok_local = bool(reconcile_result.get("ok"))
             except Exception:
                 logger.exception("[PB1][%s] reconcile_today failed", reason_label.upper())
         try:

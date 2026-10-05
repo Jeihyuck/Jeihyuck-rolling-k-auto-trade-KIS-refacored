@@ -241,6 +241,7 @@ from trader.kr.market_state_overlay import (filter_kr_entry_intent, calculate_kr
                                             has_kr_policy_missing_adoption_claim,
                                             is_verified_kr_policy_missing_adoption)
 from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
+                                     is_retryable_semantic_sell_attempt,
                                      normalize_sell_reason_family, same_day_semantic_sell_exists)
 
 
@@ -5380,26 +5381,7 @@ class PB1Engine:
     @staticmethod
     def _is_retryable_sell_order_row(order: dict[str, Any] | None) -> bool:
         """Retry only when prior durable evidence proves no live broker SELL exists."""
-        row = order if isinstance(order, dict) else {}
-        status = str(row.get("status") or "").upper()
-        if status in {"CREATED", "INTENT", "SKIP"}:
-            # These states are retryable only if the prior row never crossed
-            # the broker-submit boundary. A synthetic broker_order_id or a
-            # submitted timestamp means the outcome is ambiguous and must stay fenced.
-            return not any((
-                row.get("submitted_at"),
-                row.get("acked_at"),
-                row.get("kis_odno"),
-                row.get("broker_order_id"),
-            ))
-        if status in {"ERROR", "REJECTED"}:
-            # ERROR is safe to retry only for an explicit broker rejection.
-            # Network/timeout exceptions are stored without a non-zero rt_cd
-            # and remain fenced to avoid duplicate SELLs after lost ACKs.
-            response = row.get("response_json") if isinstance(row.get("response_json"), dict) else {}
-            rt_cd = str(response.get("rt_cd") or "").strip()
-            return bool(rt_cd and rt_cd != "0")
-        return False
+        return is_retryable_semantic_sell_attempt(order or {})
 
     def _build_unified_gate_context(
         self,
@@ -10383,6 +10365,7 @@ class PB1Engine:
             fresh_validation=True,
             retry_action_prefix=retry_action_prefix,
             entry_generation=entry_generation,
+            allow_partial_retry=str(action).strip().upper().startswith("SELL:"),
         )
 
     def _record_pb1_submit_observation(
@@ -12889,6 +12872,7 @@ class PB1Engine:
         position_book = _resolve_position_book(pos)
         horizon_exit_family = _horizon_to_exit_family(trade_horizon)
         horizon_result: dict[str, Any] | None = None
+        exit_execution_meta_update: dict[str, Any] = {}
         _now_hhmm = int(self._now_kst.strftime("%H%M"))
         _max_pnl = float((pos.get("position_meta") or {}).get("max_pnl_pct_since_entry") or 0.0)
         _max_pnl = max(_max_pnl, ret_pct)
@@ -13021,8 +13005,14 @@ class PB1Engine:
                     _router_sell_pct,
                     qty,
                 )
-                # position_meta 업데이트 (tp1_done 등)
-                _meta_update = horizon_result.get("update_meta") or {}
+                _meta_update = dict(horizon_result.get("update_meta") or {})
+                exit_execution_meta_update = dict(_meta_update)
+                for completion_flag in (
+                    "tp1_done", "tp2_done", "core_tp1_done",
+                    "profit_protect_done", "abs_tp1_done",
+                    "giveback_protect_done",
+                ):
+                    _meta_update.pop(completion_flag, None)
                 _meta_update["max_pnl_pct_since_entry"] = _max_pnl
                 self.positions_repo.update_position_fields(
                     env=self.env,
@@ -13446,6 +13436,12 @@ class PB1Engine:
         if durable_blocked:
             exit_eval_payload["order_skip_reasons"] = ["SELL_ALREADY_ACCEPTED_THIS_SESSION"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+            prior_status = str((_prior_sell or {}).get("status") or "").upper()
+            if prior_status in PENDING_SELL_STATES:
+                exit_eval_payload["reconcile_required"] = 1
+                exit_eval_payload["execution_integrity_error"] = (
+                    "unresolved sibling SELL action requires broker reconciliation"
+                )
             return exit_eval_payload
         snapshot_version = f"qty:{kis_qty}:sellable:{kis_sellable_qty}"
         if NO_SELLABLE_STICKY.blocked(trade_date=str(self._today), symbol=code,
@@ -13544,16 +13540,29 @@ class PB1Engine:
 
         stage = policy_exit_stage
         reason_family = normalize_sell_reason_family(exit_reason)
+        execution_action = f"SELL:{reason_family}:{stage}"
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
                            or f"sid:{sid}:mode:{mode}")
         try:
-            today_sell_rows = self.orders_repo.list_today_orders(self.env, side="SELL", code=code, status_exclude=())
+            today_sell_rows = self.orders_repo.list_today_orders(
+                self.env, side="SELL", code=code, status_exclude=(), fail_open=False,
+            )
         except Exception as exc:
-            logger.warning("[PB1][SEMANTIC_SELL_FENCE][LOOKUP_WARN] code=%s err=%s", display_code, exc)
-            today_sell_rows = []
+            logger.critical(
+                "[PB1][SEMANTIC_SELL_FENCE][LOOKUP_FAILED] code=%s action=block_submit err=%s",
+                display_code, exc,
+            )
+            exit_eval_payload["reconcile_required"] = 1
+            exit_eval_payload["execution_integrity_error"] = (
+                f"semantic SELL ledger lookup failed: {type(exc).__name__}: {exc}"
+            )
+            exit_eval_payload["order_result"] = "SEMANTIC_SELL_LEDGER_UNAVAILABLE"
+            exit_eval_payload["order_skip_reasons"] = ["SEMANTIC_SELL_LEDGER_UNAVAILABLE"]
+            return exit_eval_payload
         if same_day_semantic_sell_exists(rows=today_sell_rows, symbol=code, strategy_owner="KR_STANDARD",
-                                         reason_family=reason_family, lifecycle_id=lifecycle_id):
+                                         reason_family=reason_family, lifecycle_id=lifecycle_id,
+                                         action_stage=stage):
             exit_eval_payload["order_skip_reasons"] = ["KR_SAME_DAY_SEMANTIC_SELL_DUPLICATE"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_SEMANTIC_DUPLICATE"
             logger.warning("[PB1][SEMANTIC_SELL_FENCE] code=%s family=%s lifecycle=%s reason=KR_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
@@ -13602,6 +13611,50 @@ class PB1Engine:
                 simulated_payload,
             )
             return exit_eval_payload
+        try:
+            action_snapshot = self.orders_repo.get_execution_action_snapshot(
+                env=self.env,
+                market="KR",
+                strategy_owner="PB1",
+                lifecycle_id=lifecycle_id,
+                action=execution_action,
+            )
+        except Exception as exc:
+            logger.critical(
+                "[PB1][EXIT][EXECUTION_CLAIM_LOOKUP_FAILED] code=%s action=%s err=%s",
+                code, execution_action, exc,
+            )
+            exit_eval_payload["reconcile_required"] = 1
+            exit_eval_payload["execution_integrity_error"] = (
+                f"execution claim lookup failed: {type(exc).__name__}: {exc}"
+            )
+            exit_eval_payload["order_result"] = "EXECUTION_CLAIM_UNAVAILABLE"
+            exit_eval_payload["order_skip_reasons"] = ["EXECUTION_CLAIM_UNAVAILABLE"]
+            return exit_eval_payload
+        if action_snapshot is not None:
+            action_state = str(action_snapshot.action_state or "").upper()
+            if action_snapshot.active_attempt_id or action_state in {"IN_FLIGHT", "UNCERTAIN"}:
+                exit_eval_payload["reconcile_required"] = 1
+                exit_eval_payload["order_result"] = "EXECUTION_ACTION_UNRESOLVED"
+                exit_eval_payload["order_skip_reasons"] = ["EXECUTION_ACTION_UNRESOLVED"]
+                return exit_eval_payload
+            if action_state == "SATISFIED":
+                exit_eval_payload["order_result"] = "EXECUTION_ACTION_ALREADY_SATISFIED"
+                exit_eval_payload["order_skip_reasons"] = ["EXECUTION_ACTION_ALREADY_SATISFIED"]
+                return exit_eval_payload
+            if action_state in {"RETRYABLE", "PARTIALLY_SATISFIED"}:
+                remaining_target_qty = action_snapshot.remaining_target_qty
+                if remaining_target_qty is None:
+                    exit_eval_payload["reconcile_required"] = 1
+                    exit_eval_payload["order_result"] = "EXECUTION_ACTION_REMAINING_QTY_UNKNOWN"
+                    exit_eval_payload["order_skip_reasons"] = ["EXECUTION_ACTION_REMAINING_QTY_UNKNOWN"]
+                    return exit_eval_payload
+                orderable_qty = min(int(orderable_qty), int(remaining_target_qty))
+                if orderable_qty <= 0:
+                    exit_eval_payload["order_result"] = "EXECUTION_ACTION_ALREADY_SATISFIED"
+                    exit_eval_payload["order_skip_reasons"] = ["EXECUTION_ACTION_ALREADY_SATISFIED"]
+                    return exit_eval_payload
+                exit_eval_payload["orderable_qty"] = orderable_qty
         stock_name = str(self._name_for_code(code) or pos.get("name") or code)
         logger.info(
             "[EXIT][ORDER_READY] code=%s name=%s qty=%s family=%s reason=%s",
@@ -13688,6 +13741,8 @@ class PB1Engine:
                 request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
                               "exit_reason": exit_reason,
                               "reason_family": reason_family, "position_lifecycle_id": lifecycle_id,
+                              "semantic_action": execution_action,
+                              "execution_meta_update": exit_execution_meta_update,
                               "profit_capture_stage": profit_capture_stage,
                               "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
                               "exit_stage": stage,
@@ -13833,6 +13888,11 @@ class PB1Engine:
                 "[PB1][EXIT][EXECUTION_CLAIM_BLOCK] code=%s action_key=%s reason=%s",
                 code, claim.action_key, claim.reason,
             )
+            if claim.reason in {"unresolved_lifecycle_action", "unresolved_attempt_active"}:
+                exit_eval_payload["reconcile_required"] = 1
+                exit_eval_payload["execution_integrity_error"] = (
+                    "unresolved sibling SELL action requires broker reconciliation"
+                )
             self.orders_repo.mark_error(
                 self.env, client_key,
                 {"rt_cd": "EXECUTION_ACTION_ALREADY_CLAIMED", "broker_submit": False},

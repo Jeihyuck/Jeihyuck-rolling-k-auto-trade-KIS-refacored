@@ -103,9 +103,32 @@ def test_reconcile_cancel_without_fill_quantity_preserves_unknown_and_uncertaint
     ]
 
 
+def test_reconcile_explicit_reject_without_fill_quantity_is_terminal():
+    repo = RecordingOrdersRepo()
+
+    _record_execution_claim_observation(
+        orders_repo=repo,
+        source_order={"client_order_key": "reject-no-fill"},
+        broker_status="REJECTED",
+        cumulative_filled_qty=None,
+        requested_qty=10,
+    )
+
+    assert repo.observations == [
+        (
+            "reject-no-fill",
+            {
+                "state": "REJECTED_EXPLICIT",
+                "cumulative_filled_qty": 0,
+                "authoritative": True,
+            },
+        )
+    ]
+
+
 def test_claim_ledger_failure_is_exposed_as_unavailable_health():
     class UnavailableOrdersRepo:
-        def execution_claim_health(self):
+        def execution_claim_health(self, *, market=None):
             raise RuntimeError("ledger unavailable")
 
     assert _execution_claim_health(UnavailableOrdersRepo()) == {
@@ -165,7 +188,7 @@ def test_reconcile_observation_persistence_failure_degrades_health_and_keeps_cla
             failed_observations.append(_kwargs)
             raise OSError("execution claim ledger write failed")
 
-        def execution_claim_health(self):
+        def execution_claim_health(self, *, market=None):
             return claims.health()
 
     class NoopRepo:
@@ -216,3 +239,72 @@ def test_reconcile_observation_persistence_failure_degrades_health_and_keeps_cla
         identity, attempt_id="attempt-2", requested_qty=5,
         fresh_validation=True, client_order_key="pb1-sell-2",
     ).acquired
+
+
+def test_reconcile_marks_unresolved_kr_claims_degraded_without_counting_us_claims(
+    monkeypatch,
+):
+    from trader import reconcile_kis
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(
+        engine, tables=[schema.execution_claims, schema.execution_attempts],
+    )
+    claims = DurableExecutionClaimRepo(
+        engine, schema.execution_claims, schema.execution_attempts,
+    )
+    for market, owner in (("KR", "PB1"), ("US", "US_STANDARD")):
+        identity = SemanticActionIdentity(
+            env="practice",
+            account_id="test-account",
+            market=market,
+            trading_epoch_id="test-epoch",
+            strategy_owner=owner,
+            lifecycle_id=f"{market.lower()}-cycle",
+            action="SELL:TP1",
+            trade_date=date(2026, 10, 2),
+        )
+        assert claims.acquire(
+            identity, attempt_id=f"{market.lower()}-attempt", requested_qty=1,
+        ).acquired
+
+    class OrdersRepoWithClaimHealth:
+        def execution_claim_health(self, *, market=None):
+            return claims.health(market=market)
+
+    class NoopRepo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __getattr__(self, _name):
+            return lambda **_kwargs: None
+
+    monkeypatch.setattr(reconcile_kis, "_resolve_reconcile_run_id", lambda *_args: "run")
+    monkeypatch.setattr(reconcile_kis, "now_kst", lambda: datetime(2026, 10, 2, 12))
+    monkeypatch.setattr(reconcile_kis, "OrdersRepo", lambda _engine: OrdersRepoWithClaimHealth())
+    monkeypatch.setattr(reconcile_kis, "FillsRepo", NoopRepo)
+    monkeypatch.setattr(reconcile_kis, "PositionsRepo", NoopRepo)
+    monkeypatch.setattr(reconcile_kis, "LedgerEventsRepo", NoopRepo)
+    monkeypatch.setattr(reconcile_kis, "ReconcileLogRepo", NoopRepo)
+
+    class FakeKis:
+        def inquire_daily_ccld(self, **_kwargs):
+            return {"output1": []}
+
+    result = reconcile_today(
+        engine=engine,
+        kis=FakeKis(),
+        ctx=RunContext(
+            run_id="run",
+            env="practice",
+            strategy="pb1_pullback_close",
+            started_at=datetime(2026, 10, 2, 12),
+            dry_run=True,
+        ),
+    )
+
+    assert result["ok"] is False
+    assert result["degraded"] == "unresolved_execution_actions"
+    assert result["execution_claim_health"]["integrity_status"] == "DEGRADED"
+    assert result["execution_claim_health"]["unresolved_execution_actions"] == 1

@@ -11,7 +11,10 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.db.schema import schema_for_engine
 from trader.kis_wrapper import KisAuthError, KisOrderOutcomeUnknown
 from trader.pb1_engine import PB1Engine
-from trader.reconcile_kis import _promote_open_buy_orders_from_holdings
+from trader.reconcile_kis import (
+    _project_pb1_exit_stage_truth,
+    _promote_open_buy_orders_from_holdings,
+)
 from trader.trade_plan import build_entry_exit_plan
 from trader.window_router import WindowDecision
 from tests.kr.test_kr_entry_authoritative_gate_state import _build_candidate
@@ -93,6 +96,48 @@ class AmbiguousSellKis:
         raise KisOrderOutcomeUnknown("accepted boundary crossed; ACK body unavailable")
 
 
+class UnresolvedThenAcceptedSellKis:
+    def __init__(self) -> None:
+        self.sell_calls = 0
+        self.sell_quantities: list[int] = []
+
+    def sell_stock_market(self, code: str, qty: int):
+        self.sell_calls += 1
+        self.sell_quantities.append(qty)
+        if self.sell_calls == 1:
+            raise KisOrderOutcomeUnknown("accepted boundary crossed; ACK body unavailable")
+        return {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"SELL-{self.sell_calls}"},
+        }
+
+
+class RetryableSellKis:
+    def __init__(self, *, reject_first: bool = False) -> None:
+        self.sell_calls = 0
+        self.sell_quantities: list[int] = []
+        self.reject_first = reject_first
+
+    def sell_stock_market(self, code: str, qty: int):
+        self.sell_calls += 1
+        self.sell_quantities.append(qty)
+        if self.reject_first and self.sell_calls == 1:
+            return {
+                "rt_cd": "1",
+                "msg_cd": "REJECTED",
+                "msg1": "broker rejected order",
+                "output": {},
+            }
+        return {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"SELL-{self.sell_calls}"},
+        }
+
+
 def _engine(db, kis, *, phase: str = "entry", window_name: str = "day", balance_snapshot=None):
     return PB1Engine(
         universe_repo=object(),
@@ -120,6 +165,53 @@ def _new_db():
     db = sa.create_engine("sqlite:///:memory:")
     create_schema_with_active_test_epoch(db)
     return db
+
+
+def _sell_case(db, kis, *, holding_qty: int = 20):
+    code = "123450"
+    positions = PositionsRepo(db)
+    persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
+        env="practice",
+        strategy="pb1_pullback_close",
+        account_id=get_account_key(env="practice"),
+        sid=1,
+        mode=1,
+        code=code,
+        market="J",
+        qty=holding_qty,
+        avg_price=100.0,
+    )
+    assert persisted is not None
+    balance = {
+        "output1": [{
+            "pdno": code,
+            "hldg_qty": str(holding_qty),
+            "ord_psbl_qty": str(holding_qty),
+            "pchs_avg_pric": "100",
+        }],
+        "output2": [{}],
+    }
+    engine = _engine(db, kis, phase="manage", balance_snapshot=balance)
+    engine._resolve_price_with_fallback = lambda *_args, **_kwargs: (109.0, "test")
+    position = dict(persisted)
+    position.update(
+        qty=holding_qty,
+        kis_qty=holding_qty,
+        orderable_qty=holding_qty,
+        avg_buy_price=100.0,
+        last_price=109.0,
+        holding_source="kis_balance",
+    )
+    return engine, position
+
+
+def _run_sell(engine, position):
+    return engine._plan_exit_event(
+        position,
+        {"close": 109.0, "ma20": 101.0, "ma50": 99.0},
+        pd.DataFrame(),
+        "day",
+    )
 
 
 def test_regular_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeypatch):
@@ -399,6 +491,452 @@ def test_tp_sell_unresolved_ack_keeps_pending_and_blocks_restart_resubmit(monkey
 
     assert kis.sell_calls == 1
     assert second["order_result"] == "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+
+
+def test_explicit_sell_reject_allows_fresh_retry_through_pb1_claim(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis(reject_first=True)
+    engine, position = _sell_case(db, kis)
+
+    _run_sell(engine, position)
+    assert kis.sell_calls == 1
+    assert OrdersRepo(db).list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]["status"] == "ERROR"
+
+    second_engine, second_position = _sell_case(db, kis)
+    second = _run_sell(second_engine, second_position)
+
+    assert second["submitted"] == 1
+    assert kis.sell_calls == 2
+    sell_orders = OrdersRepo(db).list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )
+    assert len(sell_orders) == 2
+    assert sorted(row["status"] for row in sell_orders) == ["ACKED", "ERROR"]
+
+
+def test_giveback_completion_waits_for_authoritative_sell_fill(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setattr("trader.pb1_engine._position_policy_missing_contract", lambda *_args: False)
+    monkeypatch.setattr("trader.pb1_engine._resolve_position_horizon", lambda *_args, **_kwargs: "SWING")
+    monkeypatch.setattr("trader.pb1_engine._resolve_position_book", lambda *_args, **_kwargs: "SWING_BOOK")
+    monkeypatch.setattr(
+        "trader.pb1_engine._horizon_to_exit_family",
+        lambda *_args, **_kwargs: "SWING_STAGED_EXIT",
+    )
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis(reject_first=True)
+    engine, position = _sell_case(db, kis)
+    position.update(
+        entry_style_selected="ENTRY_PULLBACK",
+        exit_policy_family="SWING_STAGED_EXIT",
+        trade_horizon="SWING",
+    )
+    position["position_meta"] = {
+        **(position.get("position_meta") or {}),
+        "max_pnl_pct_since_entry": 13.0,
+    }
+    first = _run_sell(engine, position)
+
+    orders = OrdersRepo(db)
+    first_order = orders.list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    assert first_order["status"] == "ERROR"
+    assert first_order["request_json"]["exit_reason"] == "SWING_PROFIT_PROTECT_GIVEBACK"
+    assert first.get("submitted") != 1
+    rejected_position = PositionsRepo(db).get_position(
+        env="practice",
+        strategy="pb1_pullback_close",
+        sid=1,
+        mode=1,
+        code="123450",
+        position_cycle_id=str(position["position_cycle_id"]),
+        portfolio_epoch_id=str(position["portfolio_epoch_id"]),
+    )
+    assert rejected_position["position_meta"].get("giveback_protect_done") is not True
+
+    retry_engine, retry_position = _sell_case(db, kis)
+    retry_position.update(
+        entry_style_selected="ENTRY_PULLBACK",
+        exit_policy_family="SWING_STAGED_EXIT",
+        trade_horizon="SWING",
+    )
+    retry_position["position_meta"] = {
+        **(retry_position.get("position_meta") or {}),
+        "max_pnl_pct_since_entry": 13.0,
+    }
+    retry = _run_sell(retry_engine, retry_position)
+    sell_orders = orders.list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )
+    assert retry["submitted"] == 1
+    assert len(sell_orders) == 2
+    assert kis.sell_calls == 2
+
+    retried_order = next(row for row in sell_orders if row["status"] == "ACKED")
+    assert retried_order["request_json"]["exit_reason"] == "SWING_PROFIT_PROTECT_GIVEBACK"
+    assert (
+        retried_order["request_json"]["semantic_action"]
+        == first_order["request_json"]["semantic_action"]
+    )
+    order = orders.get_order_by_client_order_key(
+        "practice", retried_order["client_order_key"],
+    )
+    requested_qty = int(order["qty"])
+    request_json = order["request_json"]
+    assert request_json["execution_meta_update"]["giveback_protect_done"] is True
+    orders.record_execution_claim_for_order(
+        order["client_order_key"],
+        state="FILLED",
+        cumulative_filled_qty=requested_qty,
+        authoritative=True,
+    )
+    snapshot = orders.get_execution_action_snapshot(
+        env="practice",
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=request_json["position_lifecycle_id"],
+        action=request_json["semantic_action"],
+    )
+    assert snapshot.action_state == "SATISFIED"
+    assert snapshot.active_attempt_id is None
+    _project_pb1_exit_stage_truth(
+        orders_repo=orders,
+        positions_repo=PositionsRepo(db),
+        env="practice",
+        code="123450",
+        strategy="pb1_pullback_close",
+        source_order=order,
+        request_json=request_json,
+    )
+    completed = PositionsRepo(db).get_position(
+        env="practice",
+        strategy="pb1_pullback_close",
+        sid=1,
+        mode=1,
+        code="123450",
+        position_cycle_id=str(position["position_cycle_id"]),
+        portfolio_epoch_id=str(position["portfolio_epoch_id"]),
+    )
+    assert completed["position_meta"]["giveback_protect_done"] is True
+
+
+def test_authoritative_zero_fill_cancel_allows_fresh_pb1_sell_retry(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    engine, position = _sell_case(db, kis)
+    _run_sell(engine, position)
+
+    orders = OrdersRepo(db)
+    order = orders.list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    orders.mark_cancelled(
+        "practice", order["client_order_key"], {"tot_ccld_qty": "0"},
+    )
+    orders.record_execution_claim_for_order(
+        order["client_order_key"],
+        state="CANCELLED",
+        cumulative_filled_qty=0,
+        authoritative=True,
+    )
+    _project_pb1_exit_stage_truth(
+        orders_repo=orders,
+        positions_repo=PositionsRepo(db),
+        env="practice",
+        code="123450",
+        strategy="pb1_pullback_close",
+        source_order=order,
+        request_json=order["request_json"],
+    )
+
+    retry_engine, retry_position = _sell_case(db, kis)
+    retried = _run_sell(retry_engine, retry_position)
+
+    assert retried["submitted"] == 1
+    assert kis.sell_calls == 2
+
+
+def test_cancel_ack_without_fill_quantity_stays_fenced_in_pb1(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    engine, position = _sell_case(db, kis)
+    _run_sell(engine, position)
+
+    orders = OrdersRepo(db)
+    order = orders.list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    orders.mark_cancelled("practice", order["client_order_key"], {"msg1": "cancel accepted"})
+    orders.record_execution_claim_for_order(
+        order["client_order_key"],
+        state="CANCELLED",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+    _project_pb1_exit_stage_truth(
+        orders_repo=orders,
+        positions_repo=PositionsRepo(db),
+        env="practice",
+        code="123450",
+        strategy="pb1_pullback_close",
+        source_order=order,
+        request_json=order["request_json"],
+    )
+
+    retry_engine, retry_position = _sell_case(db, kis)
+    retried = _run_sell(retry_engine, retry_position)
+
+    assert kis.sell_calls == 1
+    assert retried["order_result"] == "ORDER_SKIPPED_NO_SIGNAL"
+
+
+def test_partial_fill_cancel_retries_only_claimed_remaining_target(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    engine, position = _sell_case(db, kis)
+    _run_sell(engine, position)
+
+    orders = OrdersRepo(db)
+    order = orders.list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    requested_qty = int(order["qty"])
+    filled_qty = 2
+    orders.record_execution_claim_for_order(
+        order["client_order_key"],
+        state="PARTIALLY_FILLED",
+        cumulative_filled_qty=filled_qty,
+        authoritative=True,
+    )
+    orders.mark_cancelled(
+        "practice", order["client_order_key"], {"tot_ccld_qty": str(filled_qty)},
+    )
+    orders.record_execution_claim_for_order(
+        order["client_order_key"],
+        state="CANCELLED",
+        cumulative_filled_qty=filled_qty,
+        authoritative=True,
+    )
+    _project_pb1_exit_stage_truth(
+        orders_repo=orders,
+        positions_repo=PositionsRepo(db),
+        env="practice",
+        code="123450",
+        strategy="pb1_pullback_close",
+        source_order=order,
+        request_json=order["request_json"],
+    )
+
+    retry_engine, retry_position = _sell_case(db, kis, holding_qty=18)
+    retried = _run_sell(retry_engine, retry_position)
+
+    assert retried["submitted"] == 1
+    assert kis.sell_calls == 2
+    assert kis.sell_quantities[-1] == requested_qty - filled_qty
+
+
+def test_unresolved_lower_priority_sell_blocks_hard_stop_until_authoritative_remaining_qty(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = UnresolvedThenAcceptedSellKis()
+    first_engine, position = _sell_case(db, kis)
+
+    first = _run_sell(first_engine, position)
+    prior_order = OrdersRepo(db).list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    requested_qty = int(prior_order["qty"])
+    assert requested_qty > 1
+    assert first["decision_reason"] == "KR_TAKE_PROFIT_TP1"
+    assert prior_order["status"] == "UNRESOLVED_ACK"
+    assert kis.sell_calls == 1
+
+    emergency_position = dict(
+        position,
+        last_price=90.0,
+        stop_price=95.0,
+        orderable_qty=20,
+        kis_qty=20,
+    )
+    emergency_balance = {
+        "output1": [{
+            "pdno": "123450",
+            "hldg_qty": "20",
+            "ord_psbl_qty": "20",
+            "pchs_avg_pric": "100",
+        }],
+        "output2": [{}],
+    }
+    emergency_engine = _engine(
+        db, kis, phase="manage", balance_snapshot=emergency_balance,
+    )
+    emergency_engine._resolve_price_with_fallback = lambda *_args, **_kwargs: (90.0, "test")
+    blocked = emergency_engine._plan_exit_event(
+        emergency_position,
+        {"close": 90.0, "ma20": 101.0, "ma50": 99.0},
+        pd.DataFrame(),
+        "day",
+    )
+
+    assert blocked["decision_reason"] == "EXIT_HARD_STOP"
+    assert blocked.get("reconcile_required") == 1, {
+        key: blocked.get(key) for key in (
+            "order_result", "order_skip_reasons", "submit_attempted", "submitted",
+            "orderable_qty", "sell_qty", "execution_integrity_error",
+        )
+    }
+    assert blocked["order_result"] == "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+    assert kis.sell_calls == 1
+
+    filled_qty = 1
+    orders = OrdersRepo(db)
+    orders.mark_cancelled(
+        "practice", prior_order["client_order_key"],
+        {"tot_ccld_qty": str(filled_qty)},
+    )
+    orders.record_execution_claim_for_order(
+        prior_order["client_order_key"],
+        state="CANCELLED",
+        cumulative_filled_qty=filled_qty,
+        authoritative=True,
+    )
+
+    remaining_qty = 20 - filled_qty
+    remaining_engine, remaining_position = _sell_case(
+        db, kis, holding_qty=remaining_qty,
+    )
+    remaining_position.update(
+        last_price=90.0,
+        stop_price=95.0,
+        orderable_qty=remaining_qty,
+        kis_qty=remaining_qty,
+    )
+    remaining_engine._resolve_price_with_fallback = lambda *_args, **_kwargs: (90.0, "test")
+    terminal_emergency = remaining_engine._plan_exit_event(
+        remaining_position,
+        {"close": 90.0, "ma20": 101.0, "ma50": 99.0},
+        pd.DataFrame(),
+        "day",
+    )
+
+    assert terminal_emergency["decision_reason"] == "EXIT_HARD_STOP"
+    assert terminal_emergency["submitted"] == 1
+    assert kis.sell_calls == 2
+    assert kis.sell_quantities[-1] == remaining_qty
+
+
+def test_acknowledged_sibling_sell_block_requests_reconciliation_before_hard_stop(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    first_engine, position = _sell_case(db, kis)
+
+    first = _run_sell(first_engine, position)
+    prior_order = OrdersRepo(db).list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    assert first["submitted"] == 1
+    assert prior_order["status"] == "ACKED"
+    assert kis.sell_calls == 1
+
+    emergency_position = dict(
+        position,
+        last_price=90.0,
+        stop_price=95.0,
+        orderable_qty=20,
+        kis_qty=20,
+    )
+    emergency_balance = {
+        "output1": [{
+            "pdno": "123450",
+            "hldg_qty": "20",
+            "ord_psbl_qty": "20",
+            "pchs_avg_pric": "100",
+        }],
+        "output2": [{}],
+    }
+    emergency_engine = _engine(
+        db, kis, phase="manage", balance_snapshot=emergency_balance,
+    )
+    emergency_engine._resolve_price_with_fallback = lambda *_args, **_kwargs: (90.0, "test")
+    blocked = emergency_engine._plan_exit_event(
+        emergency_position,
+        {"close": 90.0, "ma20": 101.0, "ma50": 99.0},
+        pd.DataFrame(),
+        "day",
+    )
+
+    assert blocked["decision_reason"] == "EXIT_HARD_STOP"
+    assert blocked["reconcile_required"] == 1
+    assert blocked["order_result"] == "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+    assert kis.sell_calls == 1
+
+
+def test_pb1_semantic_sell_ledger_read_failure_fails_closed(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    engine, position = _sell_case(db, kis)
+    original = OrdersRepo.list_today_orders
+    calls = 0
+
+    def fail_semantic_lookup(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("SELL ledger unavailable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(OrdersRepo, "list_today_orders", fail_semantic_lookup)
+
+    result = _run_sell(engine, position)
+
+    assert calls == 2
+    assert kis.sell_calls == 0
+    assert result["reconcile_required"] == 1
+    assert result["order_result"] == "SEMANTIC_SELL_LEDGER_UNAVAILABLE"
+
+
+def test_pb1_sell_claim_persistence_failure_blocks_broker_submit(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    engine, position = _sell_case(db, kis)
+
+    def unavailable_claim(*_args, **_kwargs):
+        raise OSError("execution claim store unavailable")
+
+    monkeypatch.setattr(OrdersRepo, "claim_execution_action", unavailable_claim)
+    result = _run_sell(engine, position)
+
+    assert kis.sell_calls == 0
+    assert result["order_result"] == "EXECUTION_CLAIM_UNAVAILABLE"
+    assert result["order_skip_reasons"] == ["EXECUTION_CLAIM_UNAVAILABLE"]
 
 
 
