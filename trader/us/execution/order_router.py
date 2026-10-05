@@ -360,8 +360,22 @@ def _semantic_action_identity(intent: dict, *, account_env: str):
         or meta.get("position_cycle_id")
     )
     side = str(intent.get("side") or "").upper()
+    owner = str(
+        intent.get("strategy_owner") or meta.get("strategy_owner") or ""
+    ).strip().upper()
+    position_action = str(
+        intent.get("position_action") or meta.get("position_action") or ""
+    ).strip().upper()
     if not lifecycle_id and side == "BUY":
-        lifecycle_id = f"ENTRY:{intent.get('client_order_key') or intent.get('order_key') or ''}"
+        if owner == "US_STANDARD" and position_action == "NEW_POSITION_BUY":
+            symbol = str(intent.get("symbol") or "").strip().upper()
+            if not symbol:
+                raise ValueError("US_STANDARD new-position BUY requires a symbol")
+            lifecycle_id = f"ENTRY:{owner}:{symbol}"
+        elif owner == "US_STANDARD" and position_action == "ADD_TO_EXISTING_BUY":
+            raise ValueError("US_STANDARD add BUY requires its parent position lifecycle")
+        else:
+            lifecycle_id = f"ENTRY:{intent.get('client_order_key') or intent.get('order_key') or ''}"
     if not lifecycle_id:
         raise ValueError("semantic action requires a position lifecycle identity")
     epoch_id = meta.get("trading_epoch_id") or intent.get("trading_epoch_id") or _active_us_epoch(required=True)
@@ -389,7 +403,7 @@ def _semantic_action_identity(intent: dict, *, account_env: str):
         account_id=account_hash,
         market="US",
         trading_epoch_id=str(epoch_id),
-        strategy_owner=str(intent.get("strategy_owner") or meta.get("strategy_owner") or ""),
+        strategy_owner=owner,
         lifecycle_id=str(lifecycle_id),
         action=str(action),
         trade_date=trade_date,
@@ -654,6 +668,16 @@ def _semantic_action_instance(
     if side == "BUY" and owner == "TQQQ_INFINITE":
         if trade_date is None:
             raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
+        return trade_date.isoformat()
+    position_action = str(
+        intent.get("position_action") or meta.get("position_action") or ""
+    ).strip().upper()
+    if side == "BUY" and owner == "US_STANDARD" and (
+        position_action == "NEW_POSITION_BUY"
+        or action.strip().upper() == "US_STANDARD_NEW_POSITION_BUY"
+    ):
+        if trade_date is None:
+            raise ValueError("US_STANDARD new-position BUY requires a valid trade date")
         return trade_date.isoformat()
     if side != "SELL":
         return None
@@ -1610,6 +1634,29 @@ def route_order(
         return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
                 "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
     lifecycle_meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if (
+        side == "BUY"
+        and str(intent.get("strategy_owner") or "").strip().upper() == "US_STANDARD"
+        and str(intent.get("position_action") or lifecycle_meta.get("position_action") or "").strip().upper()
+        == "ADD_TO_EXISTING_BUY"
+        and not (
+            intent.get("position_lifecycle_id")
+            or lifecycle_meta.get("position_lifecycle_id")
+            or intent.get("position_cycle_id")
+            or lifecycle_meta.get("position_cycle_id")
+        )
+    ):
+        logger.error(
+            "[US_ORDER][LIFECYCLE_INTEGRITY][BLOCK] symbol=%s side=BUY "
+            "reason=add_parent_lifecycle_identity_missing",
+            symbol_upper,
+        )
+        return {
+            "status": "POLICY_LIFECYCLE_INTEGRITY_MISSING",
+            "reason": "add_parent_lifecycle_identity_missing",
+            "broker_submit": False,
+            "intent": intent,
+        }
     if side == "SELL" and not (
         intent.get("position_lifecycle_id")
         or lifecycle_meta.get("position_lifecycle_id")

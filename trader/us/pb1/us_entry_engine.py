@@ -946,6 +946,7 @@ def generate_entry_intents(
 
         position_state_for_order = position_state or (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
+        held_lifecycle_id = None
         if position_state_for_order == "HELD":
             allow_add = allow_add_to_existing and os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
             allow_avg_down = os.getenv("US_ALLOW_AVERAGING_DOWN", "0") in {"1", "true", "TRUE", "yes", "YES"}
@@ -955,6 +956,30 @@ def generate_entry_intents(
                 logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_ADD_DISABLED", symbol)
                 continue
             held_snapshot = _load_held_position_snapshot(symbol, provider=provider)
+            held_meta = (
+                held_snapshot.get("meta")
+                if isinstance(held_snapshot.get("meta"), dict) else {}
+            )
+            held_lifecycle_id = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        held_snapshot.get("position_lifecycle_id"),
+                        held_snapshot.get("position_cycle_id"),
+                        held_meta.get("position_lifecycle_id"),
+                        held_meta.get("position_cycle_id"),
+                    )
+                    if str(value or "").strip()
+                ),
+                None,
+            )
+            if not held_lifecycle_id:
+                track_skip(symbol, "position_lifecycle_identity_missing")
+                logger.error(
+                    "[US_ENTRY][ADD_LIFECYCLE_MISSING] symbol=%s action=skip_buy",
+                    symbol,
+                )
+                continue
             pnl_pct = _held_pnl_pct(held_snapshot, current_price=price)
             if pnl_pct is None:
                 track_skip(symbol, "add_pnl_unknown")
@@ -1053,7 +1078,15 @@ def generate_entry_intents(
         import hashlib
         trade_date_for_key = _resolve_us_trade_date(now)
         today_str = trade_date_for_key.replace("-", "")
-        
+        semantic_action = (
+            "US_STANDARD_NEW_POSITION_BUY"
+            if position_action == "NEW_POSITION_BUY" else None
+        )
+        position_lifecycle_id = (
+            f"ENTRY:US_STANDARD:{str(symbol).strip().upper()}"
+            if position_action == "NEW_POSITION_BUY" else held_lifecycle_id
+        )
+
         key_raw = f"{symbol}_{today_str}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
@@ -1172,8 +1205,12 @@ def generate_entry_intents(
             "symbol": symbol,
             "exchange": exchange,
             "side": "BUY",
+            "strategy_owner": "US_STANDARD",
             "position_state": position_state_for_order,
             "position_action": position_action,
+            "position_lifecycle_id": position_lifecycle_id,
+            "semantic_action": semantic_action,
+            "action_instance": trade_date_for_key if semantic_action else None,
             "qty": qty,
             "limit_price": limit_price,
             "notional_usd": notional,
@@ -1232,6 +1269,7 @@ def generate_entry_intents(
             "source": "locked_watchlist",
             "min_hold_minutes": int(os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")),
             "meta": {
+                "strategy_owner": "US_STANDARD",
                 "book": os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK"),
                 "horizon": os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY"),
                 "exit_policy": os.getenv("US_DEFAULT_EXIT_POLICY", "US_SWING_DEFAULT"),
@@ -1241,6 +1279,9 @@ def generate_entry_intents(
                 "source": "locked_watchlist",
                 "position_state": position_state_for_order,
                 "position_action": position_action,
+                "position_lifecycle_id": position_lifecycle_id,
+                "semantic_action": semantic_action,
+                "action_instance": trade_date_for_key if semantic_action else None,
                 "theme_cluster": (entry_meta or {}).get("theme_cluster"),
                 "source_tags": (entry_meta or {}).get("source_tags"),
                 "sector": (entry_meta or {}).get("sector"),
