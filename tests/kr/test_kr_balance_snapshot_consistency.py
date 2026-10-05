@@ -5,6 +5,7 @@ import sqlalchemy as sa
 from trader.db.repos import OrdersRepo
 from trader.db.schema import schema_for_engine
 from tests.kr.test_kr_sell_no_sellable_session_block import FakeKis, _make_engine
+from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
 BALANCE = {
@@ -70,7 +71,7 @@ def test_balance_freshness_classification():
 
 def _engine_with_filled_tp1(*, source: str, initial: dict, kis):
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     OrdersRepo(db).create_intent_idempotent(
         env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
         code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,

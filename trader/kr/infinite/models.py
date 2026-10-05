@@ -49,6 +49,6 @@ class OrderIntent:
 @dataclass(frozen=True)
 class BrokerOrderState:
     status: str
-    filled_qty: int = 0
+    filled_qty: int | None = None
     filled_notional_krw: float = 0
     filled_avg_price: float|None = None

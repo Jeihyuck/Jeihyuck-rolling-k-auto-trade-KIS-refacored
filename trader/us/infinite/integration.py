@@ -979,7 +979,14 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                            "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY")
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
                          and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND" else None)
-        lifecycle_id = str((state.metadata or {}).get("position_lifecycle_id") or state.cycle_id)
+        lifecycle_id = str(
+            (
+                state.cycle_id
+                if decision.action == Action.BUY
+                else (state.metadata or {}).get("position_lifecycle_id") or state.cycle_id
+            )
+            or ""
+        )
         avg_asof = str(raw.get("broker_avg_price_asof") or raw.get("balance_asof") or datetime.now(timezone.utc).isoformat()) if raw else datetime.now(timezone.utc).isoformat()
         sell_contract = {
             "broker_avg_price": broker.average_price,
@@ -1051,6 +1058,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,
             "trade_date": trading_date.isoformat(),
             "client_order_key": client_order_key,
+            "position_lifecycle_id": lifecycle_id,
+            **({"semantic_action": "TQQQ_INFINITE_BUY"} if decision.action == Action.BUY else {}),
             "strategy": "TQQQ_INFINITE_V3", "strategy_owner": "TQQQ_INFINITE",
             "strategy_name": "TQQQ_INFINITE", "strategy_version": config.policy_version,
             "sleeve_id": "TQQQ_INFINITE", "theme_cluster": theme_cluster,
@@ -1066,6 +1075,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "policy_action": policy_action,
                      "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE",
                      "cycle_id": state.cycle_id,
+                     "position_lifecycle_id": lifecycle_id,
+                     **({"semantic_action": "TQQQ_INFINITE_BUY"} if decision.action == Action.BUY else {}),
                      "profit_stage": decision.metadata.get("profit_stage"),
                      "tp1_sold_qty": decision.metadata.get("tp1_sold_qty"),
                      "remaining_qty": decision.metadata.get("remaining_qty"),

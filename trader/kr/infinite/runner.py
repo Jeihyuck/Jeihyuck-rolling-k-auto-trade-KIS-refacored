@@ -267,6 +267,19 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             return RunResult(Decision(Action.BLOCK, "KR_INF_CYCLE_ID_MISSING", next_status=Status.FROZEN), state)
         if not repository.create_intent(state, decision, day, market_state):
             return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
+        claim_identity, claim = repository.claim_submit(
+            state=state,
+            decision=decision,
+            trade_date=day,
+            symbol=config.symbol,
+            env=env,
+        )
+        if not claim.acquired:
+            logger.error(
+                "[KR_INFINITE][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
+                claim.action_key, claim.reason,
+            )
+            return RunResult(Decision(Action.WAIT, "KR_INF_EXECUTION_ACTION_CLAIMED"), state)
 
         if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             desired = str(decision.metadata.get("desired_profit_stage") or "")
@@ -279,6 +292,13 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         except Exception as exc:
             if is_kr_order_submit_outcome_ambiguous(exc):
                 repository.mark_reconcile_pending(decision.idempotency_key, str(exc))
+                repository.record_execution_claim_observation(
+                    claim_identity,
+                    attempt_id=str(claim.attempt_id),
+                    state="UNRESOLVED",
+                    cumulative_filled_qty=None,
+                    authoritative=False,
+                )
                 logger.critical(
                     "[KR_INFINITE][ORDER_SUBMIT_UNRESOLVED] symbol=%s cycle_id=%s key=%s "
                     "action=RECONCILE_NO_RESUBMIT err=%s",
@@ -293,8 +313,22 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                     state,
                 )
             repository.mark_rejected(decision.idempotency_key, str(exc))
+            repository.record_execution_claim_observation(
+                claim_identity,
+                attempt_id=str(claim.attempt_id),
+                state="REJECTED_EXPLICIT",
+                cumulative_filled_qty=0,
+                authoritative=True,
+            )
             return RunResult(Decision(Action.BLOCK, str(exc)), state)
         repository.mark_submitted(decision.idempotency_key, order_id)
+        repository.record_execution_claim_observation(
+            claim_identity,
+            attempt_id=str(claim.attempt_id),
+            state="ACKED",
+            cumulative_filled_qty=None,
+            authoritative=False,
+        )
 
         # One immediate reconciliation is safe; absence of a fill consumes no unit.
         state, post_updates = _reconcile_pending(repository, executor, state, day)

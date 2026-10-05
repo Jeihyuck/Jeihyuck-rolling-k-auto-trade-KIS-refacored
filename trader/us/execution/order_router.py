@@ -345,6 +345,72 @@ def _is_cash_insufficient_reject(msg: str) -> bool:
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
 
 
+def _semantic_action_identity(intent: dict, *, account_env: str):
+    from datetime import date
+    import hashlib
+    from trader.account_state import get_account_key
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.repos import _active_us_epoch
+
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    lifecycle_id = (
+        intent.get("position_lifecycle_id")
+        or meta.get("position_lifecycle_id")
+        or intent.get("position_cycle_id")
+        or meta.get("position_cycle_id")
+    )
+    side = str(intent.get("side") or "").upper()
+    owner = str(
+        intent.get("strategy_owner") or meta.get("strategy_owner") or ""
+    ).strip().upper()
+    position_action = str(
+        intent.get("position_action") or meta.get("position_action") or ""
+    ).strip().upper()
+    if not lifecycle_id and side == "BUY":
+        if owner == "US_STANDARD" and position_action == "NEW_POSITION_BUY":
+            symbol = str(intent.get("symbol") or "").strip().upper()
+            if not symbol:
+                raise ValueError("US_STANDARD new-position BUY requires a symbol")
+            lifecycle_id = f"ENTRY:{owner}:{symbol}"
+        elif owner == "US_STANDARD" and position_action == "ADD_TO_EXISTING_BUY":
+            raise ValueError("US_STANDARD add BUY requires its parent position lifecycle")
+        else:
+            lifecycle_id = f"ENTRY:{intent.get('client_order_key') or intent.get('order_key') or ''}"
+    if not lifecycle_id:
+        raise ValueError("semantic action requires a position lifecycle identity")
+    epoch_id = meta.get("trading_epoch_id") or intent.get("trading_epoch_id") or _active_us_epoch(required=True)
+    if not epoch_id:
+        raise RuntimeError("semantic action requires an active trading epoch")
+    action = (
+        meta.get("semantic_action")
+        or intent.get("semantic_action")
+        or meta.get("profit_capture_stage")
+        or intent.get("profit_capture_stage")
+        or intent.get("stage")
+        or intent.get("reason")
+        or meta.get("reason")
+        or ("ENTRY" if side == "BUY" else "")
+    )
+    if not action:
+        raise ValueError("semantic action stage is required")
+    try:
+        trade_date = date.fromisoformat(str(intent.get("trade_date") or ""))
+    except ValueError:
+        trade_date = None
+    account_hash = hashlib.sha256(get_account_key(env=account_env).encode("utf-8")).hexdigest()
+    return SemanticActionIdentity(
+        env=account_env,
+        account_id=account_hash,
+        market="US",
+        trading_epoch_id=str(epoch_id),
+        strategy_owner=owner,
+        lifecycle_id=str(lifecycle_id),
+        action=str(action),
+        trade_date=trade_date,
+        action_instance=_semantic_action_instance(intent, meta, str(action), trade_date),
+    )
+
+
 def _cash_tick_key(trade_date: str | None, intent: dict | None = None) -> str:
     meta = (intent or {}).get("meta") if isinstance(intent, dict) else {}
     meta = meta if isinstance(meta, dict) else {}
@@ -570,6 +636,63 @@ def _pending_sell_qty_for_symbol(symbol: str, trade_date: str | None) -> int:
 
 _SEMANTIC_SELL_FAMILIES = frozenset({"DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM",
     "CLUSTER_EXPOSURE_TRIM", "PROFIT_CAPTURE", "TREND_EXIT", "TQQQ_INFINITE_TP"})
+_TRADE_DATE_REPEATABLE_SELL_ACTIONS = frozenset({
+    "DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM",
+})
+
+
+def _semantic_sell_identity_stage(intent: dict, meta: dict, reason: str) -> tuple[str, str]:
+    family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in reason), reason)
+    stage = str(
+        meta.get("profit_capture_stage")
+        or intent.get("profit_capture_stage")
+        or meta.get("semantic_action")
+        or intent.get("semantic_action")
+        or ""
+    ).strip().upper()
+    if not stage:
+        import re
+        match = re.search(r"(?:^|_)(TP[1-3])(?:_|$)", reason)
+        if match:
+            stage = match.group(1)
+    return family, stage
+
+
+def _semantic_action_instance(
+    intent: dict, meta: dict, action: str, trade_date: date | None,
+) -> str | None:
+    side = str(intent.get("side") or "").upper()
+    owner = str(
+        intent.get("strategy_owner") or meta.get("strategy_owner") or ""
+    ).strip().upper()
+    if side == "BUY" and owner == "TQQQ_INFINITE":
+        if trade_date is None:
+            raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
+        return trade_date.isoformat()
+    position_action = str(
+        intent.get("position_action") or meta.get("position_action") or ""
+    ).strip().upper()
+    if side == "BUY" and owner == "US_STANDARD" and (
+        position_action == "NEW_POSITION_BUY"
+        or action.strip().upper() == "US_STANDARD_NEW_POSITION_BUY"
+    ):
+        if trade_date is None:
+            raise ValueError("US_STANDARD new-position BUY requires a valid trade date")
+        return trade_date.isoformat()
+    if side != "SELL":
+        return None
+    labels = {
+        str(value or "").strip().upper()
+        for value in (
+            intent.get("reason"), meta.get("reason"),
+            intent.get("exit_family"), meta.get("exit_family"), action,
+        )
+    }
+    if not labels.intersection(_TRADE_DATE_REPEATABLE_SELL_ACTIONS):
+        return None
+    if trade_date is None:
+        raise ValueError("repeatable defense action requires a valid trade date")
+    return trade_date.isoformat()
 
 
 def same_day_semantic_sell_exists(intent: dict) -> bool:
@@ -578,25 +701,40 @@ def same_day_semantic_sell_exists(intent: dict) -> bool:
         return False
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
     reason = str(intent.get("reason") or meta.get("reason") or "").upper()
-    family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in reason), reason)
+    family, stage = _semantic_sell_identity_stage(intent, meta, reason)
     if family not in _SEMANTIC_SELL_FAMILIES:
         return False
     wanted = (str(intent.get("symbol") or "").upper(), "SELL",
               str(intent.get("strategy_owner") or meta.get("strategy_owner") or meta.get("book") or "").upper(),
-              family, str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or meta.get("cycle_id") or ""))
+              family, stage,
+              str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or meta.get("cycle_id") or ""))
+    from trader.us.db.repos import load_us_daily_orders_for_report
     try:
-        from trader.us.db.repos import load_us_daily_orders_for_report
-        for row in load_us_daily_orders_for_report(str(intent.get("trade_date") or "")) or []:
-            row_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-            row_reason = str(row.get("reason") or row_meta.get("reason") or "").upper()
-            row_family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in row_reason), row_reason)
-            actual = (str(row.get("symbol") or "").upper(), str(row.get("side") or "").upper(),
-                      str(row.get("strategy_owner") or row_meta.get("strategy_owner") or row_meta.get("book") or "").upper(),
-                      row_family, str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
-            if actual == wanted:
-                return True
-    except Exception as exc:
-        logger.warning("[US_ORDER][SEMANTIC_FENCE][WARN] symbol=%s err=%s", wanted[0], exc)
+        rows = load_us_daily_orders_for_report(str(intent.get("trade_date") or ""))
+    except Exception:
+        logger.exception("[US_ORDER][SEMANTIC_FENCE][LEDGER_UNAVAILABLE] symbol=%s", wanted[0])
+        raise
+    if rows is None:
+        raise RuntimeError("semantic SELL ledger lookup returned no result")
+    for row in rows:
+        row_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_reason = str(row.get("reason") or row_meta.get("reason") or "").upper()
+        row_family, row_stage = _semantic_sell_identity_stage(row, row_meta, row_reason)
+        row_status = str(row.get("status") or "").upper()
+        if row_status in {"REJECTED", "REJECTED_EXPLICIT"}:
+            continue
+        if (
+            row_status in {"CANCELLED", "CANCELED", "CANCELLED_ZERO_FILL"}
+            and row_meta.get("cancel_authoritative") is True
+            and int(row.get("qty_filled") or row_meta.get("cumulative_filled_qty") or 0) == 0
+        ):
+            continue
+        actual = (str(row.get("symbol") or "").upper(), str(row.get("side") or "").upper(),
+                  str(row.get("strategy_owner") or row_meta.get("strategy_owner") or row_meta.get("book") or "").upper(),
+                  row_family, row_stage,
+                  str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
+        if actual == wanted:
+            return True
     return False
 
 def _validate_take_profit_with_fresh_broker_position(
@@ -827,10 +965,21 @@ def route_order(
         })
         intent["meta"] = meta
 
-    if same_day_semantic_sell_exists(intent):
-        logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
-        return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
-                "broker_submit": False, "intent": intent}
+    try:
+        if same_day_semantic_sell_exists(intent):
+            logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
+            return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
+                    "broker_submit": False, "intent": intent}
+    except Exception as exc:
+        logger.critical("[US_ORDER][SEMANTIC_FENCE][FAIL_CLOSED] symbol=%s err=%s", symbol, exc)
+        return {
+            "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
+            "reason": "semantic_sell_duplicate_lookup_failed",
+            "execution_integrity_error": str(exc),
+            "broker_submit": False,
+            "retry_order": False,
+            "intent": intent,
+        }
     is_tqqq_infinite = (
         symbol_upper == TQQQ_SYMBOL
         and intent.get("strategy_owner") == TQQQ_OWNER
@@ -1484,10 +1633,111 @@ def route_order(
         append_order_event("ORDER_FENCED", intent, context=context, broker_status="ORDER_FENCED_BEFORE_BROKER_SUBMIT")
         return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
                 "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+    lifecycle_meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if (
+        side == "BUY"
+        and str(intent.get("strategy_owner") or "").strip().upper() == "US_STANDARD"
+        and str(intent.get("position_action") or lifecycle_meta.get("position_action") or "").strip().upper()
+        == "ADD_TO_EXISTING_BUY"
+        and not (
+            intent.get("position_lifecycle_id")
+            or lifecycle_meta.get("position_lifecycle_id")
+            or intent.get("position_cycle_id")
+            or lifecycle_meta.get("position_cycle_id")
+        )
+    ):
+        logger.error(
+            "[US_ORDER][LIFECYCLE_INTEGRITY][BLOCK] symbol=%s side=BUY "
+            "reason=add_parent_lifecycle_identity_missing",
+            symbol_upper,
+        )
+        return {
+            "status": "POLICY_LIFECYCLE_INTEGRITY_MISSING",
+            "reason": "add_parent_lifecycle_identity_missing",
+            "broker_submit": False,
+            "intent": intent,
+        }
+    if side == "SELL" and not (
+        intent.get("position_lifecycle_id")
+        or lifecycle_meta.get("position_lifecycle_id")
+        or intent.get("position_cycle_id")
+        or lifecycle_meta.get("position_cycle_id")
+    ):
+        logger.error(
+            "[US_ORDER][LIFECYCLE_INTEGRITY][BLOCK] symbol=%s side=SELL "
+            "reason=position_lifecycle_identity_missing",
+            symbol_upper,
+        )
+        return {
+            "status": "POLICY_LIFECYCLE_INTEGRITY_MISSING",
+            "reason": "position_lifecycle_identity_missing",
+            "broker_submit": False,
+            "intent": intent,
+        }
+    try:
+        claim_identity = _semantic_action_identity(intent, account_env=account_env)
+        from trader.us.db.repos import claim_execution_action, record_execution_action_observation
+        claim = claim_execution_action(
+            claim_identity,
+            attempt_id=intent["submit_attempt_id"],
+            requested_qty=qty,
+            fresh_validation=True,
+            client_order_key=str(order_key or ""),
+        )
+        if not claim.acquired:
+            logger.error(
+                "[US_ORDER][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
+                claim.action_key, claim.reason,
+            )
+            return {
+                "status": "ORDER_FENCED_UNRESOLVED_ACTION",
+                "reason": claim.reason,
+                "execution_action_key": claim.action_key,
+                "broker_submit": False,
+                "retry_order": False,
+                "requires_reconcile": True,
+                "intent": intent,
+            }
+        intent.setdefault("meta", {})["execution_action_key"] = claim.action_key
+    except Exception as exc:
+        logger.critical("[US_ORDER][EXECUTION_CLAIM][UNAVAILABLE] broker_submit=blocked err=%s", exc)
+        return {
+            "status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE",
+            "reason": "execution_claim_unavailable",
+            "execution_integrity_error": str(exc),
+            "broker_submit": False,
+            "retry_order": False,
+            "intent": intent,
+        }
+
+    def _record_claim_observation(
+        state: str, filled_qty: int | None, *, authoritative: bool,
+    ) -> str | None:
+        try:
+            record_execution_action_observation(
+                claim_identity, attempt_id=intent["submit_attempt_id"],
+                state=state, cumulative_filled_qty=filled_qty,
+                authoritative=authoritative,
+            )
+            return None
+        except Exception as exc:
+            logger.exception(
+                "[US_ORDER][EXECUTION_CLAIM][OBSERVATION_FAILED] action_key=%s state=%s",
+                claim.action_key, state,
+            )
+            return f"{type(exc).__name__}: {exc}"
+
     from trader.us.execution.order_journal import append_order_event
     try:
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
     except Exception as exc:
+        try:
+            from trader.us.db.repos import release_execution_action_before_submit
+            release_execution_action_before_submit(
+                claim_identity, attempt_id=intent["submit_attempt_id"],
+            )
+        except Exception:
+            logger.exception("[US_ORDER][EXECUTION_CLAIM][PRE_SUBMIT_RELEASE_FAILED] action_key=%s", claim.action_key)
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
         return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
@@ -1505,12 +1755,71 @@ def route_order(
     # KIS 주문 성공 후 DB 저장 실패는 REJECT가 아니라 ACK_DB_FAILED이다.
     order_no: str | None = None
     resp: Any = None
+    from trader.us.execution.kis_us_client import KisUSPreSubmitError
+
+    def _mark_broker_submit_boundary() -> None:
+        observation_error = _record_claim_observation(
+            "SUBMITTED", None, authoritative=False,
+        )
+        if observation_error:
+            raise KisUSPreSubmitError(
+                f"CLAIM_OBSERVATION_FAILED_BEFORE_HTTP: {observation_error}"
+            )
+
+    set_submit_boundary = getattr(kis_client, "set_before_order_http", None)
+    clear_submit_boundary = getattr(kis_client, "clear_before_order_http", None)
     try:
+        if callable(set_submit_boundary):
+            set_submit_boundary(_mark_broker_submit_boundary)
+        else:
+            _mark_broker_submit_boundary()
         if side == "BUY":
             resp = kis_client.place_us_buy_order(symbol, exchange, qty, price)
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
     except Exception as exc:
+        if isinstance(exc, KisUSPreSubmitError):
+            integrity_error = str(exc)
+            try:
+                append_order_event(
+                    "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
+                    broker_status="PRE_SUBMIT_FAILURE",
+                    raw_response={"error": integrity_error},
+                )
+            except Exception as journal_exc:
+                integrity_error = f"{integrity_error}; abort journal failed: {journal_exc}"
+                logger.exception("[US_ORDER][PRE_IO_ABORT_JOURNAL_FAILED] action_key=%s", claim.action_key)
+            requires_reconcile = False
+            try:
+                from trader.us.db.repos import release_execution_action_before_submit
+                release_execution_action_before_submit(
+                    claim_identity, attempt_id=intent["submit_attempt_id"],
+                )
+            except Exception as release_exc:
+                requires_reconcile = True
+                integrity_error = f"{integrity_error}; claim release failed: {release_exc}"
+                logger.exception(
+                    "[US_ORDER][EXECUTION_CLAIM][PRE_IO_RELEASE_FAILED] action_key=%s",
+                    claim.action_key,
+                )
+            return {
+                "status": (
+                    "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED"
+                    if "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP" in str(exc)
+                    else "BROKER_SUBMIT_PRE_IO_FAILED"
+                ),
+                "reason": (
+                    "submitted_state_persistence_failed_before_broker_io"
+                    if "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP" in str(exc)
+                    else "broker_request_not_sent"
+                ),
+                "execution_integrity_error": integrity_error,
+                "execution_action_key": claim.action_key,
+                "broker_submit": False,
+                "retry_order": not requires_reconcile,
+                "requires_reconcile": requires_reconcile,
+                "intent": intent,
+            }
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
         msg = str(exc)
         if side == "SELL" and (is_no_balance_sell_reject(msg) or "잔고내역" in msg):
@@ -1538,9 +1847,11 @@ def route_order(
         deterministic = is_no_balance_sell_reject(msg) or _is_cash_insufficient_reject(msg) or any(token in msg.lower() for token in ("invalid quantity", "invalid price", "업무 거절", "주문 불가"))
         if not deterministic:
             append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response={"error": msg})
+            observation_error = _record_claim_observation("UNRESOLVED", None, authoritative=False)
             return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "reason": msg, "kis_ack": False,
                     "broker_submit": True, "retry_order": False, "requires_reconcile": True,
-                    "submit_attempt_id": intent["submit_attempt_id"], "intent": intent}
+                    "submit_attempt_id": intent["submit_attempt_id"],
+                    "execution_integrity_error": observation_error, "intent": intent}
         if side == "BUY" and _is_cash_insufficient_reject(msg):
             _CASH_EXHAUSTED_TICKS.add(_cash_tick_key(trade_date, intent))
             logger.error("[US_ORDER][CASH_EXHAUSTED] env=%s symbol=%s reason=broker_orderable_cash_insufficient cash_exhausted=1", account_env, symbol)
@@ -1555,8 +1866,20 @@ def route_order(
         }
         _persist_with_trade_date(save_order_reject, reject_result)
         append_order_event("ORDER_REJECTED", intent, context=context, broker_status="REJECTED", raw_response={"reason": msg})
+        observation_error = _record_claim_observation("REJECTED_EXPLICIT", 0, authoritative=True)
         if order_key:
             mark_order_intent_rejected(order_key, reason=msg)
+        if observation_error:
+            return {
+                "status": "REJECT_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED",
+                "reason": msg,
+                "execution_integrity_error": observation_error,
+                "kis_ack": False,
+                "broker_submit": True,
+                "retry_order": False,
+                "requires_reconcile": True,
+                "intent": intent,
+            }
         return {
             "status": "REJECT",
             "reason": msg,
@@ -1566,6 +1889,15 @@ def route_order(
             "cash_exhausted": bool(side == "BUY" and _is_cash_insufficient_reject(msg)),
             "intent": intent,
         }
+    finally:
+        if callable(clear_submit_boundary):
+            try:
+                clear_submit_boundary()
+            except Exception:
+                logger.exception(
+                    "[US_ORDER][SUBMIT_BOUNDARY_CLEAR_FAILED] action_key=%s",
+                    claim.action_key,
+                )
 
     # A broker response means submission occurred. Parsing/audit failures are
     # unresolved ACK states and must never enter broker rejection handling.
@@ -1575,12 +1907,16 @@ def route_order(
     except Exception as exc:
         logger.error("[US_ORDER][ACK_PARSE_FAILED] symbol=%s err=%s", symbol, exc)
         append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
+        observation_error = _record_claim_observation("UNRESOLVED", None, authoritative=False)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
-                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp,
+                "execution_integrity_error": observation_error, "intent": intent}
     if not order_no:
         append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
+        observation_error = _record_claim_observation("UNRESOLVED", None, authoritative=False)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
-                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp,
+                "execution_integrity_error": observation_error, "intent": intent}
     try:
         append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no,
                            broker_status="ACK", raw_response=resp)
@@ -1589,6 +1925,7 @@ def route_order(
         return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,
                 "broker_submit": True, "retry_order": False, "requires_reconcile": True,
                 "order_no": order_no, "intent": intent}
+    observation_error = _record_claim_observation("ACKED", None, authoritative=False)
     logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
     if context is not None:
         context.invalidate_after_order(symbol)
@@ -1634,6 +1971,22 @@ def route_order(
     ack_db_saved = False
     try:
         ack_db_saved = bool(_persist_with_trade_date(save_order_ack, ack_result))
+        if ack_db_saved and observation_error:
+            return {
+                "status": "ACK_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "order_no": order_no,
+                "response": resp,
+                "intent": intent,
+                "kis_ack": True,
+                "ack_db_saved": True,
+                "broker_submit": True,
+                "retry_order": False,
+                "requires_reconcile": True,
+                "execution_integrity_error": observation_error,
+            }
         if ack_db_saved:
             logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
     except Exception:

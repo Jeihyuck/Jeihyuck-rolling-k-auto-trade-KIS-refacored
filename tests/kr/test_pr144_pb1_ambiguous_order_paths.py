@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import sqlalchemy as sa
 
+from trader.account_state import get_account_key
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.kis_wrapper import KisAuthError, KisOrderOutcomeUnknown
@@ -14,6 +15,7 @@ from trader.reconcile_kis import _promote_open_buy_orders_from_holdings
 from trader.trade_plan import build_entry_exit_plan
 from trader.window_router import WindowDecision
 from tests.kr.test_kr_entry_authoritative_gate_state import _build_candidate
+from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
 class AmbiguousBuyKis:
@@ -116,7 +118,7 @@ def _engine(db, kis, *, phase: str = "entry", window_name: str = "day", balance_
 
 def _new_db():
     db = sa.create_engine("sqlite:///:memory:")
-    schema_for_engine(db).metadata.create_all(db)
+    create_schema_with_active_test_epoch(db)
     return db
 
 
@@ -140,6 +142,59 @@ def test_regular_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeyp
 
     assert kis.buy_calls == 1
     assert second["terminal_event"] == "FINAL_SKIP"
+
+
+def test_kr_claim_acquisition_failure_blocks_before_broker_submit(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+
+    def unavailable_claim(*_args, **_kwargs):
+        raise OSError("execution claim store unavailable")
+
+    monkeypatch.setattr(OrdersRepo, "claim_execution_action", unavailable_claim)
+    kis = AckOnlyBuyKis()
+    candidate = _build_candidate("018260")
+    candidate.client_order_key = "kr-claim-acquisition-failure"
+
+    result = _engine(_new_db(), kis)._place_entry(candidate)
+
+    assert result["submit_terminal_status"] == "EXECUTION_CLAIM_UNAVAILABLE"
+    assert result["skipped_reason"] == "EXECUTION_CLAIM_UNAVAILABLE"
+    assert kis.buy_calls == 0
+
+
+def test_kr_claim_observation_failure_is_visible_and_keeps_submit_fence(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    db = _new_db()
+    kis = AckOnlyBuyKis()
+    record_observation = OrdersRepo.record_execution_claim_for_order
+
+    def fail_ack_observation(self, client_order_key, **kwargs):
+        if kwargs.get("state") == "ACKED":
+            raise OSError("execution claim store unavailable after broker ACK")
+        return record_observation(self, client_order_key, **kwargs)
+
+    monkeypatch.setattr(OrdersRepo, "record_execution_claim_for_order", fail_ack_observation)
+    candidate = _build_candidate("018260")
+    candidate.client_order_key = "kr-claim-observation-failure"
+
+    first = _engine(db, kis)._place_entry(candidate)
+    health = OrdersRepo(db).execution_claim_health()
+
+    assert kis.buy_calls == 1
+    assert first["reconcile_required"] == 1
+    assert first["execution_integrity_error"]
+    assert first["submit_terminal_status"] == (
+        "EXECUTION_CLAIM_OBSERVATION_FAILED_RECONCILE_REQUIRED"
+    )
+    assert health["unresolved_execution_actions"] == 1
+
+    retry = _build_candidate("018260")
+    retry.client_order_key = "kr-claim-observation-failure-retry"
+    second = _engine(db, kis)._place_entry(retry)
+
+    assert second["submit_terminal_status"] == "EXECUTION_ACTION_ALREADY_CLAIMED"
+    assert kis.buy_calls == 1
+    assert OrdersRepo(db).execution_claim_health()["unresolved_execution_actions"] == 1
 
 
 def test_close_buy_unresolved_ack_survives_restart_and_blocks_resubmit(monkeypatch):
@@ -202,7 +257,7 @@ def _prepare_parent_position(db):
             "entry_style_selected": "ENTRY_PULLBACK",
         },
         status="ACKED",
-        account_id="acct",
+        account_id=get_account_key(env="practice"),
     )
     assert created
     positions.apply_fill(
@@ -219,7 +274,7 @@ def _prepare_parent_position(db):
         tax=0.0,
         filled_at=datetime(2026, 9, 23, 12, 0, tzinfo=ZoneInfo("Asia/Seoul")),
         order_id=root_order_id,
-        account_id="acct",
+        account_id=get_account_key(env="practice"),
     )
     positions.update_position_fields(
         env="practice",
@@ -277,7 +332,7 @@ def test_tp_sell_unresolved_ack_keeps_pending_and_blocks_restart_resubmit(monkey
     persisted, created = positions.get_or_create_imported_cycle_for_kis_holding(
         env="practice",
         strategy="pb1_pullback_close",
-        account_id="practice:unknown",
+        account_id=get_account_key(env="practice"),
         sid=1,
         mode=1,
         code="067290",

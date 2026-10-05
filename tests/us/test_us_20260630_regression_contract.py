@@ -142,6 +142,7 @@ def test_add_to_existing_intent_carries_capital_deployment_fields(monkeypatch):
         positions = [{
             "symbol": "AAPL", "qty": 10, "avg_price": 100.0,
             "market_value_usd": 1100.0, "unrealized_pnl_pct": 0.10,
+            "position_lifecycle_id": "test-position-lifecycle",
         }]
         def get_current_price(self, symbol, exchange):
             return {"last": 110.0}

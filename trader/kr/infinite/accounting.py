@@ -38,6 +38,8 @@ def buy_quantity(state: State, orderable_cash: float, price: float) -> tuple[int
 def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderState,
                          trade_date: date) -> tuple[State, int, float]:
     """Apply only the newly confirmed portion of a broker fill."""
+    if broker.filled_qty is None:
+        return state, 0, 0.0
     delta_qty = max(0, int(broker.filled_qty or 0) - int(intent.filled_qty or 0))
     delta_notional_decimal = max(
         Decimal("0"),

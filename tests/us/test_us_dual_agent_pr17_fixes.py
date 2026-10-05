@@ -23,6 +23,16 @@ def _patch_entry_db(monkeypatch, pos):
 
 def _run_entry(monkeypatch, pos, price=110.0):
     from trader.us.pb1.us_entry_engine import generate_entry_intents
+    pos = {
+        symbol: {
+            **position,
+            "position_lifecycle_id": position.get(
+                "position_lifecycle_id",
+                f"test-position-lifecycle:{symbol}",
+            ),
+        }
+        for symbol, position in pos.items()
+    }
     monkeypatch.setenv("US_MIN_ENTRY_SCORE", "0.01")
     monkeypatch.setenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")
     monkeypatch.setenv("US_ALLOW_ADD_TO_EXISTING", "1")
@@ -158,6 +168,7 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
             "symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1,
             "available_qty": 1, "orderable_qty": 1, "limit_price": 10.0, "notional_usd": 10.0,
             "client_order_key": "new-sell-no-balance", "trade_date": "2026-06-18",
+            "position_lifecycle_id": "ack-closed-lifecycle",
         },
         kis_client=_Kis(),
         allowed_symbols={"AAOI"},
@@ -395,7 +406,7 @@ def test_route_order_ack_db_failed_when_save_order_ack_returns_false(monkeypatch
             return {"output": {"ODNO": "ACK1"}}
 
     result = route_order(
-        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 1, "limit_price": 10, "notional_usd": 10, "client_order_key": "ack-false", "trade_date": "2026-06-18"},
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 1, "limit_price": 10, "notional_usd": 10, "client_order_key": "ack-false", "trade_date": "2026-06-18", "position_lifecycle_id": "ack-failed-lifecycle"},
         allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=_Kis(),
     )
     assert result["status"] == "ACK_DB_FAILED"

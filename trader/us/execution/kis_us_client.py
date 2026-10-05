@@ -151,6 +151,10 @@ class KisUSClientError(Exception):
     """KIS US API 오류."""
 
 
+class KisUSPreSubmitError(KisUSClientError, RuntimeError):
+    """Known failure before the order HTTP request could have reached KIS."""
+
+
 class KisUSTemporaryError(KisUSClientError):
     """KIS US API 일시적 오류 (재시도 가능)."""
 
@@ -208,10 +212,17 @@ class KisUSClient:
         self._tick_context = None
         self._stage_deadline: float | None = None
         self._stage_max_attempts: int | None = None
+        self._before_order_http = None
 
     def bind_tick_context(self, context: Any) -> "KisUSClient":
         self._tick_context = context
         return self
+
+    def set_before_order_http(self, callback: Any) -> None:
+        self._before_order_http = callback
+
+    def clear_before_order_http(self) -> None:
+        self._before_order_http = None
 
     def _request_budget(self, configured_timeout: float = 10.0, reserve: float = 0.05) -> float:
         """Return a request timeout bounded by the authoritative tick deadline."""
@@ -992,16 +1003,18 @@ class KisUSClient:
         order_type: str = "LIMIT",
     ) -> dict:
         """해외주식 매수 주문 (모의투자)."""
-        self._assert_not_offline("place_us_buy_order")
-        us_cfg.assert_us_paper_order_allowed()
-        
-        # Final safety guard: signal-only mode
-        if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
-            raise RuntimeError(
-                "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
-            )
-        
-        tr = get_tr_info("us_buy_order")
+        try:
+            self._assert_not_offline("place_us_buy_order")
+            us_cfg.assert_us_paper_order_allowed()
+            if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
+                raise RuntimeError(
+                    "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
+                )
+            tr = get_tr_info("us_buy_order")
+        except Exception as exc:
+            if isinstance(exc, KisUSPreSubmitError):
+                raise
+            raise KisUSPreSubmitError(f"BUY order setup failed before broker HTTP: {exc}") from exc
         return self._place_order(tr, symbol, exchange, qty, price, order_type)
 
     def place_us_sell_order(
@@ -1013,16 +1026,18 @@ class KisUSClient:
         order_type: str = "LIMIT",
     ) -> dict:
         """해외주식 매도 주문 (모의투자)."""
-        self._assert_not_offline("place_us_sell_order")
-        us_cfg.assert_us_paper_order_allowed()
-        
-        # Final safety guard: signal-only mode
-        if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
-            raise RuntimeError(
-                "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
-            )
-        
-        tr = get_tr_info("us_sell_order")
+        try:
+            self._assert_not_offline("place_us_sell_order")
+            us_cfg.assert_us_paper_order_allowed()
+            if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
+                raise RuntimeError(
+                    "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
+                )
+            tr = get_tr_info("us_sell_order")
+        except Exception as exc:
+            if isinstance(exc, KisUSPreSubmitError):
+                raise
+            raise KisUSPreSubmitError(f"SELL order setup failed before broker HTTP: {exc}") from exc
         return self._place_order(tr, symbol, exchange, qty, price, order_type)
 
     def _place_order(
@@ -1034,32 +1049,36 @@ class KisUSClient:
         price: float,
         order_type: str,
     ) -> dict:
-        headers = self._build_headers(tr["tr_id"])
-        excg_code = get_order_exchange_code_for_api(exchange)
-        body = {
-            "CANO": self._cano,
-            "ACNT_PRDT_CD": self._acnt_prdt_cd,
-            "OVRS_EXCG_CD": excg_code,
-            "PDNO": symbol,
-            "ORD_QTY": str(qty),
-            "OVRS_ORD_UNPR": f"{price:.2f}",
-            "ORD_SVR_DVSN_CD": "0",
-            "ORD_DVSN": "00",  # 지정가
-        }
-        # Safe log: CANO, token, appkey, appsecret 미포함
-        order_side = "SELL" if "sell" in tr.get("tr_id", "").lower() or "S" in tr.get("order_side", "") else "BUY"
-        logger.info(
-            "[US_ORDER][REQUEST_SAFE] side=%s symbol=%s exchange_input=%s exchange_api=%s"
-            " qty=%s price=%.2f ord_dvsn=%s tr_id=%s",
-            order_side,
-            symbol,
-            exchange,
-            excg_code,
-            qty,
-            price,
-            body.get("ORD_DVSN"),
-            tr.get("tr_id", ""),
-        )
+        try:
+            headers = self._build_headers(tr["tr_id"])
+            excg_code = get_order_exchange_code_for_api(exchange)
+            body = {
+                "CANO": self._cano,
+                "ACNT_PRDT_CD": self._acnt_prdt_cd,
+                "OVRS_EXCG_CD": excg_code,
+                "PDNO": symbol,
+                "ORD_QTY": str(qty),
+                "OVRS_ORD_UNPR": f"{price:.2f}",
+                "ORD_SVR_DVSN_CD": "0",
+                "ORD_DVSN": "00",  # 지정가
+            }
+            order_side = "SELL" if "sell" in tr.get("tr_id", "").lower() or "S" in tr.get("order_side", "") else "BUY"
+            logger.info(
+                "[US_ORDER][REQUEST_SAFE] side=%s symbol=%s exchange_input=%s exchange_api=%s"
+                " qty=%s price=%.2f ord_dvsn=%s tr_id=%s",
+                order_side,
+                symbol,
+                exchange,
+                excg_code,
+                qty,
+                price,
+                body.get("ORD_DVSN"),
+                tr.get("tr_id", ""),
+            )
+        except Exception as exc:
+            if isinstance(exc, KisUSPreSubmitError):
+                raise
+            raise KisUSPreSubmitError(f"order request setup failed before broker HTTP: {exc}") from exc
         return self._post(tr["path"], headers=headers, body=body)
 
     def cancel_us_order(
@@ -1417,12 +1436,19 @@ class KisUSClient:
         endpoint = _endpoint_label("POST", path)
         
         for attempt in range(1, max_attempts + 1):
+            http_attempted = False
             try:
                 self._apply_rate_limit(path)
                 
                 url = self._base_url + path
+                timeout = self._request_budget()
                 record_kis_http_call("POST", path)
-                resp = requests.post(url, headers=headers, json=body, timeout=self._request_budget())
+                if is_order_submit and self._before_order_http is not None:
+                    callback = self._before_order_http
+                    self._before_order_http = None
+                    callback()
+                http_attempted = True
+                resp = requests.post(url, headers=headers, json=body, timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
@@ -1444,6 +1470,10 @@ class KisUSClient:
                 return data
             
             except Exception as err:
+                if is_order_submit and not http_attempted:
+                    raise KisUSPreSubmitError(
+                        f"POST {path} failed before broker HTTP: {err}"
+                    ) from err
                 last_error = err
                 is_temp = self._is_temporary_error(err, None)
                 

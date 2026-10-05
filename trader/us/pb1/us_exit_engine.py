@@ -159,7 +159,31 @@ def evaluate_exit(
     except Exception as exc:
         logger.warning("[US_EXIT][ENTRY_CONTRACT][WARN] symbol=%s err=%s", position.get("symbol"), exc)
 
+    position_meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    risk_state = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
+    risk_state_data = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
+    risk_lifecycle = (
+        risk_state_data.get("lifecycle")
+        if isinstance(risk_state_data.get("lifecycle"), dict) else {}
+    )
+    position_lifecycle_id = next(
+        (
+            str(value).strip()
+            for value in (
+                position.get("position_lifecycle_id"),
+                position_meta.get("position_lifecycle_id"),
+                risk_lifecycle.get("lifecycle_id"),
+            )
+            if str(value or "").strip()
+        ),
+        None,
+    )
+
     def _emit_exit(**kwargs):
+        kwargs.setdefault(
+            "position_lifecycle_id",
+            str(position_lifecycle_id) if position_lifecycle_id else None,
+        )
         return _make_exit_intent(policy_cfg=cfg, **kwargs)
 
     symbol = position.get("symbol", "")
@@ -538,6 +562,7 @@ def _make_exit_intent(
     trail_high_price: float | None = None,
     meta_extra: dict | None = None,
     policy_cfg: dict | None = None,
+    position_lifecycle_id: str | None = None,
 ) -> dict | None:
     """Exit order intent 생성."""
     import hashlib
@@ -606,6 +631,7 @@ def _make_exit_intent(
         "partial_allowed": partial_allowed,
         "leg_no": leg_no,
         "trade_date": trade_date,
+        **({"position_lifecycle_id": position_lifecycle_id} if position_lifecycle_id else {}),
         "meta": {
             "decision_price": current_price,
             "reason": reason,
@@ -639,6 +665,7 @@ def _make_exit_intent(
             "qty": qty,
             "decision_ts_et": decision_ts_et,
             **(meta_extra or {}),
+            **({"position_lifecycle_id": position_lifecycle_id} if position_lifecycle_id else {}),
         },
     }
 

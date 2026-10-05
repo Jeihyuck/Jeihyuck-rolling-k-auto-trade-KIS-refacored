@@ -5,11 +5,76 @@ same invariants rather than rebuilding balance/order semantics independently.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
+
+
+@dataclass(frozen=True)
+class SemanticActionIdentity:
+    env: str
+    account_id: str
+    market: str
+    trading_epoch_id: str
+    strategy_owner: str
+    lifecycle_id: str
+    action: str
+    trade_date: date | None = None
+    action_instance: str | None = None
+
+    def __post_init__(self) -> None:
+        required = (
+            self.env, self.account_id, self.market, self.trading_epoch_id,
+            self.strategy_owner, self.lifecycle_id, self.action,
+        )
+        if any(not str(value or "").strip() for value in required):
+            raise ValueError("semantic action identity fields must be non-empty")
+
+    @property
+    def action_key(self) -> str:
+        payload = {
+            "env": self.env.strip().lower(),
+            "account_id": self.account_id.strip(),
+            "market": self.market.strip().upper(),
+            "trading_epoch_id": self.trading_epoch_id.strip(),
+            "strategy_owner": self.strategy_owner.strip().upper(),
+            "lifecycle_id": self.lifecycle_id.strip(),
+            "action": self.action.strip().upper(),
+        }
+        if self.action_instance is not None:
+            instance = str(self.action_instance).strip()
+            if not instance:
+                raise ValueError("semantic action instance must be non-empty")
+            payload["action_instance"] = instance
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class SubmitAttemptState(str, Enum):
+    CREATED = "CREATED"
+    SUBMITTED = "SUBMITTED"
+    ACKED = "ACKED"
+    UNRESOLVED = "UNRESOLVED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    REJECTED_EXPLICIT = "REJECTED_EXPLICIT"
+    CANCELLED_ZERO_FILL = "CANCELLED_ZERO_FILL"
+    CANCELLED_PARTIAL_FILL = "CANCELLED_PARTIAL_FILL"
+    RECONCILE_ERROR = "RECONCILE_ERROR"
+
+
+class SemanticActionState(str, Enum):
+    OPEN = "OPEN"
+    IN_FLIGHT = "IN_FLIGHT"
+    UNCERTAIN = "UNCERTAIN"
+    PARTIALLY_SATISFIED = "PARTIALLY_SATISFIED"
+    SATISFIED = "SATISFIED"
+    RETRYABLE = "RETRYABLE"
+    SUPERSEDED = "SUPERSEDED"
 
 
 class OrderState(str, Enum):

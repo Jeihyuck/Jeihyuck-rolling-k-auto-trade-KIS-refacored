@@ -132,7 +132,7 @@ class KISExecutor:
             return None
         if post_qty != pre_qty:
             return None
-        return BrokerOrderState("EXPIRED")
+        return BrokerOrderState("EXPIRED", 0)
 
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
         # Reconcile against the order's original trading day, not the current
@@ -170,16 +170,18 @@ class KISExecutor:
             )
             if historical_expiry is not None:
                 return historical_expiry
-            # A successful historical inquiry with no matching row can only
-            # close a zero-fill day order. Durable partial-fill evidence stays
-            # fenced because re-sizing a replacement from current holdings
-            # could overshoot the intended TP stage.
-            inquiry_ok = isinstance(raw, dict) and str(raw.get("rt_cd") or "0").strip() in {"", "0"}
-            if lookup_date < trade_date and inquiry_ok and int(intent.filled_qty or 0) == 0:
-                return BrokerOrderState("EXPIRED")
             return BrokerOrderState("RECONCILE_PENDING")
-        qty = int(float(row.get("tot_ccld_qty") or row.get("ccld_qty") or row.get("filled_qty") or 0))
+        qty_raw = next(
+            (row.get(key) for key in ("tot_ccld_qty", "ccld_qty", "filled_qty") if row.get(key) not in (None, "")),
+            None,
+        )
+        try:
+            qty = int(float(qty_raw)) if qty_raw is not None else None
+        except (TypeError, ValueError):
+            qty = None
         avg = float(row.get("avg_prvs") or row.get("avg_price") or row.get("ccld_unpr") or 0)
+        if qty is None:
+            return BrokerOrderState("RECONCILE_PENDING")
         if qty >= intent.requested_qty:
             status = "FILLED"
         elif qty > 0:

@@ -1,18 +1,54 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import asdict
 from datetime import date
+from uuid import uuid4
 
 from sqlalchemy import text
+from trader.db.schema import schema_for_engine
 from trader.db.engine import get_engine
 from trader.account_state import get_account_key, resolve_env_name
 from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
+from trader.execution_claims import DurableExecutionClaimRepo
+from trader.execution_state import SemanticActionIdentity
 
 from .models import BrokerOrderState, Decision, OrderIntent, State, Status
 
 PENDING = frozenset({"INTENT_CREATED", "SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING"})
+
+
+def execution_action_identity(
+    *,
+    env: str,
+    account_key: str,
+    market: str,
+    trading_epoch_id: str,
+    symbol: str,
+    cycle_id: str,
+    side: str,
+    reason: str,
+    stage: str | None = None,
+    unit_sequence: int | None = None,
+    trade_date: date | None = None,
+) -> SemanticActionIdentity:
+    side_value = str(side or "").upper()
+    if side_value in {"SELL_PARTIAL", "SELL_ALL"}:
+        semantic_action = f"SELL:{str(stage or reason).upper()}"
+    else:
+        semantic_action = f"{side_value}:{str(reason).upper()}:UNIT:{int(unit_sequence or 0)}"
+    return SemanticActionIdentity(
+        env=env,
+        account_id=hashlib.sha256(account_key.encode("utf-8")).hexdigest(),
+        market=market,
+        trading_epoch_id=trading_epoch_id,
+        strategy_owner="KR_INFINITE",
+        lifecycle_id=f"{symbol}:{cycle_id}",
+        action=semantic_action,
+        trade_date=trade_date,
+    )
 
 
 class InfiniteRepository:
@@ -25,6 +61,111 @@ class InfiniteRepository:
         env = resolve_env_name()
         return active_trading_epoch_id(
             bind, env=env, account_id=get_account_key(env=env), required=bool(required)
+        )
+
+    def claim_submit(
+        self,
+        *,
+        state: State,
+        decision: Decision,
+        trade_date: date,
+        symbol: str,
+        env: str,
+    ):
+        account_key = get_account_key(env=env)
+        epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=account_key, required=True,
+        )
+        stage = str(
+            decision.metadata.get("desired_profit_stage")
+            or decision.metadata.get("profit_stage")
+            or ""
+        )
+        identity = execution_action_identity(
+            env=env,
+            account_key=account_key,
+            market="KR",
+            trading_epoch_id=str(epoch_id),
+            symbol=symbol,
+            cycle_id=str(state.cycle_id or ""),
+            side=decision.action.value,
+            reason=decision.reason,
+            stage=stage or None,
+            unit_sequence=state.units_used + 1 if decision.action.value in {"BUY", "RECOVERY"} else None,
+            trade_date=trade_date,
+        )
+        schema = schema_for_engine(self.engine)
+        repo = DurableExecutionClaimRepo(
+            self.engine, schema.execution_claims, schema.execution_attempts,
+        )
+        attempt_id = str(uuid4())
+        claim = repo.acquire(
+            identity,
+            attempt_id=attempt_id,
+            requested_qty=int(decision.qty or 0),
+            client_order_key=str(decision.idempotency_key or ""),
+            fresh_validation=True,
+        )
+        if claim.acquired:
+            with self.engine.begin() as conn:
+                conn.execute(text("""UPDATE kr_infinite_order_intents
+                    SET metadata=COALESCE(metadata,'{}'::jsonb) || CAST(:metadata AS jsonb),
+                        updated_at=NOW()
+                    WHERE trading_epoch_id=:epoch_id AND idempotency_key=:key"""), {
+                        "metadata": json.dumps({
+                            "execution_claim_action_key": claim.action_key,
+                            "execution_submit_attempt_id": attempt_id,
+                        }),
+                        "epoch_id": epoch_id,
+                        "key": decision.idempotency_key,
+                    })
+        return identity, claim
+
+    def record_execution_claim_observation(
+        self,
+        identity: SemanticActionIdentity,
+        *,
+        attempt_id: str,
+        state: str,
+        cumulative_filled_qty: int | None,
+        authoritative: bool,
+    ):
+        schema = schema_for_engine(self.engine)
+        repo = DurableExecutionClaimRepo(
+            self.engine, schema.execution_claims, schema.execution_attempts,
+        )
+        return repo.record_observation(
+            identity,
+            attempt_id=attempt_id,
+            state=state,
+            cumulative_filled_qty=cumulative_filled_qty,
+            authoritative=authoritative,
+        )
+
+    def record_execution_claim_for_order(
+        self,
+        client_order_key: str,
+        *,
+        state: str,
+        cumulative_filled_qty: int | None,
+        authoritative: bool,
+    ):
+        schema = schema_for_engine(self.engine)
+        repo = DurableExecutionClaimRepo(
+            self.engine, schema.execution_claims, schema.execution_attempts,
+        )
+        attempt = repo.find_attempt_for_client_order_key(client_order_key)
+        if attempt is None:
+            raise LookupError(
+                f"execution claim attempt not found for client order key {client_order_key}"
+            )
+        action_key, attempt_id = attempt
+        return repo.record_observation(
+            action_key,
+            attempt_id=attempt_id,
+            state=state,
+            cumulative_filled_qty=cumulative_filled_qty,
+            authoritative=authoritative,
         )
 
     def ensure_schema(self) -> None:
@@ -175,11 +316,47 @@ class InfiniteRepository:
         with self.engine.begin() as conn:
             epoch_id = self._epoch_id(conn, required=True)
             for intent, broker in updates:
+                previous_qty = int(intent.filled_qty or 0)
+                qty = broker.filled_qty if broker.filled_qty is not None else (
+                    previous_qty if previous_qty > 0 else None
+                )
                 conn.execute(text("""UPDATE kr_infinite_order_intents SET status=:status,filled_qty=:qty,
                     filled_notional_krw=:notional,filled_avg_price=:average,updated_at=NOW() WHERE id=:id"""),
-                    {"status": broker.status, "qty": broker.filled_qty, "notional": broker.filled_notional_krw,
+                    {"status": broker.status, "qty": qty, "notional": broker.filled_notional_krw,
                      "average": broker.filled_avg_price, "id": intent.id})
             self._save_state(conn, state, epoch_id=epoch_id)
+        terminal_fill_states = {"FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
+        for intent, broker in updates:
+            metadata = dict(intent.metadata or {})
+            if not metadata.get("execution_claim_action_key"):
+                continue
+            status = str(broker.status or "").upper()
+            if status == "FILLED":
+                claim_state = "FILLED"
+            elif status == "PARTIALLY_FILLED":
+                claim_state = "PARTIALLY_FILLED"
+            elif status == "REJECTED":
+                claim_state = "REJECTED_EXPLICIT"
+            elif status in {"CANCELLED", "EXPIRED"}:
+                claim_state = "CANCELLED"
+            elif status == "RECONCILE_PENDING":
+                claim_state = "UNRESOLVED"
+            else:
+                claim_state = "ACKED"
+            qty = broker.filled_qty if status in terminal_fill_states else None
+            authoritative = status == "REJECTED" or (
+                status in {"FILLED", "PARTIALLY_FILLED"} and qty is not None
+            )
+            if status in {"CANCELLED", "EXPIRED"}:
+                authoritative = broker.filled_qty is not None
+            if status in {"FILLED", "PARTIALLY_FILLED"} and qty is None:
+                claim_state = "UNRESOLVED"
+            self.record_execution_claim_for_order(
+                intent.idempotency_key,
+                state=claim_state,
+                cumulative_filled_qty=qty,
+                authoritative=authoritative,
+            )
 
     def save_state(self, state: State) -> None:
         with self.engine.begin() as conn:

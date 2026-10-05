@@ -12,6 +12,7 @@ def _intent(symbol="AAPL", side="BUY", qty=2, price=100.0):
         "limit_price": price,
         "notional_usd": qty * price,
         "strategy": "test",
+        **({"position_lifecycle_id": f"test-lifecycle-{symbol}"} if side == "SELL" else {}),
     }
 
 
