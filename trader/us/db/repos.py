@@ -465,7 +465,6 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
     }
     resolution_events = {
         "JOURNAL_REPLAY_FILL_CONFIRMED",
-        "ORDER_OPEN",
         "ORDER_PARTIALLY_FILLED",
         "ORDER_FILLED",
         "ORDER_REJECTED",

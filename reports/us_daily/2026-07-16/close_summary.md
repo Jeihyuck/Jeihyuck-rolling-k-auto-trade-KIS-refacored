@@ -3,6 +3,13 @@
 > **KIS_ENV: PRACTICE**
 > 모의투자 주문이며 실계좌/MTS에는 표시되지 않음
 
+## Trade Reason & PnL
+- Realized PnL (gross): $0.00
+- Same-day BUY-lot EOD unrealized PnL: $0.00
+- Gross trade-day impact: $0.00
+- Fees/taxes: excluded unless explicitly available in broker evidence
+
+
 **Session**: CLOSE
 
 ## Runtime Metadata
@@ -10,10 +17,10 @@
 | Field | Value |
 |---|---|
 | trade_date | 2026-07-16 |
-| branch | dual-agent |
-| commit_sha | dbbf119be00e48e1472a62f31ee3961ca63462c5 |
-| workflow | local |
-| run_id | local |
+| branch | stabilize/02-us-broker-recovery-restacked-20261005 |
+| commit_sha | e8fe8f12fcd145d4ab3a7b4a838b7fe7794a113d |
+| workflow | dynamic/copilot-swe-agent/copilot |
+| run_id | 37314717817 |
 | session | close |
 | env | practice |
 | KIS_ENV | practice |
@@ -40,32 +47,43 @@
 | account_loss_kill_switch_triggered | False |
 | forbidden_hedge_block_count | 0 |
 | report_consistency | REPORT_INCONSISTENT_POSITION_VALUE |
-| canonical_order_source | router_session_summary |
-| canonical_position_source | kis_final_balance |
+| canonical_order_source |  |
+| canonical_position_source |  |
 | orders_submitted_total | 0 |
+| session_orders_submitted | 0 |
+| daily_orders_submitted_total | 0 |
 | orders_ack_total | 0 |
 | orders_rejected_total | 0 |
+| orders_cancelled_total | 0 |
+| orders_zero_fill_cancelled_total | 0 |
+| orders_partial_fill_cancelled_total | 0 |
+| orders_unknown_fill_cancelled_total | 0 |
 | orders_unresolved_total | 0 |
 | buy_notional_total | 0.0 |
 | sell_notional_total | 0.0 |
+| session_buy_notional | 0.0 |
+| session_sell_notional | 0.0 |
+| daily_buy_notional_total | 0.0 |
+| daily_sell_notional_total | 0.0 |
+| daily_fills_total | 0 |
 | actual_new_positions | 0 |
 | open_position_count | 1 |
-| account_equity_krw | 49999999.99999999 |
-| account_equity_usd | 0.0 |
+| account_equity_krw | None |
+| account_equity_usd | None |
 | invested_market_value_usd | 0.0 |
-| cash_usd | 34482.75862068965 |
+| cash_usd | None |
 | gross_exposure_pct | 0.0 |
-| target_exposure_pct | 0.7 |
-| max_exposure_pct | 0.85 |
-| min_cash_buffer_pct | 0.15 |
-| deployment_gap_usd | 24137.931034482754 |
-| deployable_cash_usd | 29310.344827586203 |
-| allowed_new_buy_usd | 24137.931034482754 |
-| capital_deployment_action | NEW_AND_ADD_ALLOWED |
+| target_exposure_pct | 0.0 |
+| max_exposure_pct | 0.0 |
+| min_cash_buffer_pct | 0.0 |
+| deployment_gap_usd | 0.0 |
+| deployable_cash_usd | 0.0 |
+| allowed_new_buy_usd | 0.0 |
+| capital_deployment_action | NORMAL |
 | max_positions | 35 |
-| available_new_slots | 35 |
+| available_new_slots | 0 |
 | avg_position_value_usd | 0.0 |
-| underdeployed | True |
+| underdeployed | False |
 | full_position | False |
 | orders_submitted | 0 |
 | orders_ack | 0 |
@@ -142,7 +160,7 @@
 
 ## Warnings
 
--ORDER_SOURCE_EMPTY
+-ACCOUNT_EQUITY_UNAVAILABLE_HOLDINGS_ONLY_BALANCE
 
 ## Errors
 

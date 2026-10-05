@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-01
+# US Daily Report - 2026-10-05
 
 ## Required Fields
 
-- trade_date: 2026-05-01
+- trade_date: 2026-10-05
 - branch: stabilize/02-us-broker-recovery-restacked-20261005
 - commit_sha: test-sha
 - run_id: 25718405741
@@ -10,18 +10,18 @@
 - github_run_attempt: 1
 - sha: test-sha
 - workflow: US Trade AM
-- session: afternoon
-- session_id: afternoon-25718405741
+- session: am
+- session_id: am-25718405741
 - event_name: workflow_dispatch
 - actor: copilot-swe-agent[bot]
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-10-05T13:31:48.467675Z
-- started_at_et: 2026-10-05T09:31:48.461556-04:00
-- started_at_kst: 2026-10-05T22:31:48.467675+09:00
-- ended_at_utc: 2026-10-05T13:31:48.467675Z
-- ended_at_et: 2026-10-05T09:31:48.467664-04:00
-- ended_at_kst: 2026-10-05T22:31:48.467675+09:00
+- started_at_utc: 2026-10-05T13:31:48.538736Z
+- started_at_et: 2026-10-05T09:31:48.528609-04:00
+- started_at_kst: 2026-10-05T22:31:48.538736+09:00
+- ended_at_utc: 2026-10-05T13:31:48.538736Z
+- ended_at_et: 2026-10-05T09:31:48.538721-04:00
+- ended_at_kst: 2026-10-05T22:31:48.538736+09:00
 - wall_elapsed_sec: 0.0
 - code_version_source: github_actions
 - dry_run: True
@@ -38,7 +38,7 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_3
+- last_stage: tick_2
 - final_status: OK
 - reason: max_ticks
 - session_orders_sent: 0

@@ -287,10 +287,6 @@ def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fai
         "client_order_key": "unresolved-order",
         "submit_attempt_id": "unresolved-attempt",
     }
-    open_identity = {
-        "client_order_key": "open-order",
-        "submit_attempt_id": "open-attempt",
-    }
     events = [
         {"event_type": "JOURNAL_REPLAY_UNRESOLVED", **recovered_identity},
         {
@@ -298,8 +294,6 @@ def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fai
             "meta": {"broker_recovery_status": "REBOUND"},
             **recovered_identity,
         },
-        {"event_type": "JOURNAL_REPLAY_FAILED", **open_identity},
-        {"event_type": "ORDER_OPEN", **open_identity},
         {"event_type": "JOURNAL_REPLAY_FAILED", **unresolved_identity},
     ]
     monkeypatch.setattr(repos, "load_today_fills", lambda trade_date: [])
@@ -324,3 +318,30 @@ def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fai
     assert result["manual_reconcile_required"] is True
     result, _ = _configure_close(monkeypatch, tmp_path, clean_health)
     assert result["status"] == "OK"
+
+
+def test_open_order_does_not_resolve_recovery_failure(monkeypatch):
+    from trader.us.db import repos
+
+    identity = {
+        "client_order_key": "open-order",
+        "submit_attempt_id": "open-attempt",
+    }
+    events = [
+        {"event_type": "JOURNAL_REPLAY_FAILED", **identity},
+        {"event_type": "ORDER_OPEN", **identity},
+    ]
+    monkeypatch.setattr(repos, "load_today_fills", lambda trade_date: [])
+    monkeypatch.setattr(repos, "load_us_daily_orders_for_report", lambda trade_date: [])
+    monkeypatch.setattr(
+        "trader.us.execution.order_journal.load_order_events",
+        lambda trade_date: events,
+    )
+    monkeypatch.setattr(repos, "load_execution_claim_health", lambda: {
+        "unresolved_execution_actions": 0,
+        "execution_claim_conflicts": 0,
+    })
+
+    health = repos.load_broker_recovery_health("2026-10-01")
+
+    assert health["broker_fill_rebound_failure_count"] == 1
