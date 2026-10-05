@@ -548,17 +548,45 @@ class DurableExecutionClaimRepo:
             action_instance=row["action_instance"],
         )
 
-    def find_attempt_for_client_order_key(self, client_order_key: str) -> tuple[str, str] | None:
+    def find_attempt_for_client_order_key(
+        self,
+        client_order_key: str,
+        *,
+        env: str | None = None,
+        account_id: str | None = None,
+        market: str | None = None,
+        trading_epoch_id: str | None = None,
+    ) -> tuple[str, str] | None:
+        filters = [
+            self.attempts.c.client_order_key == str(client_order_key),
+        ]
+        for field, value, normalize in (
+            (self.actions.c.env, env, str.lower),
+            (self.actions.c.account_id, account_id, str),
+            (self.actions.c.market, market, str.upper),
+            (self.actions.c.trading_epoch_id, trading_epoch_id, str),
+        ):
+            if value is not None:
+                filters.append(field == normalize(str(value).strip()))
         with self.engine.connect() as conn:
             row = conn.execute(
                 sa.select(self.attempts.c.action_key, self.attempts.c.attempt_id)
-                .where(self.attempts.c.client_order_key == str(client_order_key))
+                .join(self.actions, self.actions.c.action_key == self.attempts.c.action_key)
+                .where(*filters)
                 .order_by(self.attempts.c.attempt_no.desc())
                 .limit(1)
             ).first()
         return (str(row[0]), str(row[1])) if row else None
 
-    def active_attempts(self, *, market: str | None = None) -> list[dict[str, Any]]:
+    def active_attempts(
+        self,
+        *,
+        env: str | None = None,
+        account_id: str | None = None,
+        market: str | None = None,
+        trading_epoch_id: str | None = None,
+        strategy_owner: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return persisted active attempts for recovery; this does not create a fence."""
         stmt = (
             sa.select(
@@ -566,6 +594,7 @@ class DurableExecutionClaimRepo:
                 self.actions.c.env,
                 self.actions.c.account_id,
                 self.actions.c.market,
+                self.actions.c.trading_epoch_id,
                 self.actions.c.strategy_owner,
                 self.actions.c.lifecycle_id,
                 self.actions.c.action,
@@ -585,29 +614,54 @@ class DurableExecutionClaimRepo:
             )
             .where(self.actions.c.active_attempt_id.is_not(None))
         )
-        if market:
-            stmt = stmt.where(self.actions.c.market == str(market).strip().upper())
+        for field, value, normalize in (
+            (self.actions.c.env, env, str.lower),
+            (self.actions.c.account_id, account_id, str),
+            (self.actions.c.market, market, str.upper),
+            (self.actions.c.trading_epoch_id, trading_epoch_id, str),
+            (self.actions.c.strategy_owner, strategy_owner, str.upper),
+        ):
+            if value is not None:
+                stmt = stmt.where(field == normalize(str(value).strip()))
         with self.engine.connect() as conn:
             return [dict(row) for row in conn.execute(stmt).mappings().all()]
 
-    def health(self, *, market: str | None = None) -> dict[str, int]:
-        stmt = sa.select(
-            sa.func.sum(sa.case(
-                (
-                    sa.or_(
-                        self.actions.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
-                        self.actions.c.active_attempt_id.is_not(None),
-                    ),
-                    1,
-                ),
-                else_=0,
-            )),
-            sa.func.sum(self.actions.c.claim_conflicts),
-        )
-        if market:
-            stmt = stmt.where(self.actions.c.market == str(market).strip().upper())
+    def health(
+        self,
+        *,
+        env: str | None = None,
+        account_id: str | None = None,
+        market: str | None = None,
+        trading_epoch_id: str | None = None,
+        strategy_owner: str | None = None,
+    ) -> dict[str, int]:
+        filters = []
+        for field, value, normalize in (
+            (self.actions.c.env, env, str.lower),
+            (self.actions.c.account_id, account_id, str),
+            (self.actions.c.market, market, str.upper),
+            (self.actions.c.trading_epoch_id, trading_epoch_id, str),
+            (self.actions.c.strategy_owner, strategy_owner, str.upper),
+        ):
+            if value is not None:
+                filters.append(field == normalize(str(value).strip()))
         with self.engine.connect() as conn:
-            values = conn.execute(stmt).one()
+            values = conn.execute(
+                sa.select(
+                    sa.func.sum(sa.case(
+                        (
+                            sa.or_(
+                                self.actions.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
+                                self.actions.c.active_attempt_id.is_not(None),
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )),
+                    sa.func.sum(self.actions.c.claim_conflicts),
+                )
+                .where(*filters)
+            ).one()
         return {
             "unresolved_execution_actions": int(values[0] or 0),
             "execution_claim_conflicts": int(values[1] or 0),

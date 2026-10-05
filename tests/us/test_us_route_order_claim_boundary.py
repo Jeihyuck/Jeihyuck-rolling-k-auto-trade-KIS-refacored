@@ -1284,6 +1284,12 @@ def test_route_post_io_observation_failure_surfaces_reconcile_integrity(monkeypa
     from trader.us.db import repos
 
     monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice",
+        "account_id": "route-test-account",
+        "market": "US",
+        "trading_epoch_id": "route-test-epoch",
+    })
     record_observation = claim_repo.record_observation
 
     def fail_unresolved(identity, **kwargs):
