@@ -14,6 +14,8 @@ def test_cross_date_replay_uses_source_date_fills_for_reused_broker_order_number
 ):
     import trader.us.db.repos as repos
     import trader.us.execution.order_journal as journal
+    from trader.us.execution.fills import get_fills_today
+    from trader.us.execution.tick_context import TickExecutionContext
 
     source_date = "2026-10-01"
     invocation_date = "2026-10-02"
@@ -74,39 +76,53 @@ def test_cross_date_replay_uses_source_date_fills_for_reused_broker_order_number
         lambda **kwargs: pytest.fail("invocation-date fill must not reconcile prior-date claim"),
     )
 
-    requested_fill_dates = []
+    class Provider:
+        _offline = False
 
-    def fills_today(*, provider, trade_date):
-        requested_fill_dates.append(trade_date)
-        if trade_date == invocation_date:
-            return {
-                "status": "OK",
-                "fills": [{
+        def __init__(self):
+            self.fill_trade_dates = []
+            self._tick_context = TickExecutionContext(
+                trade_date=invocation_date,
+                session="am",
+                session_run_id="run",
+                session_generation=1,
+                tick_id="tick",
+                fills_snapshot=[{
                     "order_no": "REUSED-ORDER-NO",
                     "symbol": "QXYZ",
                     "side": "SELL",
                     "filled_qty": 2,
                     "avg_price": 11.0,
                 }],
-            }
-        return {"status": "OK", "fills": []}
+                fills_snapshot_at=1.0,
+            )
 
-    monkeypatch.setattr("trader.us.execution.fills.get_fills_today", fills_today)
-
-    class Provider:
         def get_balance(self, force_refresh=False):
             return {"positions": []}
 
         def get_today_orders(self, *, trade_date):
             return []
 
+        def _get_client(self):
+            return self
+
+        def get_us_fills_today(self, *, trade_date):
+            self.fill_trade_dates.append(trade_date)
+            return []
+
+    provider = Provider()
+
     result = journal.replay_order_journal(
         invocation_date,
-        provider=Provider(),
+        provider=provider,
         include_active_claims=True,
         active_claims_only=True,
     )
 
-    assert set(requested_fill_dates) == {source_date, invocation_date}
+    assert provider.fill_trade_dates == [source_date]
+    assert get_fills_today(provider=provider, trade_date=invocation_date)["fills"] == (
+        provider._tick_context.fills_snapshot
+    )
+    assert provider.fill_trade_dates == [source_date]
     assert result["filled_count"] == 0
     assert result["unresolved_count"] == 1

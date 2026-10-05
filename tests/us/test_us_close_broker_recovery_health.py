@@ -287,6 +287,10 @@ def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fai
         "client_order_key": "unresolved-order",
         "submit_attempt_id": "unresolved-attempt",
     }
+    open_identity = {
+        "client_order_key": "open-order",
+        "submit_attempt_id": "open-attempt",
+    }
     events = [
         {"event_type": "JOURNAL_REPLAY_UNRESOLVED", **recovered_identity},
         {
@@ -294,6 +298,8 @@ def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fai
             "meta": {"broker_recovery_status": "REBOUND"},
             **recovered_identity,
         },
+        {"event_type": "JOURNAL_REPLAY_FAILED", **open_identity},
+        {"event_type": "ORDER_OPEN", **open_identity},
         {"event_type": "JOURNAL_REPLAY_FAILED", **unresolved_identity},
     ]
     monkeypatch.setattr(repos, "load_today_fills", lambda trade_date: [])
@@ -308,7 +314,7 @@ def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fai
     })
 
     health = repos.load_broker_recovery_health("2026-10-01")
-    events[:] = events[:2]
+    events.pop()
     clean_health = repos.load_broker_recovery_health("2026-10-01")
 
     assert health["broker_fill_rebound_failure_count"] == 1
