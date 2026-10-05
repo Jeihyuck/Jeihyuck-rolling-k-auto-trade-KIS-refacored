@@ -81,7 +81,11 @@ def test_us_reconcile_only_does_not_short_circuit_exit_lane(tmp_path, monkeypatc
         "am": {"effective_status": "FAILED", "reason": "fill_persistence_failed_after_orders_sent", "orders_ack": 1}
     }}))
 
-    held = {"symbol": "HELD", "exchange": "NASDAQ", "qty": 1, "orderable_qty": 1, "entry_price": 100.0}
+    held = {
+        "symbol": "HELD", "exchange": "NASDAQ", "qty": 1, "orderable_qty": 1,
+        "entry_price": 100.0, "trading_epoch_id": "prior-epoch",
+        "epoch_visibility_status": "STALE_EPOCH_VISIBLE_PROTECTIVE",
+    }
     class Provider:
         def _get_client(self):
             return type("Client", (), {"stats": {}})()
@@ -100,9 +104,10 @@ def test_us_reconcile_only_does_not_short_circuit_exit_lane(tmp_path, monkeypatc
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda _now: "REGULAR_MID")
     monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": cash})
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda **_kwargs: {
-        "status": "OK", "balance_fetch_status": "OK", "authoritative_positions": True,
-        "preserve_previous_positions": False, "positions": [held], "position_count": 1,
-        "position_symbols": ["HELD"], "block_new_entry": False,
+        "status": "TEMP_ERROR", "balance_fetch_status": "FAILED",
+        "authoritative_positions": False, "preserve_previous_positions": True,
+        "positions": [], "position_count": 0, "position_symbols": [],
+        "block_new_entry": True,
     })
     monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda **_kwargs: {"status": "OK", "fills": []})
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_ack_orders_with_balance", lambda **_kwargs: {
@@ -110,6 +115,22 @@ def test_us_reconcile_only_does_not_short_circuit_exit_lane(tmp_path, monkeypatc
     })
     monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        "trader.us.db.repos.load_positions",
+        lambda _date, *, include_epoch_mismatches=False: (
+            [held] if include_epoch_mismatches else []
+        ),
+    )
+    monkeypatch.setattr(
+        "trader.us.position_lifecycle_state.reconcile_us_position_lifecycles",
+        lambda **_kwargs: {
+            "HELD": {
+                "lifecycle_id": "current-epoch-lifecycle",
+                "trading_epoch_id": "current-epoch",
+                "opened_at": "2026-07-21T14:00:00+00:00",
+            }
+        },
+    )
     monkeypatch.setattr("trader.us.db.repos.load_today_symbols_sold", lambda **_kwargs: set())
     monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *_args, **_kwargs: 0.0)
     monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **_kwargs: False)
@@ -128,6 +149,8 @@ def test_us_reconcile_only_does_not_short_circuit_exit_lane(tmp_path, monkeypatc
     assert result["reconcile_only_until_clean"] == 1
     assert [intent["symbol"] for intent, _kwargs in routed] == ["HELD"]
     assert routed[0][1]["allowed_symbols"] is None
+    assert "position_lifecycle_id" not in held
+    assert "opened_at" not in held
 
 
 def test_clean_marker_does_not_release_unresolved_ack(tmp_path, monkeypatch):

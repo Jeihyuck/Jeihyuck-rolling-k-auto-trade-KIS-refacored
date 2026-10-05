@@ -22,3 +22,29 @@ def test_trend_filter_blocks_only_existing_non_healthy():
     kept, blocked = filter_add_to_existing_by_trend_state([{"symbol":"AMD","side":"BUY"},{"symbol":"NEW","side":"BUY"}], [{"symbol":"AMD","qty":1,"trend_state":"WARNING"}])
     assert [b["symbol"] for b in blocked] == ["AMD"]
     assert [k["symbol"] for k in kept] == ["NEW"]
+
+
+def test_new_lifecycle_does_not_inherit_prior_trend_streak_or_exit_flags():
+    first=update_us_position_trend_state(
+        symbol="SAMPLE",trade_date="2026-07-10",
+        now=datetime(2026,7,10,tzinfo=timezone.utc),current_price=89,
+        final30={"trade_date":"2026-07-10","available":True,"score_contract_ok":True,"in_final30_today":False},
+        daily={"ma20":100,"ma50":95},lifecycle_id="life-a",
+    )
+    first["trend_trim_done"]=True
+    risk=repos.load_us_position_risk_state("SAMPLE","2026-07-10")
+    state=dict(risk.get("state") or {})
+    state["trend"]=first
+    risk["state"]=state
+    repos.save_us_position_risk_state("SAMPLE","2026-07-10",risk)
+
+    reopened=update_us_position_trend_state(
+        symbol="SAMPLE",trade_date="2026-07-11",
+        now=datetime(2026,7,11,tzinfo=timezone.utc),current_price=101,
+        final30={"trade_date":"2026-07-11","available":True,"score_contract_ok":True,"in_final30_today":True},
+        daily={"ma20":100,"ma50":95},lifecycle_id="life-b",
+    )
+
+    assert reopened["final30_absent_streak"]==0
+    assert reopened["below_ma20_streak"]==0
+    assert reopened["trend_trim_done"] is False

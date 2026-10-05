@@ -4,6 +4,14 @@ from datetime import datetime, timedelta, timezone
 
 from trader.us.db import repos
 
+_POSITION_IDENTITY = {
+    "env": "practice",
+    "account_id": "practice:test-account",
+    "trading_epoch_id": "epoch-trend-test",
+    "strategy_owner": "US_STANDARD",
+    "position_lifecycle_id": "life-trend-test",
+}
+
 
 def setup_function():
     repos.reset_memory_stores()
@@ -63,7 +71,7 @@ def test_tick_trend_warning_blocks_add_to_existing_without_sell():
     from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
 
     _seed_daily(rows=_daily(last=101.0))
-    positions = [{"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "entry_price": 100, "current_price_usd": 101, "holding_trade_days": 3}]
+    positions = [{"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "entry_price": 100, "current_price_usd": 101, "holding_trade_days": 3, **_POSITION_IDENTITY}]
     positions, counts, _, _ = _update_position_trends_for_tick(
         positions=positions,
         provider=_Provider(_daily(last=101.0)),
@@ -83,7 +91,7 @@ def test_two_and_three_day_weakness_create_trim_then_exit():
     from trader.us.runner.trade_tick_runner import _update_position_trends_for_tick
     from trader.us.pb1.us_exit_engine import evaluate_exit
 
-    pos = {"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10, "entry_price": 100, "current_price_usd": 99, "holding_trade_days": 3}
+    pos = {"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10, "entry_price": 100, "current_price_usd": 99, "holding_trade_days": 3, **_POSITION_IDENTITY}
     for td in ["2026-07-10", "2026-07-11"]:
         rows = _daily_below_ma20_above_ma50(end=td)
         _seed_daily(rows=rows)
@@ -111,7 +119,7 @@ def test_stale_final30_does_not_increment_and_daily_error_unknown_no_sell():
     from trader.us.pb1.us_exit_engine import evaluate_exit
 
     _seed_daily(rows=_daily())
-    positions = [{"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "entry_price": 100, "current_price_usd": 99, "holding_trade_days": 3}]
+    positions = [{"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "entry_price": 100, "current_price_usd": 99, "holding_trade_days": 3, **_POSITION_IDENTITY}]
     positions, *_ = _update_position_trends_for_tick(positions=positions, provider=_Provider(), trade_date="2026-07-10", now=datetime(2026, 7, 10, tzinfo=timezone.utc), locked_watchlist_cache=_final30("2026-07-09"), watchlist_cache_source="stale")
     assert positions[0]["final30_absent_streak"] == 0
     from trader.us.db.price_daily_repo import reset_us_daily_memory
@@ -154,7 +162,7 @@ def test_run_trade_tick_injects_warning_before_exit_and_blocks_existing_buy(monk
     monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": 5000.0})
     _seed_daily(rows=_daily(last=101.0))
     monkeypatch.setattr("trader.us.data_provider.USDataProvider", lambda offline=False: _Provider(_daily(last=101.0)))
-    positions = [{"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10, "entry_price": 100.0, "current_price_usd": 101.0}]
+    positions = [{"symbol": "AMD", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10, "entry_price": 100.0, "current_price_usd": 101.0, **_POSITION_IDENTITY}]
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None, trade_date=None: {"status": "OK", "positions": positions, "total_pvs_usd": 10000, "balance_fetch_status": "OK", "balance_parse_status": "OK", "authoritative_positions": True, "preserve_previous_positions": False})
     monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda provider=None, signal_only=False, trade_date=None: {"status": "OK", "fills": []})
     monkeypatch.setattr("trader.us.db.repos.load_today_symbols_sold", lambda trade_date=None: set())

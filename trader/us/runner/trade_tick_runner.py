@@ -792,24 +792,37 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
             logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=insufficient_history state=UNKNOWN", symbol)
         try:
             from trader.us.position_trend_state import update_us_position_trend_state
-            frozen_trend_cfg = {}
-            try:
-                from trader.us.entry_exit_contract import contract_exit_config
-                frozen_trend_cfg = contract_exit_config(pos)
-            except Exception:
+            lifecycle_id = str(pos.get("position_lifecycle_id") or "").strip()
+            if not lifecycle_id:
+                logger.error(
+                    "[US_POSITION][TREND_STATE][IDENTITY_MISSING] symbol=%s action=UNKNOWN",
+                    symbol,
+                )
+                trend = {
+                    "trend_state": "UNKNOWN", "weakness_signals": [],
+                    "final30_absent_streak": 0, "below_ma20_streak": 0,
+                    "below_ma50_streak": 0, "ma20": None, "ma50": None,
+                    "rs_20d": None,
+                }
+            else:
                 frozen_trend_cfg = {}
-            trend = update_us_position_trend_state(
-                symbol=symbol,
-                trade_date=trade_date,
-                now=now,
-                current_price=float(current_price) if current_price is not None else None,
-                holding_trade_days=int(pos.get("holding_trade_days") or 0),
-                final30=final30_payload,
-                daily=daily,
-                lifecycle_id=pos.get("position_lifecycle_id"),
-                warning_threshold=frozen_trend_cfg.get("trend_score_warning_threshold"),
-                severe_threshold=frozen_trend_cfg.get("trend_score_severe_threshold"),
-            )
+                try:
+                    from trader.us.entry_exit_contract import contract_exit_config
+                    frozen_trend_cfg = contract_exit_config(pos)
+                except Exception:
+                    frozen_trend_cfg = {}
+                trend = update_us_position_trend_state(
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    now=now,
+                    current_price=float(current_price) if current_price is not None else None,
+                    holding_trade_days=int(pos.get("holding_trade_days") or 0),
+                    final30=final30_payload,
+                    daily=daily,
+                    lifecycle_id=lifecycle_id,
+                    warning_threshold=frozen_trend_cfg.get("trend_score_warning_threshold"),
+                    severe_threshold=frozen_trend_cfg.get("trend_score_severe_threshold"),
+                )
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STATE][WARN] symbol=%s err=%s", symbol, exc)
             trend = {"trend_state": "UNKNOWN", "weakness_signals": [], "final30_absent_streak": 0, "below_ma20_streak": 0, "below_ma50_streak": 0, "ma20": None, "ma50": None, "rs_20d": None}
@@ -1650,7 +1663,9 @@ def run_trade_tick(
             recon = reconcile_positions(provider=provider, trade_date=trade_date)
         else:
             from trader.us.db.repos import load_positions as _load_positions_for_reconcile_skip
-            _positions = _load_positions_for_reconcile_skip(trade_date)
+            _positions = _load_positions_for_reconcile_skip(
+                trade_date, include_epoch_mismatches=True,
+            )
             recon = {
                 "status": "SKIPPED_BALANCE_RECONCILE",
                 "reason": "reconcile_interval_skip",
@@ -2088,9 +2103,13 @@ def run_trade_tick(
     from trader.us.db.repos import load_positions as db_load_positions
     if authoritative_recon:
         current_positions = list(recon_positions)
+    elif intentional_balance_skip and isinstance(recon_positions, list):
+        current_positions = list(recon_positions)
     else:
         try:
-            current_positions = db_load_positions(trade_date)
+            current_positions = db_load_positions(
+                trade_date, include_epoch_mismatches=True,
+            )
         except Exception:
             current_positions = []
     try:
@@ -2099,6 +2118,7 @@ def run_trade_tick(
             positions=current_positions,
             trade_date=trade_date,
             now=now,
+            env=env,
             authoritative=(
                 bool(should_reconcile_balance)
                 and not recon.get("preserve_previous_positions")
@@ -2107,6 +2127,8 @@ def run_trade_tick(
             fills=fills_today,
         )
         for _p in current_positions:
+            if _p.get("epoch_visibility_status") == "STALE_EPOCH_VISIBLE_PROTECTIVE":
+                continue
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
             if _lc:
                 _p["position_lifecycle_id"] = _lc.get("lifecycle_id")

@@ -76,7 +76,8 @@ def test_real_postgres_durable_ledger_and_lifecycle_isolation(pg_engine):
     assert len(repos.load_us_order_events("2026-08-04")) == 1
 
     repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="FILLED",
-                                       position_lifecycle_id="L1", order_key="L1K")
+                                       position_lifecycle_id="L1", order_key="L1K",
+                                       qty=2, filled_qty=2, evidence_type="KIS_EXECUTION_ACTUAL")
     repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="PENDING",
                                        position_lifecycle_id="L2", order_key="L2K")
     l1 = repos.load_us_profit_capture_state("2026-08-04", ["JPM"], {"JPM": "L1"})["JPM"]
@@ -115,6 +116,28 @@ def test_real_postgres_reconcile_updates_actual_fill_with_typed_jsonb_binds(pg_e
     assert row["meta"]["remaining_qty"] == 0
     assert row["meta"]["requested_qty"] == 1
     assert row["meta"]["observed_at"]
+
+
+def test_real_postgres_buy_fill_history_query_binds_trade_date(pg_engine):
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_fills
+                (trade_date, symbol, exchange, side, qty, price_usd, filled_at, meta)
+            VALUES
+                ('2026-08-24', 'HIST', 'NASDAQ', 'BUY', 2, 100,
+                 '2026-08-24T14:00:00+00:00', '{}'::jsonb)
+        """))
+
+    fills = repos.load_us_buy_fill_history_candidates(
+        "HIST", trade_date="2026-08-24", lookback_days=30,
+    )
+
+    assert len(fills) == 1
+    assert fills[0]["symbol"] == "HIST"
+    assert fills[0]["trade_date"].isoformat() == "2026-08-24"
 
 
 def test_tqqq_load_open_orders_side_filter_has_no_postgres_ambiguous_parameter(pg_engine):

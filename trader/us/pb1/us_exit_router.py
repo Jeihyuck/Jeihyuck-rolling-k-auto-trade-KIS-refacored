@@ -158,10 +158,9 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
         return True, 0, required
 
     entry_time_raw = (
-        position.get("entry_time")
-        or position.get("created_at")
+        position.get("opened_at")
+        or position.get("entry_time")
         or position.get("entry_at")
-        or position.get("opened_at")
         or position.get("opened_trade_date")
     )
     if not entry_time_raw:

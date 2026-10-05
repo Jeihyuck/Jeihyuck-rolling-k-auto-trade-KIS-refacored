@@ -59,8 +59,9 @@ def test_tick_and_router_have_no_typeerror_trade_date_retry():
     assert "save_position_snapshot(recon_positions)" not in tick_src
     assert "save_reconcile_log(payload)" not in tick_src
     assert "return func(payload)" not in router_src
-    assert "_load_positions_for_reconcile_skip(trade_date)" in tick_src
-    assert "db_load_positions(trade_date)" in tick_src
+    assert "_load_positions_for_reconcile_skip(" in tick_src
+    assert "include_epoch_mismatches=True" in tick_src
+    assert "db_load_positions(\n                trade_date, include_epoch_mismatches=True," in tick_src
 
 
 def test_authoritative_empty_balance_is_persisted(monkeypatch):

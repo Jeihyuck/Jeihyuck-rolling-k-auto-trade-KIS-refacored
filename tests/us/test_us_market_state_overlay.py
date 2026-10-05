@@ -12,6 +12,13 @@ from trader.us.market_state_overlay import (
 )
 
 
+def mark_tp_filled(trade_date, symbol, stage, lifecycle, qty=25):
+    repos.mark_us_profit_capture_stage(
+        trade_date, symbol, stage, status="FILLED", position_lifecycle_id=lifecycle,
+        qty=qty, filled_qty=qty, evidence_type="KIS_EXECUTION_ACTUAL",
+    )
+
+
 def rows_oldest_first(*closes, start=1):
     return [{"date": f"202607{start+i:02d}", "close": c} for i, c in enumerate(closes)]
 
@@ -237,11 +244,11 @@ def test_profit_capture_persistent_duplicate_prevention(monkeypatch):
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp1", status="ACK", position_lifecycle_id="life-AAPL")
     assert build_profit_capture_intents([{**pos, "current_price_usd": 105}], overlay, trade_date="2026-07-09") == []
-    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp1", status="FILLED", position_lifecycle_id="life-AAPL")
+    mark_tp_filled("2026-07-09", "AAPL", "tp1", "life-AAPL")
     tp2 = build_profit_capture_intents([{**pos, "current_price_usd": 105}], overlay, trade_date="2026-07-09")
     assert tp2 and tp2[0]["reason"] == "TAKE_PROFIT_TP2"
-    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp2", status="FILLED", position_lifecycle_id="life-AAPL")
-    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp3", status="FILLED", position_lifecycle_id="life-AAPL")
+    mark_tp_filled("2026-07-09", "AAPL", "tp2", "life-AAPL")
+    mark_tp_filled("2026-07-09", "AAPL", "tp3", "life-AAPL")
     assert build_profit_capture_intents([{**pos, "current_price_usd": 109}], overlay, trade_date="2026-07-09") == []
 
 
@@ -255,15 +262,15 @@ def test_profit_capture_stage_order_gap_up_starts_with_tp1(monkeypatch):
     assert len(first) == 1
     assert first[0]["reason"] == "TAKE_PROFIT_TP1"
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
-    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp1", status="FILLED", position_lifecycle_id="life-GAP")
+    mark_tp_filled("2026-07-10", "GAP", "tp1", "life-GAP")
     second = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
     assert len(second) == 1
     assert second[0]["reason"] == "TAKE_PROFIT_TP2"
-    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp2", status="FILLED", position_lifecycle_id="life-GAP")
+    mark_tp_filled("2026-07-10", "GAP", "tp2", "life-GAP")
     third = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
     assert len(third) == 1
     assert third[0]["reason"] == "TAKE_PROFIT_TP3"
-    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp3", status="FILLED", position_lifecycle_id="life-GAP")
+    mark_tp_filled("2026-07-10", "GAP", "tp3", "life-GAP")
     assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-10") == []
 
 
@@ -284,6 +291,67 @@ def test_profit_capture_rejected_stage_can_retry(monkeypatch):
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="DONE", position_lifecycle_id="life-RETRY")
     assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-11") == []
+
+
+def test_tp_progression_uses_idempotent_actual_fills_and_retries_remaining_qty(monkeypatch):
+    from trader.us.profit_capture import sync_profit_capture_stage_from_order
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
+    position = authoritative_position("PARTIAL", 103, qty=100)
+    first = build_profit_capture_intents([position], overlay, trade_date="2026-07-12")
+    assert len(first) == 1 and first[0]["qty"] == 25
+    lifecycle = first[0]["position_lifecycle_id"]
+
+    event = {
+        "trade_date": "2026-07-12", "symbol": "PARTIAL",
+        "profit_capture_stage": "tp1", "position_lifecycle_id": lifecycle,
+        "client_order_key": first[0]["client_order_key"], "requested_qty": 25,
+        "evidence_type": "KIS_ORDER_STATUS_ACTUAL",
+    }
+    sync_profit_capture_stage_from_order(**event, order_status="ACK", filled_qty=0)
+    state = repos.load_us_profit_capture_state("2026-07-12", ["PARTIAL"], {"PARTIAL": lifecycle})["PARTIAL"]
+    assert state["tp1_pending"] and not state["tp1_done"]
+    assert build_profit_capture_intents(
+        [authoritative_position("PARTIAL", 103, qty=100)], overlay, trade_date="2026-07-12",
+    ) == []
+
+    partial_event = {
+        **event, "order_status": "PARTIALLY_FILLED", "filled_qty": 10,
+        "evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+    }
+    sync_profit_capture_stage_from_order(**partial_event)
+    sync_profit_capture_stage_from_order(**partial_event)
+    state = repos.load_us_profit_capture_state("2026-07-12", ["PARTIAL"], {"PARTIAL": lifecycle})["PARTIAL"]
+    assert state["tp1_pending"] and not state["tp1_done"]
+    assert state["meta"]["tp1_filled_qty"] == 10
+
+    sync_profit_capture_stage_from_order(**{
+        **partial_event, "order_status": "CANCELLED",
+    })
+    retry = build_profit_capture_intents(
+        [authoritative_position("PARTIAL", 103, qty=90)], overlay, trade_date="2026-07-12",
+    )
+    assert len(retry) == 1
+    assert retry[0]["qty"] == 15
+    assert retry[0]["client_order_key"] != first[0]["client_order_key"]
+
+    filled_event = {
+        **event, "client_order_key": retry[0]["client_order_key"],
+        "requested_qty": 15, "filled_qty": 15,
+        "order_status": "FILLED", "evidence_type": "KIS_EXECUTION_ACTUAL",
+    }
+    sync_profit_capture_stage_from_order(**filled_event)
+    sync_profit_capture_stage_from_order(**filled_event)
+    state = repos.load_us_profit_capture_state("2026-07-12", ["PARTIAL"], {"PARTIAL": lifecycle})["PARTIAL"]
+    assert state["tp1_done"] and not state["tp1_pending"]
+    assert state["meta"]["tp1_filled_qty"] == 25
+
+    tp2 = build_profit_capture_intents(
+        [authoritative_position("PARTIAL", 105, qty=75)], overlay, trade_date="2026-07-12",
+    )
+    assert len(tp2) == 1 and tp2[0]["reason"] == "TAKE_PROFIT_TP2"
 
 
 def test_profit_capture_uses_position_cost_fallback_with_provenance():

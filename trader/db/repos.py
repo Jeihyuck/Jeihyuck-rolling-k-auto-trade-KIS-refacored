@@ -6536,7 +6536,39 @@ class PositionsRepo:
                     "status": "OPEN",
                 }
                 if entry_meta_json:
-                    merged_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, entry_meta_json)
+                    existing_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
+                    merged_entry_meta = _merge_json_dict(existing_entry_meta, entry_meta_json)
+                    if row:
+                        for key in (
+                            "entry_contract_sha256",
+                            "entry_contract_version",
+                            "entry_exit_plan_sha256",
+                            "entry_reason",
+                            "entry_style_selected",
+                            "entry_decision_family",
+                            "entry_rule_version",
+                            "entry_thesis",
+                            "trade_horizon",
+                            "exit_policy_family",
+                            "eod_action",
+                            "force_eod_close",
+                            "max_trading_days",
+                            "initial_stop_price",
+                            "initial_risk_r",
+                            "policy_source",
+                            "policy_version",
+                            "tp1_done",
+                            "tp2_done",
+                            "tp3_done",
+                            "max_pnl_pct_since_entry",
+                            "max_price",
+                            "max_close",
+                            "last_trail_stop",
+                        ):
+                            if key in existing_entry_meta:
+                                merged_entry_meta[key] = existing_entry_meta[key]
+                            else:
+                                merged_entry_meta.pop(key, None)
                     values.update(
                         {
                             "entry_reason": merged_entry_meta.get("entry_reason") or row.get("entry_reason") if row else merged_entry_meta.get("entry_reason"),
@@ -6554,7 +6586,11 @@ class PositionsRepo:
                             "max_trading_days": merged_entry_meta.get("max_trading_days") or row.get("max_trading_days") if row else merged_entry_meta.get("max_trading_days"),
                             "initial_stop_price": _safe_float_or_none(merged_entry_meta.get("initial_stop_price")) or row.get("initial_stop_price") if row else _safe_float_or_none(merged_entry_meta.get("initial_stop_price")),
                             "initial_risk_r": _safe_float_or_none(merged_entry_meta.get("initial_risk_r")) or row.get("initial_risk_r") if row else _safe_float_or_none(merged_entry_meta.get("initial_risk_r")),
-                            "entry_exit_plan_json": entry_exit_plan or (row.get("entry_exit_plan_json") if row else {}),
+                            "entry_exit_plan_json": (
+                                row.get("entry_exit_plan_json")
+                                if row
+                                else entry_exit_plan
+                            ) or {},
                             "policy_source": merged_entry_meta.get("policy_source") or row.get("policy_source") if row else merged_entry_meta.get("policy_source"),
                             "policy_version": merged_entry_meta.get("policy_version") or row.get("policy_version") if row else merged_entry_meta.get("policy_version"),
                         }

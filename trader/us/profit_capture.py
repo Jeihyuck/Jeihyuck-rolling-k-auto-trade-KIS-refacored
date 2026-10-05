@@ -60,7 +60,7 @@ def authoritative_broker_avg(position: dict, *, now: datetime | None = None,
         (position.get("db_avg_price") or position.get("fresh_db_position_avg_price"), "fallback_fresh_db_position_avg", position.get("db_position_asof") or position.get("updated_at"), True),
         (position.get("avg_price_usd"), "fallback_avg_price_usd", position.get("updated_at") or position.get("as_of"), is_kis),
         (position.get("avg_cost"), "fallback_avg_cost", position.get("updated_at") or position.get("as_of"), False),
-        (position.get("entry_price"), "fallback_entry_price", position.get("entry_at") or position.get("entry_time") or position.get("created_at"), False),
+        (position.get("entry_price"), "fallback_entry_price", position.get("entry_at") or position.get("entry_time"), False),
     ))
     for candidate_value, candidate_source, candidate_asof, authoritative in candidates:
         try:
@@ -114,4 +114,5 @@ def sync_profit_capture_stage_from_order(**event) -> None:
         broker_order_no=event.get("broker_order_no"), status=status,
         qty=requested if requested > 0 else None,
         filled_qty=filled if filled >= 0 else None,
+        evidence_type=evidence,
     )

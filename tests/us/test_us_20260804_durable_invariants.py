@@ -49,7 +49,8 @@ def test_order_state_machine_never_regresses_terminal_or_cumulative(monkeypatch)
 def test_late_l1_fill_does_not_mutate_l2(monkeypatch):
     monkeypatch.setattr(repos,"_get_engine_or_none",lambda:None); repos._MEM_PROFIT_CAPTURE_STATE.clear()
     repos.mark_us_profit_capture_stage("2026-08-04","JPM","tp1",status="PENDING",position_lifecycle_id="L2",order_key="L2K")
-    repos.mark_us_profit_capture_stage("2026-08-04","JPM","tp1",status="FILLED",position_lifecycle_id="L1",order_key="L1K")
+    repos.mark_us_profit_capture_stage("2026-08-04","JPM","tp1",status="FILLED",position_lifecycle_id="L1",order_key="L1K",
+                                       qty=2,filled_qty=2,evidence_type="KIS_EXECUTION_ACTUAL")
     l1=repos.load_us_profit_capture_state("2026-08-04",["JPM"],{"JPM":"L1"})["JPM"]
     l2=repos.load_us_profit_capture_state("2026-08-04",["JPM"],{"JPM":"L2"})["JPM"]
     assert l1["tp1_done"] and l2["tp1_pending"] and not l2["tp1_done"]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -66,8 +66,15 @@ def _meta():
     }
 
 
-def _ccld_row(odno: str, *, qty: int = 21, avg: float = 49350.0, code: str = "028050"):
-    return {
+def _ccld_row(
+    odno: str,
+    *,
+    qty: int = 21,
+    avg: float = 49350.0,
+    code: str = "028050",
+    ccld_tmd: str | None = "101530",
+):
+    row = {
         "odno": odno,
         "pdno": code,
         "sll_buy_dvsn_cd": "02",
@@ -75,6 +82,9 @@ def _ccld_row(odno: str, *, qty: int = 21, avg: float = 49350.0, code: str = "02
         "tot_ccld_qty": str(qty),
         "avg_prvs": str(avg),
     }
+    if ccld_tmd is not None:
+        row["ccld_tmd"] = ccld_tmd
+    return row
 
 
 class _ExactCcldKis:
@@ -421,10 +431,70 @@ def test_cross_day_acked_buy_restores_only_with_exact_execution_proof(monkeypatc
     assert pos["entry_decision_family"] == "ENTRY_PULLBACK_OVERRIDE"
     assert pos["trade_horizon"] == "SWING"
     assert pos["exit_policy_family"] == "SWING_STAGED_EXIT"
+    expected_opened_at = datetime.combine(
+        (now - timedelta(days=1)).date(),
+        datetime.strptime("101530", "%H%M%S").time(),
+        tzinfo=fix._KST,
+    )
+    assert fix._kst_dt(pos["opened_at"]) == expected_opened_at
+    assert fix._kst_dt(pos["entry_ts"]) == expected_opened_at
     assert float(pos["initial_stop_price"]) == pytest.approx(43573.21428571428)
     assert order["status"] == "FILLED"
     assert sum(int(fill["qty"]) for fill in fills) == 21
     assert kis.calls
+
+
+def test_kis_ord_timestamp_aliases_preserve_cross_day_execution_date():
+    timestamp = fix._execution_fill_timestamp(
+        {"ord_dt": "20261004", "ord_tmd": "101530"},
+        fallback_date=datetime(2026, 10, 5).date(),
+    )
+
+    assert timestamp == datetime(2026, 10, 4, 10, 15, 30, tzinfo=fix._KST)
+
+
+def test_cross_day_fill_without_execution_time_stays_policy_missing(monkeypatch):
+    engine = _db()
+    schema = schema_for_engine(engine)
+    order_id, source_cycle, imported_cycle, epoch_id, position_id = (
+        str(uuid4()), str(uuid4()), str(uuid4()), str(uuid4()), str(uuid4())
+    )
+    now = now_kst()
+    with engine.begin() as conn:
+        _portfolio_epoch(conn, schema, epoch_id)
+        _insert_source_order(
+            conn,
+            schema,
+            order_id=order_id,
+            cycle_id=source_cycle,
+            epoch_id=epoch_id,
+            now=now,
+        )
+        _insert_imported_position(
+            conn,
+            schema,
+            position_id=position_id,
+            cycle_id=imported_cycle,
+            epoch_id=epoch_id,
+            now=now,
+        )
+    monkeypatch.setattr(fix, "_active_epoch", lambda *_args, **_kwargs: None)
+    result = fix._recover_cross_day_contract_from_holdings(
+        engine=engine,
+        kis=_ExactCcldKis([_ccld_row("0000010034", ccld_tmd=None)]),
+        env="practice",
+        strategy=STRATEGY,
+        holdings_rows=[{"pdno": "028050", "hldg_qty": "21", "pchs_avg_pric": "49350"}],
+        now=now,
+    )
+    assert result["recovered"] == []
+    assert result["review_required"] == ["028050"]
+    with engine.connect() as conn:
+        pos = conn.execute(
+            sa.select(schema.positions).where(schema.positions.c.position_id == position_id)
+        ).mappings().one()
+    assert pos["position_origin"] == "IMPORTED"
+    assert pos["exit_policy_family"] == "POLICY_MISSING"
 
 
 def test_cross_day_acked_buy_without_execution_evidence_stays_policy_missing(monkeypatch):

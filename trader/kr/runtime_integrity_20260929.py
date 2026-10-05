@@ -323,6 +323,39 @@ def _row_side_is_buy(row: dict[str, Any]) -> bool:
     return raw in {"02", "BUY", "매수"} or "BUY" in raw or "매수" in raw
 
 
+def _execution_fill_timestamp(row: dict[str, Any], fallback_date: date) -> datetime | None:
+    raw = str(
+        row.get("ccld_tmd")
+        or row.get("ccld_time")
+        or row.get("ord_tmd")
+        or row.get("filled_at")
+        or row.get("fill_time")
+        or ""
+    ).strip()
+    if not raw:
+        return None
+    parsed = _kst_dt(raw)
+    if parsed is not None:
+        return parsed
+    digits = "".join(character for character in raw if character.isdigit())
+    if len(digits) != 6:
+        return None
+    raw_date = str(
+        row.get("ccld_dt") or row.get("trd_dt") or row.get("ord_dt") or ""
+    ).strip()
+    fill_date = fallback_date
+    if raw_date:
+        try:
+            fill_date = datetime.strptime(raw_date, "%Y%m%d").date()
+        except ValueError:
+            return None
+    try:
+        fill_time = datetime.strptime(digits, "%H%M%S").time()
+    except ValueError:
+        return None
+    return datetime.combine(fill_date, fill_time, tzinfo=_KST)
+
+
 def _execution_proof_for_order(kis: Any, order: dict[str, Any]) -> dict[str, Any] | None:
     created = _kst_dt(order.get("created_at"))
     odno = str(order.get("kis_odno") or order.get("broker_order_id") or "").strip()
@@ -347,11 +380,15 @@ def _execution_proof_for_order(kis: Any, order: dict[str, Any]) -> dict[str, Any
     avg = _px(row.get("avg_prvs") or row.get("avg_price") or row.get("ccld_unpr"))
     if filled_qty <= 0 or avg <= 0:
         return None
+    filled_at = _execution_fill_timestamp(row, created.date())
+    if filled_at is None:
+        return None
     return {
         "filled_qty": filled_qty,
         "avg_price": avg,
         "filled_notional": filled_qty * avg,
-        "trade_date": created.date().isoformat(),
+        "filled_at": filled_at.isoformat(),
+        "trade_date": filled_at.date().isoformat(),
         "odno": odno,
         "row": row,
     }
@@ -532,11 +569,13 @@ def _persist_missing_fill(
     source_epoch: str,
     source_odno: str,
     entry_ts: Any,
-    now: datetime,
 ) -> bool:
     order_id = str(order.get("order_id") or "")
     target_qty = _qty(proof.get("filled_qty"))
     target_notional = float(proof.get("filled_notional") or 0.0)
+    fill_timestamp = _kst_dt(entry_ts)
+    if fill_timestamp is None:
+        return False
     durable_qty, durable_notional = _durable_fill_totals(engine, schema, order_id)
     if durable_qty > target_qty:
         return False
@@ -561,7 +600,7 @@ def _persist_missing_fill(
             price=price,
             fee=0.0,
             tax=0.0,
-            filled_at=entry_ts or now,
+            filled_at=fill_timestamp,
             raw_json={
                 "source": "KR_CROSS_DAY_EXACT_DAILY_CCLD",
                 "broker_execution_trade_date": proof.get("trade_date"),
@@ -643,6 +682,7 @@ def _recover_cross_day_contract_from_holdings(
                 ).mappings().all()
             ]
         candidates: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+        execution_evidence_incomplete = False
         for order in orders:
             created = _kst_dt(order.get("created_at"))
             if created is None or created.date() >= today or (today - created.date()).days > max_age_days:
@@ -656,12 +696,14 @@ def _recover_cross_day_contract_from_holdings(
                 proof = _execution_proof_for_order(kis, order)
             except Exception as exc:
                 logger.warning("[KR_P0][CROSS_DAY_EXECUTION_PROOF_FAIL] code=%s err=%s", code, exc)
+                execution_evidence_incomplete = True
                 continue
             if proof is None or _qty(proof.get("filled_qty")) != broker_qty:
+                execution_evidence_incomplete = True
                 continue
             candidates.append((order, meta, plan, proof))
         if len(candidates) != 1:
-            if candidates:
+            if candidates or execution_evidence_incomplete:
                 review_required.append(code)
             continue
         order, meta, plan, proof = candidates[0]
@@ -687,7 +729,9 @@ def _recover_cross_day_contract_from_holdings(
                 "holding_age_unknown": False,
             }
         )
-        entry_ts = order.get("acked_at") or order.get("submitted_at") or order.get("created_at")
+        entry_ts = _kst_dt(proof.get("filled_at"))
+        if entry_ts is None:
+            continue
         if not _persist_missing_fill(
             engine=engine,
             schema=schema,
@@ -699,7 +743,6 @@ def _recover_cross_day_contract_from_holdings(
             source_epoch=source_epoch,
             source_odno=source_odno,
             entry_ts=entry_ts,
-            now=now,
         ):
             review_required.append(code)
             continue
@@ -709,6 +752,7 @@ def _recover_cross_day_contract_from_holdings(
             "position_cycle_id": source_cycle,
             "portfolio_epoch_id": source_epoch,
             "position_origin": "SYSTEM",
+            "opened_at": entry_ts,
             "position_meta": position_meta,
             "entry_ts": entry_ts.isoformat() if hasattr(entry_ts, "isoformat") else str(entry_ts or ""),
             "entry_reason": plan.get("entry_reason") or meta.get("entry_reason"),

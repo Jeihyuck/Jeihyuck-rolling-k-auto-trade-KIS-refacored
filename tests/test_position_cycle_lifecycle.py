@@ -40,6 +40,121 @@ def test_full_sell_then_rebuy_creates_new_clean_cycle():
     assert old["status"] == "CLOSED" and old["closed_reason"] == "FULL_SELL"
 
 
+def test_add_buy_preserves_frozen_contract_and_tp_state_until_reentry():
+    engine, repo = _repo()
+    opened_at = datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc)
+    first_plan = {"policy_version": "frozen-a", "profit_plan": {"tp1_profit_pct": 12}}
+    add_plan = {"policy_version": "today-b", "profit_plan": {"tp1_profit_pct": 99}}
+    first_meta = {
+        "entry_contract_sha256": "contract-a",
+        "entry_contract_version": "v1",
+        "entry_exit_plan_sha256": "plan-a",
+        "tp1_done": False,
+    }
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+        market="KOSPI", side="BUY", qty=2, price=100, fee=0, tax=0,
+        filled_at=opened_at, entry_meta_json=first_meta, entry_exit_plan=first_plan,
+    )
+    original = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000001")
+    frozen_plan_sha = original["entry_meta_json"]["entry_exit_plan_sha256"]
+    repo.update_position_fields(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+        fields={"position_meta": {"tp1_done": True}, "max_price": 140},
+    )
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+        market="KOSPI", side="BUY", qty=1, price=120, fee=0, tax=0,
+        filled_at=opened_at.replace(day=2),
+        entry_meta_json={**first_meta, "entry_contract_sha256": "contract-b", "tp1_done": False},
+        entry_exit_plan=add_plan,
+    )
+    added = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000001")
+    assert added["position_cycle_id"] == original["position_cycle_id"]
+    assert added["opened_at"] == original["opened_at"]
+    assert added["entry_exit_plan_json"] == first_plan
+    assert added["entry_meta_json"]["entry_contract_sha256"] == "contract-a"
+    assert added["entry_meta_json"]["entry_exit_plan_sha256"] == frozen_plan_sha
+    assert added["position_meta"]["tp1_done"] is True
+    assert added["max_price"] == 140
+
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+        market="KOSPI", side="SELL", qty=1, price=130, fee=0, tax=0,
+        filled_at=opened_at.replace(day=3),
+    )
+    partial = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000001")
+    assert partial["position_cycle_id"] == original["position_cycle_id"]
+    assert partial["status"] == "OPEN"
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+        market="KOSPI", side="SELL", qty=2, price=130, fee=0, tax=0,
+        filled_at=opened_at.replace(day=4),
+    )
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+        market="KOSPI", side="BUY", qty=1, price=150, fee=0, tax=0,
+        filled_at=opened_at.replace(day=5),
+        entry_meta_json={"entry_contract_sha256": "contract-c"},
+        entry_exit_plan={"policy_version": "contract-c"},
+    )
+    reentered = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000001")
+    assert reentered["position_cycle_id"] != original["position_cycle_id"]
+    assert reentered["entry_exit_plan_json"] == {"policy_version": "contract-c"}
+    assert reentered["position_meta"] == {}
+    assert reentered["max_price"] is None
+
+
+def test_add_buy_cannot_adopt_policy_for_evidence_poor_cycle():
+    _, repo = _repo()
+    filled_at = datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc)
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000002",
+        market="KOSPI", side="BUY", qty=1, price=100, fee=0, tax=0,
+        filled_at=filled_at,
+        entry_meta_json={"exit_policy_family": "POLICY_MISSING", "policy_source": "missing"},
+    )
+    repo.apply_fill(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000002",
+        market="KOSPI", side="BUY", qty=1, price=110, fee=0, tax=0,
+        filled_at=filled_at.replace(day=2),
+        entry_meta_json={"exit_policy_family": "SWING_STAGED_EXIT", "policy_source": "today"},
+        entry_exit_plan={"policy_version": "today"},
+    )
+    position = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000002")
+    assert position["exit_policy_family"] == "POLICY_MISSING"
+    assert position["policy_source"] == "missing"
+    assert position["entry_exit_plan_json"] == {}
+
+
+def test_confirmed_tp_fill_is_persisted_idempotently_on_its_open_cycle():
+    _, repo = _repo()
+    _fill(repo, "BUY")
+    position = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000001")
+    args = {
+        "env": "practice",
+        "strategy": "pb1",
+        "sid": 1,
+        "mode": 1,
+        "code": "000001",
+        "position_cycle_id": position["position_cycle_id"],
+        "stage": "tp1",
+        "client_order_key": "tp1-cycle-key",
+        "filled_qty": 1,
+    }
+
+    assert repo.mark_profit_capture_fill(**args)
+    assert repo.mark_profit_capture_fill(**args)
+
+    updated = repo.get_position(env="practice", strategy="pb1", sid=1, mode=1, code="000001")
+    assert updated["position_cycle_id"] == position["position_cycle_id"]
+    assert updated["position_meta"]["kr_tp1_done"] is True
+    assert updated["position_meta"]["kr_tp1_pending"] is False
+    assert updated["position_meta"]["kr_tp1_filled_qty"] == 1
+    assert updated["position_meta"]["kr_tp1_order_key"] == "tp1-cycle-key"
+    assert updated["tp1_done"] is True
+
+
 def test_imported_cycle_does_not_inherit_history():
     state = new_cycle_state(epoch_id="epoch-new", price=491000, origin="IMPORTED")
     assert state["entry_price"] == 491000

@@ -346,6 +346,13 @@ def test_us_postgres_buy_contract_survives_position_restart_and_drives_sell(monk
             conn.exec_driver_sql(open("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql", encoding="utf-8").read())
             conn.exec_driver_sql(open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read())
             conn.exec_driver_sql(open("migrations/0047_us_order_events_profit_lifecycle.sql", encoding="utf-8").read())
+            for table in (
+                "us_order_intents", "us_orders", "us_fills", "us_positions",
+                "us_order_events", "us_profit_capture_lifecycle",
+            ):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+                )
 
         monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
         monkeypatch.setenv("KIS_ENV", "practice")
@@ -482,8 +489,15 @@ def test_us_lifecycle_uses_confirmed_buy_fill_time_and_preserves_it_after_restar
     contract = _contract()
     fill_time = "2026-09-18T13:35:00+00:00"
     now = datetime(2026, 9, 18, 14, 0, tzinfo=timezone.utc)
+    identity = {
+        "env": "practice",
+        "account_id": "practice:test-account",
+        "trading_epoch_id": "epoch-lifecycle-test",
+        "strategy_owner": "US_STANDARD",
+    }
     positions = [{
         "symbol": "AAPL", "qty": 10, "entry_price": 100.0, "current_price_usd": 101.0,
+        **identity,
         "meta": {
             "entry_exit_contract": contract,
             "entry_exit_contract_sha256": contract["sha256"],
@@ -492,13 +506,28 @@ def test_us_lifecycle_uses_confirmed_buy_fill_time_and_preserves_it_after_restar
     }]
     out = lifecycle.reconcile_us_position_lifecycles(
         positions=positions, trade_date="2026-09-18", now=now, authoritative=True,
+        env="practice",
         fills=[{
             "symbol": "AAPL", "side": "BUY", "qty": 10, "price_usd": 100.0,
             "filled_at": fill_time,
+            "env": identity["env"],
+            "account_id": identity["account_id"],
+            "trading_epoch_id": identity["trading_epoch_id"],
+            "strategy_owner": identity["strategy_owner"],
+            "position_lifecycle_id": "life-entry-contract",
+            "meta": {
+                "position_lifecycle_id": "life-entry-contract",
+                "strategy_owner": identity["strategy_owner"],
+                "entry_exit_contract": contract,
+                "entry_exit_contract_sha256": contract["sha256"],
+                "entry_exit_contract_version": contract["version"],
+            },
         }],
     )
+    assert out["AAPL"]["lifecycle_id"] == "life-entry-contract"
     assert out["AAPL"]["opened_at"] == fill_time
     assert out["AAPL"]["opened_at_source"] == "confirmed_buy_fill"
+    assert out["AAPL"]["entry_policy"]["entry_exit_contract_sha256"] == contract["sha256"]
     assert positions[0]["opened_at"] == fill_time
     assert positions[0]["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
 
@@ -511,11 +540,11 @@ def test_us_lifecycle_uses_confirmed_buy_fill_time_and_preserves_it_after_restar
     later = datetime(2026, 9, 18, 20, 10, tzinfo=timezone.utc)
     restarted_positions = [{
         "symbol": "AAPL", "qty": 10, "entry_price": 100.0, "current_price_usd": 101.0,
-        "meta": {},
+        **identity, "meta": {},
     }]
     out2 = lifecycle.reconcile_us_position_lifecycles(
         positions=restarted_positions, trade_date="2026-09-18", now=later,
-        authoritative=True, fills=[],
+        authoritative=True, fills=[], env="practice",
     )
     assert out2["AAPL"]["opened_at"] == fill_time
     assert restarted_positions[0]["opened_at"] == fill_time

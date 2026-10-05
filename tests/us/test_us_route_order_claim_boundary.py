@@ -758,11 +758,16 @@ def test_satisfied_tp1_stays_one_shot_across_dates_while_tp2_tp3_remain_distinct
 
 
 def test_tqqq_run_sleeve_uses_cycle_lifecycle_and_one_daily_buy_action(monkeypatch):
-    from datetime import date
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
     from trader.us.infinite.integration import run_sleeve
     from trader.us.infinite.models import Action, Decision, InfiniteState, Status
     from trader.us.execution.order_router import _semantic_action_identity
 
+    monkeypatch.setattr(
+        "trader.us.market_calendar.now_ny",
+        lambda: datetime(2026, 10, 2, 12, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
     monkeypatch.setenv("DRY_RUN", "0")
