@@ -108,14 +108,24 @@ class InfiniteRepository:
         )
         if claim.acquired:
             with self.engine.begin() as conn:
-                conn.execute(text("""UPDATE kr_infinite_order_intents
-                    SET metadata=COALESCE(metadata,'{}'::jsonb) || CAST(:metadata AS jsonb),
+                metadata = json.dumps({
+                    "execution_claim_action_key": claim.action_key,
+                    "execution_submit_attempt_id": attempt_id,
+                })
+                if conn.dialect.name == "sqlite":
+                    metadata_update = """
+                        metadata=json_patch(COALESCE(metadata,'{}'), :metadata),
+                        updated_at=CURRENT_TIMESTAMP
+                    """
+                else:
+                    metadata_update = """
+                        metadata=COALESCE(metadata,'{}'::jsonb) || CAST(:metadata AS jsonb),
                         updated_at=NOW()
+                    """
+                conn.execute(text(f"""UPDATE kr_infinite_order_intents
+                    SET {metadata_update}
                     WHERE trading_epoch_id=:epoch_id AND idempotency_key=:key"""), {
-                        "metadata": json.dumps({
-                            "execution_claim_action_key": claim.action_key,
-                            "execution_submit_attempt_id": attempt_id,
-                        }),
+                        "metadata": metadata,
                         "epoch_id": epoch_id,
                         "key": decision.idempotency_key,
                     })

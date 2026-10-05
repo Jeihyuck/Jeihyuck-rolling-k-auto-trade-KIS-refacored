@@ -2876,6 +2876,7 @@ class OrdersRepo:
         fresh_validation: bool,
         retry_action_prefix: str | None = None,
         entry_generation: bool = False,
+        allow_partial_retry: bool = False,
     ):
         from trader.account_state import get_account_key, resolve_env_name
         from trader.db.trading_epoch import active_trading_epoch_id
@@ -2934,8 +2935,38 @@ class OrdersRepo:
             client_order_key=client_order_key,
             fresh_validation=fresh_validation,
             retry_action_prefix=retry_action_prefix,
+            allow_partial_retry=allow_partial_retry,
         )
         return identity, claim
+
+    def get_execution_action_snapshot(
+        self,
+        *,
+        env: str,
+        market: str,
+        strategy_owner: str,
+        lifecycle_id: str,
+        action: str,
+    ):
+        from trader.account_state import get_account_key, resolve_env_name
+        from trader.db.trading_epoch import active_trading_epoch_id
+        from trader.execution_state import SemanticActionIdentity
+
+        env = resolve_env_name(env)
+        account_key = get_account_key(env=env)
+        epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=account_key, required=True,
+        )
+        identity = SemanticActionIdentity(
+            env=env,
+            account_id=hashlib.sha256(account_key.encode("utf-8")).hexdigest(),
+            market=market,
+            trading_epoch_id=str(epoch_id),
+            strategy_owner=str(strategy_owner),
+            lifecycle_id=str(lifecycle_id),
+            action=str(action).strip().upper(),
+        )
+        return self._execution_claim_repo.get_if_exists(identity)
 
     def record_execution_claim_for_order(
         self,
@@ -2959,8 +2990,8 @@ class OrdersRepo:
             authoritative=authoritative,
         )
 
-    def execution_claim_health(self) -> dict[str, int]:
-        return self._execution_claim_repo.health()
+    def execution_claim_health(self, *, market: str | None = None) -> dict[str, int]:
+        return self._execution_claim_repo.health(market=market)
 
     def release_execution_claim_before_submit_for_order(self, client_order_key: str) -> None:
         attempt = self._execution_claim_repo.find_attempt_for_client_order_key(client_order_key)
@@ -3735,6 +3766,7 @@ class OrdersRepo:
         side: str | None = None,
         code: str | None = None,
         status_exclude: Iterable[str] | None = ("ERROR",),
+        fail_open: bool | None = None,
     ) -> list[dict]:
         now = now_kst()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -3757,7 +3789,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_orders",
-            fail_open=_resolve_lookup_fail_open(env),
+            fail_open=_resolve_lookup_fail_open(env) if fail_open is None else fail_open,
         )
 
     def list_today_buy_orders(

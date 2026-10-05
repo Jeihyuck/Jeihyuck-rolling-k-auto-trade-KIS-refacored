@@ -165,12 +165,15 @@ def _record_execution_claim_observation(
     status = str(broker_status or "").strip().upper()
     filled_qty = cumulative_filled_qty
     authoritative = False
-    if status in {"REJECTED", "REJECT"} and filled_qty == 0:
+    if status in {"REJECTED", "REJECT"} and filled_qty in {None, 0}:
         claim_state = "REJECTED_EXPLICIT"
         authoritative = True
+        filled_qty = 0
     elif status in {"CANCELLED", "CANCELED", "CANCEL"}:
         claim_state = "CANCELLED"
         authoritative = filled_qty is not None
+    elif status == "RECONCILE_ERROR":
+        claim_state = "RECONCILE_ERROR"
     elif filled_qty is not None and requested_qty and filled_qty >= requested_qty:
         claim_state = "FILLED"
         authoritative = True
@@ -199,15 +202,84 @@ def _record_execution_claim_observation(
     return None
 
 
-def _execution_claim_health(orders_repo: OrdersRepo) -> dict[str, Any]:
+def _execution_claim_health(
+    orders_repo: OrdersRepo, *, market: str | None = None,
+) -> dict[str, Any]:
     try:
-        return {"available": True, **orders_repo.execution_claim_health()}
+        return {
+            "available": True,
+            **orders_repo.execution_claim_health(market=market),
+        }
     except Exception as exc:
         logger.error(
             "[RECONCILE][EXECUTION_CLAIM][HEALTH_UNAVAILABLE] err=%s",
             exc,
         )
         return {"available": False, "error": type(exc).__name__}
+
+
+def _execution_claim_integrity_reason(
+    health: dict[str, Any], *, observation_failures: int = 0,
+) -> str | None:
+    if observation_failures:
+        return "execution_claim_observation_failed"
+    if not health.get("available"):
+        return "execution_claim_health_unavailable"
+    if int(health.get("unresolved_execution_actions") or 0) > 0:
+        return "unresolved_execution_actions"
+    return None
+
+
+def _project_pb1_exit_stage_truth(
+    *,
+    orders_repo: OrdersRepo,
+    positions_repo: PositionsRepo,
+    env: str,
+    code: str,
+    strategy: str,
+    source_order: dict,
+    request_json: dict,
+) -> None:
+    action = str(request_json.get("semantic_action") or "").strip()
+    lifecycle_id = str(
+        request_json.get("position_lifecycle_id")
+        or request_json.get("lifecycle_id")
+        or ""
+    )
+    if not action or not lifecycle_id:
+        return
+    snapshot = orders_repo.get_execution_action_snapshot(
+        env=env,
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=lifecycle_id,
+        action=action,
+    )
+    if snapshot is None or snapshot.active_attempt_id:
+        return
+    state = str(snapshot.action_state or "").upper()
+    if state not in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}:
+        return
+
+    fields: dict[str, Any] = {}
+    if state == "SATISFIED":
+        update = request_json.get("execution_meta_update")
+        if isinstance(update, dict):
+            fields.update(update)
+    profit_capture_stage = str(request_json.get("profit_capture_stage") or "").lower()
+    if profit_capture_stage in {"tp1", "tp2", "tp3"}:
+        fields[f"kr_{profit_capture_stage}_pending"] = False
+    if fields:
+        positions_repo.update_position_fields(
+            env=env,
+            strategy=str(source_order.get("strategy") or strategy),
+            sid=int(source_order.get("sid") or 1),
+            mode=int(source_order.get("mode") or 1),
+            code=code,
+            fields={"position_meta": fields},
+            position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+            portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+        )
 
 
 def _parse_date_time(row: dict) -> datetime:
@@ -1150,6 +1222,30 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     "error": observation_error,
                 }
             )
+        execution_meta_update = request_json.get("execution_meta_update")
+        execution_action = str(request_json.get("semantic_action") or "").strip()
+        if side == "SELL" and source_order and execution_action and isinstance(execution_meta_update, dict):
+            try:
+                _project_pb1_exit_stage_truth(
+                    orders_repo=orders_repo,
+                    positions_repo=positions_repo,
+                    env=env,
+                    code=code,
+                    strategy=str(source_order.get("strategy") or strategy),
+                    source_order=source_order,
+                    request_json=request_json,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[RECONCILE][EXECUTION_CLAIM][STAGE_PROJECTION_FAILED] key=%s action=%s",
+                    source_order.get("client_order_key"), execution_action,
+                )
+                execution_claim_observation_failures.append(
+                    {
+                        "client_order_key": str(source_order.get("client_order_key") or ""),
+                        "error": f"stage_projection:{type(exc).__name__}",
+                    }
+                )
         if filled_qty and filled_price is not None and side != "UNKNOWN":
             fills_repo.upsert_fill(
                 env=env,
@@ -1303,9 +1399,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
     if execution_claim_observation_failures:
         degraded_reason = degraded_reason or "execution_claim_observation_failed"
-    execution_claim_health = _execution_claim_health(orders_repo)
+    execution_claim_health = _execution_claim_health(orders_repo, market="KR")
+    integrity_reason = _execution_claim_integrity_reason(
+        execution_claim_health,
+        observation_failures=len(execution_claim_observation_failures),
+    )
+    degraded_reason = degraded_reason or integrity_reason
+    execution_claim_health["integrity_status"] = (
+        "DEGRADED" if degraded_reason else "OK"
+    )
+    if degraded_reason:
+        execution_claim_health["integrity_reason"] = degraded_reason
     if execution_claim_observation_failures:
-        execution_claim_health["integrity_status"] = "DEGRADED"
         execution_claim_health["observation_persistence_failures"] = len(
             execution_claim_observation_failures
         )
@@ -1609,10 +1714,27 @@ def reconcile_kis(
     # authoritative view so post-tick policy/health checks do not fall back to
     # the stale balance snapshot captured near the beginning of the tick.
     reconcile_result["_final_holdings_rows"] = list(holdings_rows)
-    execution_claim_health = _execution_claim_health(orders_repo)
+    execution_claim_health = _execution_claim_health(orders_repo, market="KR")
     observation_failure_count = int(reconcile_result.get("execution_claim_observation_failures") or 0)
+    integrity_reason = _execution_claim_integrity_reason(
+        execution_claim_health,
+        observation_failures=observation_failure_count,
+    )
+    if reconcile_result.get("unresolved_broker_activity"):
+        integrity_reason = integrity_reason or "unresolved_broker_activity"
+    if reconcile_result.get("guard_reason"):
+        integrity_reason = integrity_reason or str(reconcile_result["guard_reason"])
+    if integrity_reason:
+        reconcile_result["ok"] = False
+        reconcile_result["degraded"] = (
+            reconcile_result.get("degraded") or integrity_reason
+        )
+    execution_claim_health["integrity_status"] = (
+        "DEGRADED" if integrity_reason or not reconcile_result.get("ok", True) else "OK"
+    )
+    if integrity_reason:
+        execution_claim_health["integrity_reason"] = integrity_reason
     if observation_failure_count:
-        execution_claim_health["integrity_status"] = "DEGRADED"
         execution_claim_health["observation_persistence_failures"] = observation_failure_count
     reconcile_result["execution_claim_health"] = execution_claim_health
     return reconcile_result

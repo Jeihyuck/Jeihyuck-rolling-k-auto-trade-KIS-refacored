@@ -6,8 +6,11 @@ from sqlalchemy import text
 
 from trader.execution_claims import DurableExecutionClaimRepo
 from trader.execution_state import SemanticActionIdentity
+from trader.db.repos import OrdersRepo
 from trader.kr.infinite.models import (
+    Action,
     BrokerOrderState,
+    Decision,
     OrderIntent,
     State,
     Status,
@@ -15,6 +18,7 @@ from trader.kr.infinite.models import (
 from trader.kr.infinite.repository import InfiniteRepository
 from trader.kr.infinite.executor import KISExecutor
 from trader.db.schema import schema_for_engine
+from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
 
 
 DAY = date(2026, 10, 2)
@@ -179,3 +183,148 @@ def test_broker_row_without_fill_quantity_stays_fenced_through_executor(monkeypa
         identity, attempt_id="attempt-2", requested_qty=5,
         fresh_validation=True, client_order_key="order-2",
     ).acquired
+
+
+def test_infinite_submit_claim_isolated_from_pb1_actions_in_both_directions():
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = create_schema_with_active_test_epoch(engine)
+    schema.metadata.create_all(
+        engine, tables=[schema.execution_claims, schema.execution_attempts],
+    )
+    symbol = "122630"
+    cycle_id = "shared-test-cycle"
+    lifecycle_id = f"{symbol}:{cycle_id}"
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE kr_infinite_order_intents (
+                trading_epoch_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                metadata TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (trading_epoch_id, idempotency_key)
+            )
+        """))
+        for key in ("infinite-tp1", "infinite-tp2"):
+            conn.execute(text("""
+                INSERT INTO kr_infinite_order_intents
+                    (trading_epoch_id, idempotency_key, metadata)
+                SELECT trading_epoch_id, :key, '{}'
+                FROM trading_epochs
+                WHERE env='practice' AND status='ACTIVE'
+            """), {"key": key})
+
+    infinite_repo = InfiniteRepository(engine)
+    pb1_orders = OrdersRepo(engine)
+    pb1_identity, pb1_claim = pb1_orders.claim_execution_action(
+        env="practice",
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=lifecycle_id,
+        action="SELL:TP1",
+        trade_date=DAY,
+        attempt_id="pb1-tp1",
+        requested_qty=5,
+        client_order_key="pb1-tp1",
+        fresh_validation=True,
+    )
+    state = State(cycle_id=cycle_id, status=Status.ACTIVE)
+    tp1_decision = Decision(
+        Action.SELL_PARTIAL,
+        "TAKE_PROFIT",
+        qty=5,
+        idempotency_key="infinite-tp1",
+        metadata={"desired_profit_stage": "TP1"},
+    )
+    infinite_identity, infinite_claim = infinite_repo.claim_submit(
+        state=state,
+        decision=tp1_decision,
+        trade_date=DAY,
+        symbol=symbol,
+        env="practice",
+    )
+
+    assert pb1_claim.acquired and infinite_claim.acquired
+    assert pb1_identity.strategy_owner == "PB1"
+    assert infinite_identity.strategy_owner == "KR_INFINITE"
+    assert pb1_identity.lifecycle_id == infinite_identity.lifecycle_id == lifecycle_id
+    assert pb1_identity.action == infinite_identity.action == "SELL:TP1"
+    assert pb1_identity.action_key != infinite_identity.action_key
+
+    claims = DurableExecutionClaimRepo(
+        engine, schema.execution_claims, schema.execution_attempts,
+    )
+    claims.record_observation(
+        pb1_identity,
+        attempt_id="pb1-tp1",
+        state="UNRESOLVED",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+    assert claims.get(infinite_identity).action_state == "IN_FLIGHT"
+
+    infinite_repo.record_execution_claim_observation(
+        infinite_identity,
+        attempt_id=str(infinite_claim.attempt_id),
+        state="FILLED",
+        cumulative_filled_qty=5,
+        authoritative=True,
+    )
+    tp2_decision = Decision(
+        Action.SELL_PARTIAL,
+        "TAKE_PROFIT",
+        qty=3,
+        idempotency_key="infinite-tp2",
+        metadata={"desired_profit_stage": "TP2"},
+    )
+    infinite_tp2_identity, infinite_tp2_claim = infinite_repo.claim_submit(
+        state=state,
+        decision=tp2_decision,
+        trade_date=DAY,
+        symbol=symbol,
+        env="practice",
+    )
+    assert infinite_tp2_claim.acquired
+    assert claims.get(pb1_identity).action_state == "UNCERTAIN"
+
+    infinite_repo.record_execution_claim_observation(
+        infinite_tp2_identity,
+        attempt_id=str(infinite_tp2_claim.attempt_id),
+        state="UNRESOLVED",
+        cumulative_filled_qty=None,
+        authoritative=False,
+    )
+    claims.record_observation(
+        pb1_identity,
+        attempt_id="pb1-tp1",
+        state="REJECTED_EXPLICIT",
+        cumulative_filled_qty=0,
+        authoritative=True,
+    )
+    pb1_hard_stop_identity, pb1_hard_stop_claim = pb1_orders.claim_execution_action(
+        env="practice",
+        market="KR",
+        strategy_owner="PB1",
+        lifecycle_id=lifecycle_id,
+        action="SELL:HARD_STOP:FULL_EXIT",
+        trade_date=DAY,
+        attempt_id="pb1-hard-stop",
+        requested_qty=18,
+        client_order_key="pb1-hard-stop",
+        fresh_validation=True,
+    )
+
+    assert pb1_hard_stop_claim.acquired
+    assert pb1_hard_stop_identity.strategy_owner == "PB1"
+    assert claims.get(infinite_tp2_identity).action_state == "UNCERTAIN"
+    with engine.connect() as conn:
+        owner_rows = conn.execute(
+            sa.select(schema.execution_claims.c.strategy_owner)
+            .where(schema.execution_claims.c.action_key.in_([
+                pb1_identity.action_key,
+                infinite_identity.action_key,
+                infinite_tp2_identity.action_key,
+                pb1_hard_stop_identity.action_key,
+            ]))
+        ).scalars().all()
+    assert owner_rows.count("PB1") == 2
+    assert owner_rows.count("KR_INFINITE") == 2

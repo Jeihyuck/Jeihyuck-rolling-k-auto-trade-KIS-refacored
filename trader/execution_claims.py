@@ -114,6 +114,7 @@ class DurableExecutionClaimRepo:
         fresh_validation: bool = False,
         client_order_key: str | None = None,
         retry_action_prefix: str | None = None,
+        allow_partial_retry: bool = False,
     ) -> ExecutionClaim:
         qty = int(requested_qty)
         if qty <= 0 or not str(attempt_id or "").strip():
@@ -238,7 +239,12 @@ class DurableExecutionClaimRepo:
                 self._record_conflict(conn, key)
                 return ExecutionClaim(False, key, reason="fresh_validation_required")
             remaining = row["remaining_target_qty"]
-            if remaining is None or qty != int(remaining):
+            remaining_qty = None if remaining is None else int(remaining)
+            if (
+                remaining_qty is None
+                or qty > remaining_qty
+                or (not allow_partial_retry and qty != remaining_qty)
+            ):
                 self._record_conflict(conn, key)
                 return ExecutionClaim(False, key, reason="remaining_target_qty_mismatch")
             attempt_no = int(conn.execute(
@@ -251,7 +257,11 @@ class DurableExecutionClaimRepo:
                     action.c.action_key == key,
                     action.c.active_attempt_id.is_(None),
                     action.c.action_state.in_(("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")),
-                    action.c.remaining_target_qty == qty,
+                    (
+                        action.c.remaining_target_qty >= qty
+                        if allow_partial_retry
+                        else action.c.remaining_target_qty == qty
+                    ),
                 )
                 .values(
                     active_attempt_id=attempt_id,
@@ -376,7 +386,11 @@ class DurableExecutionClaimRepo:
                     action_state = "UNCERTAIN"
             elif state == "CANCELLED":
                 if authoritative and observed_qty is not None:
-                    action_state = "RETRYABLE" if total == 0 else "PARTIALLY_SATISFIED"
+                    action_state = (
+                        "SATISFIED" if remaining == 0
+                        else "RETRYABLE" if total == 0
+                        else "PARTIALLY_SATISFIED"
+                    )
                     active_attempt_id = None
                     attempt_state = "CANCELLED_ZERO_FILL" if observed_qty == 0 else "CANCELLED_PARTIAL_FILL"
                 else:
@@ -505,6 +519,20 @@ class DurableExecutionClaimRepo:
             ).mappings().one_or_none()
         if row is None:
             raise RuntimeError("semantic action not found")
+        return self._snapshot(row)
+
+    def get_if_exists(
+        self, identity: SemanticActionIdentity | str,
+    ) -> ExecutionClaimSnapshot | None:
+        key = self._action_key(identity)
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                sa.select(self.actions).where(self.actions.c.action_key == key)
+            ).mappings().one_or_none()
+        return self._snapshot(row) if row is not None else None
+
+    @staticmethod
+    def _snapshot(row: Any) -> ExecutionClaimSnapshot:
         return ExecutionClaimSnapshot(
             action_key=str(row["action_key"]),
             action_state=str(row["action_state"]),

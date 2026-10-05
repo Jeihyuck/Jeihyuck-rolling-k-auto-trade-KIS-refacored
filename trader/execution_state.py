@@ -108,10 +108,12 @@ def balance_freshness_for_source(source: str | None) -> BalanceFreshness:
 
 
 SELL_GUARD_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+                               "BROKER_RESULT_UNKNOWN", "RECONCILE_ERROR", "RECONCILE_PENDING",
                                "PARTIAL_FILLED", "FILLED",
                                "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
                                "ACKED_IDEMPOTENT_RECOVERED", "NO_SELLABLE_QTY"})
 PENDING_SELL_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+                                 "BROKER_RESULT_UNKNOWN", "RECONCILE_ERROR", "RECONCILE_PENDING",
                                  "PARTIAL_FILLED", "ACKED_IDEMPOTENT_RECOVERED"})
 
 
