@@ -350,6 +350,20 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     # Query authoritative snapshots once per timeout, not once per journal row.
     balance = None
     today_orders = None
+    fills_by_trade_date: dict[str, list[dict] | None] = {}
+
+    def fills_for_trade_date(source_trade_date: str) -> list[dict] | None:
+        if source_trade_date not in fills_by_trade_date:
+            try:
+                from trader.us.execution.fills import get_fills_today
+                response = get_fills_today(provider=provider, trade_date=source_trade_date)
+                fills_by_trade_date[source_trade_date] = (
+                    response.get("fills") if response.get("status") == "OK" else None
+                )
+            except Exception:
+                fills_by_trade_date[source_trade_date] = None
+        return fills_by_trade_date[source_trade_date]
+
     all_fills = None
     if provider is not None:
         try: balance = provider.get_balance(force_refresh=True)
@@ -359,11 +373,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             method = getattr(provider, "get_today_orders", None)
             today_orders = method(trade_date=trade_date) if callable(method) else None
         except Exception: today_orders = None
-        try:
-            from trader.us.execution.fills import get_fills_today
-            response = get_fills_today(provider=provider, trade_date=trade_date)
-            all_fills = response.get("fills") if response.get("status") == "OK" else None
-        except Exception: all_fills = None
+        all_fills = fills_for_trade_date(trade_date)
     positions_by_symbol = {}
     if isinstance(balance, dict):
         for pos in balance.get("positions") or []:
@@ -374,12 +384,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         if "BROKER_SUBMIT_STARTED" not in types or "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types: continue
         event_trade_date = str(latest.get("trade_date") or trade_date)
         event_orders = today_orders
+        event_fills = all_fills
         if provider is not None and event_trade_date != trade_date:
             try:
                 method = getattr(provider, "get_today_orders", None)
                 event_orders = method(trade_date=event_trade_date) if callable(method) else None
             except Exception:
                 event_orders = None
+            event_fills = fills_for_trade_date(event_trade_date)
         append_order_event("JOURNAL_REPLAY_STARTED", latest)
         ack = next((e for e in reversed(order_events) if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}), None)
         symbol, side, requested = str(latest.get("symbol") or "").upper(), str(latest.get("side") or "").upper(), int(latest.get("qty") or 0)
@@ -419,8 +431,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         unresolved_symbol_sides.append([symbol, side])
                         append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
                         continue
-                if not broker_fill and isinstance(all_fills, list):
-                    matched = [f for f in all_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
+                if not broker_fill and isinstance(event_fills, list):
+                    matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
                     if matched:
                         def _cum(row):
                             return int(row.get("cumulative_filled_qty") or row.get("filled_qty") or row.get("qty") or 0)

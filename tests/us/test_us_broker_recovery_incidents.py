@@ -336,6 +336,12 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
         engine, us_execution_claims, us_execution_attempts,
     )
     monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice",
+        "account_id": "active-replay-account",
+        "market": "US",
+        "trading_epoch_id": "active-replay-epoch",
+    })
 
     active_identity = None
     for key, attempt_id, action, terminal in (

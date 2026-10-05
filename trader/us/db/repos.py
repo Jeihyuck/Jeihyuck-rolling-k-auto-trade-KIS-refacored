@@ -401,7 +401,9 @@ def record_execution_action_observation_for_client_order_key(
     authoritative: bool,
 ):
     repo = _execution_claim_repo()
-    attempt = repo.find_attempt_for_client_order_key(client_order_key)
+    attempt = repo.find_attempt_for_client_order_key(
+        client_order_key, **_us_execution_claim_scope(),
+    )
     if attempt is None:
         raise LookupError(f"execution claim attempt not found for client order key {client_order_key}")
     action_key, attempt_id = attempt
@@ -417,7 +419,166 @@ def release_execution_action_before_submit(identity: Any, *, attempt_id: str) ->
 
 
 def load_execution_claim_health() -> dict[str, int]:
-    return _execution_claim_repo().health()
+    return _execution_claim_repo().health(**_us_execution_claim_scope())
+
+
+def _us_execution_claim_scope() -> dict[str, str]:
+    from trader.account_state import get_account_key, resolve_env_name
+
+    env = resolve_env_name()
+    account_id = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
+    return {
+        "env": env,
+        "account_id": account_id,
+        "market": "US",
+        "trading_epoch_id": _us_state_epoch_id(),
+    }
+
+
+def load_active_execution_claim_attempts() -> list[dict]:
+    return _execution_claim_repo().active_attempts(**_us_execution_claim_scope())
+
+
+def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
+    """Expose unresolved and unattributed broker truth in close/report health."""
+    from trader.us.execution.order_journal import load_order_events
+
+    fills = load_today_fills(trade_date)
+    orders = load_us_daily_orders_for_report(trade_date) or []
+    events = load_order_events(trade_date)
+    journal_available = events is not None
+    if events is None:
+        events = []
+    unattributed = [
+        fill for fill in fills
+        if _parse_json_meta(fill.get("meta")).get("attribution_status") == "UNATTRIBUTED"
+    ]
+    successful_rebounds = sum(
+        str(event.get("event_type") or "") == "BROKER_ACK_RECOVERED"
+        and _parse_json_meta(event.get("meta")).get("broker_recovery_status") == "REBOUND"
+        for event in events
+    )
+    failed_attempts: dict[tuple[str, str], bool] = {}
+    failure_events = {
+        "JOURNAL_REPLAY_UNRESOLVED",
+        "JOURNAL_REPLAY_FAILED",
+        "BROKER_FILL_ATTRIBUTION_FAILED",
+    }
+    resolution_events = {
+        "JOURNAL_REPLAY_FILL_CONFIRMED",
+        "ORDER_PARTIALLY_FILLED",
+        "ORDER_FILLED",
+        "ORDER_REJECTED",
+        "ORDER_CANCELLED",
+    }
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        meta = _parse_json_meta(event.get("meta"))
+        is_rebound = (
+            event_type == "BROKER_ACK_RECOVERED"
+            and meta.get("broker_recovery_status") == "REBOUND"
+        )
+        if event_type not in failure_events and event_type not in resolution_events and not is_rebound:
+            continue
+        attempt_key = (
+            str(event.get("client_order_key") or ""),
+            str(event.get("submit_attempt_id") or ""),
+        )
+        if not any(attempt_key):
+            attempt_key = ("", str(event.get("event_id") or id(event)))
+        failed_attempts[attempt_key] = event_type in failure_events
+    failed_rebounds = sum(failed_attempts.values()) + len(unattributed)
+    cumulative_fill_qty_by_key: dict[str, int] = {}
+    individual_execution_qty_by_key: dict[str, int] = {}
+    individual_execution_ids_by_key: dict[str, set[str]] = {}
+    for fill in fills:
+        meta = _parse_json_meta(fill.get("meta"))
+        if meta.get("attribution_status") == "UNATTRIBUTED":
+            continue
+        key = str(fill.get("client_order_key") or fill.get("order_no") or "")
+        if not key:
+            continue
+        evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if _is_kis_execution_evidence(evidence):
+            execution_id = str(
+                fill.get("fill_idempotency_key")
+                or meta.get("fill_idempotency_key")
+                or _fill_execution_identity(fill, trade_date)
+            )
+            seen = individual_execution_ids_by_key.setdefault(key, set())
+            if execution_id not in seen:
+                seen.add(execution_id)
+                individual_execution_qty_by_key[key] = (
+                    individual_execution_qty_by_key.get(key, 0) + int(fill.get("qty") or 0)
+                )
+            continue
+        cumulative = int(
+            meta.get("cumulative_filled_qty")
+            or fill.get("cumulative_filled_qty")
+            or fill.get("qty")
+            or 0
+        )
+        cumulative_fill_qty_by_key[key] = max(
+            cumulative_fill_qty_by_key.get(key, 0), cumulative,
+        )
+    fill_qty_by_key = {
+        key: individual_execution_qty_by_key.get(key, cumulative_fill_qty_by_key.get(key, 0))
+        for key in cumulative_fill_qty_by_key.keys() | individual_execution_qty_by_key.keys()
+    }
+    cumulative_mismatches = sum(
+        int(order.get("qty_filled") or 0) > 0
+        and fill_qty_by_key.get(str(order.get("client_order_key") or ""), 0) != int(order.get("qty_filled") or 0)
+        for order in orders
+    )
+    order_meta_by_key = {
+        str(order.get("client_order_key") or ""): _parse_json_meta(order.get("meta"))
+        for order in orders
+    }
+    missing_sell_cost_basis_keys = set()
+    for fill in fills:
+        fill_meta = _parse_json_meta(fill.get("meta"))
+        evidence = str(fill_meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if (
+            str(fill.get("side") or "").upper() != "SELL"
+            or not _is_actual_evidence(evidence)
+            or int(fill.get("qty") or fill_meta.get("cumulative_filled_qty") or 0) <= 0
+        ):
+            continue
+        client_key = str(fill.get("client_order_key") or "")
+        lineage = {**order_meta_by_key.get(client_key, {}), **fill_meta}
+        has_cost_basis = False
+        for field in ("broker_avg_price", "avg_cost", "cost_basis_price_usd", "entry_price"):
+            try:
+                value = float(lineage.get(field))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                has_cost_basis = True
+                break
+        if not has_cost_basis:
+            missing_sell_cost_basis_keys.add(client_key or str(fill.get("order_no") or "UNKNOWN"))
+    claim_health_available = True
+    try:
+        claim_health = load_execution_claim_health()
+        unresolved_actions = int(claim_health.get("unresolved_execution_actions", 0))
+        duplicate_detections = int(claim_health.get("execution_claim_conflicts", 0))
+    except Exception:
+        unresolved_actions = 0
+        duplicate_detections = 0
+        claim_health_available = False
+    return {
+        "available": journal_available and claim_health_available,
+        "journal_available": journal_available,
+        "execution_claim_health_available": claim_health_available,
+        "recovery_health_error_count": int(not journal_available) + int(not claim_health_available),
+        "unresolved_execution_actions": unresolved_actions,
+        "unattributed_broker_fills": len(unattributed),
+        "broker_fill_rebound_success_count": successful_rebounds,
+        "broker_fill_rebound_failure_count": failed_rebounds,
+        "duplicate_semantic_submit_detection_count": duplicate_detections,
+        "broker_local_cumulative_fill_mismatch_count": cumulative_mismatches,
+        "filled_sell_missing_cost_basis_count": len(missing_sell_cost_basis_keys),
+    }
 
 
 def load_active_execution_claim_attempts() -> list[dict]:
