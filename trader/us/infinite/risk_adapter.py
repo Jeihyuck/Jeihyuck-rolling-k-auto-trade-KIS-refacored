@@ -42,20 +42,34 @@ def apply_tqqq_runtime_entry_override(overlay: dict | None) -> tuple[bool, str]:
     if bool(overlay.get("entry_can_proceed", True)):
         return False, "entry_already_allowed"
 
-    block_reason = str(
-        overlay.get("trade_block_reason")
-        or overlay.get("degraded_reason")
-        or overlay.get("entry_block_reason")
-        or ""
-    ).strip().lower()
+    runtime_gate = overlay.get("tqqq_runtime_gate")
+    if not isinstance(runtime_gate, dict):
+        return False, "runtime_entry_block_provenance_missing"
+    if (
+        runtime_gate.get("entry_block_source") != "authoritative_session_prep_guard"
+        or not str(runtime_gate.get("prep_run_id") or "").strip()
+        or runtime_gate.get("prep_recovery_verified") is not True
+    ):
+        return False, "authoritative_prep_recovery_not_proven"
+
+    block_reason = str(runtime_gate.get("entry_block_reason") or "").strip().lower()
     if block_reason not in TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS:
         return False, block_reason or "unknown_runtime_entry_block"
+    if (
+        not bool(overlay.get("tqqq_policy_override_allowed", False))
+        or runtime_gate.get("override_authorized") is not True
+    ):
+        return False, "tqqq_pb1_policy_override_not_authorized"
 
-    context_quality = str(overlay.get("tqqq_context_quality") or "").strip().lower()
-    quote_stale = bool(overlay.get("tqqq_quote_stale", False))
-    exit_can_proceed = bool(overlay.get("exit_can_proceed", True))
-    hard_failure = bool(overlay.get("hard_system_failure", False))
-    reconcile_block = bool(overlay.get("reconcile_entry_block", False))
+    context_quality = str(runtime_gate.get("context_quality") or "").strip().lower()
+    quote_stale = bool(runtime_gate.get("quote_stale", True) or overlay.get("tqqq_quote_stale", True))
+    exit_can_proceed = bool(runtime_gate.get("exit_can_proceed", False)) and bool(
+        overlay.get("exit_can_proceed", False)
+    )
+    hard_failure = bool(runtime_gate.get("hard_system_failure", True) or overlay.get("hard_system_failure", True))
+    reconcile_block = bool(
+        runtime_gate.get("reconcile_entry_block", True) or overlay.get("reconcile_entry_block", True)
+    )
     if context_quality != "ok" or quote_stale or not exit_can_proceed or hard_failure or reconcile_block:
         return False, "tqqq_operational_safety_not_proven"
 

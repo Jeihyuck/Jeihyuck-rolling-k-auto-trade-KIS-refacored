@@ -1,6 +1,7 @@
 import time
 
 import pytest
+from unittest.mock import patch
 
 from trader.us.execution.kis_us_client import KisUSClient, KisUSTemporaryError
 from trader.us.execution.order_economics import order_intent_economics_valid
@@ -11,6 +12,37 @@ from trader.us.runner.trade_tick_runner import (
     calculate_latency_accounting,
     is_recoverable_order_route_budget_error,
 )
+from trader.us.runner.status_contract import classify_runtime_integrity
+
+
+@pytest.mark.parametrize(
+    ("tick_result", "expected"),
+    [
+        (
+            {"entry_can_proceed": False, "entry_block_reason": "sector_cap_violation_block"},
+            "POLICY_ENTRY_BLOCKED",
+        ),
+        (
+            {"entry_can_proceed": False, "entry_block_reason": "sector_cap_violation_block",
+             "reconcile_entry_block": True},
+            "RECONCILE_REQUIRED",
+        ),
+        (
+            {"entry_contract_integrity_block_count": 1},
+            "INTEGRITY_DEGRADED",
+        ),
+        (
+            {"entry_can_proceed": True, "exit_route_liveness_failure": True},
+            "LIVENESS_DEGRADED",
+        ),
+        (
+            {"entry_can_proceed": True, "exit_route_reconcile_required": True},
+            "RECONCILE_REQUIRED",
+        ),
+    ],
+)
+def test_runtime_integrity_classifies_policy_reconcile_integrity_and_liveness(tick_result, expected):
+    assert classify_runtime_integrity(tick_result) == expected
 
 
 @pytest.mark.parametrize("symbol,decision_price,qty", [
@@ -104,6 +136,112 @@ def test_route_created_client_is_bound_to_same_context(monkeypatch):
     assert result["status"] == "ACK"
 
 
+def test_deadline_expiring_during_submit_journal_cannot_reach_broker(monkeypatch):
+    from trader.us.execution import order_router, order_journal
+
+    class Client:
+        def __init__(self):
+            self.submits = 0
+
+        def bind_tick_context(self, context):
+            return self
+
+        def place_us_buy_order(self, *_args):
+            self.submits += 1
+            return {"output": {"ODNO": "LATE-1"}}
+
+    context = TickExecutionContext(
+        "2026-09-01", "am", "run", 1, "tick", deadline=time.monotonic() + 10,
+    )
+    client = Client()
+    events = []
+
+    def append_event(event_type, *_args, **_kwargs):
+        events.append(event_type)
+        if event_type == "BROKER_SUBMIT_STARTED":
+            context.deadline = time.monotonic() - 1
+
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setattr(order_router, "canonical_order_risk_check", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr("trader.us.execution.order_router.resolve_dry_run_for_us_order", lambda: False)
+    monkeypatch.setattr("trader.us.db.repos.save_order_intent", lambda *a, **k: True)
+    monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda **k: set())
+    monkeypatch.setattr(order_journal, "append_order_event", append_event)
+
+    result = order_router.route_order(
+        {
+            "symbol": "MSFT", "exchange": "NASDAQ", "side": "BUY", "qty": 1,
+            "limit_price": 100, "notional_usd": 100, "client_order_key": "late-deadline",
+            "trade_date": "2026-09-01",
+        },
+        kis_client=client,
+        context=context,
+    )
+
+    assert result["status"] == "ORDER_DISABLED_EXECUTION_CLAIM_RELEASE_FAILED"
+    assert result["broker_submit"] is False
+    assert result["retry_order"] is False
+    assert result["requires_reconcile"] is True
+    assert client.submits == 0
+    assert events == ["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"]
+
+
+def test_aborted_pre_boundary_submit_is_not_counted_as_broker_activity(monkeypatch):
+    from trader.us.execution import order_journal
+
+    monkeypatch.setattr(
+        order_journal,
+        "load_order_events",
+        lambda *_args, **_kwargs: [
+            {"event_type": "BROKER_SUBMIT_STARTED", "submit_attempt_id": "a1",
+             "client_order_key": "k1", "side": "BUY"},
+            {"event_type": "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
+             "submit_attempt_id": "a1", "client_order_key": "k1", "side": "BUY"},
+        ],
+    )
+
+    counts = order_journal.aggregate_order_events("2026-09-01")
+    assert counts["orders_sent_total"] == 0
+    assert counts["unresolved_submit_attempt_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "events, expected_unresolved",
+    [
+        (
+            [{"event_type": "BROKER_SUBMIT_STARTED", "submit_attempt_id": "a1"}],
+            1,
+        ),
+        (
+            [
+                {"event_type": "BROKER_SUBMIT_STARTED", "submit_attempt_id": "a1"},
+                {"event_type": "BROKER_ACK_RECEIVED", "submit_attempt_id": "a1"},
+            ],
+            1,
+        ),
+        (
+            [
+                {"event_type": "BROKER_SUBMIT_STARTED", "submit_attempt_id": "a1"},
+                {"event_type": "BROKER_ACK_RECEIVED", "submit_attempt_id": "a1"},
+                {"event_type": "DB_ACK_PERSISTED", "submit_attempt_id": "a1"},
+            ],
+            0,
+        ),
+    ],
+)
+def test_order_journal_aggregation_surfaces_unresolved_submit_attempts(
+    monkeypatch, events, expected_unresolved
+):
+    from trader.us.execution import order_journal
+
+    monkeypatch.setattr(order_journal, "load_order_events", lambda *_a, **_k: events)
+
+    assert order_journal.aggregate_order_events("2026-09-01")[
+        "unresolved_submit_attempt_count"
+    ] == expected_unresolved
+
+
 def test_token_rate_limit_wait_obeys_short_deadline(monkeypatch):
     import trader.us.execution.kis_us_client as module
     client = KisUSClient(offline=False).bind_tick_context(TickExecutionContext(
@@ -116,6 +254,14 @@ def test_token_rate_limit_wait_obeys_short_deadline(monkeypatch):
     with pytest.raises(KisUSTemporaryError, match="token refresh wait"):
         client.get_access_token()
     assert time.monotonic() - started < 0.2
+
+
+def test_expired_tick_context_loses_submit_authority():
+    context = TickExecutionContext(
+        "2026-09-01", "am", "run", 1, "tick", deadline=time.monotonic() - 0.01,
+    )
+    assert context.remaining_sec() == 0
+    assert context.broker_submit_allowed() is False
 
 
 def test_child_budget_reserves_parent_cleanup_and_honors_configured_deadline():

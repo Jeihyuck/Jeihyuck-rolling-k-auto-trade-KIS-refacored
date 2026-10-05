@@ -41,6 +41,44 @@ def is_no_balance_sell_reject(message: str) -> bool:
     return any(pattern.lower() in text for pattern in NO_BALANCE_PATTERNS)
 
 
+_POLICY_ENTRY_BLOCK_REASONS = {
+    "sector_cap_violation_block", "cluster_cap_contract_failed", "risk_off_entry_block",
+    "allow_new_buy_false", "final30_empty", "final30_below_absolute_min",
+    "final30_underfilled_regime_block", "score_contract_failed", "validation_failed",
+    "volume_missing_provider_entry_block",
+}
+
+
+def classify_runtime_integrity(tick_result: dict | None) -> str:
+    """Separate policy entry blocks from execution, reconciliation, and liveness failures."""
+    if not isinstance(tick_result, dict):
+        return "INTEGRITY_DEGRADED"
+    if (
+        tick_result.get("system_invariant_failure")
+        or int(tick_result.get("entry_contract_integrity_block_count") or 0) > 0
+    ):
+        return "INTEGRITY_DEGRADED"
+    if (
+        tick_result.get("reconcile_entry_block")
+        or tick_result.get("reconcile_only_until_clean")
+        or tick_result.get("manual_reconcile_required")
+        or int(tick_result.get("unresolved_ack_count") or 0) > 0
+        or int(tick_result.get("pending_order_count") or 0) > 0
+        or tick_result.get("exit_route_reconcile_required")
+    ):
+        return "RECONCILE_REQUIRED"
+    block_reason = str(
+        tick_result.get("entry_block_reason")
+        or tick_result.get("trade_block_reason")
+        or ""
+    ).strip().lower()
+    if not bool(tick_result.get("entry_can_proceed", True)) and block_reason in _POLICY_ENTRY_BLOCK_REASONS:
+        return "POLICY_ENTRY_BLOCKED"
+    if tick_result.get("exit_route_liveness_failure") or tick_result.get("entry_degraded"):
+        return "LIVENESS_DEGRADED"
+    return "OK"
+
+
 def classify_tick_status(tick_result: dict | str | None) -> str:
     """Return success/warning/fatal for a tick result payload or raw status."""
     if isinstance(tick_result, dict):

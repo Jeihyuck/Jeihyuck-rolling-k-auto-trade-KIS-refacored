@@ -1,0 +1,74 @@
+{
+  "incident_date": "2026-10-01",
+  "evidence_scope": "Executable replay test orchestrates the NVDA, JNJ, TQQQ, and close production-component paths using isolated fake stores, combines both recovered fills through the production PnL aggregator, and separately validates close-runner integrity; it is not a shared account snapshot",
+  "code_sha": "c8dbb308691e9c72f2f26076a890d68819160b82",
+  "settings": {
+    "DRY_RUN": "1",
+    "ALLOW_REAL_ORDER": "0",
+    "DISABLE_REAL_TRADING": "1",
+    "US_TQQQ_INFINITE_ENABLED": "1",
+    "US_TQQQ_INFINITE_REAL_ORDER": "1",
+    "US_KIS_ORDER_ALLOWED": "1",
+    "US_DISABLE_TICK_PROCESS_ISOLATION": "1"
+  },
+  "session": {
+    "run_id": "synthetic-oct1-runtime-replay"
+  },
+  "prep": {
+    "run_id": "synthetic-oct1-prep-run",
+    "status": "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP",
+    "entry_can_proceed": false,
+    "trade_block_reason": "sector_cap_violation_block"
+  },
+  "initial_balance": {
+    "account_equity_usd": 10000.0,
+    "source": "synthetic_test_balance"
+  },
+  "initial_positions": [
+    {
+      "symbol": "TQQQ",
+      "qty": 6,
+      "orderable_qty": 6,
+      "avg_price": 79.664,
+      "exchange": "NASDAQ",
+      "strategy_owner": "TQQQ_INFINITE",
+      "balance_source": "kis_balance_authoritative"
+    }
+  ],
+  "broker_responses": {
+    "balance": "synthetic complete authoritative KIS balance fixture",
+    "preorder_position": "synthetic complete authoritative KIS position fixture",
+    "fills": "synthetic empty fill response",
+    "ack_reconcile": "synthetic clean reconcile response",
+    "order_submit": "DRY_RUN route result; no broker request",
+    "nvda_submit": "separate test injects broker-accepted response loss and later KIS order/fill rebound",
+    "jnj_submit": "separate test injects unresolved local ACK and later cumulative broker fill rebound",
+    "close": "close-runner integrity is tested with a separate fake store; the orchestrator aggregates returned NVDA/JNJ fill rows through the production PnL summary"
+  },
+  "clock": {
+    "timestamp": "2026-10-01T10:06:00-04:00",
+    "timezone": "America/New_York"
+  },
+  "prices": {
+    "TQQQ": 77.49,
+    "QQQ_completed_close": 100.0,
+    "QQQ_ma50": 99.0,
+    "QQQ_ma200": 98.0
+  },
+  "synthesized_missing_inputs": [
+    "original incident code SHA",
+    "original PREP artifact/run identifier",
+    "KIS balance and order response payloads",
+    "complete QQQ context and exact incident quote timestamp",
+    "original NVDA/JNJ broker order numbers, fill prices/fees, and exact balance deltas",
+    "single shared fake-account database and one run_trade_close snapshot combining the NVDA/JNJ broker histories"
+  ],
+  "production_path_test_ids": [
+    "test_oct1_session_tick_overlay_routes_only_verified_tqqq_policy_override",
+    "test_oct1_executable_replay_orchestrates_nvda_jnj_tqqq_and_close",
+    "test_nvda_ambiguous_ack_recovers_original_claim_across_restart_and_date",
+    "test_jnj_broker_fill_rebounds_to_unique_unresolved_local_intent",
+    "test_cancel_then_late_fill_and_repeated_snapshot_are_monotonic",
+    "test_close_fails_closed_for_broker_recovery_integrity_health"
+  ]
+}

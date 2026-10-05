@@ -403,6 +403,19 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
         **candidate_metrics,
     }
 
+
+def _worst_tick_health_status(results: list[dict], field: str, severity: dict[str, int]) -> str:
+    statuses = [
+        str((result or {}).get(field) or "").strip().upper()
+        for result in results
+        if isinstance(result, dict)
+    ]
+    ranked = [status for status in statuses if status in severity]
+    if ranked:
+        return max(ranked, key=severity.__getitem__)
+    return next((status for status in reversed(statuses) if status), "UNKNOWN")
+
+
 def _write_us_schedule_health(payload: dict, session: str) -> None:
     """reports/us_schedule_health/{trade_date}.json 에 세션 결과를 기록한다.
 
@@ -450,6 +463,9 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "entry_degraded": payload.get("entry_degraded", 0),
             "entry_degraded_reason": payload.get("entry_degraded_reason", ""),
             "entry_eval_status": payload.get("entry_eval_status", ""),
+            "runtime_integrity_status": payload.get("runtime_integrity_status", "UNKNOWN"),
+            "sell_liveness_status": payload.get("sell_liveness_status", "UNKNOWN"),
+            "exit_route_liveness_failure": bool(payload.get("exit_route_liveness_failure", False)),
             "entry_watchlist_source": payload.get("entry_watchlist_source", ""),
             "watchlist_fallback_used": payload.get("watchlist_fallback_used", 0),
             "exit_routed_before_entry": payload.get("exit_routed_before_entry", 0),
@@ -496,6 +512,14 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         sessions = existing["sessions"]
         fatal = [name for name, row in sessions.items() if str((row or {}).get("effective_status") or "").upper() == "FAILED" or "fill_persistence_failed" in str((row or {}).get("reason") or "")]
         mismatch = [name for name, row in sessions.items() if "MISMATCH" in str((row or {}).get("final_status") or "").upper()]
+        liveness_failures = [
+            name for name, row in sessions.items()
+            if str((row or {}).get("runtime_integrity_status") or "").upper()
+            in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED", "INTEGRITY_DEGRADED"}
+            or str((row or {}).get("sell_liveness_status") or "").upper()
+            in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"}
+            or bool((row or {}).get("exit_route_liveness_failure"))
+        ]
         broker_fills = max(int((row or {}).get("broker_fills_fetched", 0) or 0) for row in sessions.values()) if sessions else 0
         persisted_fills = max(int((row or {}).get("fills_count", 0) or 0) for row in sessions.values()) if sessions else 0
         manual_reconcile_required = any(bool((row or {}).get("manual_reconcile_required")) or int((row or {}).get("pending_order_count", 0) or 0) > 0 or int((row or {}).get("unresolved_ack_count", 0) or 0) > 0 or str((row or {}).get("ack_reconcile_before_route_status") or "").upper() == "WARN" for row in sessions.values())
@@ -505,11 +529,14 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             health_status, health_ok, health_reason = "FAILED", False, "broker_fills_not_persisted"
         elif mismatch:
             health_status, health_ok, health_reason = "WARNING_RECONCILE_MISMATCH", False, "us_fill_or_reconcile_mismatch"
+        elif liveness_failures:
+            health_status, health_ok, health_reason = "FAILED_RUNTIME_INTEGRITY", False, "protective_sell_liveness_failure"
         else:
             health_status, health_ok, health_reason = "OK", True, ""
         existing.update({"ok": health_ok, "status": health_status, "reason": health_reason,
                          "us": {"am": sessions.get("am", {}), "afternoon": sessions.get("afternoon", {}), "close": sessions.get("close", {}),
                                 "fills_count": persisted_fills, "broker_fills_fetched": broker_fills,
+                                "runtime_liveness_failures": liveness_failures,
                                 "manual_reconcile_required": int(manual_reconcile_required),
                                 "pending_order_count": max(int((row or {}).get("pending_order_count", 0) or 0) for row in sessions.values()) if sessions else 0}})
         existing["updated_at_utc"] = now_utc
@@ -707,6 +734,32 @@ def _session_end_dt(session: str, now: datetime) -> datetime:
     NY_TZ = ZoneInfo("America/New_York")
     h, m = _SESSION_END_TIMES.get(session, (16, 0))
     return now.replace(hour=h, minute=m, second=0, microsecond=0).astimezone(NY_TZ)
+
+
+_TICK_LATENCY_STAGE_KEYS = (
+    "balance_snapshot_ms", "prep_status_ms", "watchlist_load_ms", "position_reconcile_ms",
+    "order_reconcile_ms", "fill_fetch_ms", "fill_persist_ms", "cash_fetch_ms",
+    "price_fetch_ms", "exit_engine_ms", "market_state_ms", "tqqq_infinite_ms",
+    "entry_engine_ms", "risk_gate_ms", "order_route_ms",
+)
+
+
+def _aggregate_tick_latency(tick_results: list[dict]) -> dict:
+    measured = [row for row in tick_results or [] if isinstance(row, dict) and "tick_total_ms" in row]
+    totals = {
+        key: round(sum(float(row.get(key) or 0.0) for row in measured), 3)
+        for key in _TICK_LATENCY_STAGE_KEYS
+    }
+    tick_totals = [float(row.get("tick_total_ms") or 0.0) for row in measured]
+    return {
+        "measured_tick_count": len(measured),
+        "total_tick_ms": round(sum(tick_totals), 3),
+        "max_tick_ms": round(max(tick_totals, default=0.0), 3),
+        "max_unaccounted_ms": round(
+            max((float(row.get("unaccounted_ms") or 0.0) for row in measured), default=0.0), 3
+        ),
+        "stage_ms": totals,
+    }
 
 
 def run_trade_session(
@@ -1143,7 +1196,10 @@ def run_trade_session(
 
         # ── Tick loop (try/finally로 감싸서 report를 항상 작성) ───────────────────
         from trader.us.runner.trade_tick_runner import load_watchlist_from_artifact, run_trade_tick
-        from trader.us.runner.tick_entry_permission import resolve_shared_tick_entry_evaluation_permission
+        from trader.us.runner.tick_entry_permission import (
+            resolve_shared_tick_entry_evaluation_permission,
+            resolve_tqqq_policy_entry_override_permission,
+        )
 
         prep_status_cache: dict | None = None
         locked_watchlist_cache: list[dict] | None = None
@@ -1298,6 +1354,12 @@ def run_trade_session(
                                 timeout_entry_block=timeout_entry_block,
                                 session_execution_mode=session_execution_mode,
                             ),
+                            tqqq_policy_override_allowed=resolve_tqqq_policy_entry_override_permission(
+                                prep_guard_result,
+                                timeout_entry_block=timeout_entry_block,
+                                session_execution_mode=session_execution_mode,
+                            ),
+                            entry_block_reason=str(prep_guard_result.get("trade_block_reason") or ""),
                             exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
                             session_run_id=session_run_id,
                             session_generation=session_generation,
@@ -1948,6 +2010,28 @@ def run_trade_session(
         if prep_status_value == "UNKNOWN":
             prep_status_value = prep_status_fallback
 
+        tick_latency = _aggregate_tick_latency(results)
+        runtime_integrity_status = _worst_tick_health_status(
+            results,
+            "runtime_integrity_status",
+            {
+                "OK": 0,
+                "POLICY_ENTRY_BLOCKED": 1,
+                "LIVENESS_DEGRADED": 2,
+                "RECONCILE_REQUIRED": 3,
+                "INTEGRITY_DEGRADED": 4,
+            },
+        )
+        sell_liveness_status = _worst_tick_health_status(
+            results,
+            "sell_liveness_status",
+            {"OK": 0, "LIVENESS_DEGRADED": 1, "RECONCILE_REQUIRED": 2},
+        )
+        exit_route_liveness_failure = any(
+            bool((tick or {}).get("exit_route_liveness_failure"))
+            for tick in results
+            if isinstance(tick, dict)
+        )
         _prov = _runtime_provenance(session=session, run_id=run_id, started_at_et=session_started_at_et, ended_at_et=now_et_iso(), wall_elapsed_sec=session_wall_elapsed_sec)
         session_trade_block_reason = (
             regime_block_report.get("trade_block_reason")
@@ -1960,6 +2044,10 @@ def run_trade_session(
             "session_generation": session_generation,
             "prep_run_id": str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),
             "run_source": run_source,
+            "tick_latency": tick_latency,
+            "runtime_integrity_status": runtime_integrity_status,
+            "sell_liveness_status": sell_liveness_status,
+            "exit_route_liveness_failure": exit_route_liveness_failure,
             **_prov,
             "trade_date": trade_date,
             "session": "daily_final" if session == "close" else session,
@@ -2042,6 +2130,7 @@ def run_trade_session(
             "orders_blocked": total_orders_blocked,  # backward compat: total across session
             "orders_blocked_total": total_orders_blocked,
             "orders_blocked_last_tick": int(final_tick.get("orders_blocked", 0) or 0),
+            "tick_latency": tick_latency,
             "block_reasons": block_reasons_total,  # backward compat: total across session
             "block_reasons_total": block_reasons_total,
             "block_reasons_last_tick": final_tick.get("block_reasons", {}),
@@ -2274,6 +2363,9 @@ def run_trade_session(
             "signal_only": resolved_signal_only,
             "status_detail": status_detail,
             "kis_order_allowed": kis_order_allowed,
+            "tick_latency": tick_latency,
+            "runtime_integrity_status": report_payload["runtime_integrity_status"],
+            "sell_liveness_status": report_payload["sell_liveness_status"],
             "results": results,
             "last_stage": last_stage,
         }

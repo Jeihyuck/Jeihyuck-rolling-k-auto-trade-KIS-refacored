@@ -441,6 +441,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "open_order_pending_count": open_order_pending_count,
             "daily_report_status": daily_report_result.get("status"),
             "report_consistency": report_consistency,
+            "close_integrity_status": (daily_report_result.get("report") or {}).get("close_integrity_status", "UNKNOWN"),
             "position_snapshot_error": position_snapshot_error,
             "broker_recovery_health": broker_recovery_health,
             "broker_recovery_integrity_errors": broker_recovery_integrity_errors,

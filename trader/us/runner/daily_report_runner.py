@@ -41,9 +41,12 @@ def _broker_recovery_health_errors(health: dict | None) -> list[str]:
         ("recovery_health_error_count", "BROKER_RECOVERY_HEALTH_ERRORS"),
         ("unattributed_broker_fills", "BROKER_FILLS_UNATTRIBUTED"),
         ("broker_fill_rebound_failure_count", "BROKER_FILL_REBOUND_FAILED"),
+        ("duplicate_semantic_submit_detection_count", "DUPLICATE_SEMANTIC_SUBMIT"),
         ("broker_local_cumulative_fill_mismatch_count", "BROKER_LOCAL_FILL_MISMATCH"),
         ("unresolved_execution_actions", "UNRESOLVED_EXECUTION_ACTIONS"),
         ("filled_sell_missing_cost_basis_count", "FILLED_SELL_COST_BASIS_MISSING"),
+        ("stale_pending_exit_stage_after_fill_count", "STALE_PENDING_EXIT_STAGE_AFTER_FILL"),
+        ("closed_lifecycle_open_state_count", "CLOSED_LIFECYCLE_OPEN_STATE"),
     ):
         try:
             count = int(health.get(field) or 0)
@@ -1152,6 +1155,8 @@ def run_daily_report(
         "report_run_id": close_run_id or "",
         "broker_orders_created": 0, "broker_orders_submitted": 0, "broker_orders_ack": 0,
         "broker_orders_filled": 0, "broker_orders_rejected": 0, "broker_orders_unresolved": 0,
+        "unresolved_submit_attempt_count": 0,
+        "close_integrity_status": "OK",
         "kis_fill_order_count": 0, "kis_fill_execution_count": 0,
         "balance_delta_confirmed_order_count": 0, "synthetic_fill_order_count": 0,
         "first_failed_dirty_code": "",
@@ -1439,12 +1444,22 @@ def run_daily_report(
                     report["orders_submitted"] = report["orders_submitted_total"]
                 from trader.us.execution.order_journal import aggregate_order_events
                 journal_counts = aggregate_order_events(trade_date)
+                report["unresolved_submit_attempt_count"] = int(
+                    journal_counts.get("unresolved_submit_attempt_count") or 0
+                )
+                if report["unresolved_submit_attempt_count"]:
+                    report["close_integrity_status"] = "RECONCILE_REQUIRED"
+                    report["errors"].append(
+                        "RECONCILE_REQUIRED:unresolved_broker_submit_attempts="
+                        f"{report['unresolved_submit_attempt_count']}"
+                    )
+                    report["report_consistency"] = "FAILED"
                 if journal_counts.get("orders_sent_total", 0):
                     report.update(journal_counts)
                     report["buy_order_count"] = journal_counts["buy_orders_count"]
                     report["sell_order_count"] = journal_counts["sell_orders_count"]
                     invariant_ok = (
-                        report["orders_sent_total"] == report["buy_orders_count"] + report["sell_orders_count"]
+                        report["orders_sent_total"] == report["buy_order_count"] + report["sell_order_count"]
                         and report["orders_ack_total"] + report["orders_reject_total"] <= report["orders_sent_total"]
                         and report["orders_fill_confirmed"] <= report["orders_ack_total"]
                     )
@@ -1453,6 +1468,9 @@ def run_daily_report(
                         report["report_consistency"] = "REPORT_INCONSISTENT"
             except Exception as exc:
                 report["warnings"].append(f"orders_load_failed: {exc}")
+                report["errors"].append("INTEGRITY_DEGRADED:order_journal_or_order_store_unavailable")
+                report["close_integrity_status"] = "INTEGRITY_DEGRADED"
+                report["report_consistency"] = "FAILED"
                 logger.warning("[US_DAILY_REPORT][WARN] orders load failed: %s", exc)
             
             # Fills
@@ -1797,6 +1815,36 @@ def run_daily_report(
 
     schedule_health_payload = _load_json_if_exists(os.path.join("reports", "us_schedule_health", f"{trade_date}.json"))
     sessions_payload = schedule_health_payload.get("sessions") if isinstance(schedule_health_payload.get("sessions"), dict) else {}
+    runtime_liveness_failures = []
+    for _name in ("am", "afternoon"):
+        _row = sessions_payload.get(_name) if isinstance(sessions_payload, dict) else None
+        if not isinstance(_row, dict):
+            continue
+        _runtime_status = str(_row.get("runtime_integrity_status") or "").upper()
+        _sell_status = str(_row.get("sell_liveness_status") or "").upper()
+        if (
+            _runtime_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED", "INTEGRITY_DEGRADED"}
+            or _sell_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"}
+            or bool(_row.get("exit_route_liveness_failure"))
+        ):
+            runtime_liveness_failures.append({
+                "session": _name,
+                "runtime_integrity_status": _runtime_status or "UNKNOWN",
+                "sell_liveness_status": _sell_status or "UNKNOWN",
+            })
+    report["runtime_liveness_failures"] = runtime_liveness_failures
+    if session == "close" and runtime_liveness_failures:
+        report["errors"].append("CLOSE_INTEGRITY_FAILED: protective_sell_liveness_failure")
+        report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
+        report["close_integrity_status"] = (
+            "RECONCILE_REQUIRED"
+            if any(
+                row["runtime_integrity_status"] == "RECONCILE_REQUIRED"
+                or row["sell_liveness_status"] == "RECONCILE_REQUIRED"
+                for row in runtime_liveness_failures
+            )
+            else "INTEGRITY_DEGRADED"
+        )
     failed_dirty_code = ""
     for _name in ("am", "afternoon", "close"):
         row = sessions_payload.get(_name) if isinstance(sessions_payload, dict) else None
@@ -1869,6 +1917,18 @@ def run_daily_report(
         report["errors"].extend(broker_health_errors)
         report["warnings"].extend(broker_health_errors)
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
+        if session == "close":
+            reconcile_errors = (
+                "BROKER_RECOVERY_HEALTH_UNAVAILABLE",
+                "BROKER_RECOVERY_HEALTH_ERRORS",
+                "UNRESOLVED_EXECUTION_ACTIONS",
+                "BROKER_FILLS_UNATTRIBUTED",
+                "BROKER_FILL_REBOUND_FAILED",
+            )
+            if any(error.startswith(reconcile_errors) for error in broker_health_errors):
+                report["close_integrity_status"] = "RECONCILE_REQUIRED"
+            elif report.get("close_integrity_status") == "OK":
+                report["close_integrity_status"] = "INTEGRITY_DEGRADED"
     if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
         pass
     elif any(str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
@@ -1877,6 +1937,18 @@ def run_daily_report(
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "SOURCE_MISMATCH")
     else:
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), (report.get("canonical_sources") or {}).get("report_consistency", "OK"))
+
+    if report.get("close_integrity_status") == "OK":
+        if (
+            int(report.get("orders_unresolved_total", 0) or 0) > 0
+            or int(report.get("unresolved_error_total", 0) or 0) > 0
+            or int(report.get("open_order_pending_total", 0) or 0) > 0
+        ):
+            report["close_integrity_status"] = "RECONCILE_REQUIRED"
+        elif report.get("errors") or report.get("report_consistency") in {
+            "REPORT_INCONSISTENT_POSITION_VALUE", "FAILED", "REPORT_INCONSISTENT"
+        }:
+            report["close_integrity_status"] = "INTEGRITY_DEGRADED"
 
     if report.get("report_consistency") in {"REPORT_INCONSISTENT_POSITION_VALUE", "FAILED"}:
         report["status"] = "FAILED_RECONCILE"

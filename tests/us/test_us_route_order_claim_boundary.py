@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+import time
 
 import sqlalchemy as sa
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from trader.execution_claims import DurableExecutionClaimRepo
 from trader.execution_state import SemanticActionIdentity
 from trader.us.db.execution_claim_schema import metadata as claim_metadata, us_execution_claims
+from trader.us.execution.tick_context import TickExecutionContext
 from trader.us.execution.order_router import _semantic_action_identity, route_order
 from trader.us.execution.kis_us_client import KisUSPreSubmitError
 
@@ -338,6 +340,60 @@ def test_route_known_pre_http_failure_releases_claim_for_retry(monkeypatch):
     retry = route_order(_intent("2026-10-02"), kis_client=broker)
     assert retry["status"] == "ACK"
     assert broker.calls == 2
+
+
+def test_tick_expiry_after_submit_journal_releases_claim_for_fresh_retry(monkeypatch):
+    engine, claim_repo, broker = _route_fixture(monkeypatch)
+    from trader.us.execution import order_journal
+
+    first_context = TickExecutionContext(
+        "2026-10-02", "am", "run-1", 1, "tick-1", deadline=time.monotonic() + 10,
+    )
+    journal_events = []
+
+    def expire_after_submit_start(event_type, *_args, **_kwargs):
+        journal_events.append(event_type)
+        if event_type == "BROKER_SUBMIT_STARTED":
+            first_context.deadline = time.monotonic() - 1
+        return {}
+
+    monkeypatch.setattr(order_journal, "append_order_event", expire_after_submit_start)
+    first_intent = _intent("2026-10-02", client_order_key="expired-before-boundary")
+    expired = route_order(first_intent, kis_client=broker, context=first_context)
+
+    assert expired["status"] == "ORDER_FENCED_BEFORE_BROKER_SUBMIT"
+    assert expired["broker_submit"] is False
+    assert expired["retry_order"] is True
+    assert expired["requires_reconcile"] is False
+    assert journal_events == [
+        "BROKER_SUBMIT_STARTED",
+        "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
+    ]
+    assert broker.calls == 0
+    released = claim_repo.get(_identity("2026-10-02"))
+    assert released.action_state == "OPEN"
+    assert released.active_attempt_id is None
+    first_attempt_id = expired["intent"]["submit_attempt_id"]
+    with engine.connect() as conn:
+        attempt_state = conn.execute(
+            sa.select(claim_repo.attempts.c.attempt_state).where(
+                claim_repo.attempts.c.attempt_id == first_attempt_id
+            )
+        ).scalar_one()
+    assert attempt_state == "ABANDONED_PRE_SUBMIT"
+
+    fresh_context = TickExecutionContext(
+        "2026-10-02", "am", "run-1", 1, "tick-2", deadline=time.monotonic() + 10,
+    )
+    retry = route_order(
+        _intent("2026-10-02", client_order_key="fresh-retry"),
+        kis_client=broker,
+        context=fresh_context,
+    )
+    assert retry["status"] == "ACK"
+    assert retry["intent"]["submit_attempt_id"] != first_attempt_id
+    assert broker.calls == 1
+    assert claim_repo.get(_identity("2026-10-02")).action_state == "IN_FLIGHT"
 
 
 def test_route_explicit_reject_retries_after_fresh_claim_validation(monkeypatch):
@@ -777,6 +833,10 @@ def test_tqqq_run_sleeve_uses_cycle_lifecycle_and_one_daily_buy_action(monkeypat
     monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
     monkeypatch.setenv("US_ORDER_ARMED", "1")
     monkeypatch.setenv("US_BLOCK_NEW_ENTRY_AFTER_ET", "23:59")
+    monkeypatch.setattr(
+        "trader.us.market_calendar.now_ny",
+        lambda: datetime(2026, 10, 2, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
     _engine, claim_repo, broker = _route_fixture(
         monkeypatch, fail_submit=True, production_identity=True,
     )
@@ -1263,6 +1323,38 @@ def test_route_response_loss_keeps_durable_fence_across_restart_and_date(monkeyp
 
     assert first["status"] == "BROKER_SUBMIT_RESULT_UNKNOWN"
     assert first["requires_reconcile"] is True
+    assert first["retry_order"] is False
+    assert broker.calls == 1
+
+    restarted_repo = DurableExecutionClaimRepo(engine, us_execution_claims)
+    monkeypatch.setattr("trader.us.db.repos.claim_execution_action", restarted_repo.acquire)
+    monkeypatch.setattr(
+        "trader.us.db.repos.record_execution_action_observation",
+        restarted_repo.record_observation,
+    )
+    next_day = route_order(_intent("2026-10-05"), kis_client=broker)
+
+    assert next_day["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert next_day["requires_reconcile"] is True
+    assert broker.calls == 1
+    assert restarted_repo.health()["unresolved_execution_actions"] == 1
+
+
+def test_possible_post_boundary_dns_failure_remains_fenced(monkeypatch):
+    import requests
+
+    engine, claim_repo, broker = _route_fixture(monkeypatch)
+
+    def fail_during_transport(*_args, **_kwargs):
+        broker.calls += 1
+        raise requests.exceptions.ConnectionError("temporary failure in name resolution")
+
+    broker.place_us_buy_order = fail_during_transport
+    first = route_order(_intent("2026-10-02"), kis_client=broker)
+
+    assert first["status"] == "BROKER_SUBMIT_RESULT_UNKNOWN"
+    assert first["requires_reconcile"] is True
+    assert first["retry_order"] is False
     assert broker.calls == 1
 
     restarted_repo = DurableExecutionClaimRepo(engine, us_execution_claims)

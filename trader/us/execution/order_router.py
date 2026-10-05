@@ -1740,6 +1740,47 @@ def route_order(
             logger.exception("[US_ORDER][EXECUTION_CLAIM][PRE_SUBMIT_RELEASE_FAILED] action_key=%s", claim.action_key)
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
         return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
+    if context is not None and not context.broker_submit_allowed():
+        abort_journal_error = None
+        try:
+            append_order_event(
+                "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
+                intent,
+                context=context,
+                broker_status="tick_authority_expired_before_broker_submit",
+            )
+        except Exception as exc:
+            abort_journal_error = exc
+            logger.critical("[US_ORDER][SUBMIT_ABORT_JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
+        release_error = None
+        try:
+            from trader.us.db.repos import release_execution_action_before_submit
+            release_execution_action_before_submit(
+                claim_identity, attempt_id=intent["submit_attempt_id"],
+            )
+        except Exception as exc:
+            release_error = exc
+            logger.exception(
+                "[US_ORDER][EXECUTION_CLAIM][PRE_BOUNDARY_RELEASE_FAILED] action_key=%s",
+                claim.action_key,
+            )
+        integrity_errors = [
+            str(error) for error in (abort_journal_error, release_error) if error is not None
+        ]
+        return {
+            "status": (
+                "ORDER_FENCED_BEFORE_BROKER_SUBMIT"
+                if release_error is None
+                else "ORDER_DISABLED_EXECUTION_CLAIM_RELEASE_FAILED"
+            ),
+            "reason": "tick_authority_expired_before_broker_submit",
+            "execution_integrity_error": "; ".join(integrity_errors) or None,
+            "execution_action_key": claim.action_key,
+            "broker_submit": False,
+            "retry_order": release_error is None,
+            "requires_reconcile": release_error is not None,
+            "intent": intent,
+        }
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
     logger.info(
         "[US_ORDER_SUBMIT_ATTEMPT] symbol=%s side=%s qty=%s limit_price=%.4f notional=%.4f",

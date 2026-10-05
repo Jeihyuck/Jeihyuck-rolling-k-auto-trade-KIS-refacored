@@ -138,27 +138,48 @@ def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None
     lifecycle: dict[str, set[str]] = {}
     fill_execution_keys: set[tuple] = set()
     partial_observation_keys: set[tuple] = set()
+    aborted = {
+        str(event.get("submit_attempt_id") or "").strip()
+        for event in events
+        if event.get("event_type") == "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"
+    }
     for event in events:
         attempt = str(event.get("submit_attempt_id") or "").strip()
         if not attempt:
             continue
         event_type = str(event.get("event_type") or "")
-        if event_type == "BROKER_SUBMIT_STARTED":
+        if event_type == "BROKER_SUBMIT_STARTED" and attempt not in aborted:
             submits.setdefault(attempt, event)
         lifecycle.setdefault(attempt, set()).add(event_type)
+        if attempt in aborted:
+            continue
         if event_type in {"ORDER_PARTIALLY_FILLED", "ORDER_FILLED"}:
             event_key = (attempt, event.get("broker_order_no"), event_type, event.get("raw_response_hash"))
             fill_execution_keys.add(event_key)
             if event_type == "ORDER_PARTIALLY_FILLED": partial_observation_keys.add(event_key)
-    ack = {a for a, types in lifecycle.items() if types & {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}}
-    rejected = {a for a, types in lifecycle.items() if "ORDER_REJECTED" in types}
-    filled = {a for a, types in lifecycle.items() if "ORDER_FILLED" in types}
+    ack = {a for a, types in lifecycle.items() if a not in aborted and types & {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}}
+    rejected = {a for a, types in lifecycle.items() if a not in aborted and "ORDER_REJECTED" in types}
+    filled = {a for a, types in lifecycle.items() if a not in aborted and "ORDER_FILLED" in types}
+    unresolved_submit_count = sum(
+        1
+        for attempt, types in lifecycle.items()
+        if attempt in submits
+        and attempt not in aborted
+        and (
+            not (types & {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED", "ORDER_REJECTED"})
+            or (
+                bool(types & {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"})
+                and not (types & {"DB_ACK_PERSISTED", "JOURNAL_REPLAY_DB_ACK_RESTORED"})
+            )
+        )
+    )
     buy = sum(str(e.get("side") or "").upper() == "BUY" for e in submits.values())
     sell = sum(str(e.get("side") or "").upper() == "SELL" for e in submits.values())
     return {"scope": "trade_day", "orders_sent_total": len(submits), "buy_orders_count": buy,
             "sell_orders_count": sell, "orders_ack_total": len(ack), "orders_reject_total": len(rejected),
             "orders_fill_confirmed": len(filled), "fill_execution_row_count": len(fill_execution_keys),
             "partial_fill_observation_count": len(partial_observation_keys),
+            "unresolved_submit_attempt_count": unresolved_submit_count,
             "unique_submit_attempt_count": len(submits),
             "unique_client_order_count": len({e.get('client_order_key') for e in submits.values()}),
             "unique_broker_order_count": len({e.get('broker_order_no') for e in events if e.get('broker_order_no')})}
@@ -350,7 +371,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
 
     for key, order_events in grouped.items():
         latest = order_events[-1]; types = {e.get("event_type") for e in order_events}
-        if "BROKER_SUBMIT_STARTED" not in types: continue
+        if "BROKER_SUBMIT_STARTED" not in types or "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types: continue
         event_trade_date = str(latest.get("trade_date") or trade_date)
         event_orders = today_orders
         if provider is not None and event_trade_date != trade_date:

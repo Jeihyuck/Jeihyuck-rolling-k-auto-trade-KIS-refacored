@@ -1,0 +1,81 @@
+{
+  "incident_date": "2026-09-30",
+  "evidence_scope": "Executable deterministic replay through production run_trade_session -> three production run_trade_tick evaluations with synthesized KIS/DB latency causing safe entry deferral then fresh-tick recovery, and separately lifecycle resolver -> soft-exit min-hold router -> order router; original broker evidence is unavailable",
+  "code_sha": "c8dbb308691e9c72f2f26076a890d68819160b82",
+  "settings": {
+    "DRY_RUN": "0",
+    "ALLOW_REAL_ORDER": "0",
+    "DISABLE_REAL_TRADING": "1",
+    "US_KIS_ORDER_ALLOWED": "1",
+    "US_DISABLE_TICK_PROCESS_ISOLATION": "1",
+    "US_ENTRY_EVAL_TIMEOUT_SEC": "1",
+    "US_MIN_ENTRY_EVAL_BUDGET_SEC": "0.05",
+    "US_EXECUTION_TAIL_RESERVE_SEC": "20",
+    "US_TICK_TIMEOUT_SEC": "360",
+    "US_TICK_TIMEOUT_MIN_SEC": "360",
+    "US_TICK_DEADLINE_SEC": "1.0"
+  },
+  "test_timing_overrides": {
+    "execution_tail_reserve_sec": 0.05,
+    "purpose": "Scale the production reserve proportionally for the subsecond offline deadline; no broker order is submitted"
+  },
+  "prep": {
+    "run_id": "synthesized-sep30-test-prep",
+    "status": "OK",
+    "entry_can_proceed": "not asserted by the SELL replay",
+    "trade_block_reason": "not supplied"
+  },
+  "session": {
+    "mode": "am",
+    "run_id": "synthesized-sep30-tick-replay"
+  },
+  "initial_balance": {
+    "account_equity_usd": 10000.0,
+    "source": "fake provider; not broker truth"
+  },
+  "initial_positions": [
+    {
+      "symbol": "SAMPLE",
+      "qty": 1,
+      "orderable_qty": 1,
+      "avg_cost": 949.55,
+      "strategy_owner": "US_STANDARD",
+      "position_lifecycle_id": "life-cross-day",
+      "opened_at": "2026-09-22T14:00:00+00:00",
+      "opened_at_source": "synthesized confirmed_buy_fill lineage",
+      "created_at": "2026-09-30T13:32:00+00:00"
+    }
+  ],
+  "broker_responses": {
+    "balance": "synthesized complete authoritative position snapshot",
+    "sell_signal": "synthesized soft-stop exit intent",
+    "order_submit": "fake route_order ACK; no live KIS request",
+    "fills": "not supplied"
+  },
+  "clock": {
+    "timestamp": "2026-09-30T09:36:00-04:00",
+    "timezone": "America/New_York",
+    "source": "synthesized deterministic replay clock"
+  },
+  "session_tick_replay_clock": {
+    "timestamp": "2026-09-30T10:06:00-04:00",
+    "timezone": "America/New_York",
+    "source": "synthesized deterministic clock outside opening-buy restriction for liveness evaluation"
+  },
+  "prices": {
+    "SAMPLE_entry": 949.55,
+    "SAMPLE_current": 969.0483
+  },
+  "synthesized_missing_inputs": [
+    "original incident code SHA, PREP run/status, and broker account balance",
+    "original position owner/lifecycle and confirmed BUY-fill provenance",
+    "original KIS SELL evaluation, order acknowledgement, fills, and response timestamps",
+    "original live session-loop latency measurements and actual broker-filled entry"
+  ],
+  "production_path_test_ids": [
+    "test_sep30_crossday_soft_sell_routes_through_tick_before_optional_entry",
+    "test_sep30_session_services_valid_entry_after_repeated_production_ticks",
+    "test_sep30_legacy_tick_budget_upgrade_preserves_execution_tail",
+    "test_cross_day_lifecycle_time_beats_same_day_position_row_created_at"
+  ]
+}

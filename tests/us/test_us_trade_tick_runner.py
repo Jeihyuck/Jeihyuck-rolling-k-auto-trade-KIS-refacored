@@ -91,8 +91,13 @@ def test_monitoring_universe_is_union_of_final30_and_positions():
     assert build_monitoring_universe(final30, positions) == {"NVDA", "TSLA", "APP", "BE", "INTC"}
 
 
-@pytest.mark.parametrize("ack_db_failure", [False, True])
-def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch, ack_db_failure):
+@pytest.mark.parametrize(
+    ("ack_db_failure", "exit_claim_release_failed"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_20260731_risk_off_prefilter_backfills_full_tick(
+    monkeypatch, ack_db_failure, exit_claim_release_failed
+):
     """Regression: filtered leaders must not consume the engine's three slots."""
     from trader.us.runner.trade_tick_runner import run_trade_tick
 
@@ -139,7 +144,7 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch, ack_db_fai
     class Engine:
         last_entry_diagnostics = {"attempted": 3, "accepted": 3}
         def evaluate_exits(self, positions, provider, now):
-            if not ack_db_failure:
+            if not (ack_db_failure or exit_claim_release_failed):
                 return []
             return [{
                 "symbol": "EXIT", "exchange": "NYSE", "side": "SELL", "qty": 1,
@@ -158,6 +163,13 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch, ack_db_fai
     routed = []
     def fake_route(intent, **kwargs):
         routed.append(intent)
+        if exit_claim_release_failed and intent["side"] == "SELL":
+            return {
+                "status": "ORDER_DISABLED_EXECUTION_CLAIM_RELEASE_FAILED",
+                "side": intent["side"], "symbol": intent["symbol"],
+                "intent": intent, "broker_submit": False, "retry_order": False,
+                "requires_reconcile": True,
+            }
         if ack_db_failure and intent["side"] == "BUY":
             return {
                 "status": "ACK_DB_FAILED", "side": intent["side"], "symbol": intent["symbol"],
@@ -182,7 +194,16 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch, ack_db_fai
     )
 
     assert captured["eligible"][:3] == ["MPC", "KO", "AMGN"]
-    assert [intent["symbol"] for intent in routed] == (["EXIT", "MPC"] if ack_db_failure else ["MPC", "KO", "AMGN"])
+    if exit_claim_release_failed:
+        assert [intent["symbol"] for intent in routed] == ["EXIT", "MPC", "KO", "AMGN"]
+        assert result["exit_route_reconcile_required"] is True
+        assert result["runtime_integrity_status"] == "RECONCILE_REQUIRED"
+        assert result["sell_liveness_status"] == "RECONCILE_REQUIRED"
+        assert result["exit_route_liveness_failure"] is True
+    else:
+        assert [intent["symbol"] for intent in routed] == (
+            ["EXIT", "MPC"] if ack_db_failure else ["MPC", "KO", "AMGN"]
+        )
     assert result["prefilter_blocked_candidates"][0]["symbol"] == "DDOG"
     assert result["final_entry_intents"] == 3
     if ack_db_failure:
