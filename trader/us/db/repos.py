@@ -400,7 +400,9 @@ def record_execution_action_observation_for_client_order_key(
     authoritative: bool,
 ):
     repo = _execution_claim_repo()
-    attempt = repo.find_attempt_for_client_order_key(client_order_key)
+    attempt = repo.find_attempt_for_client_order_key(
+        client_order_key, **_us_execution_claim_scope(),
+    )
     if attempt is None:
         raise LookupError(f"execution claim attempt not found for client order key {client_order_key}")
     action_key, attempt_id = attempt
@@ -416,11 +418,24 @@ def release_execution_action_before_submit(identity: Any, *, attempt_id: str) ->
 
 
 def load_execution_claim_health() -> dict[str, int]:
-    return _execution_claim_repo().health()
+    return _execution_claim_repo().health(**_us_execution_claim_scope())
+
+
+def _us_execution_claim_scope() -> dict[str, str]:
+    from trader.account_state import get_account_key, resolve_env_name
+
+    env = resolve_env_name()
+    account_id = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
+    return {
+        "env": env,
+        "account_id": account_id,
+        "market": "US",
+        "trading_epoch_id": _us_state_epoch_id(),
+    }
 
 
 def load_active_execution_claim_attempts() -> list[dict]:
-    return _execution_claim_repo().active_attempts(market="US")
+    return _execution_claim_repo().active_attempts(**_us_execution_claim_scope())
 
 
 def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
@@ -442,14 +457,36 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         and _parse_json_meta(event.get("meta")).get("broker_recovery_status") == "REBOUND"
         for event in events
     )
-    failed_rebounds = sum(
-        str(event.get("event_type") or "") in {
-            "JOURNAL_REPLAY_UNRESOLVED",
-            "JOURNAL_REPLAY_FAILED",
-            "BROKER_FILL_ATTRIBUTION_FAILED",
-        }
-        for event in events
-    ) + len(unattributed)
+    failed_attempts: dict[tuple[str, str], bool] = {}
+    failure_events = {
+        "JOURNAL_REPLAY_UNRESOLVED",
+        "JOURNAL_REPLAY_FAILED",
+        "BROKER_FILL_ATTRIBUTION_FAILED",
+    }
+    resolution_events = {
+        "JOURNAL_REPLAY_FILL_CONFIRMED",
+        "ORDER_PARTIALLY_FILLED",
+        "ORDER_FILLED",
+        "ORDER_REJECTED",
+        "ORDER_CANCELLED",
+    }
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        meta = _parse_json_meta(event.get("meta"))
+        is_rebound = (
+            event_type == "BROKER_ACK_RECOVERED"
+            and meta.get("broker_recovery_status") == "REBOUND"
+        )
+        if event_type not in failure_events and event_type not in resolution_events and not is_rebound:
+            continue
+        attempt_key = (
+            str(event.get("client_order_key") or ""),
+            str(event.get("submit_attempt_id") or ""),
+        )
+        if not any(attempt_key):
+            attempt_key = ("", str(event.get("event_id") or id(event)))
+        failed_attempts[attempt_key] = event_type in failure_events
+    failed_rebounds = sum(failed_attempts.values()) + len(unattributed)
     cumulative_fill_qty_by_key: dict[str, int] = {}
     individual_execution_qty_by_key: dict[str, int] = {}
     individual_execution_ids_by_key: dict[str, set[str]] = {}

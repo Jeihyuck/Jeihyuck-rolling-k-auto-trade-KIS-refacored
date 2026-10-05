@@ -272,3 +272,49 @@ def test_recovery_health_sums_distinct_execution_rows_not_cumulative_snapshots(m
     health = repos.load_broker_recovery_health("2026-10-01")
 
     assert health["broker_local_cumulative_fill_mismatch_count"] == 0
+
+
+def test_rebound_supersedes_historical_replay_failure_but_unresolved_attempt_fails_close(
+    monkeypatch, tmp_path,
+):
+    from trader.us.db import repos
+
+    recovered_identity = {
+        "client_order_key": "recovered-order",
+        "submit_attempt_id": "recovered-attempt",
+    }
+    unresolved_identity = {
+        "client_order_key": "unresolved-order",
+        "submit_attempt_id": "unresolved-attempt",
+    }
+    events = [
+        {"event_type": "JOURNAL_REPLAY_UNRESOLVED", **recovered_identity},
+        {
+            "event_type": "BROKER_ACK_RECOVERED",
+            "meta": {"broker_recovery_status": "REBOUND"},
+            **recovered_identity,
+        },
+        {"event_type": "JOURNAL_REPLAY_FAILED", **unresolved_identity},
+    ]
+    monkeypatch.setattr(repos, "load_today_fills", lambda trade_date: [])
+    monkeypatch.setattr(repos, "load_us_daily_orders_for_report", lambda trade_date: [])
+    monkeypatch.setattr(
+        "trader.us.execution.order_journal.load_order_events",
+        lambda trade_date: events,
+    )
+    monkeypatch.setattr(repos, "load_execution_claim_health", lambda: {
+        "unresolved_execution_actions": 0,
+        "execution_claim_conflicts": 0,
+    })
+
+    health = repos.load_broker_recovery_health("2026-10-01")
+    events[:] = events[:2]
+    clean_health = repos.load_broker_recovery_health("2026-10-01")
+
+    assert health["broker_fill_rebound_failure_count"] == 1
+    assert clean_health["broker_fill_rebound_failure_count"] == 0
+    result, _ = _configure_close(monkeypatch, tmp_path, health)
+    assert result["status"] == "ERROR"
+    assert result["manual_reconcile_required"] is True
+    result, _ = _configure_close(monkeypatch, tmp_path, clean_health)
+    assert result["status"] == "OK"

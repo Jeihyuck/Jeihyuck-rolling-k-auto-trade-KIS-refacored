@@ -1250,3 +1250,99 @@ def test_real_postgres_full_fill_rejects_nonfinite_fill_price(pg_engine, bad_pri
     assert row["qty_filled"] == 0
     assert row["avg_price_usd"] is None
     assert fill_count == 0
+
+
+def test_real_postgres_active_claim_recovery_is_scoped_to_current_generation(
+    pg_engine, monkeypatch,
+):
+    import hashlib
+    from datetime import date
+    import trader.us.db.repos as repos
+    from trader.account_state import get_account_key
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts,
+        us_execution_claims,
+    )
+
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("CANO", "12345678")
+    monkeypatch.setenv("ACNT_PRDT_CD", "01")
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *args, **kwargs: "current-epoch")
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+
+    account_id = hashlib.sha256(
+        get_account_key(env="practice").encode("utf-8")
+    ).hexdigest()
+
+    def unresolved_claim(*, env, epoch, attempt_id, client_key):
+        identity = SemanticActionIdentity(
+            env=env,
+            account_id=account_id,
+            market="US",
+            trading_epoch_id=epoch,
+            strategy_owner="US_STANDARD",
+            lifecycle_id="same-lifecycle",
+            action=f"ACTION:{attempt_id}",
+            trade_date=date(2026, 10, 1),
+        )
+        assert claim_repo.acquire(
+            identity,
+            attempt_id=attempt_id,
+            requested_qty=1,
+            client_order_key=client_key,
+        ).acquired
+        claim_repo.record_observation(
+            identity,
+            attempt_id=attempt_id,
+            state="UNRESOLVED",
+            cumulative_filled_qty=None,
+            authoritative=False,
+        )
+        return identity
+
+    unresolved_claim(
+        env="live", epoch="current-epoch",
+        attempt_id="foreign-live", client_key="foreign-live-key",
+    )
+    unresolved_claim(
+        env="practice", epoch="prior-epoch",
+        attempt_id="prior-generation", client_key="prior-generation-key",
+    )
+    current_identity = unresolved_claim(
+        env="practice", epoch="current-epoch",
+        attempt_id="current-generation", client_key="current-generation-key",
+    )
+
+    same_generation = SemanticActionIdentity(
+        env="practice",
+        account_id=account_id,
+        market="US",
+        trading_epoch_id="current-epoch",
+        strategy_owner="US_STANDARD",
+        lifecycle_id="same-lifecycle",
+        action="ACTION:SAME-GENERATION-RETRY",
+        trade_date=date(2026, 10, 1),
+    )
+    blocked = claim_repo.acquire(
+        same_generation,
+        attempt_id="same-generation-retry",
+        requested_qty=1,
+        client_order_key="same-generation-retry-key",
+    )
+
+    active_claims = repos.load_active_execution_claim_attempts()
+    health = repos.load_execution_claim_health()
+
+    assert not blocked.acquired
+    assert blocked.reason == "unresolved_lifecycle_action"
+    assert [claim["active_attempt_id"] for claim in active_claims] == [
+        "current-generation",
+    ]
+    assert health["unresolved_execution_actions"] == 1
+    assert claim_repo.get(current_identity).action_state == "UNCERTAIN"
