@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from trader.us.infinite.risk_adapter import TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS
+
 
 _OPERATIONAL_GUARD_STATES = frozenset({
     "PREFLIGHT_EXIT_ONLY",
@@ -55,3 +57,25 @@ def resolve_shared_tick_entry_evaluation_permission(
         return False
 
     return bool(guard.get("entry_can_proceed", False))
+
+
+def resolve_tqqq_policy_entry_override_permission(
+    prep_guard_result: dict[str, Any] | None,
+    *,
+    timeout_entry_block: bool,
+    session_execution_mode: str,
+) -> bool:
+    """Authorize only the owner-specific override for a verified PB1 policy block."""
+    guard = dict(prep_guard_result or {})
+    if timeout_entry_block or str(session_execution_mode or "NORMAL").upper() != "NORMAL":
+        return False
+    if guard.get("ok") is not True or guard.get("entry_can_proceed") is not False:
+        return False
+    if str(guard.get("guard_state") or "").upper() != "PREP_DEGRADED_ENTRY_BLOCKED":
+        return False
+    if not bool(guard.get("exit_can_proceed", True)) or not str(guard.get("prep_run_id") or guard.get("run_id") or "").strip():
+        return False
+    if bool(guard.get("run_revision_mismatch") or guard.get("version_mismatch")):
+        return False
+    reason = str(guard.get("trade_block_reason") or "").strip().lower()
+    return reason in TQQQ_PB1_ONLY_ENTRY_BLOCK_REASONS

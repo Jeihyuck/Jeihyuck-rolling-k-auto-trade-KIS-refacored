@@ -8,6 +8,7 @@ on:
       - master
       - stabilize/02-us-broker-recovery-20261004
       - stabilize/03-kr-broker-recovery-20261004
+      - stabilize/04-lifecycle-contract-recovery-20261004
   workflow_dispatch:
 
 jobs:

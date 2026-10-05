@@ -28,6 +28,8 @@ def _reset(monkeypatch, tmp_path):
     monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path))
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos.reset_memory_stores()
+    from trader.us.execution import order_router
+    order_router._SENT_ORDER_KEYS.clear()
 
 
 def _local_submit(
@@ -112,7 +114,7 @@ def _broker_fill(
     }
 
 
-def test_jnj_broker_fill_rebounds_to_unique_unresolved_local_intent(monkeypatch, tmp_path):
+def _replay_jnj_broker_fill_rebound(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path)
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'jnj-claims.sqlite'}")
     claim_metadata.create_all(engine)
@@ -171,6 +173,14 @@ def test_jnj_broker_fill_rebounds_to_unique_unresolved_local_intent(monkeypatch,
     assert trend_state["trend_trim_done"] is True
     assert claim_repo.get(claim_identity).action_state == "SATISFIED"
     engine.dispose()
+    return {
+        "orders": [dict(order) for order in repos._MEM_ORDERS],
+        "fills": [dict(fill) for fill in repos._MEM_FILLS],
+    }
+
+
+def test_jnj_broker_fill_rebounds_to_unique_unresolved_local_intent(monkeypatch, tmp_path):
+    _replay_jnj_broker_fill_rebound(monkeypatch, tmp_path)
 
 
 def test_pb1_entry_fill_rebounds_only_to_matching_trade_date_generation(
@@ -775,7 +785,7 @@ def test_broker_observation_timestamp_is_not_used_as_order_event_time():
     assert normalized["us_trade_date"] is None
 
 
-def test_nvda_ambiguous_ack_recovers_original_claim_across_restart_and_date(monkeypatch, tmp_path):
+def _replay_nvda_ambiguous_ack_across_restart_and_date(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path / "journal")
     from trader.us.execution import order_router
 
@@ -922,7 +932,16 @@ def test_nvda_ambiguous_ack_recovers_original_claim_across_restart_and_date(monk
     )
     assert same_day_duplicate["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
     assert broker.calls == 2
+    replay_evidence = {
+        "orders": [dict(order) for order in repos._MEM_ORDERS],
+        "fills": [dict(fill) for fill in repos._MEM_FILLS],
+    }
     engine.dispose()
+    return replay_evidence
+
+
+def test_nvda_ambiguous_ack_recovers_original_claim_across_restart_and_date(monkeypatch, tmp_path):
+    _replay_nvda_ambiguous_ack_across_restart_and_date(monkeypatch, tmp_path)
 
 
 def test_cancel_then_late_fill_and_repeated_snapshot_are_monotonic(monkeypatch, tmp_path):
@@ -1005,3 +1024,69 @@ def test_claim_health_query_failure_is_reported_as_unavailable(monkeypatch, tmp_
     assert health["available"] is False
     assert health["execution_claim_health_available"] is False
     assert health["recovery_health_error_count"] == 1
+
+
+def test_oct1_executable_replay_orchestrates_nvda_jnj_tqqq_and_close(
+    monkeypatch, tmp_path,
+):
+    from tests.us.test_us_close_broker_recovery_health import _clean_health, _configure_close
+    from tests.us.test_us_sep29_tqqq_owner_runtime_gate import _replay_session_tick_tqqq
+
+    jnj_path = tmp_path / "jnj"
+    nvda_path = tmp_path / "nvda"
+    tqqq_path = tmp_path / "tqqq"
+    close_path = tmp_path / "close"
+    for path in (jnj_path, nvda_path, tqqq_path, close_path):
+        path.mkdir()
+
+    with monkeypatch.context() as phase_patch:
+        nvda_replay = _replay_nvda_ambiguous_ack_across_restart_and_date(phase_patch, nvda_path)
+    with monkeypatch.context() as phase_patch:
+        jnj_replay = _replay_jnj_broker_fill_rebound(phase_patch, jnj_path)
+    with monkeypatch.context() as phase_patch:
+        _replay_session_tick_tqqq(
+            phase_patch,
+            tqqq_path,
+            "incident_20261001_tqqq_sector_cap.json.fixture",
+            None,
+        )
+    from trader.us.runner.daily_report_runner import _build_trade_reason_pnl_summary
+
+    fills = nvda_replay["fills"] + jnj_replay["fills"]
+    order_audit = [
+        {
+            "symbol": order["symbol"],
+            "side": order["side"],
+            "client_order_key": order["client_order_key"],
+            "filled_qty": order["qty_filled"],
+            "fill_price": order.get("avg_price") or order.get("fill_price"),
+            "gross_realized_pnl": (order.get("meta") or {}).get("realized_pnl_usd"),
+        }
+        for replay in (nvda_replay, jnj_replay)
+        for order in replay["orders"]
+        if str(order.get("side") or "").upper() == "SELL"
+        and int(order.get("qty_filled") or 0) > 0
+    ]
+    pnl = _build_trade_reason_pnl_summary(order_audit, [], fills)
+    assert len(fills) == 2
+    assert pnl["realized_trade_count_with_pnl"] == 2
+    assert pnl["realized_pnl_usd"] == round(sum(
+        float((fill.get("meta") or {}).get("realized_pnl_usd") or 0.0)
+        for fill in fills
+    ), 4)
+    close_input_health = _clean_health()
+    close_input_health["broker_fill_rebound_success_count"] = len(fills)
+    with monkeypatch.context() as phase_patch:
+        close_result, close_health = _configure_close(
+            phase_patch,
+            close_path,
+            close_input_health,
+            attributable_fills=fills,
+            pnl_summary=pnl,
+        )
+    assert close_result["status"] == "OK"
+    assert close_result["report_consistency"] == "OK"
+    assert close_health["unresolved_execution_actions"] == 0
+    assert close_health["kis_fills"] == fills
+    assert close_health["persisted_fills"] == fills
+    assert close_health["trade_pnl_analysis"] == pnl

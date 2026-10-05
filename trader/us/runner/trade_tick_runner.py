@@ -1418,6 +1418,8 @@ def run_trade_tick(
     watchlist_cache_source: str | None = None,
     entry_can_proceed: bool = True,
     exit_can_proceed: bool = True,
+    tqqq_policy_override_allowed: bool = False,
+    entry_block_reason: str = "",
     session_run_id: str = "",
     session_generation: int = 1,
     prep_run_id: str = "",
@@ -2469,6 +2471,18 @@ def run_trade_tick(
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
 
+    exit_route_result = route_exit_orders_immediately(
+        exit_intents,
+        buy_daily_notional=buy_daily_notional,
+        position_count=position_count,
+        effective_budget=effective_budget,
+        signal_only=signal_only,
+        kis_order_allowed=kis_order_allowed,
+        current_position_symbols=current_position_symbols,
+        context=tick_context,
+        kis_client=routing_kis_client,
+    )
+
     infinite_result = {"status": "OFF", "orders": []}
     _tqqq_infinite_started = time.monotonic()
     if _infinite_config.enabled:
@@ -2496,8 +2510,45 @@ def run_trade_tick(
             except Exception as _quote_exc:
                 logger.warning("[TQQQ_INF][QUOTE] price=0 source=USDataProvider stale=1 valid=0 error=%s", _quote_exc)
                 _tqqq_price, _quote_source, _quote_stale = 0.0, "USDataProvider", True
+            _tqqq_entry_block_reason = str(entry_block_reason or "").strip()
+            _tqqq_hard_system_failure = bool(
+                recon.get("block_new_entry")
+                or not balance_circuit.get("entry_can_proceed", True)
+                or not daily_notional_available
+                or fills_contract_error
+                or (fills_temp_error and real_order_mode)
+                or tick_context.remaining_sec() <= 0
+            )
+            _tqqq_runtime_gate = {
+                "entry_block_reason": (
+                    _tqqq_entry_block_reason
+                    or str(prep_result_for_overlay.get("trade_block_reason") or "").strip()
+                ),
+                "entry_block_source": (
+                    "authoritative_session_prep_guard"
+                    if _tqqq_entry_block_reason
+                    else "prep_overlay_unverified"
+                ),
+                "prep_run_id": str(prep_run_id or ""),
+                "prep_recovery_verified": bool(
+                    tqqq_policy_override_allowed
+                    and _tqqq_entry_block_reason
+                    and prep_run_id
+                ),
+                "override_authorized": bool(tqqq_policy_override_allowed),
+                "context_quality": str(market_state_overlay.get("tqqq_context_quality") or ""),
+                "quote_stale": bool(_quote_stale),
+                "exit_can_proceed": bool(exit_can_proceed),
+                "reconcile_entry_block": bool(reconcile_entry_block),
+                "hard_system_failure": _tqqq_hard_system_failure,
+            }
             _infinite_overlay = {
                 **market_state_overlay,
+                "trade_block_reason": (
+                    _tqqq_entry_block_reason
+                    or str(prep_result_for_overlay.get("trade_block_reason") or "").strip()
+                ),
+                "tqqq_runtime_gate": _tqqq_runtime_gate,
                 "tqqq_quote_source": _quote_source,
                 "tqqq_quote_stale": _quote_stale,
                 # The Infinite sleeve runs before standard entry evaluation,
@@ -2506,6 +2557,9 @@ def run_trade_tick(
                 "opening_buy_start_et": opening_buy_start_et,
                 "entry_can_proceed": bool(entry_can_proceed),
                 "exit_can_proceed": bool(exit_can_proceed),
+                "tqqq_policy_override_allowed": bool(tqqq_policy_override_allowed),
+                "reconcile_entry_block": bool(reconcile_entry_block),
+                "hard_system_failure": _tqqq_hard_system_failure,
                 "now_et": now.isoformat(),
             }
             _ttl_cancel = _ttl_query = None
@@ -2529,18 +2583,7 @@ def run_trade_tick(
         logger.info("[US_TICK_LOOP][TICK] session=%s tick=%s entry_can_proceed=%d exit_can_proceed=%d positions=%d monitoring_universe=%d", session, tick_index, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)), len(current_positions), len(monitoring_universe))
     except Exception:
         monitoring_universe = set(current_position_symbols or [])
-    exit_route_result = route_exit_orders_immediately(
-        exit_intents,
-        buy_daily_notional=buy_daily_notional,
-        position_count=position_count,
-        effective_budget=effective_budget,
-        signal_only=signal_only,
-        kis_order_allowed=kis_order_allowed,
-        current_position_symbols=current_position_symbols,
-        context=tick_context,
-        kis_client=routing_kis_client,
-    )
-    orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
+    orders = list(exit_route_result.get("orders", [])) + list(infinite_result.get("orders", []))
     # Aggregate broker-routed SELL truth across both TQQQ Infinite and PB1 exits.
     # BUY orders from the Infinite sleeve are explicitly excluded.
     sell_notional_routed = _routed_sell_notional(orders)
@@ -3916,9 +3959,62 @@ def run_trade_tick(
     )
     logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
                 tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
+    from trader.us.runner.status_contract import classify_runtime_integrity
+    exit_route_orders = exit_route_result.get("orders", [])
+    exit_route_statuses = {str(order.get("status") or "").upper() for order in exit_route_orders}
+    exit_route_reconcile_required = any(
+        bool(order.get("requires_reconcile"))
+        or str(order.get("status") or "").upper() in {
+            "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+            "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
+        }
+        or "RECONCILE_REQUIRED" in str(order.get("status") or "").upper()
+        for order in exit_route_orders
+    )
+    exit_route_liveness_failure = bool(
+        exit_intents_count
+        and not signal_only
+        and (
+            exit_route_reconcile_required
+            or any(
+                status in {"ERROR", "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "ORDER_ROUTE_BUDGET_EXHAUSTED"}
+                for status in exit_route_statuses
+            )
+        )
+    )
+    runtime_integrity_status = classify_runtime_integrity({
+        "system_invariant_failure": locals().get("system_invariant_failure", ""),
+        "entry_contract_integrity_block_count": entry_contract_integrity_block_count,
+        "reconcile_entry_block": reconcile_entry_block,
+        "reconcile_only_until_clean": locals().get("reconcile_only_until_clean", False),
+        "manual_reconcile_required": locals().get("ack_db_failed_buy_stop", False),
+        "unresolved_ack_count": locals().get("unresolved_ack_count", 0),
+        "pending_order_count": int(
+            (ack_recon_after_route.get("unresolved_count")
+             if isinstance(ack_recon_after_route, dict)
+             else ack_recon.get("unresolved_count", 0))
+            or 0
+        ),
+        "exit_route_reconcile_required": exit_route_reconcile_required,
+        "entry_can_proceed": entry_can_proceed,
+        "entry_block_reason": entry_block_reason,
+        "trade_block_reason": locals().get("trade_block_reason", ""),
+        "entry_degraded": entry_degraded,
+        "exit_route_liveness_failure": exit_route_liveness_failure,
+    })
+    sell_liveness_status = (
+        "RECONCILE_REQUIRED" if exit_route_reconcile_required
+        else "LIVENESS_DEGRADED" if exit_route_liveness_failure
+        else "OK"
+    )
     return {
         **latency_metrics,
         "status": status,
+        "runtime_integrity_status": runtime_integrity_status,
+        "sell_liveness_status": sell_liveness_status,
+        "exit_route_reconcile_required": exit_route_reconcile_required,
+        "exit_route_liveness_failure": exit_route_liveness_failure,
+        "entry_block_reason": entry_block_reason,
         "reason": primary_reject_reason or ("entry_degraded_exit_routed" if exit_routed_after_entry_degraded else ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none")),
         "primary_reject_reason": primary_reject_reason,
         "reject_reasons": reject_reasons,

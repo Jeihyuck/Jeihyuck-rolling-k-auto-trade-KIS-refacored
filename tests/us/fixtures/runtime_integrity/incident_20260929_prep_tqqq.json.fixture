@@ -1,0 +1,72 @@
+{
+  "incident_date": "2026-09-29",
+  "evidence_scope": "Executable deterministic replay through run_trade_session -> run_trade_tick -> TQQQ sleeve -> router; original broker/deployment evidence is incomplete and synthesized inputs are not broker truth",
+  "code_sha": "c8dbb308691e9c72f2f26076a890d68819160b82",
+  "settings": {
+    "DRY_RUN": "1",
+    "ALLOW_REAL_ORDER": "0",
+    "DISABLE_REAL_TRADING": "1",
+    "US_TQQQ_INFINITE_ENABLED": "1",
+    "US_TQQQ_INFINITE_REAL_ORDER": "1",
+    "US_KIS_ORDER_ALLOWED": "1",
+    "US_DISABLE_TICK_PROCESS_ISOLATION": "1"
+  },
+  "session": {
+    "run_id": "synthesized-sep29-runtime-replay",
+    "mode": "am"
+  },
+  "prep": {
+    "run_id": "synthesized-sep29-prep-run",
+    "status": "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP",
+    "entry_can_proceed": false,
+    "trade_block_reason": "sector_cap_violation_block"
+  },
+  "initial_balance": {
+    "account_equity_usd": 10000.0,
+    "source": "synthesized_test_balance"
+  },
+  "initial_positions": [
+    {
+      "symbol": "TQQQ",
+      "qty": 6,
+      "orderable_qty": 6,
+      "avg_price": 79.664,
+      "exchange": "NASDAQ",
+      "strategy_owner": "TQQQ_INFINITE",
+      "balance_source": "synthesized_test_fixture"
+    }
+  ],
+  "broker_responses": {
+    "balance": "synthesized complete authoritative test balance; not observed broker truth",
+    "preorder_position": "synthesized held-position response",
+    "fills": "synthesized empty fill response",
+    "ack_reconcile": "synthesized clean reconcile response",
+    "order_submit": "DRY_RUN; no broker request",
+    "websocket": "synthesized disconnect/reconnect and quote cache exercised through production adapter; no live approval-key request"
+  },
+  "clock": {
+    "timestamp": "2026-09-29T10:06:00-04:00",
+    "timezone": "America/New_York",
+    "source": "synthesized deterministic replay clock"
+  },
+  "prices": {
+    "TQQQ": 77.49,
+    "QQQ_completed_close": 100.0,
+    "QQQ_ma50": 99.0,
+    "QQQ_ma200": 98.0
+  },
+  "synthesized_missing_inputs": [
+    "original incident code SHA and deployment settings",
+    "original PREP artifact/run ID and status payload",
+    "initial KIS balance, position, order, and fill responses",
+    "original quote timestamps and completed QQQ context",
+    "original cross-process WebSocket/AppKey overlap telemetry"
+  ],
+  "production_path_test_ids": [
+    "test_sep29_executable_session_tick_prep_and_tqqq_replay",
+    "test_oct1_session_tick_overlay_routes_only_verified_tqqq_policy_override",
+    "test_websocket_adapter_reconnects_and_only_serves_fresh_quotes",
+    "test_prep_wrapper_disables_realtime_websocket_after_env_load",
+    "test_trade_wrappers_do_not_disable_websocket"
+  ]
+}

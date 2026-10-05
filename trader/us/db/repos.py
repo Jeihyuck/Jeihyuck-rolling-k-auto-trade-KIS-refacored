@@ -557,6 +557,130 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
                 break
         if not has_cost_basis:
             missing_sell_cost_basis_keys.add(client_key or str(fill.get("order_no") or "UNKNOWN"))
+    stale_pending_exit_stage_count = 0
+    closed_lifecycle_open_state_count = 0
+    positions = load_positions(as_of=trade_date, include_epoch_mismatches=True)
+    order_key_by_number = {
+        str(order.get("order_no") or "").strip(): str(order.get("client_order_key") or "")
+        for order in orders
+        if str(order.get("order_no") or "").strip()
+    }
+    actual_fill_qty_by_key: dict[str, int] = {}
+    for fill in fills:
+        fill_meta = _parse_json_meta(fill.get("meta"))
+        evidence = str(fill_meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if str(fill.get("side") or "").upper() != "SELL" or not _is_actual_evidence(evidence):
+            continue
+        key = str(fill.get("client_order_key") or "").strip()
+        if not key:
+            key = order_key_by_number.get(str(fill.get("order_no") or "").strip(), "")
+        if not key:
+            continue
+        try:
+            quantity = int(
+                fill_meta.get("cumulative_filled_qty")
+                or fill.get("cumulative_filled_qty")
+                or fill.get("qty")
+                or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            quantity = 0
+        actual_fill_qty_by_key[key] = max(actual_fill_qty_by_key.get(key, 0), quantity)
+
+    for position in positions:
+        symbol = str(position.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        position_meta = _parse_json_meta(position.get("meta"))
+        risk_row = load_latest_us_position_risk_state(symbol, trade_date) or {}
+        risk_state = _parse_json_meta(risk_row.get("state"))
+        lifecycle = _parse_json_meta(risk_state.get("lifecycle") or position_meta.get("lifecycle"))
+        lifecycle_open = (
+            lifecycle.get("is_open")
+            if "is_open" in lifecycle
+            else position_meta.get("lifecycle_is_open")
+        )
+        try:
+            holding_qty = int(position.get("qty") or position.get("holding_qty") or 0)
+        except (TypeError, ValueError, OverflowError):
+            holding_qty = 0
+        if lifecycle_open is False and holding_qty > 0:
+            closed_lifecycle_open_state_count += 1
+
+        lifecycle_id = str(
+            position.get("position_lifecycle_id")
+            or position_meta.get("position_lifecycle_id")
+            or ""
+        ).strip()
+        if lifecycle_id:
+            stage_state = load_us_profit_capture_state(
+                trade_date, [symbol], {symbol: lifecycle_id}
+            ).get(symbol, {})
+            stage_meta = _parse_json_meta(stage_state.get("meta"))
+            for stage in ("tp1", "tp2", "tp3"):
+                if not stage_state.get(f"{stage}_pending"):
+                    continue
+                try:
+                    target_qty = int(stage_meta.get(f"{stage}_qty") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    target_qty = 0
+                raw_order_keys = stage_meta.get(f"{stage}_order_keys") or []
+                order_keys = (
+                    [raw_order_keys]
+                    if isinstance(raw_order_keys, str)
+                    else list(raw_order_keys)
+                    if isinstance(raw_order_keys, (list, tuple, set))
+                    else []
+                )
+                latest_key = stage_state.get(f"{stage}_order_key")
+                if latest_key:
+                    order_keys.append(latest_key)
+                distinct_order_keys = {
+                    str(key or "").strip() for key in order_keys if str(key or "").strip()
+                }
+                actual_stage_filled_qty = sum(
+                    actual_fill_qty_by_key.get(key, 0) for key in distinct_order_keys
+                )
+                try:
+                    persisted_stage_filled_qty = int(
+                        stage_meta.get(f"{stage}_filled_qty") or 0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    persisted_stage_filled_qty = 0
+                if (
+                    target_qty > 0
+                    and actual_stage_filled_qty >= target_qty
+                    and persisted_stage_filled_qty < target_qty
+                ):
+                    stale_pending_exit_stage_count += 1
+
+        trend = _parse_json_meta(risk_state.get("trend"))
+        for stage in ("trend_trim", "trend_exit", "time_stop_trim", "time_stop_exit"):
+            if not trend.get(f"{stage}_pending"):
+                continue
+            order_key = str(trend.get(f"{stage}_order_key") or "").strip()
+            order = next(
+                (
+                    candidate for candidate in orders
+                    if str(candidate.get("client_order_key") or "").strip() == order_key
+                ),
+                {},
+            )
+            try:
+                target_qty = int(
+                    order.get("qty")
+                    or order.get("qty_requested")
+                    or order.get("qty_filled")
+                    or 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                target_qty = 0
+            if (
+                order_key
+                and target_qty > 0
+                and actual_fill_qty_by_key.get(order_key, 0) >= target_qty
+            ):
+                stale_pending_exit_stage_count += 1
     claim_health_available = True
     try:
         claim_health = load_execution_claim_health()
@@ -578,6 +702,8 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         "duplicate_semantic_submit_detection_count": duplicate_detections,
         "broker_local_cumulative_fill_mismatch_count": cumulative_mismatches,
         "filled_sell_missing_cost_basis_count": len(missing_sell_cost_basis_keys),
+        "stale_pending_exit_stage_after_fill_count": stale_pending_exit_stage_count,
+        "closed_lifecycle_open_state_count": closed_lifecycle_open_state_count,
     }
 
 

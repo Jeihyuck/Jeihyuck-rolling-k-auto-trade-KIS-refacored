@@ -5,6 +5,9 @@ Tests that guard_us_prep_contract.py fails fast (within timeout + 5sec)
 when DB operations hang or exceed timeout.
 """
 import os
+import contextlib
+import io
+import runpy
 import subprocess
 import sys
 import time
@@ -162,52 +165,44 @@ def test_actual_today_trade_date_source():
     assert "trade_date_source=actual_ny_today" in output
 
 
-def test_prep_status_timeout_fails_fast():
+def _run_guard_in_process(monkeypatch, tmp_path):
+    script_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "scripts", "guard_us_prep_contract.py"
+    )
+    monkeypatch.chdir(tmp_path)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        try:
+            runpy.run_path(script_path, run_name="__main__")
+        except SystemExit as exc:
+            return int(exc.code), output.getvalue()
+    return 0, output.getvalue()
+
+
+def test_prep_status_timeout_fails_fast(monkeypatch, tmp_path):
     """When prep status load times out, guard should fail within timeout + 5 sec."""
-    import threading
-    
     def delayed_prep_status(trade_date, timeout_sec=20):
-        """Simulate hanging DB call."""
-        time.sleep(30)  # Sleep longer than timeout
+        time.sleep(2)
         return {"status": "OK"}
-    
-    with patch("trader.us.db.repos.load_latest_us_prep_status", side_effect=delayed_prep_status):
-        script_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "scripts", "guard_us_prep_contract.py"
-        )
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        
-        env = os.environ.copy()
-        env.update({
-            "SESSION": "am",
-            "FORCE_NOW_INPUT": "2026-05-07T09:35:00-04:00",
-            "US_PREP_GUARD_TIMEOUT_SEC": "1",
-            "PBCORE_DB_URL": "postgresql://dummy",  # Force DB mode
-        })
-        
+
+    from trader.us.db import repos
+
+    with patch.object(repos, "load_latest_us_prep_status", side_effect=delayed_prep_status):
+        monkeypatch.setenv("SESSION", "am")
+        monkeypatch.setenv("FORCE_NOW_INPUT", "2026-05-07T09:35:00-04:00")
+        monkeypatch.setenv("US_PREP_GUARD_TIMEOUT_SEC", "1")
+        monkeypatch.setenv("PBCORE_DB_URL", "")
         start = time.monotonic()
-        proc = subprocess.run(
-            [sys.executable, script_path],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=10,  # subprocess timeout as safety
-        )
+        returncode, output = _run_guard_in_process(monkeypatch, tmp_path)
         elapsed = time.monotonic() - start
-        
-        # Should fail fast (within 1 + 5 = 6 sec)
-        assert elapsed < 6.0, f"Guard took {elapsed:.1f}s, expected < 6s"
-        
-        # Should exit with error
-        assert proc.returncode == 1
-        
-        output = proc.stdout + proc.stderr
-        assert "[US_PREP_GUARD][FAIL]" in output
-        assert "reason=prep_status_timeout" in output or "[US_TIMEOUT_GUARD][TIMEOUT]" in output
+
+    assert elapsed < 6.0, f"Guard took {elapsed:.1f}s, expected < 6s"
+    assert returncode == 1
+    assert "[US_PREP_GUARD][FAIL]" in output
+    assert "reason=prep_status_timeout" in output
 
 
-def test_watchlist_timeout_fails_fast():
+def test_watchlist_timeout_fails_fast(monkeypatch, tmp_path):
     """When watchlist load times out, guard should fail within timeout + 5 sec."""
     def ok_prep_status(trade_date, timeout_sec=20):
         return {"status": "OK"}
@@ -217,39 +212,19 @@ def test_watchlist_timeout_fails_fast():
         time.sleep(30)
         return [{"symbol": f"SYM{i}"} for i in range(15)]
     
-    with patch("trader.us.db.repos.load_latest_us_prep_status", side_effect=ok_prep_status), \
-         patch("trader.us.db.repos.load_locked_us_watchlist", side_effect=delayed_watchlist):
-        
-        script_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "scripts", "guard_us_prep_contract.py"
-        )
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        
-        env = os.environ.copy()
-        env.update({
-            "SESSION": "am",
-            "FORCE_NOW_INPUT": "2026-05-07T09:35:00-04:00",
-            "US_PREP_GUARD_TIMEOUT_SEC": "1",
-            "PBCORE_DB_URL": "postgresql://dummy",  # Force DB mode
-        })
-        
+    from trader.us.db import repos
+
+    with patch.object(repos, "load_latest_us_prep_status", side_effect=ok_prep_status), \
+         patch.object(repos, "load_locked_us_watchlist", side_effect=delayed_watchlist):
+        monkeypatch.setenv("SESSION", "am")
+        monkeypatch.setenv("FORCE_NOW_INPUT", "2026-05-07T09:35:00-04:00")
+        monkeypatch.setenv("US_PREP_GUARD_TIMEOUT_SEC", "1")
+        monkeypatch.setenv("PBCORE_DB_URL", "")
         start = time.monotonic()
-        proc = subprocess.run(
-            [sys.executable, script_path],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=10,
-        )
+        returncode, output = _run_guard_in_process(monkeypatch, tmp_path)
         elapsed = time.monotonic() - start
-        
-        # Should fail fast (within 1 + 5 = 6 sec, but prep_status will take ~1s too, so < 12s)
-        assert elapsed < 12.0, f"Guard took {elapsed:.1f}s, expected < 12s"
-        
-        # Should exit with error
-        assert proc.returncode == 1
-        
-        output = proc.stdout + proc.stderr
-        assert "[US_PREP_GUARD][FAIL]" in output
-        assert "reason=watchlist_load_timeout" in output or "[US_TIMEOUT_GUARD][TIMEOUT]" in output
+
+    assert elapsed < 12.0, f"Guard took {elapsed:.1f}s, expected < 12s"
+    assert returncode == 1
+    assert "[US_PREP_GUARD][FAIL]" in output
+    assert "reason=watchlist_load_timeout" in output

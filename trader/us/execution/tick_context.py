@@ -112,6 +112,7 @@ class TickExecutionContext:
         durable = self._durable_state()
         return (
             not self.is_cancelled()
+            and self.remaining_sec() > 0
             and self.session_state == "ACTIVE"
             and self.session_run_id == self.active_session_run_id
             and self.session_generation == self.active_session_generation
