@@ -530,6 +530,38 @@ class DurableExecutionClaimRepo:
             ).first()
         return (str(row[0]), str(row[1])) if row else None
 
+    def active_attempts(self, *, market: str | None = None) -> list[dict[str, Any]]:
+        """Return persisted active attempts for recovery; this does not create a fence."""
+        stmt = (
+            sa.select(
+                self.actions.c.action_key,
+                self.actions.c.env,
+                self.actions.c.account_id,
+                self.actions.c.market,
+                self.actions.c.strategy_owner,
+                self.actions.c.lifecycle_id,
+                self.actions.c.action,
+                self.actions.c.trade_date,
+                self.actions.c.cumulative_filled_qty,
+                self.actions.c.active_attempt_id,
+                self.attempts.c.requested_qty,
+                self.attempts.c.client_order_key,
+                self.attempts.c.attempt_state,
+            )
+            .join(
+                self.attempts,
+                sa.and_(
+                    self.attempts.c.action_key == self.actions.c.action_key,
+                    self.attempts.c.attempt_id == self.actions.c.active_attempt_id,
+                ),
+            )
+            .where(self.actions.c.active_attempt_id.is_not(None))
+        )
+        if market:
+            stmt = stmt.where(self.actions.c.market == str(market).strip().upper())
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(stmt).mappings().all()]
+
     def health(self) -> dict[str, int]:
         with self.engine.connect() as conn:
             values = conn.execute(

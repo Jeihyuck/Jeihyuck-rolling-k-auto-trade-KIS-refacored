@@ -2,7 +2,7 @@ name: US Harness (Offline QA)
 
 on:
   pull_request:
-    branches: [dual-agent]
+    branches: [dual-agent, stabilize/01-execution-state-contract-20261004]
     paths:
       - "trader/us/**"
       - "tests/us/**"
@@ -70,6 +70,17 @@ jobs:
             trader/us/runner/trade_tick_runner.py \
             trader/us/runner/trade_close_runner.py \
             scripts/repair_us_trade_integrity.py
+
+      - name: Run PostgreSQL broker recovery acceptance
+        shell: bash
+        run: |
+          test -n "$PBCORE_TEST_POSTGRES_URL"
+          python -m pytest -q \
+            tests/us/test_us_postgres_integration_real.py::test_real_postgres_rebounds_unique_submit_journal_candidate \
+            tests/us/test_us_postgres_integration_real.py::test_real_postgres_nvda_route_journal_recovery_fences_and_rebounds_after_restart \
+            tests/us/test_us_postgres_integration_real.py::test_real_postgres_ambiguous_candidates_persist_unattributed_fill \
+            tests/us/test_us_postgres_integration_real.py::test_real_postgres_imports_only_after_no_internal_candidate \
+            tests/us/test_us_postgres_integration_real.py::test_real_postgres_partial_fill_cancel_without_price_stays_unresolved
 
       - name: Run pytest (tests/us, including real PostgreSQL integration)
         shell: bash

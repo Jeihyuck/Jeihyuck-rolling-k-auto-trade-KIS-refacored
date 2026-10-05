@@ -25,11 +25,33 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 _CONSISTENCY_SEVERITY = {"OK": 0, "DEGRADED_DB_FALLBACK_TO_KIS": 1, "SOURCE_MISMATCH": 2,
-                         "REPORT_INCONSISTENT": 3, "REPORT_INCONSISTENT_POSITION_VALUE": 4, "FAILED": 5}
+                         "REPORT_INCONSISTENT": 3, "FAILED": 5,
+                         "REPORT_INCONSISTENT_POSITION_VALUE": 6}
 
 
 def worsen_consistency(current: str, new: str) -> str:
     return new if _CONSISTENCY_SEVERITY.get(new, 3) > _CONSISTENCY_SEVERITY.get(current, 0) else current
+
+
+def _broker_recovery_health_errors(health: dict | None) -> list[str]:
+    if not isinstance(health, dict) or health.get("available") is not True:
+        return ["BROKER_RECOVERY_HEALTH_UNAVAILABLE"]
+    errors = []
+    for field, error in (
+        ("recovery_health_error_count", "BROKER_RECOVERY_HEALTH_ERRORS"),
+        ("unattributed_broker_fills", "BROKER_FILLS_UNATTRIBUTED"),
+        ("broker_fill_rebound_failure_count", "BROKER_FILL_REBOUND_FAILED"),
+        ("broker_local_cumulative_fill_mismatch_count", "BROKER_LOCAL_FILL_MISMATCH"),
+        ("unresolved_execution_actions", "UNRESOLVED_EXECUTION_ACTIONS"),
+        ("filled_sell_missing_cost_basis_count", "FILLED_SELL_COST_BASIS_MISSING"),
+    ):
+        try:
+            count = int(health.get(field) or 0)
+        except (TypeError, ValueError, OverflowError):
+            count = 1
+        if count > 0:
+            errors.append(f"{error}:{count}")
+    return errors
 
 
 def _fill_is_synthetic(fill: dict) -> bool:
@@ -897,6 +919,7 @@ def run_daily_report(
     kis_fills: list[dict] | None = None,
     close_order_classification: dict | None = None,
     close_run_id: str | None = None,
+    broker_recovery_health: dict | None = None,
 ) -> dict:
     """Generate US daily report.
     
@@ -1140,6 +1163,7 @@ def run_daily_report(
     }
     if offline:
         report["execution_claim_health"] = {"available": False, "reason": "offline_mode"}
+        report["broker_recovery_health"] = {"available": False, "reason": "offline_mode"}
     else:
         try:
             from trader.us.db.repos import load_execution_claim_health
@@ -1153,6 +1177,17 @@ def run_daily_report(
                 "available": False,
                 "error": type(exc).__name__,
             }
+        try:
+            from trader.us.db.repos import load_broker_recovery_health
+            report["broker_recovery_health"] = load_broker_recovery_health(trade_date)
+        except Exception as exc:
+            logger.error("[US_DAILY_REPORT][BROKER_RECOVERY_HEALTH_UNAVAILABLE] err=%s", exc)
+            report["broker_recovery_health"] = {
+                "available": False,
+                "error": type(exc).__name__,
+            }
+        if broker_recovery_health is not None:
+            report["broker_recovery_health"] = broker_recovery_health
 
     contract_snapshot = _load_contract_status_snapshot(trade_date)
     report["pinned_contract_status"] = contract_snapshot.get("pinned_contract_status")
@@ -1825,6 +1860,15 @@ def run_daily_report(
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
         report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
+    broker_health_errors = (
+        _broker_recovery_health_errors(report.get("broker_recovery_health"))
+        if session == "close" and not offline else []
+    )
+    if broker_health_errors:
+        report["broker_recovery_integrity_errors"] = broker_health_errors
+        report["errors"].extend(broker_health_errors)
+        report["warnings"].extend(broker_health_errors)
+        report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
     if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
         pass
     elif any(str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
@@ -1856,6 +1900,8 @@ def run_daily_report(
         or int(report.get("broker_orders_unresolved", 0) or 0) > 0
         or report.get("status") == "WARNING_RECONCILE_MISMATCH"
         or report.get("report_consistency") == "REPORT_INCONSISTENT"
+        or bool(broker_health_errors)
+        or any("ERROR_MISSING_SELL_COST_BASIS" in str(error) for error in report.get("errors", []))
     )
 
     if not report.get("entry_block_source"):

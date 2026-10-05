@@ -9,6 +9,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 from trader.us.utils.order_no import normalize_us_order_no
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,11 @@ def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> 
             break
     if date_text and time_text:
         time_text = time_text.zfill(6)[:6]
-        return f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}T{time_text[:2]}:{time_text[2:4]}:{time_text[4:6]}"
+        source_time = datetime.strptime(
+            f"{date_text[:8]}{time_text}",
+            "%Y%m%d%H%M%S",
+        ).replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        return source_time.isoformat()
     return date_text
 
 
@@ -103,14 +108,43 @@ def get_fills_today(
         fills = []
         for row in raw:
             order_no = _first_nonblank(row, "odno", "order_no", "ODNO")
+            source_date = _first_nonblank(row, "ord_dt", "ORD_DT")
+            source_time = _first_nonblank(row, "ord_tmd", "ORD_TMD")
             order_timestamp = _combine_kis_date_time(
-                _first_nonblank(row, "ord_dt", "ORD_DT"),
-                _first_nonblank(row, "ord_tmd", "ORD_TMD"),
+                source_date,
+                source_time,
+            )
+            order_timestamp_utc = (
+                datetime.fromisoformat(order_timestamp).astimezone(timezone.utc).isoformat()
+                if "T" in order_timestamp else ""
             )
             requested_qty = int(row.get("ft_ord_qty") or row.get("ord_qty") or 0)
-            cumulative_filled_qty = int(row.get("ft_ccld_qty", 0) or 0)
-            remaining_qty = int(row.get("nccs_qty") or row.get("rmn_qty") or 0)
+            cumulative_raw = _first_nonblank(
+                row, "ft_ccld_qty", "ccld_qty", "tot_ccld_qty",
+            )
+            cumulative_filled_qty = (
+                int(cumulative_raw) if cumulative_raw not in (None, "") else None
+            )
+            remaining_raw = _first_nonblank(row, "nccs_qty", "rmn_qty")
+            remaining_qty = (
+                int(remaining_raw) if remaining_raw not in (None, "") else None
+            )
             avg_price_usd = float(row.get("ft_ccld_unpr3", 0) or 0)
+            order_price_raw = _first_nonblank(
+                row, "limit_price", "ord_unpr", "ft_ord_unpr3",
+            )
+            order_price = (
+                float(order_price_raw)
+                if order_price_raw not in (None, "")
+                else None
+            )
+            if cumulative_filled_qty is None:
+                logger.warning(
+                    "[US_FILLS][UNKNOWN_CUMULATIVE_QUANTITY] order_no=%s symbol=%s",
+                    order_no,
+                    row.get("pdno", ""),
+                )
+                continue
             if cumulative_filled_qty <= 0:
                 logger.debug(
                     "[US_FILLS][SKIP_UNFILLED_ORDER] order_no=%s symbol=%s remaining_qty=%s",
@@ -126,15 +160,26 @@ def get_fills_today(
                 "qty": cumulative_filled_qty,
                 "price": avg_price_usd,
                 "avg_price_usd": avg_price_usd,
+                "order_price": order_price,
                 "filled_at": order_timestamp or row.get("ord_dt", ""),
                 "observed_at": observed_at,
                 "order_timestamp": order_timestamp,
+                "order_timestamp_utc": order_timestamp_utc,
+                "order_timestamp_source": "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD",
+                "order_timestamp_source_timezone": "Asia/Seoul",
                 "order_no": order_no,
                 "order_no_raw": order_no,
                 "order_no_norm": normalize_us_order_no(order_no),
                 "requested_qty": requested_qty,
+                "order_price": order_price,
                 "cumulative_filled_qty": cumulative_filled_qty,
                 "remaining_qty": remaining_qty,
+                "status": str(
+                    row.get("status")
+                    or row.get("ord_sttus")
+                    or row.get("ord_status")
+                    or ""
+                ).upper(),
                 "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
                 "meta": {
                     "is_synthetic": False,
@@ -144,6 +189,11 @@ def get_fills_today(
                     "remaining_qty": remaining_qty,
                     "requested_qty": requested_qty,
                     "order_timestamp": order_timestamp,
+                    "order_timestamp_utc": order_timestamp_utc,
+                    "order_timestamp_source": "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD",
+                    "source_timezone": "Asia/Seoul",
+                    "source_timestamp_date": source_date,
+                    "source_timestamp_time": source_time,
                     "observed_at": observed_at,
                     "order_no_raw": order_no,
                     "order_no_norm": normalize_us_order_no(order_no),

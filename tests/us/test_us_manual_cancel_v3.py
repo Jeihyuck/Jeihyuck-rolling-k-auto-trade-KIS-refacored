@@ -6,7 +6,8 @@ class CancelProvider:
     def get_balance(self, force_refresh=False):
         return {"positions": []}
     def get_fills_by_order_no(self, **_kwargs):
-        return {"status": "cancel_complete", "filled_qty": 0, "remaining_qty": 0,
+        return {"status": "cancel_complete", "requested_qty": 2, "filled_qty": 0,
+                "filled_qty_present": True, "remaining_qty": 0, "remaining_qty_present": True,
                 "symbol": "AAPL", "side": "SELL", "order_no": "O1"}
 
 
@@ -14,7 +15,10 @@ def test_manual_cancel_is_terminal_and_not_unresolved(monkeypatch):
     order = {"symbol": "AAPL", "side": "SELL", "order_no": "O1", "client_order_key": "k",
              "qty_requested": 2, "meta": {"pre_order_holding_qty": 2}}
     monkeypatch.setattr("trader.us.db.repos.load_pending_ack_orders", lambda **_: [order])
-    monkeypatch.setattr("trader.us.db.repos.apply_broker_order_observation", lambda **_: {"status": "OK"})
+    monkeypatch.setattr(
+        "trader.us.db.repos.apply_broker_order_observation",
+        lambda **_: {"status": "OK", "authoritative": True, "requires_reconcile": False},
+    )
     result = reconcile.reconcile_ack_orders_with_balance(provider=CancelProvider(), trade_date="2026-08-21")
     assert result["status"] == "OK"
     assert result["canceled_count"] == 1

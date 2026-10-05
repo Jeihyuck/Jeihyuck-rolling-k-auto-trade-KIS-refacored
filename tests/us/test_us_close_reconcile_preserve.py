@@ -10,6 +10,27 @@ def _patch_close_common(monkeypatch):
     monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda **kwargs: {"status": "OK", "fills": []})
     monkeypatch.setattr("trader.us.db.repos.save_fills_with_result", lambda fills, trade_date=None: {"status":"OK","inserted_count":0,"updated_count":0,"unchanged_count":0,"regression_count":0})
     monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda payload, trade_date=None: None)
+    monkeypatch.setattr("trader.us.db.repos.load_broker_recovery_health", lambda trade_date: {
+        "available": True,
+        "recovery_health_error_count": 0,
+        "unattributed_broker_fills": 0,
+        "broker_fill_rebound_failure_count": 0,
+        "broker_local_cumulative_fill_mismatch_count": 0,
+        "unresolved_execution_actions": 0,
+        "filled_sell_missing_cost_basis_count": 0,
+    })
+    monkeypatch.setattr(
+        "trader.us.execution.order_journal.replay_order_journal",
+        lambda *args, **kwargs: {"status": "OK", "unresolved_count": 0},
+    )
+    monkeypatch.setattr(
+        "trader.us.execution.reconcile.reconcile_ack_orders_with_balance",
+        lambda **kwargs: {"status": "OK", "unresolved_count": 0, "failed_count": 0},
+    )
+    monkeypatch.setattr(
+        "trader.us.execution.reconcile.classify_ack_orders_with_final_balance",
+        lambda **kwargs: {"status": "OK", "orders": [], "counts": {}, "pending_order_count": 0},
+    )
     monkeypatch.setattr("trader.us.runner.daily_report_runner.run_daily_report", lambda **kwargs: None)
 
 
@@ -34,7 +55,11 @@ def test_close_does_not_save_empty_positions_when_reconcile_raises(tmp_path, mon
 
     assert saved["called"] is False
     assert result["reconcile_status"] == "TEMP_ERROR"
-    assert result["status"] == "OK_WITH_WARNINGS"
+    assert result["status"] == "ERROR"
+    assert result["manual_reconcile_required"] is True
+    assert result["reconcile_required"] is True
+    assert result["report_consistency"] == "FAILED"
+    assert result["daily_report_status"] == "FAILED_RECONCILE"
 
 
 def test_close_saves_authoritative_empty_positions(tmp_path, monkeypatch):

@@ -419,6 +419,130 @@ def load_execution_claim_health() -> dict[str, int]:
     return _execution_claim_repo().health()
 
 
+def load_active_execution_claim_attempts() -> list[dict]:
+    return _execution_claim_repo().active_attempts(market="US")
+
+
+def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
+    """Expose unresolved and unattributed broker truth in close/report health."""
+    from trader.us.execution.order_journal import load_order_events
+
+    fills = load_today_fills(trade_date)
+    orders = load_us_daily_orders_for_report(trade_date) or []
+    events = load_order_events(trade_date)
+    journal_available = events is not None
+    if events is None:
+        events = []
+    unattributed = [
+        fill for fill in fills
+        if _parse_json_meta(fill.get("meta")).get("attribution_status") == "UNATTRIBUTED"
+    ]
+    successful_rebounds = sum(
+        str(event.get("event_type") or "") == "BROKER_ACK_RECOVERED"
+        and _parse_json_meta(event.get("meta")).get("broker_recovery_status") == "REBOUND"
+        for event in events
+    )
+    failed_rebounds = sum(
+        str(event.get("event_type") or "") in {
+            "JOURNAL_REPLAY_UNRESOLVED",
+            "JOURNAL_REPLAY_FAILED",
+            "BROKER_FILL_ATTRIBUTION_FAILED",
+        }
+        for event in events
+    ) + len(unattributed)
+    cumulative_fill_qty_by_key: dict[str, int] = {}
+    individual_execution_qty_by_key: dict[str, int] = {}
+    individual_execution_ids_by_key: dict[str, set[str]] = {}
+    for fill in fills:
+        meta = _parse_json_meta(fill.get("meta"))
+        if meta.get("attribution_status") == "UNATTRIBUTED":
+            continue
+        key = str(fill.get("client_order_key") or fill.get("order_no") or "")
+        if not key:
+            continue
+        evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if _is_kis_execution_evidence(evidence):
+            execution_id = str(
+                fill.get("fill_idempotency_key")
+                or meta.get("fill_idempotency_key")
+                or _fill_execution_identity(fill, trade_date)
+            )
+            seen = individual_execution_ids_by_key.setdefault(key, set())
+            if execution_id not in seen:
+                seen.add(execution_id)
+                individual_execution_qty_by_key[key] = (
+                    individual_execution_qty_by_key.get(key, 0) + int(fill.get("qty") or 0)
+                )
+            continue
+        cumulative = int(
+            meta.get("cumulative_filled_qty")
+            or fill.get("cumulative_filled_qty")
+            or fill.get("qty")
+            or 0
+        )
+        cumulative_fill_qty_by_key[key] = max(
+            cumulative_fill_qty_by_key.get(key, 0), cumulative,
+        )
+    fill_qty_by_key = {
+        key: individual_execution_qty_by_key.get(key, cumulative_fill_qty_by_key.get(key, 0))
+        for key in cumulative_fill_qty_by_key.keys() | individual_execution_qty_by_key.keys()
+    }
+    cumulative_mismatches = sum(
+        int(order.get("qty_filled") or 0) > 0
+        and fill_qty_by_key.get(str(order.get("client_order_key") or ""), 0) != int(order.get("qty_filled") or 0)
+        for order in orders
+    )
+    order_meta_by_key = {
+        str(order.get("client_order_key") or ""): _parse_json_meta(order.get("meta"))
+        for order in orders
+    }
+    missing_sell_cost_basis_keys = set()
+    for fill in fills:
+        fill_meta = _parse_json_meta(fill.get("meta"))
+        evidence = str(fill_meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+        if (
+            str(fill.get("side") or "").upper() != "SELL"
+            or not _is_actual_evidence(evidence)
+            or int(fill.get("qty") or fill_meta.get("cumulative_filled_qty") or 0) <= 0
+        ):
+            continue
+        client_key = str(fill.get("client_order_key") or "")
+        lineage = {**order_meta_by_key.get(client_key, {}), **fill_meta}
+        has_cost_basis = False
+        for field in ("broker_avg_price", "avg_cost", "cost_basis_price_usd", "entry_price"):
+            try:
+                value = float(lineage.get(field))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                has_cost_basis = True
+                break
+        if not has_cost_basis:
+            missing_sell_cost_basis_keys.add(client_key or str(fill.get("order_no") or "UNKNOWN"))
+    claim_health_available = True
+    try:
+        claim_health = load_execution_claim_health()
+        unresolved_actions = int(claim_health.get("unresolved_execution_actions", 0))
+        duplicate_detections = int(claim_health.get("execution_claim_conflicts", 0))
+    except Exception:
+        unresolved_actions = 0
+        duplicate_detections = 0
+        claim_health_available = False
+    return {
+        "available": journal_available and claim_health_available,
+        "journal_available": journal_available,
+        "execution_claim_health_available": claim_health_available,
+        "recovery_health_error_count": int(not journal_available) + int(not claim_health_available),
+        "unresolved_execution_actions": unresolved_actions,
+        "unattributed_broker_fills": len(unattributed),
+        "broker_fill_rebound_success_count": successful_rebounds,
+        "broker_fill_rebound_failure_count": failed_rebounds,
+        "duplicate_semantic_submit_detection_count": duplicate_detections,
+        "broker_local_cumulative_fill_mismatch_count": cumulative_mismatches,
+        "filled_sell_missing_cost_basis_count": len(missing_sell_cost_basis_keys),
+    }
+
+
 def _epoch_enforced() -> bool:
     from trader.db.trading_epoch import trading_epoch_enforced
     return trading_epoch_enforced()
@@ -971,9 +1095,9 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
 
 def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         raw_order_no: str, canonical_order_no: str, symbol: str, side: str,
-        requested_qty: int, filled_qty: int, remaining_qty: int,
+        requested_qty: int, filled_qty: int | None, remaining_qty: int | None,
         broker_status: str, evidence_type: str, observed_at: str | None = None,
-        raw_row: dict | None = None) -> dict:
+        raw_row: dict | None = None, broker_open_qty: int | None = None) -> dict:
     """Atomically apply broker truth, then emit the canonical lifecycle event."""
     td, key = str(trade_date), str(client_order_key)
     status = str(broker_status or "").upper().replace("CANCELED", "CANCELLED")
@@ -981,7 +1105,21 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     allowed = {"ACK", "OPEN", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
     if status not in allowed:
         return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
-    if int(filled_qty) < 0 or int(filled_qty) > int(requested_qty):
+    filled_qty_value = None if filled_qty is None else int(filled_qty)
+    if filled_qty_value is None:
+        for name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty"):
+            raw_filled = (raw_row or {}).get(name)
+            if raw_filled not in (None, ""):
+                try:
+                    parsed = float(raw_filled)
+                    if math.isfinite(parsed) and parsed >= 0 and parsed.is_integer():
+                        filled_qty_value = int(parsed)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                break
+    if filled_qty_value is not None and (
+        filled_qty_value < 0 or filled_qty_value > int(requested_qty)
+    ):
         return {"status":"BROKER_OBSERVATION_QUARANTINED","reason":"cumulative_filled_qty_out_of_range"}
     broker_reported_status = status
 
@@ -997,6 +1135,9 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             break
     broker_requested_qty = None
     broker_requested_valid = broker_requested_raw in (None, "")
+    if (raw_row or {}).get("requested_qty_present") is False:
+        broker_requested_raw = None
+        broker_requested_valid = False
     if broker_requested_raw not in (None, ""):
         try:
             broker_requested_num = float(broker_requested_raw)
@@ -1005,15 +1146,46 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                 broker_requested_valid = True
         except (TypeError, ValueError):
             broker_requested_valid = False
+    broker_remaining_raw = broker_open_qty
+    if broker_remaining_raw is None:
+        broker_remaining_raw = next(
+        (
+            (raw_row or {}).get(name)
+            for name in ("broker_open_qty", "remaining_qty", "rmn_qty", "ord_remn_qty", "nccs_qty")
+            if (raw_row or {}).get(name) not in (None, "")
+        ),
+        None,
+        )
+    if (
+        (raw_row or {}).get("remaining_qty_present") is False
+        or (raw_row or {}).get("broker_open_qty_present") is False
+    ):
+        broker_remaining_raw = None
+    broker_remaining_qty = None
+    if broker_remaining_raw is not None:
+        try:
+            broker_remaining_num = float(broker_remaining_raw)
+            if (
+                math.isfinite(broker_remaining_num)
+                and broker_remaining_num >= 0
+                and broker_remaining_num.is_integer()
+            ):
+                broker_remaining_qty = int(broker_remaining_num)
+        except (TypeError, ValueError):
+            pass
 
-    fill_bearing_status = status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0
+    fill_bearing_status = (
+        status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"}
+        and filled_qty_value is not None
+        and filled_qty_value > 0
+    )
     if fill_bearing_status and broker_requested_raw not in (None, ""):
         if not broker_requested_valid or broker_requested_qty != int(requested_qty):
             mismatch_reason = (
                 "cancel_full_fill_requested_qty_mismatch"
                 if (
                     broker_reported_status == "CANCELLED"
-                    and int(filled_qty) == int(requested_qty)
+                    and filled_qty_value == int(requested_qty)
                     and int(remaining_qty) == 0
                 )
                 else "fill_requested_qty_mismatch"
@@ -1032,7 +1204,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if (
         status == "CANCELLED"
         and int(requested_qty) > 0
-        and int(filled_qty) == int(requested_qty)
+        and filled_qty_value == int(requested_qty)
         and int(remaining_qty) == 0
     ):
         # Cancel/fill race normalization requires strong broker request
@@ -1051,9 +1223,21 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         # the race.  Durable order state, lifecycle event, and return value all
         # describe the terminal economic state: FILLED.
         status = "FILLED"
+    action_remaining_qty = (
+        None if remaining_qty is None else int(remaining_qty)
+    )
+    if status == "CANCELLED" and (
+        filled_qty_value is None
+        or action_remaining_qty != int(requested_qty) - filled_qty_value
+    ):
+        action_remaining_qty = None
     meta_patch = {"order_no_raw": str(raw_order_no), "order_no_norm": str(canonical_order_no),
-                  "remaining_qty": int(remaining_qty), "broker_observed_at": observed_at,
-                  "broker_raw_row": raw_row or {}, "fill_evidence_type": evidence_type}
+                  "remaining_qty": action_remaining_qty,
+                  "semantic_action_remaining_qty": action_remaining_qty,
+                  "broker_open_qty": broker_remaining_qty,
+                  "broker_observed_at": observed_at,
+                  "broker_raw_row": raw_row or {}, "fill_evidence_type": evidence_type,
+                  "filled_quantity_status": "UNKNOWN" if filled_qty_value is None else "KNOWN"}
     if broker_reported_status != status:
         meta_patch["broker_reported_status"] = broker_reported_status
         meta_patch["terminal_status_normalized_from"] = broker_reported_status
@@ -1095,7 +1279,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         and status == "FILLED"
         and broker_requested_valid
         and broker_requested_qty == int(requested_qty)
-        and int(filled_qty) == int(requested_qty)
+        and filled_qty_value == int(requested_qty)
         and int(remaining_qty) == 0
     )
     terminal_status_conflict = (
@@ -1103,10 +1287,16 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         and status != old_status
         and not cancel_full_fill_correction
     )
-    stale = terminal_status_conflict or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
+    stale = terminal_status_conflict or (
+        old_status == "PARTIALLY_FILLED" and status in {"ACK", "OPEN"}
+    ) or (filled_qty_value is not None and filled_qty_value < old_filled)
     if stale:
         return {"status":"OK","order_status":old_status,"observation_ignored":"ORDER_OBSERVATION_IGNORED_STALE"}
-    if status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"} and int(filled_qty) > 0:
+    if (
+        status in {"PARTIALLY_FILLED", "FILLED", "CANCELLED"}
+        and filled_qty_value is not None
+        and filled_qty_value > 0
+    ):
         # A cancellation may arrive as the first durable broker observation
         # after one or more executions.  Persist cumulative fill truth first,
         # then apply the terminal CANCELLED status below.  Never manufacture a
@@ -1124,7 +1314,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         fill_price_source = "broker_observation"
         if not (math.isfinite(fill_price) and fill_price > 0):
             if (
-                old_filled >= int(filled_qty)
+                old_filled >= filled_qty_value
                 and math.isfinite(old_avg_price)
                 and old_avg_price > 0
             ):
@@ -1145,13 +1335,13 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     "requires_reconcile": True,
                     "retry_order": False,
                     "entry_fence": True,
-                    "observed_filled_qty": int(filled_qty),
+                    "observed_filled_qty": filled_qty_value,
                     "persisted_filled_qty": old_filled,
                 }
         result = mark_order_filled_by_reconcile(
             order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
-            filled_qty=filled_qty, requested_qty=requested_qty,
-            cumulative_filled_qty=filled_qty,
+            filled_qty=filled_qty_value, requested_qty=requested_qty,
+            cumulative_filled_qty=filled_qty_value,
             avg_price_usd=fill_price,
             source="broker_order_observation", evidence_type=evidence_type,
             trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
@@ -1167,7 +1357,10 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                                          "exchange": order.get("exchange"), "meta": order.get("meta")})
             if not (str(order.get("status") or "").upper() == "FILLED" and status == "CANCELLED"):
                 order["status"] = status
-            order["qty_filled"] = max(int(order.get("qty_filled") or 0), int(filled_qty))
+            order["qty_filled"] = max(
+                int(order.get("qty_filled") or 0),
+                old_filled if filled_qty_value is None else filled_qty_value,
+            )
             order["order_no"] = order.get("order_no") or raw_order_no
             order["meta"] = {**_parse_json_meta(order.get("meta")), **meta_patch}
             order_meta = order["meta"]
@@ -1191,17 +1384,22 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     qty_filled=GREATEST(qty_filled,:filled),
                     order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
                     WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
-                    {"status": status, "filled": int(filled_qty), "ono": raw_order_no, "meta": _json_param(order_meta),
+                    {"status": status, "filled": old_filled if filled_qty_value is None else filled_qty_value,
+                     "ono": raw_order_no, "meta": _json_param(order_meta),
                      "td": td, "key": key, **epoch_params})
                 if int(result.rowcount or 0) != 1:
                     return {"status": "ORDER_NOT_FOUND"}
-        if side.upper() == "SELL" and order_meta.get("profit_capture_stage"):
+        if (
+            side.upper() == "SELL"
+            and order_meta.get("profit_capture_stage")
+            and filled_qty_value is not None
+        ):
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
             sync_profit_capture_stage_from_order(trade_date=td, symbol=symbol,
                 position_lifecycle_id=str(order_meta.get("position_lifecycle_id") or ""),
                 client_order_key=key, broker_order_no=raw_order_no,
                 profit_capture_stage=str(order_meta.get("profit_capture_stage")),
-                order_status=status, evidence_type=evidence_type, filled_qty=filled_qty,
+                order_status=status, evidence_type=evidence_type, filled_qty=filled_qty_value,
                 requested_qty=requested_qty)
     from trader.us.execution.order_journal import append_order_event
     event_type = {"ACK": "BROKER_ACK_RECOVERED", "OPEN": "ORDER_OPEN",
@@ -1215,24 +1413,33 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     claim_update_error = None
     action_key = str(order_meta.get("execution_action_key") or "")
     attempt_id = str(order_meta.get("submit_attempt_id") or "")
-    if action_key and attempt_id:
-        broker_fill_raw = next(
-            (
-                (raw_row or {}).get(name)
-                for name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
-                if (raw_row or {}).get(name) not in (None, "")
-            ),
-            None,
+    broker_fill_raw = next(
+        (
+            (raw_row or {}).get(name)
+            for name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
+            if (raw_row or {}).get(name) not in (None, "")
+        ),
+        None,
+    )
+    if (raw_row or {}).get("filled_qty_present") is False:
+        broker_fill_raw = None
+    observation_qty = filled_qty_value if broker_fill_raw is not None else None
+    authoritative = status == "REJECTED" and (
+        broker_requested_valid
+        and broker_requested_qty == int(requested_qty)
+        and broker_fill_raw is not None
+        and observation_qty == 0
+    )
+    if status == "CANCELLED":
+        authoritative = bool(
+            broker_requested_valid
+            and broker_requested_qty == int(requested_qty)
+            and broker_fill_raw is not None
+            and observation_qty is not None
+            and broker_remaining_qty == 0
+            and action_remaining_qty == int(requested_qty) - observation_qty
         )
-        observation_qty = int(filled_qty) if broker_fill_raw is not None or int(filled_qty) > 0 else None
-        authoritative = status == "REJECTED" and int(filled_qty) == 0
-        if status == "CANCELLED":
-            authoritative = bool(
-                broker_requested_valid
-                and broker_requested_qty == int(requested_qty)
-                and broker_fill_raw is not None
-                and observation_qty is not None
-            )
+    if action_key and attempt_id:
         claim_state = {
             "ACK": "ACKED",
             "OPEN": "ACKED",
@@ -1257,6 +1464,22 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                 action_key, status,
             )
     result = {"status": "OK", "order_status": status}
+    result["authoritative"] = bool(authoritative)
+    if status == "CANCELLED":
+        result["semantic_action_remaining_qty"] = action_remaining_qty
+        result["broker_open_qty"] = broker_remaining_qty
+    if status == "CANCELLED" and not authoritative:
+        result.update({
+            "filled_quantity_status": "UNKNOWN" if observation_qty is None else "KNOWN",
+            "requires_reconcile": True,
+            "retry_order": False,
+        })
+    if status == "REJECTED" and not authoritative:
+        result.update({
+            "filled_quantity_status": "UNKNOWN" if observation_qty is None else "KNOWN",
+            "requires_reconcile": True,
+            "retry_order": False,
+        })
     if claim_update_error:
         result.update({
             "execution_claim_update_error": claim_update_error,
@@ -1875,6 +2098,466 @@ def _import_broker_actual_order(fill: dict, *, trade_date: str) -> dict:
     logger.warning("[US_FILLS][IMPORTED_ORDER] trade_date=%s order_no=%s symbol=%s side=%s", trade_date, order_no_raw, symbol, side)
     return load_us_order_for_fill(order_no=order_no_raw, client_order_key=key, symbol=symbol, trade_date=trade_date)
 
+
+def _recovery_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _broker_fill_recovery_candidates(fill: dict, *, trade_date: str) -> tuple[str, list[dict]]:
+    """Find exact or strongly evidenced local submit attempts for a broker fill."""
+    symbol = str(fill.get("symbol") or "").strip().upper()
+    side = str(fill.get("side") or "").strip().upper()
+    fill_meta = _parse_json_meta(fill.get("meta"))
+    raw_fill = fill.get("raw") if isinstance(fill.get("raw"), dict) else {}
+
+    def explicit_int(names: tuple[str, ...], sources: tuple[dict, ...]) -> int | None:
+        for source in sources:
+            for name in names:
+                value = source.get(name)
+                if value in (None, ""):
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                return int(number) if math.isfinite(number) and number >= 0 and number.is_integer() else None
+        return None
+
+    fill_sources = (fill, raw_fill, fill_meta)
+    requested_qty = explicit_int(
+        ("requested_qty", "qty_requested", "ord_qty", "ft_ord_qty"), fill_sources,
+    )
+    cumulative_qty = explicit_int(
+        ("cumulative_filled_qty", "filled_qty", "qty_filled", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty", "qty"),
+        fill_sources,
+    )
+    broker_open_qty = explicit_int(
+        ("broker_open_qty", "remaining_qty", "nccs_qty", "rmn_qty", "ord_remn_qty"),
+        fill_sources,
+    )
+    if requested_qty is None:
+        return "INVALID_BROKER_QUANTITY", []
+    broker_status = str(fill.get("status") or raw_fill.get("status") or "").upper()
+    terminal_cancel = broker_status in {
+        "CANCELED", "CANCELLED", "CANCEL_COMPLETE", "CANCELLED_COMPLETE",
+        "취소", "취소완료",
+    }
+    if (
+        not symbol or side not in {"BUY", "SELL"} or requested_qty <= 0
+        or cumulative_qty is None or cumulative_qty <= 0 or cumulative_qty > requested_qty
+        or broker_open_qty is None
+        or (terminal_cancel and broker_open_qty != 0)
+        or (not terminal_cancel and cumulative_qty + broker_open_qty != requested_qty)
+    ):
+        return "BROKER_IDENTITY_INCOMPLETE", []
+    source_name = str(
+        fill.get("order_timestamp_source")
+        or fill_meta.get("order_timestamp_source")
+        or ""
+    )
+    source_timezone = str(
+        fill.get("order_timestamp_source_timezone")
+        or fill_meta.get("source_timezone")
+        or fill_meta.get("order_timestamp_source_timezone")
+        or ""
+    )
+    broker_timestamp = _recovery_timestamp(
+        fill.get("order_timestamp_utc")
+        or fill_meta.get("order_timestamp_utc")
+        or fill.get("order_timestamp")
+        or fill_meta.get("order_timestamp")
+    )
+    source_timestamp_raw = (
+        fill.get("order_timestamp")
+        or fill_meta.get("order_timestamp")
+    )
+    if not source_timestamp_raw:
+        source_date = fill.get("source_timestamp_date") or fill_meta.get("source_timestamp_date")
+        source_time = fill.get("source_timestamp_time") or fill_meta.get("source_timestamp_time")
+        date_digits = "".join(char for char in str(source_date or "") if char.isdigit())
+        time_digits = "".join(char for char in str(source_time or "") if char.isdigit())
+        if len(date_digits) == 8 and len(time_digits) >= 6:
+            source_timestamp_raw = (
+                f"{date_digits[:4]}-{date_digits[4:6]}-{date_digits[6:8]}"
+                f"T{time_digits[:2]}:{time_digits[2:4]}:{time_digits[4:6]}"
+            )
+    source_timestamp = None
+    if source_timestamp_raw:
+        try:
+            source_timestamp = datetime.fromisoformat(
+                str(source_timestamp_raw).replace("Z", "+00:00")
+            )
+            if source_timestamp.tzinfo is None and source_timezone == "Asia/Seoul":
+                from zoneinfo import ZoneInfo
+                source_timestamp = source_timestamp.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        except (TypeError, ValueError):
+            source_timestamp = None
+    source_timezone_matches = False
+    if source_timestamp is not None and source_timestamp.tzinfo is not None:
+        from zoneinfo import ZoneInfo
+        source_timezone_matches = (
+            source_timestamp.utcoffset()
+            == source_timestamp.astimezone(ZoneInfo("Asia/Seoul")).utcoffset()
+        )
+    timestamps_agree = bool(
+        source_timestamp is not None
+        and source_timestamp.tzinfo is not None
+        and source_timezone_matches
+        and broker_timestamp is not None
+        and abs(
+            (
+                source_timestamp.astimezone(timezone.utc)
+                - broker_timestamp.astimezone(timezone.utc)
+            ).total_seconds()
+        ) < 1
+    )
+    broker_time_is_provenanced = bool(
+        source_name == "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD"
+        and source_timezone == "Asia/Seoul"
+        and broker_timestamp is not None
+        and timestamps_agree
+    )
+    if broker_time_is_provenanced:
+        from zoneinfo import ZoneInfo
+        broker_time_is_provenanced = (
+            broker_timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+            == trade_date
+        )
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        order_rows = [
+            dict(row) for row in _MEM_ORDERS
+            if str(row.get("trade_date") or trade_date) == trade_date
+            and str(row.get("symbol") or "").upper() == symbol
+            and str(row.get("side") or "").upper() == side
+            and str(row.get("status") or "").upper()
+            in {"PENDING", "SENT", "ACK", "OPEN", "PARTIALLY_FILLED", "CANCELLED"}
+        ]
+        intent_rows = [
+            dict(row) for row in _MEM_INTENTS
+            if str(row.get("trade_date") or trade_date) == trade_date
+            and str(row.get("symbol") or "").upper() == symbol
+            and str(row.get("side") or "").upper() == side
+            and str(row.get("status") or "").upper() in {"PENDING", "SENT"}
+        ]
+    else:
+        try:
+            with engine.connect() as conn:
+                epoch_id = _active_us_epoch(conn)
+                order_sql = """
+                    SELECT * FROM us_orders
+                    WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                      AND status IN ('PENDING','SENT','ACK','OPEN','PARTIALLY_FILLED','CANCELLED')
+                """
+                intent_sql = """
+                    SELECT * FROM us_order_intents
+                    WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                      AND status IN ('PENDING','SENT')
+                """
+                params = {"td": trade_date, "symbol": symbol, "side": side}
+                if epoch_id:
+                    order_sql += " AND trading_epoch_id=:epoch_id"
+                    intent_sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                order_rows = [dict(row) for row in conn.execute(text(order_sql), params).mappings()]
+                intent_rows = [dict(row) for row in conn.execute(text(intent_sql), params).mappings()]
+        except Exception:
+            logger.exception("[US_FILLS][RECOVERY][LOCAL_LEDGER_UNAVAILABLE]")
+            return "LOCAL_LEDGER_UNAVAILABLE", []
+
+    from trader.us.execution.order_journal import load_order_events
+    try:
+        events = load_order_events(trade_date)
+    except Exception:
+        logger.exception("[US_FILLS][RECOVERY][JOURNAL_UNAVAILABLE]")
+        return "JOURNAL_UNAVAILABLE", []
+    if events is None:
+        return "JOURNAL_UNAVAILABLE", []
+
+    order_by_key = {
+        str(row.get("client_order_key") or ""): row
+        for row in order_rows if str(row.get("client_order_key") or "")
+    }
+    intent_by_key = {
+        str(row.get("client_order_key") or ""): row
+        for row in intent_rows if str(row.get("client_order_key") or "")
+    }
+    candidates: list[dict] = []
+    broker_order_no = normalize_us_order_no(fill.get("order_no") or fill.get("order_no_raw"))
+    broker_client_key = str(fill.get("client_order_key") or "").strip()
+    expected_owner = str(fill.get("strategy_owner") or fill_meta.get("strategy_owner") or "").upper()
+    expected_lifecycle = str(
+        fill.get("position_lifecycle_id") or fill_meta.get("position_lifecycle_id") or ""
+    )
+    window_sec = max(0.0, float(os.getenv("US_AMBIGUOUS_MATCH_WINDOW_SEC", "120")))
+    price_tolerance = max(
+        0.0, float(os.getenv("US_AMBIGUOUS_MATCH_PRICE_TOLERANCE", "0.02")),
+    )
+
+    def price_value(sources: tuple[dict, ...], names: tuple[str, ...]) -> float | None:
+        for source in sources:
+            for name in names:
+                value = source.get(name)
+                if value in (None, ""):
+                    continue
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return price if math.isfinite(price) and price > 0 else None
+        return None
+
+    broker_price = price_value(
+        fill_sources,
+        ("limit_price", "limit_price_usd", "order_price", "order_price_usd"),
+    )
+    from trader.us.symbols import normalize_us_exchange
+
+    def normalized_exchange(value: Any) -> str:
+        raw_exchange = str(value or "").strip()
+        if not raw_exchange:
+            return ""
+        try:
+            return normalize_us_exchange(raw_exchange)
+        except Exception:
+            return raw_exchange.upper()
+
+    potential_candidates: list[dict] = []
+    exact_candidates: list[dict] = []
+    qualified_candidates: list[dict] = []
+    for key in sorted(set(order_by_key) | set(intent_by_key)):
+        local_order = order_by_key.get(key) or {}
+        local_intent = intent_by_key.get(key) or {}
+        local_meta = {
+            **_parse_json_meta(local_intent.get("meta")),
+            **_parse_json_meta(local_order.get("meta")),
+        }
+        key_events = [
+            event for event in events
+            if str(event.get("client_order_key") or "") == key
+            and str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
+        ]
+        if not key_events:
+            continue
+        matching_order_events = [
+            event for event in events
+            if str(event.get("client_order_key") or "") == key
+            and str(event.get("event_type") or "") in {
+                "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED",
+                "ORDER_OPEN", "ORDER_PARTIALLY_FILLED", "ORDER_FILLED",
+            }
+            and broker_order_no
+            and normalize_us_order_no(
+                event.get("broker_order_no") or event.get("raw_broker_order_no")
+            ) == broker_order_no
+        ]
+        if broker_client_key and broker_client_key == key:
+            matching_order_events.extend(key_events[:1])
+        event = key_events[0]
+        event_meta = _parse_json_meta(event.get("meta"))
+        attempts = {
+            str(item.get("submit_attempt_id") or "")
+            for item in key_events if item.get("submit_attempt_id")
+        }
+        action_keys = {
+            str(_parse_json_meta(item.get("meta")).get("execution_action_key") or "")
+            for item in key_events
+        }
+        attempt_id = str(event.get("submit_attempt_id") or "")
+        action_key = str(event_meta.get("execution_action_key") or "")
+        owner_values = {
+            str(value).upper()
+            for value in (
+                local_order.get("strategy_owner"), local_intent.get("strategy_owner"),
+                local_meta.get("strategy_owner"), event.get("strategy_owner"),
+                event_meta.get("strategy_owner"),
+            )
+            if value
+        }
+        lifecycle_values = {
+            str(value)
+            for value in (
+                local_order.get("position_lifecycle_id"),
+                local_intent.get("position_lifecycle_id"),
+                local_meta.get("position_lifecycle_id"),
+                event.get("position_lifecycle_id"), event_meta.get("position_lifecycle_id"),
+            )
+            if value
+        }
+        owner = next(iter(owner_values)) if len(owner_values) == 1 else ""
+        lifecycle = next(iter(lifecycle_values)) if len(lifecycle_values) == 1 else ""
+        base_candidate = {
+            "client_order_key": key,
+            "order": local_order,
+            "intent": local_intent,
+            "meta": {**local_meta, **event_meta},
+            "event": event,
+            "exact_broker_order": bool(matching_order_events),
+            "strategy_owner": owner,
+            "position_lifecycle_id": lifecycle,
+            "submit_attempt_id": attempt_id,
+        }
+        potential_candidates.append(base_candidate)
+        if (
+            len(key_events) != 1 or len(attempts) != 1 or len(action_keys) != 1
+            or not attempt_id or not action_key or not owner or not lifecycle
+            or str(event.get("symbol") or "").upper() != symbol
+            or str(event.get("side") or "").upper() != side
+            or int(event.get("requested_qty") or event.get("qty") or 0) != requested_qty
+        ):
+            continue
+
+        if expected_owner and owner != expected_owner:
+            continue
+        if expected_lifecycle and lifecycle != expected_lifecycle:
+            continue
+        if base_candidate["exact_broker_order"] or broker_client_key == key:
+            exact_candidates.append(base_candidate)
+            continue
+
+        if not broker_time_is_provenanced:
+            continue
+        local_exchange = normalized_exchange(
+            local_order.get("exchange") or local_intent.get("exchange") or event.get("exchange")
+        )
+        broker_exchange = normalized_exchange(
+            fill.get("exchange") or raw_fill.get("exchange") or fill_meta.get("exchange")
+        )
+        if local_exchange and broker_exchange and local_exchange != broker_exchange:
+            continue
+        local_requested_qty = int(
+            local_order.get("qty_requested") or local_intent.get("qty")
+            or event.get("requested_qty") or event.get("qty") or 0
+        )
+        local_filled_qty = int(local_order.get("qty_filled") or 0)
+        if (
+            local_requested_qty != requested_qty
+            or local_filled_qty < 0
+            or local_filled_qty > cumulative_qty
+        ):
+            continue
+        submit_time = _recovery_timestamp(
+            event.get("submitted_at_utc") or event_meta.get("submitted_at_utc")
+        )
+        if submit_time is None:
+            continue
+        if abs((broker_timestamp - submit_time).total_seconds()) > window_sec:
+            continue
+        local_price = price_value(
+            (local_order, local_intent, local_meta, event, event_meta),
+            ("limit_price_usd", "limit_price", "order_price_usd", "order_price"),
+        )
+        if (
+            local_price is not None and broker_price is not None
+            and abs(local_price - broker_price) > price_tolerance
+        ):
+            continue
+        qualified_candidates.append(base_candidate)
+
+    if len(exact_candidates) == 1:
+        return "MATCHED", exact_candidates
+    if len(exact_candidates) > 1:
+        return "AMBIGUOUS", exact_candidates
+    if len(qualified_candidates) == 1:
+        return "MATCHED", qualified_candidates
+    if len(qualified_candidates) > 1 or len(potential_candidates) > 1:
+        return "AMBIGUOUS", qualified_candidates or potential_candidates
+    if potential_candidates:
+        return "UNATTRIBUTED", potential_candidates
+    return "NO_CANDIDATE", []
+
+
+def _rebind_broker_fill_to_local_order(fill: dict, *, trade_date: str) -> tuple[str, dict]:
+    status, candidates = _broker_fill_recovery_candidates(fill, trade_date=trade_date)
+    if status != "MATCHED":
+        return status, {}
+    candidate = candidates[0]
+    local_order, local_intent = candidate["order"], candidate["intent"]
+    meta = {
+        **candidate["meta"],
+        "strategy_owner": candidate["strategy_owner"],
+        "position_lifecycle_id": candidate["position_lifecycle_id"],
+        "submit_attempt_id": candidate["submit_attempt_id"],
+        "execution_action_key": candidate["meta"]["execution_action_key"],
+        "broker_recovery_status": "REBOUND",
+        "broker_recovery_evidence": (
+            "EXACT_BROKER_ORDER_JOURNAL"
+            if candidate["exact_broker_order"] else "UNIQUE_SUBMIT_ATTEMPT_AND_LOCAL_INTENT"
+        ),
+    }
+    order_no = str(fill.get("order_no_raw") or fill.get("order_no") or "").strip()
+    key = candidate["client_order_key"]
+    payload = {
+        **local_intent,
+        **local_order,
+        "client_order_key": key,
+        "symbol": str(fill.get("symbol") or "").upper(),
+        "exchange": fill.get("exchange") or local_order.get("exchange") or local_intent.get("exchange") or "NASDAQ",
+        "side": str(fill.get("side") or "").upper(),
+        "qty_requested": int(local_order.get("qty_requested") or local_intent.get("qty") or 0),
+        "qty_filled": int(local_order.get("qty_filled") or 0),
+        "order_no": order_no,
+        "status": "ACK",
+        "dry_run": False,
+        "meta": meta,
+    }
+    if not save_order_ack(payload, trade_date=trade_date):
+        return "REBOUND_PERSIST_FAILED", {}
+    fill_meta = {**meta, **_parse_json_meta(fill.get("meta"))}
+    fill_meta.update({
+        "strategy_owner": candidate["strategy_owner"],
+        "position_lifecycle_id": candidate["position_lifecycle_id"],
+        "submit_attempt_id": candidate["submit_attempt_id"],
+        "execution_action_key": candidate["meta"]["execution_action_key"],
+        "broker_recovery_status": "REBOUND",
+        "broker_recovery_evidence": meta["broker_recovery_evidence"],
+    })
+    fill["client_order_key"] = key
+    fill["meta"] = fill_meta
+    from trader.us.execution.order_journal import append_order_event
+    append_order_event(
+        "BROKER_ACK_RECOVERED",
+        {**payload, "qty": payload["qty_requested"], "meta": meta},
+        broker_order_no=order_no,
+        broker_status="ACK",
+    )
+    order = load_us_order_for_fill(
+        order_no=order_no, client_order_key=key, symbol=payload["symbol"], trade_date=trade_date,
+    )
+    return ("MATCHED", order) if order else ("REBOUND_PERSIST_FAILED", {})
+
+
+def _mark_unattributed_broker_fill(fill: dict, *, trade_date: str, reason: str, candidate_count: int) -> None:
+    meta = _parse_json_meta(fill.get("meta"))
+    for field in (
+        "strategy_owner", "strategy_name", "strategy_version", "sleeve_id",
+        "position_lifecycle_id", "position_cycle_id", "semantic_action",
+        "reason", "profit_capture_stage", "trend_stage", "avg_cost",
+        "cost_basis_price_usd", "entry_price", "frozen_buy_contract",
+    ):
+        meta.pop(field, None)
+    meta.update({
+        "attribution_status": "UNATTRIBUTED",
+        "attribution_reason": reason,
+        "candidate_count": int(candidate_count),
+        "trade_date": trade_date,
+        "fill_evidence_type": str(fill.get("fill_evidence_type") or meta.get("fill_evidence_type") or ""),
+    })
+    order_no = normalize_us_order_no(fill.get("order_no") or fill.get("order_no_raw")) or "UNKNOWN"
+    symbol = str(fill.get("symbol") or "").upper() or "UNKNOWN"
+    side = str(fill.get("side") or "").upper() or "UNKNOWN"
+    fill["client_order_key"] = f"KIS_UNATTRIBUTED_{trade_date}_{order_no}_{symbol}_{side}"
+    fill["meta"] = meta
+    fill["save_status"] = "UNATTRIBUTED_BROKER_FILL"
+
+
 def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     """us_fills 저장."""
     global _LAST_SAVE_FILLS_ERROR
@@ -1884,28 +2567,63 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         return 0
     from trader.us.execution.order_identity import valid_identity
     for f in fills:
-        try:
-            order = load_us_order_for_fill(order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
-                                           symbol=str(f.get("symbol") or ""), trade_date=td)
-            if valid_identity(order.get("client_order_key")):
-                f["client_order_key"] = order.get("client_order_key")
-            order_meta = _parse_json_meta(order.get("meta"))
-            fill_meta = dict(f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}
-            for field in (
-                "session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source",
-                "strategy_owner", "strategy_name", "strategy_version", "sleeve_id",
-            ):
-                if order_meta.get(field) is not None:
-                    fill_meta.setdefault(field, order_meta[field])
-            if str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_EXECUTION_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL", "KIS_ORDER_CUMULATIVE_ACTUAL"}:
-                fill_meta.setdefault("is_synthetic", False)
+        fill_meta = _parse_json_meta(f.get("meta"))
+        evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+        is_actual_cumulative = _is_kis_order_cumulative_evidence(evidence)
+        if fill_meta.get("attribution_status") == "UNATTRIBUTED":
             f["meta"] = fill_meta
-        except Exception:
-            pass
+            continue
+        order = load_us_order_for_fill(
+            order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
+            symbol=str(f.get("symbol") or ""), trade_date=td,
+        )
+        if order and (
+            str(order.get("symbol") or "").upper() != str(f.get("symbol") or "").upper()
+            or str(order.get("side") or "").upper() != str(f.get("side") or "").upper()
+            or (
+                fill_meta.get("strategy_owner")
+                and str(_parse_json_meta(order.get("meta")).get("strategy_owner") or "").upper()
+                != str(fill_meta.get("strategy_owner")).upper()
+            )
+        ):
+            _mark_unattributed_broker_fill(f, trade_date=td, reason="EXACT_ORDER_IDENTITY_CONFLICT", candidate_count=1)
+            continue
+        if not order and is_actual_cumulative:
+            recovery_status, order = _rebind_broker_fill_to_local_order(f, trade_date=td)
+            if recovery_status == "NO_CANDIDATE":
+                if _get_engine_or_none() is not None:
+                    order = _import_broker_actual_order(f, trade_date=td)
+                    if not order:
+                        f["save_status"] = "BROKER_FILL_IMPORT_PERSIST_FAILED"
+                        continue
+                else:
+                    order_no = str(f.get("order_no") or "").strip()
+                    f["client_order_key"] = f"KIS_{td}_{order_no}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
+                    f_meta = _parse_json_meta(f.get("meta"))
+                    f_meta.update({
+                        "order_origin": "broker_actual_without_local_order",
+                        "import_reason": "no_local_candidate_in_memory_test_store",
+                    })
+                    f["meta"] = f_meta
+                    continue
+            elif recovery_status != "MATCHED":
+                _mark_unattributed_broker_fill(
+                    f, trade_date=td, reason=recovery_status, candidate_count=len(
+                        _broker_fill_recovery_candidates(f, trade_date=td)[1]
+                    ),
+                )
+                continue
+        if valid_identity(order.get("client_order_key")):
+            f["client_order_key"] = order.get("client_order_key")
+        order_meta = _parse_json_meta(order.get("meta"))
+        fill_meta = {**order_meta, **_parse_json_meta(f.get("meta"))}
+        if is_actual_cumulative:
+            fill_meta.setdefault("is_synthetic", False)
+        f["meta"] = fill_meta
         fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
         evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
-        if evidence in {"KIS_ACTUAL", "KIS_EXECUTION_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL", "KIS_ORDER_CUMULATIVE_ACTUAL"} and not valid_identity(f.get("client_order_key")) and valid_identity(f.get("order_no")):
-            f["client_order_key"] = f"KIS_{td}_{str(f.get('order_no')).strip()}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
+        if _is_actual_evidence(evidence) and not valid_identity(f.get("client_order_key")):
+            _mark_unattributed_broker_fill(f, trade_date=td, reason="LOCAL_ORDER_IDENTITY_UNAVAILABLE", candidate_count=0)
     invalid = [
         f for f in fills
         if str((f.get("meta") or {}).get("fill_evidence_type") or f.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_EXECUTION_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL", "KIS_ORDER_CUMULATIVE_ACTUAL"}
@@ -1930,6 +2648,9 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
             if not _is_kis_order_cumulative_evidence(evidence):
                 remaining_fills.append(f)
                 continue
+            if fill_meta.get("attribution_status") == "UNATTRIBUTED":
+                remaining_fills.append(f)
+                continue
             try:
                 order = load_us_order_for_fill(
                     order_no=f.get("order_no"),
@@ -1938,11 +2659,9 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                     trade_date=td,
                 )
                 if not order:
-                    order = _import_broker_actual_order(f, trade_date=td)
-                    if not order:
-                        f["save_status"] = "FILL_PERSIST_ERROR"
-                        logger.error("[US_FILLS][ATOMIC_ACTUAL][IMPORT_FAILED] trade_date=%s order_no=%s symbol=%s side=%s", td, f.get("order_no"), f.get("symbol"), f.get("side"))
-                        continue
+                    f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                    logger.error("[US_FILLS][ATOMIC_ACTUAL][ORDER_NOT_FOUND] trade_date=%s order_no=%s symbol=%s side=%s", td, f.get("order_no"), f.get("symbol"), f.get("side"))
+                    continue
                 resolved_symbol = str(f.get("symbol") or order.get("symbol") or "").strip().upper()
                 resolved_side = str(f.get("side") or order.get("side") or "").strip().upper()
                 requested_qty = int(fill_meta.get("requested_qty") or f.get("requested_qty") or order.get("qty_requested") or f.get("qty") or 0)
@@ -1980,6 +2699,71 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                 f["save_status"] = "RECONCILE_UPDATE_FAILED"
                 f["atomic_reconcile_error"] = str(exc)
                 logger.error("[US_FILLS][ATOMIC_ACTUAL][ERROR] %s", exc)
+        if len(remaining_fills) != len(fills):
+            fills = remaining_fills
+            if not fills:
+                logger.info("[US_FILLS][SAVE][ATOMIC_ACTUAL_DONE] confirmed=%d input=%d", atomic_count, original_fill_count)
+                return atomic_count
+    else:
+        remaining_fills = []
+        original_fill_count = len(fills)
+        for f in fills:
+            fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+            evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+            if (
+                not _is_kis_order_cumulative_evidence(evidence)
+                or fill_meta.get("attribution_status") == "UNATTRIBUTED"
+                or f.get("_already_reconciled")
+            ):
+                remaining_fills.append(f)
+                continue
+            order = load_us_order_for_fill(
+                order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
+                symbol=str(f.get("symbol") or ""), trade_date=td,
+            )
+            if not order:
+                remaining_fills.append(f)
+                continue
+            try:
+                prior = _active_fill_cumulatives_for_order(
+                    trade_date=td,
+                    order_no=str(f.get("order_no") or order.get("order_no") or ""),
+                    client_order_key=str(f.get("client_order_key") or order.get("client_order_key") or ""),
+                    symbol=str(f.get("symbol") or "").upper(),
+                    side=str(f.get("side") or "").upper(),
+                )
+                requested_qty = int(
+                    fill_meta.get("requested_qty") or f.get("requested_qty")
+                    or order.get("qty_requested") or f.get("qty") or 0
+                )
+                cumulative_qty = int(
+                    fill_meta.get("cumulative_filled_qty")
+                    or f.get("cumulative_filled_qty") or f.get("qty") or 0
+                )
+                result = mark_order_filled_by_reconcile(
+                    order_no=str(f.get("order_no") or ""),
+                    client_order_key=str(f.get("client_order_key") or ""),
+                    symbol=str(f.get("symbol") or "").upper(),
+                    side=str(f.get("side") or "").upper(),
+                    filled_qty=cumulative_qty,
+                    requested_qty=requested_qty,
+                    cumulative_filled_qty=cumulative_qty,
+                    evidence_type=evidence,
+                    avg_price_usd=float(f.get("price_usd") or f.get("price") or 0),
+                    source="save_fills_kis_actual",
+                    trade_date=td,
+                    meta=fill_meta,
+                )
+                f["save_status"] = str(result.get("status") or "RECONCILE_UPDATE_FAILED")
+                f["atomic_reconcile_result"] = result
+                if result.get("status") == "OK" and int(prior.get("actual") or 0) == 0:
+                    atomic_count += 1
+                else:
+                    remaining_fills.append(f)
+            except Exception as exc:
+                f["save_status"] = "RECONCILE_UPDATE_FAILED"
+                f["atomic_reconcile_error"] = str(exc)
+                remaining_fills.append(f)
         if len(remaining_fills) != len(fills):
             fills = remaining_fills
             if not fills:
@@ -2057,11 +2841,14 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                             "order_no": str(f.get("order_no") or ""),
                         },
                     ).mappings().first()
-                    if not order_row:
+                    if not order_row and str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED":
                         f["save_status"] = "FILL_ORDER_NOT_FOUND"
                         skipped_duplicates += 1
                         continue
-                    order_epoch_id = _assert_us_order_epoch(dict(order_row), trading_epoch_id)
+                    if order_row:
+                        order_epoch_id = _assert_us_order_epoch(dict(order_row), trading_epoch_id)
+                    elif _is_actual_evidence(evidence):
+                        order_epoch_id = trading_epoch_id
 
                 existing_select_cols = "qty, meta, trading_epoch_id" if order_epoch_id else "qty, meta"
                 existing = conn.execute(
@@ -2153,6 +2940,10 @@ def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> 
     """Structured fill-save result for close/reconcile callers."""
     inserted = save_fills(fills, trade_date=trade_date)
     terminal_statuses = {
+        "UNATTRIBUTED_BROKER_FILL",
+        "BROKER_FILL_IMPORT_PERSIST_FAILED",
+        "BROKER_FILL_RECOVERY_UNAVAILABLE",
+        "EXECUTION_CLAIM_UPDATE_FAILED",
         "EVIDENCE_QUANTITY_REGRESSION",
         "EVIDENCE_QUANTITY_CONFLICT",
         "EVIDENCE_QUANTITY_OVERFLOW",
@@ -2177,6 +2968,10 @@ def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> 
                 "error_status_counts": status_counts, "error": _LAST_SAVE_FILLS_ERROR}
     if status_counts:
         priority = [
+            "UNATTRIBUTED_BROKER_FILL",
+            "BROKER_FILL_RECOVERY_UNAVAILABLE",
+            "BROKER_FILL_IMPORT_PERSIST_FAILED",
+            "EXECUTION_CLAIM_UPDATE_FAILED",
             "EVIDENCE_QUANTITY_OVERFLOW",
             "EVIDENCE_QUANTITY_CONFLICT",
             "EVIDENCE_QUANTITY_REGRESSION",
@@ -2230,7 +3025,8 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
             if trading_epoch_id:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at, trading_epoch_id
+                           order_no, client_order_key, fill_idempotency_key,
+                           filled_at, trading_epoch_id
                 """ + pnl_select + """, meta
                     FROM us_fills
                     WHERE trade_date=:td AND trading_epoch_id=:trading_epoch_id
@@ -2239,7 +3035,8 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
             else:
                 sql = """
                     SELECT trade_date, symbol, exchange, side, qty, price_usd,
-                           order_no, client_order_key, filled_at
+                           order_no, client_order_key, fill_idempotency_key,
+                           filled_at
                 """ + pnl_select + """, meta
                     FROM us_fills
                     WHERE trade_date=:td
@@ -2861,7 +3658,7 @@ def load_us_order_for_fill(
             )
             if order_no_match or (cok and str(o.get("client_order_key") or "") == cok):
                 matches.append(o)
-        return dict(matches[-1]) if matches else {}
+        return dict(matches[0]) if len(matches) == 1 else {}
     try:
         with engine.begin() as conn:
             # Exact lookup remains the fast path.  Bound it to the active
@@ -2871,7 +3668,7 @@ def load_us_order_for_fill(
             epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
             epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
             epoch_select = ", trading_epoch_id" if epoch_id else ""
-            row = conn.execute(text("""
+            rows = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
                        qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
                 FROM us_orders
@@ -2880,10 +3677,11 @@ def load_us_order_for_fill(
                        OR (:cok <> '' AND client_order_key = :cok))
             """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-                LIMIT 1
-            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok, **epoch_params}).mappings().first()
-            if row:
-                return dict(row)
+            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok, **epoch_params}).mappings().all()
+            if len(rows) == 1:
+                return dict(rows[0])
+            if len(rows) > 1:
+                return {}
             if not on_norm:
                 return {}
             candidates = conn.execute(text("""
@@ -2893,12 +3691,13 @@ def load_us_order_for_fill(
             """ + epoch_clause + """
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
             """), {"td": td, "symbol": sym, **epoch_params}).mappings().all()
+            normalized_matches = []
             for candidate in candidates:
                 candidate_dict = dict(candidate)
                 meta = _parse_json_meta(candidate_dict.get("meta"))
                 if normalize_us_order_no(candidate_dict.get("order_no")) == on_norm or normalize_us_order_no(meta.get("order_no_norm")) == on_norm:
-                    return candidate_dict
-            return {}
+                    normalized_matches.append(candidate_dict)
+            return normalized_matches[0] if len(normalized_matches) == 1 else {}
     except Exception as exc:
         logger.warning("[US_ORDER][LOAD_FOR_FILL_WARN] symbol=%s order_no=%s cok=%s err=%s", sym, on, cok, exc)
         return {}
@@ -3030,6 +3829,32 @@ def _active_fill_cumulatives_for_order(
     return result
 
 
+def _record_actual_fill_execution_claim(
+    order_meta: dict, *, cumulative_qty: int, requested_qty: int, evidence: str,
+) -> str | None:
+    if not _is_kis_order_cumulative_evidence(evidence):
+        return None
+    action_key = str(order_meta.get("execution_action_key") or "")
+    attempt_id = str(order_meta.get("submit_attempt_id") or "")
+    if not action_key or not attempt_id:
+        return None
+    try:
+        record_execution_action_observation_by_key(
+            action_key,
+            attempt_id=attempt_id,
+            state="FILLED" if cumulative_qty >= requested_qty else "PARTIALLY_FILLED",
+            cumulative_filled_qty=cumulative_qty,
+            authoritative=True,
+        )
+        return None
+    except Exception as exc:
+        logger.exception(
+            "[US_ORDER][EXECUTION_CLAIM][FILL_UPDATE_FAILED] action_key=%s",
+            action_key,
+        )
+        return str(exc)
+
+
 def mark_order_filled_by_reconcile(
     *, order_no: str, client_order_key: str, symbol: str | None = None,
     side: str | None = None, filled_qty: int, avg_price_usd: float,
@@ -3086,6 +3911,7 @@ def mark_order_filled_by_reconcile(
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", cumulative=observed_cumulative)
         order.update({"status": status, "qty_filled": cumulative, "avg_price_usd": price,
+                      "order_no": order.get("order_no") or on,
                       "updated_at": now_utc, "meta": order_meta})
         if not synthetic and _is_kis_order_cumulative_evidence(evidence):
             for f in _MEM_FILLS:
@@ -3105,7 +3931,11 @@ def mark_order_filled_by_reconcile(
                             and not is_synthetic_fill_meta(f.get("meta")) and int(((f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}).get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or 0) == observed_cumulative for f in _MEM_FILLS)
         delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
         delta = max(0, observed_cumulative - delta_base)
-        fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
+        fill_delta = (
+            observed_cumulative
+            if not synthetic and _is_kis_order_cumulative_evidence(evidence)
+            else delta
+        )
         if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
             fill_delta = 0
         if fill_delta and not actual_exists:
@@ -3138,6 +3968,17 @@ def mark_order_filled_by_reconcile(
                 broker_order_no=on, profit_capture_stage=str(order_meta.get("profit_capture_stage")),
                 order_status=status, evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
             )
+        claim_error = _record_actual_fill_execution_claim(
+            order_meta, cumulative_qty=cumulative, requested_qty=requested, evidence=evidence,
+        )
+        if claim_error:
+            return {
+                **result,
+                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
+                "execution_claim_update_error": claim_error,
+                "requires_reconcile": True,
+                "retry_order": False,
+            }
         return result
     try:
         with engine.begin() as conn:
@@ -3352,7 +4193,18 @@ def mark_order_filled_by_reconcile(
                     profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
                     evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
                 )
-            return result
+        claim_error = _record_actual_fill_execution_claim(
+            merged, cumulative_qty=cumulative, requested_qty=requested, evidence=evidence,
+        )
+        if claim_error:
+            return {
+                **result,
+                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
+                "execution_claim_update_error": claim_error,
+                "requires_reconcile": True,
+                "retry_order": False,
+            }
+        return result
     except FillAccountingInvariantError as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
         return exc.payload

@@ -1466,6 +1466,7 @@ def run_trade_tick(
     ack_recon: dict[str, Any] = {"status": "SKIP", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
     ack_recon_before_route: dict[str, Any] = dict(ack_recon)
     ack_recon_after_route: dict[str, Any] = dict(ack_recon)
+    active_claim_recovery_result: dict[str, Any] = {"status": "SKIP", "unresolved_count": 0}
     fill_save_result: dict[str, Any] = {"status": "OK"}
 
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
@@ -1903,12 +1904,31 @@ def run_trade_tick(
     if not offline:
         _order_reconcile_started = time.monotonic()
         try:
+            from trader.us.execution.order_journal import replay_order_journal
+            active_claim_recovery_result = replay_order_journal(
+                trade_date,
+                session_run_id=session_run_id,
+                tick_id=tick_id,
+                provider=provider,
+                include_active_claims=True,
+                active_claims_only=True,
+            )
+            ack_recon["active_claim_recovery"] = active_claim_recovery_result
+            logger.info("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY] result=%s", active_claim_recovery_result)
+        except Exception as exc:
+            active_claim_recovery_result = {
+                "status": "ERROR", "error": str(exc), "failed_count": 1, "unresolved_count": 1,
+            }
+            ack_recon["active_claim_recovery"] = active_claim_recovery_result
+            logger.error("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY_ERROR] %s", exc)
+        try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon = reconcile_ack_orders_with_balance(
                 provider=provider,
                 trade_date=trade_date,
                 env=env,
             )
+            ack_recon["active_claim_recovery"] = active_claim_recovery_result
             ack_recon_before_route = dict(ack_recon)
             logger.info(
                 "[US_RECONCILE][ACK_RECONCILE][TICK_BEFORE_ROUTE] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
@@ -4046,6 +4066,7 @@ def run_trade_tick(
         "ack_reconcile_before_route_confirmed_count": int(ack_recon_before_route.get("confirmed_count", 0) or 0),
         "ack_reconcile_before_route_balance_reconcile_count": int(ack_recon_before_route.get("balance_reconcile_count", 0) or 0),
         "ack_reconcile_before_route_unresolved_count": int(ack_recon_before_route.get("unresolved_count", 0) or 0),
+        "active_claim_recovery": active_claim_recovery_result,
         "ack_reconcile_after_route_status": ack_recon_after_route.get("status", "SKIP"),
         "ack_reconcile_after_route_pending_count": int(ack_recon_after_route.get("pending_count", 0) or 0),
         "ack_reconcile_after_route_confirmed_count": int(ack_recon_after_route.get("confirmed_count", 0) or 0),

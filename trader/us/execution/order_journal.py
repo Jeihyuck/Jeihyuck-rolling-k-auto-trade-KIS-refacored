@@ -193,10 +193,12 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
     except Exception: wanted_exchange = str(exchange or "").upper()
     try: submitted = datetime.fromisoformat(str(submitted_at_utc).replace("Z", "+00:00"))
     except Exception: return {"status": "AMBIGUOUS_SUBMIT_IDENTITY_INVALID", "matches": []}
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    from zoneinfo import ZoneInfo
+    wanted_trade_date = str(trade_date).replace("-", "")
     eligible = []
     for row in broker_rows or []:
-        row_date = str(row.get("trade_date") or row.get("ord_dt") or "").replace(".", "-")
-        if row_date and row_date.replace("-", "") != trade_date.replace("-", ""): continue
         if str(row.get("symbol") or row.get("pdno") or "").upper() != symbol.upper(): continue
         if str(row.get("side") or "").upper() != side.upper(): continue
         if int(row.get("requested_qty") or row.get("qty") or 0) != int(requested_qty): continue
@@ -205,11 +207,16 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
         if wanted_exchange and row_exchange and row_exchange != wanted_exchange: continue
         row_price = float(row.get("limit_price") or row.get("order_price") or 0)
         if limit_price > 0 and row_price > 0 and abs(row_price - limit_price) > price_tolerance: continue
-        time_raw = row.get("submitted_at_utc") or row.get("order_timestamp") or row.get("observed_at")
+        time_raw = row.get("submitted_at_utc") or row.get("order_timestamp")
         if not time_raw: continue
         try:
             observed = datetime.fromisoformat(str(time_raw).replace("Z", "+00:00"))
             if observed.tzinfo is None: observed = observed.replace(tzinfo=timezone.utc)
+            row_trade_date = str(
+                row.get("us_trade_date")
+                or observed.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+            ).replace("-", "")
+            if row_trade_date != wanted_trade_date: continue
             if abs((observed - submitted).total_seconds()) > window: continue
         except Exception: continue
         eligible.append(row)
@@ -237,11 +244,61 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
 
 
 def replay_order_journal(trade_date: str, session_run_id: str | None = None,
-                         tick_id: str | None = None, provider: Any | None = None) -> dict:
+                         tick_id: str | None = None, provider: Any | None = None,
+                         include_active_claims: bool = False,
+                         active_claims_only: bool = False) -> dict:
     """Restore DB evidence and independently classify broker truth; never resubmit."""
     events = load_order_events(trade_date, session_run_id=session_run_id)
     if tick_id:
         events = [e for e in events if e.get("tick_id") == tick_id]
+    active_claim_errors = []
+    active_attempt_keys: set[tuple[str, str]] = set()
+    if include_active_claims:
+        try:
+            from trader.us.db.repos import load_active_execution_claim_attempts
+            active_claims = load_active_execution_claim_attempts()
+            for claim in active_claims:
+                source_date = str(claim.get("trade_date") or "")
+                key = str(claim.get("client_order_key") or "")
+                attempt_id = str(claim.get("active_attempt_id") or "")
+                if not source_date or not key or not attempt_id:
+                    active_claim_errors.append({
+                        "symbol": "", "side": "", "reason": "active_claim_identity_incomplete",
+                    })
+                    continue
+                active_attempt_keys.add((key, attempt_id))
+                if source_date == trade_date and not active_claims_only:
+                    continue
+                source_events = load_order_events(source_date)
+                attempt_events = [
+                    event for event in source_events
+                    if str(event.get("client_order_key") or "") == key
+                    and str(event.get("submit_attempt_id") or "") == attempt_id
+                ]
+                if not any(event.get("event_type") == "BROKER_SUBMIT_STARTED" for event in attempt_events):
+                    active_claim_errors.append({
+                        "symbol": "", "side": "", "reason": "active_claim_submit_journal_missing",
+                    })
+                    continue
+                events.extend(attempt_events)
+        except Exception as exc:
+            active_claim_errors.append({
+                "symbol": "", "side": "", "reason": f"active_claim_lookup_failed:{type(exc).__name__}",
+            })
+    if active_claims_only:
+        events = [
+            event for event in events
+            if (
+                str(event.get("client_order_key") or ""),
+                str(event.get("submit_attempt_id") or ""),
+            ) in active_attempt_keys
+        ]
+        unique_events = {}
+        for event in events:
+            event_id = str(event.get("event_id") or "")
+            identity = event_id or repr(sorted(event.items()))
+            unique_events[identity] = event
+        events = list(unique_events.values())
     grouped: dict[str, list[dict]] = {}
     for event in events:
         key = str(event.get("client_order_key") or "").strip()
@@ -251,6 +308,22 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
               "broker_rejected_count": 0, "broker_unknown_count": 0,
               "identity_mismatch_count": 0, "failed_count": 0}
     unresolved_symbol_sides: list[list[str]] = []
+    for error in active_claim_errors:
+        counts["failed_count"] += 1
+        unresolved_symbol_sides.append([error["symbol"], error["side"]])
+    if active_claims_only and not events:
+        unresolved = counts["failed_count"]
+        return {
+            "status": "ERROR" if unresolved else "OK",
+            **counts,
+            "restored_ack_count": 0,
+            "filled_count": 0,
+            "broker_confirmed_count": 0,
+            "unresolved_count": unresolved,
+            "unresolved_symbol_sides": unresolved_symbol_sides,
+            "events_scanned": 0,
+            "balance_fetched": False,
+        }
     from trader.us.db.repos import save_order_ack, mark_order_filled_by_reconcile, apply_broker_order_observation
     from trader.us.utils.order_no import normalize_us_order_no
     # Query authoritative snapshots once per timeout, not once per journal row.
@@ -278,15 +351,23 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     for key, order_events in grouped.items():
         latest = order_events[-1]; types = {e.get("event_type") for e in order_events}
         if "BROKER_SUBMIT_STARTED" not in types: continue
+        event_trade_date = str(latest.get("trade_date") or trade_date)
+        event_orders = today_orders
+        if provider is not None and event_trade_date != trade_date:
+            try:
+                method = getattr(provider, "get_today_orders", None)
+                event_orders = method(trade_date=event_trade_date) if callable(method) else None
+            except Exception:
+                event_orders = None
         append_order_event("JOURNAL_REPLAY_STARTED", latest)
         ack = next((e for e in reversed(order_events) if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}), None)
         symbol, side, requested = str(latest.get("symbol") or "").upper(), str(latest.get("side") or "").upper(), int(latest.get("qty") or 0)
         if not ack or not str(ack.get("broker_order_no") or ""):
             match = match_ambiguous_submit_to_broker_order(
-                trade_date=trade_date, symbol=symbol, side=side, requested_qty=requested,
+                trade_date=event_trade_date, symbol=symbol, side=side, requested_qty=requested,
                 limit_price=float(latest.get("limit_price") or 0),
                 submitted_at_utc=str(latest.get("submitted_at_utc") or latest.get("timestamp") or ""),
-                exchange=str(latest.get("exchange") or ""), broker_rows=today_orders or [])
+                exchange=str(latest.get("exchange") or ""), broker_rows=event_orders or [])
             if match.get("status") != "MATCHED":
                 counts["broker_unknown_count"] += 1; unresolved_symbol_sides.append([symbol, side])
                 append_order_event("JOURNAL_REPLAY_UNRESOLVED", latest, broker_status=str(match.get("status")), raw_response={"candidate_count": len(match.get("matches") or [])}); continue
@@ -303,7 +384,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 "position_lifecycle_id": ack.get("position_lifecycle_id") or (ack.get("meta") or {}).get("position_lifecycle_id")}
             if save_order_ack({"client_order_key": key,"symbol": symbol,"exchange": ack.get("exchange"),"side": side,
                 "qty_requested": requested,"qty_filled": 0,"order_no": order_no,"status": "ACK",
-                "meta": recovered_meta}, trade_date=trade_date):
+                "meta": recovered_meta}, trade_date=event_trade_date):
                 counts["db_ack_restored_count"] += 1
                 append_order_event("JOURNAL_REPLAY_DB_ACK_RESTORED", ack, broker_order_no=order_no, broker_status="JOURNAL_ACK_DB_RESTORED")
             broker_fill = None
@@ -311,7 +392,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 detail = getattr(provider, "get_fills_by_order_no", None)
                 if callable(detail):
                     try:
-                        broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=trade_date)
+                        broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=event_trade_date)
                     except TypeError as exc:
                         counts["failed_count"] += 1
                         unresolved_symbol_sides.append([symbol, side])
@@ -357,25 +438,48 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 if str(broker_fill.get("symbol") or symbol).upper()!=symbol or str(broker_fill.get("side") or side).upper()!=side:
                     counts["identity_mismatch_count"] += 1; unresolved_symbol_sides.append([symbol,side]); continue
                 cumulative=int(broker_fill["filled_qty"])
-                result=mark_order_filled_by_reconcile(order_no=order_no,client_order_key=key,symbol=symbol,side=side,
-                    filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,
-                    avg_price_usd=float(broker_fill.get("avg_price") or 0),source="fills_by_order_no",
-                    evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",trade_date=trade_date,meta={**recovered_meta, "journal_replay":True})
+                fill_price = float(broker_fill.get("avg_price") or broker_fill.get("avg_price_usd") or 0)
+                result = apply_broker_order_observation(
+                    trade_date=event_trade_date,
+                    client_order_key=key,
+                    raw_order_no=order_no,
+                    canonical_order_no=normalize_us_order_no(order_no),
+                    symbol=symbol,
+                    side=side,
+                    requested_qty=requested,
+                    filled_qty=cumulative,
+                    remaining_qty=max(0, requested - cumulative),
+                    broker_status="FILLED" if cumulative >= requested else "PARTIALLY_FILLED",
+                    evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+                    observed_at=broker_fill.get("observed_at"),
+                    raw_row={**broker_fill, "requested_qty": requested, "avg_price": fill_price},
+                )
                 if result.get("status") == "EVIDENCE_QUANTITY_CONFLICT":
                     counts["identity_mismatch_count"] += 1; unresolved_symbol_sides.append([symbol,side])
                     append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="EVIDENCE_QUANTITY_CONFLICT", raw_response=result)
                     continue
                 if result.get("status") != "OK": raise RuntimeError(result.get("status"))
+                if result.get("observation_ignored"):
+                    counts["failed_count"] += 1
+                    unresolved_symbol_sides.append([symbol, side])
+                    append_order_event(
+                        "JOURNAL_REPLAY_FAILED",
+                        ack,
+                        broker_order_no=order_no,
+                        broker_status=str(result["observation_ignored"]),
+                        raw_response=result,
+                    )
+                    continue
                 bucket="broker_full_fill_count" if cumulative>=requested else "broker_partial_fill_count"; counts[bucket]+=1
                 append_order_event("JOURNAL_REPLAY_FILL_CONFIRMED",ack,broker_order_no=order_no,
                                    broker_status="BROKER_FILL_CONFIRMED" if cumulative>=requested else "BROKER_PARTIAL_FILL_CONFIRMED")
                 append_order_event("ORDER_FILLED" if cumulative>=requested else "ORDER_PARTIALLY_FILLED", ack,
                     broker_order_no=order_no, broker_status="FILLED" if cumulative>=requested else "PARTIALLY_FILLED",
-                    raw_response={"cumulative_filled_qty": cumulative, "fill_price": float(broker_fill.get("avg_price") or 0),
+                    raw_response={"cumulative_filled_qty": cumulative, "fill_price": fill_price,
                                   "execution_timestamp": broker_fill.get("execution_timestamp") or broker_fill.get("observed_at"),
                                   "broker_execution_id": broker_fill.get("broker_execution_id"), "fees": broker_fill.get("fees")})
             else:
-                broker_order = next((o for o in (today_orders or []) if normalize_us_order_no(o.get("order_no") or o.get("odno"))==normalize_us_order_no(order_no) and str(o.get("symbol") or o.get("pdno") or symbol).upper()==symbol and str(o.get("side") or side).upper()==side),None)
+                broker_order = next((o for o in (event_orders or []) if normalize_us_order_no(o.get("order_no") or o.get("odno"))==normalize_us_order_no(order_no) and str(o.get("symbol") or o.get("pdno") or symbol).upper()==symbol and str(o.get("side") or side).upper()==side),None)
                 if broker_order:
                     broker_symbol=str(broker_order.get("symbol") or broker_order.get("pdno") or symbol).upper()
                     broker_side=str(broker_order.get("side") or side).upper()
@@ -383,15 +487,26 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         counts["identity_mismatch_count"]+=1; unresolved_symbol_sides.append([symbol,side])
                     else:
                         observed_status = str(broker_order.get("status") or "ACK").upper()
-                        result = apply_broker_order_observation(trade_date=trade_date, client_order_key=key,
+                        result = apply_broker_order_observation(trade_date=event_trade_date, client_order_key=key,
                             raw_order_no=str(broker_order.get("raw_order_no") or broker_order.get("order_no") or order_no),
                             canonical_order_no=normalize_us_order_no(broker_order.get("order_no") or order_no),
                             symbol=symbol, side=side, requested_qty=requested,
-                            filled_qty=int(broker_order.get("filled_qty") or 0),
+                            filled_qty=broker_order.get("filled_qty"),
                             remaining_qty=int(broker_order.get("remaining_qty") or requested),
                             broker_status=observed_status, evidence_type="KIS_ORDER_STATUS_ACTUAL",
                             observed_at=broker_order.get("observed_at"), raw_row=broker_order)
                         if result.get("status") != "OK": raise RuntimeError(result.get("status"))
+                        if result.get("requires_reconcile"):
+                            counts["broker_unknown_count"] += 1
+                            unresolved_symbol_sides.append([symbol, side])
+                            append_order_event(
+                                "JOURNAL_REPLAY_UNRESOLVED",
+                                ack,
+                                broker_order_no=order_no,
+                                broker_status=str(result.get("filled_quantity_status") or observed_status),
+                                raw_response=result,
+                            )
+                            continue
                         if observed_status in {"REJECTED","REJECT","CANCELLED","CANCELED","EXPIRED"}: counts["broker_rejected_count"]+=1
                         else: counts["broker_unfilled_ack_count"]+=1
                 else:
@@ -413,7 +528,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                             result=mark_order_filled_by_reconcile(order_no=order_no,client_order_key=key,symbol=symbol,side=side,
                                 filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,
                                 avg_price_usd=float(latest.get("limit_price") or latest.get("price") or 0),source="journal_replay_balance_delta",
-                                evidence_type="BALANCE_DELTA_SYNTHETIC",trade_date=trade_date,meta={"journal_replay":True})
+                                evidence_type="BALANCE_DELTA_SYNTHETIC",trade_date=event_trade_date,meta={"journal_replay":True})
                             if result.get("status") != "OK": raise RuntimeError(result.get("status"))
                             counts["broker_full_fill_count" if cumulative>=requested else "broker_partial_fill_count"] += 1
                             append_order_event("JOURNAL_REPLAY_FILL_CONFIRMED",ack,broker_order_no=order_no,

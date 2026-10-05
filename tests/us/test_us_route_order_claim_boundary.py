@@ -393,9 +393,12 @@ def test_reconcile_cancel_requires_authoritative_zero_fill_before_retry(monkeypa
 
     authoritative_zero = repos.apply_broker_order_observation(
         **observation,
-        raw_row={"requested_qty": 5, "filled_qty": 0, "remaining_qty": 5},
+        raw_row={"requested_qty": 5, "filled_qty": 0, "remaining_qty": 0},
     )
     assert authoritative_zero["order_status"] == "CANCELLED"
+    assert authoritative_zero["authoritative"] is True
+    assert authoritative_zero["semantic_action_remaining_qty"] == 5
+    assert authoritative_zero["broker_open_qty"] == 0
     assert claim_repo.get(identity).action_state == "RETRYABLE"
 
     retried = route_order(
@@ -431,7 +434,7 @@ def test_reconcile_partial_cancel_preserves_fill_and_retries_only_remainder(monk
     raw_row = {
         "requested_qty": 5,
         "filled_qty": 2,
-        "remaining_qty": 3,
+        "remaining_qty": 0,
         "avg_price": 10.0,
     }
     first = repos.apply_broker_order_observation(**observation, raw_row=raw_row)
@@ -439,6 +442,9 @@ def test_reconcile_partial_cancel_preserves_fill_and_retries_only_remainder(monk
     snapshot = claim_repo.get(_identity("2026-10-02"))
 
     assert first["order_status"] == second["order_status"] == "CANCELLED"
+    assert first["authoritative"] is True
+    assert first["semantic_action_remaining_qty"] == 3
+    assert first["broker_open_qty"] == 0
     assert snapshot.action_state == "PARTIALLY_SATISFIED"
     assert snapshot.cumulative_filled_qty == 2
     assert snapshot.remaining_target_qty == 3
@@ -451,6 +457,149 @@ def test_reconcile_partial_cancel_preserves_fill_and_retries_only_remainder(monk
     assert retried["status"] == "ACK"
     assert broker.calls == 2
     assert retried["intent"]["qty"] == 3
+
+
+@pytest.mark.parametrize(
+    (
+        "filled_qty", "open_qty", "include_requested", "include_filled",
+        "include_open", "expected_cancelled", "expected_claim",
+    ),
+    [
+        (0, 0, True, True, True, 1, "RETRYABLE"),
+        (2, 0, True, True, True, 1, "PARTIALLY_SATISFIED"),
+        (None, 0, True, False, True, 0, "UNCERTAIN"),
+        (0, None, True, True, False, 0, "UNCERTAIN"),
+        (0, 0, False, True, True, 0, "UNCERTAIN"),
+    ],
+    ids=(
+        "zero-fill-terminal", "partial-fill-terminal", "missing-fill",
+        "missing-open-qty", "missing-requested-qty",
+    ),
+)
+def test_reconcile_terminal_cancel_requires_complete_endpoint_evidence(
+    monkeypatch, filled_qty, open_qty, include_requested, include_filled,
+    include_open, expected_cancelled, expected_claim,
+):
+    from trader.us.db import repos
+    from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+
+    save_ack = repos.save_order_ack
+    _engine, claim_repo, broker = _route_fixture(monkeypatch)
+    repos = _enable_in_memory_reconciliation(monkeypatch, claim_repo, save_ack)
+    intent = _intent("2026-10-02", qty=5, action="CANCEL_CASE")
+    assert route_order(intent, kis_client=broker)["status"] == "ACK"
+
+    class Provider:
+        def get_balance(self, **_kwargs):
+            return {"positions": []}
+
+        def get_fills_by_order_no(self, **_kwargs):
+            row = {
+                "status": "CANCELLED",
+                "avg_price": 10.0,
+            }
+            if include_requested:
+                row.update({"requested_qty": 5, "requested_qty_present": True})
+            else:
+                row["requested_qty_present"] = False
+            if include_filled:
+                row.update({"filled_qty": filled_qty, "filled_qty_present": True})
+            else:
+                row["filled_qty_present"] = False
+            if include_open:
+                row.update({"remaining_qty": open_qty, "remaining_qty_present": True})
+            else:
+                row["remaining_qty_present"] = False
+            return row
+
+    result = reconcile_ack_orders_with_balance(
+        provider=Provider(), trade_date="2026-10-02",
+    )
+    identity = _identity("2026-10-02", "CANCEL_CASE")
+
+    assert result["cancelled_count"] == expected_cancelled
+    assert result["unresolved_count"] == (0 if expected_cancelled else 1)
+    assert claim_repo.get(identity).action_state == expected_claim
+    assert claim_repo.health()["unresolved_execution_actions"] == int(
+        expected_claim == "UNCERTAIN"
+    )
+    assert repos._MEM_ORDERS[0]["status"] == "CANCELLED"
+    if filled_qty:
+        assert repos._MEM_ORDERS[0]["qty_filled"] == filled_qty
+        assert claim_repo.get(identity).cumulative_filled_qty == filled_qty
+
+
+def test_reconcile_repeated_terminal_cancel_is_idempotent(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+
+    save_ack = repos.save_order_ack
+    _engine, claim_repo, broker = _route_fixture(monkeypatch)
+    repos = _enable_in_memory_reconciliation(monkeypatch, claim_repo, save_ack)
+    intent = _intent("2026-10-02", qty=5, action="CANCEL_REPEAT")
+    assert route_order(intent, kis_client=broker)["status"] == "ACK"
+
+    class Provider:
+        def get_balance(self, **_kwargs):
+            return {"positions": []}
+
+        def get_fills_by_order_no(self, **_kwargs):
+            return {
+                "status": "CANCELLED",
+                "requested_qty": 5,
+                "requested_qty_present": True,
+                "filled_qty": 0,
+                "filled_qty_present": True,
+                "remaining_qty": 0,
+                "remaining_qty_present": True,
+            }
+
+    first = reconcile_ack_orders_with_balance(provider=Provider(), trade_date="2026-10-02")
+    state_after_first = claim_repo.get(_identity("2026-10-02", "CANCEL_REPEAT")).action_state
+    second = reconcile_ack_orders_with_balance(provider=Provider(), trade_date="2026-10-02")
+
+    assert first["cancelled_count"] == 1
+    assert second["cancelled_count"] == 0
+    assert second["unresolved_count"] == 0
+    assert state_after_first == "RETRYABLE"
+    assert claim_repo.get(_identity("2026-10-02", "CANCEL_REPEAT")).action_state == "RETRYABLE"
+    assert repos._MEM_ORDERS[0]["qty_filled"] == 0
+
+
+def test_reconcile_does_not_count_non_authoritative_ok_cancel_as_clean(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+
+    save_ack = repos.save_order_ack
+    _engine, _claim_repo, broker = _route_fixture(monkeypatch)
+    repos = _enable_in_memory_reconciliation(monkeypatch, _claim_repo, save_ack)
+    intent = _intent("2026-10-02", qty=5, action="CANCEL_NONAUTH")
+    assert route_order(intent, kis_client=broker)["status"] == "ACK"
+    monkeypatch.setattr(
+        repos,
+        "apply_broker_order_observation",
+        lambda **_kwargs: {
+            "status": "OK", "order_status": "CANCELLED",
+            "authoritative": False, "requires_reconcile": True,
+        },
+    )
+
+    class Provider:
+        def get_balance(self, **_kwargs):
+            return {"positions": []}
+
+        def get_fills_by_order_no(self, **_kwargs):
+            return {
+                "status": "CANCELLED", "requested_qty": 5,
+                "filled_qty": 0, "remaining_qty": 0,
+            }
+
+    result = reconcile_ack_orders_with_balance(
+        provider=Provider(), trade_date="2026-10-02",
+    )
+
+    assert result["cancelled_count"] == 0
+    assert result["unresolved_count"] == 1
 
 
 def test_route_filled_tp1_leaves_tp2_and_tp3_eligible(monkeypatch):
@@ -616,6 +765,12 @@ def test_tqqq_run_sleeve_uses_cycle_lifecycle_and_one_daily_buy_action(monkeypat
 
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("DISABLE_REAL_TRADING", "0")
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
     monkeypatch.setenv("US_BLOCK_NEW_ENTRY_AFTER_ET", "23:59")
     _engine, claim_repo, broker = _route_fixture(
         monkeypatch, fail_submit=True, production_identity=True,
@@ -1009,7 +1164,7 @@ def test_unresolved_sell_blocks_emergency_until_reconciled_remaining_qty(monkeyp
         raw_row={
             "requested_qty": 3,
             "filled_qty": 1,
-            "remaining_qty": 2,
+            "remaining_qty": 0,
             "avg_price": 10.0,
         },
     )
