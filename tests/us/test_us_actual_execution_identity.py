@@ -18,9 +18,19 @@ def _seed(monkeypatch):
 def test_get_fills_today_returns_order_cumulative_snapshot_without_execution_identity():
     fill=get_fills_today(provider=Provider([_raw(cumulative='7', remaining='3')]), trade_date='2026-07-17')['fills'][0]
     assert fill['fill_evidence_type']=='KIS_ORDER_CUMULATIVE_ACTUAL'
-    assert fill['order_timestamp']=='2026-07-17T09:30:01'
+    assert fill['order_timestamp']=='2026-07-17T09:30:01+09:00'
+    assert fill['order_timestamp_utc']=='2026-07-17T00:30:01+00:00'
     assert fill['requested_qty']==10 and fill['cumulative_filled_qty']==7 and fill['remaining_qty']==3
     assert 'broker_execution_id' not in fill and 'execution_sequence' not in fill and 'execution_timestamp' not in fill
+
+
+def test_get_fills_today_does_not_coerce_missing_cumulative_quantity_to_zero():
+    response = get_fills_today(
+        provider=Provider([_raw(cumulative=None, remaining='10')]),
+        trade_date='2026-07-17',
+    )
+    assert response["status"] == "OK"
+    assert response["fills"] == []
 
 def test_cumulative_progress_updates_one_active_row(monkeypatch):
     _seed(monkeypatch)

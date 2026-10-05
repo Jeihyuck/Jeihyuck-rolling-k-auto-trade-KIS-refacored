@@ -86,6 +86,126 @@ def test_ack_reconcile_rejects_regressed_provider_snapshot(monkeypatch):
     assert calls == []
 
 
+def test_authoritative_zero_fill_rejection_releases_claim_for_fresh_retry(monkeypatch, tmp_path):
+    from datetime import date
+    import sqlalchemy as sa
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db import repos
+    from trader.us.db.execution_claim_schema import (
+        metadata,
+        us_execution_attempts,
+        us_execution_claims,
+    )
+    from trader.us.execution.order_journal import append_order_event
+    from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'reject-claim.sqlite'}")
+    metadata.create_all(engine)
+    claim_repo = DurableExecutionClaimRepo(
+        engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    identity = SemanticActionIdentity(
+        env="practice",
+        account_id="reject-recovery-account",
+        market="US",
+        trading_epoch_id="reject-recovery-epoch",
+        strategy_owner="US_STANDARD",
+        lifecycle_id="reject-recovery-lifecycle",
+        action="SELL_TRIM",
+        trade_date=date.fromisoformat("2026-10-05"),
+    )
+    attempt_id = "reject-attempt-1"
+    client_order_key = "reject-order-key"
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt_id, requested_qty=2,
+        client_order_key=client_order_key,
+    ).acquired
+    claim_repo.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    intent = {
+        "trade_date": "2026-10-05",
+        "client_order_key": client_order_key,
+        "submit_attempt_id": attempt_id,
+        "symbol": "REJECT_TEST",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty": 2,
+        "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": "reject-recovery-lifecycle",
+        "meta": {
+            "execution_action_key": identity.action_key,
+            "submit_attempt_id": attempt_id,
+            "strategy_owner": "US_STANDARD",
+            "position_lifecycle_id": "reject-recovery-lifecycle",
+        },
+    }
+    assert repos.save_order_intent(intent, trade_date="2026-10-05")
+    assert repos.save_order_ack({
+        **intent,
+        "qty_requested": 2,
+        "qty_filled": 0,
+        "order_no": "reject-broker-order",
+        "status": "ACK",
+        "meta": intent["meta"],
+    }, trade_date="2026-10-05")
+    append_order_event("BROKER_SUBMIT_STARTED", intent)
+    append_order_event(
+        "BROKER_ACK_RECEIVED", intent, broker_order_no="reject-broker-order",
+    )
+
+    class Provider:
+        def get_balance(self, **_kwargs):
+            return {"positions": []}
+
+        def get_fills_by_order_no(self, **_kwargs):
+            return {
+                "status": "REJECTED",
+                "requested_qty": 2,
+                "filled_qty": 0,
+                "symbol": "REJECT_TEST",
+                "side": "SELL",
+                "order_no": "reject-broker-order",
+            }
+
+    result = reconcile_ack_orders_with_balance(
+        provider=Provider(), trade_date="2026-10-05",
+    )
+
+    assert result["status"] == "OK"
+    assert result["rejected_count"] == 1
+    assert result["unresolved_count"] == 0
+    assert repos._MEM_ORDERS[0]["status"] == "REJECTED"
+    assert claim_repo.get(identity).action_state == "RETRYABLE"
+    assert claim_repo.get(identity).active_attempt_id is None
+    retry = claim_repo.acquire(
+        identity, attempt_id="reject-attempt-2", requested_qty=2,
+        fresh_validation=True, client_order_key="reject-order-key-retry",
+    )
+    assert retry.acquired
+    engine.dispose()
+
+
+def test_rejection_without_explicit_zero_fill_evidence_stays_fenced(monkeypatch, tmp_path):
+    from trader.us.execution.reconcile import is_terminal_zero_fill_rejection
+
+    assert not is_terminal_zero_fill_rejection({
+        "status": "REJECTED", "requested_qty": 2,
+    })
+    assert not is_terminal_zero_fill_rejection({
+        "status": "REJECTED", "requested_qty": 2, "filled_qty": 1,
+    })
+    assert is_terminal_zero_fill_rejection({
+        "status": "거부", "requested_qty": 2, "filled_qty": 0,
+    })
+
+
 def test_close_does_not_retry_reconcile_without_trade_date(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     calls = []
@@ -432,4 +552,3 @@ def test_unvalidated_terminal_transition_still_cannot_supersede_cancel(monkeypat
     assert result["observation_ignored"] == "ORDER_OBSERVATION_IGNORED_STALE"
     assert repos._MEM_ORDERS[0]["status"] == "CANCELLED"
     assert repos._MEM_FILLS == []
-

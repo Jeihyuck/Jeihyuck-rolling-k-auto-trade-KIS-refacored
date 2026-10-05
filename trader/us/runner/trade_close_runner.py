@@ -115,7 +115,20 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "unresolved_count": 0,
             "failed_count": 0,
         }
+        active_claim_recovery_result: dict = {"status": "SKIP", "unresolved_count": 0}
         if not offline:
+            try:
+                from trader.us.execution.order_journal import replay_order_journal
+                active_claim_recovery_result = replay_order_journal(
+                    trade_date, provider=provider, include_active_claims=True,
+                )
+                logger.info("[US_TRADE_CLOSE][ACTIVE_CLAIM_RECOVERY] result=%s", active_claim_recovery_result)
+            except Exception as exc:
+                active_claim_recovery_result = {
+                    "status": "ERROR", "error": str(exc), "failed_count": 1, "unresolved_count": 1,
+                }
+                logger.error("[US_TRADE_CLOSE][ACTIVE_CLAIM_RECOVERY_ERROR] %s", exc)
+            ack_reconcile_result["active_claim_recovery"] = active_claim_recovery_result
             try:
                 from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
                 ack_reconcile_result = reconcile_ack_orders_with_balance(
@@ -123,6 +136,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                     trade_date=trade_date,
                     env=env,
                 )
+                ack_reconcile_result["active_claim_recovery"] = active_claim_recovery_result
                 logger.info("[US_TRADE_CLOSE][ACK_RECONCILE] result=%s", ack_reconcile_result)
             except Exception as exc:
                 ack_reconcile_result = {
@@ -245,9 +259,32 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 close_order_classification = {"status": "ERROR", "error": str(exc), "orders": [], "counts": {}, "pending_order_count": 0}
                 logger.warning("[US_TRADE_CLOSE][WARN] order final classification failed: %s", exc)
 
+        broker_recovery_health: dict = {"available": False, "reason": "offline_mode"}
+        if not offline:
+            try:
+                from trader.us.db.repos import load_broker_recovery_health
+                broker_recovery_health = load_broker_recovery_health(trade_date)
+            except Exception as exc:
+                broker_recovery_health = {
+                    "available": False,
+                    "recovery_health_error_count": 1,
+                    "error": type(exc).__name__,
+                }
+                logger.error("[US_TRADE_CLOSE][BROKER_RECOVERY_HEALTH_ERROR] %s", exc)
+            try:
+                broker_recovery_health["unresolved_execution_actions"] = max(
+                    int(broker_recovery_health.get("unresolved_execution_actions") or 0),
+                    int(active_claim_recovery_result.get("unresolved_count") or 0),
+                )
+            except (TypeError, ValueError, OverflowError):
+                broker_recovery_health["unresolved_execution_actions"] = 1
+
         # 8. Daily report
         try:
-            from trader.us.runner.daily_report_runner import run_daily_report
+            from trader.us.runner.daily_report_runner import (
+                _broker_recovery_health_errors,
+                run_daily_report,
+            )
             final_positions_authoritative = bool(
                 reconcile_result.get("status") == "OK"
                 and reconcile_result.get("balance_fetch_status") == "OK"
@@ -265,16 +302,30 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 env=env, session="close", trade_date=trade_date, offline=offline,
                 final_balance=direct_balance, final_positions=direct_positions, kis_fills=fills,
                 close_order_classification=close_order_classification, close_run_id=run_id,
+                broker_recovery_health=broker_recovery_health,
             )
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] daily report failed: %s", exc)
             daily_report_result = {"status": "ERROR", "report": {"report_consistency": "REPORT_INCONSISTENT"}}
+            from trader.us.runner.daily_report_runner import _broker_recovery_health_errors
 
         # 9. Status 계산
         status = "OK"
         daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
         pending_count = int(close_order_classification.get("pending_order_count") or 0)
         report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
+        from trader.us.runner.daily_report_runner import worsen_consistency
+
+        broker_recovery_integrity_errors = (
+            _broker_recovery_health_errors(broker_recovery_health) if not offline else []
+        )
+        report_errors = (daily_report_result.get("report") or {}).get("errors") or []
+        missing_sell_cost_basis = any(
+            "ERROR_MISSING_SELL_COST_BASIS" in str(error) for error in report_errors
+        ) or any(
+            "FILLED_SELL_COST_BASIS_MISSING" in error
+            for error in broker_recovery_integrity_errors
+        )
         reconcile_status = str(reconcile_result.get("status") or "UNKNOWN").upper()
         ack_reconcile_status = str(ack_reconcile_result.get("status") or "UNKNOWN").upper()
         ack_reconcile_failed = bool(
@@ -297,14 +348,30 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "EVIDENCE_QUANTITY_REGRESSION",
             "EVIDENCE_QUANTITY_CONFLICT",
             "EVIDENCE_QUANTITY_OVERFLOW",
+            "TEMP_ERROR",
         }
+        final_balance_unresolved = not offline and (
+            reconcile_status == "TEMP_ERROR"
+            or str(reconcile_result.get("balance_fetch_status") or "").upper()
+            in {"FAILED", "ERROR", "TEMP_ERROR"}
+        )
+        if final_balance_unresolved:
+            report_consistency = worsen_consistency(report_consistency, "FAILED")
+            report_data = daily_report_result.setdefault("report", {})
+            report_data["report_consistency"] = report_consistency
+            report_data.setdefault("errors", []).append("FINAL_BALANCE_UNRESOLVED")
+            report_data["manual_reconcile_required"] = 1
+            daily_report_result["status"] = "FAILED_RECONCILE"
         if (
             fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}
             or position_snapshot_error
             or reconcile_status in reconcile_error_statuses
             or ack_reconcile_failed
+            or broker_recovery_integrity_errors
+            or missing_sell_cost_basis
         ):
-            report_consistency = "FAILED"
+            report_consistency = worsen_consistency(report_consistency, "FAILED")
+            (daily_report_result.get("report") or {})["report_consistency"] = report_consistency
         report_failed = (
             daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS", "WARNING_OPEN_ORDER_PENDING"}
             or bool((daily_report_result.get("report") or {}).get("errors"))
@@ -315,6 +382,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         elif reconcile_status in reconcile_error_statuses:
             status = "ERROR"
         elif ack_reconcile_failed:
+            status = "ERROR"
+        elif broker_recovery_integrity_errors or missing_sell_cost_basis:
             status = "ERROR"
         elif position_snapshot_error:
             status = "ERROR"
@@ -373,6 +442,16 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "daily_report_status": daily_report_result.get("status"),
             "report_consistency": report_consistency,
             "position_snapshot_error": position_snapshot_error,
+            "broker_recovery_health": broker_recovery_health,
+            "broker_recovery_integrity_errors": broker_recovery_integrity_errors,
+            "manual_reconcile_required": bool(
+                broker_recovery_integrity_errors or missing_sell_cost_basis
+                or report_failed or pending_count > 0
+            ),
+            "reconcile_required": bool(
+                broker_recovery_integrity_errors or missing_sell_cost_basis
+                or report_failed or pending_count > 0
+            ),
         }
     finally:
         release_us_session_running_lock(trade_date, "close", run_id=run_id)

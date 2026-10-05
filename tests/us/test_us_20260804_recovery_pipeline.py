@@ -21,7 +21,8 @@ def _meta():
 def _intent():
     return {"trade_date":"2026-08-04","client_order_key":"K1","submit_attempt_id":"A1",
             "symbol":"JPM","exchange":"NYSE","side":"SELL","qty":2,"limit_price":106,
-            "position_lifecycle_id":"L1","meta":_meta()}
+            "position_lifecycle_id":"L1","submitted_at_utc":"2026-08-04T13:31:00+00:00",
+            "meta":_meta()}
 
 
 class Provider:
@@ -35,7 +36,7 @@ def _row(status="OPEN", order_no="40991", filled=0, remaining=2):
     return {"trade_date":"2026-08-04","symbol":"JPM","side":"SELL","requested_qty":2,
             "filled_qty":filled,"remaining_qty":remaining,"status":status,"order_no":order_no,
             "raw_order_no":order_no,"exchange":"NYSE","limit_price":106,
-            "submitted_at_utc":datetime.now(timezone.utc).isoformat(),"observed_at":datetime.now(timezone.utc).isoformat(),
+            "submitted_at_utc":"2026-08-04T13:31:00+00:00","observed_at":datetime.now(timezone.utc).isoformat(),
             "avg_price":106}
 
 
@@ -88,7 +89,8 @@ def test_explicit_cancel_and_reject_update_db_and_release_tp(tmp_path,monkeypatc
     for status in ("CANCELLED","REJECTED","EXPIRED"):
         case=tmp_path/status; _seed(case,monkeypatch)
         append_order_event("BROKER_ACK_RECEIVED",_intent(),broker_order_no="0000040991",broker_status="ACK")
-        result=replay_order_journal("2026-08-04",provider=Provider([_row(status)]))
+        cancel_row = _row(status, filled=0, remaining=0)
+        result=replay_order_journal("2026-08-04",provider=Provider([cancel_row]))
         assert result["status"]=="OK" and repos._MEM_ORDERS[-1]["status"]==status
         state=repos.load_us_profit_capture_state("2026-08-04",["JPM"],{"JPM":"L1"})["JPM"]
         assert not state["tp1_pending"] and not state["tp1_done"]
@@ -112,7 +114,7 @@ def test_jpm_two_page_provider_pipeline_preserves_all_seven(monkeypatch):
     jpm=[row for row in normalized if row["symbol"]=="JPM"]
     assert len(jpm)==2 and {row["canonical_order_no"] for row in jpm}=={"40991"}
     assert all(row["submitted_at_utc"] for row in normalized)
-    # 09:31:06 EDT == 13:31:06 UTC.  No synthetic timestamp is injected into broker rows.
+    # KIS ord_dt/ord_tmd is source-local KST: 22:31:06 KST == 13:31:06 UTC.
     matched=match_ambiguous_submit_to_broker_order(trade_date="2026-07-16",symbol="JPM",side="SELL",
         requested_qty=2,limit_price=353.69,submitted_at_utc="2026-07-16T13:31:06+00:00",
         exchange="NYSE",broker_rows=normalized)

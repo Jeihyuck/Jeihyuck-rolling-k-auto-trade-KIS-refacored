@@ -24,17 +24,100 @@ _FILL_CONTRACT_ERROR_STATUSES = {
 
 _BROKER_CANCEL_STATUSES = frozenset({
     "CANCELED", "CANCELLED", "CANCEL_COMPLETE", "CANCELLED_COMPLETE",
-    "EXPIRED", "REJECTED", "취소", "취소완료", "거부",
+    "취소", "취소완료",
 })
+_BROKER_REJECT_STATUSES = frozenset({"REJECT", "REJECTED", "거부"})
+
+
+def _terminal_cancel_quantities(observation: dict | None) -> tuple[str, int | None, int | None, int | None]:
+    row = observation or {}
+    status = str(row.get("status") or row.get("order_status") or row.get("ord_status") or "").strip().upper()
+    if row.get("requested_qty_present") is False:
+        return status, None, None, None
+    requested_raw = next(
+        (row[key] for key in ("requested_qty", "qty_requested", "ord_qty", "ft_ord_qty", "ORD_QTY")
+         if row.get(key) not in (None, "")),
+        None,
+    )
+    filled_raw = next(
+        (row[key] for key in ("filled_qty", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
+         if row.get(key) not in (None, "")),
+        None,
+    )
+    remaining_raw = next(
+        (row[key] for key in ("broker_open_qty", "remaining_qty", "rmn_qty", "ord_remn_qty", "nccs_qty")
+         if row.get(key) not in (None, "")),
+        None,
+    )
+    if (
+        row.get("filled_qty_present") is False
+        or row.get("remaining_qty_present") is False
+        or row.get("broker_open_qty_present") is False
+    ):
+        return status, None, None, None
+    if requested_raw is None or filled_raw is None or remaining_raw is None:
+        return status, None, None, None
+    try:
+        requested = int(float(requested_raw))
+        filled = int(float(filled_raw))
+        remaining = int(float(remaining_raw))
+    except (TypeError, ValueError):
+        return status, None, None, None
+    if (
+        requested <= 0 or float(requested_raw) != requested
+        or filled < 0 or float(filled_raw) != filled
+        or remaining < 0 or float(remaining_raw) != remaining
+        or filled > requested
+    ):
+        return status, None, None, None
+    return status, requested, filled, remaining
+
+
+def is_terminal_cancel_observation(observation: dict | None) -> bool:
+    """Require explicit KIS request, cumulative-fill, terminal-status and open-qty evidence."""
+    status, requested, filled, broker_open_qty = _terminal_cancel_quantities(observation)
+    return bool(
+        status in _BROKER_CANCEL_STATUSES
+        and requested is not None and filled is not None and broker_open_qty == 0
+    )
 
 
 def is_terminal_zero_fill_cancel(observation: dict | None) -> bool:
-    """Recognize manual/broker terminal cancellations without inventing a fill."""
+    """Recognize a terminal broker cancellation with explicit zero cumulative fills."""
+    status, requested, filled, broker_open_qty = _terminal_cancel_quantities(observation)
+    return bool(
+        status in _BROKER_CANCEL_STATUSES
+        and requested is not None and filled == 0 and broker_open_qty == 0
+    )
+
+
+def is_terminal_zero_fill_rejection(observation: dict | None) -> bool:
+    """Require explicit request and zero-fill evidence for a terminal rejection."""
     row = observation or {}
     status = str(row.get("status") or row.get("order_status") or row.get("ord_status") or "").strip().upper()
-    filled = int(float(row.get("filled_qty") or row.get("tot_ccld_qty") or 0))
-    remaining = int(float(row.get("remaining_qty") or row.get("rmn_qty") or row.get("ord_remn_qty") or 0))
-    return filled == 0 and remaining == 0 and status in _BROKER_CANCEL_STATUSES
+    if status not in _BROKER_REJECT_STATUSES:
+        return False
+    if row.get("requested_qty_present") is False or row.get("filled_qty_present") is False:
+        return False
+    requested_raw = next(
+        (row[key] for key in ("requested_qty", "qty_requested", "ord_qty", "ft_ord_qty", "ORD_QTY")
+         if row.get(key) not in (None, "")),
+        None,
+    )
+    filled_raw = next(
+        (row[key] for key in ("filled_qty", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
+         if row.get(key) not in (None, "")),
+        None,
+    )
+    try:
+        requested = float(requested_raw)
+        filled = float(filled_raw)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        requested > 0 and requested.is_integer()
+        and filled == 0
+    )
 
 
 def _safe_float(value: Any) -> float:
@@ -489,11 +572,12 @@ def reconcile_ack_orders_with_balance(
             "unresolved_count": 0,
             "open_order_pending_count": 0,
             "cancelled_count": 0,
+            "rejected_count": 0,
             "expired_count": 0,
             "unresolved_error_count": 0,
             "failed_count": 0,
             "confirmed_orders": [],
-            "symbols_by_status": {"confirmed": [], "balance_confirmed": [], "open_order_pending": [], "cancelled": [], "expired": [], "unresolved_error": []},
+            "symbols_by_status": {"confirmed": [], "balance_confirmed": [], "open_order_pending": [], "cancelled": [], "rejected": [], "expired": [], "unresolved_error": []},
             "order_nos_by_status": {"open_order_pending": [], "unresolved_error": []},
         }
 
@@ -516,10 +600,11 @@ def reconcile_ack_orders_with_balance(
     expired_count = 0
     failed_count = 0
     canceled_count = 0
+    rejected_count = 0
     confirmed_orders: list[dict] = []
     symbols_by_status: dict[str, list[str]] = {
         "confirmed": [], "fill_api_confirmed": [], "balance_confirmed": [],
-        "open_order_pending": [], "cancelled": [], "expired": [],
+        "open_order_pending": [], "cancelled": [], "rejected": [], "expired": [],
         "unresolved_error": [], "unresolved": [],
     }
     order_nos_by_status: dict[str, list[str]] = {"open_order_pending": [], "unresolved_error": []}
@@ -568,23 +653,85 @@ def reconcile_ack_orders_with_balance(
                     symbols_by_status["expired"].append(symbol)
                     logger.info("[US_RECONCILE][ACK_EXPIRED] symbol=%s order_no=%s", symbol, order_no)
                     continue
-                if is_terminal_zero_fill_cancel(fills_resp):
+                terminal_status = str(fills_resp.get("status") or "").strip().upper()
+                is_rejection = terminal_status in _BROKER_REJECT_STATUSES
+                if terminal_status in _BROKER_CANCEL_STATUSES or is_rejection:
                     terminal_status = str(fills_resp.get("status") or "CANCELLED").upper()
-                    broker_status = "REJECTED" if terminal_status in {"REJECTED", "거부"} else "CANCELLED"
+                    broker_status = "REJECTED" if is_rejection else "CANCELLED"
+                    terminal_quantities_are_explicit = (
+                        is_terminal_zero_fill_rejection(fills_resp)
+                        if is_rejection else is_terminal_cancel_observation(fills_resp)
+                    )
+                    cumulative_filled_qty = None
+                    if fills_resp.get("filled_qty_present") is not False:
+                        cumulative_filled_qty = next(
+                            (
+                                fills_resp[name]
+                                for name in (
+                                    "filled_qty", "cumulative_filled_qty", "tot_ccld_qty",
+                                    "ft_ccld_qty", "ccld_qty",
+                                )
+                                if fills_resp.get(name) not in (None, "")
+                            ),
+                            None,
+                        )
+                    broker_open_qty = None
+                    if (
+                        fills_resp.get("remaining_qty_present") is not False
+                        and fills_resp.get("broker_open_qty_present") is not False
+                    ):
+                        broker_open_qty = next(
+                            (
+                                fills_resp[name]
+                                for name in (
+                                    "broker_open_qty", "remaining_qty", "rmn_qty",
+                                    "ord_remn_qty", "nccs_qty",
+                                )
+                                if fills_resp.get(name) not in (None, "")
+                            ),
+                            None,
+                        )
+                    try:
+                        semantic_remaining_qty = (
+                            max(0, qty - int(cumulative_filled_qty))
+                            if cumulative_filled_qty is not None else None
+                        )
+                    except (TypeError, ValueError):
+                        semantic_remaining_qty = None
                     mark_result = apply_broker_order_observation(
                         trade_date=trade_date, client_order_key=client_order_key,
                         raw_order_no=order_no, canonical_order_no=normalize_us_order_no(order_no),
-                        symbol=symbol, side=side, requested_qty=qty, filled_qty=0,
-                        remaining_qty=0, broker_status=broker_status,
-                        evidence_type="KIS_TERMINAL_ZERO_FILL", observed_at=fills_resp.get("observed_at"),
+                        symbol=symbol, side=side, requested_qty=qty,
+                        filled_qty=cumulative_filled_qty,
+                        remaining_qty=semantic_remaining_qty,
+                        broker_open_qty=broker_open_qty, broker_status=broker_status,
+                        evidence_type="KIS_TERMINAL_CANCEL", observed_at=fills_resp.get("observed_at"),
                         raw_row=fills_resp,
                     )
-                    if mark_result.get("status") in {"OK", "ORDER_NOT_FOUND", "ORDER_IDENTITY_NOT_UNIQUE"}:
-                        canceled_count += 1
-                        symbols_by_status["cancelled"].append(symbol)
-                        logger.info("[US_RECONCILE][MANUAL_CANCEL] symbol=%s order_no=%s status=%s",
+                    if (
+                        mark_result.get("status") == "OK"
+                        and not mark_result.get("requires_reconcile")
+                        and mark_result.get("authoritative") is True
+                    ):
+                        if is_rejection:
+                            rejected_count += 1
+                            symbols_by_status["rejected"].append(symbol)
+                        else:
+                            canceled_count += 1
+                            symbols_by_status["cancelled"].append(symbol)
+                        logger.info("[US_RECONCILE][TERMINAL_NO_FILL] symbol=%s order_no=%s status=%s",
                                     symbol, order_no, broker_status)
                         continue
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
+                    if mark_result.get("status") != "OK":
+                        failed_count += 1
+                        symbols_by_status["unresolved_error"].append(symbol)
+                    logger.error(
+                        "[US_RECONCILE][TERMINAL_NOT_AUTHORITATIVE] symbol=%s order_no=%s status=%s explicit_quantities=%s result=%r",
+                        symbol, order_no, broker_status, terminal_quantities_are_explicit, mark_result,
+                    )
+                    continue
                 fill_contract_status = str(
                     fills_resp.get("evidence_status") or fills_resp.get("status") or "OK"
                 ).upper()
@@ -844,6 +991,7 @@ def reconcile_ack_orders_with_balance(
         "unresolved_count": unresolved_count,
         "open_order_pending_count": open_order_pending_count,
         "cancelled_count": canceled_count,
+        "rejected_count": rejected_count,
         "expired_count": expired_count,
         "unresolved_error_count": unresolved_count,
         "failed_count": failed_count,

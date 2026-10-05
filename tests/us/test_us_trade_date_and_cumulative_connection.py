@@ -129,6 +129,23 @@ def test_close_persists_explicit_us_trade_date(tmp_path, monkeypatch):
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", reconcile_positions)
     monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", save_position_snapshot)
     monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", save_reconcile_log)
+    monkeypatch.setattr("trader.us.db.repos.load_broker_recovery_health", lambda trade_date: {
+        "available": True,
+        "recovery_health_error_count": 0,
+        "unattributed_broker_fills": 0,
+        "broker_fill_rebound_failure_count": 0,
+        "broker_local_cumulative_fill_mismatch_count": 0,
+        "unresolved_execution_actions": 0,
+        "filled_sell_missing_cost_basis_count": 0,
+    })
+    monkeypatch.setattr(
+        "trader.us.execution.order_journal.replay_order_journal",
+        lambda *args, **kwargs: {"status": "OK", "unresolved_count": 0},
+    )
+    monkeypatch.setattr(
+        "trader.us.execution.reconcile.reconcile_ack_orders_with_balance",
+        lambda **kwargs: {"status": "OK", "unresolved_count": 0, "failed_count": 0},
+    )
     monkeypatch.setattr("trader.us.execution.reconcile.classify_ack_orders_with_final_balance", lambda **kwargs: {"status": "OK", "orders": [], "counts": {}, "pending_order_count": 0})
     monkeypatch.setattr("trader.us.runner.daily_report_runner.run_daily_report", lambda **kwargs: {"status": "OK", "report": {"report_consistency": "OK"}})
 

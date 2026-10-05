@@ -19,11 +19,15 @@ def pg_engine(monkeypatch):
         conn.execute(text("DROP TABLE IF EXISTS us_order_intents CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS us_order_events CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS us_profit_capture_lifecycle CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS us_execution_attempts CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS us_execution_claims CASCADE"))
         # Exercise the same production migrations rather than a test-only schema.
         conn.exec_driver_sql(open("migrations/0038_us_agent_tables.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0047_us_order_events_profit_lifecycle.sql", encoding="utf-8").read())
+        conn.exec_driver_sql(open("migrations/0053_execution_state_claims.sql", encoding="utf-8").read())
+        conn.exec_driver_sql(open("migrations/0054_semantic_action_instances.sql", encoding="utf-8").read())
         # Production has migration 0052's unified trading-epoch columns.  This
         # focused US fixture does not create the KR/state tables required to
         # execute the entire 0052 script, so mirror the US ALTERs that current
@@ -501,6 +505,539 @@ def test_real_postgres_partial_fill_cancel_without_price_stays_unresolved(pg_eng
     assert fill_count == 0
 
 
+def test_real_postgres_rebounds_unique_submit_journal_candidate(pg_engine, monkeypatch, tmp_path):
+    from datetime import date
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts,
+        us_execution_claims,
+    )
+    from trader.us.execution.order_journal import append_order_event
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    trade_date = "2026-10-01"
+    client_key = "recovery-persisted-submit"
+    attempt_id = "recovery-persisted-attempt"
+    lifecycle = "recovery-persisted-cycle"
+    action = "DEFENSE_RISK_OFF_TRIM"
+    identity = SemanticActionIdentity(
+        env="practice",
+        account_id="recovery-postgres-account",
+        market="US",
+        trading_epoch_id="recovery-postgres-epoch",
+        strategy_owner="US_STANDARD",
+        lifecycle_id=lifecycle,
+        action=action,
+        trade_date=date.fromisoformat(trade_date),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt_id, requested_qty=5,
+        client_order_key=client_key,
+    ).acquired
+    claim_repo.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+
+    meta = {
+        "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": lifecycle,
+        "submit_attempt_id": attempt_id,
+        "execution_action_key": identity.action_key,
+        "semantic_action": action,
+        "avg_cost": 42.5,
+        "entry_price": 42.5,
+        "submitted_at_utc": "2026-10-01T15:00:00+00:00",
+    }
+    intent = {
+        "trade_date": trade_date,
+        "client_order_key": client_key,
+        "symbol": "XYZ",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty": 5,
+        "strategy": "us_pb1",
+        "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": lifecycle,
+        "submit_attempt_id": attempt_id,
+        "meta": meta,
+    }
+    assert repos.save_order_intent(intent, trade_date=trade_date)
+    assert repos.save_order_ack(
+        {
+            **intent,
+            "qty_requested": 5,
+            "qty_filled": 0,
+            "status": "PENDING",
+            "order_no": "",
+            "meta": meta,
+        },
+        trade_date=trade_date,
+    )
+    append_order_event("BROKER_SUBMIT_STARTED", intent)
+
+    fill = {
+        "trade_date": trade_date,
+        "symbol": "XYZ",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty": 3,
+        "cumulative_filled_qty": 3,
+        "requested_qty": 5,
+        "broker_open_qty": 2,
+        "price_usd": 44.0,
+        "order_no": "broker-recovery-1",
+        "filled_at": "2026-10-01T15:00:00+00:00",
+        "order_timestamp": "2026-10-02T00:00:00",
+        "order_timestamp_utc": "2026-10-01T15:00:00+00:00",
+        "order_timestamp_source": "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD",
+        "order_timestamp_source_timezone": "Asia/Seoul",
+        "meta": {
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "cumulative_filled_qty": 3,
+            "requested_qty": 5,
+            "broker_open_qty": 2,
+            "order_timestamp": "2026-10-02T00:00:00",
+            "order_timestamp_utc": "2026-10-01T15:00:00+00:00",
+            "order_timestamp_source": "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD",
+            "order_timestamp_source_timezone": "Asia/Seoul",
+            "avg_price_usd": 44.0,
+        },
+    }
+    assert repos.save_fills([fill], trade_date=trade_date) == 1
+
+    with pg_engine.begin() as conn:
+        order = conn.execute(
+            text("SELECT client_order_key,qty_filled,meta FROM us_orders WHERE order_no=:order_no"),
+            {"order_no": "broker-recovery-1"},
+        ).mappings().one()
+        actual_fills = conn.execute(
+            text("SELECT qty,meta FROM us_fills WHERE order_no=:order_no AND meta->>'is_synthetic'='false'"),
+            {"order_no": "broker-recovery-1"},
+        ).mappings().all()
+    assert order["client_order_key"] == client_key
+    assert order["qty_filled"] == 3
+    assert order["meta"]["strategy_owner"] == "US_STANDARD"
+    assert order["meta"]["position_lifecycle_id"] == lifecycle
+    assert order["meta"]["avg_cost"] == 42.5
+    assert order["meta"]["semantic_action"] == action
+    assert len(actual_fills) == 1
+    assert actual_fills[0]["qty"] == 3
+    assert actual_fills[0]["meta"]["strategy_owner"] == "US_STANDARD"
+    assert actual_fills[0]["meta"]["position_lifecycle_id"] == lifecycle
+    assert actual_fills[0]["meta"]["semantic_action"] == action
+    assert actual_fills[0]["meta"]["cost_basis_price_usd"] == 42.5
+    assert actual_fills[0]["meta"]["realized_pnl_usd"] == 4.5
+
+
+def test_real_postgres_nvda_route_journal_recovery_fences_and_rebounds_after_restart(
+    pg_engine, monkeypatch, tmp_path,
+):
+    from sqlalchemy import text
+    from trader.us.execution import order_router
+    from trader.us.execution.order_journal import (
+        load_order_events,
+        replay_order_journal,
+    )
+    from trader.us.execution.order_router import route_order
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts,
+        us_execution_claims,
+    )
+    import trader.us.db.repos as repos
+
+    trade_date = "2026-10-01"
+    journal_dir = tmp_path / "journal"
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(journal_dir))
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *_args, **_kwargs: "incident-epoch")
+    monkeypatch.setattr(order_router, "same_day_semantic_sell_exists", lambda _intent: False)
+    monkeypatch.setattr(
+        "trader.us.execution.order_identity.normalize_and_validate_order_identity",
+        lambda intent, _context: intent,
+    )
+    monkeypatch.setattr(order_router, "canonical_order_risk_check", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+    monkeypatch.setattr(order_router, "assert_order_allowed", lambda *_args, **_kwargs: None)
+
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", claim_repo.acquire)
+    monkeypatch.setattr(repos, "record_execution_action_observation", claim_repo.record_observation)
+    monkeypatch.setattr(repos, "release_execution_action_before_submit", claim_repo.release_before_submit)
+
+    class Broker:
+        calls = 0
+
+        def place_us_sell_order(self, *_args):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("response lost after broker acceptance")
+            return {"ok": True, "order_no": f"nvda-order-{self.calls}"}
+
+    broker = Broker()
+    intent = {
+        "trade_date": trade_date,
+        "client_order_key": "nvda-postgres-ambiguous",
+        "symbol": "NVDA",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty": 3,
+        "limit_price": 90.0,
+        "notional_usd": 270.0,
+        "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": "nvda-postgres-lifecycle",
+        "reason": "DEFENSE_RISK_OFF_TRIM",
+        "semantic_action": "DEFENSE_RISK_OFF_TRIM",
+        "submitted_at_utc": "2026-10-01T14:00:00+00:00",
+        "holding_qty": 10,
+        "orderable_qty": 10,
+        "sellable_qty": 10,
+        "available_qty": 10,
+        "meta": {
+            "strategy_owner": "US_STANDARD",
+            "position_lifecycle_id": "nvda-postgres-lifecycle",
+            "semantic_action": "DEFENSE_RISK_OFF_TRIM",
+            "reason": "DEFENSE_RISK_OFF_TRIM",
+            "avg_cost": 80.0,
+        },
+    }
+
+    first = route_order(intent, kis_client=broker)
+    assert first["status"] == "BROKER_SUBMIT_RESULT_UNKNOWN"
+    assert broker.calls == 1
+    fenced = route_order(
+        {**intent, "trade_date": "2026-10-05", "client_order_key": "nvda-postgres-before-truth"},
+        kis_client=broker,
+    )
+    assert fenced["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert broker.calls == 1
+    submit = next(
+        event for event in load_order_events(trade_date)
+        if event["event_type"] == "BROKER_SUBMIT_STARTED"
+    )
+
+    class BrokerTruth:
+        _offline = False
+        _tick_context = None
+
+        def get_balance(self, **_kwargs):
+            return {"positions": [{"symbol": "NVDA", "qty": 7}]}
+
+        def get_today_orders(self, trade_date):
+            assert trade_date in {"2026-10-01", "2026-10-05"}
+            broker_order_no = (
+                "nvda-broker-order" if trade_date == "2026-10-01"
+                else "nvda-order-2"
+            )
+            return [{
+                "trade_date": trade_date,
+                "order_no": broker_order_no,
+                "symbol": "NVDA",
+                "exchange": "NASDAQ",
+                "side": "SELL",
+                "requested_qty": 3,
+                "filled_qty": 3,
+                "remaining_qty": 0,
+                "limit_price": 90.0,
+                "submitted_at_utc": submit["submitted_at_utc"],
+                "status": "FILLED",
+                "avg_price": 90.0,
+            }]
+
+        def get_fills_by_order_no(self, **_kwargs):
+            return {
+                "order_no": (
+                    "nvda-broker-order" if _kwargs.get("order_no") == "nvda-broker-order"
+                    else "nvda-order-2"
+                ),
+                "symbol": "NVDA",
+                "side": "SELL",
+                "requested_qty": 3,
+                "filled_qty": 3,
+                "remaining_qty": 0,
+                "status": "FILLED",
+                "avg_price": 90.0,
+            }
+
+        def _get_client(self):
+            return self
+
+        def get_us_fills_today(self, **_kwargs):
+            return []
+
+    provider = BrokerTruth()
+    recovery = replay_order_journal(
+        "2026-10-02", provider=provider, include_active_claims=True,
+    )
+    assert recovery["broker_full_fill_count"] == 1
+    with pg_engine.begin() as conn:
+        order = conn.execute(
+            text("""SELECT client_order_key,order_no,qty_filled,status,meta
+                FROM us_orders WHERE order_no='nvda-broker-order'"""),
+        ).mappings().one()
+        fill_count = conn.execute(
+            text("""SELECT COUNT(*) FROM us_fills
+                WHERE order_no='nvda-broker-order' AND meta->>'is_synthetic'='false'"""),
+        ).scalar_one()
+        fill = conn.execute(
+            text("""SELECT meta FROM us_fills
+                WHERE order_no='nvda-broker-order' AND meta->>'is_synthetic'='false'"""),
+        ).mappings().one()
+    assert order["client_order_key"] == intent["client_order_key"]
+    assert order["qty_filled"] == 3
+    assert order["status"] == "FILLED"
+    assert order["meta"]["strategy_owner"] == "US_STANDARD"
+    assert order["meta"]["position_lifecycle_id"] == "nvda-postgres-lifecycle"
+    assert fill_count == 1
+    assert fill["meta"]["strategy_owner"] == "US_STANDARD"
+    assert fill["meta"]["position_lifecycle_id"] == "nvda-postgres-lifecycle"
+    assert fill["meta"]["cost_basis_price_usd"] == 80.0
+    assert fill["meta"]["realized_pnl_usd"] == 30.0
+
+    restarted_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: restarted_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", restarted_repo.acquire)
+    prior_action_key = submit["meta"]["execution_action_key"]
+    assert restarted_repo.get(prior_action_key).action_state == "SATISFIED"
+    repeated_recovery = replay_order_journal(
+        trade_date, provider=provider, include_active_claims=True,
+    )
+    assert repeated_recovery["broker_full_fill_count"] == 1
+    with pg_engine.begin() as conn:
+        repeated_fill_count = conn.execute(
+            text("""SELECT COUNT(*) FROM us_fills
+                WHERE order_no='nvda-broker-order' AND meta->>'is_synthetic'='false'"""),
+        ).scalar_one()
+    assert repeated_fill_count == 1
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""CREATE OR REPLACE FUNCTION fail_nvda_ack_insert()
+            RETURNS trigger AS $$ BEGIN
+                IF NEW.client_order_key = 'nvda-postgres-later-date' THEN
+                    RAISE EXCEPTION 'forced ACK persistence failure';
+                END IF;
+                RETURN NEW;
+            END; $$ LANGUAGE plpgsql"""))
+        conn.execute(text("""CREATE TRIGGER fail_nvda_ack_insert_trigger
+            BEFORE INSERT ON us_orders FOR EACH ROW EXECUTE FUNCTION fail_nvda_ack_insert()"""))
+    later = route_order(
+        {**intent, "trade_date": "2026-10-05", "client_order_key": "nvda-postgres-later-date"},
+        kis_client=broker,
+    )
+    assert later["status"] == "ACK_DB_FAILED"
+    assert broker.calls == 2
+    duplicate = route_order(
+        {**intent, "trade_date": "2026-10-05", "client_order_key": "nvda-postgres-same-day-duplicate"},
+        kis_client=broker,
+    )
+    assert duplicate["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert broker.calls == 2
+    with pg_engine.begin() as conn:
+        conn.execute(text("DROP TRIGGER fail_nvda_ack_insert_trigger ON us_orders"))
+        conn.execute(text("DROP FUNCTION fail_nvda_ack_insert()"))
+    ack_recovery = replay_order_journal(
+        "2026-10-05", provider=provider, include_active_claims=True,
+    )
+    assert ack_recovery["broker_full_fill_count"] == 1
+    later_action_key = later["intent"]["meta"]["execution_action_key"]
+    assert restarted_repo.get(later_action_key).action_state == "SATISFIED"
+    with pg_engine.begin() as conn:
+        ack_recovered_order = conn.execute(
+            text("""SELECT client_order_key,order_no,qty_filled,status
+                FROM us_orders WHERE client_order_key='nvda-postgres-later-date'"""),
+        ).mappings().one()
+    assert ack_recovered_order["order_no"] == "nvda-order-2"
+    assert ack_recovered_order["qty_filled"] == 3
+    assert ack_recovered_order["status"] == "FILLED"
+
+
+def test_real_postgres_ambiguous_candidates_persist_unattributed_fill(pg_engine, monkeypatch, tmp_path):
+    from datetime import date
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts,
+        us_execution_claims,
+    )
+    from trader.us.execution.order_journal import append_order_event
+    import trader.us.db.repos as repos
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    trade_date = "2026-10-01"
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+
+    for owner, lifecycle, suffix in (
+        ("US_STANDARD", "pb1-recovery-cycle", "pb1"),
+        ("TQQQ_INFINITE", "infinite-recovery-cycle", "infinite"),
+    ):
+        client_key = f"recovery-candidate-{suffix}"
+        attempt_id = f"recovery-attempt-{suffix}"
+        identity = SemanticActionIdentity(
+            env="practice",
+            account_id="recovery-postgres-account",
+            market="US",
+            trading_epoch_id="recovery-postgres-epoch",
+            strategy_owner=owner,
+            lifecycle_id=lifecycle,
+            action="DEFENSE_RISK_OFF_TRIM",
+            trade_date=date.fromisoformat(trade_date),
+        )
+        assert claim_repo.acquire(
+            identity, attempt_id=attempt_id, requested_qty=5,
+            client_order_key=client_key,
+        ).acquired
+        claim_repo.record_observation(
+            identity, attempt_id=attempt_id, state="UNRESOLVED",
+            cumulative_filled_qty=None, authoritative=False,
+        )
+        meta = {
+            "strategy_owner": owner,
+            "position_lifecycle_id": lifecycle,
+            "submit_attempt_id": attempt_id,
+            "execution_action_key": identity.action_key,
+            "semantic_action": "DEFENSE_RISK_OFF_TRIM",
+            "submitted_at_utc": "2026-10-01T15:00:00+00:00",
+        }
+        intent = {
+            "trade_date": trade_date,
+            "client_order_key": client_key,
+            "symbol": "XYZ",
+            "exchange": "NASDAQ",
+            "side": "SELL",
+            "qty": 5,
+            "strategy": "us_pb1" if owner == "US_STANDARD" else "tqqq_infinite",
+            "strategy_owner": owner,
+            "position_lifecycle_id": lifecycle,
+            "submit_attempt_id": attempt_id,
+            "meta": meta,
+        }
+        assert repos.save_order_intent(intent, trade_date=trade_date)
+        assert repos.save_order_ack(
+            {
+                **intent,
+                "qty_requested": 5,
+                "qty_filled": 0,
+                "status": "PENDING",
+                "order_no": "",
+            },
+            trade_date=trade_date,
+        )
+        append_order_event("BROKER_SUBMIT_STARTED", intent)
+
+    fill = {
+        "trade_date": trade_date,
+        "symbol": "XYZ",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty": 3,
+        "cumulative_filled_qty": 3,
+        "requested_qty": 5,
+        "broker_open_qty": 2,
+        "price_usd": 44.0,
+        "order_no": "ambiguous-broker-order",
+        "filled_at": "2026-10-01T15:00:00+00:00",
+        "order_timestamp": "2026-10-02T00:00:00",
+        "order_timestamp_utc": "2026-10-01T15:00:00+00:00",
+        "order_timestamp_source": "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD",
+        "order_timestamp_source_timezone": "Asia/Seoul",
+        "meta": {
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "cumulative_filled_qty": 3,
+            "requested_qty": 5,
+            "broker_open_qty": 2,
+            "order_timestamp": "2026-10-02T00:00:00",
+            "order_timestamp_utc": "2026-10-01T15:00:00+00:00",
+            "order_timestamp_source": "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD",
+            "order_timestamp_source_timezone": "Asia/Seoul",
+            "avg_price_usd": 44.0,
+        },
+    }
+    repos.save_fills([fill], trade_date=trade_date)
+
+    from sqlalchemy import text
+    with pg_engine.begin() as conn:
+        fills = conn.execute(
+            text("SELECT client_order_key,meta FROM us_fills WHERE order_no=:order_no"),
+            {"order_no": "ambiguous-broker-order"},
+        ).mappings().all()
+        imported_orders = conn.execute(
+            text("SELECT COUNT(*) FROM us_orders WHERE client_order_key LIKE 'KIS_IMPORTED_%'"),
+        ).scalar_one()
+        claims = conn.execute(
+            text("""SELECT strategy_owner,lifecycle_id,action_state,active_attempt_id
+                FROM us_execution_claims ORDER BY strategy_owner"""),
+        ).mappings().all()
+    assert len(fills) == 1
+    assert fills[0]["meta"]["attribution_status"] == "UNATTRIBUTED"
+    assert fills[0]["meta"]["candidate_count"] == 2
+    assert "strategy_owner" not in fills[0]["meta"]
+    assert imported_orders == 0
+    assert [(row["strategy_owner"], row["lifecycle_id"]) for row in claims] == [
+        ("TQQQ_INFINITE", "infinite-recovery-cycle"),
+        ("US_STANDARD", "pb1-recovery-cycle"),
+    ]
+    assert all(
+        row["action_state"] == "UNCERTAIN" and row["active_attempt_id"]
+        for row in claims
+    )
+
+
+def test_real_postgres_imports_only_after_no_internal_candidate(pg_engine, tmp_path):
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+
+    trade_date = "2026-10-02"
+    fill = {
+        "trade_date": trade_date,
+        "symbol": "ABC",
+        "exchange": "NASDAQ",
+        "side": "SELL",
+        "qty": 2,
+        "cumulative_filled_qty": 2,
+        "requested_qty": 2,
+        "broker_open_qty": 0,
+        "price_usd": 51.0,
+        "order_no": "unmatched-broker-order",
+        "filled_at": "2026-10-02T15:00:00+00:00",
+        "meta": {
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "cumulative_filled_qty": 2,
+            "requested_qty": 2,
+            "broker_open_qty": 0,
+            "avg_price_usd": 51.0,
+        },
+    }
+    repos.save_fills([fill], trade_date=trade_date)
+
+    with pg_engine.begin() as conn:
+        order = conn.execute(
+            text("SELECT client_order_key,meta FROM us_orders WHERE order_no=:order_no"),
+            {"order_no": "unmatched-broker-order"},
+        ).mappings().one()
+        actual_fill_count = conn.execute(
+            text("SELECT COUNT(*) FROM us_fills WHERE order_no=:order_no"),
+            {"order_no": "unmatched-broker-order"},
+        ).scalar_one()
+    assert order["client_order_key"].startswith("KIS_IMPORTED_")
+    assert order["meta"]["order_origin"] == "broker_actual_without_local_order"
+    assert actual_fill_count == 1
+
+
 @pytest.mark.parametrize("bad_price", ["NaN", "Infinity"])
 def test_real_postgres_nonfinite_partial_cancel_price_stays_unresolved(pg_engine, bad_price):
     from sqlalchemy import text
@@ -714,3 +1251,98 @@ def test_real_postgres_full_fill_rejects_nonfinite_fill_price(pg_engine, bad_pri
     assert row["avg_price_usd"] is None
     assert fill_count == 0
 
+
+def test_real_postgres_active_claim_recovery_is_scoped_to_current_generation(
+    pg_engine, monkeypatch,
+):
+    import hashlib
+    from datetime import date
+    import trader.us.db.repos as repos
+    from trader.account_state import get_account_key
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts,
+        us_execution_claims,
+    )
+
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("CANO", "12345678")
+    monkeypatch.setenv("ACNT_PRDT_CD", "01")
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *args, **kwargs: "current-epoch")
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+
+    account_id = hashlib.sha256(
+        get_account_key(env="practice").encode("utf-8")
+    ).hexdigest()
+
+    def unresolved_claim(*, env, epoch, attempt_id, client_key):
+        identity = SemanticActionIdentity(
+            env=env,
+            account_id=account_id,
+            market="US",
+            trading_epoch_id=epoch,
+            strategy_owner="US_STANDARD",
+            lifecycle_id="same-lifecycle",
+            action=f"ACTION:{attempt_id}",
+            trade_date=date(2026, 10, 1),
+        )
+        assert claim_repo.acquire(
+            identity,
+            attempt_id=attempt_id,
+            requested_qty=1,
+            client_order_key=client_key,
+        ).acquired
+        claim_repo.record_observation(
+            identity,
+            attempt_id=attempt_id,
+            state="UNRESOLVED",
+            cumulative_filled_qty=None,
+            authoritative=False,
+        )
+        return identity
+
+    unresolved_claim(
+        env="live", epoch="current-epoch",
+        attempt_id="foreign-live", client_key="foreign-live-key",
+    )
+    unresolved_claim(
+        env="practice", epoch="prior-epoch",
+        attempt_id="prior-generation", client_key="prior-generation-key",
+    )
+    current_identity = unresolved_claim(
+        env="practice", epoch="current-epoch",
+        attempt_id="current-generation", client_key="current-generation-key",
+    )
+
+    same_generation = SemanticActionIdentity(
+        env="practice",
+        account_id=account_id,
+        market="US",
+        trading_epoch_id="current-epoch",
+        strategy_owner="US_STANDARD",
+        lifecycle_id="same-lifecycle",
+        action="ACTION:SAME-GENERATION-RETRY",
+        trade_date=date(2026, 10, 1),
+    )
+    blocked = claim_repo.acquire(
+        same_generation,
+        attempt_id="same-generation-retry",
+        requested_qty=1,
+        client_order_key="same-generation-retry-key",
+    )
+
+    active_claims = repos.load_active_execution_claim_attempts()
+    health = repos.load_execution_claim_health()
+
+    assert not blocked.acquired
+    assert blocked.reason == "unresolved_lifecycle_action"
+    assert [claim["active_attempt_id"] for claim in active_claims] == [
+        "current-generation",
+    ]
+    assert health["unresolved_execution_actions"] == 1
+    assert claim_repo.get(current_identity).action_state == "UNCERTAIN"

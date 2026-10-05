@@ -533,6 +533,10 @@ def normalize_us_order_status_row(row: dict) -> dict:
     remaining_raw = _get_first_valid(
         row, ("remaining_qty", "nccs_qty", "rmn_qty"), None
     )
+    remaining_qty_present = bool(
+        remaining_raw is not None
+        and _is_valid_nonnegative_integral_qty(remaining_raw)
+    )
     quantity_error = None
     for label, raw_value in (
         ("requested_qty", requested_raw),
@@ -568,15 +572,33 @@ def normalize_us_order_status_row(row: dict) -> dict:
         status = "UNKNOWN"
     trade_date_raw = str(_get_first_valid(row, ("trade_date", "ord_dt", "ORD_DT"), "") or "")
     order_time_raw = str(_get_first_valid(row, ("ord_tmd", "ORD_TMD"), "") or "")
-    submitted_at_utc = _get_first_valid(row, ("submitted_at_utc", "order_timestamp", "observed_at"), None)
+    submitted_at_utc = _get_first_valid(
+        row, ("submitted_at_utc", "order_timestamp"), None,
+    )
     time_error = None
     if not submitted_at_utc and trade_date_raw and order_time_raw:
         try:
             from zoneinfo import ZoneInfo
-            local = datetime.strptime(trade_date_raw.replace("-", "") + order_time_raw, "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("America/New_York"))
+            local = datetime.strptime(
+                trade_date_raw.replace("-", "") + order_time_raw, "%Y%m%d%H%M%S",
+            ).replace(tzinfo=ZoneInfo("Asia/Seoul"))
             submitted_at_utc = local.astimezone(timezone.utc).isoformat()
         except Exception:
             time_error = "invalid_kis_order_datetime"
+    us_trade_date = None
+    if submitted_at_utc:
+        try:
+            parsed_order_timestamp = datetime.fromisoformat(
+                str(submitted_at_utc).replace("Z", "+00:00")
+            )
+            if parsed_order_timestamp.tzinfo is None:
+                parsed_order_timestamp = parsed_order_timestamp.replace(tzinfo=timezone.utc)
+            from zoneinfo import ZoneInfo
+            us_trade_date = parsed_order_timestamp.astimezone(
+                ZoneInfo("America/New_York")
+            ).date().isoformat()
+        except Exception:
+            time_error = time_error or "invalid_provider_order_timestamp"
     normalization_result = (
         "normalized"
         if order_no
@@ -596,12 +618,31 @@ def normalize_us_order_status_row(row: dict) -> dict:
         "order_no": order_no, "raw_order_no": order_no,
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
         "requested_qty": requested,
+        "requested_qty_present": bool(
+            requested_raw is not None
+            and _is_valid_nonnegative_integral_qty(requested_raw)
+        ),
         "filled_qty": filled,
         "filled_qty_raw_present": bool(filled_qty_raw_present),
         "filled_qty_present": bool(filled_qty_present),
         "remaining_qty": remaining,
+        "remaining_qty_present": remaining_qty_present,
+        "broker_open_qty": (
+            _safe_int(remaining_raw, 0) if remaining_qty_present else None
+        ),
+        "broker_open_qty_present": remaining_qty_present,
         "status": status,
         "trade_date": trade_date_raw,
+        "us_trade_date": us_trade_date,
+        "order_timestamp_source": (
+            "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD"
+            if trade_date_raw and order_time_raw else "PROVIDER_SUPPLIED_TIMESTAMP"
+        ),
+        "order_timestamp_source_timezone": (
+            "Asia/Seoul" if trade_date_raw and order_time_raw else None
+        ),
+        "source_timestamp_date": trade_date_raw,
+        "source_timestamp_time": order_time_raw,
         "exchange": str(_get_first_valid(row, ("exchange", "ovrs_excg_cd", "OVRS_EXCG_CD"), "") or ""),
         "limit_price": _safe_float(_get_first_valid(row, ("limit_price", "ft_ord_unpr3", "ord_unpr"), 0.0)),
         "submitted_at_utc": submitted_at_utc,
