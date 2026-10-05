@@ -1303,16 +1303,24 @@ def test_real_postgres_active_claim_recovery_is_scoped_to_current_generation(
         get_account_key(env="practice").encode("utf-8")
     ).hexdigest()
 
-    def unresolved_claim(*, env, epoch, attempt_id, client_key):
+    def unresolved_claim(
+        *,
+        env,
+        epoch,
+        attempt_id,
+        client_key,
+        claim_account_id=account_id,
+        trade_date=date(2026, 10, 1),
+    ):
         identity = SemanticActionIdentity(
             env=env,
-            account_id=account_id,
+            account_id=claim_account_id,
             market="US",
             trading_epoch_id=epoch,
             strategy_owner="US_STANDARD",
             lifecycle_id="same-lifecycle",
             action=f"ACTION:{attempt_id}",
-            trade_date=date(2026, 10, 1),
+            trade_date=trade_date,
         )
         assert claim_repo.acquire(
             identity,
@@ -1337,9 +1345,15 @@ def test_real_postgres_active_claim_recovery_is_scoped_to_current_generation(
         env="practice", epoch="prior-epoch",
         attempt_id="prior-generation", client_key="prior-generation-key",
     )
+    unresolved_claim(
+        env="practice", epoch="current-epoch",
+        attempt_id="foreign-account", client_key="foreign-account-key",
+        claim_account_id="foreign-account-id",
+    )
     current_identity = unresolved_claim(
         env="practice", epoch="current-epoch",
         attempt_id="current-generation", client_key="current-generation-key",
+        trade_date=date(2026, 9, 30),
     )
 
     same_generation = SemanticActionIdentity(
@@ -1369,3 +1383,11 @@ def test_real_postgres_active_claim_recovery_is_scoped_to_current_generation(
     ]
     assert health["unresolved_execution_actions"] == 1
     assert claim_repo.get(current_identity).action_state == "UNCERTAIN"
+    assert {
+        claim["active_attempt_id"] for claim in claim_repo.active_attempts()
+    } == {
+        "foreign-live",
+        "prior-generation",
+        "foreign-account",
+        "current-generation",
+    }
