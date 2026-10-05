@@ -68,7 +68,7 @@ def test_cross_day_execution_proof_accepts_explicit_buy_side_only():
     install_kr_20260929_side_proof_guard()
 
     proof = base._execution_proof_for_order(
-        _Kis(_row(sll_buy_dvsn_cd="02")), _order()
+        _Kis(_row(sll_buy_dvsn_cd="02", ccld_tmd="101530")), _order()
     )
     assert proof is not None
     assert proof["filled_qty"] == 21

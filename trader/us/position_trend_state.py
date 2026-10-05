@@ -25,18 +25,51 @@ def _i(v: Any, d: int = 0) -> int:
 def _b(v: Any) -> bool: return bool(v)
 def _iso(now: datetime) -> str: return (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
 
-def load_trend_state(symbol: str, trade_date: str) -> dict:
+def load_trend_state(symbol: str, trade_date: str, lifecycle_id: str | None = None) -> dict:
     risk = load_latest_us_position_risk_state(symbol, trade_date)
-    return dict(((risk.get("state") or {}).get("trend") or {}))
+    trend = dict(((risk.get("state") or {}).get("trend") or {}))
+    if lifecycle_id and str(trend.get("lifecycle_id") or "") != str(lifecycle_id):
+        return {}
+    return trend
 
-def save_trend_state(symbol: str, trade_date: str, trend: dict) -> dict:
+def save_trend_state(
+    symbol: str,
+    trade_date: str,
+    trend: dict,
+    lifecycle_id: str | None = None,
+) -> dict:
     risk = load_us_position_risk_state(symbol, trade_date) or {}
     state = dict(risk.get("state") or {})
-    # preserve lifecycle from latest if today's missing
+    expected_lifecycle_id = str(lifecycle_id or trend.get("lifecycle_id") or "")
+    current_lifecycle = state.get("lifecycle") if isinstance(state.get("lifecycle"), dict) else {}
+    if (
+        current_lifecycle.get("lifecycle_id")
+        and str(current_lifecycle["lifecycle_id"]) != expected_lifecycle_id
+    ):
+        logger.error(
+            "[US_POSITION][TREND_STATE][LIFECYCLE_MISMATCH] symbol=%s expected=%s current=%s action=SKIP_PERSIST",
+            symbol, expected_lifecycle_id, current_lifecycle["lifecycle_id"],
+        )
+        return trend
     if "lifecycle" not in state:
         latest = load_latest_us_position_risk_state(symbol, trade_date)
-        if isinstance(latest.get("state"), dict) and latest["state"].get("lifecycle"):
-            state["lifecycle"] = latest["state"]["lifecycle"]
+        latest_lifecycle = (
+            latest.get("state", {}).get("lifecycle")
+            if isinstance(latest.get("state"), dict) else None
+        )
+        if (
+            isinstance(latest_lifecycle, dict)
+            and expected_lifecycle_id
+            and str(latest_lifecycle.get("lifecycle_id") or "") == expected_lifecycle_id
+        ):
+            state["lifecycle"] = latest_lifecycle
+        elif isinstance(latest_lifecycle, dict) and latest_lifecycle.get("lifecycle_id"):
+            logger.error(
+                "[US_POSITION][TREND_STATE][LIFECYCLE_MISMATCH] symbol=%s expected=%s latest=%s action=SKIP_PERSIST",
+                symbol, expected_lifecycle_id or "MISSING",
+                latest_lifecycle.get("lifecycle_id"),
+            )
+            return trend
     state["trend"] = trend
     risk["state"] = state
     save_us_position_risk_state(symbol, trade_date, risk)
@@ -56,7 +89,7 @@ def update_us_position_trend_state(
     warning_threshold: float | None = None,
     severe_threshold: float | None = None,
 ) -> dict:
-    prev = load_trend_state(symbol, trade_date)
+    prev = load_trend_state(symbol, trade_date, lifecycle_id)
     once = prev.get("last_daily_update_trade_date") != trade_date
     warning_thr = float(
         warning_threshold if warning_threshold is not None
@@ -126,7 +159,7 @@ def update_us_position_trend_state(
     elif once and trend.get("trend_trim_done"): trend["post_trim_nonrecovery_days"] = _i(prev.get("post_trim_nonrecovery_days")) + 1
     for k in ("trend_trim_pending","trend_trim_done","trend_exit_pending","trend_exit_done","time_stop_trim_pending","time_stop_trim_done","time_stop_exit_pending","time_stop_exit_done"):
         trend.setdefault(k, False)
-    save_trend_state(symbol, trade_date, trend)
+    save_trend_state(symbol, trade_date, trend, lifecycle_id)
     logger.info("[US_POSITION][TREND_STATE] symbol=%s state=%s final30_absent_streak=%s below_ma20_streak=%s below_ma50_streak=%s holding_trade_days=%s signals=%s action=%s", symbol, state, absent, below20, below50, trend.get("holding_trade_days"), ",".join(signals), "HOLD_BLOCK_ADD" if state in {"UNKNOWN","WARNING"} else state)
     return trend
 

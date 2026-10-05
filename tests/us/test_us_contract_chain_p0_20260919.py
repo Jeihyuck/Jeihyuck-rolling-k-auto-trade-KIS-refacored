@@ -238,6 +238,13 @@ def test_us_continuous_postgres_prep_to_sell_uses_one_original_contract(monkeypa
                 "migrations/0047_us_order_events_profit_lifecycle.sql",
             ):
                 conn.exec_driver_sql(open(migration, encoding="utf-8").read())
+            for table in (
+                "us_order_intents", "us_orders", "us_fills", "us_positions",
+                "us_order_events", "us_profit_capture_lifecycle",
+            ):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+                )
 
         monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
         monkeypatch.setenv("KIS_ENV", "practice")

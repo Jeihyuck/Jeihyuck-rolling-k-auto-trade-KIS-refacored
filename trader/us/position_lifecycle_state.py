@@ -57,8 +57,27 @@ def _i(v: Any, default: int = 0) -> int:
         return default
 
 
-def _new_lifecycle_id(symbol: str, trade_date: str, opened_at: str, entry_price: float, qty: int) -> str:
-    raw = f"{symbol}|{trade_date}|{opened_at}|{entry_price:.6f}|{qty}"
+def _new_lifecycle_id(
+    symbol: str,
+    trade_date: str,
+    opened_at: str,
+    entry_price: float,
+    qty: int,
+    identity: dict[str, str],
+    prior_lifecycle_id: str | None = None,
+) -> str:
+    raw = "|".join((
+        identity["env"],
+        identity["account_id"],
+        identity["trading_epoch_id"],
+        identity["strategy_owner"],
+        symbol,
+        trade_date,
+        opened_at,
+        f"{entry_price:.6f}",
+        str(qty),
+        prior_lifecycle_id or "",
+    ))
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -72,13 +91,206 @@ def _position_entry_price(pos: dict) -> float:
     return buy_amount / qty if qty > 0 and buy_amount > 0 else 0.0
 
 
-def _confirmed_buy_opened_at(
+def _position_identity(pos: dict, *, env: str | None) -> dict[str, str]:
+    meta = pos.get("meta") if isinstance(pos.get("meta"), dict) else {}
+    contract = meta.get("entry_exit_contract") if isinstance(meta.get("entry_exit_contract"), dict) else {}
+
+    def value(*keys: str) -> str:
+        for key in keys:
+            raw = pos.get(key) if pos.get(key) not in (None, "") else meta.get(key)
+            if raw not in (None, ""):
+                return str(raw).strip()
+        return ""
+
+    resolved_env = value("env", "trading_env") or str(env or "").strip().lower()
+    account_id = value("account_id", "account_key")
+    if not account_id:
+        try:
+            from trader.account_state import get_account_key
+            account_id = get_account_key(env=resolved_env)
+        except Exception:
+            account_id = ""
+    return {
+        "env": resolved_env.lower(),
+        "account_id": account_id,
+        "trading_epoch_id": value("trading_epoch_id"),
+        "strategy_owner": (
+            value("strategy_owner", "sleeve_id")
+            or str(contract.get("strategy_owner") or contract.get("sleeve_id") or "").strip()
+        ).upper(),
+        "position_lifecycle_id": value(
+            "position_lifecycle_id", "position_cycle_id", "lifecycle_id", "cycle_id",
+        ),
+    }
+
+
+def _lifecycle_matches_identity(lifecycle: dict, identity: dict[str, str]) -> bool:
+    if not all(identity.get(key) for key in (
+        "env", "account_id", "trading_epoch_id", "strategy_owner",
+    )):
+        return False
+    expected = {
+        "env": identity["env"],
+        "trading_epoch_id": identity["trading_epoch_id"],
+        "strategy_owner": identity["strategy_owner"],
+    }
+    for field, value in expected.items():
+        stored = lifecycle.get(field) or (
+            lifecycle.get("sleeve_id") if field == "strategy_owner" else None
+        )
+        if not stored or str(stored).strip().lower() != value.lower():
+            return False
+    if lifecycle.get("account_id") and str(lifecycle["account_id"]).strip() != identity["account_id"]:
+        return False
+    if identity.get("position_lifecycle_id") and str(lifecycle.get("lifecycle_id") or "") != identity["position_lifecycle_id"]:
+        return False
+    return bool(lifecycle.get("lifecycle_id"))
+
+
+def _identity_is_current(identity: dict[str, str]) -> bool:
+    if not all(identity.get(key) for key in (
+        "env", "account_id", "trading_epoch_id", "strategy_owner",
+    )):
+        return False
+    try:
+        from trader.account_state import get_account_key, resolve_env_name
+        from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+
+        if _get_engine_or_none() is None:
+            return True
+        return bool(
+            resolve_env_name() == identity["env"]
+            and get_account_key(env=identity["env"]) == identity["account_id"]
+            and str(_active_us_epoch() or "") == identity["trading_epoch_id"]
+        )
+    except Exception:
+        return False
+
+
+def _bind_authoritative_position_identity(
+    pos: dict,
+    *,
+    identity: dict[str, str],
+    trade_date: str,
+    fills: list[dict] | None,
+    authoritative: bool,
+) -> dict[str, str]:
+    """Bind missing broker identity only from active-account or exact evidence."""
+    if authoritative and not identity.get("trading_epoch_id"):
+        try:
+            from trader.us.db.repos import _active_us_epoch
+
+            active_epoch = str(_active_us_epoch() or "")
+        except Exception:
+            active_epoch = ""
+        if active_epoch:
+            identity["trading_epoch_id"] = active_epoch
+            pos["trading_epoch_id"] = active_epoch
+
+    if not identity.get("trading_epoch_id"):
+        return identity
+
+    lifecycle_matches: dict[str, tuple[str, dict]] = {}
+    try:
+        from trader.us.db.repos import load_us_position_risk_state_candidates
+
+        rows = load_us_position_risk_state_candidates(
+            _sym(pos.get("symbol")), trade_date,
+        )
+    except Exception:
+        rows = []
+    for row in rows:
+        state = row.get("state") if isinstance(row.get("state"), dict) else {}
+        lifecycle = state.get("lifecycle") if isinstance(state.get("lifecycle"), dict) else {}
+        row_epoch = str(row.get("trading_epoch_id") or lifecycle.get("trading_epoch_id") or "")
+        lifecycle_env = str(lifecycle.get("env") or lifecycle.get("trading_env") or "").lower()
+        lifecycle_account = str(lifecycle.get("account_id") or lifecycle.get("account_key") or "")
+        owner = str(lifecycle.get("strategy_owner") or lifecycle.get("sleeve_id") or "").upper()
+        lifecycle_id = str(lifecycle.get("lifecycle_id") or "")
+        if (
+            row_epoch == identity["trading_epoch_id"]
+            and lifecycle_env == identity["env"]
+            and lifecycle_account == identity["account_id"]
+            and owner and lifecycle_id and lifecycle.get("is_open") is True
+            and (
+                not identity.get("strategy_owner")
+                or identity["strategy_owner"] == owner
+            )
+            and (
+                not identity.get("position_lifecycle_id")
+                or identity["position_lifecycle_id"] == lifecycle_id
+            )
+        ):
+            lifecycle_matches[lifecycle_id] = (owner, lifecycle)
+
+    if len(lifecycle_matches) == 1:
+        lifecycle_id, (owner, _lifecycle) = next(iter(lifecycle_matches.items()))
+        identity["strategy_owner"] = identity.get("strategy_owner") or owner
+        identity["position_lifecycle_id"] = (
+            identity.get("position_lifecycle_id") or lifecycle_id
+        )
+        if not pos.get("strategy_owner"):
+            pos["strategy_owner"] = identity["strategy_owner"]
+        if not pos.get("position_lifecycle_id"):
+            pos["position_lifecycle_id"] = identity["position_lifecycle_id"]
+        return identity
+
+    fill_matches: list[tuple[str, str]] = []
+    for fill in fills or []:
+        meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
+        if (
+            _sym(fill.get("symbol")) != _sym(pos.get("symbol"))
+            or str(fill.get("side") or "").upper() != "BUY"
+            or _i(fill.get("qty")) <= 0
+            or str(fill.get("trading_epoch_id") or meta.get("trading_epoch_id") or "")
+            != identity["trading_epoch_id"]
+            or str(fill.get("env") or meta.get("env") or meta.get("trading_env") or "").lower()
+            != identity["env"]
+            or str(fill.get("account_id") or meta.get("account_id") or meta.get("account_key") or "")
+            != identity["account_id"]
+        ):
+            continue
+        contract = meta.get("entry_exit_contract") if isinstance(meta.get("entry_exit_contract"), dict) else {}
+        owner = str(
+            fill.get("strategy_owner") or meta.get("strategy_owner")
+            or fill.get("sleeve_id") or meta.get("sleeve_id")
+            or contract.get("strategy_owner") or ""
+        ).strip().upper()
+        lifecycle_id = str(
+            fill.get("position_lifecycle_id") or meta.get("position_lifecycle_id")
+            or fill.get("position_cycle_id") or meta.get("position_cycle_id") or ""
+        ).strip()
+        if (
+            owner
+            and (not identity.get("strategy_owner") or identity["strategy_owner"] == owner)
+            and (
+                not identity.get("position_lifecycle_id")
+                or lifecycle_id == identity["position_lifecycle_id"]
+            )
+        ):
+            fill_matches.append((owner, lifecycle_id))
+
+    owners = {owner for owner, _ in fill_matches}
+    lifecycle_ids = {lifecycle_id for _, lifecycle_id in fill_matches if lifecycle_id}
+    if len(owners) == 1:
+        identity["strategy_owner"] = next(iter(owners))
+        if not pos.get("strategy_owner"):
+            pos["strategy_owner"] = identity["strategy_owner"]
+        if len(lifecycle_ids) == 1 and all(lifecycle_id for _, lifecycle_id in fill_matches):
+            identity["position_lifecycle_id"] = next(iter(lifecycle_ids))
+            if not pos.get("position_lifecycle_id"):
+                pos["position_lifecycle_id"] = identity["position_lifecycle_id"]
+    return identity
+
+
+def _confirmed_buy_fill(
     fills: list[dict] | None,
     symbol: str,
+    identity: dict[str, str],
     *,
     after: str | datetime | None = None,
-) -> str | None:
-    """Return earliest confirmed BUY fill for the new lifecycle.
+) -> tuple[dict, str] | None:
+    """Return the earliest actual BUY fill tied to this account, epoch, and owner.
 
     When a prior lifecycle closed on the same trade date, ignore fills from the
     old cycle by requiring the BUY timestamp to be strictly after closed_at.
@@ -96,12 +308,36 @@ def _confirmed_buy_opened_at(
         except Exception:
             lower_bound = None
 
-    candidates: list[tuple[datetime, str]] = []
+    candidates: list[tuple[datetime, str, dict]] = []
     for fill in fills or []:
         if _sym(fill.get("symbol")) != _sym(symbol) or str(fill.get("side") or "").upper() != "BUY":
             continue
         meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
-        raw = fill.get("filled_at") or fill.get("execution_timestamp") or meta.get("observed_at")
+        contract = meta.get("entry_exit_contract") if isinstance(meta.get("entry_exit_contract"), dict) else {}
+        epoch = fill.get("trading_epoch_id") or meta.get("trading_epoch_id")
+        owner = (
+            fill.get("strategy_owner") or meta.get("strategy_owner")
+            or fill.get("sleeve_id") or meta.get("sleeve_id")
+            or contract.get("strategy_owner")
+        )
+        lifecycle_id = (
+            fill.get("position_lifecycle_id") or meta.get("position_lifecycle_id")
+            or fill.get("position_cycle_id") or meta.get("position_cycle_id")
+        )
+        fill_env = fill.get("env") or meta.get("env") or meta.get("trading_env")
+        fill_account = fill.get("account_id") or meta.get("account_id")
+        if (
+            str(epoch or "") != identity["trading_epoch_id"]
+            or str(owner or "").strip().upper() != identity["strategy_owner"]
+            or str(fill_env or "").strip().lower() != identity["env"]
+            or str(fill_account or "").strip() != identity["account_id"]
+            or (
+                identity.get("position_lifecycle_id")
+                and str(lifecycle_id or "") != identity["position_lifecycle_id"]
+            )
+        ):
+            continue
+        raw = fill.get("filled_at") or fill.get("execution_timestamp")
         if not raw:
             continue
         try:
@@ -116,13 +352,14 @@ def _confirmed_buy_opened_at(
             dt_utc = dt.astimezone(timezone.utc)
             if lower_bound is not None and dt_utc <= lower_bound:
                 continue
-            candidates.append((dt_utc, text_value))
+            candidates.append((dt_utc, text_value, fill))
         except Exception:
             continue
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])
-    return candidates[0][1]
+    _, opened_at, fill = candidates[0]
+    return fill, opened_at
 
 
 def _save_lifecycle(symbol: str, trade_date: str, lifecycle: dict, *, base: dict | None = None) -> dict:
@@ -134,7 +371,15 @@ def _save_lifecycle(symbol: str, trade_date: str, lifecycle: dict, *, base: dict
     return lifecycle
 
 
-def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, now: datetime, authoritative: bool, fills: list[dict] | None = None) -> dict[str, dict]:
+def reconcile_us_position_lifecycles(
+    *,
+    positions: list[dict],
+    trade_date: str,
+    now: datetime,
+    authoritative: bool,
+    fills: list[dict] | None = None,
+    env: str | None = None,
+) -> dict[str, dict]:
     """Carry open lifecycle state forward and close only on authoritative zero."""
     now_iso = _iso(now)
     current: dict[str, dict] = {_sym(p.get("symbol")): p for p in positions or [] if _sym(p.get("symbol")) and _i(p.get("qty")) > 0}
@@ -144,20 +389,65 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
     for symbol, pos in current.items():
         qty = _i(pos.get("qty"))
         entry = _position_entry_price(pos)
-        position_policy = _entry_policy(pos)
+        identity = _position_identity(pos, env=env)
+        identity = _bind_authoritative_position_identity(
+            pos,
+            identity=identity,
+            trade_date=trade_date,
+            fills=fills,
+            authoritative=authoritative,
+        )
+        if not all(identity.get(key) for key in (
+            "env", "account_id", "trading_epoch_id", "strategy_owner",
+        )):
+            pos["lifecycle_identity_status"] = "MISSING_OR_AMBIGUOUS"
+            logger.error(
+                "[US_POSITION][LIFECYCLE][IDENTITY_MISSING] symbol=%s env=%s epoch=%s owner=%s action=PROTECTIVE",
+                symbol, identity.get("env") or "NA",
+                identity.get("trading_epoch_id") or "NA",
+                identity.get("strategy_owner") or "NA",
+            )
+            continue
+        if not _identity_is_current(identity):
+            pos["lifecycle_identity_status"] = "AMBIGUOUS_OR_MISMATCHED"
+            logger.error(
+                "[US_POSITION][LIFECYCLE][IDENTITY_MISMATCH] symbol=%s env=%s epoch=%s owner=%s action=PROTECTIVE",
+                symbol, identity["env"], identity["trading_epoch_id"],
+                identity["strategy_owner"],
+            )
+            continue
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+        if lifecycle and not _lifecycle_matches_identity(lifecycle, identity):
+            lifecycle = {}
         if not lifecycle or lifecycle.get("is_open") is False:
-            confirmed_opened_at = _confirmed_buy_opened_at(
-                fills, symbol, after=lifecycle.get("closed_at") if lifecycle else None,
+            confirmed_buy = _confirmed_buy_fill(
+                fills, symbol, identity, after=lifecycle.get("closed_at") if lifecycle else None,
             )
+            confirmed_fill, confirmed_opened_at = confirmed_buy or ({}, None)
+            fill_meta = confirmed_fill.get("meta") if isinstance(confirmed_fill.get("meta"), dict) else {}
+            fill_lifecycle_id = str(
+                confirmed_fill.get("position_lifecycle_id")
+                or fill_meta.get("position_lifecycle_id")
+                or confirmed_fill.get("position_cycle_id")
+                or fill_meta.get("position_cycle_id")
+                or ""
+            ).strip()
             opened_at = confirmed_opened_at or now_iso
+            opened_at_source = "confirmed_buy_fill" if confirmed_opened_at else "first_authoritative_position_observation"
+            lifecycle_id = _new_lifecycle_id(
+                symbol, trade_date, opened_at, entry, qty, identity,
+                str(lifecycle.get("lifecycle_id") or "") if lifecycle else None,
+            )
+            if fill_lifecycle_id:
+                lifecycle_id = fill_lifecycle_id
+            fill_policy = _entry_policy(confirmed_fill) if confirmed_buy else {}
             lifecycle = {
-                "lifecycle_id": _new_lifecycle_id(symbol, trade_date, opened_at, entry, qty),
+                "lifecycle_id": lifecycle_id,
                 "is_open": True,
                 "opened_trade_date": trade_date,
                 "opened_at": opened_at,
-                "opened_at_source": "confirmed_buy_fill" if confirmed_opened_at else "first_authoritative_position_observation",
+                "opened_at_source": opened_at_source,
                 "closed_trade_date": None,
                 "closed_at": None,
                 "entry_price": entry,
@@ -169,17 +459,25 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
                 "high_watermark": max(entry, _f(pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px"))),
                 "high_watermark_at": now_iso,
                 "high_watermark_source": "us_position_risk_state",
-                "entry_policy": position_policy,
+                "entry_policy": fill_policy if fill_lifecycle_id == lifecycle_id else {},
             }
+            lifecycle.update({
+                "env": identity["env"],
+                "account_id": identity["account_id"],
+                "trading_epoch_id": identity["trading_epoch_id"],
+                "strategy_owner": identity["strategy_owner"],
+                "sleeve_id": identity["strategy_owner"],
+            })
+            identity["position_lifecycle_id"] = lifecycle_id
         else:
             lifecycle["last_seen_qty"] = qty
             lifecycle["last_seen_trade_date"] = trade_date
             if lifecycle.get("last_holding_day_counted") != trade_date:
                 lifecycle["holding_trade_days"] = _i(lifecycle.get("holding_trade_days"), 1) + 1
                 lifecycle["last_holding_day_counted"] = trade_date
-            if not lifecycle.get("entry_policy") and position_policy:
-                lifecycle["entry_policy"] = position_policy
+            identity["position_lifecycle_id"] = str(lifecycle.get("lifecycle_id") or "")
         carried_policy = dict(lifecycle.get("entry_policy") or {})
+        lifecycle["identity_status"] = "IDENTIFIED"
         _save_lifecycle(symbol, trade_date, lifecycle)
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
@@ -188,6 +486,7 @@ def reconcile_us_position_lifecycles(*, positions: list[dict], trade_date: str, 
             "opened_at_source": lifecycle.get("opened_at_source"),
             "holding_trade_days": lifecycle.get("holding_trade_days"),
             "lifecycle_state_source": "us_position_risk_state",
+            "lifecycle_identity_status": "IDENTIFIED",
             **carried_policy,
         })
         pos_meta = dict(pos.get("meta") or {})

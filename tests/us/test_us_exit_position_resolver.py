@@ -207,6 +207,67 @@ def test_resolver_preserves_existing_entry_price_with_source():
     assert meta["ok"] == 1
 
 
+def test_resolver_risk_state_lookup_failure_remains_fail_soft(monkeypatch):
+    from trader.us.db import repos
+
+    monkeypatch.setattr(
+        "trader.us.pb1.us_exit_position_resolver._identity_is_current",
+        lambda _identity: True,
+    )
+
+    def fail_lookup(*_args, **_kwargs):
+        raise RuntimeError("risk state unavailable")
+
+    monkeypatch.setattr(repos, "load_us_position_risk_state_candidates", fail_lookup)
+    positions, meta = enrich_us_positions_for_exit(
+        [{
+            "symbol": "SAMPLE", "qty": 1, "entry_price": 100.0,
+            "entry_price_source": "kis_avg_price_usd",
+            "env": "practice", "account_id": "practice:test",
+            "trading_epoch_id": "epoch-a", "strategy_owner": "US_STANDARD",
+            "position_lifecycle_id": "life-a",
+        }],
+        trade_date="2026-05-18",
+        env="practice",
+    )
+
+    assert len(positions) == 1
+    assert positions[0]["pnl_input_ok"] is True
+    assert meta["ok"] == 1
+
+
+def test_buy_fill_history_query_binds_trade_date(monkeypatch):
+    from trader.us.db import repos
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params):
+            assert {"symbol", "trade_date", "lookback"} <= set(statement._bindparams)
+            return Result()
+
+    class Engine:
+        def connect(self):
+            return Connection()
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+
+    assert repos.load_us_buy_fill_history_candidates(
+        "SAMPLE", trade_date="2026-05-18", lookback_days=30,
+    ) == []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 10: max_price fallback — position에 max_price 없으면 entry_price로 설정
 # ─────────────────────────────────────────────────────────────────────────────

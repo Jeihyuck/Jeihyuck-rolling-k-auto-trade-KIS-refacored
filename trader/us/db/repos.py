@@ -335,6 +335,7 @@ def reset_memory_stores() -> None:
     _MEM_POSITIONS = []
     _MEM_RECONCILE_LOGS = []
     _MEM_RISK_STATE = {}
+    _MEM_PROFIT_CAPTURE_STATE.clear()
     try:
         from trader.us.db.price_daily_repo import reset_us_daily_memory
         reset_us_daily_memory()
@@ -1678,6 +1679,42 @@ def load_latest_us_position_risk_state(symbol: str, on_or_before_trade_date: str
         return dict(candidates[0]) if candidates else {}
 
 
+def load_us_position_risk_state_candidates(
+    symbol: str, on_or_before_trade_date: str,
+) -> list[dict]:
+    """Return bounded risk-state candidates for exact lifecycle selection."""
+    key_symbol = str(symbol or "").strip().upper()
+    td = str(on_or_before_trade_date)
+    engine = _get_engine_or_none()
+    if engine is None:
+        candidates = [
+            dict(value) for (day, sym), value in _MEM_RISK_STATE.items()
+            if sym == key_symbol and str(day) <= td
+        ]
+        return sorted(
+            candidates,
+            key=lambda row: (str(row.get("trade_date") or ""), str(row.get("updated_at") or "")),
+            reverse=True,
+        )
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            rows = conn.execute(text("""
+                SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                       first_soft_stop_seen_at, last_soft_stop_seen_at,
+                       lowest_price_since_breach, last_price, last_pnl_pct,
+                       state, updated_at
+                FROM us_position_risk_state
+                WHERE symbol=:symbol AND trade_date<=:trade_date
+                ORDER BY trade_date DESC, updated_at DESC
+                LIMIT 2000
+            """), {"symbol": key_symbol, "trade_date": td}).mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][CANDIDATES_WARN] symbol=%s err=%s", key_symbol, exc)
+        return []
+
+
 def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dict[str, dict]:
     """Return latest open lifecycle per symbol on or before trade_date."""
     td = str(on_or_before_trade_date)
@@ -1880,6 +1917,7 @@ def mark_us_profit_capture_stage(
     position_lifecycle_id: str = "",
     broker_order_no: str | None = None,
     filled_qty: int | None = None,
+    evidence_type: str | None = None,
 ) -> None:
     """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
     sym = str(symbol or "").strip().upper()
@@ -1895,15 +1933,51 @@ def mark_us_profit_capture_stage(
     existing = load_us_profit_capture_state(td, [sym], {sym: lifecycle}).get(sym, {})
     now_iso = datetime.now(timezone.utc).isoformat()
     status_upper = str(status or "PENDING").upper()
+    evidence_upper = str(evidence_type or "").upper()
+    try:
+        from trader.us.profit_capture import BROKER_TERMINAL_EVIDENCE
+    except Exception:
+        BROKER_TERMINAL_EVIDENCE = set()
+    meta = dict(existing.get("meta") or {})
+    if qty is not None:
+        meta[f"{stg}_qty"] = max(int(meta.get(f"{stg}_qty") or 0), int(qty))
+    if order_key:
+        order_keys = list(meta.get(f"{stg}_order_keys") or [])
+        if order_key not in order_keys:
+            order_keys.append(order_key)
+        meta[f"{stg}_order_keys"] = order_keys
+    if filled_qty is not None and evidence_upper in BROKER_TERMINAL_EVIDENCE:
+        try:
+            observed_filled = max(0, int(filled_qty))
+        except (TypeError, ValueError):
+            observed_filled = 0
+        if order_key:
+            fills_by_order = dict(meta.get(f"{stg}_fills_by_order_key") or {})
+            fills_by_order[order_key] = max(int(fills_by_order.get(order_key) or 0), observed_filled)
+            meta[f"{stg}_fills_by_order_key"] = fills_by_order
+            meta[f"{stg}_filled_qty"] = sum(int(value or 0) for value in fills_by_order.values())
+        else:
+            meta[f"{stg}_filled_qty"] = max(int(meta.get(f"{stg}_filled_qty") or 0), observed_filled)
+    target_qty = int(meta.get(f"{stg}_qty") or 0)
+    cumulative_filled_qty = int(meta.get(f"{stg}_filled_qty") or 0)
+    actual_stage_complete = (
+        evidence_upper in BROKER_TERMINAL_EVIDENCE
+        and target_qty > 0
+        and cumulative_filled_qty >= target_qty
+    )
     terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
-    if terminal_failure:
+    if actual_stage_complete or existing.get(f"{stg}_done"):
+        existing[f"{stg}_done"] = True
+        existing[f"{stg}_pending"] = False
+    elif terminal_failure:
         existing[f"{stg}_pending"] = False
         existing[f"{stg}_done"] = False
     else:
-        existing[f"{stg}_pending"] = status_upper in {"PENDING", "SUBMITTED", "ACK", "ACK_PENDING", "OPEN", "PARTIALLY_FILLED", "AMBIGUOUS_ACK", "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED"}
-        if status_upper in {"DONE", "FILLED"}:
-            existing[f"{stg}_done"] = True
-            existing[f"{stg}_pending"] = False
+        existing[f"{stg}_pending"] = status_upper in {
+            "PENDING", "SUBMITTED", "ACK", "ACK_PENDING", "OPEN",
+            "PARTIALLY_FILLED", "AMBIGUOUS_ACK", "BROKER_SUBMIT_RESULT_UNKNOWN",
+            "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED", "DONE", "FILLED",
+        }
     if order_key:
         existing[f"{stg}_order_key"] = order_key
     existing["position_lifecycle_id"] = lifecycle
@@ -1912,12 +1986,11 @@ def mark_us_profit_capture_stage(
     if not terminal_failure:
         existing[f"{stg}_at"] = existing.get(f"{stg}_at") or now_iso
     existing["last_profit_capture_at"] = now_iso
-    meta = dict(existing.get("meta") or {})
-    meta.update({"last_stage": stg, "last_status": status_upper})
-    if qty is not None:
-        meta[f"{stg}_qty"] = int(qty)
-    if filled_qty is not None:
-        meta[f"{stg}_filled_qty"] = max(int(meta.get(f"{stg}_filled_qty") or 0), int(filled_qty))
+    meta.update({
+        "last_stage": stg,
+        "last_status": status_upper,
+        "last_evidence_type": evidence_upper or None,
+    })
     if notional_usd is not None:
         meta[f"{stg}_notional_usd"] = float(notional_usd)
     existing["meta"] = meta
@@ -3270,6 +3343,14 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 "high_watermark_source": p.get("high_watermark_source"),
                 "trend_state": p.get("trend_state"),
             })
+            for field in (
+                "env", "trading_env", "account_id", "account_key",
+                "trading_epoch_id", "strategy_owner", "sleeve_id",
+                "position_lifecycle_id", "position_cycle_id", "opened_at",
+                "opened_at_source", "opened_trade_date",
+            ):
+                if p.get(field) is not None:
+                    meta[field] = p[field]
             p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
             p["meta"] = meta
             _MEM_POSITIONS.append({
@@ -3315,6 +3396,14 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     "high_watermark_source": p.get("high_watermark_source"),
                     "trend_state": p.get("trend_state"),
                 })
+                for field in (
+                    "env", "trading_env", "account_id", "account_key",
+                    "trading_epoch_id", "strategy_owner", "sleeve_id",
+                    "position_lifecycle_id", "position_cycle_id", "opened_at",
+                    "opened_at_source", "opened_trade_date",
+                ):
+                    if p.get(field) is not None:
+                        meta[field] = p[field]
                 p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
                 p["meta"] = meta
                 params = {
@@ -3382,23 +3471,27 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
     return count
 
 
-def load_positions(as_of: str | None = None) -> list[dict]:
-    """open 포지션(qty>0) 반환. meta의 orderable_qty/sellable_qty를 top-level로 promote."""
+def load_positions(
+    as_of: str | None = None, *, include_epoch_mismatches: bool = False,
+) -> list[dict]:
+    """Return positive positions, optionally surfacing stale-epoch rows as degraded."""
     td = as_of or _today()
     engine = _get_engine_or_none()
+    active_epoch = None
     if engine is None:
         rows = [p for p in _MEM_POSITIONS
                 if (p.get("as_of") == td or p.get("trade_date") == td)
                 and int(p.get("qty", 0)) > 0]
+        active_epoch = _active_us_epoch()
     else:
         try:
             with engine.begin() as conn:
-                trading_epoch_id = _active_us_epoch(conn)
+                active_epoch = _active_us_epoch(conn)
                 sql = "SELECT * FROM us_positions WHERE as_of=:td AND qty>0"
                 params = {"td": td}
-                if trading_epoch_id:
+                if active_epoch and not include_epoch_mismatches:
                     sql += " AND trading_epoch_id=:trading_epoch_id"
-                    params["trading_epoch_id"] = trading_epoch_id
+                    params["trading_epoch_id"] = active_epoch
                 raw = conn.execute(text(sql), params)
                 rows = [dict(r._mapping) for r in raw]
         except Exception as exc:
@@ -3423,6 +3516,24 @@ def load_positions(as_of: str | None = None) -> list[dict]:
         r["current_price_usd"] = r.get("current_px") or 0
         r["entry_price_source"] = meta.get("entry_price_source") or "us_positions_avg_cost"
         r["balance_source"] = meta.get("balance_source") or "us_positions_db"
+        for field in (
+            "env", "trading_env", "account_id", "account_key", "strategy_owner",
+            "sleeve_id", "position_lifecycle_id", "position_cycle_id",
+            "opened_at", "opened_trade_date", "opened_at_source",
+        ):
+            if r.get(field) is None and meta.get(field) is not None:
+                r[field] = meta[field]
+        epoch_mismatch = bool(
+            active_epoch and str(r.get("trading_epoch_id") or "") != str(active_epoch)
+        )
+        if include_epoch_mismatches and epoch_mismatch:
+            r["epoch_visibility_status"] = "STALE_EPOCH_VISIBLE_PROTECTIVE"
+            r["lifecycle_identity_status"] = "AMBIGUOUS_OR_MISMATCHED"
+            r["sell_management_degraded"] = True
+            logger.error(
+                "[US_POSITIONS][EPOCH_VISIBILITY] symbol=%s position_epoch=%s active_epoch=%s action=VISIBLE_DEGRADED_NO_REBIND",
+                r.get("symbol"), r.get("trading_epoch_id") or "MISSING", active_epoch,
+            )
         for field in _US_ENTRY_POLICY_FIELDS:
             if meta.get(field) is not None:
                 r[field] = meta[field]
@@ -5698,7 +5809,7 @@ def load_us_positions_by_symbols(
                 rows = conn.execute(
                     text("""
                         SELECT DISTINCT ON (symbol)
-                            symbol, exchange, qty, avg_cost,
+                            symbol, exchange, qty, avg_cost, trading_epoch_id,
                             current_px, unrealized_pnl_usd, meta, as_of
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
@@ -5713,7 +5824,7 @@ def load_us_positions_by_symbols(
                 rows = conn.execute(
                     text("""
                         SELECT DISTINCT ON (symbol)
-                            symbol, exchange, qty, avg_cost,
+                            symbol, exchange, qty, avg_cost, trading_epoch_id,
                             current_px, unrealized_pnl_usd, meta, as_of
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
@@ -5726,7 +5837,7 @@ def load_us_positions_by_symbols(
 
             result = {}
             for row in rows:
-                cols = ["symbol", "exchange", "qty", "avg_cost",
+                cols = ["symbol", "exchange", "qty", "avg_cost", "trading_epoch_id",
                         "current_px", "unrealized_pnl_usd", "meta", "as_of"]
                 d = dict(zip(cols, row))
                 sym = str(d.get("symbol") or "").strip().upper()
@@ -5781,7 +5892,8 @@ def load_latest_us_buy_fills_by_symbols(
             sql = """
                     SELECT DISTINCT ON (symbol)
                         symbol, exchange, qty, price_usd,
-                        filled_at, trade_date, client_order_key, order_no, meta
+                        filled_at, trade_date, client_order_key, order_no,
+                        trading_epoch_id, meta
                     FROM us_fills
                     WHERE symbol = ANY(:syms)
                       AND side = 'BUY'
@@ -5797,7 +5909,8 @@ def load_latest_us_buy_fills_by_symbols(
 
             result = {}
             cols = ["symbol", "exchange", "qty", "price_usd",
-                    "filled_at", "trade_date", "client_order_key", "order_no", "meta"]
+                    "filled_at", "trade_date", "client_order_key", "order_no",
+                    "trading_epoch_id", "meta"]
             for row in rows:
                 d = dict(zip(cols, row))
                 sym = str(d.get("symbol") or "").strip().upper()
@@ -5806,6 +5919,75 @@ def load_latest_us_buy_fills_by_symbols(
     except Exception as exc:
         logger.warning("[US_DB][load_latest_us_buy_fills_by_symbols][WARN] %s", exc)
         return {}
+
+
+def load_us_position_history_candidates(symbol: str, as_of: str | None = None) -> list[dict]:
+    """Return recent positive position snapshots without collapsing by symbol/epoch."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return []
+    td = str(as_of or _today())
+    engine = _get_engine_or_none()
+    if engine is None:
+        candidates = [
+            dict(row) for row in _MEM_POSITIONS
+            if str(row.get("symbol") or "").strip().upper() == sym
+            and str(row.get("as_of") or row.get("trade_date") or "") <= td
+            and int(row.get("qty") or 0) > 0
+        ]
+        return sorted(candidates, key=lambda row: str(row.get("as_of") or ""), reverse=True)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT *
+                FROM us_positions
+                WHERE UPPER(symbol)=:symbol AND as_of<=:as_of AND qty>0
+                ORDER BY as_of DESC, created_at DESC
+                LIMIT 2000
+            """), {"symbol": sym, "as_of": td}).mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("[US_POSITIONS][HISTORY_CANDIDATES_WARN] symbol=%s err=%s", sym, exc)
+        return []
+
+
+def load_us_buy_fill_history_candidates(
+    symbol: str, trade_date: str | None = None, lookback_days: int = 3650,
+) -> list[dict]:
+    """Return bounded BUY-fill candidates without selecting a symbol-only latest row."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return []
+    td = str(trade_date or _today())
+    engine = _get_engine_or_none()
+    if engine is None:
+        candidates = [
+            dict(row) for row in _MEM_FILLS
+            if str(row.get("symbol") or "").strip().upper() == sym
+            and str(row.get("side") or "").upper() == "BUY"
+            and str(row.get("trade_date") or "") <= td
+        ]
+        return sorted(
+            candidates,
+            key=lambda row: (str(row.get("trade_date") or ""), str(row.get("filled_at") or "")),
+            reverse=True,
+        )[:5000]
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT symbol, exchange, qty, price_usd, filled_at, trade_date,
+                       client_order_key, order_no, trading_epoch_id, meta
+                FROM us_fills
+                WHERE UPPER(symbol)=:symbol AND side='BUY'
+                  AND trade_date >= (CAST(:trade_date AS date) - :lookback * INTERVAL '1 day')
+                  AND trade_date <= CAST(:trade_date AS date)
+                ORDER BY trade_date DESC, filled_at DESC
+                LIMIT 5000
+            """), {"symbol": sym, "trade_date": td, "lookback": max(1, int(lookback_days))}).mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("[US_FILLS][HISTORY_CANDIDATES_WARN] symbol=%s err=%s", sym, exc)
+        return []
 
 
 def has_pending_order_for_symbol_side(

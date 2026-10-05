@@ -92,3 +92,11 @@ def test_partial_quantity_without_price_stays_partial_and_does_not_advance_tp():
     assert result["fills"] == 0
     assert fills.calls == []
     assert positions.calls == []
+
+
+def test_ack_without_balance_change_does_not_advance_tp_stage():
+    _orders, fills, positions, result = _run(current_qty=10)
+
+    assert result["fills"] == 0
+    assert fills.calls == []
+    assert positions.calls == []

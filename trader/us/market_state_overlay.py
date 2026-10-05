@@ -908,15 +908,26 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 break
             if return_rate >= threshold and return_rate > 0 and not bool(meta.get(flag)) and not bool(meta_state.get(flag)) and not bool(state.get(flag)) and not bool(state.get(pending_flag)):
                 max_sell = max(0, q - int(q * local_runner_min))
-                qty = min(max_sell, max(1, int(q * sell_pct)))
+                stage = flag.replace("_done", "")
+                stage_meta = state.get("meta") if isinstance(state.get("meta"), dict) else {}
+                try:
+                    stage_target_qty = int(stage_meta.get(f"{stage}_qty") or 0)
+                    stage_filled_qty = int(stage_meta.get(f"{stage}_filled_qty") or 0)
+                except (TypeError, ValueError):
+                    stage_target_qty = stage_filled_qty = 0
+                remaining_stage_qty = max(0, stage_target_qty - stage_filled_qty)
+                stage_qty = max(1, int(q * sell_pct)) if stage_target_qty <= 0 else remaining_stage_qty
+                qty = min(max_sell, stage_qty)
                 if qty > 0:
                     lifecycle = str(p.get("position_lifecycle_id"))
-                    order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2" if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {})}})
+                    base_order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
+                    prior_order_keys = list(stage_meta.get(f"{stage}_order_keys") or [])
+                    order_key = base_order_key if not prior_order_keys else f"{base_order_key}_R{len(prior_order_keys) + 1}"
+                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2" if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
                     if trade_date:
                         try:
                             from trader.us.db.repos import mark_us_profit_capture_stage
-                            mark_us_profit_capture_stage(trade_date, sym, flag.replace("_done", ""), position_lifecycle_id=lifecycle, order_key=order_key, qty=qty, notional_usd=qty * price, status="PENDING")
+                            mark_us_profit_capture_stage(trade_date, sym, stage, position_lifecycle_id=lifecycle, order_key=order_key, qty=qty, notional_usd=qty * price, status="PENDING")
                             state[pending_flag] = True
                             profit_capture_state[sym] = state
                         except Exception as exc:

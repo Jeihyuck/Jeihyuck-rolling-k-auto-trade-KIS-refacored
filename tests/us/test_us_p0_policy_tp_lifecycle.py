@@ -12,7 +12,8 @@ def test_tp_completion_carries_across_trade_dates_for_same_lifecycle(monkeypatch
     _offline(monkeypatch)
     repos.mark_us_profit_capture_stage(
         "2026-09-14", "JPM", "tp1", position_lifecycle_id="life-1",
-        order_key="tp1-order", qty=2, status="FILLED",
+        order_key="tp1-order", qty=2, filled_qty=2, status="FILLED",
+        evidence_type="KIS_EXECUTION_ACTUAL",
     )
     next_day = repos.load_us_profit_capture_state(
         "2026-09-15", ["JPM"], {"JPM": "life-1"},
