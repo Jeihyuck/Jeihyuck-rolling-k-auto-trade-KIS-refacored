@@ -158,6 +158,7 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
             "symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1,
             "available_qty": 1, "orderable_qty": 1, "limit_price": 10.0, "notional_usd": 10.0,
             "client_order_key": "new-sell-no-balance", "trade_date": "2026-06-18",
+            "position_lifecycle_id": "ack-closed-lifecycle",
         },
         kis_client=_Kis(),
         allowed_symbols={"AAOI"},
@@ -395,7 +396,7 @@ def test_route_order_ack_db_failed_when_save_order_ack_returns_false(monkeypatch
             return {"output": {"ODNO": "ACK1"}}
 
     result = route_order(
-        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 1, "limit_price": 10, "notional_usd": 10, "client_order_key": "ack-false", "trade_date": "2026-06-18"},
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 1, "limit_price": 10, "notional_usd": 10, "client_order_key": "ack-false", "trade_date": "2026-06-18", "position_lifecycle_id": "ack-failed-lifecycle"},
         allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=_Kis(),
     )
     assert result["status"] == "ACK_DB_FAILED"

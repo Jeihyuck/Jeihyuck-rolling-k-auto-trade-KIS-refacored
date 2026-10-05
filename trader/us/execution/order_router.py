@@ -647,7 +647,15 @@ def _semantic_sell_identity_stage(intent: dict, meta: dict, reason: str) -> tupl
 def _semantic_action_instance(
     intent: dict, meta: dict, action: str, trade_date: date | None,
 ) -> str | None:
-    if str(intent.get("side") or "").upper() != "SELL":
+    side = str(intent.get("side") or "").upper()
+    owner = str(
+        intent.get("strategy_owner") or meta.get("strategy_owner") or ""
+    ).strip().upper()
+    if side == "BUY" and owner == "TQQQ_INFINITE":
+        if trade_date is None:
+            raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
+        return trade_date.isoformat()
+    if side != "SELL":
         return None
     labels = {
         str(value or "").strip().upper()
@@ -1601,6 +1609,24 @@ def route_order(
         append_order_event("ORDER_FENCED", intent, context=context, broker_status="ORDER_FENCED_BEFORE_BROKER_SUBMIT")
         return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
                 "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+    lifecycle_meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if side == "SELL" and not (
+        intent.get("position_lifecycle_id")
+        or lifecycle_meta.get("position_lifecycle_id")
+        or intent.get("position_cycle_id")
+        or lifecycle_meta.get("position_cycle_id")
+    ):
+        logger.error(
+            "[US_ORDER][LIFECYCLE_INTEGRITY][BLOCK] symbol=%s side=SELL "
+            "reason=position_lifecycle_identity_missing",
+            symbol_upper,
+        )
+        return {
+            "status": "POLICY_LIFECYCLE_INTEGRITY_MISSING",
+            "reason": "position_lifecycle_identity_missing",
+            "broker_submit": False,
+            "intent": intent,
+        }
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation

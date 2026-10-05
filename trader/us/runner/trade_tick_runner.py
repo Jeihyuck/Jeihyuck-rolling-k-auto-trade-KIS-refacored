@@ -1161,6 +1161,16 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
         selected_reason = str(selected.get("reason") or selected_meta.get("reason") or _exit_family(selected))
         absorbed = [str(row.get("reason") or (row.get("meta") or {}).get("reason") or _exit_family(row))
                     for _, row in rows[1:]]
+        lifecycle_ids = {
+            str(value)
+            for _, row in rows
+            for value in (
+                row.get("position_lifecycle_id"),
+                (row.get("meta") or {}).get("position_lifecycle_id")
+                if isinstance(row.get("meta"), dict) else None,
+            )
+            if value
+        }
         merge_fields = {
             "merged_exit_intent": len(rows) > 1, "absorbed_exit_reasons": absorbed,
             "selected_exit_reason": selected_reason, "selected_exit_family": _exit_family(selected),
@@ -1170,6 +1180,15 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
         selected.update(merge_fields)
         selected_meta.update(merge_fields)
         selected_meta.setdefault("exit_family", _exit_family(selected))
+        if len(lifecycle_ids) == 1:
+            lifecycle_id = next(iter(lifecycle_ids))
+            selected["position_lifecycle_id"] = lifecycle_id
+            selected_meta["position_lifecycle_id"] = lifecycle_id
+        elif len(lifecycle_ids) > 1:
+            selected.pop("position_lifecycle_id", None)
+            selected.pop("position_cycle_id", None)
+            selected_meta.pop("position_lifecycle_id", None)
+            selected_meta.pop("position_cycle_id", None)
         selected["meta"] = selected_meta
         merged.append(selected)
     return passthrough + merged

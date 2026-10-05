@@ -3,6 +3,13 @@
 > **KIS_ENV: PRACTICE**
 > 모의투자 주문이며 실계좌/MTS에는 표시되지 않음
 
+## Trade Reason & PnL
+- Realized PnL (gross): $0.00
+- Same-day BUY-lot EOD unrealized PnL: $0.00
+- Gross trade-day impact: $0.00
+- Fees/taxes: excluded unless explicitly available in broker evidence
+
+
 **Session**: CLOSE
 
 ## Runtime Metadata
@@ -10,10 +17,10 @@
 | Field | Value |
 |---|---|
 | trade_date | 2026-07-16 |
-| branch | dual-agent |
-| commit_sha | dbbf119be00e48e1472a62f31ee3961ca63462c5 |
-| workflow | local |
-| run_id | local |
+| branch | stabilize/01-execution-state-contract-20261004 |
+| commit_sha | 7f42cfb333a9e371f5dc385dd1f06a7561aeee9b |
+| workflow | dynamic/copilot-swe-agent/copilot |
+| run_id | 37245610492 |
 | session | close |
 | env | practice |
 | KIS_ENV | practice |
@@ -43,17 +50,28 @@
 | canonical_order_source | router_session_summary |
 | canonical_position_source | kis_final_balance |
 | orders_submitted_total | 0 |
+| session_orders_submitted | 0 |
+| daily_orders_submitted_total | 0 |
 | orders_ack_total | 0 |
 | orders_rejected_total | 0 |
+| orders_cancelled_total | 0 |
+| orders_zero_fill_cancelled_total | 0 |
+| orders_partial_fill_cancelled_total | 0 |
+| orders_unknown_fill_cancelled_total | 0 |
 | orders_unresolved_total | 0 |
 | buy_notional_total | 0.0 |
 | sell_notional_total | 0.0 |
+| session_buy_notional | 0.0 |
+| session_sell_notional | 0.0 |
+| daily_buy_notional_total | 0.0 |
+| daily_sell_notional_total | 0.0 |
+| daily_fills_total | 0 |
 | actual_new_positions | 0 |
 | open_position_count | 1 |
-| account_equity_krw | 49999999.99999999 |
-| account_equity_usd | 0.0 |
+| account_equity_krw | None |
+| account_equity_usd | None |
 | invested_market_value_usd | 0.0 |
-| cash_usd | 34482.75862068965 |
+| cash_usd | None |
 | gross_exposure_pct | 0.0 |
 | target_exposure_pct | 0.7 |
 | max_exposure_pct | 0.85 |
@@ -143,6 +161,7 @@
 ## Warnings
 
 -ORDER_SOURCE_EMPTY
+-ACCOUNT_EQUITY_UNAVAILABLE_HOLDINGS_ONLY_BALANCE
 
 ## Errors
 

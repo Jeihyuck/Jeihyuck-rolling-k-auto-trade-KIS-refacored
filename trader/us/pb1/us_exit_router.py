@@ -96,6 +96,35 @@ def _is_hard_exit(exit_type: str) -> bool:
     return exit_type in _HARD_EXIT_TYPES
 
 
+def _propagate_position_lifecycle(intent: dict | None, position: dict) -> dict | None:
+    if not intent or str(intent.get("side") or "").upper() != "SELL":
+        return intent
+    position_meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    risk_state = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
+    risk_state_data = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
+    risk_lifecycle = (
+        risk_state_data.get("lifecycle")
+        if isinstance(risk_state_data.get("lifecycle"), dict) else {}
+    )
+    lifecycle_id = next(
+        (
+            str(value).strip()
+            for value in (
+                position.get("position_lifecycle_id"),
+                position_meta.get("position_lifecycle_id"),
+                risk_lifecycle.get("lifecycle_id"),
+            )
+            if str(value or "").strip()
+        ),
+        None,
+    )
+    if lifecycle_id:
+        intent["position_lifecycle_id"] = str(lifecycle_id)
+        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+        intent["meta"] = {**meta, "position_lifecycle_id": str(lifecycle_id)}
+    return intent
+
+
 # ── min_hold guard ─────────────────────────────────────────────────────────
 
 def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, int]:
@@ -267,12 +296,15 @@ def _make_day_exit_intent(
     symbol: str, exchange: str, qty: int,
     current_price: float, entry_price: float,
     exit_type: str, reason: str, pnl_pct: float,
+    position_lifecycle_id: str | None = None,
 ) -> dict:
     import hashlib
     from datetime import date
-    key_raw = f"{symbol}_{date.today():%Y%m%d}_SELL_{exit_type}"
+    trade_date = date.today()
+    key_raw = f"{symbol}_{trade_date:%Y%m%d}_SELL_{exit_type}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
     unrealized = (current_price - entry_price) * qty
+    limit_price = round(current_price * 0.998, 4)
     logger.info(
         "[US_EXIT][DAY_CHECK] symbol=%s pnl_pct=%.4f exit_type=%s reason=%s",
         symbol, pnl_pct, exit_type, reason,
@@ -283,18 +315,24 @@ def _make_day_exit_intent(
         "side": "SELL",
         "qty": qty,
         "available_qty": qty,
-        "limit_price": round(current_price * 0.998, 4),
-        "notional_usd": round(current_price * qty, 4),
+        "limit_price": limit_price,
+        "notional_usd": round(limit_price * qty, 4),
         "exit_type": exit_type,
         "reason": reason,
         "unrealized_pnl_usd": round(unrealized, 4),
         "unrealized_pnl_pct": round(pnl_pct, 4),
         "client_order_key": client_order_key,
+        "trade_date": trade_date.isoformat(),
         "strategy": "us_pb1_exit",
         "exit_policy": "DAY_BOOK",
         "book": "DAY_BOOK",
         "horizon": "DAY_TRADE",
-        "meta": {"holding_qty": qty, "orderable_qty": qty, "sellable_qty": qty, "qty_source": "holding_qty"},
+        **({"position_lifecycle_id": position_lifecycle_id} if position_lifecycle_id else {}),
+        "meta": {
+            "holding_qty": qty, "orderable_qty": qty, "sellable_qty": qty,
+            "qty_source": "holding_qty",
+            **({"position_lifecycle_id": position_lifecycle_id} if position_lifecycle_id else {}),
+        },
     }
 
 
@@ -324,6 +362,33 @@ def evaluate_day_exit(
     exchange = position.get("exchange", "NASDAQ")
     entry_price = _get_entry_price(position)
     qty = int(position.get("qty") or position.get("holding_qty") or 0)
+    position_meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    risk_state = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
+    risk_state_data = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
+    risk_lifecycle = (
+        risk_state_data.get("lifecycle")
+        if isinstance(risk_state_data.get("lifecycle"), dict) else {}
+    )
+    position_lifecycle_id = next(
+        (
+            str(value).strip()
+            for value in (
+                position.get("position_lifecycle_id"),
+                position_meta.get("position_lifecycle_id"),
+                risk_lifecycle.get("lifecycle_id"),
+            )
+            if str(value or "").strip()
+        ),
+        None,
+    )
+
+    def _emit_day_exit(*args):
+        return _make_day_exit_intent(
+            *args,
+            position_lifecycle_id=(
+                str(position_lifecycle_id) if position_lifecycle_id else None
+            ),
+        )
 
     if entry_price <= 0 or current_price <= 0 or qty <= 0:
         return None
@@ -339,7 +404,7 @@ def evaluate_day_exit(
     # day_hard_stop: BUY-time contract first; ENV only for legacy positions.
     day_hard_stop = float(day_cfg.get("hard_stop", os.getenv("US_DAY_HARD_STOP_PCT", "0.03")))
     if pnl_pct <= -day_hard_stop:
-        return _make_day_exit_intent(
+        return _emit_day_exit(
             symbol, exchange, qty, current_price, entry_price,
             "day_hard_stop",
             f"pnl_pct={pnl_pct:.4f} <= -{day_hard_stop}",
@@ -362,7 +427,7 @@ def evaluate_day_exit(
     # day_profit_take: 당일 익절
     day_profit_take = float(day_cfg.get("profit_take", os.getenv("US_DAY_PROFIT_TAKE_PCT", "0.025")))
     if pnl_pct >= day_profit_take:
-        return _make_day_exit_intent(
+        return _emit_day_exit(
             symbol, exchange, qty, current_price, entry_price,
             "day_profit_take",
             f"pnl_pct={pnl_pct:.4f} >= day_profit_take={day_profit_take}",
@@ -374,7 +439,7 @@ def evaluate_day_exit(
     day_trailing = float(day_cfg.get("trailing_stop", os.getenv("US_DAY_TRAILING_STOP_PCT", "0.025")))
     if max_price > 0 and current_price < max_price * (1 - day_trailing):
         trail = (max_price - current_price) / max_price
-        return _make_day_exit_intent(
+        return _emit_day_exit(
             symbol, exchange, qty, current_price, entry_price,
             "day_trailing",
             f"trail_pct={trail:.4f} >= day_trailing={day_trailing}",
@@ -396,7 +461,7 @@ def evaluate_day_exit(
                     "now_et=%s flatten_after=%s",
                     symbol, now_et.strftime("%H:%M:%S"), flatten_after_et,
                 )
-                return _make_day_exit_intent(
+                return _emit_day_exit(
                     symbol, exchange, qty, current_price, entry_price,
                     "day_close_flatten",
                     f"close_flatten after {flatten_after_et} ET",
@@ -454,7 +519,7 @@ def route_exit_by_book_horizon(
             intent = evaluate_day_exit(position=position, current_price=current_price, now=now)
         if intent:
             intent.setdefault("exit_policy", "DAY_BOOK")
-        return intent
+        return _propagate_position_lifecycle(intent, position)
 
     # SWING_BOOK (기본)
     try:
@@ -467,4 +532,4 @@ def route_exit_by_book_horizon(
         intent.setdefault("exit_policy", "US_SWING_DEFAULT")
         intent.setdefault("book", "SWING_BOOK")
         intent.setdefault("horizon", "SWING_CARRY")
-    return intent
+    return _propagate_position_lifecycle(intent, position)

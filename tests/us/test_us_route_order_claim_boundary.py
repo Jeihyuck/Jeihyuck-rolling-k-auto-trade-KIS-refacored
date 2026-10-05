@@ -607,6 +607,197 @@ def test_satisfied_tp1_stays_one_shot_across_dates_while_tp2_tp3_remain_distinct
     assert broker.calls == 3
 
 
+def test_tqqq_run_sleeve_uses_cycle_lifecycle_and_one_daily_buy_action(monkeypatch):
+    from datetime import date
+    from trader.us.infinite.integration import run_sleeve
+    from trader.us.infinite.models import Action, Decision, InfiniteState, Status
+    from trader.us.execution.order_router import _semantic_action_identity
+
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    monkeypatch.setenv("US_BLOCK_NEW_ENTRY_AFTER_ET", "23:59")
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, fail_submit=True, production_identity=True,
+    )
+    state = InfiniteState(
+        cycle_id="tqqq-cycle-route-test",
+        cycle_start_date=date(2026, 10, 1),
+        core_filled_notional=100.0,
+        status=Status.ACTIVE,
+        metadata={"position_lifecycle_id": "stale-position-lifecycle"},
+    )
+
+    class _InfiniteRepo:
+        def __init__(self):
+            self.state = state
+
+        def ensure_schema(self):
+            return None
+
+        def load_state(self, **_kwargs):
+            return self.state
+
+        def save_state(self, value):
+            self.state = value
+
+        def pending_sides(self, *_args):
+            return False, False
+
+        def fill_accounting(self, *_args):
+            return 0.0, 0.0, 0.0, None, None
+
+        def reconcile_metadata(self, current, **_kwargs):
+            return current
+
+    reason = {"value": "FAST_DIP_ADD_BUY"}
+    monkeypatch.setattr(
+        "trader.us.infinite.integration.evaluate",
+        lambda **_kwargs: Decision(
+            Action.BUY, reason["value"], qty=1, notional=50.0,
+            next_status=Status.ACTIVE,
+        ),
+    )
+
+    def run(trading_date):
+        return run_sleeve(
+            positions=[], price=50.0, trading_date=date.fromisoformat(trading_date),
+            overlay={"market_state": "NORMAL"}, repository=_InfiniteRepo(),
+            route=lambda intent: route_order(intent, kis_client=broker),
+        )
+
+    day_one = run("2026-10-02")
+    first_intent = day_one["orders"][0]["intent"]
+    identity = _semantic_action_identity(first_intent, account_env="practice")
+    assert identity.lifecycle_id == "tqqq-cycle-route-test"
+    assert identity.action == "TQQQ_INFINITE_BUY"
+    assert identity.action_instance == "2026-10-02"
+    assert day_one["status"] == "BROKER_SUBMIT_RESULT_UNKNOWN"
+
+    reason["value"] = "ROUTINE_ADD_BUY"
+    same_day = run("2026-10-02")
+    assert same_day["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    next_day_unresolved = run("2026-10-05")
+    assert next_day_unresolved["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert broker.calls == 1
+
+    claim = claim_repo.get(identity)
+    claim_repo.record_observation(
+        identity, attempt_id=claim.active_attempt_id, state="FILLED",
+        cumulative_filled_qty=1, authoritative=True,
+    )
+    broker.fail_submit = False
+    next_day_terminal = run("2026-10-05")
+    assert next_day_terminal["status"] == "ACK"
+    next_identity = _semantic_action_identity(
+        next_day_terminal["orders"][0]["intent"], account_env="practice",
+    )
+    assert next_identity.lifecycle_id == identity.lifecycle_id
+    assert next_identity.action == identity.action
+    assert next_identity.action_instance == "2026-10-05"
+    assert next_identity.action_key != identity.action_key
+    assert broker.calls == 2
+
+    # A different TQQQ BUY reason does not create a second same-day authority.
+    reason["value"] = "FAST_DIP_ADD_BUY"
+    same_day_again = run("2026-10-05")
+    assert same_day_again["status"] == "BLOCKED"
+    assert broker.calls == 2
+    sell_identity = _semantic_action_identity(
+        {
+            "side": "SELL", "strategy_owner": "TQQQ_INFINITE",
+            "position_lifecycle_id": "tqqq-cycle-route-test",
+            "trade_date": "2026-10-05", "reason": "TAKE_PROFIT_TQQQ_INFINITE",
+            "profit_capture_stage": "TP1",
+        },
+        account_env="practice",
+    )
+    assert sell_identity.action_instance is None
+
+
+def test_sell_without_source_lifecycle_fails_closed_without_synthesizing(monkeypatch):
+    _engine, _claim_repo, broker = _route_fixture(
+        monkeypatch, production_identity=True,
+    )
+    intent = _intent(
+        "2026-10-02", qty=1, action="HARD_STOP",
+        client_order_key="missing-source-lifecycle", side="SELL",
+    )
+    intent.pop("position_lifecycle_id")
+    result = route_order(intent, kis_client=broker)
+    assert result["status"] == "POLICY_LIFECYCLE_INTEGRITY_MISSING"
+    assert result["reason"] == "position_lifecycle_identity_missing"
+    assert result["broker_submit"] is False
+    assert broker.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("exit_kind", "current_price"),
+    (("hard_stop", 91.0), ("trend_exit", 100.0), ("day_exit", 103.0)),
+)
+def test_pb1_generated_sell_keeps_source_lifecycle_through_durable_route(
+    monkeypatch, exit_kind, current_price,
+):
+    from datetime import datetime, timezone
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.execution.order_router import _semantic_action_identity
+    from trader.us.pb1.us_exit_engine import generate_exit_intents
+    from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
+
+    _engine, claim_repo, broker = _route_fixture(monkeypatch, production_identity=True)
+    lifecycle_id = f"pb1-route-lifecycle-{exit_kind}"
+    book = "DAY_BOOK" if exit_kind == "day_exit" else "SWING_BOOK"
+    horizon = "DAY_TRADE" if exit_kind == "day_exit" else "SWING_CARRY"
+    contract = build_us_entry_exit_contract({
+        "symbol": "SPY", "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "book": book, "horizon": horizon,
+        "exit_policy": "DAY_BOOK" if book == "DAY_BOOK" else "US_SWING_DEFAULT",
+        "entry_strategy": "us_pb1", "entry_signal_type": "pullback",
+        "entry_style_selected": "ENTRY_PULLBACK", "reasons": ["ENTRY_PULLBACK"],
+        "score_breakdown": {"pullback": 0.8}, "filters_passed": ["score", "risk"],
+    })
+    position = {
+        "symbol": "SPY", "exchange": "NASDAQ", "qty": 10, "orderable_qty": 10,
+        "entry_price": 100.0, "max_price": 100.0, "position_lifecycle_id": lifecycle_id,
+        "entry_time": "2026-10-01T10:00:00-04:00",
+        "book": book, "horizon": horizon,
+        "meta": {
+            "position_lifecycle_id": lifecycle_id,
+            "entry_exit_contract": contract,
+        },
+    }
+    if exit_kind == "trend_exit":
+        monkeypatch.setattr(
+            "trader.us.position_trend_state.choose_trend_time_exit",
+            lambda *_args, **_kwargs: ("trend_deterioration_exit", 5, "TREND_EXIT"),
+        )
+    if exit_kind == "day_exit":
+        monkeypatch.setenv("US_DAY_PROFIT_TAKE_PCT", "0.025")
+    class _Provider:
+        def get_current_price(self, _symbol, _exchange):
+            return current_price
+
+    generated = generate_exit_intents(
+        [position], _Provider(), now=datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc),
+    )
+    assert len(generated) == 1
+    intent = generated[0]
+    assert intent.get("position_lifecycle_id") == lifecycle_id
+    assert intent.get("meta", {}).get("position_lifecycle_id") == lifecycle_id
+
+    routed = route_exit_orders_immediately(
+        generated, buy_daily_notional=0.0, position_count=1, effective_budget=5000.0,
+        signal_only=False, kis_order_allowed=True, current_position_symbols={"SPY"},
+        kis_client=broker,
+    )
+    assert routed["orders"][0]["status"] == "ACK"
+    routed_intent = routed["orders"][0].get("intent") or intent
+    identity = _semantic_action_identity(routed_intent, account_env="practice")
+    assert identity.lifecycle_id == lifecycle_id
+    claim = claim_repo.get(identity)
+    assert claim.active_attempt_id is not None
+    assert broker.calls == 1
+
+
 def test_unresolved_sell_blocks_emergency_until_reconciled_remaining_qty(monkeypatch):
     from trader.us.db import repos
 
