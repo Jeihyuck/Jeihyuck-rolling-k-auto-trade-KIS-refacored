@@ -955,6 +955,35 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
 
             risk = load_us_position_risk_state(symbol, trade_date) or {}
             nested = dict(risk.get("state") or {})
+            lifecycle = (
+                dict(nested.get("lifecycle") or {})
+                if isinstance(nested.get("lifecycle"), dict)
+                else {}
+            )
+            record_owner = str(
+                meta.get("strategy_owner")
+                or meta.get("sleeve_id")
+                or rec.get("strategy_owner")
+                or rec.get("sleeve_id")
+                or ""
+            ).upper()
+            lifecycle_owner = str(
+                lifecycle.get("strategy_owner")
+                or lifecycle.get("sleeve_id")
+                or ""
+            ).upper()
+            if (
+                not lifecycle_id
+                and record_owner == "US_STANDARD"
+                and lifecycle_owner == "US_STANDARD"
+                and lifecycle.get("is_open") is True
+                and str(lifecycle.get("lifecycle_id") or "").strip()
+            ):
+                lifecycle_id = str(lifecycle.get("lifecycle_id")).strip()
+                logger.info(
+                    "[US_EXIT][SOFT_STOP_STATE][LIFECYCLE_RECOVERED] symbol=%s lifecycle_id=%s source=current_open_lifecycle",
+                    symbol, lifecycle_id,
+                )
             prior = dict(nested.get("soft_stop_execution") or {})
             if prior.get("position_lifecycle_id") and lifecycle_id and prior.get("position_lifecycle_id") != lifecycle_id:
                 prior = {}
