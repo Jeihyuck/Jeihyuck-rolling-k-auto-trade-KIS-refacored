@@ -485,3 +485,40 @@ def test_late_daily_ccld_partial_execution_prices_need_complete_order_proof():
         fills_repo=fills, source_order=order, env="practice",
         confirmed_cumulative_qty=5,
     ) == pytest.approx(116.0)
+
+
+def test_position_pnl_status_stays_unresolved_until_all_sell_orders_are_priced():
+    engine = _db()
+    repo = PositionsRepo(engine)
+    pos = _open_position(engine, code="123455", qty=10, avg=100.0)
+    common = dict(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="123455", market="J",
+        filled_at=datetime(2026, 10, 6, 1, tzinfo=timezone.utc),
+        position_cycle_id=str(pos["position_cycle_id"]),
+        portfolio_epoch_id=str(pos["portfolio_epoch_id"]),
+    )
+    first = repo.reconcile_sell_execution(
+        **common, order_id="sell-stage-1", confirmed_cumulative_qty=2,
+        fill_price=None, pre_order_holding_qty=10, broker_holding_qty=8,
+    )
+    assert first["realized_pnl_status"] == "REALIZED_PNL_UNRESOLVED"
+    second = repo.reconcile_sell_execution(
+        **common, order_id="sell-stage-2", confirmed_cumulative_qty=2,
+        fill_price=120.0, pre_order_holding_qty=8, broker_holding_qty=6,
+    )
+    assert second["order_realized_pnl_status"] == "CONFIRMED"
+    assert second["realized_pnl_status"] == "REALIZED_PNL_UNRESOLVED"
+    third = repo.reconcile_sell_execution(
+        **common, order_id="sell-stage-1", confirmed_cumulative_qty=2,
+        fill_price=110.0, pre_order_holding_qty=10, broker_holding_qty=None,
+    )
+    assert third["realized_pnl_status"] == "CONFIRMED"
+    stored = repo.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="123455", position_cycle_id=str(pos["position_cycle_id"]),
+        portfolio_epoch_id=str(pos["portfolio_epoch_id"]),
+    )
+    assert stored["qty"] == 6
+    assert stored["position_meta"]["realized_pnl_status"] == "CONFIRMED"
+    assert stored["realized_pnl"] == pytest.approx(60.0)
