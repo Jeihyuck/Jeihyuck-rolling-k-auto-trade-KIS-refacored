@@ -167,6 +167,10 @@ def test_oct5_confirmed_persistent_soft_stop_full_exit_survives_general_repeat_g
     ]
 
     for snapshot in incidents:
+        # The 2026-10-05 PR154-era rows have confirmed fill quantity/order
+        # identity but an empty soft_stop_execution lifecycle id.
+        snapshot["risk_state"]["state"]["soft_stop_execution"]["position_lifecycle_id"] = ""
+
         # These prices intentionally do not satisfy the old generic repeat
         # risk-escalation thresholds. The persistent contract itself must carry
         # the already-confirmed partial stop into the full-exit leg.
