@@ -593,6 +593,28 @@ def _promote_open_buy_orders_from_holdings(
                         pre_order_holding_qty=saved_pre,
                         broker_holding_qty=None,
                     )
+                    _project_pb1_exit_stage_truth(
+                        orders_repo=orders_repo,
+                        positions_repo=positions_repo,
+                        env=env,
+                        code=code,
+                        strategy=str(order.get("strategy") or strategy),
+                        source_order=order,
+                        request_json=request_json,
+                    )
+                    tp_stage = str(request_json.get("profit_capture_stage") or "").lower()
+                    if tp_stage in {"tp1", "tp2", "tp3"} and saved_filled >= int(order.get("qty") or 0):
+                        positions_repo.mark_profit_capture_fill(
+                            env=env,
+                            strategy=str(order.get("strategy") or strategy),
+                            sid=int(order.get("sid") or 1),
+                            mode=int(order.get("mode") or 1),
+                            code=code,
+                            position_cycle_id=str(order.get("position_cycle_id") or ""),
+                            stage=tp_stage,
+                            client_order_key=str(order.get("client_order_key") or ""),
+                            filled_qty=saved_filled,
+                        )
                 else:
                     continue
                 claim_error = _record_execution_claim_observation(
