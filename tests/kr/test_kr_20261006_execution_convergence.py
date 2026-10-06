@@ -345,3 +345,95 @@ def test_holdings_fallback_satisfies_buy_execution_claim():
     assert snapshot.cumulative_filled_qty == 2
     assert snapshot.remaining_target_qty == 0
     assert orders.get_order_by_client_order_key("practice", client_key)["status"] == "FILLED"
+
+
+def test_sell_reconcile_rejects_unattributed_db_quantity_drift():
+    engine = _db()
+    positions = PositionsRepo(engine)
+    current = _open_position(engine, code="123451", qty=12, avg=100.0)
+    with pytest.raises(RuntimeError, match="KR_SELL_RECONCILE_DB_BASELINE_DRIFT"):
+        positions.reconcile_sell_execution(
+            env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+            code="123451", market="J", confirmed_cumulative_qty=3,
+            fill_price=None, filled_at=datetime(2026, 10, 6, 1, tzinfo=timezone.utc),
+            position_cycle_id=str(current["position_cycle_id"]),
+            portfolio_epoch_id=str(current["portfolio_epoch_id"]),
+            order_id="sell-unrelated-drift",
+            pre_order_holding_qty=10, broker_holding_qty=7,
+        )
+    stored = positions.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="123451", position_cycle_id=str(current["position_cycle_id"]),
+        portfolio_epoch_id=str(current["portfolio_epoch_id"]),
+    )
+    assert stored["qty"] == 12
+
+
+def test_closed_full_sell_accepts_late_price_without_reopening_or_double_booking():
+    engine = _db()
+    repo = PositionsRepo(engine)
+    pos = _open_position(engine, code="123452", qty=5, avg=100.0)
+    when = datetime(2026, 10, 6, 1, tzinfo=timezone.utc)
+    kwargs = dict(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="123452", market="J", confirmed_cumulative_qty=5,
+        filled_at=when, position_cycle_id=str(pos["position_cycle_id"]),
+        portfolio_epoch_id=str(pos["portfolio_epoch_id"]),
+        order_id="sell-full-late-price", pre_order_holding_qty=5,
+    )
+    first = repo.reconcile_sell_execution(**kwargs, fill_price=None, broker_holding_qty=0)
+    assert first["qty_applied"] == 5
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        before = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_id == pos["position_id"]
+        )).mappings().one()
+    assert before["status"] == "CLOSED" and before["qty"] == 0
+    assert before["realized_pnl"] == 0
+
+    second = repo.reconcile_sell_execution(**kwargs, fill_price=120.0, broker_holding_qty=None)
+    third = repo.reconcile_sell_execution(**kwargs, fill_price=120.0, broker_holding_qty=None)
+    assert second["qty_applied"] == 0 and second["pnl_qty_applied"] == 5
+    assert third["qty_applied"] == 0 and third["pnl_qty_applied"] == 0
+    with engine.connect() as conn:
+        after = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_id == pos["position_id"]
+        )).mappings().one()
+    assert after["status"] == "CLOSED" and after["qty"] == 0
+    assert after["realized_pnl"] == pytest.approx(100.0)
+    assert after["closed_ts"] == before["closed_ts"]
+
+    with pytest.raises(RuntimeError, match="KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT"):
+        repo.reconcile_sell_execution(**kwargs, fill_price=121.0, broker_holding_qty=None)
+
+
+def test_partial_sell_later_cumulative_average_price_uses_incremental_proceeds():
+    engine = _db()
+    repo = PositionsRepo(engine)
+    pos = _open_position(engine, code="123453", qty=10, avg=100.0)
+    kwargs = dict(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="123453", market="J",
+        filled_at=datetime(2026, 10, 6, 1, tzinfo=timezone.utc),
+        position_cycle_id=str(pos["position_cycle_id"]),
+        portfolio_epoch_id=str(pos["portfolio_epoch_id"]),
+        order_id="sell-partial-cumulative", pre_order_holding_qty=10,
+    )
+    first = repo.reconcile_sell_execution(
+        **kwargs, confirmed_cumulative_qty=2, fill_price=110.0,
+        broker_holding_qty=8,
+    )
+    second = repo.reconcile_sell_execution(
+        **kwargs, confirmed_cumulative_qty=5, fill_price=116.0,
+        broker_holding_qty=5,
+    )
+    assert first["pnl_qty_applied"] == 2
+    assert second["pnl_qty_applied"] == 3
+    stored = repo.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="123453", position_cycle_id=str(pos["position_cycle_id"]),
+        portfolio_epoch_id=str(pos["portfolio_epoch_id"]),
+    )
+    assert stored["qty"] == 5
+    # 5 sold shares total at cumulative broker average 116; basis 100.
+    assert stored["realized_pnl"] == pytest.approx(80.0)
