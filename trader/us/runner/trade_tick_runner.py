@@ -972,6 +972,7 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
                 or lifecycle.get("sleeve_id")
                 or ""
             ).upper()
+            lifecycle_recovered_from_current = False
             if not lifecycle_id:
                 def _parse_soft_stop_evidence_time(raw):
                     if raw in (None, ""):
@@ -1004,6 +1005,7 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
                 )
                 if can_recover_lifecycle:
                     lifecycle_id = str(lifecycle.get("lifecycle_id")).strip()
+                    lifecycle_recovered_from_current = True
                     logger.info(
                         "[US_EXIT][SOFT_STOP_STATE][LIFECYCLE_RECOVERED] symbol=%s lifecycle_id=%s source=current_open_lifecycle",
                         symbol, lifecycle_id,
@@ -1056,7 +1058,18 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
                 "order_no": str(order_no or ""),
             }
             risk["state"] = nested
-            save_us_position_risk_state(symbol, trade_date, risk)
+            saved = save_us_position_risk_state(
+                symbol,
+                trade_date,
+                risk,
+                require_durable=lifecycle_recovered_from_current,
+            )
+            if lifecycle_recovered_from_current and saved is not True:
+                logger.error(
+                    "[US_EXIT][SOFT_STOP_STATE][LIFECYCLE_RECOVERY_SAVE_FAILED] symbol=%s lifecycle_id=%s action=fail_closed",
+                    symbol, lifecycle_id or "NA",
+                )
+                continue
             logger.info(
                 "[US_EXIT][SOFT_STOP_STATE][FILLED] symbol=%s lifecycle_id=%s qty=%s price=%.4f order_no=%s",
                 symbol, lifecycle_id or "NA", filled_qty, fill_price, order_no or "",
