@@ -374,10 +374,14 @@ def test_oct5_legacy_blank_soft_stop_lifecycle_upgrades_from_broker_order(monkey
         }
 
     monkeypatch.setattr(repos, "load_us_order_for_fill", load_order_for_fill)
+    def save_legacy_upgrade(symbol, trade_date, state):
+        saves.append((symbol, trade_date, state))
+        return True
+
     monkeypatch.setattr(
         repos,
         "save_us_position_risk_state",
-        lambda symbol, trade_date, state: saves.append((symbol, trade_date, state)),
+        save_legacy_upgrade,
     )
 
     for incident, _broker_time in incidents:
@@ -400,6 +404,61 @@ def test_oct5_legacy_blank_soft_stop_lifecycle_upgrades_from_broker_order(monkey
         assert reason == "PERSISTENT_SOFT_STOP_ESCALATION"
 
     assert {symbol for symbol, _, _ in saves} == {"JNJ", "MRK"}
+
+
+def test_legacy_soft_stop_upgrade_requires_durable_save(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.pb1.us_exit_engine import (
+        _confirmed_soft_stop_partial_fill_for_current_lifecycle,
+        _recover_legacy_soft_stop_execution_lifecycle,
+    )
+
+    incident = _oct5_persistent_snapshot(
+        symbol="JNJ",
+        entry_price=270.65,
+        current_price=253.75,
+        qty=1,
+        first_fill_qty=1,
+        first_soft_stop_price=255.13,
+        lifecycle_id="life-jnj-oct5",
+        breach_count=67,
+    )
+    soft_exec = incident["risk_state"]["state"]["soft_stop_execution"]
+    soft_exec["position_lifecycle_id"] = ""
+
+    monkeypatch.setattr(
+        repos,
+        "load_us_order_for_fill",
+        lambda **kwargs: {
+            "trade_date": "2026-10-05",
+            "symbol": "JNJ",
+            "side": "SELL",
+            "qty_filled": 1,
+            "status": "FILLED",
+            "meta": {
+                "strategy_owner": "US_STANDARD",
+                "source_endpoint": "KIS_INQUIRE_CCNL",
+                "order_timestamp": "2026-10-05T23:04:28",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        repos,
+        "save_us_position_risk_state",
+        lambda *args, **kwargs: False,
+    )
+
+    recovered = _recover_legacy_soft_stop_execution_lifecycle(
+        incident,
+        incident["risk_state"],
+        dict(soft_exec),
+        incident["position_lifecycle_id"],
+    )
+    assert recovered.get("position_lifecycle_id") in ("", None)
+
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(incident)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_LEGACY_LIFECYCLE_UNVERIFIED"
 
 
 def test_legacy_blank_soft_stop_same_day_ambiguous_open_time_fails_closed(monkeypatch):
