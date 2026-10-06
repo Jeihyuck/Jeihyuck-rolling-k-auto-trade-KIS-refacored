@@ -1,0 +1,48 @@
+name: KR/US Shared Settlement Integrity
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  settlement-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: settlement_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d settlement_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/settlement_ci
+      NULLIM_SETTLEMENT_SHADOW_ENABLED: "0"
+      NULLIM_SETTLEMENT_WRITER_ENABLED: "0"
+      DRY_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then python -m pip install -r requirements-dev.txt; fi
+          pip install pytest sqlalchemy psycopg2-binary
+      - name: Compile
+        run: python -m compileall -q trader/settlement
+      - name: Shared settlement contract and market-specific regressions
+        run: |
+          pytest -q tests/test_shared_settlement_ledger.py
+          if [ -f tests/test_kr_us_settlement_shadow.py ]; then pytest -q tests/test_kr_us_settlement_shadow.py; fi
+          if [ -f tests/test_settlement_release_gate.py ]; then pytest -q tests/test_settlement_release_gate.py; fi
+          if [ -f tests/test_settlement_postgres_concurrency.py ]; then pytest -q tests/test_settlement_postgres_concurrency.py; fi
