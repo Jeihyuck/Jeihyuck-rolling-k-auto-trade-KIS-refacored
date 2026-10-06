@@ -391,6 +391,63 @@ def test_soft_stop_fill_state_recovers_current_lifecycle_when_fill_meta_omits_id
     assert soft_state["first_soft_stop_filled_qty"] == 1
     assert soft_state["position_lifecycle_id"] == "life-jnj-oct5"
 
+def test_soft_stop_fill_state_does_not_use_observed_at_as_execution_time(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.runner.trade_tick_runner import _mark_soft_stop_stages_from_records
+
+    store = {
+        "trade_date": "2026-10-06",
+        "symbol": "JNJ",
+        "soft_stop_breach_count": 0,
+        "state": {
+            "lifecycle": {
+                "lifecycle_id": "life-jnj-reentry",
+                "is_open": True,
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "opened_at": "2026-10-06T15:00:00+00:00",
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        repos,
+        "load_us_position_risk_state",
+        lambda symbol, trade_date: dict(store),
+    )
+    saves = []
+    monkeypatch.setattr(
+        repos,
+        "save_us_position_risk_state",
+        lambda symbol, trade_date, state: saves.append(state),
+    )
+
+    _mark_soft_stop_stages_from_records(
+        [{
+            "symbol": "JNJ",
+            "side": "SELL",
+            "qty": 1,
+            "price": 255.13,
+            "order_no": "old-order",
+            "client_order_key": "old-soft-stop",
+            # Observation occurs after re-entry, but there is no actual
+            # execution/order timestamp. This must not authorize rebinding.
+            "observed_at": "2026-10-06T16:00:00+00:00",
+            "meta": {
+                "exit_reason": "soft_stop_loss",
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "observed_at": "2026-10-06T16:00:00+00:00",
+            },
+        }],
+        trade_date="2026-10-06",
+        status="FILLED",
+    )
+
+    assert saves == []
+    assert "soft_stop_execution" not in store["state"]
+
+
 def test_soft_stop_fill_state_does_not_rebind_stale_fill_to_reentry_lifecycle(monkeypatch):
     from trader.us.db import repos
     from trader.us.runner.trade_tick_runner import _mark_soft_stop_stages_from_records
