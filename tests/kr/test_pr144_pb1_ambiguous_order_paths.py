@@ -285,6 +285,11 @@ def test_kr_claim_observation_failure_is_visible_and_keeps_submit_fence(monkeypa
     second = _engine(db, kis)._place_entry(retry)
 
     assert second["submit_terminal_status"] == "EXECUTION_ACTION_ALREADY_CLAIMED"
+    blocked_order = OrdersRepo(db).get_order_by_client_order_key(
+        "practice", retry.client_order_key
+    )
+    assert blocked_order["status"] == "ERROR"
+    assert blocked_order["response_json"]["broker_submit"] is False
     assert kis.buy_calls == 1
     assert OrdersRepo(db).execution_claim_health()["unresolved_execution_actions"] == 1
 
@@ -1196,3 +1201,57 @@ def test_add_on_explicit_business_reject_is_retryable_even_after_submitted_times
     assert len(rows) == 2
     assert rows[0]["client_order_key"] != rows[1]["client_order_key"]
     assert rows[1]["status"] == "ACKED"
+
+
+def test_pb1_sell_execution_lifecycle_uses_position_cycle_not_sid_mode(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setenv("KR_MARKET_STATE_OVERLAY_ENABLE", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "1")
+    db = _new_db()
+    kis = RetryableSellKis()
+    engine, position = _sell_case(db, kis)
+
+    _run_sell(engine, position)
+
+    order = OrdersRepo(db).list_today_orders(
+        "practice", side="SELL", code="123450", status_exclude=(),
+    )[0]
+    request_json = order["request_json"]
+    assert request_json["position_lifecycle_id"] == str(position["position_cycle_id"])
+    assert request_json["position_lifecycle_id"] != "sid:1:mode:1"
+
+
+def test_pb1_entry_retry_qty_is_capped_to_durable_remaining_target(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    monkeypatch.setattr(
+        OrdersRepo,
+        "get_retryable_execution_action_snapshot",
+        lambda *_args, **_kwargs: SimpleNamespace(remaining_target_qty=2),
+    )
+
+    class CaptureQtyKis(AckOnlyBuyKis):
+        def __init__(self):
+            super().__init__()
+            self.quantities = []
+
+        def buy_stock_limit(self, code: str, qty: int, price: float):
+            self.quantities.append(qty)
+            return super().buy_stock_limit(code, qty, price)
+
+    db = _new_db()
+    kis = CaptureQtyKis()
+    candidate = _build_candidate("018260")
+    candidate.planned_qty = 5
+
+    result = _engine(db, kis)._place_entry(candidate)
+    order = OrdersRepo(db).get_order_by_client_order_key(
+        "practice", candidate.client_order_key
+    )
+
+    assert result["api_submitted"] == 1
+    assert kis.quantities == [2]
+    assert order["qty"] == 2
+    assert order["request_json"]["requested_qty"] == 2
+    assert order["request_json"]["entry_plan"]["qty"] == 2
