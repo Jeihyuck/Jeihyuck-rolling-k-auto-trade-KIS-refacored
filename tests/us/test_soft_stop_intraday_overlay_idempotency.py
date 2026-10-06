@@ -236,6 +236,12 @@ def test_persistent_soft_stop_requires_confirmed_fill_for_current_lifecycle():
     assert allowed is False
     assert reason == "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
 
+    missing_owner = dict(base)
+    missing_owner.pop("strategy_owner", None)
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(missing_owner)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_OWNER_UNVERIFIED"
+
 
 def test_persistent_soft_stop_owner_isolation_keeps_tqqq_out():
     from trader.us.pb1.us_exit_engine import (
