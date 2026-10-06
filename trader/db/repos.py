@@ -6572,11 +6572,7 @@ class PositionsRepo:
                 "market": market,
                 "last_trade_at": filled_at,
                 "position_meta": position_meta,
-                "last_reconciled_at": (
-                    filled_at.isoformat()
-                    if hasattr(filled_at, "isoformat")
-                    else str(filled_at)
-                ),
+                "last_reconciled_at": filled_at,
             }
             if new_qty <= 0:
                 values.update(
