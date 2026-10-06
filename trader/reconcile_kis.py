@@ -1416,7 +1416,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             incremental_daily_qty = max(0, broker_cumulative_qty - previous_confirmed_qty)
             next_confirmed_qty = max(previous_confirmed_qty, broker_cumulative_qty)
         else:
-            incremental_daily_qty = 0 if already_applied else int(filled_qty or 0)
+            # An older KIS holdings-based promotion already proves the
+            # cumulative quantity. A per-fill daily-ccld row without an
+            # explicit broker cumulative total must not count it again.
+            if (
+                previous_confirmed_qty > 0
+                and source_response.get("promotion_source") == "kis_holdings"
+            ):
+                incremental_daily_qty = 0
+            else:
+                incremental_daily_qty = 0 if already_applied else int(filled_qty or 0)
             next_confirmed_qty = previous_confirmed_qty + incremental_daily_qty
         next_confirmed_notional = previous_confirmed_notional
         # A cancellation can only be finalized from an explicit broker
@@ -1562,7 +1571,25 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
                         pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
                     )
-            if incremental_daily_qty > 0 and side == "SELL" and source_order:
+            # A KIS daily-ccld execution may arrive *after* holdings fallback
+            # has already confirmed the same cumulative quantity. In that case
+            # incremental_daily_qty is 0 but the previously missing economic
+            # execution price must still close the position's PnL lifecycle.
+            # ccld_prc is a per-execution price, NOT necessarily an average
+            # for all partial executions; only apply it to an entire cumulative
+            # fill when this broker row proves the whole quantity.
+            full_single_execution_price = (
+                next_confirmed_qty > 0
+                and filled_qty is not None
+                and int(filled_qty) == next_confirmed_qty
+                and filled_price is not None
+                and filled_price > 0
+                and broker_cumulative_qty is not None
+                and broker_cumulative_qty == next_confirmed_qty
+            )
+            if side == "SELL" and source_order and (
+                incremental_daily_qty > 0 or full_single_execution_price
+            ):
                 positions_repo.reconcile_sell_execution(
                     env=env,
                     strategy=str(source_order.get("strategy") or strategy),
@@ -1571,7 +1598,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     code=code,
                     market=source_order.get("market") or market,
                     confirmed_cumulative_qty=next_confirmed_qty,
-                    fill_price=float(filled_price),
+                    fill_price=(
+                        float(filled_price)
+                        if full_single_execution_price else None
+                    ),
                     filled_at=order_time,
                     position_cycle_id=str(source_order.get("position_cycle_id") or ""),
                     portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
