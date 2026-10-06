@@ -267,7 +267,9 @@ def _recover_legacy_soft_stop_execution_lifecycle(
     upgraded_risk = dict(risk_state)
     upgraded_risk["state"] = upgraded_state
     try:
-        saved = save_us_position_risk_state(symbol, trade_date, upgraded_risk)
+        saved = save_us_position_risk_state(
+            symbol, trade_date, upgraded_risk, require_durable=True,
+        )
     except Exception as exc:
         logger.warning(
             "[US_EXIT][PERSISTENT_SOFT_STOP][LEGACY_RECOVERY_SAVE_WARN] symbol=%s err=%s",
