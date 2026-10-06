@@ -6627,6 +6627,7 @@ class PositionsRepo:
         portfolio_epoch_id: str | None = None,
         position_cycle_id: str | None = None,
         order_id: str | None = None,
+        buy_application_cumulative_qty: int | None = None,
     ) -> None:
         if entry_meta and not entry_meta_json:
             entry_meta_json = entry_meta
@@ -6759,6 +6760,38 @@ class PositionsRepo:
                 return
 
             if side.upper() == "BUY":
+                # Holdings fallback and historical BUY retry must agree on one
+                # durable application marker, in the *same transaction* as qty.
+                # Never infer a missing marker from an already-changed balance.
+                if buy_application_cumulative_qty is not None:
+                    if not order_id or not position_cycle_id:
+                        raise RuntimeError("KR_BUY_APPLICATION_PROVENANCE_MISSING")
+                    target = int(buy_application_cumulative_qty)
+                    current_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
+                    watermark_map = _merge_json_dict(
+                        current_meta.get("broker_truth_buy_applied_orders"), {}
+                    )
+                    previous = _merge_json_dict(watermark_map.get(str(order_id)), {})
+                    previous_qty = int(previous.get("qty") or 0)
+                    if target < previous_qty or target - previous_qty != qty:
+                        raise RuntimeError("KR_BUY_APPLICATION_CUMULATIVE_CONFLICT")
+                    pre_qty = request_json.get("pre_order_holding_qty")
+                    if not previous and row and (
+                        pre_qty is None or current_qty != int(pre_qty)
+                    ):
+                        raise RuntimeError("KR_BUY_APPLICATION_BASELINE_DRIFT")
+                    watermark_map[str(order_id)] = {
+                        "qty": target,
+                        "notional": (
+                            float(previous.get("notional") or 0.0)
+                            + float(qty) * float(price)
+                        ),
+                        "fee": float(previous.get("fee") or 0.0) + float(fee),
+                        "tax": float(previous.get("tax") or 0.0) + float(tax),
+                    }
+                    entry_meta_json = _merge_json_dict(entry_meta_json, {
+                        "broker_truth_buy_applied_orders": watermark_map,
+                    })
                 new_qty = current_qty + qty
                 new_total_cost = total_cost + cost_delta
                 new_avg = new_total_cost / new_qty if new_qty > 0 else None
