@@ -1436,7 +1436,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             and status not in {"CANCELLED", "CANCELED", "CANCEL"}
             and filled_qty is not None
         ):
-            claim_filled_qty = previous_confirmed_qty + int(filled_qty or 0)
+            # The raw per-fill row can describe quantity already confirmed
+            # through holdings; it must not inflate the execution claim.
+            claim_filled_qty = next_confirmed_qty
         if incremental_daily_qty > 0 and filled_price is not None:
             next_confirmed_notional = (
                 previous_confirmed_notional
