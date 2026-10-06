@@ -546,8 +546,17 @@ def reconcile_ack_orders_with_balance(
     env: str = "practice",
 ) -> dict:
     """ACK 상태이나 qty_filled=0인 주문의 체결 여부를 KIS fills + 잔고로 확인."""
-    from trader.us.db.repos import load_pending_ack_orders, mark_order_filled_by_reconcile, apply_broker_order_observation
+    from trader.us.db.repos import (load_pending_ack_orders, mark_order_filled_by_reconcile,
+                                    apply_broker_order_observation, _get_engine_or_none)
     from trader.us.utils.order_no import normalize_us_order_no
+
+    settlement_shadow_engine = None
+    try:
+        from trader.settlement.shadow import enabled as settlement_shadow_enabled
+        if settlement_shadow_enabled():
+            settlement_shadow_engine = _get_engine_or_none()
+    except Exception:
+        logger.exception("[SETTLEMENT_SHADOW][US_ENGINE_ERROR]")
 
     if provider is None:
         from trader.us.data_provider import USDataProvider
@@ -773,6 +782,18 @@ def reconcile_ack_orders_with_balance(
             )
 
         if fill_confirmed:
+            # Phase 3: read-only cross-market settlement projection.
+            try:
+                from trader.settlement.shadow import shadow_us_reconcile
+                shadow_us_reconcile(
+                    order=order, trade_date=trade_date,
+                    cumulative_qty=fill_qty,
+                    broker_fill_price=fill_price if fill_price and fill_price > 0 else None,
+                    evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+                    engine=settlement_shadow_engine,
+                )
+            except Exception:
+                logger.exception("[SETTLEMENT_SHADOW][US_ACTUAL_PROBE_ERROR] symbol=%s", symbol)
             logger.info(
                 "[US_RECONCILE][FILL_CONFIRMED] symbol=%s order_no=%s qty=%d price=%.4f",
                 symbol, order_no, fill_qty, fill_price,
@@ -825,6 +846,20 @@ def reconcile_ack_orders_with_balance(
 
         if delta_confirmation["status"] in {"BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL"}:
             filled_by_balance = int(delta_confirmation.get("filled_qty_by_balance") or 0)
+            try:
+                from trader.settlement.shadow import shadow_us_reconcile
+                shadow_us_reconcile(
+                    order=order, trade_date=trade_date,
+                    cumulative_qty=filled_by_balance,
+                    broker_fill_price=None,
+                    evidence_type="BALANCE_DELTA_SYNTHETIC",
+                    pre_holding_qty=pre_qty_for_delta,
+                    post_holding_qty=post_qty_for_delta,
+                    exclusive_order_proof=False,
+                    engine=settlement_shadow_engine,
+                )
+            except Exception:
+                logger.exception("[SETTLEMENT_SHADOW][US_BALANCE_PROBE_ERROR] symbol=%s", symbol)
             source_name = "balance_reconcile_partial" if delta_confirmation["status"] == "BALANCE_CONFIRMED_PARTIAL" else f"balance_reconcile_{side.lower()}"
             logger.info(
                 "[US_RECONCILE][BALANCE_DELTA_CONFIRMED] symbol=%s side=%s order_qty=%d filled_qty=%d pre_qty=%s post_qty=%s status=%s",
