@@ -374,7 +374,8 @@ def test_oct5_legacy_blank_soft_stop_lifecycle_upgrades_from_broker_order(monkey
         }
 
     monkeypatch.setattr(repos, "load_us_order_for_fill", load_order_for_fill)
-    def save_legacy_upgrade(symbol, trade_date, state):
+    def save_legacy_upgrade(symbol, trade_date, state, **kwargs):
+        assert kwargs.get("require_durable") is True
         saves.append((symbol, trade_date, state))
         return True
 
@@ -404,6 +405,24 @@ def test_oct5_legacy_blank_soft_stop_lifecycle_upgrades_from_broker_order(monkey
         assert reason == "PERSISTENT_SOFT_STOP_ESCALATION"
 
     assert {symbol for symbol, _, _ in saves} == {"JNJ", "MRK"}
+
+
+def test_risk_state_require_durable_does_not_use_memory_fallback(monkeypatch):
+    from trader.us.db import repos
+
+    key = ("2026-10-05", "STRICTDURABLE")
+    repos._MEM_RISK_STATE.pop(key, None)
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+
+    ok = repos.save_us_position_risk_state(
+        "STRICTDURABLE",
+        "2026-10-05",
+        {"state": {"soft_stop_execution": {"position_lifecycle_id": "life-strict"}}},
+        require_durable=True,
+    )
+
+    assert ok is False
+    assert key not in repos._MEM_RISK_STATE
 
 
 def test_legacy_soft_stop_upgrade_requires_durable_save(monkeypatch):
