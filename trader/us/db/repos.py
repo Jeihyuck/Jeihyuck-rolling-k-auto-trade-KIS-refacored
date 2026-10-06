@@ -1913,14 +1913,14 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
         logger.warning("[US_RISK_STATE][LOAD_OPEN_LIFECYCLES_WARN] trade_date=%s err=%s", td, exc)
         return {}
 
-def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> None:
-    """Upsert per-symbol US intraday risk state; idempotent and fail-soft."""
+def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> bool:
+    """Upsert per-symbol US intraday risk state; return durable success."""
     key = _risk_state_key(symbol, trade_date)
     normalized = _normalize_risk_state(key[1], trade_date, state)
     engine = _get_engine_or_none()
     if engine is None:
         _MEM_RISK_STATE[key] = normalized
-        return
+        return True
     try:
         with engine.begin() as conn:
             _ensure_us_position_risk_state_table(conn)
@@ -1962,9 +1962,11 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
                     "state": _json_param(normalized["state"]),
                 },
             )
+        return True
     except Exception as exc:
         logger.warning("[US_RISK_STATE][SAVE_WARN] symbol=%s trade_date=%s err=%s", key[1], trade_date, exc)
         _MEM_RISK_STATE[key] = normalized
+        return False
 
 
 
