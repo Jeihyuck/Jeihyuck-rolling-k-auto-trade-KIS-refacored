@@ -6500,7 +6500,7 @@ class PositionsRepo:
                 self._schema.positions.c.sid == sid,
                 self._schema.positions.c.mode == mode,
                 self._schema.positions.c.code == code,
-                self._schema.positions.c.status == "OPEN",
+                self._schema.positions.c.status.in_(("OPEN", "CLOSED")),
                 sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == cycle_id,
             ]
             if portfolio_epoch_id:
@@ -6529,6 +6529,8 @@ class PositionsRepo:
             state = per_order.get(order_key)
             if not isinstance(state, dict):
                 state = {}
+            if str(row.get("status") or "").upper() == "CLOSED" and not state:
+                raise RuntimeError("KR_SELL_RECONCILE_CLOSED_UNATTRIBUTED")
             qty_accounted = max(0, int(state.get("qty_accounted") or 0))
             pnl_accounted_qty = max(0, int(state.get("pnl_accounted_qty") or 0))
             if confirmed_qty < qty_accounted or confirmed_qty < pnl_accounted_qty:
@@ -6545,7 +6547,15 @@ class PositionsRepo:
                         raise RuntimeError("KR_SELL_RECONCILE_BALANCE_DELTA_MISMATCH")
                 if broker_qty > current_qty:
                     raise RuntimeError("KR_SELL_RECONCILE_DB_QTY_BELOW_BROKER")
+                if pre_order_holding_qty is not None:
+                    expected_prior_db_qty = max(
+                        0, int(pre_order_holding_qty) - qty_accounted
+                    )
+                    if current_qty not in (expected_prior_db_qty, broker_qty):
+                        raise RuntimeError("KR_SELL_RECONCILE_DB_BASELINE_DRIFT")
                 qty_applied = current_qty - broker_qty
+                if qty_applied > confirmed_qty - qty_accounted:
+                    raise RuntimeError("KR_SELL_RECONCILE_UNATTRIBUTED_QTY_DELTA")
                 new_qty = broker_qty
             else:
                 incremental_qty = confirmed_qty - qty_accounted
@@ -6572,12 +6582,29 @@ class PositionsRepo:
                 if fill_price is not None and float(fill_price) > 0
                 else None
             )
+            prior_fill_price = float(state.get("fill_price") or 0.0)
+            previously_accounted_notional = float(
+                state.get("pnl_accounted_notional")
+                or prior_fill_price * pnl_accounted_qty
+            )
             if broker_fill_price is not None:
-                pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
-                next_realized_pnl += (
-                    broker_fill_price - avg_buy_price
-                ) * float(pnl_qty_applied)
-                pnl_accounted_qty = confirmed_qty
+                # Treat a single supplied broker price as the cumulative
+                # execution average for this order. Never double-book proceeds
+                # when a partial fill later becomes fully filled.
+                new_proceeds = broker_fill_price * confirmed_qty
+                if pnl_accounted_qty == confirmed_qty and pnl_accounted_qty > 0:
+                    if abs(new_proceeds - previously_accounted_notional) > 1e-5:
+                        raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
+                else:
+                    pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
+                    if new_proceeds + 1e-5 < previously_accounted_notional:
+                        raise RuntimeError("KR_SELL_RECONCILE_PROCEEDS_REGRESSION")
+                    next_realized_pnl += (
+                        new_proceeds - previously_accounted_notional
+                        - avg_buy_price * float(pnl_qty_applied)
+                    )
+                    pnl_accounted_qty = confirmed_qty
+                    previously_accounted_notional = new_proceeds
 
             state.update({
                 "confirmed_cumulative_qty": confirmed_qty,
@@ -6586,7 +6613,8 @@ class PositionsRepo:
                 "broker_holding_qty": (
                     None if broker_holding_qty is None else int(broker_holding_qty)
                 ),
-                "fill_price": broker_fill_price,
+                "fill_price": broker_fill_price if broker_fill_price is not None else (prior_fill_price or None),
+                "pnl_accounted_notional": previously_accounted_notional,
                 "realized_pnl_status": (
                     "CONFIRMED"
                     if pnl_accounted_qty >= confirmed_qty
@@ -6615,13 +6643,19 @@ class PositionsRepo:
                 "position_meta": position_meta,
                 "last_reconciled_at": filled_at,
             }
-            if new_qty <= 0:
+            if new_qty <= 0 and str(row.get("status") or "").upper() != "CLOSED":
                 values.update(
                     status="CLOSED",
                     closed_ts=filled_at,
                     closed_reason="FULL_SELL",
                     avg_buy_price=None,
                 )
+            elif str(row.get("status") or "").upper() == "CLOSED":
+                if new_qty != 0:
+                    raise RuntimeError("KR_SELL_RECONCILE_CLOSED_POSITION_REOPEN")
+                # Delayed price reconciliation must not rewrite the economic
+                # close time or reopen a completed position.
+                values.pop("last_trade_at", None)
             conn.execute(
                 sa.update(self._schema.positions)
                 .where(self._schema.positions.c.position_id == row["position_id"])
