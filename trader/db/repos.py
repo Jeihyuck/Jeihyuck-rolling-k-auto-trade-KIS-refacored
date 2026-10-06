@@ -6529,8 +6529,12 @@ class PositionsRepo:
             state = per_order.get(order_key)
             if not isinstance(state, dict):
                 state = {}
-            if str(row.get("status") or "").upper() == "CLOSED" and not state:
-                raise RuntimeError("KR_SELL_RECONCILE_CLOSED_UNATTRIBUTED")
+            if str(row.get("status") or "").upper() == "CLOSED":
+                if not state:
+                    raise RuntimeError("KR_SELL_RECONCILE_CLOSED_UNATTRIBUTED")
+                avg_buy_price = float(state.get("cost_basis_at_sell") or 0.0)
+                if avg_buy_price <= 0:
+                    raise RuntimeError("KR_SELL_RECONCILE_CLOSED_COST_BASIS_MISSING")
             qty_accounted = max(0, int(state.get("qty_accounted") or 0))
             pnl_accounted_qty = max(0, int(state.get("pnl_accounted_qty") or 0))
             if confirmed_qty < qty_accounted or confirmed_qty < pnl_accounted_qty:
@@ -6588,6 +6592,8 @@ class PositionsRepo:
                 or prior_fill_price * pnl_accounted_qty
             )
             if broker_fill_price is not None:
+                if avg_buy_price <= 0:
+                    raise RuntimeError("KR_SELL_RECONCILE_COST_BASIS_MISSING")
                 # Treat a single supplied broker price as the cumulative
                 # execution average for this order. Never double-book proceeds
                 # when a partial fill later becomes fully filled.
@@ -6608,6 +6614,7 @@ class PositionsRepo:
 
             state.update({
                 "confirmed_cumulative_qty": confirmed_qty,
+                "cost_basis_at_sell": avg_buy_price,
                 "qty_accounted": confirmed_qty,
                 "pnl_accounted_qty": pnl_accounted_qty,
                 "broker_holding_qty": (
