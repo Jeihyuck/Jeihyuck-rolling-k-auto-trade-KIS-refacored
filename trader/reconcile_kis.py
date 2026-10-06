@@ -1619,10 +1619,23 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             # order average or overwrite a confirmed cost with a guess.
             verified_cumulative_sell_price = None
             if side == "SELL" and source_order and next_confirmed_qty > 0:
-                verified_cumulative_sell_price = _verified_order_sell_average_from_ccld_fills(
-                    fills_repo=fills_repo, source_order=source_order,
-                    env=env, confirmed_cumulative_qty=next_confirmed_qty,
-                )
+                # A single exact KIS execution for the whole broker-confirmed
+                # order is itself complete execution-price proof.
+                if (
+                    broker_cumulative_qty == next_confirmed_qty
+                    and filled_qty == next_confirmed_qty
+                    and filled_price is not None and filled_price > 0
+                ):
+                    verified_cumulative_sell_price = float(filled_price)
+                elif isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
+                    # For multiple partial executions, derive the weighted
+                    # average from exact order-linked persisted broker fills.
+                    # Test/diagnostic repositories without an engine cannot
+                    # prove prior partial prices; leave PnL unresolved.
+                    verified_cumulative_sell_price = _verified_order_sell_average_from_ccld_fills(
+                        fills_repo=fills_repo, source_order=source_order,
+                        env=env, confirmed_cumulative_qty=next_confirmed_qty,
+                    )
             if side == "SELL" and source_order and (
                 incremental_daily_qty > 0 or verified_cumulative_sell_price is not None
             ):
