@@ -92,6 +92,51 @@ def test_holdings_fallback_closes_sell_claim_and_converges_qty_without_price():
         cumulative_filled_qty=None,
         authoritative=False,
     )
+    # Reproduce the live Oct-06 state: the old holdings fallback already
+    # terminalized the order, but did not close the execution claim or reduce
+    # the PB1 position quantity.
+    terminal_ts = datetime(2026, 10, 6, 0, 48, tzinfo=timezone.utc)
+    orders.upsert_reconciled_order(
+        env="practice",
+        run_id=None,
+        strategy="pb1_pullback_close",
+        sid=1,
+        mode=1,
+        code="293490",
+        market="J",
+        side="SELL",
+        ord_type="MARKET",
+        qty=37,
+        limit_price=10050.0,
+        stage="PROFIT_PROTECT_PARTIAL_1",
+        client_order_key=client_key,
+        kis_odno="0000012522",
+        status="FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+        request_json={
+            "pre_order_holding_qty": 115,
+            "pre_order_orderable_qty": 115,
+            "requested_qty": 37,
+            "submitted_qty": 37,
+            "position_lifecycle_id": cycle,
+            "semantic_action": action,
+            "strategy_owner": "KR_STANDARD",
+            "execution_meta_update": {"giveback_protect_done": True},
+        },
+        response_json={
+            "promotion_source": "kis_holdings",
+            "pre_order_holding_qty": 115,
+            "holding_qty": 78,
+            "holding_delta": 37,
+            "requested_qty": 37,
+            "submitted_qty": 37,
+            "confirmed_fill_qty": 37,
+            "confirmed_fill_price": None,
+            "fill_price_source": "UNRESOLVED",
+            "realized_pnl_status": "REALIZED_PNL_UNRESOLVED",
+        },
+        submitted_at=terminal_ts,
+        acked_at=terminal_ts,
+    )
 
     result = _promote_open_buy_orders_from_holdings(
         env="practice",
