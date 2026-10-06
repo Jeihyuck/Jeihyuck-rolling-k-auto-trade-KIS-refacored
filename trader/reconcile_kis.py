@@ -434,7 +434,10 @@ def _broker_execution_price(response_json: dict) -> float | None:
         if isinstance(nested, dict):
             candidates.append(nested)
     for payload in candidates:
-        for key in ("ccld_unpr", "exec_price", "execution_price", "fill_price", "avg_ccld_unpr"):
+        for key in (
+            "ccld_unpr", "exec_price", "execution_price", "fill_price",
+            "avg_ccld_unpr", "confirmed_fill_price",
+        ):
             value = _to_float(payload.get(key))
             if value is not None and value > 0:
                 return value
@@ -456,10 +459,52 @@ def _promote_open_buy_orders_from_holdings(
     promoted_orders = 0
     promoted_fills = 0
     promoted_codes: list[str] = []
-    for order in orders_repo.get_open_orders(env) or []:
+    candidate_orders = list(orders_repo.get_open_orders(env) or [])
+    seen_order_ids = {
+        str(row.get("order_id") or row.get("client_order_key") or "")
+        for row in candidate_orders
+    }
+    try:
+        for terminal_order in orders_repo.list_today_orders(
+            env, status_exclude=(), fail_open=False,
+        ) or []:
+            terminal_status = str(terminal_order.get("status") or "").upper()
+            if terminal_status not in {
+                "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+            }:
+                continue
+            terminal_response = _json_dict(terminal_order.get("response_json"))
+            if str(terminal_response.get("promotion_source") or "") != "kis_holdings":
+                continue
+            if (_to_int(terminal_response.get("confirmed_fill_qty")) or 0) <= 0:
+                continue
+            terminal_identity = str(
+                terminal_order.get("order_id")
+                or terminal_order.get("client_order_key")
+                or ""
+            )
+            if terminal_identity in seen_order_ids:
+                continue
+            candidate_orders.append(terminal_order)
+            seen_order_ids.add(terminal_identity)
+            logger.warning(
+                "[RECONCILE][PROMOTE_RECOVERY] code=%s status=%s "
+                "reason=TERMINAL_HOLDINGS_PROMOTION_NEEDS_CONVERGENCE",
+                _normalize_code(terminal_order.get("code")), terminal_status,
+            )
+    except Exception:
+        logger.exception(
+            "[RECONCILE][PROMOTE_RECOVERY][SCAN_FAIL] env=%s action=OPEN_ORDERS_ONLY",
+            env,
+        )
+
+    for order in candidate_orders:
         side = str(order.get("side") or "").upper()
         status = str(order.get("status") or "").upper()
-        if side not in {"BUY", "SELL"} or status not in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}:
+        if side not in {"BUY", "SELL"} or status not in {
+            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK",
+            "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+        }:
             continue
         code = _normalize_code(order.get("code"))
         if not code:
