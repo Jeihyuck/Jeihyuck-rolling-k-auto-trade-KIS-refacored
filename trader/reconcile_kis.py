@@ -786,6 +786,27 @@ def _promote_open_buy_orders_from_holdings(
         client_order_key = str(order.get("client_order_key") or f"{env}:{strategy}:{code}:promote").strip()
         order_time = order.get("acked_at") or order.get("submitted_at") or tick_ts
 
+        # Phase 3 shadow probe: never changes order, claim or position truth.
+        if confirmed_fill_qty > 0:
+            try:
+                from trader.settlement.shadow import shadow_kr_promotion
+                exclusive = sum(
+                    1 for candidate in candidate_orders
+                    if _normalize_code(candidate.get("code")) == code
+                    and str(candidate.get("status") or "").upper()
+                    in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
+                ) == 1
+                shadow_kr_promotion(
+                    engine=orders_repo.engine, order=order, request_json=request_json,
+                    cumulative_qty=confirmed_fill_qty,
+                    broker_fill_price=broker_fill_price,
+                    pre_holding_qty=pre_order_holding_qty,
+                    post_holding_qty=holding_qty,
+                    exclusive_order_proof=exclusive,
+                )
+            except Exception:
+                logger.exception("[SETTLEMENT_SHADOW][KR_PROBE_ERROR] code=%s", code)
+
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=ctx_run_id,
