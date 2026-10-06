@@ -593,15 +593,6 @@ def _promote_open_buy_orders_from_holdings(
                         pre_order_holding_qty=saved_pre,
                         broker_holding_qty=None,
                     )
-                    _project_pb1_exit_stage_truth(
-                        orders_repo=orders_repo,
-                        positions_repo=positions_repo,
-                        env=env,
-                        code=code,
-                        strategy=str(order.get("strategy") or strategy),
-                        source_order=order,
-                        request_json=request_json,
-                    )
                     tp_stage = str(request_json.get("profit_capture_stage") or "").lower()
                     if tp_stage in {"tp1", "tp2", "tp3"} and saved_filled >= int(order.get("qty") or 0):
                         positions_repo.mark_profit_capture_fill(
@@ -628,6 +619,17 @@ def _promote_open_buy_orders_from_holdings(
                     logger.error(
                         "[RECONCILE][PROMOTE_RECOVERY][CLAIM_FAILED] code=%s error=%s",
                         code, claim_error,
+                    )
+                if side == "SELL" and positions_repo is not None:
+                    # The projector requires the claim to be SATISFIED first.
+                    _project_pb1_exit_stage_truth(
+                        orders_repo=orders_repo,
+                        positions_repo=positions_repo,
+                        env=env,
+                        code=code,
+                        strategy=str(order.get("strategy") or strategy),
+                        source_order=order,
+                        request_json=request_json,
                     )
                 promoted_orders += 1
                 promoted_codes.append(code)
