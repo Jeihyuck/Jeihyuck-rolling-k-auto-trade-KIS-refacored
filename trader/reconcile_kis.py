@@ -19,6 +19,7 @@ from trader.db.trading_epoch import active_trading_epoch_id
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
+from trader.kr.holdings_promotion_repair import repair_promoted_buy_watermark
 
 # Import KisAPI and KisTemporaryError from kis_wrapper
 try:
@@ -465,8 +466,8 @@ def _promote_open_buy_orders_from_holdings(
         for row in candidate_orders
     }
     try:
-        for terminal_order in orders_repo.list_today_orders(
-            env, status_exclude=(), fail_open=False,
+        for terminal_order in orders_repo.list_recent_holdings_promoted_orders_for_repair(
+            env, lookback_days=35, limit=128,
         ) or []:
             terminal_status = str(terminal_order.get("status") or "").upper()
             if terminal_status not in {
@@ -515,6 +516,106 @@ def _promote_open_buy_orders_from_holdings(
 
         request_json = _json_dict(order.get("request_json"))
         response_json = _json_dict(order.get("response_json"))
+        if status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
+            # Recover only from the order's *saved* broker observation; a
+            # current-day holding balance cannot reconstruct an older fill.
+            saved_pre = _to_int(response_json.get("pre_order_holding_qty"))
+            saved_post = _to_int(response_json.get("holding_qty"))
+            saved_filled = _to_int(response_json.get("confirmed_fill_qty"))
+            if (
+                response_json.get("promotion_source") != "kis_holdings"
+                or saved_pre is None or saved_post is None
+                or saved_filled is None or saved_filled <= 0
+                or saved_filled > int(order.get("qty") or 0)
+                or saved_post != (
+                    saved_pre + saved_filled if side == "BUY"
+                    else saved_pre - saved_filled
+                )
+            ):
+                logger.error(
+                    "[RECONCILE][PROMOTE_RECOVERY][PROOF_INCOMPLETE] code=%s order_id=%s",
+                    code, order.get("order_id"),
+                )
+                continue
+            # Do not rewrite older positions from an observation that predates
+            # later trades. This also protects against repeated KIS order IDs.
+            if holding_qty != saved_post or not order.get("created_at"):
+                logger.warning(
+                    "[RECONCILE][PROMOTE_RECOVERY][REVIEW_REQUIRED] code=%s reason=HISTORICAL_HOLDING_DRIFT",
+                    code,
+                )
+                continue
+            schema = schema_for_engine(orders_repo.engine)
+            try:
+                with orders_repo.engine.connect() as conn:
+                    intervening = conn.execute(sa.select(schema.orders.c.order_id).where(sa.and_(
+                        schema.orders.c.env == env,
+                        schema.orders.c.strategy == order.get("strategy"),
+                        schema.orders.c.code == code,
+                        schema.orders.c.position_cycle_id == order.get("position_cycle_id"),
+                        schema.orders.c.portfolio_epoch_id == order.get("portfolio_epoch_id"),
+                        schema.orders.c.created_at > order["created_at"],
+                        schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+                            "PARTIAL_FILLED", "FILLED",
+                            "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+                        )),
+                    )).limit(1)).first()
+                if intervening:
+                    logger.warning(
+                        "[RECONCILE][PROMOTE_RECOVERY][REVIEW_REQUIRED] code=%s reason=INTERVENING_ORDER",
+                        code,
+                    )
+                    continue
+                if side == "BUY":
+                    if not repair_promoted_buy_watermark(
+                        engine=orders_repo.engine, env=env, order=order,
+                    ):
+                        logger.warning(
+                            "[RECONCILE][PROMOTE_RECOVERY][REVIEW_REQUIRED] code=%s reason=BUY_APPLICATION_PROOF_MISSING",
+                            code,
+                        )
+                        continue
+                elif positions_repo is not None:
+                    positions_repo.reconcile_sell_execution(
+                        env=env,
+                        strategy=str(order.get("strategy") or strategy),
+                        sid=int(order.get("sid") or 1),
+                        mode=int(order.get("mode") or 1),
+                        code=code,
+                        market=order.get("market"),
+                        confirmed_cumulative_qty=saved_filled,
+                        fill_price=_broker_execution_price(response_json),
+                        filled_at=tick_ts,
+                        position_cycle_id=str(order.get("position_cycle_id") or ""),
+                        portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                        order_id=str(order.get("order_id") or ""),
+                        pre_order_holding_qty=saved_pre,
+                        broker_holding_qty=None,
+                    )
+                else:
+                    continue
+                claim_error = _record_execution_claim_observation(
+                    orders_repo=orders_repo,
+                    source_order=order,
+                    broker_status=status,
+                    cumulative_filled_qty=saved_filled,
+                    requested_qty=int(order.get("qty") or 0),
+                )
+                if claim_error:
+                    logger.error(
+                        "[RECONCILE][PROMOTE_RECOVERY][CLAIM_FAILED] code=%s error=%s",
+                        code, claim_error,
+                    )
+                promoted_orders += 1
+                promoted_codes.append(code)
+            except Exception:
+                logger.exception(
+                    "[RECONCILE][PROMOTE_RECOVERY][APPLY_FAILED] code=%s order_id=%s",
+                    code, order.get("order_id"),
+                )
+            continue
+
         if side == "BUY":
             request_json = _recover_kr_buy_request_from_response(
                 order=order, request_json=request_json, response_json=response_json
@@ -853,6 +954,7 @@ def _promote_open_buy_orders_from_holdings(
                     portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
                     position_cycle_id=str(order.get("position_cycle_id") or "") or None,
                     order_id=str(order.get("order_id") or "") or None,
+                    buy_application_cumulative_qty=confirmed_fill_qty,
                 )
                 logger.warning(
                     "[RECONCILE][BUY_POSITION_APPLY] code=%s incremental_qty=%s cumulative_qty=%s cycle=%s epoch=%s source=kis_holdings_fallback",
