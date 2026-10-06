@@ -192,7 +192,10 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
         lifecycle_reason = "PERSISTENT_SOFT_STOP_ESCALATION_LEGACY_LIFECYCLE_RECOVERED"
 
     try:
-        orderable_qty = int(position.get("orderable_qty") or position.get("qty") or position.get("holding_qty") or 0)
+        if "orderable_qty" in position and position.get("orderable_qty") is not None:
+            orderable_qty = int(position.get("orderable_qty"))
+        else:
+            orderable_qty = int(position.get("qty") or position.get("holding_qty") or 0)
     except (TypeError, ValueError):
         orderable_qty = 0
     if orderable_qty <= 0:
