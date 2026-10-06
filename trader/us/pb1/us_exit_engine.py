@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 # US Explanation System
@@ -108,8 +108,25 @@ def soft_stop_repeat_allowed(position: dict, *, intraday_market_overlay: str = "
     return False, "SOFT_STOP_REPEAT_BLOCKED"
 
 
+def _parse_soft_stop_state_ts(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> tuple[bool, str]:
-    """Require broker-confirmed first soft-stop fill before persistent escalation."""
+    """Require broker-confirmed first soft-stop fill before persistent escalation.
+
+    PR154-era fills can have an empty soft-stop execution lifecycle id.  Recover
+    those only when the persisted fill timestamp is provably inside the current
+    still-open lifecycle; never bind an older fill across a re-entry boundary.
+    """
     symbol = str(position.get("symbol") or "").upper()
     owner = str(
         position.get("owner_strategy")
@@ -140,9 +157,14 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
         ),
         "",
     )
-    execution_lifecycle = str(soft_exec.get("position_lifecycle_id") or "").strip()
-    if not current_lifecycle or not execution_lifecycle or current_lifecycle != execution_lifecycle:
-        return False, "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
+    state_lifecycle = str(lifecycle_state.get("lifecycle_id") or "").strip()
+    if (
+        not current_lifecycle
+        or not state_lifecycle
+        or current_lifecycle != state_lifecycle
+        or lifecycle_state.get("is_open") is not True
+    ):
+        return False, "PERSISTENT_SOFT_STOP_CURRENT_LIFECYCLE_UNVERIFIED"
 
     if not bool(soft_exec.get("soft_stop_triggered_today")) or not bool(soft_exec.get("soft_stop_partial_done")):
         return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_UNCONFIRMED"
@@ -152,6 +174,20 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
         first_filled_qty = 0
     if first_filled_qty <= 0:
         return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_QTY_MISSING"
+    if not str(soft_exec.get("client_order_key") or soft_exec.get("order_no") or "").strip():
+        return False, "PERSISTENT_SOFT_STOP_FILL_IDENTITY_MISSING"
+
+    execution_lifecycle = str(soft_exec.get("position_lifecycle_id") or "").strip()
+    if execution_lifecycle:
+        if current_lifecycle != execution_lifecycle:
+            return False, "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
+        lifecycle_reason = "PERSISTENT_SOFT_STOP_ESCALATION"
+    else:
+        opened_at = _parse_soft_stop_state_ts(lifecycle_state.get("opened_at"))
+        first_soft_stop_at = _parse_soft_stop_state_ts(soft_exec.get("first_soft_stop_at"))
+        if opened_at is None or first_soft_stop_at is None or first_soft_stop_at < opened_at:
+            return False, "PERSISTENT_SOFT_STOP_LEGACY_LIFECYCLE_UNVERIFIED"
+        lifecycle_reason = "PERSISTENT_SOFT_STOP_ESCALATION_LEGACY_LIFECYCLE_RECOVERED"
 
     try:
         orderable_qty = int(position.get("orderable_qty") or position.get("qty") or position.get("holding_qty") or 0)
@@ -160,8 +196,7 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
     if orderable_qty <= 0:
         return False, "PERSISTENT_SOFT_STOP_NO_ORDERABLE_QTY"
 
-    return True, "PERSISTENT_SOFT_STOP_ESCALATION"
-
+    return True, lifecycle_reason
 
 def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
