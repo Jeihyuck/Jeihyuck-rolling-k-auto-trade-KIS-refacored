@@ -10751,7 +10751,7 @@ class PB1Engine:
             if isinstance(plan, dict):
                 plan["qty"] = qty
                 plan["execution_retry_remaining_target_qty"] = remaining_target_qty
-                if record_price > 0:
+                if float(record_price or 0.0) > 0:
                     plan["planned_value"] = float(record_price) * float(qty)
             entry_meta["execution_retry_remaining_target_qty"] = remaining_target_qty
             entry_meta["execution_retry_fresh_sizing_qty"] = fresh_qty
