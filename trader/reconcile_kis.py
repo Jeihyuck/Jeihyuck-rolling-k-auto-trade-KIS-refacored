@@ -445,6 +445,45 @@ def _broker_execution_price(response_json: dict) -> float | None:
     return None
 
 
+def _verified_order_sell_average_from_ccld_fills(
+    *, fills_repo: FillsRepo, source_order: dict, env: str,
+    confirmed_cumulative_qty: int,
+) -> float | None:
+    """Compute cumulative average only from exact attributed KIS executions.
+
+    Daily-ccld price may be a per-execution price. Synthetic holdings-derived
+    fills cannot supply execution-price evidence.
+    """
+    order_id = str(source_order.get("order_id") or "")
+    if not order_id or confirmed_cumulative_qty <= 0:
+        return None
+    schema = schema_for_engine(fills_repo.engine)
+    with fills_repo.engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.fills).where(sa.and_(
+            schema.fills.c.env == env,
+            schema.fills.c.order_id == uuid_value_for_url(str(fills_repo.engine.url), order_id),
+            schema.fills.c.side == "SELL",
+        ))).mappings().all()
+    seen_ids = set()
+    quantity = 0
+    notional = 0.0
+    for row in rows:
+        meta = _json_dict(row.get("fill_meta_json"))
+        if meta.get("fill_source") != "daily_ccld":
+            continue
+        execution_id = str(row.get("broker_fill_id") or row.get("trade_id") or "")
+        fill_qty = int(row.get("qty") or 0)
+        price = _to_float(row.get("price"))
+        if not execution_id or execution_id in seen_ids or fill_qty <= 0 or price is None or price <= 0:
+            return None
+        seen_ids.add(execution_id)
+        quantity += fill_qty
+        notional += fill_qty * price
+    if quantity != confirmed_cumulative_qty or not seen_ids:
+        return None
+    return notional / float(quantity)
+
+
 def _promote_open_buy_orders_from_holdings(
     *,
     env: str,
@@ -1573,24 +1612,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
                         pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
                     )
-            # A KIS daily-ccld execution may arrive *after* holdings fallback
-            # has already confirmed the same cumulative quantity. In that case
-            # incremental_daily_qty is 0 but the previously missing economic
-            # execution price must still close the position's PnL lifecycle.
-            # ccld_prc is a per-execution price, NOT necessarily an average
-            # for all partial executions; only apply it to an entire cumulative
-            # fill when this broker row proves the whole quantity.
-            full_single_execution_price = (
-                next_confirmed_qty > 0
-                and filled_qty is not None
-                and int(filled_qty) == next_confirmed_qty
-                and filled_price is not None
-                and filled_price > 0
-                and broker_cumulative_qty is not None
-                and broker_cumulative_qty == next_confirmed_qty
-            )
+            # Reconstruct cumulative economics from *all* exactly attributed
+            # KIS execution rows. This handles the case where holdings
+            # confirmed quantity first and daily-ccld returns late executions
+            # one at a time. Do not treat a per-execution price as a cumulative
+            # order average or overwrite a confirmed cost with a guess.
+            verified_cumulative_sell_price = None
+            if side == "SELL" and source_order and next_confirmed_qty > 0:
+                verified_cumulative_sell_price = _verified_order_sell_average_from_ccld_fills(
+                    fills_repo=fills_repo, source_order=source_order,
+                    env=env, confirmed_cumulative_qty=next_confirmed_qty,
+                )
             if side == "SELL" and source_order and (
-                incremental_daily_qty > 0 or full_single_execution_price
+                incremental_daily_qty > 0 or verified_cumulative_sell_price is not None
             ):
                 positions_repo.reconcile_sell_execution(
                     env=env,
@@ -1600,10 +1634,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     code=code,
                     market=source_order.get("market") or market,
                     confirmed_cumulative_qty=next_confirmed_qty,
-                    fill_price=(
-                        float(filled_price)
-                        if full_single_execution_price else None
-                    ),
+                    fill_price=verified_cumulative_sell_price,
                     filled_at=order_time,
                     position_cycle_id=str(source_order.get("position_cycle_id") or ""),
                     portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
