@@ -10365,7 +10365,10 @@ class PB1Engine:
             fresh_validation=True,
             retry_action_prefix=retry_action_prefix,
             entry_generation=entry_generation,
-            allow_partial_retry=str(action).strip().upper().startswith("SELL:"),
+            allow_partial_retry=(
+                entry_generation
+                or str(action).strip().upper().startswith("SELL:")
+            ),
         )
 
     def _record_pb1_submit_observation(
@@ -10715,6 +10718,49 @@ class PB1Engine:
             return status
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=record_price)
         entry_meta.update(plan_entry_meta)
+        entry_lifecycle_id = str(
+            entry_meta.get("position_lifecycle_id")
+            or cf.features.get("position_lifecycle_id")
+            or f"PB1_ENTRY:{self.STRATEGY_NAME}:{cf.market}:{cf.mode}:{cf.code}"
+        ).strip()
+        try:
+            retry_snapshot = self.orders_repo.get_retryable_execution_action_snapshot(
+                env=self.env,
+                market="KR",
+                strategy_owner="PB1",
+                lifecycle_id=entry_lifecycle_id,
+                action_prefix=f"BUY_ENTRY:{stage}",
+            )
+        except Exception:
+            logger.exception(
+                "[PB1][ENTRY][RETRY_TARGET_LOOKUP_FAIL] code=%s lifecycle=%s",
+                display_code, entry_lifecycle_id,
+            )
+            retry_snapshot = None
+        if retry_snapshot is not None and retry_snapshot.remaining_target_qty is not None:
+            remaining_target_qty = max(0, int(retry_snapshot.remaining_target_qty))
+            if remaining_target_qty <= 0:
+                status["skipped"] = 1
+                status["skipped_reason"] = "EXECUTION_ACTION_ALREADY_SATISFIED"
+                status["submit_terminal_status"] = "EXECUTION_ACTION_ALREADY_SATISFIED"
+                status["terminal_event"] = "FINAL_SKIP"
+                return status
+            fresh_qty = int(qty or 0)
+            qty = min(fresh_qty, remaining_target_qty)
+            cf.planned_qty = qty
+            if isinstance(plan, dict):
+                plan["qty"] = qty
+                plan["execution_retry_remaining_target_qty"] = remaining_target_qty
+                if record_price > 0:
+                    plan["planned_value"] = float(record_price) * float(qty)
+            entry_meta["execution_retry_remaining_target_qty"] = remaining_target_qty
+            entry_meta["execution_retry_fresh_sizing_qty"] = fresh_qty
+            entry_meta["execution_retry_submit_qty"] = qty
+            logger.info(
+                "[PB1][ENTRY][RETRY_TARGET] code=%s fresh_qty=%s remaining_target=%s "
+                "submit_qty=%s action=CAP_TO_DURABLE_TARGET",
+                display_code, fresh_qty, remaining_target_qty, qty,
+            )
         # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
         _eh_horizon = entry_meta.get("trade_horizon") or "SWING_CARRY"
         _eh_book = {"DAY_PROTECT": "DAY_BOOK", "SWING_CARRY": "SWING_BOOK", "CORE_CARRY": "CORE_BOOK"}.get(_eh_horizon, "SWING_BOOK")
@@ -10978,13 +11024,7 @@ class PB1Engine:
         try:
             claim_identity, claim = self._claim_pb1_submit_action(
                 client_order_key=effective_client_order_key or "",
-                lifecycle_id=str(
-                    entry_meta.get("position_lifecycle_id")
-                    or cf.features.get("position_lifecycle_id")
-                    or (
-                        f"PB1_ENTRY:{self.STRATEGY_NAME}:{cf.market}:{cf.mode}:{cf.code}"
-                    )
-                ),
+                lifecycle_id=entry_lifecycle_id,
                 action=f"BUY_ENTRY:{stage}",
                 requested_qty=int(qty or 0),
                 retry_action_prefix=f"BUY_ENTRY:{stage}",
@@ -11015,6 +11055,27 @@ class PB1Engine:
                 "[PB1][ENTRY][EXECUTION_CLAIM_BLOCK] code=%s action_key=%s reason=%s",
                 display_code, claim.action_key, claim.reason,
             )
+            try:
+                self.orders_repo.mark_error(
+                    self.env,
+                    effective_client_order_key or "",
+                    {
+                        "rt_cd": "EXECUTION_ACTION_ALREADY_CLAIMED",
+                        "msg_cd": str(claim.reason or "CLAIM_BLOCKED"),
+                        "msg1": "broker_not_called; intent_closed",
+                        "broker_submit": False,
+                    },
+                )
+                logger.info(
+                    "[PB1][ENTRY][EXECUTION_CLAIM_INTENT_CLOSED] code=%s key=%s "
+                    "reason=%s status=ERROR",
+                    display_code, effective_client_order_key, claim.reason,
+                )
+            except Exception:
+                logger.exception(
+                    "[PB1][ENTRY][EXECUTION_CLAIM_INTENT_CLOSE_FAIL] code=%s key=%s",
+                    display_code, effective_client_order_key,
+                )
             status["skipped"] = 1
             status["skipped_reason"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
             status["submit_terminal_status"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
@@ -13542,8 +13603,23 @@ class PB1Engine:
         reason_family = normalize_sell_reason_family(exit_reason)
         execution_action = f"SELL:{reason_family}:{stage}"
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
-        lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
-                           or f"sid:{sid}:mode:{mode}")
+        lifecycle_id = str(
+            pos.get("position_lifecycle_id")
+            or position_meta.get("position_lifecycle_id")
+            or _cycle_id
+            or position_meta.get("position_cycle_id")
+            or ""
+        ).strip()
+        if not lifecycle_id:
+            logger.critical(
+                "[PB1][EXIT][LIFECYCLE_MISSING] code=%s action=block_sell_submit",
+                display_code,
+            )
+            exit_eval_payload["reconcile_required"] = 1
+            exit_eval_payload["execution_integrity_error"] = "position lifecycle identity missing"
+            exit_eval_payload["order_result"] = "POSITION_LIFECYCLE_ID_MISSING"
+            exit_eval_payload["order_skip_reasons"] = ["POSITION_LIFECYCLE_ID_MISSING"]
+            return exit_eval_payload
         try:
             today_sell_rows = self.orders_repo.list_today_orders(
                 self.env, side="SELL", code=code, status_exclude=(), fail_open=False,
