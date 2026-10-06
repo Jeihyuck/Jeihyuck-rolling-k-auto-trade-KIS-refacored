@@ -13608,18 +13608,18 @@ class PB1Engine:
             or position_meta.get("position_lifecycle_id")
             or _cycle_id
             or position_meta.get("position_cycle_id")
-            or ""
-        ).strip()
-        if not lifecycle_id:
-            logger.critical(
-                "[PB1][EXIT][LIFECYCLE_MISSING] code=%s action=block_sell_submit",
-                display_code,
+            or (
+                f"PB1_POSITION_FALLBACK:{self.STRATEGY_NAME}:"
+                f"{pos.get('portfolio_epoch_id') or 'NO_EPOCH'}:"
+                f"{market}:{sid}:{mode}:{code_key}"
             )
-            exit_eval_payload["reconcile_required"] = 1
-            exit_eval_payload["execution_integrity_error"] = "position lifecycle identity missing"
-            exit_eval_payload["order_result"] = "POSITION_LIFECYCLE_ID_MISSING"
-            exit_eval_payload["order_skip_reasons"] = ["POSITION_LIFECYCLE_ID_MISSING"]
-            return exit_eval_payload
+        ).strip()
+        if lifecycle_id.startswith("PB1_POSITION_FALLBACK:"):
+            logger.warning(
+                "[PB1][EXIT][LIFECYCLE_FALLBACK] code=%s lifecycle=%s "
+                "reason=POSITION_CYCLE_EVIDENCE_MISSING action=SYMBOL_SCOPED_FENCE",
+                display_code, lifecycle_id,
+            )
         try:
             today_sell_rows = self.orders_repo.list_today_orders(
                 self.env, side="SELL", code=code, status_exclude=(), fail_open=False,
