@@ -2939,6 +2939,52 @@ class OrdersRepo:
         )
         return identity, claim
 
+    def get_retryable_execution_action_snapshot(
+        self,
+        *,
+        env: str,
+        market: str,
+        strategy_owner: str,
+        lifecycle_id: str,
+        action_prefix: str,
+    ):
+        """Return the durable retryable action for this lifecycle, if one exists.
+
+        PB1 uses this before creating a new broker intent so a fresh risk/sizing
+        result cannot silently enlarge the durable semantic action target.
+        """
+        from trader.account_state import get_account_key, resolve_env_name
+        from trader.db.trading_epoch import active_trading_epoch_id
+        from trader.execution_state import SemanticActionIdentity
+
+        env = resolve_env_name(env)
+        account_key = get_account_key(env=env)
+        epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=account_key, required=True,
+        )
+        identity = SemanticActionIdentity(
+            env=env,
+            account_id=hashlib.sha256(account_key.encode("utf-8")).hexdigest(),
+            market=market,
+            trading_epoch_id=str(epoch_id),
+            strategy_owner=str(strategy_owner),
+            lifecycle_id=str(lifecycle_id),
+            action=str(action_prefix).strip().upper(),
+        )
+        retryable = self._execution_claim_repo.find_retryable_action_instance(
+            identity,
+            action_prefix=str(action_prefix).strip().upper(),
+        )
+        if retryable is None:
+            return None
+        retryable_action, retryable_instance = retryable
+        identity = replace(
+            identity,
+            action=retryable_action,
+            action_instance=retryable_instance,
+        )
+        return self._execution_claim_repo.get(identity)
+
     def get_execution_action_snapshot(
         self,
         *,
@@ -6368,6 +6414,200 @@ class PositionsRepo:
             client_order_key, int(result.rowcount or 0),
         )
         return bool(result.rowcount)
+
+    def reconcile_sell_execution(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        sid: int,
+        mode: int,
+        code: str,
+        market: str | None,
+        confirmed_cumulative_qty: int,
+        fill_price: float | None,
+        filled_at: datetime,
+        position_cycle_id: str,
+        portfolio_epoch_id: str | None,
+        order_id: str,
+        pre_order_holding_qty: int | None = None,
+        broker_holding_qty: int | None = None,
+    ) -> dict[str, Any]:
+        """Converge SELL quantity independently from execution-price/PnL truth.
+
+        KIS balance can prove that shares left the account while daily-ccld is
+        unavailable.  In that case quantity/cost basis must converge now, while
+        realized PnL remains unresolved until a broker execution price arrives.
+        Per-order cumulative markers make both phases idempotent.
+        """
+        confirmed_qty = max(0, int(confirmed_cumulative_qty or 0))
+        if confirmed_qty <= 0:
+            return {"qty_applied": 0, "pnl_qty_applied": 0}
+        order_key = str(order_id or "").strip()
+        cycle_id = str(position_cycle_id or "").strip()
+        if not order_key or not cycle_id:
+            raise RuntimeError("KR_SELL_RECONCILE_PROVENANCE_MISSING")
+
+        with self.engine.begin() as conn:
+            trading_epoch_id = active_trading_epoch_id(
+                conn, env=env, account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code,
+                self._schema.positions.c.status == "OPEN",
+                sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == cycle_id,
+            ]
+            if portfolio_epoch_id:
+                conditions.append(
+                    sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String)
+                    == str(portfolio_epoch_id)
+                )
+            if trading_epoch_id is not None:
+                conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
+                )
+            row = conn.execute(
+                select(self._schema.positions).where(and_(*conditions)).with_for_update()
+            ).mappings().one_or_none()
+            if row is None:
+                raise RuntimeError("KR_SELL_RECONCILE_POSITION_NOT_FOUND")
+            row = dict(row)
+
+            current_qty = int(row.get("qty") or 0)
+            avg_buy_price = float(row.get("avg_buy_price") or 0.0)
+            realized_pnl = float(row.get("realized_pnl") or 0.0)
+            position_meta = _merge_json_dict(row.get("position_meta"), {})
+            per_order = position_meta.get("sell_execution_reconcile")
+            if not isinstance(per_order, dict):
+                per_order = {}
+            state = per_order.get(order_key)
+            if not isinstance(state, dict):
+                state = {}
+            qty_accounted = max(0, int(state.get("qty_accounted") or 0))
+            pnl_accounted_qty = max(0, int(state.get("pnl_accounted_qty") or 0))
+            if confirmed_qty < qty_accounted or confirmed_qty < pnl_accounted_qty:
+                raise RuntimeError("KR_SELL_RECONCILE_CUMULATIVE_REGRESSION")
+
+            qty_applied = 0
+            if broker_holding_qty is not None:
+                broker_qty = max(0, int(broker_holding_qty))
+                if pre_order_holding_qty is not None:
+                    expected_broker_qty = max(
+                        0, int(pre_order_holding_qty) - confirmed_qty
+                    )
+                    if broker_qty != expected_broker_qty:
+                        raise RuntimeError("KR_SELL_RECONCILE_BALANCE_DELTA_MISMATCH")
+                if broker_qty > current_qty:
+                    raise RuntimeError("KR_SELL_RECONCILE_DB_QTY_BELOW_BROKER")
+                qty_applied = current_qty - broker_qty
+                new_qty = broker_qty
+            else:
+                incremental_qty = confirmed_qty - qty_accounted
+                if pre_order_holding_qty is not None:
+                    prior_expected_qty = max(
+                        0, int(pre_order_holding_qty) - qty_accounted
+                    )
+                    confirmed_expected_qty = max(
+                        0, int(pre_order_holding_qty) - confirmed_qty
+                    )
+                    if current_qty == confirmed_expected_qty:
+                        incremental_qty = 0
+                    elif current_qty != prior_expected_qty:
+                        raise RuntimeError("KR_SELL_RECONCILE_BASELINE_DRIFT")
+                if incremental_qty > current_qty:
+                    raise RuntimeError("KR_SELL_RECONCILE_QTY_EXCEEDS_POSITION")
+                qty_applied = max(0, incremental_qty)
+                new_qty = max(0, current_qty - qty_applied)
+
+            pnl_qty_applied = 0
+            next_realized_pnl = realized_pnl
+            broker_fill_price = (
+                float(fill_price)
+                if fill_price is not None and float(fill_price) > 0
+                else None
+            )
+            if broker_fill_price is not None:
+                pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
+                next_realized_pnl += (
+                    broker_fill_price - avg_buy_price
+                ) * float(pnl_qty_applied)
+                pnl_accounted_qty = confirmed_qty
+
+            state.update({
+                "confirmed_cumulative_qty": confirmed_qty,
+                "qty_accounted": confirmed_qty,
+                "pnl_accounted_qty": pnl_accounted_qty,
+                "broker_holding_qty": (
+                    None if broker_holding_qty is None else int(broker_holding_qty)
+                ),
+                "fill_price": broker_fill_price,
+                "realized_pnl_status": (
+                    "CONFIRMED"
+                    if pnl_accounted_qty >= confirmed_qty
+                    else "REALIZED_PNL_UNRESOLVED"
+                ),
+            })
+            per_order = dict(per_order)
+            per_order[order_key] = state
+            position_meta = _merge_json_dict(
+                position_meta,
+                {
+                    "sell_execution_reconcile": per_order,
+                    "realized_pnl_status": state["realized_pnl_status"],
+                },
+            )
+            values: dict[str, Any] = {
+                "qty": new_qty,
+                "total_cost": (
+                    float(avg_buy_price) * float(new_qty)
+                    if avg_buy_price > 0
+                    else max(0.0, float(row.get("total_cost") or 0.0))
+                ),
+                "realized_pnl": next_realized_pnl,
+                "market": market,
+                "last_trade_at": filled_at,
+                "position_meta": position_meta,
+                "last_reconciled_at": (
+                    filled_at.isoformat()
+                    if hasattr(filled_at, "isoformat")
+                    else str(filled_at)
+                ),
+            }
+            if new_qty <= 0:
+                values.update(
+                    status="CLOSED",
+                    closed_ts=filled_at,
+                    closed_reason="FULL_SELL",
+                    avg_buy_price=None,
+                )
+            conn.execute(
+                sa.update(self._schema.positions)
+                .where(self._schema.positions.c.position_id == row["position_id"])
+                .values(**values, updated_at=func.now())
+            )
+
+        logger.warning(
+            "[KR_POSITION][SELL_RECONCILE] code=%s order_id=%s confirmed_qty=%s "
+            "qty_applied=%s pnl_qty_applied=%s remaining_qty=%s price_status=%s",
+            code,
+            order_key,
+            confirmed_qty,
+            qty_applied,
+            pnl_qty_applied,
+            new_qty,
+            "CONFIRMED" if broker_fill_price is not None else "UNRESOLVED",
+        )
+        return {
+            "qty_applied": qty_applied,
+            "pnl_qty_applied": pnl_qty_applied,
+            "remaining_qty": new_qty,
+            "realized_pnl_status": state["realized_pnl_status"],
+        }
 
     def apply_fill(
         self,
