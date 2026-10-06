@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 # US Explanation System
@@ -107,6 +107,268 @@ def soft_stop_repeat_allowed(position: dict, *, intraday_market_overlay: str = "
         return True, "SOFT_STOP_REPEAT_ALLOWED_BY_RISK_ESCALATION"
     return False, "SOFT_STOP_REPEAT_BLOCKED"
 
+
+def _parse_soft_stop_state_ts(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _legacy_soft_stop_broker_order_timestamp(order: dict) -> datetime | None:
+    meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+    if not meta and isinstance(order.get("meta"), str):
+        try:
+            import json as _json
+            parsed = _json.loads(order.get("meta") or "{}")
+            meta = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            meta = {}
+
+    raw_utc = meta.get("order_timestamp_utc") or order.get("order_timestamp_utc")
+    if raw_utc not in (None, ""):
+        try:
+            parsed = datetime.fromisoformat(str(raw_utc).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    raw_order = meta.get("order_timestamp") or order.get("order_timestamp")
+    source = str(
+        meta.get("order_timestamp_source")
+        or meta.get("source_endpoint")
+        or ""
+    ).upper()
+    if raw_order in (None, "") or (
+        "KIS" not in source and "INQUIRE_CCNL" not in source
+    ):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        parsed = datetime.fromisoformat(str(raw_order).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _recover_legacy_soft_stop_execution_lifecycle(
+    position: dict,
+    risk_state: dict,
+    soft_exec: dict,
+    current_lifecycle: str,
+) -> dict:
+    """Upgrade PR154-era blank lifecycle state only from broker-order evidence."""
+    if not current_lifecycle or str(soft_exec.get("position_lifecycle_id") or "").strip():
+        return soft_exec
+
+    state = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
+    lifecycle = state.get("lifecycle") if isinstance(state.get("lifecycle"), dict) else {}
+    owner = str(
+        position.get("owner_strategy")
+        or position.get("strategy_owner")
+        or position.get("sleeve_id")
+        or lifecycle.get("strategy_owner")
+        or lifecycle.get("sleeve_id")
+        or ""
+    ).upper()
+    if owner != "US_STANDARD" or lifecycle.get("is_open") is not True:
+        return soft_exec
+    if str(lifecycle.get("lifecycle_id") or "").strip() != current_lifecycle:
+        return soft_exec
+
+    symbol = str(position.get("symbol") or "").upper()
+    trade_date = str(risk_state.get("trade_date") or "")[:10]
+    order_no = str(soft_exec.get("order_no") or "")
+    client_order_key = str(soft_exec.get("client_order_key") or "")
+    if not symbol or not trade_date or not (order_no or client_order_key):
+        return soft_exec
+
+    try:
+        from trader.us.db.repos import load_us_order_for_fill, save_us_position_risk_state
+        order = load_us_order_for_fill(
+            order_no=order_no or None,
+            client_order_key=client_order_key or None,
+            symbol=symbol,
+            trade_date=trade_date,
+        ) or {}
+    except Exception as exc:
+        logger.warning(
+            "[US_EXIT][PERSISTENT_SOFT_STOP][LEGACY_RECOVERY_LOOKUP_WARN] symbol=%s err=%s",
+            symbol, exc,
+        )
+        return soft_exec
+
+    order_meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+    if not order_meta and isinstance(order.get("meta"), str):
+        try:
+            import json as _json
+            parsed = _json.loads(order.get("meta") or "{}")
+            order_meta = parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            order_meta = {}
+
+    order_owner = str(
+        order_meta.get("strategy_owner")
+        or order_meta.get("sleeve_id")
+        or ""
+    ).upper()
+    try:
+        filled_qty = int(order.get("qty_filled") or 0)
+    except (TypeError, ValueError):
+        filled_qty = 0
+    if (
+        str(order.get("side") or "").upper() != "SELL"
+        or order_owner != "US_STANDARD"
+        or filled_qty <= 0
+    ):
+        return soft_exec
+
+    broker_ts = _legacy_soft_stop_broker_order_timestamp(order)
+    if broker_ts is None:
+        return soft_exec
+
+    opened_trade_date = str(lifecycle.get("opened_trade_date") or "")[:10]
+    order_trade_date = str(order.get("trade_date") or trade_date)[:10]
+    if not opened_trade_date or not order_trade_date or order_trade_date < opened_trade_date:
+        return soft_exec
+    if order_trade_date == opened_trade_date:
+        opened_raw = lifecycle.get("opened_at")
+        if opened_raw in (None, ""):
+            return soft_exec
+        # Same-day recovery requires timezone-bearing lifecycle evidence.
+        opened_text = str(opened_raw)
+        if isinstance(opened_raw, str) and not (
+            opened_text.endswith("Z")
+            or "+" in opened_text[10:]
+            or "-" in opened_text[10:]
+        ):
+            return soft_exec
+        opened_at = _parse_soft_stop_state_ts(opened_raw)
+        if opened_at is None or broker_ts < opened_at:
+            return soft_exec
+
+    upgraded = {
+        **soft_exec,
+        "position_lifecycle_id": current_lifecycle,
+        "lifecycle_recovery_source": "BROKER_ORDER_TIMESTAMP",
+        "lifecycle_recovery_order_timestamp_utc": broker_ts.isoformat(),
+    }
+    upgraded_state = dict(state)
+    upgraded_state["soft_stop_execution"] = upgraded
+    upgraded_risk = dict(risk_state)
+    upgraded_risk["state"] = upgraded_state
+    try:
+        saved = save_us_position_risk_state(
+            symbol, trade_date, upgraded_risk, require_durable=True,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[US_EXIT][PERSISTENT_SOFT_STOP][LEGACY_RECOVERY_SAVE_WARN] symbol=%s err=%s",
+            symbol, exc,
+        )
+        return soft_exec
+    if saved is not True:
+        logger.error(
+            "[US_EXIT][PERSISTENT_SOFT_STOP][LEGACY_RECOVERY_SAVE_FAILED] symbol=%s action=fail_closed",
+            symbol,
+        )
+        return soft_exec
+
+    logger.info(
+        "[US_EXIT][PERSISTENT_SOFT_STOP][LEGACY_RECOVERY_OK] symbol=%s lifecycle_id=%s order_no=%s",
+        symbol, current_lifecycle, order_no or "NA",
+    )
+    risk_state.clear()
+    risk_state.update(upgraded_risk)
+    return upgraded
+
+
+def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> tuple[bool, str]:
+    """Require broker-confirmed first soft-stop fill before persistent escalation.
+
+    PR154-era fills can have an empty soft-stop execution lifecycle id.  Recover
+    those only when the persisted fill timestamp is provably inside the current
+    still-open lifecycle; never bind an older fill across a re-entry boundary.
+    """
+    symbol = str(position.get("symbol") or "").upper()
+    owner = str(
+        position.get("owner_strategy")
+        or position.get("strategy_owner")
+        or position.get("sleeve_id")
+        or ""
+    ).upper()
+    if symbol == "TQQQ" or owner == "TQQQ_INFINITE":
+        return False, "PERSISTENT_SOFT_STOP_OWNER_ISOLATION"
+    if owner != "US_STANDARD":
+        return False, "PERSISTENT_SOFT_STOP_OWNER_UNVERIFIED"
+
+    risk_state = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
+    state = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
+    soft_exec = state.get("soft_stop_execution") if isinstance(state.get("soft_stop_execution"), dict) else {}
+    lifecycle_state = state.get("lifecycle") if isinstance(state.get("lifecycle"), dict) else {}
+
+    current_lifecycle = next(
+        (
+            str(value).strip()
+            for value in (
+                position.get("position_lifecycle_id"),
+                (position.get("meta") or {}).get("position_lifecycle_id")
+                if isinstance(position.get("meta"), dict) else None,
+                lifecycle_state.get("lifecycle_id"),
+            )
+            if str(value or "").strip()
+        ),
+        "",
+    )
+    state_lifecycle = str(lifecycle_state.get("lifecycle_id") or "").strip()
+    if (
+        not current_lifecycle
+        or not state_lifecycle
+        or current_lifecycle != state_lifecycle
+        or lifecycle_state.get("is_open") is not True
+    ):
+        return False, "PERSISTENT_SOFT_STOP_CURRENT_LIFECYCLE_UNVERIFIED"
+
+    if not bool(soft_exec.get("soft_stop_triggered_today")) or not bool(soft_exec.get("soft_stop_partial_done")):
+        return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_UNCONFIRMED"
+
+    execution_lifecycle = str(soft_exec.get("position_lifecycle_id") or "").strip()
+    if execution_lifecycle and current_lifecycle != execution_lifecycle:
+        return False, "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
+
+    try:
+        first_filled_qty = int(soft_exec.get("first_soft_stop_filled_qty") or 0)
+    except (TypeError, ValueError):
+        first_filled_qty = 0
+    if first_filled_qty <= 0:
+        return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_QTY_MISSING"
+    if not str(soft_exec.get("client_order_key") or soft_exec.get("order_no") or "").strip():
+        return False, "PERSISTENT_SOFT_STOP_FILL_IDENTITY_MISSING"
+
+    if not execution_lifecycle:
+        return False, "PERSISTENT_SOFT_STOP_LEGACY_LIFECYCLE_UNVERIFIED"
+    lifecycle_reason = "PERSISTENT_SOFT_STOP_ESCALATION"
+
+    try:
+        if "orderable_qty" in position and position.get("orderable_qty") is not None:
+            orderable_qty = int(position.get("orderable_qty"))
+        else:
+            orderable_qty = int(position.get("qty") or position.get("holding_qty") or 0)
+    except (TypeError, ValueError):
+        orderable_qty = 0
+    if orderable_qty <= 0:
+        return False, "PERSISTENT_SOFT_STOP_NO_ORDERABLE_QTY"
+
+    return True, lifecycle_reason
 
 def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
@@ -360,8 +622,12 @@ def evaluate_exit(
             required_ticks + 1,
             int(cfg.get("persistent_soft_stop_ticks", os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3")) or 3),
         )
-        already_reduced = bool(position.get("soft_stop_partial_done") or position.get("partial_soft_stop_done") or position.get("last_exit_type") == EXIT_SOFT_STOP_LOSS)
-        if already_reduced and breach_count >= persistent_required:
+        partial_fill_confirmed, partial_fill_reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(position)
+        if partial_fill_confirmed and breach_count >= persistent_required:
+            logger.info(
+                "[US_EXIT][PERSISTENT_SOFT_STOP][SIGNAL] symbol=%s reason=%s ticks=%d/%d",
+                symbol, partial_fill_reason, breach_count, persistent_required,
+            )
             return _emit_exit(
                 symbol=symbol, exchange=exchange, qty=qty,
                 current_price=current_price, entry_price=entry_price,
@@ -816,8 +1082,17 @@ def prepare_exit_position_snapshots(
                     or ((risk_state.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id")
                     or ""
                 )
+                if (
+                    soft_exec
+                    and not str(soft_exec.get("position_lifecycle_id") or "").strip()
+                    and current_lifecycle
+                ):
+                    soft_exec = _recover_legacy_soft_stop_execution_lifecycle(
+                        pos, risk_state, dict(soft_exec), current_lifecycle,
+                    )
+                    pos["risk_state"] = risk_state
                 soft_lifecycle = str(soft_exec.get("position_lifecycle_id") or "")
-                if not soft_lifecycle or not current_lifecycle or soft_lifecycle == current_lifecycle:
+                if current_lifecycle and soft_lifecycle == current_lifecycle:
                     pos["soft_stop_triggered_today"] = bool(soft_exec.get("soft_stop_triggered_today"))
                     pos["soft_stop_partial_done"] = bool(soft_exec.get("soft_stop_partial_done"))
                     pos["first_soft_stop_at"] = soft_exec.get("first_soft_stop_at")
@@ -881,12 +1156,25 @@ def _evaluate_exit_intents_from_snapshots(
             continue
 
         intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now, include_trend_time=include_trend_time)
-        if intent is not None and intent.get("exit_type") in {"soft_stop_loss", "persistent_soft_stop_full_exit"}:
+        if intent is not None and intent.get("exit_type") == "soft_stop_loss":
             allowed, repeat_reason = soft_stop_repeat_allowed(pos, intraday_market_overlay=str(pos.get("intraday_market_overlay") or "NORMAL"), close_session=bool(pos.get("close_session")))
             if not allowed:
                 pos["soft_stop_repeat_blocked_count"] = int(pos.get("soft_stop_repeat_blocked_count") or 0) + 1
                 logger.info("[US_EXIT][SOFT_STOP_REPEAT_BLOCKED] symbol=%s reason=%s", symbol, repeat_reason)
                 intent = None
+        elif intent is not None and intent.get("exit_type") == "persistent_soft_stop_full_exit":
+            escalation_allowed, escalation_reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(pos)
+            if not escalation_allowed:
+                logger.error(
+                    "[US_EXIT][PERSISTENT_SOFT_STOP][BLOCKED] symbol=%s reason=%s",
+                    symbol, escalation_reason,
+                )
+                intent = None
+            else:
+                logger.info(
+                    "[US_EXIT][PERSISTENT_SOFT_STOP][ESCALATION_ALLOWED] symbol=%s reason=%s",
+                    symbol, escalation_reason,
+                )
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build exit explanation

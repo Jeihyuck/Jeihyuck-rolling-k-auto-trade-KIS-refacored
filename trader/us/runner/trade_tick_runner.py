@@ -20,7 +20,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -955,12 +955,97 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
 
             risk = load_us_position_risk_state(symbol, trade_date) or {}
             nested = dict(risk.get("state") or {})
+            lifecycle = (
+                dict(nested.get("lifecycle") or {})
+                if isinstance(nested.get("lifecycle"), dict)
+                else {}
+            )
+            record_owner = str(
+                meta.get("strategy_owner")
+                or meta.get("sleeve_id")
+                or rec.get("strategy_owner")
+                or rec.get("sleeve_id")
+                or ""
+            ).upper()
+            lifecycle_owner = str(
+                lifecycle.get("strategy_owner")
+                or lifecycle.get("sleeve_id")
+                or ""
+            ).upper()
+            lifecycle_recovered_from_current = False
+            if not lifecycle_id:
+                def _parse_soft_stop_evidence_time(raw):
+                    if raw in (None, ""):
+                        return None
+                    try:
+                        parsed = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        return parsed.astimezone(timezone.utc)
+                    except Exception:
+                        return None
+
+                fill_evidence_at = _parse_soft_stop_evidence_time(
+                    meta.get("order_timestamp_utc")
+                    or rec.get("order_timestamp_utc")
+                    or meta.get("order_timestamp")
+                    or rec.get("order_timestamp")
+                    or meta.get("execution_timestamp")
+                    or rec.get("execution_timestamp")
+                )
+                lifecycle_opened_at = _parse_soft_stop_evidence_time(lifecycle.get("opened_at"))
+                can_recover_lifecycle = bool(
+                    record_owner == "US_STANDARD"
+                    and lifecycle_owner == "US_STANDARD"
+                    and lifecycle.get("is_open") is True
+                    and str(lifecycle.get("lifecycle_id") or "").strip()
+                    and fill_evidence_at is not None
+                    and lifecycle_opened_at is not None
+                    and fill_evidence_at >= lifecycle_opened_at
+                )
+                if can_recover_lifecycle:
+                    lifecycle_id = str(lifecycle.get("lifecycle_id")).strip()
+                    lifecycle_recovered_from_current = True
+                    logger.info(
+                        "[US_EXIT][SOFT_STOP_STATE][LIFECYCLE_RECOVERED] symbol=%s lifecycle_id=%s source=current_open_lifecycle",
+                        symbol, lifecycle_id,
+                    )
+                else:
+                    logger.error(
+                        "[US_EXIT][SOFT_STOP_STATE][LIFECYCLE_UNRESOLVED] symbol=%s owner=%s lifecycle_owner=%s fill_at=%s opened_at=%s action=skip_state_mutation",
+                        symbol, record_owner or "NA", lifecycle_owner or "NA",
+                        fill_evidence_at.isoformat() if fill_evidence_at else "NA",
+                        lifecycle_opened_at.isoformat() if lifecycle_opened_at else "NA",
+                    )
+                    continue
             prior = dict(nested.get("soft_stop_execution") or {})
             if prior.get("position_lifecycle_id") and lifecycle_id and prior.get("position_lifecycle_id") != lifecycle_id:
                 prior = {}
             if prior.get("soft_stop_triggered_today"):
                 continue
-            now_iso = datetime.now(timezone.utc).isoformat()
+            evidence_at_raw = (
+                meta.get("order_timestamp_utc")
+                or rec.get("order_timestamp_utc")
+                or meta.get("order_timestamp")
+                or rec.get("order_timestamp")
+                or meta.get("execution_timestamp")
+                or rec.get("execution_timestamp")
+            )
+            try:
+                evidence_at = (
+                    evidence_at_raw
+                    if isinstance(evidence_at_raw, datetime)
+                    else datetime.fromisoformat(str(evidence_at_raw).replace("Z", "+00:00"))
+                ) if evidence_at_raw not in (None, "") else None
+                if evidence_at is not None and evidence_at.tzinfo is None:
+                    evidence_at = evidence_at.replace(tzinfo=timezone.utc)
+                now_iso = (
+                    evidence_at.astimezone(timezone.utc).isoformat()
+                    if evidence_at is not None
+                    else datetime.now(timezone.utc).isoformat()
+                )
+            except Exception:
+                now_iso = datetime.now(timezone.utc).isoformat()
             nested["soft_stop_execution"] = {
                 **prior,
                 "soft_stop_triggered_today": True,
@@ -973,7 +1058,21 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
                 "order_no": str(order_no or ""),
             }
             risk["state"] = nested
-            save_us_position_risk_state(symbol, trade_date, risk)
+            if lifecycle_recovered_from_current:
+                saved = save_us_position_risk_state(
+                    symbol,
+                    trade_date,
+                    risk,
+                    require_durable=True,
+                )
+                if saved is not True:
+                    logger.error(
+                        "[US_EXIT][SOFT_STOP_STATE][LIFECYCLE_RECOVERY_SAVE_FAILED] symbol=%s lifecycle_id=%s action=fail_closed",
+                        symbol, lifecycle_id or "NA",
+                    )
+                    continue
+            else:
+                save_us_position_risk_state(symbol, trade_date, risk)
             logger.info(
                 "[US_EXIT][SOFT_STOP_STATE][FILLED] symbol=%s lifecycle_id=%s qty=%s price=%.4f order_no=%s",
                 symbol, lifecycle_id or "NA", filled_qty, fill_price, order_no or "",
