@@ -252,6 +252,28 @@ def test_persistent_soft_stop_requires_confirmed_fill_for_current_lifecycle():
     assert reason == "PERSISTENT_SOFT_STOP_OWNER_UNVERIFIED"
 
 
+def test_persistent_soft_stop_explicit_zero_orderable_qty_fails_closed():
+    from trader.us.pb1.us_exit_engine import (
+        _confirmed_soft_stop_partial_fill_for_current_lifecycle,
+    )
+
+    position = _oct5_persistent_snapshot(
+        symbol="JNJ",
+        entry_price=270.65,
+        current_price=253.75,
+        qty=1,
+        first_fill_qty=1,
+        first_soft_stop_price=255.13,
+        lifecycle_id="life-jnj-zero-orderable",
+        breach_count=67,
+    )
+    position["orderable_qty"] = 0
+
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(position)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_NO_ORDERABLE_QTY"
+
+
 def test_persistent_soft_stop_owner_isolation_keeps_tqqq_out():
     from trader.us.pb1.us_exit_engine import (
         _confirmed_soft_stop_partial_fill_for_current_lifecycle,
