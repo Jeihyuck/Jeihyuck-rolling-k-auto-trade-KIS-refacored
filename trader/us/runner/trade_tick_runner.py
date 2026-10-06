@@ -985,14 +985,12 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
                         return None
 
                 fill_evidence_at = _parse_soft_stop_evidence_time(
-                    rec.get("filled_at")
-                    or rec.get("execution_timestamp")
+                    meta.get("order_timestamp_utc")
                     or rec.get("order_timestamp_utc")
-                    or rec.get("order_timestamp")
-                    or meta.get("filled_at")
-                    or meta.get("execution_timestamp")
-                    or meta.get("order_timestamp_utc")
                     or meta.get("order_timestamp")
+                    or rec.get("order_timestamp")
+                    or meta.get("execution_timestamp")
+                    or rec.get("execution_timestamp")
                 )
                 lifecycle_opened_at = _parse_soft_stop_evidence_time(lifecycle.get("opened_at"))
                 can_recover_lifecycle = bool(
@@ -1024,14 +1022,12 @@ def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status
             if prior.get("soft_stop_triggered_today"):
                 continue
             evidence_at_raw = (
-                rec.get("filled_at")
-                or rec.get("execution_timestamp")
+                meta.get("order_timestamp_utc")
                 or rec.get("order_timestamp_utc")
-                or rec.get("order_timestamp")
-                or meta.get("filled_at")
-                or meta.get("execution_timestamp")
-                or meta.get("order_timestamp_utc")
                 or meta.get("order_timestamp")
+                or rec.get("order_timestamp")
+                or meta.get("execution_timestamp")
+                or rec.get("execution_timestamp")
             )
             try:
                 evidence_at = (
