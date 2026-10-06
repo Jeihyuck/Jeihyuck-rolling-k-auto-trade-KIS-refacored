@@ -560,9 +560,11 @@ def test_soft_stop_fill_state_recovers_current_lifecycle_when_fill_meta_omits_id
         lambda symbol, trade_date: dict(store),
     )
 
-    def save_state(symbol, trade_date, state):
+    def save_state(symbol, trade_date, state, **kwargs):
+        assert kwargs.get("require_durable") is True
         store.clear()
         store.update(state)
+        return True
 
     monkeypatch.setattr(repos, "save_us_position_risk_state", save_state)
 
@@ -590,6 +592,65 @@ def test_soft_stop_fill_state_recovers_current_lifecycle_when_fill_meta_omits_id
     assert soft_state["soft_stop_partial_done"] is True
     assert soft_state["first_soft_stop_filled_qty"] == 1
     assert soft_state["position_lifecycle_id"] == "life-jnj-oct5"
+
+def test_fill_time_lifecycle_recovery_requires_durable_save(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.runner.trade_tick_runner import _mark_soft_stop_stages_from_records
+
+    store = {
+        "trade_date": "2026-10-05",
+        "symbol": "JNJ",
+        "soft_stop_breach_count": 7,
+        "state": {
+            "lifecycle": {
+                "lifecycle_id": "life-jnj-oct5",
+                "is_open": True,
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "opened_at": "2026-09-25T00:14:30+00:00",
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        repos,
+        "load_us_position_risk_state",
+        lambda symbol, trade_date: dict(store),
+    )
+    calls = []
+
+    def fail_durable_save(symbol, trade_date, state, **kwargs):
+        calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(
+        repos,
+        "save_us_position_risk_state",
+        fail_durable_save,
+    )
+
+    _mark_soft_stop_stages_from_records(
+        [{
+            "symbol": "JNJ",
+            "side": "SELL",
+            "qty": 1,
+            "price": 255.13,
+            "order_no": "0000001519",
+            "client_order_key": "6485927d33957ca109a53853",
+            "meta": {
+                "exit_reason": "soft_stop_loss",
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "order_timestamp_utc": "2026-10-05T14:10:24+00:00",
+            },
+        }],
+        trade_date="2026-10-05",
+        status="FILLED",
+    )
+
+    assert calls == [{"require_durable": True}]
+    assert "soft_stop_execution" not in store["state"]
+
 
 def test_soft_stop_fill_state_prefers_broker_order_time_over_persisted_filled_at(monkeypatch):
     from trader.us.db import repos
