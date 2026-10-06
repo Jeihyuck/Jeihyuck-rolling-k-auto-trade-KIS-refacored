@@ -108,13 +108,16 @@ def _oct5_persistent_snapshot(*, symbol, entry_price, current_price, qty, first_
         "soft_stop_partial_done": True,
         "first_soft_stop_price": first_soft_stop_price,
         "risk_state": {
+            "trade_date": "2026-10-05",
             "soft_stop_breach_count": breach_count,
             "state": {
                 "lifecycle": {
                     "lifecycle_id": lifecycle_id,
                     "is_open": True,
+                    "opened_trade_date": "2026-09-25",
                     "opened_at": "2026-09-25T00:14:30+00:00",
                     "strategy_owner": "US_STANDARD",
+                    "sleeve_id": "US_STANDARD",
                 },
                 "soft_stop_execution": {
                     "soft_stop_triggered_today": True,
@@ -167,10 +170,6 @@ def test_oct5_confirmed_persistent_soft_stop_full_exit_survives_general_repeat_g
     ]
 
     for snapshot in incidents:
-        # The 2026-10-05 PR154-era rows have confirmed fill quantity/order
-        # identity but an empty soft_stop_execution lifecycle id.
-        snapshot["risk_state"]["state"]["soft_stop_execution"]["position_lifecycle_id"] = ""
-
         # These prices intentionally do not satisfy the old generic repeat
         # risk-escalation thresholds. The persistent contract itself must carry
         # the already-confirmed partial stop into the full-exit leg.
@@ -294,7 +293,7 @@ def test_persistent_soft_stop_owner_isolation_keeps_tqqq_out():
     assert allowed is False
     assert reason == "PERSISTENT_SOFT_STOP_OWNER_ISOLATION"
 
-def test_oct5_legacy_blank_soft_stop_lifecycle_recovers_only_within_current_open_lifecycle():
+def test_legacy_blank_soft_stop_lifecycle_fails_closed_without_broker_upgrade():
     from trader.us.pb1.us_exit_engine import (
         _confirmed_soft_stop_partial_fill_for_current_lifecycle,
     )
@@ -312,28 +311,150 @@ def test_oct5_legacy_blank_soft_stop_lifecycle_recovers_only_within_current_open
     incident["risk_state"]["state"]["soft_stop_execution"]["position_lifecycle_id"] = ""
 
     allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(incident)
-    assert allowed is True
-    assert reason == "PERSISTENT_SOFT_STOP_ESCALATION_LEGACY_LIFECYCLE_RECOVERED"
-
-    reentered = {
-        **incident,
-        "risk_state": {
-            **incident["risk_state"],
-            "state": {
-                **incident["risk_state"]["state"],
-                "lifecycle": {
-                    **incident["risk_state"]["state"]["lifecycle"],
-                    "lifecycle_id": "life-reentry",
-                    "opened_at": "2026-10-06T15:00:00+00:00",
-                    "is_open": True,
-                },
-            },
-        },
-        "position_lifecycle_id": "life-reentry",
-    }
-    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(reentered)
     assert allowed is False
     assert reason == "PERSISTENT_SOFT_STOP_LEGACY_LIFECYCLE_UNVERIFIED"
+
+
+def test_oct5_legacy_blank_soft_stop_lifecycle_upgrades_from_broker_order(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.pb1.us_exit_engine import (
+        _confirmed_soft_stop_partial_fill_for_current_lifecycle,
+        _recover_legacy_soft_stop_execution_lifecycle,
+    )
+
+    incidents = [
+        (
+            _oct5_persistent_snapshot(
+                symbol="JNJ",
+                entry_price=270.65,
+                current_price=253.75,
+                qty=1,
+                first_fill_qty=1,
+                first_soft_stop_price=255.13,
+                lifecycle_id="life-jnj-oct5",
+                breach_count=67,
+            ),
+            "2026-10-05T23:04:28",
+        ),
+        (
+            _oct5_persistent_snapshot(
+                symbol="MRK",
+                entry_price=148.287,
+                current_price=139.95,
+                qty=6,
+                first_fill_qty=6,
+                first_soft_stop_price=139.66,
+                lifecycle_id="life-mrk-oct5",
+                breach_count=60,
+            ),
+            "2026-10-05T23:19:14",
+        ),
+    ]
+    saves = []
+
+    def load_order_for_fill(*, order_no, client_order_key, symbol, trade_date):
+        matching = next(item for item, _ in incidents if item["symbol"] == symbol)
+        broker_time = next(ts for item, ts in incidents if item["symbol"] == symbol)
+        soft_exec = matching["risk_state"]["state"]["soft_stop_execution"]
+        return {
+            "trade_date": trade_date,
+            "symbol": symbol,
+            "side": "SELL",
+            "qty_filled": soft_exec["first_soft_stop_filled_qty"],
+            "order_no": order_no,
+            "client_order_key": client_order_key,
+            "status": "FILLED",
+            "meta": {
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "source_endpoint": "KIS_INQUIRE_CCNL",
+                "order_timestamp": broker_time,
+                "exit_reason": "soft_stop_loss",
+            },
+        }
+
+    monkeypatch.setattr(repos, "load_us_order_for_fill", load_order_for_fill)
+    monkeypatch.setattr(
+        repos,
+        "save_us_position_risk_state",
+        lambda symbol, trade_date, state: saves.append((symbol, trade_date, state)),
+    )
+
+    for incident, _broker_time in incidents:
+        risk_state = incident["risk_state"]
+        soft_exec = dict(risk_state["state"]["soft_stop_execution"])
+        soft_exec["position_lifecycle_id"] = ""
+        risk_state["state"]["soft_stop_execution"] = soft_exec
+
+        upgraded = _recover_legacy_soft_stop_execution_lifecycle(
+            incident,
+            risk_state,
+            soft_exec,
+            incident["position_lifecycle_id"],
+        )
+        assert upgraded["position_lifecycle_id"] == incident["position_lifecycle_id"]
+        assert upgraded["lifecycle_recovery_source"] == "BROKER_ORDER_TIMESTAMP"
+
+        allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(incident)
+        assert allowed is True
+        assert reason == "PERSISTENT_SOFT_STOP_ESCALATION"
+
+    assert {symbol for symbol, _, _ in saves} == {"JNJ", "MRK"}
+
+
+def test_legacy_blank_soft_stop_same_day_ambiguous_open_time_fails_closed(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.pb1.us_exit_engine import (
+        _recover_legacy_soft_stop_execution_lifecycle,
+    )
+
+    incident = _oct5_persistent_snapshot(
+        symbol="JNJ",
+        entry_price=270.65,
+        current_price=253.75,
+        qty=1,
+        first_fill_qty=1,
+        first_soft_stop_price=255.13,
+        lifecycle_id="life-jnj-reentry",
+        breach_count=67,
+    )
+    lifecycle = incident["risk_state"]["state"]["lifecycle"]
+    lifecycle["opened_trade_date"] = "2026-10-05"
+    lifecycle["opened_at"] = "2026-10-05T23:10:00"  # legacy naive timestamp
+    soft_exec = incident["risk_state"]["state"]["soft_stop_execution"]
+    soft_exec["position_lifecycle_id"] = ""
+
+    monkeypatch.setattr(
+        repos,
+        "load_us_order_for_fill",
+        lambda **kwargs: {
+            "trade_date": "2026-10-05",
+            "symbol": "JNJ",
+            "side": "SELL",
+            "qty_filled": 1,
+            "status": "FILLED",
+            "meta": {
+                "strategy_owner": "US_STANDARD",
+                "source_endpoint": "KIS_INQUIRE_CCNL",
+                "order_timestamp": "2026-10-05T23:04:28",
+            },
+        },
+    )
+    saves = []
+    monkeypatch.setattr(
+        repos,
+        "save_us_position_risk_state",
+        lambda *args, **kwargs: saves.append((args, kwargs)),
+    )
+
+    recovered = _recover_legacy_soft_stop_execution_lifecycle(
+        incident,
+        incident["risk_state"],
+        dict(soft_exec),
+        incident["position_lifecycle_id"],
+    )
+    assert recovered.get("position_lifecycle_id") in ("", None)
+    assert saves == []
 
 
 def test_soft_stop_fill_state_recovers_current_lifecycle_when_fill_meta_omits_id(monkeypatch):
