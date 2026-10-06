@@ -119,8 +119,8 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
     ).upper()
     if symbol == "TQQQ" or owner == "TQQQ_INFINITE":
         return False, "PERSISTENT_SOFT_STOP_OWNER_ISOLATION"
-    if owner and owner != "US_STANDARD":
-        return False, "PERSISTENT_SOFT_STOP_NON_STANDARD_OWNER"
+    if owner != "US_STANDARD":
+        return False, "PERSISTENT_SOFT_STOP_OWNER_UNVERIFIED"
 
     risk_state = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
     state = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
