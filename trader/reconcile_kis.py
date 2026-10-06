@@ -661,6 +661,60 @@ def _promote_open_buy_orders_from_holdings(
         )
         promoted_orders += 1
 
+        claim_error = _record_execution_claim_observation(
+            orders_repo=orders_repo,
+            source_order=order,
+            broker_status=next_status,
+            cumulative_filled_qty=confirmed_fill_qty,
+            requested_qty=int(submitted_qty or requested_qty or 0),
+        )
+        if claim_error:
+            logger.error(
+                "[RECONCILE][PROMOTE][EXECUTION_CLAIM_FAILED] code=%s key=%s error=%s",
+                code, client_order_key, claim_error,
+            )
+
+        if side == "SELL" and positions_repo is not None and confirmed_fill_qty > 0:
+            try:
+                positions_repo.reconcile_sell_execution(
+                    env=env,
+                    strategy=str(order.get("strategy") or strategy),
+                    sid=int(order.get("sid") or 1),
+                    mode=int(order.get("mode") or 1),
+                    code=code,
+                    market=order.get("market"),
+                    confirmed_cumulative_qty=confirmed_fill_qty,
+                    fill_price=broker_fill_price,
+                    filled_at=tick_ts,
+                    position_cycle_id=str(order.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                    order_id=str(order.get("order_id") or ""),
+                    pre_order_holding_qty=pre_order_holding_qty,
+                    broker_holding_qty=holding_qty,
+                )
+            except Exception:
+                logger.exception(
+                    "[RECONCILE][SELL_POSITION_QTY][FAIL] code=%s order_id=%s "
+                    "confirmed_qty=%s broker_qty=%s",
+                    code, order.get("order_id"), confirmed_fill_qty, holding_qty,
+                )
+        if side == "SELL" and positions_repo is not None:
+            try:
+                _project_pb1_exit_stage_truth(
+                    orders_repo=orders_repo,
+                    positions_repo=positions_repo,
+                    env=env,
+                    code=code,
+                    strategy=str(order.get("strategy") or strategy),
+                    source_order=order,
+                    request_json=request_json,
+                )
+            except Exception:
+                logger.exception(
+                    "[RECONCILE][PROMOTE][EXIT_STAGE_PROJECTION_FAILED] code=%s key=%s",
+                    code, client_order_key,
+                )
+
         # TP lifecycle is driven by confirmed cumulative quantity, not price
         # accounting. A fully sold TP slice may have its execution price delayed
         # by KIS; that must not leave the durable stage pending forever.
@@ -1337,6 +1391,32 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
                         pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
                     )
+            if incremental_daily_qty > 0 and side == "SELL" and source_order:
+                positions_repo.reconcile_sell_execution(
+                    env=env,
+                    strategy=str(source_order.get("strategy") or strategy),
+                    sid=int(source_order.get("sid") or 1),
+                    mode=int(source_order.get("mode") or 1),
+                    code=code,
+                    market=source_order.get("market") or market,
+                    confirmed_cumulative_qty=next_confirmed_qty,
+                    fill_price=float(filled_price),
+                    filled_at=order_time,
+                    position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                    portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                    order_id=str(source_order.get("order_id") or ""),
+                    pre_order_holding_qty=_to_int(request_json.get("pre_order_holding_qty")),
+                    broker_holding_qty=None,
+                )
+                logger.info(
+                    "[RECONCILE][SELL_POSITION_APPLY] code=%s incremental_qty=%s "
+                    "cumulative_qty=%s cycle=%s epoch=%s source=daily_ccld",
+                    code,
+                    incremental_daily_qty,
+                    next_confirmed_qty,
+                    source_order.get("position_cycle_id"),
+                    source_order.get("portfolio_epoch_id"),
+                )
             if incremental_daily_qty > 0:
                 fill_count += 1
                 filled_codes.append(code)
