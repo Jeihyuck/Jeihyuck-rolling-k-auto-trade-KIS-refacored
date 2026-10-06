@@ -6563,7 +6563,11 @@ class PositionsRepo:
                 new_qty = broker_qty
             else:
                 incremental_qty = confirmed_qty - qty_accounted
-                if pre_order_holding_qty is not None:
+                if pre_order_holding_qty is not None and incremental_qty > 0:
+                    # Quantity mutation still requires this order's original
+                    # baseline. Price-only replay (incremental_qty == 0) may
+                    # occur after later, separately attributed SELL stages have
+                    # legitimately reduced the same lifecycle's current qty.
                     prior_expected_qty = max(
                         0, int(pre_order_holding_qty) - qty_accounted
                     )
