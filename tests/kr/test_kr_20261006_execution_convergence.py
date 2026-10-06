@@ -437,3 +437,51 @@ def test_partial_sell_later_cumulative_average_price_uses_incremental_proceeds()
     assert stored["qty"] == 5
     # 5 sold shares total at cumulative broker average 116; basis 100.
     assert stored["realized_pnl"] == pytest.approx(80.0)
+
+
+def test_late_daily_ccld_partial_execution_prices_need_complete_order_proof():
+    from trader.reconcile_kis import _verified_order_sell_average_from_ccld_fills
+
+    engine = _db()
+    orders, fills = OrdersRepo(engine), FillsRepo(engine)
+    pos = _open_position(engine, code="123454", qty=10, avg=100.0)
+    key = "sell-late-partial-ccld-proof"
+    order_id, created = orders.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close",
+        sid=1, mode=1, code="123454", market="J", side="SELL",
+        ord_type="LIMIT", qty=5, limit_price=110.0,
+        stage="PROFIT_PROTECT_PARTIAL_1", client_order_key=key,
+        request_json={"pre_order_holding_qty": 10},
+        status="ACKED", account_id=get_account_key(env="practice"),
+        position_cycle_id=str(pos["position_cycle_id"]),
+        portfolio_epoch_id=str(pos["portfolio_epoch_id"]),
+    )
+    assert created
+    order = orders.get_order_by_client_order_key("practice", key)
+    common = dict(
+        env="practice", run_id=None, order_id=str(order_id),
+        kis_odno="0000099933", code="123454", market="J",
+        side="SELL", fee=0, tax=0,
+        filled_at=datetime(2026, 10, 6, 1, tzinfo=timezone.utc),
+        raw_json={"source": "daily_ccld"},
+        fill_meta_json={"fill_source": "daily_ccld"},
+    )
+    fills.upsert_fill(**common, trade_id="broker-exec-1", qty=2, price=110.0)
+    assert _verified_order_sell_average_from_ccld_fills(
+        fills_repo=fills, source_order=order, env="practice",
+        confirmed_cumulative_qty=5,
+    ) is None
+    fills.upsert_fill(**common, trade_id="broker-exec-2", qty=3, price=120.0)
+    assert _verified_order_sell_average_from_ccld_fills(
+        fills_repo=fills, source_order=order, env="practice",
+        confirmed_cumulative_qty=5,
+    ) == pytest.approx(116.0)
+    # A holdings-promotion synthetic record cannot change the broker price.
+    fills.upsert_fill(
+        **{**common, "fill_meta_json": {"fill_source": "kis_holdings_fallback"}},
+        trade_id="synthetic-holdings", qty=5, price=1000.0,
+    )
+    assert _verified_order_sell_average_from_ccld_fills(
+        fills_repo=fills, source_order=order, env="practice",
+        confirmed_cumulative_qty=5,
+    ) == pytest.approx(116.0)
