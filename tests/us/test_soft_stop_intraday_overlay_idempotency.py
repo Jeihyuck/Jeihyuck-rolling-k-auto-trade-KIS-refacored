@@ -88,3 +88,172 @@ def test_confirmed_soft_stop_fill_state_reaches_repeat_gate(monkeypatch):
     allowed, reason = soft_stop_repeat_allowed(snapshots[0])
     assert allowed is False
     assert reason == "SOFT_STOP_REPEAT_BLOCKED"
+
+def _oct5_persistent_snapshot(*, symbol, entry_price, current_price, qty, first_fill_qty,
+                              first_soft_stop_price, lifecycle_id, breach_count=3):
+    return {
+        "symbol": symbol,
+        "exchange": "NYSE",
+        "strategy_owner": "US_STANDARD",
+        "qty": qty,
+        "holding_qty": qty,
+        "orderable_qty": qty,
+        "entry_price": entry_price,
+        "current_price": current_price,
+        "current_price_usd": current_price,
+        "resolved_current_price": current_price,
+        "position_lifecycle_id": lifecycle_id,
+        "soft_stop_breach_count": breach_count,
+        "soft_stop_triggered_today": True,
+        "soft_stop_partial_done": True,
+        "first_soft_stop_price": first_soft_stop_price,
+        "risk_state": {
+            "soft_stop_breach_count": breach_count,
+            "state": {
+                "lifecycle": {
+                    "lifecycle_id": lifecycle_id,
+                    "is_open": True,
+                },
+                "soft_stop_execution": {
+                    "soft_stop_triggered_today": True,
+                    "soft_stop_partial_done": True,
+                    "first_soft_stop_filled_qty": first_fill_qty,
+                    "first_soft_stop_price": first_soft_stop_price,
+                    "position_lifecycle_id": lifecycle_id,
+                },
+            },
+        },
+    }
+
+
+def test_oct5_confirmed_persistent_soft_stop_full_exit_survives_general_repeat_gate(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from trader.us.pb1 import us_exit_engine
+
+    monkeypatch.setattr(
+        us_exit_engine,
+        "should_skip_exit_due_to_pending_sell",
+        lambda *_args, **_kwargs: (False, None, None),
+    )
+
+    incidents = [
+        _oct5_persistent_snapshot(
+            symbol="JNJ",
+            entry_price=270.65,
+            current_price=253.75,
+            qty=1,
+            first_fill_qty=1,
+            first_soft_stop_price=255.13,
+            lifecycle_id="life-jnj-oct5",
+            breach_count=67,
+        ),
+        _oct5_persistent_snapshot(
+            symbol="MRK",
+            entry_price=148.287,
+            current_price=139.95,
+            qty=6,
+            first_fill_qty=6,
+            first_soft_stop_price=139.66,
+            lifecycle_id="life-mrk-oct5",
+            breach_count=60,
+        ),
+    ]
+
+    for snapshot in incidents:
+        # These prices intentionally do not satisfy the old generic repeat
+        # risk-escalation thresholds. The persistent contract itself must carry
+        # the already-confirmed partial stop into the full-exit leg.
+        allowed, reason = us_exit_engine.soft_stop_repeat_allowed(snapshot)
+        assert allowed is False
+        assert reason == "SOFT_STOP_REPEAT_BLOCKED"
+
+        intents = us_exit_engine._evaluate_exit_intents_from_snapshots(
+            [snapshot],
+            now=datetime(2026, 10, 5, 14, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
+
+        assert len(intents) == 1
+        assert intents[0]["symbol"] == snapshot["symbol"]
+        assert intents[0]["exit_type"] == "persistent_soft_stop_full_exit"
+        assert intents[0]["qty"] == snapshot["orderable_qty"]
+        assert intents[0]["position_lifecycle_id"] == snapshot["position_lifecycle_id"]
+
+
+def test_persistent_soft_stop_requires_confirmed_fill_for_current_lifecycle():
+    from trader.us.pb1.us_exit_engine import (
+        _confirmed_soft_stop_partial_fill_for_current_lifecycle,
+    )
+
+    base = _oct5_persistent_snapshot(
+        symbol="JNJ",
+        entry_price=270.65,
+        current_price=253.75,
+        qty=1,
+        first_fill_qty=1,
+        first_soft_stop_price=255.13,
+        lifecycle_id="life-current",
+    )
+
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(base)
+    assert allowed is True
+    assert reason == "PERSISTENT_SOFT_STOP_ESCALATION"
+
+    no_fill = {
+        **base,
+        "risk_state": {
+            "state": {
+                "lifecycle": {"lifecycle_id": "life-current", "is_open": True},
+                "soft_stop_execution": {
+                    "soft_stop_triggered_today": True,
+                    "soft_stop_partial_done": True,
+                    "first_soft_stop_filled_qty": 0,
+                    "position_lifecycle_id": "life-current",
+                },
+            },
+        },
+    }
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(no_fill)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_PARTIAL_FILL_QTY_MISSING"
+
+    stale_lifecycle = {
+        **base,
+        "risk_state": {
+            "state": {
+                "lifecycle": {"lifecycle_id": "life-current", "is_open": True},
+                "soft_stop_execution": {
+                    "soft_stop_triggered_today": True,
+                    "soft_stop_partial_done": True,
+                    "first_soft_stop_filled_qty": 1,
+                    "position_lifecycle_id": "life-old",
+                },
+            },
+        },
+    }
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(stale_lifecycle)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
+
+
+def test_persistent_soft_stop_owner_isolation_keeps_tqqq_out():
+    from trader.us.pb1.us_exit_engine import (
+        _confirmed_soft_stop_partial_fill_for_current_lifecycle,
+    )
+
+    position = _oct5_persistent_snapshot(
+        symbol="TQQQ",
+        entry_price=100.0,
+        current_price=94.0,
+        qty=3,
+        first_fill_qty=1,
+        first_soft_stop_price=95.0,
+        lifecycle_id="life-tqqq",
+    )
+    position["strategy_owner"] = "TQQQ_INFINITE"
+
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(position)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_OWNER_ISOLATION"
+
