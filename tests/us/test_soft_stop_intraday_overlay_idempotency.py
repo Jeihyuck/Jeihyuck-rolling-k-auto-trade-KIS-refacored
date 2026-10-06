@@ -113,12 +113,17 @@ def _oct5_persistent_snapshot(*, symbol, entry_price, current_price, qty, first_
                 "lifecycle": {
                     "lifecycle_id": lifecycle_id,
                     "is_open": True,
+                    "opened_at": "2026-09-25T00:14:30+00:00",
+                    "strategy_owner": "US_STANDARD",
                 },
                 "soft_stop_execution": {
                     "soft_stop_triggered_today": True,
                     "soft_stop_partial_done": True,
                     "first_soft_stop_filled_qty": first_fill_qty,
                     "first_soft_stop_price": first_soft_stop_price,
+                    "first_soft_stop_at": "2026-10-05T14:10:24+00:00",
+                    "client_order_key": f"soft-{symbol.lower()}",
+                    "order_no": "1519",
                     "position_lifecycle_id": lifecycle_id,
                 },
             },
@@ -262,4 +267,99 @@ def test_persistent_soft_stop_owner_isolation_keeps_tqqq_out():
     allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(position)
     assert allowed is False
     assert reason == "PERSISTENT_SOFT_STOP_OWNER_ISOLATION"
+
+def test_oct5_legacy_blank_soft_stop_lifecycle_recovers_only_within_current_open_lifecycle():
+    from trader.us.pb1.us_exit_engine import (
+        _confirmed_soft_stop_partial_fill_for_current_lifecycle,
+    )
+
+    incident = _oct5_persistent_snapshot(
+        symbol="JNJ",
+        entry_price=270.65,
+        current_price=253.75,
+        qty=1,
+        first_fill_qty=1,
+        first_soft_stop_price=255.13,
+        lifecycle_id="life-jnj-oct5",
+        breach_count=67,
+    )
+    incident["risk_state"]["state"]["soft_stop_execution"]["position_lifecycle_id"] = ""
+
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(incident)
+    assert allowed is True
+    assert reason == "PERSISTENT_SOFT_STOP_ESCALATION_LEGACY_LIFECYCLE_RECOVERED"
+
+    reentered = {
+        **incident,
+        "risk_state": {
+            **incident["risk_state"],
+            "state": {
+                **incident["risk_state"]["state"],
+                "lifecycle": {
+                    **incident["risk_state"]["state"]["lifecycle"],
+                    "lifecycle_id": "life-reentry",
+                    "opened_at": "2026-10-06T15:00:00+00:00",
+                    "is_open": True,
+                },
+            },
+        },
+        "position_lifecycle_id": "life-reentry",
+    }
+    allowed, reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(reentered)
+    assert allowed is False
+    assert reason == "PERSISTENT_SOFT_STOP_LEGACY_LIFECYCLE_UNVERIFIED"
+
+
+def test_soft_stop_fill_state_recovers_current_lifecycle_when_fill_meta_omits_id(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.runner.trade_tick_runner import _mark_soft_stop_stages_from_records
+
+    store = {
+        "trade_date": "2026-10-05",
+        "symbol": "JNJ",
+        "soft_stop_breach_count": 7,
+        "state": {
+            "lifecycle": {
+                "lifecycle_id": "life-jnj-oct5",
+                "is_open": True,
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        repos,
+        "load_us_position_risk_state",
+        lambda symbol, trade_date: dict(store),
+    )
+
+    def save_state(symbol, trade_date, state):
+        store.clear()
+        store.update(state)
+
+    monkeypatch.setattr(repos, "save_us_position_risk_state", save_state)
+
+    _mark_soft_stop_stages_from_records(
+        [{
+            "symbol": "JNJ",
+            "side": "SELL",
+            "qty": 1,
+            "price": 255.13,
+            "order_no": "0000001519",
+            "client_order_key": "6485927d33957ca109a53853",
+            "meta": {
+                "exit_reason": "soft_stop_loss",
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+            },
+        }],
+        trade_date="2026-10-05",
+        status="FILLED",
+    )
+
+    soft_state = store["state"]["soft_stop_execution"]
+    assert soft_state["soft_stop_partial_done"] is True
+    assert soft_state["first_soft_stop_filled_qty"] == 1
+    assert soft_state["position_lifecycle_id"] == "life-jnj-oct5"
 
