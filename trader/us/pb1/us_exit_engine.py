@@ -108,6 +108,61 @@ def soft_stop_repeat_allowed(position: dict, *, intraday_market_overlay: str = "
     return False, "SOFT_STOP_REPEAT_BLOCKED"
 
 
+def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> tuple[bool, str]:
+    """Require broker-confirmed first soft-stop fill before persistent escalation."""
+    symbol = str(position.get("symbol") or "").upper()
+    owner = str(
+        position.get("owner_strategy")
+        or position.get("strategy_owner")
+        or position.get("sleeve_id")
+        or ""
+    ).upper()
+    if symbol == "TQQQ" or owner == "TQQQ_INFINITE":
+        return False, "PERSISTENT_SOFT_STOP_OWNER_ISOLATION"
+    if owner and owner != "US_STANDARD":
+        return False, "PERSISTENT_SOFT_STOP_NON_STANDARD_OWNER"
+
+    risk_state = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
+    state = risk_state.get("state") if isinstance(risk_state.get("state"), dict) else {}
+    soft_exec = state.get("soft_stop_execution") if isinstance(state.get("soft_stop_execution"), dict) else {}
+    lifecycle_state = state.get("lifecycle") if isinstance(state.get("lifecycle"), dict) else {}
+
+    current_lifecycle = next(
+        (
+            str(value).strip()
+            for value in (
+                position.get("position_lifecycle_id"),
+                (position.get("meta") or {}).get("position_lifecycle_id")
+                if isinstance(position.get("meta"), dict) else None,
+                lifecycle_state.get("lifecycle_id"),
+            )
+            if str(value or "").strip()
+        ),
+        "",
+    )
+    execution_lifecycle = str(soft_exec.get("position_lifecycle_id") or "").strip()
+    if not current_lifecycle or not execution_lifecycle or current_lifecycle != execution_lifecycle:
+        return False, "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
+
+    if not bool(soft_exec.get("soft_stop_triggered_today")) or not bool(soft_exec.get("soft_stop_partial_done")):
+        return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_UNCONFIRMED"
+    try:
+        first_filled_qty = int(soft_exec.get("first_soft_stop_filled_qty") or 0)
+    except (TypeError, ValueError):
+        first_filled_qty = 0
+    if first_filled_qty <= 0:
+        return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_QTY_MISSING"
+
+    try:
+        orderable_qty = int(position.get("orderable_qty") or position.get("qty") or position.get("holding_qty") or 0)
+    except (TypeError, ValueError):
+        orderable_qty = 0
+    if orderable_qty <= 0:
+        return False, "PERSISTENT_SOFT_STOP_NO_ORDERABLE_QTY"
+
+    return True, "PERSISTENT_SOFT_STOP_ESCALATION"
+
+
 def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
 
@@ -360,8 +415,12 @@ def evaluate_exit(
             required_ticks + 1,
             int(cfg.get("persistent_soft_stop_ticks", os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3")) or 3),
         )
-        already_reduced = bool(position.get("soft_stop_partial_done") or position.get("partial_soft_stop_done") or position.get("last_exit_type") == EXIT_SOFT_STOP_LOSS)
-        if already_reduced and breach_count >= persistent_required:
+        partial_fill_confirmed, partial_fill_reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(position)
+        if partial_fill_confirmed and breach_count >= persistent_required:
+            logger.info(
+                "[US_EXIT][PERSISTENT_SOFT_STOP][SIGNAL] symbol=%s reason=%s ticks=%d/%d",
+                symbol, partial_fill_reason, breach_count, persistent_required,
+            )
             return _emit_exit(
                 symbol=symbol, exchange=exchange, qty=qty,
                 current_price=current_price, entry_price=entry_price,
@@ -881,12 +940,25 @@ def _evaluate_exit_intents_from_snapshots(
             continue
 
         intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now, include_trend_time=include_trend_time)
-        if intent is not None and intent.get("exit_type") in {"soft_stop_loss", "persistent_soft_stop_full_exit"}:
+        if intent is not None and intent.get("exit_type") == "soft_stop_loss":
             allowed, repeat_reason = soft_stop_repeat_allowed(pos, intraday_market_overlay=str(pos.get("intraday_market_overlay") or "NORMAL"), close_session=bool(pos.get("close_session")))
             if not allowed:
                 pos["soft_stop_repeat_blocked_count"] = int(pos.get("soft_stop_repeat_blocked_count") or 0) + 1
                 logger.info("[US_EXIT][SOFT_STOP_REPEAT_BLOCKED] symbol=%s reason=%s", symbol, repeat_reason)
                 intent = None
+        elif intent is not None and intent.get("exit_type") == "persistent_soft_stop_full_exit":
+            escalation_allowed, escalation_reason = _confirmed_soft_stop_partial_fill_for_current_lifecycle(pos)
+            if not escalation_allowed:
+                logger.error(
+                    "[US_EXIT][PERSISTENT_SOFT_STOP][BLOCKED] symbol=%s reason=%s",
+                    symbol, escalation_reason,
+                )
+                intent = None
+            else:
+                logger.info(
+                    "[US_EXIT][PERSISTENT_SOFT_STOP][ESCALATION_ALLOWED] symbol=%s reason=%s",
+                    symbol, escalation_reason,
+                )
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build exit explanation
