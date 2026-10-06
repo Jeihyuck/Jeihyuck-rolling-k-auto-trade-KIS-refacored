@@ -6630,11 +6630,21 @@ class PositionsRepo:
             })
             per_order = dict(per_order)
             per_order[order_key] = state
+            position_realized_status = (
+                "REALIZED_PNL_UNRESOLVED"
+                if any(
+                    str(item.get("realized_pnl_status") or "") != "CONFIRMED"
+                    for item in per_order.values()
+                    if isinstance(item, dict)
+                    and int(item.get("qty_accounted") or 0) > 0
+                )
+                else "CONFIRMED"
+            )
             position_meta = _merge_json_dict(
                 position_meta,
                 {
                     "sell_execution_reconcile": per_order,
-                    "realized_pnl_status": state["realized_pnl_status"],
+                    "realized_pnl_status": position_realized_status,
                 },
             )
             values: dict[str, Any] = {
@@ -6684,7 +6694,8 @@ class PositionsRepo:
             "qty_applied": qty_applied,
             "pnl_qty_applied": pnl_qty_applied,
             "remaining_qty": new_qty,
-            "realized_pnl_status": state["realized_pnl_status"],
+            "realized_pnl_status": position_realized_status,
+            "order_realized_pnl_status": state["realized_pnl_status"],
         }
 
     def apply_fill(
