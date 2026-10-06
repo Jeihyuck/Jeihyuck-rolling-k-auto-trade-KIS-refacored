@@ -168,6 +168,11 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
 
     if not bool(soft_exec.get("soft_stop_triggered_today")) or not bool(soft_exec.get("soft_stop_partial_done")):
         return False, "PERSISTENT_SOFT_STOP_PARTIAL_FILL_UNCONFIRMED"
+
+    execution_lifecycle = str(soft_exec.get("position_lifecycle_id") or "").strip()
+    if execution_lifecycle and current_lifecycle != execution_lifecycle:
+        return False, "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
+
     try:
         first_filled_qty = int(soft_exec.get("first_soft_stop_filled_qty") or 0)
     except (TypeError, ValueError):
@@ -177,10 +182,7 @@ def _confirmed_soft_stop_partial_fill_for_current_lifecycle(position: dict) -> t
     if not str(soft_exec.get("client_order_key") or soft_exec.get("order_no") or "").strip():
         return False, "PERSISTENT_SOFT_STOP_FILL_IDENTITY_MISSING"
 
-    execution_lifecycle = str(soft_exec.get("position_lifecycle_id") or "").strip()
     if execution_lifecycle:
-        if current_lifecycle != execution_lifecycle:
-            return False, "PERSISTENT_SOFT_STOP_LIFECYCLE_MISMATCH"
         lifecycle_reason = "PERSISTENT_SOFT_STOP_ESCALATION"
     else:
         opened_at = _parse_soft_stop_state_ts(lifecycle_state.get("opened_at"))
