@@ -3805,6 +3805,47 @@ class OrdersRepo:
             return True, rows[0]
         return False, None
 
+    def list_recent_holdings_promoted_orders_for_repair(
+        self, env: str, *, lookback_days: int = 35, limit: int = 128,
+    ) -> list[dict]:
+        """Find terminalized balance promotions across dates in this trading epoch.
+
+        Fail closed on DB errors. Current-day-only listing is insufficient once
+        yesterday's ACK was terminalized before its position/claim converged.
+        Historical replay must use saved order evidence, never today's balance
+        as the original post-order snapshot.
+        """
+        now = now_kst()
+        cutoff = now - timedelta(days=min(max(int(lookback_days), 1), 90))
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id is None:
+            return []
+        conditions = [
+            self._schema.orders.c.env == env,
+            self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+            self._schema.orders.c.created_at >= cutoff,
+            self._schema.orders.c.status.in_((
+                "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+            )),
+            sa.cast(self._schema.orders.c.response_json, sa.String).like(
+                '%"promotion_source"%kis_holdings%'
+            ),
+        ]
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(self._schema.orders.c.created_at.desc())
+            .limit(min(max(int(limit), 1), 256))
+        )
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.list_recent_holdings_promoted_orders_for_repair",
+            fail_open=False,
+        )
+
     def list_today_orders(
         self,
         env: str,
