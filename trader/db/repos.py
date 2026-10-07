@@ -3021,8 +3021,11 @@ class OrdersRepo:
         state: str,
         cumulative_filled_qty: int | None,
         authoritative: bool,
+        _conn: Any = None,
     ):
-        attempt = self._execution_claim_repo.find_attempt_for_client_order_key(client_order_key)
+        attempt = self._execution_claim_repo.find_attempt_for_client_order_key(
+            client_order_key, _conn=_conn
+        )
         if attempt is None:
             raise LookupError(
                 f"execution claim attempt not found for client order key {client_order_key}"
@@ -3034,6 +3037,7 @@ class OrdersRepo:
             state=state,
             cumulative_filled_qty=cumulative_filled_qty,
             authoritative=authoritative,
+            _conn=_conn,
         )
 
     def execution_claim_health(self, *, market: str | None = None) -> dict[str, int]:
@@ -6219,52 +6223,62 @@ class PositionsRepo:
         fields: dict,
         position_cycle_id: str | None = None,
         portfolio_epoch_id: str | None = None,
+        _conn: Any = None,
     ) -> None:
         if not fields:
             return
         values = dict(fields)
         fail_soft = set(values).isdisjoint({"qty", "avg_buy_price", "total_cost", "realized_pnl"})
         try:
-            with self.engine.begin() as conn:
-                trading_epoch_id = active_trading_epoch_id(
-                    conn,
-                    env=env,
-                    account_id=get_account_key(env=env),
-                    required=trading_epoch_enforced(),
-                )
-                conditions = [
-                    self._schema.positions.c.env == env,
-                    self._schema.positions.c.strategy == strategy,
-                    self._schema.positions.c.sid == sid,
-                    self._schema.positions.c.mode == mode,
-                    self._schema.positions.c.code == code,
-                    self._schema.positions.c.status == "OPEN",
-                ]
-                if trading_epoch_id is not None:
-                    conditions.append(
-                        self._schema.positions.c.trading_epoch_id == trading_epoch_id
+            if _conn is None:
+                with self.engine.begin() as conn:
+                    return self.update_position_fields(
+                        env=env, strategy=strategy, sid=sid, mode=mode, code=code,
+                        fields=fields, position_cycle_id=position_cycle_id,
+                        portfolio_epoch_id=portfolio_epoch_id, _conn=conn,
                     )
-                if position_cycle_id:
-                    conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
-                if portfolio_epoch_id:
-                    conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
-                existing = conn.execute(
-                    select(self._schema.positions).where(and_(*conditions))
-                ).mappings().first()
-                existing_row = dict(existing) if existing else {}
-                if "entry_meta_json" in values:
-                    values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
-                if "last_exit_eval_json" in values:
-                    values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
-                if "position_meta" in values:
-                    values["position_meta"] = _merge_json_dict(existing_row.get("position_meta"), values.get("position_meta"))
-                stmt = (
-                    sa.update(self._schema.positions)
-                    .where(and_(*conditions))
-                    .values(**values, updated_at=func.now())
+            conn = _conn
+            trading_epoch_id = active_trading_epoch_id(
+                conn,
+                env=env,
+                account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code,
+                self._schema.positions.c.status == "OPEN",
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
                 )
-                conn.execute(stmt)
+            if position_cycle_id:
+                conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
+            if portfolio_epoch_id:
+                conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
+            existing = conn.execute(
+                select(self._schema.positions).where(and_(*conditions))
+            ).mappings().first()
+            existing_row = dict(existing) if existing else {}
+            if "entry_meta_json" in values:
+                values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
+            if "last_exit_eval_json" in values:
+                values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
+            if "position_meta" in values:
+                values["position_meta"] = _merge_json_dict(existing_row.get("position_meta"), values.get("position_meta"))
+            stmt = (
+                sa.update(self._schema.positions)
+                .where(and_(*conditions))
+                .values(**values, updated_at=func.now())
+            )
+            conn.execute(stmt)
         except Exception as exc:
+            if _conn is not None:
+                raise
             if fail_soft:
                 logger.warning(
                     "[POSITIONS][UPDATE][FAIL_SOFT] env=%s strategy=%s code=%s fields=%s err=%s",
@@ -6359,6 +6373,7 @@ class PositionsRepo:
         filled_at: datetime,
         pre_order_avg_buy_price: float | None = None,
         pre_order_stop_price: float | None = None,
+        _conn: Any = None,
     ) -> bool:
         """Advance one pyramid stage only after the ADD order is fully filled.
 
@@ -6388,65 +6403,75 @@ class PositionsRepo:
                 sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id)
             )
 
-        with self.engine.begin() as conn:
-            trading_epoch_id = active_trading_epoch_id(
-                conn,
-                env=env,
-                account_id=get_account_key(env=env),
-                required=trading_epoch_enforced(),
-            )
-            if trading_epoch_id is not None:
-                conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
-            row = conn.execute(
-                select(self._schema.positions).where(and_(*conditions))
-            ).mappings().first()
-            if not row:
-                logger.error(
-                    "[KR_PYRAMID][FILL_SYNC_BLOCK] code=%s level=%s cycle=%s reason=open_cycle_not_found",
-                    code, target_level, position_cycle_id,
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.mark_pyramid_add_fill(
+                    env=env, strategy=strategy, sid=sid, mode=mode, code=code,
+                    position_cycle_id=position_cycle_id, portfolio_epoch_id=portfolio_epoch_id,
+                    target_level=target_level, client_order_key=client_order_key,
+                    filled_qty=filled_qty, requested_qty=requested_qty, fill_price=fill_price,
+                    filled_at=filled_at, pre_order_avg_buy_price=pre_order_avg_buy_price,
+                    pre_order_stop_price=pre_order_stop_price, _conn=conn,
                 )
-                return False
-
-            current_level = int(row.get("pyramid_level") or 0)
-            current_meta = _merge_json_dict(row.get("position_meta"), {})
-            if (
-                current_level >= target_level
-                and str(current_meta.get("pyramid_last_filled_order_key") or "") == str(client_order_key or "")
-            ):
-                return True
-
-            base_avg = float(pre_order_avg_buy_price or 0.0)
-            if base_avg <= 0:
-                base_avg = float(row.get("avg_buy_price") or fill_price or 0.0)
-            existing_stop = float(
-                row.get("stop_price")
-                or pre_order_stop_price
-                or row.get("initial_stop")
-                or 0.0
+        conn = _conn
+        trading_epoch_id = active_trading_epoch_id(
+            conn,
+            env=env,
+            account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id is not None:
+            conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
+        row = conn.execute(
+            select(self._schema.positions).where(and_(*conditions))
+        ).mappings().first()
+        if not row:
+            logger.error(
+                "[KR_PYRAMID][FILL_SYNC_BLOCK] code=%s level=%s cycle=%s reason=open_cycle_not_found",
+                code, target_level, position_cycle_id,
             )
-            next_stop = existing_stop
-            if base_avg > 0:
-                next_stop = max(existing_stop, base_avg * 0.995)
+            return False
 
-            next_meta = _merge_json_dict(current_meta, {
-                "pyramid_last_filled_order_key": client_order_key,
-                "pyramid_last_filled_qty": filled_qty,
-                "pyramid_last_filled_level": target_level,
-                "pyramid_last_fill_price": float(fill_price or 0.0),
-            })
-            values = {
-                "pyramid_level": max(current_level, target_level),
-                "last_add_price": float(fill_price or 0.0) or row.get("last_add_price"),
-                "last_stop_update_ts": filled_at.isoformat(),
-                "position_meta": next_meta,
-            }
-            if next_stop > 0:
-                values["stop_price"] = next_stop
-            result = conn.execute(
-                sa.update(self._schema.positions)
-                .where(and_(*conditions))
-                .values(**values, updated_at=func.now())
-            )
+        current_level = int(row.get("pyramid_level") or 0)
+        current_meta = _merge_json_dict(row.get("position_meta"), {})
+        if (
+            current_level >= target_level
+            and str(current_meta.get("pyramid_last_filled_order_key") or "") == str(client_order_key or "")
+        ):
+            return True
+
+        base_avg = float(pre_order_avg_buy_price or 0.0)
+        if base_avg <= 0:
+            base_avg = float(row.get("avg_buy_price") or fill_price or 0.0)
+        existing_stop = float(
+            row.get("stop_price")
+            or pre_order_stop_price
+            or row.get("initial_stop")
+            or 0.0
+        )
+        next_stop = existing_stop
+        if base_avg > 0:
+            next_stop = max(existing_stop, base_avg * 0.995)
+
+        next_meta = _merge_json_dict(current_meta, {
+            "pyramid_last_filled_order_key": client_order_key,
+            "pyramid_last_filled_qty": filled_qty,
+            "pyramid_last_filled_level": target_level,
+            "pyramid_last_fill_price": float(fill_price or 0.0),
+        })
+        values = {
+            "pyramid_level": max(current_level, target_level),
+            "last_add_price": float(fill_price or 0.0) or row.get("last_add_price"),
+            "last_stop_update_ts": filled_at.isoformat(),
+            "position_meta": next_meta,
+        }
+        if next_stop > 0:
+            values["stop_price"] = next_stop
+        result = conn.execute(
+            sa.update(self._schema.positions)
+            .where(and_(*conditions))
+            .values(**values, updated_at=func.now())
+        )
 
         logger.info(
             "[KR_POSITION][PYRAMID_FULL_FILL_CONFIRMED] code=%s level=%s filled_qty=%s "
@@ -6473,6 +6498,7 @@ class PositionsRepo:
         order_id: str,
         pre_order_holding_qty: int | None = None,
         broker_holding_qty: int | None = None,
+        _conn: Any = None,
     ) -> dict[str, Any]:
         """Converge SELL quantity independently from execution-price/PnL truth.
 
@@ -6489,199 +6515,209 @@ class PositionsRepo:
         if not order_key or not cycle_id:
             raise RuntimeError("KR_SELL_RECONCILE_PROVENANCE_MISSING")
 
-        with self.engine.begin() as conn:
-            trading_epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=get_account_key(env=env),
-                required=trading_epoch_enforced(),
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.reconcile_sell_execution(
+                    env=env, strategy=strategy, sid=sid, mode=mode, code=code,
+                    market=market, confirmed_cumulative_qty=confirmed_cumulative_qty,
+                    fill_price=fill_price, filled_at=filled_at,
+                    position_cycle_id=position_cycle_id, portfolio_epoch_id=portfolio_epoch_id,
+                    order_id=order_id, pre_order_holding_qty=pre_order_holding_qty,
+                    broker_holding_qty=broker_holding_qty, _conn=conn,
+                )
+        conn = _conn
+        trading_epoch_id = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.sid == sid,
+            self._schema.positions.c.mode == mode,
+            self._schema.positions.c.code == code,
+            self._schema.positions.c.status.in_(("OPEN", "CLOSED")),
+            sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == cycle_id,
+        ]
+        if portfolio_epoch_id:
+            conditions.append(
+                sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String)
+                == str(portfolio_epoch_id)
             )
-            conditions = [
-                self._schema.positions.c.env == env,
-                self._schema.positions.c.strategy == strategy,
-                self._schema.positions.c.sid == sid,
-                self._schema.positions.c.mode == mode,
-                self._schema.positions.c.code == code,
-                self._schema.positions.c.status.in_(("OPEN", "CLOSED")),
-                sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == cycle_id,
-            ]
-            if portfolio_epoch_id:
-                conditions.append(
-                    sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String)
-                    == str(portfolio_epoch_id)
-                )
-            if trading_epoch_id is not None:
-                conditions.append(
-                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
-                )
-            row = conn.execute(
-                select(self._schema.positions).where(and_(*conditions)).with_for_update()
-            ).mappings().one_or_none()
-            if row is None:
-                raise RuntimeError("KR_SELL_RECONCILE_POSITION_NOT_FOUND")
-            row = dict(row)
+        if trading_epoch_id is not None:
+            conditions.append(
+                self._schema.positions.c.trading_epoch_id == trading_epoch_id
+            )
+        row = conn.execute(
+            select(self._schema.positions).where(and_(*conditions)).with_for_update()
+        ).mappings().one_or_none()
+        if row is None:
+            raise RuntimeError("KR_SELL_RECONCILE_POSITION_NOT_FOUND")
+        row = dict(row)
 
-            current_qty = int(row.get("qty") or 0)
-            avg_buy_price = float(row.get("avg_buy_price") or 0.0)
-            realized_pnl = float(row.get("realized_pnl") or 0.0)
-            position_meta = _merge_json_dict(row.get("position_meta"), {})
-            per_order = position_meta.get("sell_execution_reconcile")
-            if not isinstance(per_order, dict):
-                per_order = {}
-            state = per_order.get(order_key)
-            if not isinstance(state, dict):
-                state = {}
-            if str(row.get("status") or "").upper() == "CLOSED":
-                if not state:
-                    raise RuntimeError("KR_SELL_RECONCILE_CLOSED_UNATTRIBUTED")
-                avg_buy_price = float(state.get("cost_basis_at_sell") or 0.0)
-                if avg_buy_price <= 0:
-                    raise RuntimeError("KR_SELL_RECONCILE_CLOSED_COST_BASIS_MISSING")
-            qty_accounted = max(0, int(state.get("qty_accounted") or 0))
-            pnl_accounted_qty = max(0, int(state.get("pnl_accounted_qty") or 0))
-            if confirmed_qty < qty_accounted or confirmed_qty < pnl_accounted_qty:
-                raise RuntimeError("KR_SELL_RECONCILE_CUMULATIVE_REGRESSION")
+        current_qty = int(row.get("qty") or 0)
+        avg_buy_price = float(row.get("avg_buy_price") or 0.0)
+        realized_pnl = float(row.get("realized_pnl") or 0.0)
+        position_meta = _merge_json_dict(row.get("position_meta"), {})
+        per_order = position_meta.get("sell_execution_reconcile")
+        if not isinstance(per_order, dict):
+            per_order = {}
+        state = per_order.get(order_key)
+        if not isinstance(state, dict):
+            state = {}
+        if str(row.get("status") or "").upper() == "CLOSED":
+            if not state:
+                raise RuntimeError("KR_SELL_RECONCILE_CLOSED_UNATTRIBUTED")
+            avg_buy_price = float(state.get("cost_basis_at_sell") or 0.0)
+            if avg_buy_price <= 0:
+                raise RuntimeError("KR_SELL_RECONCILE_CLOSED_COST_BASIS_MISSING")
+        qty_accounted = max(0, int(state.get("qty_accounted") or 0))
+        pnl_accounted_qty = max(0, int(state.get("pnl_accounted_qty") or 0))
+        if confirmed_qty < qty_accounted or confirmed_qty < pnl_accounted_qty:
+            raise RuntimeError("KR_SELL_RECONCILE_CUMULATIVE_REGRESSION")
 
-            qty_applied = 0
-            if broker_holding_qty is not None:
-                broker_qty = max(0, int(broker_holding_qty))
-                if pre_order_holding_qty is not None:
-                    expected_broker_qty = max(
-                        0, int(pre_order_holding_qty) - confirmed_qty
-                    )
-                    if broker_qty != expected_broker_qty:
-                        raise RuntimeError("KR_SELL_RECONCILE_BALANCE_DELTA_MISMATCH")
-                if broker_qty > current_qty:
-                    raise RuntimeError("KR_SELL_RECONCILE_DB_QTY_BELOW_BROKER")
-                if pre_order_holding_qty is not None:
-                    expected_prior_db_qty = max(
-                        0, int(pre_order_holding_qty) - qty_accounted
-                    )
-                    if current_qty not in (expected_prior_db_qty, broker_qty):
-                        raise RuntimeError("KR_SELL_RECONCILE_DB_BASELINE_DRIFT")
-                qty_applied = current_qty - broker_qty
-                if qty_applied > confirmed_qty - qty_accounted:
-                    raise RuntimeError("KR_SELL_RECONCILE_UNATTRIBUTED_QTY_DELTA")
-                new_qty = broker_qty
+        qty_applied = 0
+        if broker_holding_qty is not None:
+            broker_qty = max(0, int(broker_holding_qty))
+            if pre_order_holding_qty is not None:
+                expected_broker_qty = max(
+                    0, int(pre_order_holding_qty) - confirmed_qty
+                )
+                if broker_qty != expected_broker_qty:
+                    raise RuntimeError("KR_SELL_RECONCILE_BALANCE_DELTA_MISMATCH")
+            if broker_qty > current_qty:
+                raise RuntimeError("KR_SELL_RECONCILE_DB_QTY_BELOW_BROKER")
+            if pre_order_holding_qty is not None:
+                expected_prior_db_qty = max(
+                    0, int(pre_order_holding_qty) - qty_accounted
+                )
+                if current_qty not in (expected_prior_db_qty, broker_qty):
+                    raise RuntimeError("KR_SELL_RECONCILE_DB_BASELINE_DRIFT")
+            qty_applied = current_qty - broker_qty
+            if qty_applied > confirmed_qty - qty_accounted:
+                raise RuntimeError("KR_SELL_RECONCILE_UNATTRIBUTED_QTY_DELTA")
+            new_qty = broker_qty
+        else:
+            incremental_qty = confirmed_qty - qty_accounted
+            if pre_order_holding_qty is not None and incremental_qty > 0:
+                # Quantity mutation still requires this order's original
+                # baseline. Price-only replay (incremental_qty == 0) may
+                # occur after later, separately attributed SELL stages have
+                # legitimately reduced the same lifecycle's current qty.
+                prior_expected_qty = max(
+                    0, int(pre_order_holding_qty) - qty_accounted
+                )
+                confirmed_expected_qty = max(
+                    0, int(pre_order_holding_qty) - confirmed_qty
+                )
+                if current_qty == confirmed_expected_qty:
+                    incremental_qty = 0
+                elif current_qty != prior_expected_qty:
+                    raise RuntimeError("KR_SELL_RECONCILE_BASELINE_DRIFT")
+            if incremental_qty > current_qty:
+                raise RuntimeError("KR_SELL_RECONCILE_QTY_EXCEEDS_POSITION")
+            qty_applied = max(0, incremental_qty)
+            new_qty = max(0, current_qty - qty_applied)
+
+        pnl_qty_applied = 0
+        next_realized_pnl = realized_pnl
+        broker_fill_price = (
+            float(fill_price)
+            if fill_price is not None and float(fill_price) > 0
+            else None
+        )
+        prior_fill_price = float(state.get("fill_price") or 0.0)
+        previously_accounted_notional = float(
+            state.get("pnl_accounted_notional")
+            or prior_fill_price * pnl_accounted_qty
+        )
+        if broker_fill_price is not None:
+            if avg_buy_price <= 0:
+                raise RuntimeError("KR_SELL_RECONCILE_COST_BASIS_MISSING")
+            # Treat a single supplied broker price as the cumulative
+            # execution average for this order. Never double-book proceeds
+            # when a partial fill later becomes fully filled.
+            new_proceeds = broker_fill_price * confirmed_qty
+            if pnl_accounted_qty == confirmed_qty and pnl_accounted_qty > 0:
+                if abs(new_proceeds - previously_accounted_notional) > 1e-5:
+                    raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
             else:
-                incremental_qty = confirmed_qty - qty_accounted
-                if pre_order_holding_qty is not None and incremental_qty > 0:
-                    # Quantity mutation still requires this order's original
-                    # baseline. Price-only replay (incremental_qty == 0) may
-                    # occur after later, separately attributed SELL stages have
-                    # legitimately reduced the same lifecycle's current qty.
-                    prior_expected_qty = max(
-                        0, int(pre_order_holding_qty) - qty_accounted
-                    )
-                    confirmed_expected_qty = max(
-                        0, int(pre_order_holding_qty) - confirmed_qty
-                    )
-                    if current_qty == confirmed_expected_qty:
-                        incremental_qty = 0
-                    elif current_qty != prior_expected_qty:
-                        raise RuntimeError("KR_SELL_RECONCILE_BASELINE_DRIFT")
-                if incremental_qty > current_qty:
-                    raise RuntimeError("KR_SELL_RECONCILE_QTY_EXCEEDS_POSITION")
-                qty_applied = max(0, incremental_qty)
-                new_qty = max(0, current_qty - qty_applied)
-
-            pnl_qty_applied = 0
-            next_realized_pnl = realized_pnl
-            broker_fill_price = (
-                float(fill_price)
-                if fill_price is not None and float(fill_price) > 0
-                else None
-            )
-            prior_fill_price = float(state.get("fill_price") or 0.0)
-            previously_accounted_notional = float(
-                state.get("pnl_accounted_notional")
-                or prior_fill_price * pnl_accounted_qty
-            )
-            if broker_fill_price is not None:
-                if avg_buy_price <= 0:
-                    raise RuntimeError("KR_SELL_RECONCILE_COST_BASIS_MISSING")
-                # Treat a single supplied broker price as the cumulative
-                # execution average for this order. Never double-book proceeds
-                # when a partial fill later becomes fully filled.
-                new_proceeds = broker_fill_price * confirmed_qty
-                if pnl_accounted_qty == confirmed_qty and pnl_accounted_qty > 0:
-                    if abs(new_proceeds - previously_accounted_notional) > 1e-5:
-                        raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
-                else:
-                    pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
-                    if new_proceeds + 1e-5 < previously_accounted_notional:
-                        raise RuntimeError("KR_SELL_RECONCILE_PROCEEDS_REGRESSION")
-                    next_realized_pnl += (
-                        new_proceeds - previously_accounted_notional
-                        - avg_buy_price * float(pnl_qty_applied)
-                    )
-                    pnl_accounted_qty = confirmed_qty
-                    previously_accounted_notional = new_proceeds
-
-            state.update({
-                "confirmed_cumulative_qty": confirmed_qty,
-                "cost_basis_at_sell": avg_buy_price,
-                "qty_accounted": confirmed_qty,
-                "pnl_accounted_qty": pnl_accounted_qty,
-                "broker_holding_qty": (
-                    None if broker_holding_qty is None else int(broker_holding_qty)
-                ),
-                "fill_price": broker_fill_price if broker_fill_price is not None else (prior_fill_price or None),
-                "pnl_accounted_notional": previously_accounted_notional,
-                "realized_pnl_status": (
-                    "CONFIRMED"
-                    if pnl_accounted_qty >= confirmed_qty
-                    else "REALIZED_PNL_UNRESOLVED"
-                ),
-            })
-            per_order = dict(per_order)
-            per_order[order_key] = state
-            position_realized_status = (
-                "REALIZED_PNL_UNRESOLVED"
-                if any(
-                    str(item.get("realized_pnl_status") or "") != "CONFIRMED"
-                    for item in per_order.values()
-                    if isinstance(item, dict)
-                    and int(item.get("qty_accounted") or 0) > 0
+                pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
+                if new_proceeds + 1e-5 < previously_accounted_notional:
+                    raise RuntimeError("KR_SELL_RECONCILE_PROCEEDS_REGRESSION")
+                next_realized_pnl += (
+                    new_proceeds - previously_accounted_notional
+                    - avg_buy_price * float(pnl_qty_applied)
                 )
-                else "CONFIRMED"
+                pnl_accounted_qty = confirmed_qty
+                previously_accounted_notional = new_proceeds
+
+        state.update({
+            "confirmed_cumulative_qty": confirmed_qty,
+            "cost_basis_at_sell": avg_buy_price,
+            "qty_accounted": confirmed_qty,
+            "pnl_accounted_qty": pnl_accounted_qty,
+            "broker_holding_qty": (
+                None if broker_holding_qty is None else int(broker_holding_qty)
+            ),
+            "fill_price": broker_fill_price if broker_fill_price is not None else (prior_fill_price or None),
+            "pnl_accounted_notional": previously_accounted_notional,
+            "realized_pnl_status": (
+                "CONFIRMED"
+                if pnl_accounted_qty >= confirmed_qty
+                else "REALIZED_PNL_UNRESOLVED"
+            ),
+        })
+        per_order = dict(per_order)
+        per_order[order_key] = state
+        position_realized_status = (
+            "REALIZED_PNL_UNRESOLVED"
+            if any(
+                str(item.get("realized_pnl_status") or "") != "CONFIRMED"
+                for item in per_order.values()
+                if isinstance(item, dict)
+                and int(item.get("qty_accounted") or 0) > 0
             )
-            position_meta = _merge_json_dict(
-                position_meta,
-                {
-                    "sell_execution_reconcile": per_order,
-                    "realized_pnl_status": position_realized_status,
-                },
+            else "CONFIRMED"
+        )
+        position_meta = _merge_json_dict(
+            position_meta,
+            {
+                "sell_execution_reconcile": per_order,
+                "realized_pnl_status": position_realized_status,
+            },
+        )
+        values: dict[str, Any] = {
+            "qty": new_qty,
+            "total_cost": (
+                float(avg_buy_price) * float(new_qty)
+                if avg_buy_price > 0
+                else max(0.0, float(row.get("total_cost") or 0.0))
+            ),
+            "realized_pnl": next_realized_pnl,
+            "market": market,
+            "last_trade_at": filled_at,
+            "position_meta": position_meta,
+            "last_reconciled_at": filled_at,
+        }
+        if new_qty <= 0 and str(row.get("status") or "").upper() != "CLOSED":
+            values.update(
+                status="CLOSED",
+                closed_ts=filled_at,
+                closed_reason="FULL_SELL",
+                avg_buy_price=None,
             )
-            values: dict[str, Any] = {
-                "qty": new_qty,
-                "total_cost": (
-                    float(avg_buy_price) * float(new_qty)
-                    if avg_buy_price > 0
-                    else max(0.0, float(row.get("total_cost") or 0.0))
-                ),
-                "realized_pnl": next_realized_pnl,
-                "market": market,
-                "last_trade_at": filled_at,
-                "position_meta": position_meta,
-                "last_reconciled_at": filled_at,
-            }
-            if new_qty <= 0 and str(row.get("status") or "").upper() != "CLOSED":
-                values.update(
-                    status="CLOSED",
-                    closed_ts=filled_at,
-                    closed_reason="FULL_SELL",
-                    avg_buy_price=None,
-                )
-            elif str(row.get("status") or "").upper() == "CLOSED":
-                if new_qty != 0:
-                    raise RuntimeError("KR_SELL_RECONCILE_CLOSED_POSITION_REOPEN")
-                # Delayed price reconciliation must not rewrite the economic
-                # close time or reopen a completed position.
-                values.pop("last_trade_at", None)
-            conn.execute(
-                sa.update(self._schema.positions)
-                .where(self._schema.positions.c.position_id == row["position_id"])
-                .values(**values, updated_at=func.now())
-            )
+        elif str(row.get("status") or "").upper() == "CLOSED":
+            if new_qty != 0:
+                raise RuntimeError("KR_SELL_RECONCILE_CLOSED_POSITION_REOPEN")
+            # Delayed price reconciliation must not rewrite the economic
+            # close time or reopen a completed position.
+            values.pop("last_trade_at", None)
+        conn.execute(
+            sa.update(self._schema.positions)
+            .where(self._schema.positions.c.position_id == row["position_id"])
+            .values(**values, updated_at=func.now())
+        )
 
         logger.warning(
             "[KR_POSITION][SELL_RECONCILE] code=%s order_id=%s confirmed_qty=%s "
@@ -6725,313 +6761,333 @@ class PositionsRepo:
         position_cycle_id: str | None = None,
         order_id: str | None = None,
         buy_application_cumulative_qty: int | None = None,
+        buy_cost_delta_override: float | None = None,
+        _conn: Any = None,
     ) -> None:
         if entry_meta and not entry_meta_json:
             entry_meta_json = entry_meta
         entry_exit_plan = json_sanitize(entry_exit_plan or {})
         request_json: dict[str, Any] = {}
-        with self.engine.begin() as conn:
-            provenance = None
-            if order_id:
-                provenance = conn.execute(select(
-                    self._schema.orders.c.position_cycle_id,
-                    self._schema.orders.c.portfolio_epoch_id,
-                    self._schema.orders.c.trading_epoch_id,
-                    self._schema.orders.c.request_json,
-                ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
-                if provenance:
-                    position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
-                    portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
-                    request_json = provenance.get("request_json")
-                    if isinstance(request_json, str):
-                        try:
-                            request_json = json.loads(request_json)
-                        except Exception:
-                            request_json = {}
-                    if (
-                        side.upper() == "BUY"
-                        and isinstance(request_json, dict)
-                        and (request_json.get("enforce_entry_contract") or request_json.get("entry_contract_version"))
-                    ):
-                        _assert_kr_buy_entry_contract(request_json)
-                        if not entry_exit_plan:
-                            entry_exit_plan = json_sanitize(request_json.get("entry_exit_plan") or {})
-                        root_contract_sha = (
-                            request_json.get("parent_entry_contract_sha256")
-                            or request_json.get("entry_contract_sha256")
-                        )
-                        entry_meta_json = _merge_json_dict(entry_meta_json, {
-                            # Keep the lifecycle/root contract immutable across pyramid adds.
-                            "entry_contract_sha256": root_contract_sha,
-                            "entry_contract_version": request_json.get("entry_contract_version"),
-                            "last_buy_order_contract_sha256": request_json.get("entry_contract_sha256"),
-                            "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
-                            "source_buy_order_id": str(order_id),
-                            "source_buy_client_order_key": request_json.get("client_order_key"),
-                        })
-                        logger.info(
-                            "[KR_POSITION][ENTRY_CONTRACT_BOUND] code=%s order_id=%s cycle=%s contract_sha=%s",
-                            code, order_id, position_cycle_id, request_json.get("entry_contract_sha256"),
-                        )
-
-            if entry_exit_plan:
-                entry_meta_json = _merge_json_dict(entry_meta_json, {
-                    "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(entry_exit_plan),
-                })
-                plan_meta = {
-                    "entry_thesis": entry_exit_plan.get("entry_thesis"),
-                    "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
-                    "entry_reason": entry_exit_plan.get("entry_reason"),
-                    "trade_horizon": entry_exit_plan.get("trade_horizon"),
-                    "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
-                    "eod_action": entry_exit_plan.get("eod_action"),
-                    "force_eod_close": entry_exit_plan.get("force_eod_close"),
-                    "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
-                    "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
-                    "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
-                    "policy_source": entry_exit_plan.get("policy_source"),
-                    "policy_version": entry_exit_plan.get("policy_version"),
-                }
-                entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
-            account_id = account_id or get_account_key(env=env)
-            trading_epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=account_id, required=trading_epoch_enforced()
-            )
-            if provenance and trading_epoch_id is not None:
-                provenance_epoch = provenance.get("trading_epoch_id")
-                if str(provenance_epoch or "") != str(trading_epoch_id):
-                    raise RuntimeError("KR_FILL_ORDER_TRADING_EPOCH_MISMATCH")
-            portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
-                conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
-            )
-            _assert_portfolio_epoch_binding(
-                conn,
-                self._schema,
-                portfolio_epoch_id=str(portfolio_epoch_id),
-                trading_epoch_id=trading_epoch_id,
-            )
-            position_conditions = [
-                self._schema.positions.c.env == env,
-                self._schema.positions.c.strategy == strategy,
-                self._schema.positions.c.sid == sid,
-                self._schema.positions.c.mode == mode,
-                self._schema.positions.c.code == code,
-                self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
-                self._schema.positions.c.status == "OPEN",
-            ]
-            if trading_epoch_id is not None:
-                position_conditions.append(
-                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.apply_fill(
+                    env=env, strategy=strategy, sid=sid, mode=mode, code=code, market=market,
+                    side=side, qty=qty, price=price, fee=fee, tax=tax, filled_at=filled_at,
+                    entry_meta_json=entry_meta_json, entry_exit_plan=entry_exit_plan,
+                    entry_meta=entry_meta, account_id=account_id,
+                    portfolio_epoch_id=portfolio_epoch_id, position_cycle_id=position_cycle_id,
+                    order_id=order_id, buy_application_cumulative_qty=buy_application_cumulative_qty,
+                    buy_cost_delta_override=buy_cost_delta_override, _conn=conn,
                 )
-            stmt = select(self._schema.positions).where(and_(*position_conditions))
-            row = conn.execute(stmt).mappings().first()
-            if row:
-                row = dict(row)
-                if trading_epoch_id is not None and str(row.get("trading_epoch_id") or "") != str(trading_epoch_id):
-                    raise RuntimeError("KR_POSITION_TRADING_EPOCH_MISMATCH")
-            qty = int(qty)
-            cost_delta = (qty * float(price)) + float(fee) + float(tax)
-            if row:
-                current_qty = int(row.get("qty") or 0)
-                avg_buy_price = float(row.get("avg_buy_price") or 0.0)
-                total_cost = float(row.get("total_cost") or 0.0)
-                realized_pnl = float(row.get("realized_pnl") or 0.0)
-            else:
-                current_qty = 0
-                avg_buy_price = 0.0
-                total_cost = 0.0
-                realized_pnl = 0.0
-
-            if side.upper() != "BUY" and not row:
-                logger.error(
-                    "[RECONCILE][POSITION_STATE_MISMATCH] code=%s kis_qty=unknown cycle_id=none "
-                    "reason=STALE_OR_UNPROVEN_CYCLE action=EXIT_BLOCKED", code,
-                )
-                return
-            if row and position_cycle_id and str(row.get("position_cycle_id")) != str(position_cycle_id):
-                logger.error(
-                    "[RECONCILE][POSITION_STATE_MISMATCH] code=%s active_cycle=%s fill_cycle=%s "
-                    "reason=CYCLE_PROVENANCE_MISMATCH action=EXIT_BLOCKED",
-                    code, row.get("position_cycle_id"), position_cycle_id,
-                )
-                return
-
-            if side.upper() == "BUY":
-                # Holdings fallback and historical BUY retry must agree on one
-                # durable application marker, in the *same transaction* as qty.
-                # Never infer a missing marker from an already-changed balance.
-                if buy_application_cumulative_qty is not None:
-                    if not order_id or not position_cycle_id:
-                        raise RuntimeError("KR_BUY_APPLICATION_PROVENANCE_MISSING")
-                    target = int(buy_application_cumulative_qty)
-                    current_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
-                    watermark_map = _merge_json_dict(
-                        current_meta.get("broker_truth_buy_applied_orders"), {}
+        conn = _conn
+        provenance = None
+        if order_id:
+            provenance = conn.execute(select(
+                self._schema.orders.c.position_cycle_id,
+                self._schema.orders.c.portfolio_epoch_id,
+                self._schema.orders.c.trading_epoch_id,
+                self._schema.orders.c.request_json,
+            ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
+            if provenance:
+                position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
+                portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
+                request_json = provenance.get("request_json")
+                if isinstance(request_json, str):
+                    try:
+                        request_json = json.loads(request_json)
+                    except Exception:
+                        request_json = {}
+                if (
+                    side.upper() == "BUY"
+                    and isinstance(request_json, dict)
+                    and (request_json.get("enforce_entry_contract") or request_json.get("entry_contract_version"))
+                ):
+                    _assert_kr_buy_entry_contract(request_json)
+                    if not entry_exit_plan:
+                        entry_exit_plan = json_sanitize(request_json.get("entry_exit_plan") or {})
+                    root_contract_sha = (
+                        request_json.get("parent_entry_contract_sha256")
+                        or request_json.get("entry_contract_sha256")
                     )
-                    previous = _merge_json_dict(watermark_map.get(str(order_id)), {})
-                    previous_qty = int(previous.get("qty") or 0)
-                    if target < previous_qty or target - previous_qty != qty:
-                        raise RuntimeError("KR_BUY_APPLICATION_CUMULATIVE_CONFLICT")
-                    pre_qty = request_json.get("pre_order_holding_qty")
-                    if not previous and row and (
-                        pre_qty is None or current_qty != int(pre_qty)
-                    ):
-                        raise RuntimeError("KR_BUY_APPLICATION_BASELINE_DRIFT")
-                    watermark_map[str(order_id)] = {
-                        "qty": target,
-                        "notional": (
-                            float(previous.get("notional") or 0.0)
-                            + float(qty) * float(price)
-                        ),
-                        "fee": float(previous.get("fee") or 0.0) + float(fee),
-                        "tax": float(previous.get("tax") or 0.0) + float(tax),
-                    }
                     entry_meta_json = _merge_json_dict(entry_meta_json, {
-                        "broker_truth_buy_applied_orders": watermark_map,
+                        # Keep the lifecycle/root contract immutable across pyramid adds.
+                        "entry_contract_sha256": root_contract_sha,
+                        "entry_contract_version": request_json.get("entry_contract_version"),
+                        "last_buy_order_contract_sha256": request_json.get("entry_contract_sha256"),
+                        "parent_entry_contract_sha256": request_json.get("parent_entry_contract_sha256"),
+                        "source_buy_order_id": str(order_id),
+                        "source_buy_client_order_key": request_json.get("client_order_key"),
                     })
-                new_qty = current_qty + qty
-                new_total_cost = total_cost + cost_delta
-                new_avg = new_total_cost / new_qty if new_qty > 0 else None
-                values = {
-                    "qty": new_qty,
-                    "avg_buy_price": new_avg,
-                    "total_cost": new_total_cost,
-                    "realized_pnl": realized_pnl,
-                    "market": market,
-                    "last_trade_at": filled_at,
-                    "status": "OPEN",
-                }
-                if entry_meta_json:
-                    existing_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
-                    merged_entry_meta = _merge_json_dict(existing_entry_meta, entry_meta_json)
-                    if row:
-                        for key in (
-                            "entry_contract_sha256",
-                            "entry_contract_version",
-                            "entry_exit_plan_sha256",
-                            "entry_reason",
-                            "entry_style_selected",
-                            "entry_decision_family",
-                            "entry_rule_version",
-                            "entry_thesis",
-                            "trade_horizon",
-                            "exit_policy_family",
-                            "eod_action",
-                            "force_eod_close",
-                            "max_trading_days",
-                            "initial_stop_price",
-                            "initial_risk_r",
-                            "policy_source",
-                            "policy_version",
-                            "tp1_done",
-                            "tp2_done",
-                            "tp3_done",
-                            "max_pnl_pct_since_entry",
-                            "max_price",
-                            "max_close",
-                            "last_trail_stop",
-                        ):
-                            if key in existing_entry_meta:
-                                merged_entry_meta[key] = existing_entry_meta[key]
-                            else:
-                                merged_entry_meta.pop(key, None)
-                    values.update(
-                        {
-                            "entry_reason": merged_entry_meta.get("entry_reason") or row.get("entry_reason") if row else merged_entry_meta.get("entry_reason"),
-                            "entry_style_selected": merged_entry_meta.get("entry_style_selected") or row.get("entry_style_selected") if row else merged_entry_meta.get("entry_style_selected"),
-                            "entry_decision_family": merged_entry_meta.get("entry_decision_family") or row.get("entry_decision_family") if row else merged_entry_meta.get("entry_decision_family"),
-                            "entry_rule_version": merged_entry_meta.get("entry_rule_version") or row.get("entry_rule_version") if row else merged_entry_meta.get("entry_rule_version"),
-                            "entry_meta_json": merged_entry_meta,
-                            "stop_price_at_entry": _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")) or row.get("stop_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")),
-                            "pivot_price_at_entry": _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")) or row.get("pivot_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")),
-                            "exit_policy_family": merged_entry_meta.get("exit_policy_family") or row.get("exit_policy_family") if row else merged_entry_meta.get("exit_policy_family"),
-                            "entry_thesis": merged_entry_meta.get("entry_thesis") or row.get("entry_thesis") if row else merged_entry_meta.get("entry_thesis"),
-                            "trade_horizon": merged_entry_meta.get("trade_horizon") or row.get("trade_horizon") if row else merged_entry_meta.get("trade_horizon"),
-                            "eod_action": merged_entry_meta.get("eod_action") or row.get("eod_action") if row else merged_entry_meta.get("eod_action"),
-                            "force_eod_close": parse_plan_bool(merged_entry_meta.get("force_eod_close"), default=parse_plan_bool(row.get("force_eod_close") if row else False, default=False)),
-                            "max_trading_days": merged_entry_meta.get("max_trading_days") or row.get("max_trading_days") if row else merged_entry_meta.get("max_trading_days"),
-                            "initial_stop_price": _safe_float_or_none(merged_entry_meta.get("initial_stop_price")) or row.get("initial_stop_price") if row else _safe_float_or_none(merged_entry_meta.get("initial_stop_price")),
-                            "initial_risk_r": _safe_float_or_none(merged_entry_meta.get("initial_risk_r")) or row.get("initial_risk_r") if row else _safe_float_or_none(merged_entry_meta.get("initial_risk_r")),
-                            "entry_exit_plan_json": (
-                                row.get("entry_exit_plan_json")
-                                if row
-                                else entry_exit_plan
-                            ) or {},
-                            "policy_source": merged_entry_meta.get("policy_source") or row.get("policy_source") if row else merged_entry_meta.get("policy_source"),
-                            "policy_version": merged_entry_meta.get("policy_version") or row.get("policy_version") if row else merged_entry_meta.get("policy_version"),
-                        }
+                    logger.info(
+                        "[KR_POSITION][ENTRY_CONTRACT_BOUND] code=%s order_id=%s cycle=%s contract_sha=%s",
+                        code, order_id, position_cycle_id, request_json.get("entry_contract_sha256"),
                     )
-            else:
-                qty_to_close = min(qty, current_qty)
-                remaining_qty = max(current_qty - qty_to_close, 0)
-                proceeds = (float(price) * qty_to_close) - float(fee) - float(tax)
-                cost_basis = avg_buy_price * qty_to_close
-                new_realized = realized_pnl + (proceeds - cost_basis)
-                new_total_cost = max(total_cost - cost_basis, 0.0)
-                new_avg = avg_buy_price if remaining_qty > 0 else None
-                values = {
-                    "qty": remaining_qty,
-                    "avg_buy_price": new_avg,
-                    "total_cost": new_total_cost,
-                    "realized_pnl": new_realized,
-                    "market": market,
-                    "last_trade_at": filled_at,
-                }
-                if remaining_qty <= 0:
-                    values.update(status="CLOSED", closed_ts=filled_at, closed_reason="FULL_SELL")
-                if entry_meta_json:
-                    values["last_exit_plan_eval_json"] = json_sanitize(entry_meta_json)
-                    if remaining_qty <= 0:
-                        values["closed_reason"] = entry_meta_json.get("exit_reason") or entry_meta_json.get("close_reason")
-                        values["closed_ts"] = filled_at
 
-            if row:
-                conn.execute(
-                    sa.update(self._schema.positions)
-                    .where(self._schema.positions.c.position_id == row["position_id"])
-                    .values(**values, updated_at=func.now()),
+        if entry_exit_plan:
+            entry_meta_json = _merge_json_dict(entry_meta_json, {
+                "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(entry_exit_plan),
+            })
+            plan_meta = {
+                "entry_thesis": entry_exit_plan.get("entry_thesis"),
+                "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
+                "entry_reason": entry_exit_plan.get("entry_reason"),
+                "trade_horizon": entry_exit_plan.get("trade_horizon"),
+                "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
+                "eod_action": entry_exit_plan.get("eod_action"),
+                "force_eod_close": entry_exit_plan.get("force_eod_close"),
+                "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
+                "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
+                "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
+                "policy_source": entry_exit_plan.get("policy_source"),
+                "policy_version": entry_exit_plan.get("policy_version"),
+            }
+            entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
+        account_id = account_id or get_account_key(env=env)
+        trading_epoch_id = active_trading_epoch_id(
+            conn, env=env, account_id=account_id, required=trading_epoch_enforced()
+        )
+        if provenance and trading_epoch_id is not None:
+            provenance_epoch = provenance.get("trading_epoch_id")
+            if str(provenance_epoch or "") != str(trading_epoch_id):
+                raise RuntimeError("KR_FILL_ORDER_TRADING_EPOCH_MISMATCH")
+        portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
+            conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
+        )
+        _assert_portfolio_epoch_binding(
+            conn,
+            self._schema,
+            portfolio_epoch_id=str(portfolio_epoch_id),
+            trading_epoch_id=trading_epoch_id,
+        )
+        position_conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.sid == sid,
+            self._schema.positions.c.mode == mode,
+            self._schema.positions.c.code == code,
+            self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
+            self._schema.positions.c.status == "OPEN",
+        ]
+        if trading_epoch_id is not None:
+            position_conditions.append(
+                self._schema.positions.c.trading_epoch_id == trading_epoch_id
+            )
+        stmt = select(self._schema.positions).where(and_(*position_conditions))
+        row = conn.execute(stmt).mappings().first()
+        if row:
+            row = dict(row)
+            if trading_epoch_id is not None and str(row.get("trading_epoch_id") or "") != str(trading_epoch_id):
+                raise RuntimeError("KR_POSITION_TRADING_EPOCH_MISMATCH")
+        qty = int(qty)
+        if side.upper() == "BUY" and buy_cost_delta_override is not None:
+            cost_delta = float(buy_cost_delta_override) + float(fee) + float(tax)
+        else:
+            cost_delta = (qty * float(price)) + float(fee) + float(tax)
+        if row:
+            current_qty = int(row.get("qty") or 0)
+            avg_buy_price = float(row.get("avg_buy_price") or 0.0)
+            total_cost = float(row.get("total_cost") or 0.0)
+            realized_pnl = float(row.get("realized_pnl") or 0.0)
+        else:
+            current_qty = 0
+            avg_buy_price = 0.0
+            total_cost = 0.0
+            realized_pnl = 0.0
+
+        if side.upper() != "BUY" and not row:
+            logger.error(
+                "[RECONCILE][POSITION_STATE_MISMATCH] code=%s kis_qty=unknown cycle_id=none "
+                "reason=STALE_OR_UNPROVEN_CYCLE action=EXIT_BLOCKED", code,
+            )
+            return
+        if row and position_cycle_id and str(row.get("position_cycle_id")) != str(position_cycle_id):
+            logger.error(
+                "[RECONCILE][POSITION_STATE_MISMATCH] code=%s active_cycle=%s fill_cycle=%s "
+                "reason=CYCLE_PROVENANCE_MISMATCH action=EXIT_BLOCKED",
+                code, row.get("position_cycle_id"), position_cycle_id,
+            )
+            return
+
+        if side.upper() == "BUY":
+            # Holdings fallback and historical BUY retry must agree on one
+            # durable application marker, in the *same transaction* as qty.
+            # Never infer a missing marker from an already-changed balance.
+            if buy_application_cumulative_qty is not None:
+                if not order_id or not position_cycle_id:
+                    raise RuntimeError("KR_BUY_APPLICATION_PROVENANCE_MISSING")
+                target = int(buy_application_cumulative_qty)
+                current_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
+                watermark_map = _merge_json_dict(
+                    current_meta.get("broker_truth_buy_applied_orders"), {}
                 )
-            else:
-                conn.execute(
-                    sa.insert(self._schema.positions).values(
-                        position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                        position_cycle_id=position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                        portfolio_epoch_id=portfolio_epoch_id,
-                        trading_epoch_id=trading_epoch_id,
-                        opened_at=filled_at,
-                        position_origin="SYSTEM",
-                        env=env,
-                        strategy=strategy,
-                        sid=sid,
-                        mode=mode,
-                        code=code,
-                        market=market,
-                        qty=values["qty"],
-                        avg_buy_price=values["avg_buy_price"],
-                        total_cost=values["total_cost"],
-                        realized_pnl=values["realized_pnl"],
-                        last_trade_at=filled_at,
-                        status="OPEN",
-                        entry_reason=values.get("entry_reason"),
-                        entry_style_selected=values.get("entry_style_selected"),
-                        entry_decision_family=values.get("entry_decision_family"),
-                        entry_rule_version=values.get("entry_rule_version"),
-                        entry_meta_json=values.get("entry_meta_json", {}),
-                        stop_price_at_entry=values.get("stop_price_at_entry"),
-                        pivot_price_at_entry=values.get("pivot_price_at_entry"),
-                        entry_thesis=values.get("entry_thesis"),
-                        trade_horizon=values.get("trade_horizon"),
-                        eod_action=values.get("eod_action"),
-                        force_eod_close=values.get("force_eod_close", False),
-                        max_trading_days=values.get("max_trading_days"),
-                        initial_stop_price=values.get("initial_stop_price"),
-                        initial_risk_r=values.get("initial_risk_r"),
-                        exit_policy_family=values.get("exit_policy_family"),
-                        entry_exit_plan_json=values.get("entry_exit_plan_json", {}),
-                        policy_source=values.get("policy_source"),
-                        policy_version=values.get("policy_version"),
-                    )
+                previous = _merge_json_dict(watermark_map.get(str(order_id)), {})
+                previous_qty = int(previous.get("qty") or 0)
+                if target < previous_qty or target - previous_qty != qty:
+                    raise RuntimeError("KR_BUY_APPLICATION_CUMULATIVE_CONFLICT")
+                pre_qty = request_json.get("pre_order_holding_qty")
+                if not previous and row and (
+                    pre_qty is None or current_qty != int(pre_qty)
+                ):
+                    raise RuntimeError("KR_BUY_APPLICATION_BASELINE_DRIFT")
+                watermark_map[str(order_id)] = {
+                    "qty": target,
+                    "notional": (
+                        float(previous.get("notional") or 0.0)
+                        + (
+                            float(buy_cost_delta_override)
+                            if buy_cost_delta_override is not None
+                            else float(qty) * float(price)
+                        )
+                    ),
+                    "fee": float(previous.get("fee") or 0.0) + float(fee),
+                    "tax": float(previous.get("tax") or 0.0) + float(tax),
+                }
+                entry_meta_json = _merge_json_dict(entry_meta_json, {
+                    "broker_truth_buy_applied_orders": watermark_map,
+                })
+            new_qty = current_qty + qty
+            new_total_cost = total_cost + cost_delta
+            new_avg = new_total_cost / new_qty if new_qty > 0 else None
+            values = {
+                "qty": new_qty,
+                "avg_buy_price": new_avg,
+                "total_cost": new_total_cost,
+                "realized_pnl": realized_pnl,
+                "market": market,
+                "last_trade_at": filled_at,
+                "status": "OPEN",
+            }
+            if entry_meta_json:
+                existing_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, {})
+                merged_entry_meta = _merge_json_dict(existing_entry_meta, entry_meta_json)
+                if row:
+                    for key in (
+                        "entry_contract_sha256",
+                        "entry_contract_version",
+                        "entry_exit_plan_sha256",
+                        "entry_reason",
+                        "entry_style_selected",
+                        "entry_decision_family",
+                        "entry_rule_version",
+                        "entry_thesis",
+                        "trade_horizon",
+                        "exit_policy_family",
+                        "eod_action",
+                        "force_eod_close",
+                        "max_trading_days",
+                        "initial_stop_price",
+                        "initial_risk_r",
+                        "policy_source",
+                        "policy_version",
+                        "tp1_done",
+                        "tp2_done",
+                        "tp3_done",
+                        "max_pnl_pct_since_entry",
+                        "max_price",
+                        "max_close",
+                        "last_trail_stop",
+                    ):
+                        if key in existing_entry_meta:
+                            merged_entry_meta[key] = existing_entry_meta[key]
+                        else:
+                            merged_entry_meta.pop(key, None)
+                values.update(
+                    {
+                        "entry_reason": merged_entry_meta.get("entry_reason") or row.get("entry_reason") if row else merged_entry_meta.get("entry_reason"),
+                        "entry_style_selected": merged_entry_meta.get("entry_style_selected") or row.get("entry_style_selected") if row else merged_entry_meta.get("entry_style_selected"),
+                        "entry_decision_family": merged_entry_meta.get("entry_decision_family") or row.get("entry_decision_family") if row else merged_entry_meta.get("entry_decision_family"),
+                        "entry_rule_version": merged_entry_meta.get("entry_rule_version") or row.get("entry_rule_version") if row else merged_entry_meta.get("entry_rule_version"),
+                        "entry_meta_json": merged_entry_meta,
+                        "stop_price_at_entry": _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")) or row.get("stop_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")),
+                        "pivot_price_at_entry": _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")) or row.get("pivot_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")),
+                        "exit_policy_family": merged_entry_meta.get("exit_policy_family") or row.get("exit_policy_family") if row else merged_entry_meta.get("exit_policy_family"),
+                        "entry_thesis": merged_entry_meta.get("entry_thesis") or row.get("entry_thesis") if row else merged_entry_meta.get("entry_thesis"),
+                        "trade_horizon": merged_entry_meta.get("trade_horizon") or row.get("trade_horizon") if row else merged_entry_meta.get("trade_horizon"),
+                        "eod_action": merged_entry_meta.get("eod_action") or row.get("eod_action") if row else merged_entry_meta.get("eod_action"),
+                        "force_eod_close": parse_plan_bool(merged_entry_meta.get("force_eod_close"), default=parse_plan_bool(row.get("force_eod_close") if row else False, default=False)),
+                        "max_trading_days": merged_entry_meta.get("max_trading_days") or row.get("max_trading_days") if row else merged_entry_meta.get("max_trading_days"),
+                        "initial_stop_price": _safe_float_or_none(merged_entry_meta.get("initial_stop_price")) or row.get("initial_stop_price") if row else _safe_float_or_none(merged_entry_meta.get("initial_stop_price")),
+                        "initial_risk_r": _safe_float_or_none(merged_entry_meta.get("initial_risk_r")) or row.get("initial_risk_r") if row else _safe_float_or_none(merged_entry_meta.get("initial_risk_r")),
+                        "entry_exit_plan_json": (
+                            row.get("entry_exit_plan_json")
+                            if row
+                            else entry_exit_plan
+                        ) or {},
+                        "policy_source": merged_entry_meta.get("policy_source") or row.get("policy_source") if row else merged_entry_meta.get("policy_source"),
+                        "policy_version": merged_entry_meta.get("policy_version") or row.get("policy_version") if row else merged_entry_meta.get("policy_version"),
+                    }
                 )
+        else:
+            qty_to_close = min(qty, current_qty)
+            remaining_qty = max(current_qty - qty_to_close, 0)
+            proceeds = (float(price) * qty_to_close) - float(fee) - float(tax)
+            cost_basis = avg_buy_price * qty_to_close
+            new_realized = realized_pnl + (proceeds - cost_basis)
+            new_total_cost = max(total_cost - cost_basis, 0.0)
+            new_avg = avg_buy_price if remaining_qty > 0 else None
+            values = {
+                "qty": remaining_qty,
+                "avg_buy_price": new_avg,
+                "total_cost": new_total_cost,
+                "realized_pnl": new_realized,
+                "market": market,
+                "last_trade_at": filled_at,
+            }
+            if remaining_qty <= 0:
+                values.update(status="CLOSED", closed_ts=filled_at, closed_reason="FULL_SELL")
+            if entry_meta_json:
+                values["last_exit_plan_eval_json"] = json_sanitize(entry_meta_json)
+                if remaining_qty <= 0:
+                    values["closed_reason"] = entry_meta_json.get("exit_reason") or entry_meta_json.get("close_reason")
+                    values["closed_ts"] = filled_at
+
+        if row:
+            conn.execute(
+                sa.update(self._schema.positions)
+                .where(self._schema.positions.c.position_id == row["position_id"])
+                .values(**values, updated_at=func.now()),
+            )
+        else:
+            conn.execute(
+                sa.insert(self._schema.positions).values(
+                    position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                    position_cycle_id=position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                    portfolio_epoch_id=portfolio_epoch_id,
+                    trading_epoch_id=trading_epoch_id,
+                    opened_at=filled_at,
+                    position_origin="SYSTEM",
+                    env=env,
+                    strategy=strategy,
+                    sid=sid,
+                    mode=mode,
+                    code=code,
+                    market=market,
+                    qty=values["qty"],
+                    avg_buy_price=values["avg_buy_price"],
+                    total_cost=values["total_cost"],
+                    realized_pnl=values["realized_pnl"],
+                    last_trade_at=filled_at,
+                    status="OPEN",
+                    entry_reason=values.get("entry_reason"),
+                    entry_style_selected=values.get("entry_style_selected"),
+                    entry_decision_family=values.get("entry_decision_family"),
+                    entry_rule_version=values.get("entry_rule_version"),
+                    entry_meta_json=values.get("entry_meta_json", {}),
+                    stop_price_at_entry=values.get("stop_price_at_entry"),
+                    pivot_price_at_entry=values.get("pivot_price_at_entry"),
+                    entry_thesis=values.get("entry_thesis"),
+                    trade_horizon=values.get("trade_horizon"),
+                    eod_action=values.get("eod_action"),
+                    force_eod_close=values.get("force_eod_close", False),
+                    max_trading_days=values.get("max_trading_days"),
+                    initial_stop_price=values.get("initial_stop_price"),
+                    initial_risk_r=values.get("initial_risk_r"),
+                    exit_policy_family=values.get("exit_policy_family"),
+                    entry_exit_plan_json=values.get("entry_exit_plan_json", {}),
+                    policy_source=values.get("policy_source"),
+                    policy_version=values.get("policy_version"),
+                )
+            )
 
     def bootstrap_from_kis_holdings(
         self, env: str, strategy: str, sid: int, mode: int, holdings: Iterable[dict], *, account_id: str | None = None

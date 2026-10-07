@@ -318,6 +318,7 @@ class DurableExecutionClaimRepo:
         state: str,
         cumulative_filled_qty: int | None,
         authoritative: bool,
+        _conn: Any = None,
     ) -> ExecutionClaimSnapshot:
         state = str(state or "").strip().upper()
         if state not in {
@@ -331,93 +332,103 @@ class DurableExecutionClaimRepo:
             raise ValueError("cumulative fill quantity cannot be negative")
         key = self._action_key(identity)
         actions, attempts = self.actions, self.attempts
-        with self.engine.begin() as conn:
-            action_row = conn.execute(
-                sa.select(actions).where(actions.c.action_key == key).with_for_update()
-            ).mappings().one_or_none()
-            attempt_row = conn.execute(
-                sa.select(attempts).where(
-                    attempts.c.action_key == key,
-                    attempts.c.attempt_id == str(attempt_id),
-                ).with_for_update()
-            ).mappings().one_or_none()
-            if action_row is None or attempt_row is None:
-                raise RuntimeError("execution action or submit attempt not found")
-            latest_id = conn.execute(
-                sa.select(attempts.c.attempt_id)
-                .where(attempts.c.action_key == key)
-                .order_by(attempts.c.attempt_no.desc())
-                .limit(1)
-            ).scalar_one()
-            if str(latest_id) != str(attempt_id):
-                raise RuntimeError("observation for superseded submit attempt")
-            requested = int(attempt_row["requested_qty"])
-            previous = attempt_row["cumulative_filled_qty"]
-            if observed_qty is not None and observed_qty > requested:
-                raise ValueError("cumulative fill quantity exceeds submitted quantity")
-            if state == "REJECTED_EXPLICIT" and authoritative and observed_qty is None:
-                observed_qty = 0
-            if observed_qty is not None and previous is not None:
-                observed_qty = max(int(previous), observed_qty)
-            elif observed_qty is None:
-                observed_qty = previous
-            if state in {"CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL"}:
-                state = "CANCELLED"
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.record_observation(
+                    identity, attempt_id=attempt_id, state=state,
+                    cumulative_filled_qty=cumulative_filled_qty,
+                    authoritative=authoritative, _conn=conn,
+                )
+        conn = _conn
+        action_row = conn.execute(
+            sa.select(actions).where(actions.c.action_key == key).with_for_update()
+        ).mappings().one_or_none()
+        attempt_row = conn.execute(
+            sa.select(attempts).where(
+                attempts.c.action_key == key,
+                attempts.c.attempt_id == str(attempt_id),
+            ).with_for_update()
+        ).mappings().one_or_none()
+        if action_row is None or attempt_row is None:
+            raise RuntimeError("execution action or submit attempt not found")
+        latest_id = conn.execute(
+            sa.select(attempts.c.attempt_id)
+            .where(attempts.c.action_key == key)
+            .order_by(attempts.c.attempt_no.desc())
+            .limit(1)
+        ).scalar_one()
+        if str(latest_id) != str(attempt_id):
+            raise RuntimeError("observation for superseded submit attempt")
+        requested = int(attempt_row["requested_qty"])
+        previous = attempt_row["cumulative_filled_qty"]
+        if observed_qty is not None and observed_qty > requested:
+            raise ValueError("cumulative fill quantity exceeds submitted quantity")
+        if state == "REJECTED_EXPLICIT" and authoritative and observed_qty is None:
+            observed_qty = 0
+        if observed_qty is not None and previous is not None:
+            observed_qty = max(int(previous), observed_qty)
+        elif observed_qty is None:
+            observed_qty = previous
+        if state in {"CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL"}:
+            state = "CANCELLED"
 
-            before = int(action_row["filled_qty_before_attempt"] or 0)
-            total = None if observed_qty is None else before + observed_qty
-            target = int(action_row["target_qty"])
-            remaining = None if total is None else max(0, target - total)
-            action_state = "IN_FLIGHT"
-            active_attempt_id: str | None = str(attempt_id)
-            attempt_state = state
-            if state in {"CREATED", "SUBMITTED", "ACKED", "UNRESOLVED", "RECONCILE_ERROR"}:
-                action_state = "UNCERTAIN" if state in {"UNRESOLVED", "RECONCILE_ERROR"} else "IN_FLIGHT"
-            elif state == "PARTIALLY_FILLED":
-                action_state = "PARTIALLY_SATISFIED"
-            elif state == "FILLED":
-                action_state = "SATISFIED" if remaining == 0 else "PARTIALLY_SATISFIED"
+        before = int(action_row["filled_qty_before_attempt"] or 0)
+        total = None if observed_qty is None else before + observed_qty
+        target = int(action_row["target_qty"])
+        remaining = None if total is None else max(0, target - total)
+        action_state = "IN_FLIGHT"
+        active_attempt_id: str | None = str(attempt_id)
+        attempt_state = state
+        if state in {"CREATED", "SUBMITTED", "ACKED", "UNRESOLVED", "RECONCILE_ERROR"}:
+            action_state = "UNCERTAIN" if state in {"UNRESOLVED", "RECONCILE_ERROR"} else "IN_FLIGHT"
+        elif state == "PARTIALLY_FILLED":
+            action_state = "PARTIALLY_SATISFIED"
+        elif state == "FILLED":
+            action_state = "SATISFIED" if remaining == 0 else "PARTIALLY_SATISFIED"
+            active_attempt_id = None
+        elif state == "REJECTED_EXPLICIT":
+            if authoritative and observed_qty == 0:
+                action_state = "RETRYABLE" if total == 0 else "PARTIALLY_SATISFIED"
                 active_attempt_id = None
-            elif state == "REJECTED_EXPLICIT":
-                if authoritative and observed_qty == 0:
-                    action_state = "RETRYABLE" if total == 0 else "PARTIALLY_SATISFIED"
-                    active_attempt_id = None
-                else:
-                    action_state = "UNCERTAIN"
-            elif state == "CANCELLED":
-                if authoritative and observed_qty is not None:
-                    action_state = (
-                        "SATISFIED" if remaining == 0
-                        else "RETRYABLE" if total == 0
-                        else "PARTIALLY_SATISFIED"
-                    )
-                    active_attempt_id = None
-                    attempt_state = "CANCELLED_ZERO_FILL" if observed_qty == 0 else "CANCELLED_PARTIAL_FILL"
-                else:
-                    action_state = "UNCERTAIN"
+            else:
+                action_state = "UNCERTAIN"
+        elif state == "CANCELLED":
+            if authoritative and observed_qty is not None:
+                action_state = (
+                    "SATISFIED" if remaining == 0
+                    else "RETRYABLE" if total == 0
+                    else "PARTIALLY_SATISFIED"
+                )
+                active_attempt_id = None
+                attempt_state = "CANCELLED_ZERO_FILL" if observed_qty == 0 else "CANCELLED_PARTIAL_FILL"
+            else:
+                action_state = "UNCERTAIN"
 
-            conn.execute(
-                sa.update(attempts)
-                .where(attempts.c.attempt_id == str(attempt_id))
-                .values(
-                    cumulative_filled_qty=observed_qty,
-                    attempt_state=attempt_state,
-                    authoritative=bool(authoritative),
-                    updated_at=datetime.now(timezone.utc),
-                )
+        conn.execute(
+            sa.update(attempts)
+            .where(attempts.c.attempt_id == str(attempt_id))
+            .values(
+                cumulative_filled_qty=observed_qty,
+                attempt_state=attempt_state,
+                authoritative=bool(authoritative),
+                updated_at=datetime.now(timezone.utc),
             )
-            conn.execute(
-                sa.update(actions)
-                .where(actions.c.action_key == key)
-                .values(
-                    cumulative_filled_qty=total,
-                    remaining_target_qty=remaining,
-                    active_attempt_id=active_attempt_id,
-                    action_state=action_state,
-                    updated_at=datetime.now(timezone.utc),
-                )
+        )
+        conn.execute(
+            sa.update(actions)
+            .where(actions.c.action_key == key)
+            .values(
+                cumulative_filled_qty=total,
+                remaining_target_qty=remaining,
+                active_attempt_id=active_attempt_id,
+                action_state=action_state,
+                updated_at=datetime.now(timezone.utc),
             )
-        return self.get(identity)
+        )
+        updated_row = conn.execute(
+            sa.select(actions).where(actions.c.action_key == key)
+        ).mappings().one()
+        return self._snapshot(updated_row)
 
     def release_before_submit(
         self, identity: SemanticActionIdentity | str, *, attempt_id: str,
@@ -556,6 +567,7 @@ class DurableExecutionClaimRepo:
         account_id: str | None = None,
         market: str | None = None,
         trading_epoch_id: str | None = None,
+        _conn: Any = None,
     ) -> tuple[str, str] | None:
         filters = [
             self.attempts.c.client_order_key == str(client_order_key),
@@ -568,8 +580,17 @@ class DurableExecutionClaimRepo:
         ):
             if value is not None:
                 filters.append(field == normalize(str(value).strip()))
-        with self.engine.connect() as conn:
-            row = conn.execute(
+        if _conn is None:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    sa.select(self.attempts.c.action_key, self.attempts.c.attempt_id)
+                    .join(self.actions, self.actions.c.action_key == self.attempts.c.action_key)
+                    .where(*filters)
+                    .order_by(self.attempts.c.attempt_no.desc())
+                    .limit(1)
+                ).first()
+        else:
+            row = _conn.execute(
                 sa.select(self.attempts.c.action_key, self.attempts.c.attempt_id)
                 .join(self.actions, self.actions.c.action_key == self.attempts.c.action_key)
                 .where(*filters)
