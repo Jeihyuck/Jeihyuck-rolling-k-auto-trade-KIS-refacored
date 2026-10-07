@@ -34,6 +34,22 @@ def is_standard_owned_fill(row: dict) -> bool:
     return is_standard_owned_position(row)
 
 
+def filter_standard_owned_exit_intents(intents: list[dict], positions: list[dict]) -> list[dict]:
+    """Filter generated PB1 exits using the broker holding's owner evidence.
+
+    Exit intents may not carry source strategy_owner; the original holding
+    controls ownership so an explicit UNKNOWN/foreign owner stays fenced.
+    """
+    allowed = {
+        str(p.get("symbol") or p.get("code") or "").upper().strip()
+        for p in positions or [] if is_standard_owned_position(p)
+    }
+    return [
+        intent for intent in intents or []
+        if str(intent.get("symbol") or "").upper().strip() in allowed
+    ]
+
+
 def is_standard_symbol(symbol: object, *, log: bool = False) -> bool:
     standard = owner_for_symbol(symbol) == STANDARD_OWNER
     if not standard and log:

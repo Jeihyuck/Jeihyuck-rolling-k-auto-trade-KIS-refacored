@@ -84,3 +84,20 @@ def test_owner_first_scope_excludes_dedicated_and_explicit_foreign_owner():
     assert not is_standard_owned_position({"symbol": "TQQQ"})
     assert not is_standard_owned_position({"symbol": "MSFT", "strategy_owner": "UNKNOWN"})
     assert not is_standard_owned_position({"symbol": "AMD", "meta": {"strategy_owner": "OTHER"}})
+
+
+def test_cluster_trim_uses_original_holding_owner_not_intent_missing_owner():
+    from trader.us.strategy_ownership import filter_standard_owned_exit_intents
+    positions = [
+        {"symbol": "MSFT", "strategy_owner": "UNKNOWN"},
+        {"symbol": "AMD", "strategy_owner": "US_STANDARD"},
+        {"symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE"},
+    ]
+    # Intents have lost their originating owner's metadata in the generic
+    # cluster guard. Never infer missing intent owner as US_STANDARD.
+    intents = [
+        {"symbol": "MSFT", "side": "SELL", "reason": "CLUSTER_EXPOSURE_TRIM"},
+        {"symbol": "TQQQ", "side": "SELL", "reason": "CLUSTER_EXPOSURE_TRIM"},
+        {"symbol": "AMD", "side": "SELL", "reason": "CLUSTER_EXPOSURE_TRIM"},
+    ]
+    assert [x["symbol"] for x in filter_standard_owned_exit_intents(intents, positions)] == ["AMD"]

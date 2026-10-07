@@ -2574,10 +2574,11 @@ def run_trade_tick(
         )
         # The exposure constraint remains portfolio-wide; only PB1-owned
         # positions may receive the generic cluster SELL policy.
-        _cluster_trims = [
-            intent for intent in (cluster_guard_result.get("cluster_guard_trim_intents") or [])
-            if is_standard_owned_position(intent)
-        ]
+        from trader.us.strategy_ownership import filter_standard_owned_exit_intents
+        _cluster_trims = filter_standard_owned_exit_intents(
+            cluster_guard_result.get("cluster_guard_trim_intents") or [],
+            _standard_exit_positions,
+        )
         if len(_cluster_trims) != len(cluster_guard_result.get("cluster_guard_trim_intents") or []):
             logger.warning(
                 "[US_CLUSTER_GUARD][OWNER_SCOPE] blocked_foreign_sleeve_trims=%d",
@@ -2593,7 +2594,7 @@ def run_trade_tick(
             from trader.us.market_state_overlay import build_defense_trim_intents
             existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
             defense_trim_intents = build_defense_trim_intents(
-                current_positions, market_state_overlay, existing_sell_symbols,
+                _standard_exit_positions, market_state_overlay, existing_sell_symbols,
                 trade_date=trade_date, context=tick_context,
             )
             if defense_trim_intents:
