@@ -855,7 +855,9 @@ def _validate_take_profit_with_fresh_broker_position(
     # runner floor as intent creation, now against the actual broker holdings.
     # Never resize a stale TP automatically: defer to a fresh stage evaluation.
     from trader.us.market_state_overlay import resolve_profit_capture_stage_quantity
-    stage = str(meta.get("profit_capture_stage") or "").lower()
+    # Older valid TP callers encode the stage in the reason, not a separate
+    # profit_capture_stage field. Preserve that existing contract.
+    stage = str(meta.get("profit_capture_stage") or reason.rsplit("_", 1)[-1]).lower()
     if stage not in {"tp1", "tp2", "tp3"}:
         return {"ok": False, "reason": "take_profit_stage_missing"}
     try:
@@ -1486,7 +1488,12 @@ def route_order(
         broker_pos = _get_broker_position(kis_client, symbol, context=context)
         broker_holding_qty = int(broker_pos.get("qty") or broker_pos.get("holding_qty") or 0) if broker_pos else 0
         broker_orderable_qty = int(broker_pos.get("orderable_qty") or 0) if broker_pos else 0
-        if str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT"):
+        # TQQQ_INFINITE is a separately owned sleeve. Its TP rules must never
+        # be validated using the frozen US_STANDARD staged-profit contract.
+        if (
+            not is_tqqq_infinite
+            and str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT")
+        ):
             tp_guard = _validate_take_profit_with_fresh_broker_position(intent, broker_pos, now=now)
             if not tp_guard.get("ok"):
                 guard_reason = str(tp_guard.get("reason") or "take_profit_guard_failed")
@@ -1578,7 +1585,10 @@ def route_order(
             guard_meta = {**guard_meta, "holding_qty": intent.get("available_qty") or guard_meta.get("holding_qty"), "orderable_qty": intent.get("orderable_qty") or guard_meta.get("orderable_qty"), "sell_qty": sell_qty, "reason": "broker_check_unavailable_intent_fallback"}
         # For fresh KIS SELL balance, orderable_qty already reflects broker
         # reservations. In particular TP stages must not subtract them twice.
-        _is_tp_sell = str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT")
+        _is_tp_sell = (
+            not is_tqqq_infinite
+            and str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT")
+        )
         pending_sell_qty = (
             _pending_sell_qty_for_symbol(symbol, trade_date)
             if broker_pos is not None and not _is_tp_sell else 0
