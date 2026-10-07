@@ -170,3 +170,67 @@ def test_runtime_release_requires_fresh_scoped_proof_and_revision(monkeypatch, t
     decision = load_us_runtime_release(engine, obs)
     assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
     assert decision.writer_allowed is True
+
+
+def test_runtime_release_stays_atomic_during_partial_in_flight(monkeypatch, tmp_path):
+    from trader.settlement.core import settle_atomic
+    from trader.settlement.release_gate import REQUIRED_PROOFS
+
+    engine = _engine()
+    partial = _obs(cumulative=2, price=Decimal("100"))
+    settle_atomic(engine, partial, lambda _conn, _obs, _decision: None)
+
+    revision = "c" * 40
+    proof_path = tmp_path / "us-release-partial.json"
+    proof_path.write_text(json.dumps({
+        "market": "US",
+        "env": partial.env,
+        "trading_epoch_id": partial.trading_epoch_id,
+        "account_scope": partial.account_scope,
+        "run_revision": revision,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "proofs": {name: True for name in REQUIRED_PROOFS},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_RELEASE_PROOF_FILE", str(proof_path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+
+    decision = load_us_runtime_release(engine, partial)
+    assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
+    assert decision.writer_allowed is True
+
+
+def test_runtime_release_stays_atomic_during_price_pending(monkeypatch, tmp_path):
+    from trader.settlement.core import settle_atomic
+    from trader.settlement.release_gate import REQUIRED_PROOFS
+
+    engine = _engine()
+    pending = _obs(cumulative=5, price=None)
+    settle_atomic(engine, pending, lambda _conn, _obs, _decision: None)
+
+    revision = "d" * 40
+    proof_path = tmp_path / "us-release-price-pending.json"
+    proof_path.write_text(json.dumps({
+        "market": "US",
+        "env": pending.env,
+        "trading_epoch_id": pending.trading_epoch_id,
+        "account_scope": pending.account_scope,
+        "run_revision": revision,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "proofs": {name: True for name in REQUIRED_PROOFS},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_RELEASE_PROOF_FILE", str(proof_path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+
+    decision = load_us_runtime_release(engine, pending)
+    assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
+    assert decision.writer_allowed is True
+
+
+def test_fill_bearing_terminal_cancel_is_atomic_route_eligible():
+    from trader.us.db import repos
+
+    source = inspect.getsource(repos.apply_broker_order_observation)
+    assert 'evidence_type in {"KIS_ORDER_CUMULATIVE_ACTUAL", "KIS_TERMINAL_CANCEL"}' in source
+    assert "kis-order-cumulative:{evidence_type}" in source
