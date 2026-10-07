@@ -1640,10 +1640,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 },
             )
             if (
-                incremental_daily_qty > 0
-                and side == "BUY"
+                side == "BUY"
                 and source_order
                 and request_json.get("enforce_entry_contract") is True
+                and (incremental_daily_qty > 0 or atomic_writer_active)
             ):
                 def _legacy_buy_apply():
                     return positions_repo.apply_fill(
@@ -1671,7 +1671,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     from trader.settlement.kr_cutover import route_kr_settlement
 
                     def _atomic_buy_apply(conn, _obs, decision):
-                        if decision.qty_delta > 0:
+                        if decision.qty_delta > 0 or decision.notional_delta != 0:
                             positions_repo.apply_fill(
                                 env=env,
                                 strategy=str(source_order.get("strategy") or strategy),
@@ -1690,6 +1690,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                                 portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
                                 position_cycle_id=str(source_order.get("position_cycle_id") or "") or None,
                                 order_id=str(source_order.get("order_id") or "") or None,
+                                buy_cost_delta_override=float(decision.notional_delta),
                                 _conn=conn,
                             )
                         orders_repo.record_execution_claim_for_order(
@@ -1711,10 +1712,21 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         if (
                             atomic_is_pyramid_add
                             and next_confirmed_qty >= atomic_requested_buy_qty > 0
+                            and decision.price_status == "CONFIRMED"
                         ):
+                            from trader.settlement.schema import applications as settlement_applications
+                            prior_notional = conn.execute(
+                                sa.select(settlement_applications.c.applied_notional).where(
+                                    settlement_applications.c.settlement_key == decision.settlement_key
+                                )
+                            ).scalar_one()
+                            cumulative_atomic_notional = (
+                                float(prior_notional or 0.0)
+                                + float(decision.notional_delta)
+                            )
                             atomic_stage_avg_fill_price = (
-                                next_confirmed_notional / float(next_confirmed_qty)
-                                if next_confirmed_notional > 0 and next_confirmed_qty > 0
+                                cumulative_atomic_notional / float(decision.cumulative_qty)
+                                if cumulative_atomic_notional > 0 and decision.cumulative_qty > 0
                                 else float(filled_price or 0.0)
                             )
                             positions_repo.mark_pyramid_add_fill(
