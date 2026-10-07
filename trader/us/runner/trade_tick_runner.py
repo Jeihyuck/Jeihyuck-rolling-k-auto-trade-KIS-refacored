@@ -1523,6 +1523,7 @@ def run_trade_tick(
     locked_watchlist_cache: list[dict] | None = None,
     prep_cache_source: str | None = None,
     watchlist_cache_source: str | None = None,
+    completed_market_context: dict | None = None,
     entry_can_proceed: bool = True,
     exit_can_proceed: bool = True,
     tqqq_policy_override_allowed: bool = False,
@@ -2484,6 +2485,7 @@ def run_trade_tick(
             positions=current_positions,
             account_snapshot=account_snapshot,
             now=now,
+            completed_market_context=completed_market_context,
         )
         if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
             prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
@@ -4051,6 +4053,7 @@ def run_trade_tick(
         "fill_rows_persisted": int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0),
         "exit_engine_ms": float(tick_context.metrics.get("exit_engine_ms", 0)),
         "market_state_ms": float(tick_context.metrics.get("market_state_ms", 0)),
+        "completed_market_cache_hit": int(bool(market_state_overlay.get("completed_market_cache_hit"))),
         "tqqq_infinite_ms": float(tick_context.metrics.get("tqqq_infinite_ms", 0)),
         "entry_engine_ms": float(tick_context.metrics.get("entry_engine_ms", 0)),
         "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
@@ -4123,6 +4126,7 @@ def run_trade_tick(
         **latency_metrics,
         "status": status,
         "runtime_integrity_status": runtime_integrity_status,
+        "completed_market_context": market_state_overlay.get("_completed_market_context") or None,
         "sell_liveness_status": sell_liveness_status,
         "entry_liveness_status": entry_liveness_status,
         "reconcile_liveness_status": reconcile_liveness_status,

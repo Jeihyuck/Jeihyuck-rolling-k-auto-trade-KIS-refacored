@@ -1265,6 +1265,10 @@ def run_trade_session(
             except Exception as exc:
                 logger.warning("[US_SESSION][ENTRY_CACHE][SKIP] trade_date=%s error=%s", trade_date, exc)
 
+        # Child processes are ephemeral. The parent owns only immutable,
+        # quality-checked completed-day context, never live quotes or positions.
+        completed_market_context = None
+        completed_market_context_age_ticks = 0
         tick_count = 0
         warn_count = 0
         consecutive_errors = 0
@@ -1374,6 +1378,12 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
+                            completed_market_context=(
+                                completed_market_context
+                                if completed_market_context_age_ticks
+                                    < max(1, int(os.getenv("US_COMPLETED_MARKET_CONTEXT_REVALIDATE_TICKS", "12")))
+                                else None
+                            ),
                             entry_can_proceed=resolve_shared_tick_entry_evaluation_permission(
                                 prep_guard_result,
                                 timeout_entry_block=timeout_entry_block,
@@ -1414,6 +1424,16 @@ def run_trade_session(
                         tick_result = process_result.result
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
+                    # Never publish incomplete market data as reusable truth.
+                    # Scheduled revalidation detects upstream corrections even
+                    # if a provider does not publish an explicit new version.
+                    _completed_context = tick_result.get("completed_market_context")
+                    if isinstance(_completed_context, dict) and _completed_context.get("quality") == "OK":
+                        completed_market_context = _completed_context
+                        completed_market_context_age_ticks = 0
+                    elif completed_market_context is None:
+                        completed_market_context_age_ticks = 0
+                    completed_market_context_age_ticks += 1
                     results.append(tick_result)
                     final_tick = tick_result
                     tick_completed += 1
