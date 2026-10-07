@@ -2198,7 +2198,8 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
 
 
 def load_us_profit_capture_state(trade_date: str, symbols: list[str],
-                                 lifecycle_by_symbol: dict[str, str] | None = None) -> dict[str, dict]:
+                                 lifecycle_by_symbol: dict[str, str] | None = None,
+                                 _conn: Any = None) -> dict[str, dict]:
     """Load TP1/TP2/TP3 state for the current position lifecycle.
 
     TP completion belongs to a position lifecycle, not to a trading date. Rows
@@ -2237,7 +2238,7 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                     if candidate.get(key):
                         state[key] = candidate[key]
         if engine is not None:
-            with engine.connect() as conn:
+            def _read_profit_capture(conn):
                 epoch_id = _active_us_epoch(conn)
                 sql = """SELECT DISTINCT ON (stage)
                     stage,stage_status,client_order_key,raw_broker_order_no,
@@ -2249,7 +2250,12 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                     sql += " AND trading_epoch_id=:epoch_id"
                     params["epoch_id"] = epoch_id
                 sql += " ORDER BY stage,trade_date DESC,updated_at DESC"
-                rows = conn.execute(text(sql), params).mappings().all()
+                return conn.execute(text(sql), params).mappings().all()
+            if _conn is not None:
+                rows = _read_profit_capture(_conn)
+            else:
+                with engine.connect() as conn:
+                    rows = _read_profit_capture(conn)
             state={"position_lifecycle_id":lifecycle,"meta":{}}
             for row in rows:
                 stage=str(row["stage"]); status=str(row["stage_status"])
@@ -2275,6 +2281,7 @@ def mark_us_profit_capture_stage(
     broker_order_no: str | None = None,
     filled_qty: int | None = None,
     evidence_type: str | None = None,
+    _conn: Any = None,
 ) -> None:
     """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
     sym = str(symbol or "").strip().upper()
@@ -2287,7 +2294,9 @@ def mark_us_profit_capture_stage(
     lifecycle = str(position_lifecycle_id or "").strip()
     if not lifecycle:
         return
-    existing = load_us_profit_capture_state(td, [sym], {sym: lifecycle}).get(sym, {})
+    existing = load_us_profit_capture_state(
+        td, [sym], {sym: lifecycle}, _conn=_conn
+    ).get(sym, {})
     now_iso = datetime.now(timezone.utc).isoformat()
     status_upper = str(status or "PENDING").upper()
     evidence_upper = str(evidence_type or "").upper()
@@ -2352,11 +2361,12 @@ def mark_us_profit_capture_stage(
         meta[f"{stg}_notional_usd"] = float(notional_usd)
     existing["meta"] = meta
     normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
-    _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     engine = _get_engine_or_none()
+    if engine is None or _conn is None:
+        _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     if engine is not None:
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
-        with engine.begin() as conn:
+        def _write_profit_capture(conn):
             epoch_id = _active_us_epoch(conn)
             params = {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
                       "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
@@ -2390,6 +2400,11 @@ def mark_us_profit_capture_stage(
                      cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
                      state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
             conn.execute(text(sql), params)
+        if _conn is not None:
+            _write_profit_capture(_conn)
+        else:
+            with engine.begin() as conn:
+                _write_profit_capture(conn)
 
 
 def mark_us_position_exit_stage(
@@ -4791,6 +4806,7 @@ def mark_order_filled_by_reconcile(
                 client_order_key=resolved_client_order_key, broker_order_no=on,
                 profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
                 evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
+                _conn=conn,
             )
         claim_error = None
         if not _skip_claim_update:
