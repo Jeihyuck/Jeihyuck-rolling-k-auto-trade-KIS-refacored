@@ -142,3 +142,31 @@ def test_kr_position_mutators_expose_caller_connection_contract():
 
     assert "_conn" in inspect.signature(PositionsRepo.apply_fill).parameters
     assert "_conn" in inspect.signature(PositionsRepo.reconcile_sell_execution).parameters
+
+
+def test_unproven_holdings_evidence_uses_legacy_when_release_blocked():
+    calls = []
+    result = route_kr_settlement(
+        engine=_engine(), observation=None,
+        release=SettlementReleaseDecision(
+            market="KR", status="SHADOW_ONLY", writer_allowed=False,
+            missing=("HOLDINGS_ORDER_ATTRIBUTION_UNPROVEN",),
+        ),
+        apply_atomic_economic_delta=lambda *_: calls.append("atomic"),
+        apply_legacy=lambda: calls.append("legacy") or {"status": "OK"},
+    )
+    assert result.mode == "LEGACY"
+    assert calls == ["legacy"]
+
+
+def test_unproven_holdings_evidence_cannot_activate_atomic_writer():
+    with pytest.raises(RuntimeError, match="AUTHORITATIVE_OBSERVATION_REQUIRED"):
+        route_kr_settlement(
+            engine=_engine(), observation=None,
+            release=SettlementReleaseDecision(
+                market="KR", status="READY_FOR_CONTROLLED_SWITCH",
+                writer_allowed=True, missing=(),
+            ),
+            apply_atomic_economic_delta=lambda *_: None,
+            apply_legacy=lambda: None,
+        )
