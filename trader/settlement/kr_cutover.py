@@ -108,11 +108,19 @@ def _blocked_release(reason: str) -> SettlementReleaseDecision:
     )
 
 
-def load_kr_runtime_release(
+def load_kr_runtime_release_for_scope(
     engine: Engine,
-    observation: SettlementObservation,
+    *,
+    env: str,
+    trading_epoch_id: str,
+    account_scope: str | None = None,
 ) -> SettlementReleaseDecision:
-    """Load independently persisted release proofs; env alone can never enable writer."""
+    """Evaluate KR writer release for an account/epoch without applying evidence."""
+    env = str(env or "").strip().lower()
+    trading_epoch_id = str(trading_epoch_id or "").strip()
+    account_scope = str(account_scope or _account_scope(env)).strip()
+    if not env or not trading_epoch_id or not account_scope:
+        return _blocked_release("release_scope_incomplete")
     activation_requested = os.getenv(
         "NULLIM_KR_SETTLEMENT_ACTIVATE", "0"
     ).strip() == "1"
@@ -134,9 +142,9 @@ def load_kr_runtime_release(
 
     for field, expected in (
         ("market", "KR"),
-        ("env", observation.env),
-        ("trading_epoch_id", observation.trading_epoch_id),
-        ("account_scope", observation.account_scope),
+        ("env", env),
+        ("trading_epoch_id", trading_epoch_id),
+        ("account_scope", account_scope),
     ):
         if str(payload.get(field) or "") != str(expected):
             return _blocked_release("release_scope_mismatch:" + field)
@@ -175,15 +183,27 @@ def load_kr_runtime_release(
     health = check_settlement_health(
         engine,
         market="KR",
-        env=observation.env,
-        trading_epoch_id=observation.trading_epoch_id,
-        account_scope=observation.account_scope,
+        env=env,
+        trading_epoch_id=trading_epoch_id,
+        account_scope=account_scope,
     )
     return assess_release(
         market="KR",
         health=health,
         proofs=SettlementReleaseProof(**flags),
         activation_requested=True,
+    )
+
+
+def load_kr_runtime_release(
+    engine: Engine,
+    observation: SettlementObservation,
+) -> SettlementReleaseDecision:
+    return load_kr_runtime_release_for_scope(
+        engine,
+        env=observation.env,
+        trading_epoch_id=observation.trading_epoch_id,
+        account_scope=observation.account_scope,
     )
 
 
