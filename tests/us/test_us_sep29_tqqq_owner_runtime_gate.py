@@ -790,7 +790,9 @@ def _replay_session_tick_tqqq(
             (row["symbol"], row.get("strategy_owner"))
             for row in positions_seen_by_tick
         } == {
-            ("TQQQ", "TQQQ_INFINITE"),
+            # Generic PB1 trend evaluation must see only the standard owner.
+            # The dedicated Infinite sleeve is verified independently above
+            # through its TQQQ policy override and actual routed BUY.
             ("HELD_FIXTURE", "US_STANDARD"),
         }
     if operational_block is None:
