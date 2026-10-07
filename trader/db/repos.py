@@ -6223,52 +6223,62 @@ class PositionsRepo:
         fields: dict,
         position_cycle_id: str | None = None,
         portfolio_epoch_id: str | None = None,
+        _conn: Any = None,
     ) -> None:
         if not fields:
             return
         values = dict(fields)
         fail_soft = set(values).isdisjoint({"qty", "avg_buy_price", "total_cost", "realized_pnl"})
         try:
-            with self.engine.begin() as conn:
-                trading_epoch_id = active_trading_epoch_id(
-                    conn,
-                    env=env,
-                    account_id=get_account_key(env=env),
-                    required=trading_epoch_enforced(),
-                )
-                conditions = [
-                    self._schema.positions.c.env == env,
-                    self._schema.positions.c.strategy == strategy,
-                    self._schema.positions.c.sid == sid,
-                    self._schema.positions.c.mode == mode,
-                    self._schema.positions.c.code == code,
-                    self._schema.positions.c.status == "OPEN",
-                ]
-                if trading_epoch_id is not None:
-                    conditions.append(
-                        self._schema.positions.c.trading_epoch_id == trading_epoch_id
+            if _conn is None:
+                with self.engine.begin() as conn:
+                    return self.update_position_fields(
+                        env=env, strategy=strategy, sid=sid, mode=mode, code=code,
+                        fields=fields, position_cycle_id=position_cycle_id,
+                        portfolio_epoch_id=portfolio_epoch_id, _conn=conn,
                     )
-                if position_cycle_id:
-                    conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
-                if portfolio_epoch_id:
-                    conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
-                existing = conn.execute(
-                    select(self._schema.positions).where(and_(*conditions))
-                ).mappings().first()
-                existing_row = dict(existing) if existing else {}
-                if "entry_meta_json" in values:
-                    values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
-                if "last_exit_eval_json" in values:
-                    values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
-                if "position_meta" in values:
-                    values["position_meta"] = _merge_json_dict(existing_row.get("position_meta"), values.get("position_meta"))
-                stmt = (
-                    sa.update(self._schema.positions)
-                    .where(and_(*conditions))
-                    .values(**values, updated_at=func.now())
+            conn = _conn
+            trading_epoch_id = active_trading_epoch_id(
+                conn,
+                env=env,
+                account_id=get_account_key(env=env),
+                required=trading_epoch_enforced(),
+            )
+            conditions = [
+                self._schema.positions.c.env == env,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code,
+                self._schema.positions.c.status == "OPEN",
+            ]
+            if trading_epoch_id is not None:
+                conditions.append(
+                    self._schema.positions.c.trading_epoch_id == trading_epoch_id
                 )
-                conn.execute(stmt)
+            if position_cycle_id:
+                conditions.append(sa.cast(self._schema.positions.c.position_cycle_id, sa.String) == str(position_cycle_id))
+            if portfolio_epoch_id:
+                conditions.append(sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id))
+            existing = conn.execute(
+                select(self._schema.positions).where(and_(*conditions))
+            ).mappings().first()
+            existing_row = dict(existing) if existing else {}
+            if "entry_meta_json" in values:
+                values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
+            if "last_exit_eval_json" in values:
+                values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
+            if "position_meta" in values:
+                values["position_meta"] = _merge_json_dict(existing_row.get("position_meta"), values.get("position_meta"))
+            stmt = (
+                sa.update(self._schema.positions)
+                .where(and_(*conditions))
+                .values(**values, updated_at=func.now())
+            )
+            conn.execute(stmt)
         except Exception as exc:
+            if _conn is not None:
+                raise
             if fail_soft:
                 logger.warning(
                     "[POSITIONS][UPDATE][FAIL_SOFT] env=%s strategy=%s code=%s fields=%s err=%s",
@@ -6363,6 +6373,7 @@ class PositionsRepo:
         filled_at: datetime,
         pre_order_avg_buy_price: float | None = None,
         pre_order_stop_price: float | None = None,
+        _conn: Any = None,
     ) -> bool:
         """Advance one pyramid stage only after the ADD order is fully filled.
 
@@ -6392,65 +6403,75 @@ class PositionsRepo:
                 sa.cast(self._schema.positions.c.portfolio_epoch_id, sa.String) == str(portfolio_epoch_id)
             )
 
-        with self.engine.begin() as conn:
-            trading_epoch_id = active_trading_epoch_id(
-                conn,
-                env=env,
-                account_id=get_account_key(env=env),
-                required=trading_epoch_enforced(),
-            )
-            if trading_epoch_id is not None:
-                conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
-            row = conn.execute(
-                select(self._schema.positions).where(and_(*conditions))
-            ).mappings().first()
-            if not row:
-                logger.error(
-                    "[KR_PYRAMID][FILL_SYNC_BLOCK] code=%s level=%s cycle=%s reason=open_cycle_not_found",
-                    code, target_level, position_cycle_id,
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.mark_pyramid_add_fill(
+                    env=env, strategy=strategy, sid=sid, mode=mode, code=code,
+                    position_cycle_id=position_cycle_id, portfolio_epoch_id=portfolio_epoch_id,
+                    target_level=target_level, client_order_key=client_order_key,
+                    filled_qty=filled_qty, requested_qty=requested_qty, fill_price=fill_price,
+                    filled_at=filled_at, pre_order_avg_buy_price=pre_order_avg_buy_price,
+                    pre_order_stop_price=pre_order_stop_price, _conn=conn,
                 )
-                return False
-
-            current_level = int(row.get("pyramid_level") or 0)
-            current_meta = _merge_json_dict(row.get("position_meta"), {})
-            if (
-                current_level >= target_level
-                and str(current_meta.get("pyramid_last_filled_order_key") or "") == str(client_order_key or "")
-            ):
-                return True
-
-            base_avg = float(pre_order_avg_buy_price or 0.0)
-            if base_avg <= 0:
-                base_avg = float(row.get("avg_buy_price") or fill_price or 0.0)
-            existing_stop = float(
-                row.get("stop_price")
-                or pre_order_stop_price
-                or row.get("initial_stop")
-                or 0.0
+        conn = _conn
+        trading_epoch_id = active_trading_epoch_id(
+            conn,
+            env=env,
+            account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id is not None:
+            conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
+        row = conn.execute(
+            select(self._schema.positions).where(and_(*conditions))
+        ).mappings().first()
+        if not row:
+            logger.error(
+                "[KR_PYRAMID][FILL_SYNC_BLOCK] code=%s level=%s cycle=%s reason=open_cycle_not_found",
+                code, target_level, position_cycle_id,
             )
-            next_stop = existing_stop
-            if base_avg > 0:
-                next_stop = max(existing_stop, base_avg * 0.995)
+            return False
 
-            next_meta = _merge_json_dict(current_meta, {
-                "pyramid_last_filled_order_key": client_order_key,
-                "pyramid_last_filled_qty": filled_qty,
-                "pyramid_last_filled_level": target_level,
-                "pyramid_last_fill_price": float(fill_price or 0.0),
-            })
-            values = {
-                "pyramid_level": max(current_level, target_level),
-                "last_add_price": float(fill_price or 0.0) or row.get("last_add_price"),
-                "last_stop_update_ts": filled_at.isoformat(),
-                "position_meta": next_meta,
-            }
-            if next_stop > 0:
-                values["stop_price"] = next_stop
-            result = conn.execute(
-                sa.update(self._schema.positions)
-                .where(and_(*conditions))
-                .values(**values, updated_at=func.now())
-            )
+        current_level = int(row.get("pyramid_level") or 0)
+        current_meta = _merge_json_dict(row.get("position_meta"), {})
+        if (
+            current_level >= target_level
+            and str(current_meta.get("pyramid_last_filled_order_key") or "") == str(client_order_key or "")
+        ):
+            return True
+
+        base_avg = float(pre_order_avg_buy_price or 0.0)
+        if base_avg <= 0:
+            base_avg = float(row.get("avg_buy_price") or fill_price or 0.0)
+        existing_stop = float(
+            row.get("stop_price")
+            or pre_order_stop_price
+            or row.get("initial_stop")
+            or 0.0
+        )
+        next_stop = existing_stop
+        if base_avg > 0:
+            next_stop = max(existing_stop, base_avg * 0.995)
+
+        next_meta = _merge_json_dict(current_meta, {
+            "pyramid_last_filled_order_key": client_order_key,
+            "pyramid_last_filled_qty": filled_qty,
+            "pyramid_last_filled_level": target_level,
+            "pyramid_last_fill_price": float(fill_price or 0.0),
+        })
+        values = {
+            "pyramid_level": max(current_level, target_level),
+            "last_add_price": float(fill_price or 0.0) or row.get("last_add_price"),
+            "last_stop_update_ts": filled_at.isoformat(),
+            "position_meta": next_meta,
+        }
+        if next_stop > 0:
+            values["stop_price"] = next_stop
+        result = conn.execute(
+            sa.update(self._schema.positions)
+            .where(and_(*conditions))
+            .values(**values, updated_at=func.now())
+        )
 
         logger.info(
             "[KR_POSITION][PYRAMID_FULL_FILL_CONFIRMED] code=%s level=%s filled_qty=%s "
