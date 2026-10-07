@@ -1038,6 +1038,148 @@ def reconcile_ack_orders_with_balance(
     }
 
 
+def _load_close_order_attempt_truth(*, provider: Any, trade_date: str, env: str) -> list[dict]:
+    """Union active DB, durable journal/claims, and KIS rows by individual attempt.
+
+    Do not collapse two different broker orders merely because their semantic
+    strategy action is the same.  Failure of any truth source is NOT an empty
+    position/order book.
+    """
+    from trader.us.db.repos import (
+        load_pending_ack_orders_result, load_active_execution_claim_attempts,
+    )
+    from trader.us.execution.order_journal import load_order_events
+    from trader.us.utils.order_no import normalize_us_order_no
+
+    pending = load_pending_ack_orders_result(trade_date, env=env)
+    if pending.get("status") != "OK":
+        raise RuntimeError("pending_attempts_db_unavailable: " + str(pending.get("error") or "unknown"))
+    attempts: list[dict] = []
+
+    def _order_no(row):
+        return str(row.get("order_no") or row.get("broker_order_no") or
+                   row.get("raw_broker_order_no") or row.get("raw_order_no") or
+                   row.get("canonical_order_no") or "")
+
+    def _add(row: dict, source: str):
+        if not isinstance(row, dict):
+            return
+        symbol = str(row.get("symbol") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        if not symbol or side not in {"BUY", "SELL"}:
+            return
+        key = str(row.get("client_order_key") or "")
+        attempt_id = str(row.get("submit_attempt_id") or row.get("active_attempt_id") or "")
+        order_no = _order_no(row)
+        canonical = normalize_us_order_no(order_no) if order_no else ""
+        found = None
+        for existing in attempts:
+            if existing["symbol"] != symbol or existing["side"] != side:
+                continue
+            prior_no = normalize_us_order_no(existing.get("order_no")) if existing.get("order_no") else ""
+            prior_attempt = str(existing.get("submit_attempt_id") or "")
+            if canonical and prior_no and canonical == prior_no:
+                # Colliding order numbers with different durable attempts must
+                # remain separate rather than silently combining their fills.
+                if attempt_id and prior_attempt and attempt_id != prior_attempt:
+                    continue
+                found = existing
+                break
+            if attempt_id and prior_attempt and attempt_id == prior_attempt:
+                found = existing
+                break
+            if key and key == existing.get("client_order_key") and not (
+                (canonical and prior_no and canonical != prior_no)
+                or (attempt_id and prior_attempt and attempt_id != prior_attempt)
+            ):
+                found = existing
+                break
+        if found is None:
+            found = {
+                "symbol": symbol, "side": side, "order_no": order_no,
+                "client_order_key": key, "submit_attempt_id": attempt_id,
+                "_sources": [],
+            }
+            attempts.append(found)
+        if source not in found["_sources"]:
+            found["_sources"].append(source)
+        if not found.get("client_order_key") and key:
+            found["client_order_key"] = key
+        if not found.get("submit_attempt_id") and attempt_id:
+            found["submit_attempt_id"] = attempt_id
+        if not found.get("order_no") and order_no:
+            found["order_no"] = order_no
+        if source == "broker":
+            found["_broker_observation"] = dict(row)
+            # Broker quantity is evidence; never silently overwrite local
+            # metadata or identity by joining on a strategy symbol alone.
+            found["broker_remaining_qty"] = row.get("remaining_qty")
+            found["broker_filled_qty"] = row.get("filled_qty")
+            found["broker_status"] = row.get("status")
+            found["broker_filled_qty_present"] = row.get("filled_qty_present")
+            found["broker_normalization_result"] = row.get("normalization_result")
+            found["broker_requested_qty"] = row.get("requested_qty")
+            found["open_order"] = row.get("open_order")
+        else:
+            for field in ("qty_requested", "qty_filled", "status", "created_at", "meta"):
+                if row.get(field) not in (None, "") and found.get(field) in (None, ""):
+                    found[field] = row[field]
+            if source == "claim":
+                found["active_claim"] = True
+
+    for row in pending["orders"]:
+        _add(row, "local")
+    # The production US provider implements this and returns a normalized,
+    # account-scoped complete order book for the trade date.
+    if callable(getattr(provider, "get_today_orders", None)):
+        events = load_order_events(trade_date)
+        aborted = {
+            str(event.get("submit_attempt_id") or "")
+            for event in events
+            if str(event.get("event_type") or "") in {
+                "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY", "BROKER_SUBMIT_ABORTED_PRE_IO",
+            }
+        }
+        relevant_events = {
+            "BROKER_SUBMIT_STARTED", "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED",
+            "ORDER_PARTIALLY_FILLED", "ORDER_FILLED", "ORDER_CANCELLED", "ORDER_REJECTED",
+            "JOURNAL_REPLAY_UNRESOLVED",
+        }
+        for event in events:
+            event_type = str(event.get("event_type") or "")
+            attempt_id = str(event.get("submit_attempt_id") or "")
+            if event_type not in relevant_events or (attempt_id and attempt_id in aborted):
+                continue
+            _add(event, "journal")
+        for claim in load_active_execution_claim_attempts():
+            if str(claim.get("trade_date") or "")[:10] != str(trade_date):
+                continue
+            # Claims contain attempt key but not necessarily a symbol. Attach to
+            # matching client attempt, or retain a sentinel for unresolved claim.
+            claim_key = str(claim.get("client_order_key") or "")
+            claim_attempt = str(claim.get("active_attempt_id") or "")
+            matches = [
+                row for row in attempts
+                if ((claim_attempt and row.get("submit_attempt_id") == claim_attempt)
+                    or (claim_key and row.get("client_order_key") == claim_key))
+            ]
+            if len(matches) == 1:
+                matches[0]["active_claim"] = True
+                matches[0]["_sources"].append("claim")
+            else:
+                attempts.append({
+                    "symbol": "UNKNOWN", "side": "UNKNOWN", "status": "ACTIVE_CLAIM_UNKNOWN",
+                    "client_order_key": claim_key, "submit_attempt_id": claim_attempt,
+                    "_sources": ["claim"], "active_claim": True,
+                })
+        broker_rows = provider.get_today_orders(trade_date)
+        if not isinstance(broker_rows, list):
+            raise RuntimeError("broker_order_book_unavailable_or_invalid")
+        for broker_row in broker_rows:
+            _add(broker_row, "broker")
+    return attempts
+
+
 def classify_ack_orders_with_final_balance(
     *,
     provider: Any,
@@ -1049,16 +1191,23 @@ def classify_ack_orders_with_final_balance(
 
     Intended for close reports, after the broker's balance has had time to settle.
     """
-    from trader.us.db.repos import load_pending_ack_orders
-
     if orders is None:
-        orders = load_pending_ack_orders(trade_date=trade_date, env=env)
+        try:
+            orders = _load_close_order_attempt_truth(
+                provider=provider, trade_date=trade_date, env=env
+            )
+        except Exception as exc:
+            return {"status": "ERROR", "error": str(exc), "orders": [],
+                    "pending_order_count": 1, "manual_reconcile_required": 1}
 
     try:
         balance = _get_balance_force_refresh(provider)
+        if not isinstance(balance, dict) or str(balance.get("balance_parse_status") or "OK").upper() != "OK":
+            raise RuntimeError("close_broker_balance_not_authoritative")
         final_positions = _build_kis_position_by_symbol(balance.get("positions", []))
     except Exception as exc:
-        return {"status": "ERROR", "error": str(exc), "orders": [], "pending_order_count": len(orders or [])}
+        return {"status": "ERROR", "error": str(exc), "orders": [], "pending_order_count": max(1, len(orders or [])),
+                "manual_reconcile_required": 1}
 
     classified: list[dict] = []
     pending = 0
@@ -1073,6 +1222,27 @@ def classify_ack_orders_with_final_balance(
         final_orderable = int((final_positions.get(symbol) or {}).get("orderable_qty") or 0)
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
+        broker = order.get("_broker_observation") if isinstance(order.get("_broker_observation"), dict) else {}
+        broker_status = str(broker.get("status") or "").strip().upper()
+        broker_present = bool(broker)
+        broker_normalized = str(broker.get("normalization_result") or "").lower() != "quarantined"
+        broker_fill_explicit = (
+            broker.get("filled_qty_present") is not False
+            and broker.get("filled_qty") not in (None, "")
+        )
+        broker_fill = int(broker.get("filled_qty") or 0) if broker_fill_explicit else None
+        broker_remaining = (
+            int(broker["remaining_qty"])
+            if broker.get("remaining_qty") not in (None, "") else None
+        )
+        if broker.get("requested_qty") not in (None, ""):
+            broker_requested = int(broker["requested_qty"])
+            if qty and qty != broker_requested:
+                order["broker_local_quantity_conflict"] = True
+            if not qty:
+                qty = broker_requested
+        if broker_fill is not None:
+            fill_qty = max(fill_qty, broker_fill)
         identity = validate_reconcile_identity(
             trade_date=trade_date, order_no=str(order.get("order_no") or ""),
             client_order_key=str(order.get("client_order_key") or ""),
@@ -1084,12 +1254,39 @@ def classify_ack_orders_with_final_balance(
             counts[final_status] = counts.get(final_status, 0) + 1
             classified.append({"symbol": symbol, "side": side, "final_status": final_status})
             continue
-        if raw_status in {"REJECT", "REJECTED"}:
+        # Broker-open evidence wins over local terminal/partial status.  A
+        # partial fill is NOT an order-complete event while remaining > 0.
+        if order.get("broker_local_quantity_conflict") or (broker_present and not broker_normalized):
+            final_status = "ack_unresolved_error"
+        elif broker_present and broker_remaining is not None and broker_remaining > 0:
+            final_status = "partial_fill_open" if fill_qty > 0 else "ack_open_order_pending"
+        elif broker_present and broker_status in {"CANCELLED", "CANCELED", "EXPIRED", "LAPSED", "REJECTED", "REJECT"}:
+            if not broker_fill_explicit:
+                final_status = "ack_unresolved_error"
+            elif broker_fill > 0:
+                final_status = "partial_fill_cancelled" if broker_status in {"CANCELLED", "CANCELED"} else "partial_fill_terminal"
+            else:
+                final_status = "rejected" if broker_status in {"REJECTED", "REJECT"} else "cancelled_or_expired"
+        elif broker_present and broker_fill_explicit and qty > 0 and broker_fill >= qty and broker_remaining == 0:
+            final_status = "broker_fill_confirmed"
+        elif broker_present and broker_remaining == 0 and fill_qty > 0 and fill_qty < qty:
+            # Remaining zero but only a partial quantity: terminal proof is
+            # missing, so keep reconciliation pending rather than inventing it.
+            final_status = "ack_unresolved_error"
+        elif broker_present and broker_remaining is None and broker_fill_explicit and 0 < broker_fill < qty:
+            final_status = "ack_unresolved_error"
+        elif broker_present and order.get("_sources") == ["broker"]:
+            final_status = "ack_unresolved_error"  # broker-only identity is unattributed
+        elif raw_status in {"REJECT", "REJECTED"}:
             final_status = "rejected"
         elif raw_status in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
             final_status = "DUPLICATE_OR_ALREADY_CLOSED" if raw_status == "WARN_DUPLICATE_EXIT_BLOCKED" else "BLOCKED"
-        elif fill_qty > 0 or raw_status in {"FILLED", "PARTIALLY_FILLED"}:
+        elif qty > 0 and fill_qty >= qty and (not broker_present or broker_fill_explicit):
             final_status = "broker_fill_confirmed"
+        elif fill_qty > 0 or raw_status in {"PARTIALLY_FILLED"}:
+            final_status = "ack_open_order_pending" if broker_remaining is None else "ack_unresolved_error"
+        elif order.get("active_claim") and not broker_present:
+            final_status = "ack_unresolved_error"
         elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
             final_status = "balance_delta_confirmed"
         elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty == qty:
@@ -1118,12 +1315,13 @@ def classify_ack_orders_with_final_balance(
             final_status = "ack_unresolved_error"
         if final_status == "ack_unresolved_error":
             pending += 1
-        elif final_status == "ack_open_order_pending":
+        elif final_status in {"ack_open_order_pending", "partial_fill_open"}:
             open_order_pending += 1
             logger.warning(
                 "[US_CLOSE][ORDER_RECONCILE][OPEN_ORDER_PENDING] symbol=%s order_no=%s requested_qty=%s "
-                "filled_qty=0 remaining_qty=%s action=warn_not_fail",
-                symbol, order.get("order_no") or order.get("ack_no") or "", qty, qty,
+                "filled_qty=%s remaining_qty=%s action=warn_not_fail",
+                symbol, order.get("order_no") or order.get("ack_no") or "",
+                qty, fill_qty, broker_remaining if broker_remaining is not None else max(0, qty - fill_qty),
             )
         counts[final_status] = counts.get(final_status, 0) + 1
         classified.append({
@@ -1134,6 +1332,11 @@ def classify_ack_orders_with_final_balance(
             "order_no": str(order.get("order_no") or order.get("ack_no") or ""),
             "client_order_key": str(order.get("client_order_key") or ""),
             "ack_status": raw_status,
+            "broker_status": broker_status,
+            "submit_attempt_id": str(order.get("submit_attempt_id") or ""),
+            "broker_filled_qty": broker_fill,
+            "broker_remaining_qty": broker_remaining,
+            "evidence_sources": list(order.get("_sources") or []),
             "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
             "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else ("position_absent_confirmed_sell" if final_status == "position_absent_confirmed_sell" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),
             "final_status": final_status,
