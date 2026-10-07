@@ -1195,6 +1195,7 @@ def run_kr_close_policy_from_tagged_positions(
         "db_positions": db_positions,
         "latest_buy_fills": latest_buy_fills,
         "policy_sell_candidates": len(policy_orders),
+        "evaluated_positions": len(list(kis_holdings or [])),
     }
 
 
@@ -5608,9 +5609,10 @@ def run_once(
 
     remaining_s = _remaining_seconds()
     close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "0"))).strip().lower() not in {"0", "false", "no"}
-    exit_short_circuit = (phase_for_log == "exit" or window_label == "close") and not close_liquidation_enabled
-    if (phase_for_log == "exit" or window_label == "close") and close_liquidation_enabled:
-        logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled skip_exit_shortcircuit=1")
+    close_or_exit_phase = phase_for_log == "exit" or window_label == "close"
+    exit_reconcile_first = close_or_exit_phase and not close_liquidation_enabled
+    if close_or_exit_phase and close_liquidation_enabled:
+        logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled emergency_path=1")
 
     def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
         checkpoint_key = _close_reconcile_checkpoint_key(
@@ -5687,29 +5689,39 @@ def run_once(
         logger.info("[PB1][CLOSE][RECONCILE][RUN_ONCE] done=1")
         return reconcile_ok_local, close_stale_ok_local
 
-    if exit_short_circuit:
-        logger.info("[PB1][EXIT_SHORTCIRCUIT] start remaining_s=%.1f", remaining_s)
+    if exit_reconcile_first:
+        logger.info(
+            "[KR_CLOSE][PREPOLICY_RECONCILE] start remaining_s=%.1f continue_to_owner_policy=1",
+            remaining_s,
+        )
         kis = None
         try:
             kis = KisAPI()
         except Exception:
-            logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
+            logger.exception("[KR_CLOSE][PREPOLICY_RECONCILE] KIS init failed")
         run_id = os.getenv("TRADER_RUN_ID", "local")
         reconcile_ok = False
         close_stale_ok = False
         try:
-            reconcile_ok, close_stale_ok = _run_close_reconcile_once(reason_label="exit_shortcircuit", kis_obj=kis)
-            _write_last_db_write(runtime_root_dir, run_id=run_id, reason="exit_shortcircuit", now=now)
+            reconcile_ok, close_stale_ok = _run_close_reconcile_once(
+                reason_label="prepolicy_reconcile", kis_obj=kis
+            )
+            _write_last_db_write(
+                runtime_root_dir, run_id=run_id, reason="prepolicy_reconcile", now=now
+            )
             if not reconcile_ok or not close_stale_ok:
                 logger.error(
-                    "[PB1][EXIT_SHORTCIRCUIT][PARTIAL_FAIL] reconcile_ok=%s close_stale_ok=%s - continuing with caution",
+                    "[KR_CLOSE][PREPOLICY_RECONCILE][PARTIAL_FAIL] reconcile_ok=%s close_stale_ok=%s action=CONTINUE_OWNER_POLICY_WITH_GUARDS",
                     reconcile_ok,
                     close_stale_ok,
                 )
-            logger.info("[PB1][EXIT_SHORTCIRCUIT] done")
-            return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT"
+            logger.info(
+                "[KR_CLOSE][PREPOLICY_RECONCILE] done continue_to_owner_policy=1"
+            )
         except Exception:
-            logger.exception("[PB1][EXIT_SHORTCIRCUIT] failed")
+            logger.exception(
+                "[KR_CLOSE][PREPOLICY_RECONCILE] failed action=CONTINUE_OWNER_POLICY_WITH_GUARDS"
+            )
 
     if should_degrade(remaining_s):
         logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
@@ -6571,6 +6583,27 @@ def run_once(
             holdings_for_policy = []
             if isinstance(balance_snapshot_raw, dict):
                 holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
+            if kis is not None:
+                try:
+                    fresh_close_balance = kis.get_balance() or {}
+                    if isinstance(fresh_close_balance, dict):
+                        fresh_holdings = list(
+                            fresh_close_balance.get("output1")
+                            or fresh_close_balance.get("holdings")
+                            or []
+                        )
+                        if fresh_holdings:
+                            holdings_for_policy = fresh_holdings
+                            logger.info(
+                                "[KR_CLOSE][POLICY][BALANCE_REFRESH] source=KIS holdings=%s",
+                                len(holdings_for_policy),
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "[KR_CLOSE][POLICY][BALANCE_REFRESH][FAIL] err=%s fallback_snapshot_holdings=%s",
+                        exc,
+                        len(holdings_for_policy),
+                    )
             close_policy_result = run_kr_close_policy_from_tagged_positions(
                 kis_holdings=holdings_for_policy,
                 positions_repo=positions_repo,
@@ -6584,6 +6617,7 @@ def run_once(
             policy_orders = list(close_policy_result.get("policy_orders") or [])
             policy_results = list(close_policy_result.get("policy_results") or [])
             accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
+            evaluated_positions = int(close_policy_result.get("evaluated_positions") or 0)
             logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
             logger.info(
                 "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
@@ -6594,6 +6628,7 @@ def run_once(
                 "sell_orders": accepted_policy_sells,
                 "sell_orders_ack": accepted_policy_sells,
                 "policy_sell_candidates": len(policy_orders),
+                "exit_evaluated_positions": evaluated_positions,
                 "warning_counts": {},
             }, phase_for_log, "OK_CLOSE_POLICY"
 
