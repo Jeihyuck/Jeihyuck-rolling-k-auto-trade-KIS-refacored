@@ -95,3 +95,50 @@ def test_market_scope_mismatch_fails_closed():
             apply_atomic_economic_delta=lambda *_: None,
             apply_legacy=lambda: None,
         )
+
+
+def test_kr_sell_reconcile_can_share_caller_transaction():
+    from datetime import datetime, timezone
+    from trader.db.repos import PositionsRepo
+    from tests.kr.test_kr_20261006_execution_convergence import _db, _open_position
+
+    engine = _db()
+    repo = PositionsRepo(engine)
+    position = _open_position(engine, code="293490", qty=115, avg=9485.826)
+
+    with engine.begin() as conn:
+        result = repo.reconcile_sell_execution(
+            env="practice",
+            strategy="pb1_pullback_close",
+            sid=1,
+            mode=1,
+            code="293490",
+            market="KOSPI",
+            confirmed_cumulative_qty=37,
+            fill_price=None,
+            filled_at=datetime(2026, 10, 6, 0, 48, tzinfo=timezone.utc),
+            position_cycle_id=str(position["position_cycle_id"]),
+            portfolio_epoch_id=str(position["portfolio_epoch_id"]),
+            order_id="atomic-kr-sell-293490",
+            pre_order_holding_qty=115,
+            broker_holding_qty=78,
+            _conn=conn,
+        )
+        assert conn.in_transaction()
+        assert result["qty_applied"] == 37
+        assert result["remaining_qty"] == 78
+
+    stored = repo.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="293490", position_cycle_id=str(position["position_cycle_id"]),
+        portfolio_epoch_id=str(position["portfolio_epoch_id"]),
+    )
+    assert stored["qty"] == 78
+
+
+def test_kr_position_mutators_expose_caller_connection_contract():
+    import inspect
+    from trader.db.repos import PositionsRepo
+
+    assert "_conn" in inspect.signature(PositionsRepo.apply_fill).parameters
+    assert "_conn" in inspect.signature(PositionsRepo.reconcile_sell_execution).parameters
