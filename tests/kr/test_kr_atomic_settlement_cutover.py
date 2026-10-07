@@ -220,3 +220,21 @@ def test_production_reconcile_is_connected_to_single_writer_router():
     assert "load_kr_runtime_release" in source
     assert "record_execution_claim_for_order(" in source
     assert "_conn=conn" in source
+
+
+
+def test_kr_lifecycle_metadata_mutators_share_atomic_connection_contract():
+    import inspect
+    from trader.db.repos import PositionsRepo
+
+    assert "_conn" in inspect.signature(PositionsRepo.update_position_fields).parameters
+    assert "_conn" in inspect.signature(PositionsRepo.mark_pyramid_add_fill).parameters
+
+
+def test_production_atomic_callback_projects_exit_and_pyramid_state_in_same_transaction():
+    source = open("trader/reconcile_kis.py", encoding="utf-8").read()
+    assert "claim_snapshot = orders_repo.record_execution_claim_for_order(" in source
+    assert "positions_repo.update_position_fields(" in source
+    assert "positions_repo.mark_pyramid_add_fill(" in source
+    assert "_conn=conn" in source
+    assert "atomic_buy_applied = route_result.mode == \"ATOMIC_SETTLEMENT\"" in source
