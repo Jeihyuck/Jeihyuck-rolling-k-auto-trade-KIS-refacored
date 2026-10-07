@@ -737,6 +737,54 @@ def same_day_semantic_sell_exists(intent: dict) -> bool:
             return True
     return False
 
+def _tp_unsubmitted_attempt_may_release_stage(intent: dict, trade_date: str) -> bool:
+    """Only release this TP attempt if *all* durable submit sources prove absence.
+
+    Failure to read orders/journal/claims is unknown, not proof of zero.
+    Other open SELLs on the same symbol retain their own stage fence.
+    """
+    symbol = str(intent.get("symbol") or "").upper().strip()
+    key = str(intent.get("client_order_key") or "").strip()
+    if not symbol or not key or not trade_date:
+        return False
+    try:
+        from trader.us.db.repos import (
+            load_pending_ack_orders_result, load_active_execution_claim_attempts,
+            _parse_json_meta,
+        )
+        from trader.us.execution.order_journal import load_order_events
+        pending = load_pending_ack_orders_result(trade_date)
+        if pending.get("status") != "OK":
+            return False
+        for row in pending.get("orders") or []:
+            if str(row.get("symbol") or "").upper() != symbol or str(row.get("side") or "").upper() != "SELL":
+                continue
+            # Do not clear the stage when any other broker-open SELL is present.
+            if str(row.get("client_order_key") or "") != key:
+                return False
+            # Same key already active also means this cannot be a new pre-submit attempt.
+            return False
+        for row in load_active_execution_claim_attempts():
+            if str(row.get("trade_date") or "")[:10] != str(trade_date):
+                continue
+            if str(row.get("client_order_key") or "") == key:
+                return False
+        events = load_order_events(trade_date)
+        for event in events:
+            if str(event.get("client_order_key") or "") != key:
+                continue
+            if str(event.get("event_type") or "") in {
+                "BROKER_SUBMIT_STARTED", "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED",
+                "ORDER_PARTIALLY_FILLED", "ORDER_FILLED", "ORDER_CANCELLED",
+            }:
+                return False
+        return True
+    except Exception as exc:
+        logger.error("[US_PROFIT_CAPTURE][TP_FENCE][UNKNOWN] symbol=%s key=%s err=%s",
+                     symbol, key, exc)
+        return False
+
+
 def _validate_take_profit_with_fresh_broker_position(
     intent: dict, broker_position: dict | None, *, now: Any | None = None,
 ) -> dict:
@@ -1447,6 +1495,9 @@ def route_order(
                     "guard_reason": guard_reason,
                     "broker_submit": False,
                     "pre_submit_tp_block": True,
+                    "safe_to_release_tp_pending": _tp_unsubmitted_attempt_may_release_stage(
+                        intent, trade_date
+                    ),
                     "intent": intent,
                     "broker_position": broker_pos,
                 }

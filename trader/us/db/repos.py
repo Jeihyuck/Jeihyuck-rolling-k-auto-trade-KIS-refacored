@@ -3819,6 +3819,53 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
         return []
 
 
+def load_pending_ack_orders_result(trade_date: str, env: str = "practice") -> dict:
+    """Strict pending-attempt query for execution/close integrity.
+
+    Unlike the compatibility list API, a failed DB read cannot mean zero orders.
+    Includes broker-open/partially-filled statuses that older ACK-only queries
+    missed. Every row remains an individual order attempt.
+    """
+    td = trade_date or _today()
+    open_statuses = (
+        "ACK", "SENT", "PARTIALLY_FILLED", "OPEN", "PENDING",
+        "WORKING", "ACK_OPEN", "RECONCILE_PENDING", "ACK_DB_FAILED",
+        "SUBMITTED",
+    )
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {"status": "OK", "orders": [
+            dict(o) for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and str(o.get("status") or "").upper() in open_statuses
+            and int(o.get("qty_filled") or 0) < int(o.get("qty_requested") or o.get("qty") or 0)
+        ]}
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = """
+                SELECT * FROM us_orders
+                WHERE trade_date=:td
+                  AND status IN (
+                      'ACK','SENT','PARTIALLY_FILLED','OPEN','PENDING',
+                      'WORKING','ACK_OPEN','RECONCILE_PENDING','ACK_DB_FAILED',
+                      'SUBMITTED'
+                  )
+                  AND COALESCE(qty_filled, 0) < qty_requested
+            """
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at ASC"
+            return {"status": "OK", "orders": [
+                dict(row) for row in conn.execute(text(sql), params).mappings().all()
+            ]}
+    except Exception as exc:
+        logger.error("[US_ORDERS][PENDING_ATTEMPTS][DB_ERROR] trade_date=%s err=%s", td, exc)
+        return {"status": "DB_ERROR", "orders": [], "error": str(exc)}
+
+
 def _parse_json_meta(value: Any) -> dict:
     if isinstance(value, dict):
         return dict(value)

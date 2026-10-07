@@ -1420,11 +1420,19 @@ def route_exit_orders_immediately(
             stage = str(meta.get("profit_capture_stage") or "")
             if stage:
                 from trader.us.profit_capture import sync_profit_capture_stage_from_order
+                # A generic BLOCKED is not proof that this stage has no
+                # broker-open attempt. Only a positively verified pre-submit
+                # block may release this attempt's pending reservation.
                 mapped_status = {
                     "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "AMBIGUOUS_ACK",
                     "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
                     "ACK_DB_FAILED": "AMBIGUOUS_ACK", "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
                 }.get(status, status)
+                if status == "BLOCKED" and result.get("pre_submit_tp_block"):
+                    mapped_status = (
+                        "FAILED" if result.get("safe_to_release_tp_pending") is True
+                        else "AMBIGUOUS_ACK"
+                    )
                 sync_profit_capture_stage_from_order(
                     trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
                     symbol=str(intent.get("symbol") or ""),
