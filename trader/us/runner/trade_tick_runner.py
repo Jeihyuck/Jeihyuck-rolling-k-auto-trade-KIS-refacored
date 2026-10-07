@@ -27,14 +27,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _ACCOUNTED_TOP_LEVEL_STAGES = (
-    "prep_status_ms", "watchlist_load_ms", "position_reconcile_ms",
-    "exit_engine_ms", "market_state_ms", "tqqq_infinite_ms",
-    "entry_engine_ms", "risk_gate_ms", "order_route_ms",
+    # These intervals run sequentially. Provider HTTP time is a nested
+    # diagnostic and must NOT be added again to these wall-clock intervals.
+    "cash_fetch_ms", "position_reconcile_ms", "fill_fetch_stage_ms",
+    "fill_persist_ms", "order_reconcile_ms", "exit_engine_ms",
+    "market_state_ms", "tqqq_infinite_ms", "entry_engine_ms",
+    "order_route_ms", "post_route_reconcile_ms",
 )
 
 
 def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float]) -> tuple[float, float]:
-    """Account only non-nested stage timers and keep the remainder bounded."""
+    """Use distinct wall-clock spans, excluding nested KIS/DB submetrics."""
     total = max(0.0, float(total_ms))
     accounted = min(total, sum(max(0.0, float(stage_metrics.get(key, 0.0)))
                                for key in _ACCOUNTED_TOP_LEVEL_STAGES))
@@ -720,6 +723,11 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
         locked_watchlist_cache = loaded_rows
         watchlist_cache_source = "trend_final30_preload"
     counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
+    from trader.us.db.repos import load_latest_us_position_risk_states
+    _trend_symbols = [str(pos.get("symbol") or "").upper().strip() for pos in positions or [] if pos.get("symbol")]
+    latest_risk_by_symbol = load_latest_us_position_risk_states(_trend_symbols, trade_date)
+    from trader.us.market_calendar import previous_completed_us_session
+    expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
     for pos in positions or []:
         symbol = str(pos.get("symbol") or "").upper().strip()
         if not symbol:
@@ -753,10 +761,9 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
         daily = {}
         metrics_source = "insufficient_history"
         try:
-            from trader.us.market_calendar import previous_completed_us_session
-            expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
-            from trader.us.position_trend_state import load_trend_state
-            persisted = load_trend_state(symbol, trade_date)
+            persisted = dict(
+                ((latest_risk_by_symbol.get(symbol) or {}).get("state") or {}).get("trend") or {}
+            )
             if (
                 persisted.get("daily_metrics_trade_date") == trade_date
                 and str(persisted.get("daily_metrics_as_of") or "") == expected_metrics_as_of
@@ -822,6 +829,7 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
                     lifecycle_id=lifecycle_id,
                     warning_threshold=frozen_trend_cfg.get("trend_score_warning_threshold"),
                     severe_threshold=frozen_trend_cfg.get("trend_score_severe_threshold"),
+                    preloaded_latest_risk=latest_risk_by_symbol.get(symbol, {}),
                 )
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STATE][WARN] symbol=%s err=%s", symbol, exc)
@@ -1523,6 +1531,7 @@ def run_trade_tick(
     locked_watchlist_cache: list[dict] | None = None,
     prep_cache_source: str | None = None,
     watchlist_cache_source: str | None = None,
+    completed_market_context: dict | None = None,
     entry_can_proceed: bool = True,
     exit_can_proceed: bool = True,
     tqqq_policy_override_allowed: bool = False,
@@ -1925,9 +1934,12 @@ def run_trade_tick(
             logger.error("[US_TICK][ERROR] fills exception: %s", exc)
             fills_error_count += 1
         finally:
+            tick_context.metrics["fill_fetch_stage_ms"] = (
+                time.monotonic() - _fill_fetch_started
+            ) * 1000.0
             tick_context.metrics["fill_fetch_ms"] = max(
                 float(tick_context.metrics.get("fill_fetch_ms", 0.0)),
-                (time.monotonic() - _fill_fetch_started) * 1000.0,
+                tick_context.metrics["fill_fetch_stage_ms"],
             )
 
     # temp_error_count, temp_recovered_count, kis_temp_errors_by_api는 함수 시작부에서 사전 초기화됨
@@ -2484,6 +2496,7 @@ def run_trade_tick(
             positions=current_positions,
             account_snapshot=account_snapshot,
             now=now,
+            completed_market_context=completed_market_context,
         )
         if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
             prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
@@ -2700,6 +2713,7 @@ def run_trade_tick(
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
     _entry_engine_started = time.monotonic()
+    tick_context.metrics["pre_entry_elapsed_ms"] = (_entry_engine_started - tick_started_at) * 1000.0
     entry_intents: list[dict] = []
     entry_eval_error_count = 0
     entry_contract_integrity_block_count = 0
@@ -3687,6 +3701,7 @@ def run_trade_tick(
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
     ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
 
+    _post_route_reconcile_started = time.monotonic()
     if not offline and ack_cnt > 0:
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
@@ -3710,6 +3725,9 @@ def run_trade_tick(
             ack_recon = dict(ack_recon_after_route)
     else:
         ack_recon_after_route = dict(ack_recon_before_route)
+    tick_context.metrics["post_route_reconcile_ms"] = (
+        time.monotonic() - _post_route_reconcile_started
+    ) * 1000.0 if not offline and ack_cnt > 0 else 0.0
 
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
@@ -4024,6 +4042,8 @@ def run_trade_tick(
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
         "balance_retry_calls": int(tick_context.counters.get("balance_retry_calls", 0)),
         "fill_fetch_ms": float(tick_context.metrics.get("fill_fetch_ms", 0)),
+        "fill_fetch_stage_ms": float(tick_context.metrics.get("fill_fetch_stage_ms", 0)),
+        "pre_entry_elapsed_ms": float(tick_context.metrics.get("pre_entry_elapsed_ms", 0)),
         "cash_fetch_ms": float(tick_context.metrics.get("cash_fetch_ms", 0)),
         "entry_budget_sec": float(tick_context.metrics.get("entry_budget_sec", 0)),
         "execution_tail_reserve_sec": float(tick_context.metrics.get("execution_tail_reserve_sec", resolve_us_execution_tail_reserve_sec())),
@@ -4045,12 +4065,14 @@ def run_trade_tick(
         "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
         "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
         "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "post_route_reconcile_ms": float(tick_context.metrics.get("post_route_reconcile_ms", 0)),
         "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
         "fill_rows_received": len(fills_today),
         "fill_rows_changed": int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0),
         "fill_rows_persisted": int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0),
         "exit_engine_ms": float(tick_context.metrics.get("exit_engine_ms", 0)),
         "market_state_ms": float(tick_context.metrics.get("market_state_ms", 0)),
+        "completed_market_cache_hit": int(bool(market_state_overlay.get("completed_market_cache_hit"))),
         "tqqq_infinite_ms": float(tick_context.metrics.get("tqqq_infinite_ms", 0)),
         "entry_engine_ms": float(tick_context.metrics.get("entry_engine_ms", 0)),
         "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
@@ -4059,6 +4081,18 @@ def run_trade_tick(
     accounted_stage_ms, unaccounted_ms = calculate_latency_accounting(tick_total_ms, latency_metrics)
     latency_metrics["accounted_stage_ms"] = accounted_stage_ms
     latency_metrics["unaccounted_ms"] = unaccounted_ms
+    latency_metrics["pre_entry_accounted_ms"] = round(sum(
+        max(0.0, latency_metrics.get(k, 0.0)) for k in (
+            "cash_fetch_ms", "position_reconcile_ms", "fill_fetch_stage_ms",
+            "fill_persist_ms", "order_reconcile_ms", "exit_engine_ms",
+            "market_state_ms", "tqqq_infinite_ms",
+        )
+    ), 3)
+    latency_metrics["pre_entry_residual_ms"] = round(max(
+        0.0, latency_metrics["pre_entry_elapsed_ms"] -
+        latency_metrics["pre_entry_accounted_ms"]
+    ), 3)
+    latency_metrics["slot_overrun_300s"] = int(tick_total_ms > 300000)
     latency_log = logger.warning if unaccounted_ms > 2000 else logger.info
     latency_log(
         "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
@@ -4123,6 +4157,7 @@ def run_trade_tick(
         **latency_metrics,
         "status": status,
         "runtime_integrity_status": runtime_integrity_status,
+        "completed_market_context": market_state_overlay.get("_completed_market_context") or None,
         "sell_liveness_status": sell_liveness_status,
         "entry_liveness_status": entry_liveness_status,
         "reconcile_liveness_status": reconcile_liveness_status,

@@ -176,8 +176,39 @@ def calculate_qqq_long_context(closes: list[float]) -> dict[str, Any]:
     return out
 
 
-def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict[str, float | None]:
+def completed_market_context_usable(
+    context: dict | None, *, trade_date: str, expected_date: str, data_version: str,
+) -> bool:
+    """A failed/missing/stale bootstrap is never a cache hit."""
+    if not isinstance(context, dict) or context.get("quality") != "OK":
+        return False
+    return bool(
+        context.get("trade_date") == str(trade_date)
+        and context.get("expected_completed_date") == str(expected_date)
+        and context.get("data_version") == str(data_version)
+        and isinstance(context.get("returns"), dict)
+        and all(context["returns"].get(f"{symbol.lower()}_20d_return") is not None
+                for symbol in _MARKET_RETURN_SYMBOLS)
+    )
+
+
+def _market_returns(
+    provider: Any, trade_date: str, warnings: list[str],
+    completed_market_context: dict | None = None, data_version: str = "",
+) -> dict[str, float | None]:
+    from trader.us.market_calendar import previous_completed_us_session
+    expected_date = previous_completed_us_session(trade_date).isoformat()
+    if completed_market_context_usable(
+        completed_market_context, trade_date=trade_date,
+        expected_date=expected_date, data_version=data_version,
+    ):
+        return {
+            **completed_market_context["returns"],
+            "_completed_market_context": dict(completed_market_context),
+            "_completed_market_cache_hit": True,
+        }
     out: dict[str, float | None] = {}
+    latest_dates: dict[str, str] = {}
     qqq_closes: list[float] = []
     for sym in _MARKET_RETURN_SYMBOLS:
         exchange = resolve_quote_exchange(sym)
@@ -202,6 +233,7 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
         if any(_row_date_value(r) for r in clean_rows):
             clean_rows.sort(key=lambda r: _row_date_value(r) or "00000000")
         out[f"{sym.lower()}_previous_close"] = _row_close_value(clean_rows[-1]) if clean_rows else None
+        latest_dates[sym] = str(_row_date_value(clean_rows[-1]) if clean_rows else "").replace("-", "")[:8]
         if sym == "QQQ":
             qqq_closes = [v for v in (_row_close_value(row) for row in clean_rows) if v is not None]
 
@@ -233,6 +265,21 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
     # Additive Infinite context.  These values use the same completed QQQ rows
     # already fetched above and therefore perform no extra provider/HTTP call.
     out.update(calculate_qqq_long_context(qqq_closes))
+    cache_quality = (
+        "OK" if all(
+            latest_dates.get(symbol) == expected_date.replace("-", "")
+            and out.get(f"{symbol.lower()}_20d_return") is not None
+            for symbol in _MARKET_RETURN_SYMBOLS
+        ) else "INCOMPLETE"
+    )
+    out["_completed_market_context"] = {
+        "trade_date": str(trade_date),
+        "expected_completed_date": expected_date,
+        "data_version": str(data_version),
+        "quality": cache_quality,
+        "returns": dict(out),
+    }
+    out["_completed_market_cache_hit"] = False
     return out
 
 
@@ -405,14 +452,22 @@ def _account_metrics(positions: list[dict] | None, snap: dict | None) -> dict:
     }
 
 
-def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dict | None, prep_result: dict | None, positions: list[dict] | None, account_snapshot: dict | None, now=None) -> dict:
+def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dict | None, prep_result: dict | None, positions: list[dict] | None, account_snapshot: dict | None, now=None, completed_market_context: dict | None = None) -> dict:
     warnings: list[str] = []
     rc = rotation_context or (prep_result or {}).get("rotation_context") or {}
     rotation_regime = str((prep_result or {}).get("rotation_regime") or rc.get("rotation_regime") or "UNKNOWN")
     suspect = bool(rc.get("rotation_context_suspect") or (prep_result or {}).get("rotation_context_suspect"))
     suspect_policy = str(rc.get("rotation_suspect_policy") or (prep_result or {}).get("rotation_suspect_policy") or "block")
     quality = str(rc.get("benchmark_data_quality") or (prep_result or {}).get("benchmark_data_quality") or "ok").lower()
-    rets = _market_returns(provider, trade_date, warnings)
+    _data_version = str((prep_result or {}).get("completed_market_data_version")
+                         or os.getenv("US_COMPLETED_MARKET_DATA_VERSION", ""))
+    rets = _market_returns(
+        provider, trade_date, warnings,
+        completed_market_context=completed_market_context,
+        data_version=_data_version,
+    )
+    _completed_context = rets.pop("_completed_market_context", {})
+    _completed_cache_hit = bool(rets.pop("_completed_market_cache_hit", False))
     acct = _account_metrics(positions, account_snapshot)
     spy1, qqq1, smh1 = rets.get("spy_1d_return"), rets.get("qqq_1d_return"), rets.get("smh_1d_return")
     spy3, qqq3, smh3 = rets.get("spy_3d_return"), rets.get("qqq_3d_return"), rets.get("smh_3d_return")
@@ -610,6 +665,8 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         "defensive_score": defensive_score,
         "regime_reasons": reasons,
         "leading_indicators": dict(rets),
+        "_completed_market_context": _completed_context,
+        "completed_market_cache_hit": _completed_cache_hit,
         "exposure_multiplier": mults[state],
         "allow_new_buy": constraints.get("allow_new_buy", allow_new),
         "allow_add_to_existing": False if state == "DEFENSE_CRASH_REBOUND" else market_regime in {"NEUTRAL", "GROWTH_LEADERSHIP", "RISK_ON"},

@@ -88,6 +88,18 @@ jobs:
           set -o pipefail
           python -m pytest tests/test_kis_ws_price.py tests/us -q 2>&1 | tee /tmp/us-pytest.log
 
+      - name: Measure controlled PB1 twelve-tick before-after IO
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -s tests/us/test_us_20261007_performance_acceptance.py 2>&1 | tee /tmp/us-pb1-controlled-benchmark.log
+
+      - name: Measure 10-tick SELL-first, BUY ACK and unresolved-order fence
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -s tests/us/test_us_20261007_sustained_real_buy_ack.py 2>&1 | tee /tmp/us-pb1-ten-tick-ack.log
+
       - name: Run harness runner (offline, all scenarios)
         run: python -m trader.us.harness.runner --scenario all --offline
 

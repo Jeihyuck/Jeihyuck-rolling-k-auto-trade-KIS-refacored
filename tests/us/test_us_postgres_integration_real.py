@@ -1391,3 +1391,59 @@ def test_real_postgres_active_claim_recovery_is_scoped_to_current_generation(
         "foreign-account",
         "current-generation",
     }
+
+
+
+def test_same_cumulative_kis_price_correction_is_not_skipped(pg_engine):
+    """Qty unchanged is not equivalent to unchanged evidence/economics.
+
+    A previously synthetic cumulative fill must promote to actual KIS evidence,
+    and a later corrected average price must update the SAME execution row.
+    """
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+
+    _seed_order(pg_engine, key="K-EQUAL-EVIDENCE", order_no="EQUAL-3",
+                qty_requested=10, qty_filled=3)
+    params = {
+        "order_no": "EQUAL-3", "client_order_key": "K-EQUAL-EVIDENCE",
+        "symbol": "AMD", "side": "SELL",
+        "filled_qty": 3, "requested_qty": 10,
+        "cumulative_filled_qty": 3,
+        "trade_date": "2026-07-16",
+        "evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "source": "fills_by_order_no",
+    }
+    first = repos.mark_order_filled_by_reconcile(
+        **params, avg_price_usd=105.0,
+    )
+    assert first["status"] == "OK", first
+    corrected = repos.mark_order_filled_by_reconcile(
+        **params, avg_price_usd=107.25,
+    )
+    assert corrected["status"] == "OK", corrected
+    with pg_engine.begin() as conn:
+        actual = conn.execute(text("""
+            SELECT qty, price_usd, meta FROM us_fills
+            WHERE order_no = 'EQUAL-3'
+              AND NOT COALESCE((meta->>'is_synthetic')::boolean, false)
+            ORDER BY id
+        """)).mappings().all()
+        synthetic = conn.execute(text("""
+            SELECT COALESCE((meta->>'accounting_active')::boolean, true)
+            FROM us_fills
+            WHERE order_no = 'EQUAL-3'
+              AND COALESCE((meta->>'is_synthetic')::boolean, false)
+        """)).scalars().all()
+        order = conn.execute(text("""
+            SELECT qty_filled, avg_price_usd, status
+            FROM us_orders WHERE order_no='EQUAL-3'
+        """)).mappings().one()
+    assert len(actual) == 1, actual
+    assert actual[0]["qty"] == 3
+    assert float(actual[0]["price_usd"]) == 107.25
+    assert actual[0]["meta"]["fill_evidence_type"] == "KIS_ORDER_CUMULATIVE_ACTUAL"
+    assert synthetic == [False]
+    assert order["qty_filled"] == 3
+    assert float(order["avg_price_usd"]) == 107.25
+    assert order["status"] == "PARTIALLY_FILLED"

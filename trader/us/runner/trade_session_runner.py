@@ -776,10 +776,34 @@ def _aggregate_tick_latency(tick_results: list[dict]) -> dict:
         for key in _TICK_LATENCY_STAGE_KEYS
     }
     tick_totals = [float(row.get("tick_total_ms") or 0.0) for row in measured]
+    # The 300s scheduler slot and the isolated child watchdog (355s) are
+    # distinct contracts. Track both and do not hide an overrun just because
+    # the subprocess completed before the watchdog.
+    slot_overruns = sum(float(v) > 300_000.0 for v in tick_totals)
+    entry_defers = sum(
+        str(row.get("entry_degraded_reason") or row.get("entry_error_type") or "")
+        == "NEXT_TICK_ENTRY_DEFER_INSUFFICIENT_BUDGET"
+        for row in tick_results or []
+        if isinstance(row, dict)
+    )
+    kis_http_call_keys = (
+        "balance_http_calls", "fill_http_calls",
+        "quote_http_calls", "psamount_http_calls",
+    )
     return {
         "measured_tick_count": len(measured),
         "total_tick_ms": round(sum(tick_totals), 3),
+        "mean_tick_ms": round(sum(tick_totals) / len(measured), 3) if measured else 0.0,
         "max_tick_ms": round(max(tick_totals, default=0.0), 3),
+        "slot_overrun_count_300sec": slot_overruns,
+        "entry_defer_count": entry_defers,
+        "remaining_before_entry_eval_sec_mean": round(
+            sum(float(row.get("remaining_before_entry_eval_sec") or 0.0) for row in measured) / len(measured), 3
+        ) if measured else 0.0,
+        "kis_http_calls": {
+            key: sum(int(row.get(key) or 0) for row in measured)
+            for key in kis_http_call_keys
+        },
         "max_unaccounted_ms": round(
             max((float(row.get("unaccounted_ms") or 0.0) for row in measured), default=0.0), 3
         ),
@@ -1265,6 +1289,10 @@ def run_trade_session(
             except Exception as exc:
                 logger.warning("[US_SESSION][ENTRY_CACHE][SKIP] trade_date=%s error=%s", trade_date, exc)
 
+        # Child processes are ephemeral. The parent owns only immutable,
+        # quality-checked completed-day context, never live quotes or positions.
+        completed_market_context = None
+        completed_market_context_age_ticks = 0
         tick_count = 0
         warn_count = 0
         consecutive_errors = 0
@@ -1374,6 +1402,12 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
+                            completed_market_context=(
+                                completed_market_context
+                                if completed_market_context_age_ticks
+                                    < max(1, int(os.getenv("US_COMPLETED_MARKET_CONTEXT_REVALIDATE_TICKS", "12")))
+                                else None
+                            ),
                             entry_can_proceed=resolve_shared_tick_entry_evaluation_permission(
                                 prep_guard_result,
                                 timeout_entry_block=timeout_entry_block,
@@ -1414,6 +1448,17 @@ def run_trade_session(
                         tick_result = process_result.result
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
+                    # Never publish incomplete market data as reusable truth.
+                    # Scheduled revalidation detects upstream corrections even
+                    # if a provider does not publish an explicit new version.
+                    _completed_context = tick_result.get("completed_market_context")
+                    if isinstance(_completed_context, dict) and _completed_context.get("quality") == "OK":
+                        completed_market_context = _completed_context
+                        if not tick_result.get("completed_market_cache_hit"):
+                            completed_market_context_age_ticks = 0
+                    elif completed_market_context is None:
+                        completed_market_context_age_ticks = 0
+                    completed_market_context_age_ticks += 1
                     results.append(tick_result)
                     final_tick = tick_result
                     tick_completed += 1

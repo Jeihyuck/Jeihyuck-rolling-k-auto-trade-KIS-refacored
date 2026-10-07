@@ -70,6 +70,31 @@ def save_trend_state(
                 latest_lifecycle.get("lifecycle_id"),
             )
             return trend
+    # A preloaded completed-day snapshot must NEVER roll a subsequent order
+    # stage transition (pending/filled/order key) back to its earlier value.
+    # The stage writer is authoritative for these mutable execution keys.
+    live_trend = (state.get("trend") or {}) if isinstance(state.get("trend"), dict) else {}
+    if live_trend and str(live_trend.get("lifecycle_id") or "") == expected_lifecycle_id:
+        if (
+            live_trend.get("updated_at") and trend.get("updated_at")
+            and str(live_trend["updated_at"]) > str(trend["updated_at"])
+        ):
+            logger.warning(
+                "[US_POSITION][TREND_STATE][STALE_UPDATE_BLOCK] symbol=%s trade_date=%s",
+                symbol, trade_date,
+            )
+            return dict(live_trend)
+        for key, value in live_trend.items():
+            # Only execution-stage keys are broker driven. In particular,
+            # daily_metrics_trade_date and updated_at must NOT be copied from
+            # an older completed snapshot.
+            if (
+                key.startswith(("trend_trim_", "trend_exit_",
+                                "time_stop_trim_", "time_stop_exit_"))
+                and key.endswith(("_pending", "_done", "_order_key",
+                                  "_trade_date", "_at", "_qty", "_filled_qty"))
+            ):
+                trend[key] = value
     state["trend"] = trend
     risk["state"] = state
     save_us_position_risk_state(symbol, trade_date, risk)
@@ -88,8 +113,14 @@ def update_us_position_trend_state(
     lifecycle_id: str | None = None,
     warning_threshold: float | None = None,
     severe_threshold: float | None = None,
+    preloaded_latest_risk: dict | None = None,
 ) -> dict:
-    prev = load_trend_state(symbol, trade_date, lifecycle_id)
+    if preloaded_latest_risk is not None:
+        prev = dict(((preloaded_latest_risk.get("state") or {}).get("trend") or {}))
+        if lifecycle_id and str(prev.get("lifecycle_id") or "") != str(lifecycle_id):
+            prev = {}
+    else:
+        prev = load_trend_state(symbol, trade_date, lifecycle_id)
     once = prev.get("last_daily_update_trade_date") != trade_date
     warning_thr = float(
         warning_threshold if warning_threshold is not None
