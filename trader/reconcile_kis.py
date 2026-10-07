@@ -555,6 +555,34 @@ def _promote_open_buy_orders_from_holdings(
 
         request_json = _json_dict(order.get("request_json"))
         response_json = _json_dict(order.get("response_json"))
+
+        # Once the shared KR writer is actually released for this account/epoch,
+        # holdings-only inference must never fall through to the legacy economic
+        # writer. Exact KIS executions will be handled by reconcile_today().
+        try:
+            from trader.settlement.kr_cutover import load_kr_runtime_release_for_scope
+            order_epoch = str(order.get("trading_epoch_id") or "").strip()
+            if order_epoch:
+                scope_release = load_kr_runtime_release_for_scope(
+                    orders_repo.engine,
+                    env=env,
+                    trading_epoch_id=order_epoch,
+                )
+                if scope_release.writer_allowed:
+                    logger.warning(
+                        "[SETTLEMENT_CUTOVER][KR][HOLDINGS_LEGACY_BLOCKED] code=%s "
+                        "status=%s reason=ATOMIC_WRITER_ACTIVE",
+                        code, status,
+                    )
+                    continue
+        except Exception as exc:
+            if os.getenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "0").strip() == "1":
+                logger.exception(
+                    "[SETTLEMENT_CUTOVER][KR][HOLDINGS_SCOPE_ERROR] code=%s err=%s action=BLOCK_LEGACY",
+                    code, exc,
+                )
+                continue
+
         if status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
             # Recover only from the order's *saved* broker observation; a
             # current-day holding balance cannot reconstruct an older fill.
