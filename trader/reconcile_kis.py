@@ -1666,6 +1666,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         order_id=str(source_order.get("order_id") or "") or None,
                     )
 
+                atomic_buy_applied = False
                 if atomic_observation is not None and atomic_release is not None:
                     from trader.settlement.kr_cutover import route_kr_settlement
 
@@ -1702,6 +1703,38 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                             authoritative=True,
                             _conn=conn,
                         )
+                        atomic_is_pyramid_add = bool(
+                            str((source_order or {}).get("stage") or "").upper() == "PB1-ADD"
+                            or str(request_json.get("entry_reason") or "").upper() == "ENTRY_PYRAMID"
+                        )
+                        atomic_requested_buy_qty = int((source_order or {}).get("qty") or qty or 0)
+                        if (
+                            atomic_is_pyramid_add
+                            and next_confirmed_qty >= atomic_requested_buy_qty > 0
+                        ):
+                            atomic_stage_avg_fill_price = (
+                                next_confirmed_notional / float(next_confirmed_qty)
+                                if next_confirmed_notional > 0 and next_confirmed_qty > 0
+                                else float(filled_price or 0.0)
+                            )
+                            positions_repo.mark_pyramid_add_fill(
+                                env=env,
+                                strategy=str(source_order.get("strategy") or strategy),
+                                sid=int(source_order.get("sid") or 1),
+                                mode=int(source_order.get("mode") or 1),
+                                code=code,
+                                position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                                portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                                target_level=int(request_json.get("level") or 0),
+                                client_order_key=client_order_key,
+                                filled_qty=next_confirmed_qty,
+                                requested_qty=atomic_requested_buy_qty,
+                                fill_price=float(atomic_stage_avg_fill_price or 0.0),
+                                filled_at=order_time,
+                                pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
+                                pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                                _conn=conn,
+                            )
 
                     route_result = route_kr_settlement(
                         engine=engine,
@@ -1710,6 +1743,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                         apply_atomic_economic_delta=_atomic_buy_apply,
                         apply_legacy=_legacy_buy_apply,
                     )
+                    atomic_buy_applied = route_result.mode == "ATOMIC_SETTLEMENT"
                     logger.info(
                         "[SETTLEMENT_CUTOVER][KR][BUY] code=%s mode=%s cumulative=%s delta=%s",
                         code,
@@ -1739,6 +1773,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 if (
                     is_pyramid_add
                     and next_confirmed_qty >= requested_buy_qty > 0
+                    and not atomic_buy_applied
                 ):
                     stage_avg_fill_price = (
                         next_confirmed_notional / float(next_confirmed_qty)
@@ -1811,6 +1846,45 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     from trader.settlement.kr_cutover import route_kr_settlement
 
                     def _atomic_sell_apply(conn, _obs, _decision):
+                        claim_snapshot = orders_repo.record_execution_claim_for_order(
+                            str(source_order.get("client_order_key") or ""),
+                            state=(
+                                "FILLED"
+                                if next_confirmed_qty >= int(source_order.get("qty") or qty or 0)
+                                else "PARTIALLY_FILLED"
+                            ),
+                            cumulative_filled_qty=next_confirmed_qty,
+                            authoritative=True,
+                            _conn=conn,
+                        )
+                        claim_state = str(getattr(claim_snapshot, "action_state", "") or "").upper()
+                        claim_active_attempt = getattr(claim_snapshot, "active_attempt_id", None)
+                        if (
+                            not claim_active_attempt
+                            and claim_state in {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}
+                        ):
+                            atomic_meta_fields: dict[str, Any] = {}
+                            if claim_state == "SATISFIED":
+                                execution_meta_update = request_json.get("execution_meta_update")
+                                if isinstance(execution_meta_update, dict):
+                                    atomic_meta_fields.update(execution_meta_update)
+                            profit_capture_stage = str(
+                                request_json.get("profit_capture_stage") or ""
+                            ).lower()
+                            if profit_capture_stage in {"tp1", "tp2", "tp3"}:
+                                atomic_meta_fields[f"kr_{profit_capture_stage}_pending"] = False
+                            if atomic_meta_fields:
+                                positions_repo.update_position_fields(
+                                    env=env,
+                                    strategy=str(source_order.get("strategy") or strategy),
+                                    sid=int(source_order.get("sid") or 1),
+                                    mode=int(source_order.get("mode") or 1),
+                                    code=code,
+                                    fields={"position_meta": atomic_meta_fields},
+                                    position_cycle_id=str(source_order.get("position_cycle_id") or ""),
+                                    portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
+                                    _conn=conn,
+                                )
                         positions_repo.reconcile_sell_execution(
                             env=env,
                             strategy=str(source_order.get("strategy") or strategy),
@@ -1826,17 +1900,6 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                             order_id=str(source_order.get("order_id") or ""),
                             pre_order_holding_qty=_to_int(request_json.get("pre_order_holding_qty")),
                             broker_holding_qty=None,
-                            _conn=conn,
-                        )
-                        orders_repo.record_execution_claim_for_order(
-                            str(source_order.get("client_order_key") or ""),
-                            state=(
-                                "FILLED"
-                                if next_confirmed_qty >= int(source_order.get("qty") or qty or 0)
-                                else "PARTIALLY_FILLED"
-                            ),
-                            cumulative_filled_qty=next_confirmed_qty,
-                            authoritative=True,
                             _conn=conn,
                         )
 
