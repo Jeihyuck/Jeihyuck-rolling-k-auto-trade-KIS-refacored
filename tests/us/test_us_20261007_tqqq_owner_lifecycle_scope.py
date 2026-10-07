@@ -74,3 +74,13 @@ def test_infinite_partial_or_unknown_holdings_never_complete():
         overlay={}, pending_sell=True,
     )
     assert decision.next_status == Status.EXIT_PENDING
+
+
+def test_owner_first_scope_excludes_dedicated_and_explicit_foreign_owner():
+    from trader.us.strategy_ownership import is_standard_owned_position
+    assert is_standard_owned_position({"symbol": "MSFT"})
+    assert is_standard_owned_position({"symbol": "MSFT", "strategy_owner": "US_STANDARD"})
+    assert not is_standard_owned_position({"symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE"})
+    assert not is_standard_owned_position({"symbol": "TQQQ"})
+    assert not is_standard_owned_position({"symbol": "MSFT", "strategy_owner": "UNKNOWN"})
+    assert not is_standard_owned_position({"symbol": "AMD", "meta": {"strategy_owner": "OTHER"}})
