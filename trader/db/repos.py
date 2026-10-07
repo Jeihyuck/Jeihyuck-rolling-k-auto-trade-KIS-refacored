@@ -6761,6 +6761,7 @@ class PositionsRepo:
         position_cycle_id: str | None = None,
         order_id: str | None = None,
         buy_application_cumulative_qty: int | None = None,
+        buy_cost_delta_override: float | None = None,
         _conn: Any = None,
     ) -> None:
         if entry_meta and not entry_meta_json:
@@ -6776,7 +6777,7 @@ class PositionsRepo:
                     entry_meta=entry_meta, account_id=account_id,
                     portfolio_epoch_id=portfolio_epoch_id, position_cycle_id=position_cycle_id,
                     order_id=order_id, buy_application_cumulative_qty=buy_application_cumulative_qty,
-                    _conn=conn,
+                    buy_cost_delta_override=buy_cost_delta_override, _conn=conn,
                 )
         conn = _conn
         provenance = None
@@ -6878,7 +6879,10 @@ class PositionsRepo:
             if trading_epoch_id is not None and str(row.get("trading_epoch_id") or "") != str(trading_epoch_id):
                 raise RuntimeError("KR_POSITION_TRADING_EPOCH_MISMATCH")
         qty = int(qty)
-        cost_delta = (qty * float(price)) + float(fee) + float(tax)
+        if side.upper() == "BUY" and buy_cost_delta_override is not None:
+            cost_delta = float(buy_cost_delta_override) + float(fee) + float(tax)
+        else:
+            cost_delta = (qty * float(price)) + float(fee) + float(tax)
         if row:
             current_qty = int(row.get("qty") or 0)
             avg_buy_price = float(row.get("avg_buy_price") or 0.0)
@@ -6929,7 +6933,11 @@ class PositionsRepo:
                     "qty": target,
                     "notional": (
                         float(previous.get("notional") or 0.0)
-                        + float(qty) * float(price)
+                        + (
+                            float(buy_cost_delta_override)
+                            if buy_cost_delta_override is not None
+                            else float(qty) * float(price)
+                        )
                     ),
                     "fee": float(previous.get("fee") or 0.0) + float(fee),
                     "tax": float(previous.get("tax") or 0.0) + float(tax),
