@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import json
 
 import sqlalchemy as sa
 import pytest
 
 from trader.settlement.core import SettlementObservation
-from trader.settlement.kr_cutover import route_kr_settlement
+from trader.settlement.kr_cutover import (
+    load_kr_runtime_release,
+    route_kr_settlement,
+)
 from trader.settlement.release_gate import SettlementReleaseDecision
 from trader.settlement.schema import metadata
 
@@ -170,3 +174,49 @@ def test_unproven_holdings_evidence_cannot_activate_atomic_writer():
             apply_atomic_economic_delta=lambda *_: None,
             apply_legacy=lambda: None,
         )
+
+
+def test_runtime_release_env_flag_alone_cannot_activate(monkeypatch):
+    engine = _engine()
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.delenv("NULLIM_KR_SETTLEMENT_RELEASE_PROOF_FILE", raising=False)
+    decision = load_kr_runtime_release(engine, _obs())
+    assert decision.writer_allowed is False
+    assert decision.status == "ACTIVATION_BLOCKED"
+    assert "release_proof_file_missing" in decision.missing
+
+
+def test_runtime_release_requires_fresh_scoped_proof_and_revision(monkeypatch, tmp_path):
+    from trader.settlement.core import settle_atomic
+    from trader.settlement.release_gate import REQUIRED_PROOFS
+
+    engine = _engine()
+    obs = _obs()
+    settle_atomic(engine, obs, lambda _conn, _obs, _decision: None)
+
+    revision = "a" * 40
+    proof_path = tmp_path / "kr-release.json"
+    proof_path.write_text(json.dumps({
+        "market": "KR",
+        "env": obs.env,
+        "trading_epoch_id": obs.trading_epoch_id,
+        "account_scope": obs.account_scope,
+        "run_revision": revision,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "proofs": {name: True for name in REQUIRED_PROOFS},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_RELEASE_PROOF_FILE", str(proof_path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+
+    decision = load_kr_runtime_release(engine, obs)
+    assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
+    assert decision.writer_allowed is True
+
+
+def test_production_reconcile_is_connected_to_single_writer_router():
+    source = open("trader/reconcile_kis.py", encoding="utf-8").read()
+    assert "route_kr_settlement(" in source
+    assert "load_kr_runtime_release" in source
+    assert "record_execution_claim_for_order(" in source
+    assert "_conn=conn" in source
