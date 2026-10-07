@@ -85,9 +85,14 @@ def save_trend_state(
             )
             return dict(live_trend)
         for key, value in live_trend.items():
+            # Only execution-stage keys are broker driven. In particular,
+            # daily_metrics_trade_date and updated_at must NOT be copied from
+            # an older completed snapshot.
             if (
-                key.endswith(("_pending", "_done", "_order_key", "_trade_date", "_at"))
-                or key in {"post_trim_nonrecovery_days", "high_watermark", "high_watermark_at"}
+                key.startswith(("trend_trim_", "trend_exit_",
+                                "time_stop_trim_", "time_stop_exit_"))
+                and key.endswith(("_pending", "_done", "_order_key",
+                                  "_trade_date", "_at", "_qty", "_filled_qty"))
             ):
                 trend[key] = value
     state["trend"] = trend

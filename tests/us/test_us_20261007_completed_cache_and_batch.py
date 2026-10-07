@@ -199,6 +199,7 @@ def test_trend_batch_snapshot_does_not_clear_new_live_execution_stage(monkeypatc
     )
     assert result["trend_trim_pending"] is True
     assert result["trend_trim_order_key"] == "SELL-OPEN"
+    assert result["updated_at"] == "2026-10-06T19:00:01+00:00"
     assert saved[0]["state"]["soft_stop_execution"]["pending"] is True
 
 
