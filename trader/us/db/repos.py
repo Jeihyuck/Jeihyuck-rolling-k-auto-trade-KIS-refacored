@@ -4824,9 +4824,13 @@ def mark_order_filled_by_reconcile(
             }
         return result
     except FillAccountingInvariantError as exc:
+        if _conn is not None:
+            raise
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
         return exc.payload
     except Exception as exc:
+        if _conn is not None:
+            raise
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
         return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
 
