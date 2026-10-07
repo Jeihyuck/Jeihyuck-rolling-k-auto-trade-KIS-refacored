@@ -7,6 +7,12 @@ Exactly one economic writer is invoked per route decision.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from decimal import Decimal
+import hashlib
+import json
+import os
+from pathlib import Path
 from typing import Any, Callable
 
 from sqlalchemy.engine import Connection, Engine
@@ -16,7 +22,169 @@ from trader.settlement.core import (
     SettlementObservation,
     settle_atomic,
 )
-from trader.settlement.release_gate import SettlementReleaseDecision
+from trader.account_state import get_account_key
+from trader.settlement.health import check_settlement_health
+from trader.settlement.release_gate import (
+    REQUIRED_PROOFS,
+    SettlementReleaseDecision,
+    SettlementReleaseProof,
+    assess_release,
+)
+
+
+
+
+_OWNER_MAP = {
+    "PB1": "PB1",
+    "KR_STANDARD": "PB1",
+    "KR_INFINITE": "KR_INFINITE",
+}
+
+
+def _account_scope(env: str) -> str:
+    return hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
+
+
+def build_kr_broker_observation(
+    *,
+    order: dict,
+    request_json: dict,
+    broker_trade_date: date,
+    requested_qty: int,
+    cumulative_qty: int,
+    evidence_type: str,
+    evidence_digest: str,
+    execution_price: float | Decimal | None = None,
+    execution_qty: int | None = None,
+) -> SettlementObservation:
+    """Build an atomic observation only from an exact durable KR order identity."""
+    raw_owner = str(
+        request_json.get("strategy_owner")
+        or order.get("strategy_owner")
+        or ""
+    ).strip().upper()
+    owner = _OWNER_MAP.get(raw_owner, "")
+    if not owner:
+        raise RuntimeError("KR_SETTLEMENT_STRATEGY_OWNER_MISSING")
+    env = str(order.get("env") or os.getenv("KIS_ENV") or "practice").strip().lower()
+    cycle = str(order.get("position_cycle_id") or "").strip()
+    epoch = str(order.get("trading_epoch_id") or "").strip()
+    client_key = str(order.get("client_order_key") or "").strip()
+    if not cycle or not epoch or not client_key:
+        raise RuntimeError("KR_SETTLEMENT_DURABLE_IDENTITY_MISSING")
+    price = (
+        Decimal(str(execution_price))
+        if execution_price is not None and float(execution_price) > 0
+        else None
+    )
+    return SettlementObservation(
+        env=env,
+        market="KR",
+        account_scope=_account_scope(env),
+        trading_epoch_id=epoch,
+        strategy_owner=owner,
+        position_cycle_id=cycle,
+        client_order_key=client_key,
+        broker_trade_date=broker_trade_date,
+        exchange=str(order.get("market") or "KRX"),
+        broker_order_no=str(order.get("kis_odno") or order.get("broker_order_id") or ""),
+        side=str(order.get("side") or "").upper(),
+        requested_qty=int(requested_qty),
+        cumulative_qty=int(cumulative_qty),
+        evidence_type=str(evidence_type),
+        evidence_digest=str(evidence_digest),
+        currency="KRW",
+        execution_price=price,
+        execution_qty=execution_qty,
+    )
+
+
+def _blocked_release(reason: str) -> SettlementReleaseDecision:
+    return SettlementReleaseDecision(
+        market="KR",
+        status="ACTIVATION_BLOCKED",
+        writer_allowed=False,
+        missing=(reason,),
+    )
+
+
+def load_kr_runtime_release(
+    engine: Engine,
+    observation: SettlementObservation,
+) -> SettlementReleaseDecision:
+    """Load independently persisted release proofs; env alone can never enable writer."""
+    activation_requested = os.getenv(
+        "NULLIM_KR_SETTLEMENT_ACTIVATE", "0"
+    ).strip() == "1"
+    if not activation_requested:
+        return SettlementReleaseDecision(
+            market="KR",
+            status="SHADOW_ONLY",
+            writer_allowed=False,
+            missing=("activation_not_requested",),
+        )
+
+    proof_path = os.getenv("NULLIM_KR_SETTLEMENT_RELEASE_PROOF_FILE", "").strip()
+    if not proof_path:
+        return _blocked_release("release_proof_file_missing")
+    try:
+        payload = json.loads(Path(proof_path).read_text(encoding="utf-8"))
+    except Exception:
+        return _blocked_release("release_proof_file_unreadable")
+
+    for field, expected in (
+        ("market", "KR"),
+        ("env", observation.env),
+        ("trading_epoch_id", observation.trading_epoch_id),
+        ("account_scope", observation.account_scope),
+    ):
+        if str(payload.get(field) or "") != str(expected):
+            return _blocked_release("release_scope_mismatch:" + field)
+
+    expires_at = str(payload.get("expires_at") or "").strip()
+    if not expires_at:
+        return _blocked_release("release_proof_expiry_missing")
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry <= datetime.now(timezone.utc):
+            return _blocked_release("release_proof_expired")
+    except Exception:
+        return _blocked_release("release_proof_expiry_invalid")
+
+    proof_values = payload.get("proofs")
+    if not isinstance(proof_values, dict):
+        return _blocked_release("release_proofs_missing")
+    flags = {name: bool(proof_values.get(name)) for name in REQUIRED_PROOFS}
+
+    current_revision = str(
+        os.getenv("KR_RUN_REVISION")
+        or os.getenv("GITHUB_SHA")
+        or os.getenv("RUN_REVISION")
+        or ""
+    ).strip()
+    proof_revision = str(payload.get("run_revision") or "").strip()
+    flags["run_revision_matches"] = bool(
+        flags.get("run_revision_matches")
+        and current_revision
+        and proof_revision
+        and current_revision == proof_revision
+    )
+
+    health = check_settlement_health(
+        engine,
+        market="KR",
+        env=observation.env,
+        trading_epoch_id=observation.trading_epoch_id,
+        account_scope=observation.account_scope,
+    )
+    return assess_release(
+        market="KR",
+        health=health,
+        proofs=SettlementReleaseProof(**flags),
+        activation_requested=True,
+    )
 
 
 @dataclass(frozen=True)
