@@ -378,21 +378,21 @@ def claim_execution_action(identity: Any, *, attempt_id: str, requested_qty: int
 
 def record_execution_action_observation(identity: Any, *, attempt_id: str, state: str,
                                         cumulative_filled_qty: int | None,
-                                        authoritative: bool):
+                                        authoritative: bool, _conn: Any = None):
     return _execution_claim_repo().record_observation(
         identity, attempt_id=attempt_id, state=state,
         cumulative_filled_qty=cumulative_filled_qty,
-        authoritative=authoritative,
+        authoritative=authoritative, _conn=_conn,
     )
 
 
 def record_execution_action_observation_by_key(action_key: str, *, attempt_id: str, state: str,
                                               cumulative_filled_qty: int | None,
-                                              authoritative: bool):
+                                              authoritative: bool, _conn: Any = None):
     return record_execution_action_observation(
         action_key, attempt_id=attempt_id, state=state,
         cumulative_filled_qty=cumulative_filled_qty,
-        authoritative=authoritative,
+        authoritative=authoritative, _conn=_conn,
     )
 
 
@@ -4283,6 +4283,7 @@ def _active_fill_cumulatives_for_order(
 
 def _record_actual_fill_execution_claim(
     order_meta: dict, *, cumulative_qty: int, requested_qty: int, evidence: str,
+    _conn: Any = None,
 ) -> str | None:
     if not _is_kis_order_cumulative_evidence(evidence):
         return None
@@ -4297,6 +4298,7 @@ def _record_actual_fill_execution_claim(
             state="FILLED" if cumulative_qty >= requested_qty else "PARTIALLY_FILLED",
             cumulative_filled_qty=cumulative_qty,
             authoritative=True,
+            _conn=_conn,
         )
         return None
     except Exception as exc:
