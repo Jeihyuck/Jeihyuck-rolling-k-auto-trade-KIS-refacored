@@ -88,8 +88,14 @@ def update_us_position_trend_state(
     lifecycle_id: str | None = None,
     warning_threshold: float | None = None,
     severe_threshold: float | None = None,
+    preloaded_latest_risk: dict | None = None,
 ) -> dict:
-    prev = load_trend_state(symbol, trade_date, lifecycle_id)
+    if preloaded_latest_risk is not None:
+        prev = dict(((preloaded_latest_risk.get("state") or {}).get("trend") or {}))
+        if lifecycle_id and str(prev.get("lifecycle_id") or "") != str(lifecycle_id):
+            prev = {}
+    else:
+        prev = load_trend_state(symbol, trade_date, lifecycle_id)
     once = prev.get("last_daily_update_trade_date") != trade_date
     warning_thr = float(
         warning_threshold if warning_threshold is not None

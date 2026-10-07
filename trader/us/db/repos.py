@@ -1842,6 +1842,45 @@ def load_latest_us_position_risk_state(symbol: str, on_or_before_trade_date: str
         return dict(candidates[0]) if candidates else {}
 
 
+
+def load_latest_us_position_risk_states(
+    symbols: list[str], on_or_before_trade_date: str,
+) -> dict[str, dict]:
+    """One epoch-scoped query for immutable latest risk snapshots.
+
+    Failure is explicit: callers must fall back to per-symbol reads, never
+    treat an unavailable DB as proof of empty/closed lifecycle state.
+    """
+    symbols = sorted({str(s or "").strip().upper() for s in symbols if str(s or "").strip()})
+    if not symbols:
+        return {}
+    td = str(on_or_before_trade_date)
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {sym: load_latest_us_position_risk_state(sym, td) for sym in symbols}
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
+            rows = conn.execute(text("""
+                SELECT DISTINCT ON (symbol)
+                    trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                    first_soft_stop_seen_at, last_soft_stop_seen_at,
+                    lowest_price_since_breach, last_price, last_pnl_pct,
+                    state, updated_at
+                FROM us_position_risk_state
+                WHERE trading_epoch_id=:epoch_id
+                  AND symbol = ANY(:symbols) AND trade_date <= :trade_date
+                ORDER BY symbol, trade_date DESC, updated_at DESC
+            """), {"epoch_id": epoch_id, "symbols": symbols,
+                   "trade_date": td}).mappings().all()
+        return {str(row["symbol"]).upper(): dict(row) for row in rows}
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][BATCH_LOAD_WARN] symbols=%d err=%s action=fallback_per_symbol",
+                       len(symbols), exc)
+        return {sym: load_latest_us_position_risk_state(sym, td) for sym in symbols}
+
+
 def load_us_position_risk_state_candidates(
     symbol: str, on_or_before_trade_date: str,
 ) -> list[dict]:

@@ -720,6 +720,11 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
         locked_watchlist_cache = loaded_rows
         watchlist_cache_source = "trend_final30_preload"
     counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
+    from trader.us.db.repos import load_latest_us_position_risk_states
+    _trend_symbols = [str(pos.get("symbol") or "").upper().strip() for pos in positions or [] if pos.get("symbol")]
+    latest_risk_by_symbol = load_latest_us_position_risk_states(_trend_symbols, trade_date)
+    from trader.us.market_calendar import previous_completed_us_session
+    expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
     for pos in positions or []:
         symbol = str(pos.get("symbol") or "").upper().strip()
         if not symbol:
@@ -753,10 +758,9 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
         daily = {}
         metrics_source = "insufficient_history"
         try:
-            from trader.us.market_calendar import previous_completed_us_session
-            expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
-            from trader.us.position_trend_state import load_trend_state
-            persisted = load_trend_state(symbol, trade_date)
+            persisted = dict(
+                ((latest_risk_by_symbol.get(symbol) or {}).get("state") or {}).get("trend") or {}
+            )
             if (
                 persisted.get("daily_metrics_trade_date") == trade_date
                 and str(persisted.get("daily_metrics_as_of") or "") == expected_metrics_as_of
@@ -822,6 +826,7 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
                     lifecycle_id=lifecycle_id,
                     warning_threshold=frozen_trend_cfg.get("trend_score_warning_threshold"),
                     severe_threshold=frozen_trend_cfg.get("trend_score_severe_threshold"),
+                    preloaded_latest_risk=latest_risk_by_symbol.get(symbol, {}),
                 )
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STATE][WARN] symbol=%s err=%s", symbol, exc)

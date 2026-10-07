@@ -1430,7 +1430,8 @@ def run_trade_session(
                     _completed_context = tick_result.get("completed_market_context")
                     if isinstance(_completed_context, dict) and _completed_context.get("quality") == "OK":
                         completed_market_context = _completed_context
-                        completed_market_context_age_ticks = 0
+                        if not tick_result.get("completed_market_cache_hit"):
+                            completed_market_context_age_ticks = 0
                     elif completed_market_context is None:
                         completed_market_context_age_ticks = 0
                     completed_market_context_age_ticks += 1
