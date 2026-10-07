@@ -1517,7 +1517,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         result = None
         if (
             engine is not None
-            and evidence_type == "KIS_ORDER_CUMULATIVE_ACTUAL"
+            and evidence_type in {"KIS_ORDER_CUMULATIVE_ACTUAL", "KIS_TERMINAL_CANCEL"}
             and filled_qty_value > 0
         ):
             try:
@@ -1558,7 +1558,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     cumulative_qty=filled_qty_value,
                     broker_fill_price=fill_price,
                     evidence_digest=(
-                        f"kis-order-cumulative:{td}:{canonical_order_no}:"
+                        f"kis-order-cumulative:{evidence_type}:{td}:{canonical_order_no}:"
                         f"{filled_qty_value}:{fill_price}"
                     ),
                 )
