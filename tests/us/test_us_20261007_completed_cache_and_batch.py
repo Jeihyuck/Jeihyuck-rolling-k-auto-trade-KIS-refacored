@@ -169,3 +169,53 @@ def test_sustained_cache_invalidates_one_periodic_refresh_and_recovers():
         )
         cached = ret["_completed_market_context"]
     assert len(provider.calls) == 2 * n
+
+
+def test_trend_batch_snapshot_does_not_clear_new_live_execution_stage(monkeypatch):
+    from trader.us import position_trend_state as trend
+    saved = []
+    newest_risk = {
+        "state": {
+            "lifecycle": {"lifecycle_id": "lc-current", "is_open": True},
+            "soft_stop_execution": {"pending": True, "broker_order_no": "SELL-OPEN"},
+            "trend": {
+                "lifecycle_id": "lc-current", "trend_trim_pending": True,
+                "trend_trim_done": False, "trend_trim_order_key": "SELL-OPEN",
+                "updated_at": "2026-10-06T19:00:00+00:00",
+            },
+        }
+    }
+    monkeypatch.setattr(trend, "load_us_position_risk_state",
+                        lambda symbol, td: newest_risk)
+    monkeypatch.setattr(trend, "save_us_position_risk_state",
+                        lambda symbol, td, value: saved.append(value))
+    earlier_batch = {
+        "lifecycle_id": "lc-current", "trend_trim_pending": False,
+        "trend_trim_order_key": "", "trend_state": "HEALTHY",
+        "updated_at": "2026-10-06T19:00:01+00:00",
+    }
+    result = trend.save_trend_state(
+        "MSFT", "2026-10-06", earlier_batch, lifecycle_id="lc-current"
+    )
+    assert result["trend_trim_pending"] is True
+    assert result["trend_trim_order_key"] == "SELL-OPEN"
+    assert saved[0]["state"]["soft_stop_execution"]["pending"] is True
+
+
+def test_trend_late_worker_cannot_overwrite_newer_saved_state(monkeypatch):
+    from trader.us import position_trend_state as trend
+    saved = []
+    monkeypatch.setattr(trend, "load_us_position_risk_state", lambda *_a: {
+        "state": {"trend": {"lifecycle_id": "L", "trend_state": "EXIT",
+                            "updated_at": "2026-10-06T20:00:00+00:00"}}
+    })
+    monkeypatch.setattr(trend, "save_us_position_risk_state",
+                        lambda *_a: saved.append(True))
+    result = trend.save_trend_state(
+        "MSFT", "2026-10-06",
+        {"lifecycle_id": "L", "trend_state": "HEALTHY",
+         "updated_at": "2026-10-06T19:00:00+00:00"},
+        lifecycle_id="L",
+    )
+    assert result["trend_state"] == "EXIT"
+    assert not saved

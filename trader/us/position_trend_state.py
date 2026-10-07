@@ -70,6 +70,26 @@ def save_trend_state(
                 latest_lifecycle.get("lifecycle_id"),
             )
             return trend
+    # A preloaded completed-day snapshot must NEVER roll a subsequent order
+    # stage transition (pending/filled/order key) back to its earlier value.
+    # The stage writer is authoritative for these mutable execution keys.
+    live_trend = (state.get("trend") or {}) if isinstance(state.get("trend"), dict) else {}
+    if live_trend and str(live_trend.get("lifecycle_id") or "") == expected_lifecycle_id:
+        if (
+            live_trend.get("updated_at") and trend.get("updated_at")
+            and str(live_trend["updated_at"]) > str(trend["updated_at"])
+        ):
+            logger.warning(
+                "[US_POSITION][TREND_STATE][STALE_UPDATE_BLOCK] symbol=%s trade_date=%s",
+                symbol, trade_date,
+            )
+            return dict(live_trend)
+        for key, value in live_trend.items():
+            if (
+                key.endswith(("_pending", "_done", "_order_key", "_trade_date", "_at"))
+                or key in {"post_trim_nonrecovery_days", "high_watermark", "high_watermark_at"}
+            ):
+                trend[key] = value
     state["trend"] = trend
     risk["state"] = state
     save_us_position_risk_state(symbol, trade_date, risk)
