@@ -227,7 +227,7 @@ def _validate_kr_release(
 def route_kr_settlement(
     *,
     engine: Engine,
-    observation: SettlementObservation,
+    observation: SettlementObservation | None,
     release: SettlementReleaseDecision,
     apply_atomic_economic_delta: Callable[
         [Connection, SettlementObservation, SettlementDecision], None
