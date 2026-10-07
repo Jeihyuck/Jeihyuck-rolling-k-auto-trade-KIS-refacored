@@ -379,10 +379,17 @@ def reconcile_us_position_lifecycles(
     authoritative: bool,
     fills: list[dict] | None = None,
     env: str | None = None,
+    managed_owners: set[str] | None = None,
 ) -> dict[str, dict]:
-    """Carry open lifecycle state forward and close only on authoritative zero."""
+    """Carry scoped open lifecycle state forward; never close another sleeve."""
     now_iso = _iso(now)
-    current: dict[str, dict] = {_sym(p.get("symbol")): p for p in positions or [] if _sym(p.get("symbol")) and _i(p.get("qty")) > 0}
+    from trader.us.strategy_ownership import owner_for_symbol
+    owners = {str(o).upper() for o in managed_owners} if managed_owners is not None else None
+    current: dict[str, dict] = {
+        _sym(p.get("symbol")): p for p in positions or []
+        if _sym(p.get("symbol")) and _i(p.get("qty")) > 0
+        and (owners is None or owner_for_symbol(p.get("symbol")) in owners)
+    }
     out: dict[str, dict] = {}
     open_latest = load_latest_open_us_position_lifecycles(trade_date)
 
@@ -497,6 +504,12 @@ def reconcile_us_position_lifecycles(
 
     if authoritative:
         for symbol, lifecycle in (open_latest or {}).items():
+            if owners is not None:
+                persisted_owner = str(lifecycle.get("strategy_owner") or "").upper()
+                # Unknown owner must never be closed by a scoped reconciliation;
+                # an absent symbol in an owner's filtered snapshot is not zero.
+                if persisted_owner not in owners or owner_for_symbol(symbol) not in owners:
+                    continue
             if symbol in current:
                 continue
             closed = dict(lifecycle)

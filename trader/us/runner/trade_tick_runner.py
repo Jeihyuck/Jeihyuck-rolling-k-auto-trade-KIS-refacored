@@ -2235,8 +2235,19 @@ def run_trade_tick(
             current_positions = []
     try:
         from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        from trader.us.strategy_ownership import owner_for_symbol, STANDARD_OWNER
+        _standard_lifecycle_positions = [
+            p for p in current_positions
+            if owner_for_symbol(p.get("symbol")) == STANDARD_OWNER
+            and str(p.get("strategy_owner") or (p.get("meta") or {}).get("strategy_owner") or STANDARD_OWNER).upper() == STANDARD_OWNER
+        ]
+        _standard_lifecycle_fills = [
+            f for f in fills_today
+            if owner_for_symbol(f.get("symbol")) == STANDARD_OWNER
+            and str(f.get("strategy_owner") or (f.get("meta") or {}).get("strategy_owner") or STANDARD_OWNER).upper() == STANDARD_OWNER
+        ]
         lifecycle_map = reconcile_us_position_lifecycles(
-            positions=current_positions,
+            positions=_standard_lifecycle_positions,
             trade_date=trade_date,
             now=now,
             env=env,
@@ -2245,9 +2256,10 @@ def run_trade_tick(
                 and not recon.get("preserve_previous_positions")
                 and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
             ),
-            fills=fills_today,
+            fills=_standard_lifecycle_fills,
+            managed_owners={STANDARD_OWNER},
         )
-        for _p in current_positions:
+        for _p in _standard_lifecycle_positions:
             if _p.get("epoch_visibility_status") == "STALE_EPOCH_VISIBLE_PROTECTIVE":
                 continue
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
