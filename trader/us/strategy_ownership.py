@@ -14,6 +14,42 @@ def owner_for_symbol(symbol: object) -> str:
     return TQQQ_OWNER if str(symbol or "").upper().strip() == TQQQ_SYMBOL else STANDARD_OWNER
 
 
+def is_standard_owned_position(row: dict) -> bool:
+    """Broker position belongs to PB1 only when both symbol and durable owner agree.
+
+    Legacy non-dedicated positions may omit owner, but an explicit different
+    owner (or dedicated symbol) cannot cross into US_STANDARD exit policy.
+    """
+    if not isinstance(row, dict):
+        return False
+    sym = row.get("symbol") or row.get("code")
+    if owner_for_symbol(sym) != STANDARD_OWNER:
+        return False
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    asserted = str(row.get("strategy_owner") or meta.get("strategy_owner") or STANDARD_OWNER).upper()
+    return asserted == STANDARD_OWNER
+
+
+def is_standard_owned_fill(row: dict) -> bool:
+    return is_standard_owned_position(row)
+
+
+def filter_standard_owned_exit_intents(intents: list[dict], positions: list[dict]) -> list[dict]:
+    """Filter generated PB1 exits using the broker holding's owner evidence.
+
+    Exit intents may not carry source strategy_owner; the original holding
+    controls ownership so an explicit UNKNOWN/foreign owner stays fenced.
+    """
+    allowed = {
+        str(p.get("symbol") or p.get("code") or "").upper().strip()
+        for p in positions or [] if is_standard_owned_position(p)
+    }
+    return [
+        intent for intent in intents or []
+        if str(intent.get("symbol") or "").upper().strip() in allowed
+    ]
+
+
 def is_standard_symbol(symbol: object, *, log: bool = False) -> bool:
     standard = owner_for_symbol(symbol) == STANDARD_OWNER
     if not standard and log:

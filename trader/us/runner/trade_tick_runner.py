@@ -2235,8 +2235,17 @@ def run_trade_tick(
             current_positions = []
     try:
         from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        from trader.us.strategy_ownership import (
+            is_standard_owned_position, is_standard_owned_fill, STANDARD_OWNER,
+        )
+        _standard_lifecycle_positions = [
+            p for p in current_positions if is_standard_owned_position(p)
+        ]
+        _standard_lifecycle_fills = [
+            f for f in fills_today if is_standard_owned_fill(f)
+        ]
         lifecycle_map = reconcile_us_position_lifecycles(
-            positions=current_positions,
+            positions=_standard_lifecycle_positions,
             trade_date=trade_date,
             now=now,
             env=env,
@@ -2245,9 +2254,10 @@ def run_trade_tick(
                 and not recon.get("preserve_previous_positions")
                 and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
             ),
-            fills=fills_today,
+            fills=_standard_lifecycle_fills,
+            managed_owners={STANDARD_OWNER},
         )
-        for _p in current_positions:
+        for _p in _standard_lifecycle_positions:
             if _p.get("epoch_visibility_status") == "STALE_EPOCH_VISIBLE_PROTECTIVE":
                 continue
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
@@ -2362,14 +2372,29 @@ def run_trade_tick(
     # entry_price가 없으면 fail-closed SELL intent 생성 (US_EXIT_FAIL_CLOSED_ON_PNL_MISSING 기본값=1)
     _exit_trade_date = trade_date if isinstance(trade_date, str) else str(trade_date)
     _exit_engine_started = time.monotonic()
+    from trader.us.strategy_ownership import is_standard_owned_position
+    _standard_exit_positions = [
+        p for p in current_positions if is_standard_owned_position(p)
+    ]
     try:
         from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
-        current_positions, exit_position_meta = enrich_us_positions_for_exit(
-            current_positions,
+        _standard_exit_positions, exit_position_meta = enrich_us_positions_for_exit(
+            _standard_exit_positions,
             trade_date=_exit_trade_date,
             env=env,
             provider=provider,
         )
+        # Only PB1's managed positions receive generic exit enrichment.
+        # Retain all-account broker holdings for exposure and Infinite routing.
+        _standard_enriched_by_symbol = {
+            str(p.get("symbol") or "").upper(): p
+            for p in _standard_exit_positions if p.get("symbol")
+        }
+        current_positions = [
+            _standard_enriched_by_symbol.get(str(p.get("symbol") or "").upper(), p)
+            if is_standard_owned_position(p) else p
+            for p in current_positions
+        ]
         logger.info(
             "[US_EXIT][POSITION_RESOLVE] total=%d ok=%d missing=%d sources=%s missing_symbols=%s",
             exit_position_meta.get("total", 0),
@@ -2394,7 +2419,7 @@ def run_trade_tick(
         if not is_default_pb1_engine:
             try:
                 trend_positions, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
-                    positions=current_positions,
+                    positions=_standard_exit_positions,
                     provider=provider,
                     trade_date=_exit_trade_date,
                     now=now,
@@ -2403,12 +2428,12 @@ def run_trade_tick(
                 )
             except Exception as _trend_exc:
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
-                trend_positions = current_positions
+                trend_positions = _standard_exit_positions
             exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
         else:
             from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
             try:
-                exit_snapshots = prepare_exit_position_snapshots(current_positions, provider, now)
+                exit_snapshots = prepare_exit_position_snapshots(_standard_exit_positions, provider, now)
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 exit_snapshots = []
@@ -2505,7 +2530,7 @@ def run_trade_tick(
                 allow_new_symbols = True
                 logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
-        profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
+        profit_capture_intents = build_profit_capture_intents(_standard_exit_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
@@ -2544,14 +2569,32 @@ def run_trade_tick(
         )
         if _rotation_context.get("rotation_context_suspect"):
             _rotation_regime = "UNKNOWN"
-        cluster_guard_result = evaluate_portfolio_cluster_guard(current_positions, _rotation_regime, risk_capital_usd, exit_intents, provider, now)
-        if cluster_guard_result.get("cluster_guard_trim_intents"):
-            exit_intents.extend(cluster_guard_result.get("cluster_guard_trim_intents") or [])
+        cluster_guard_result = evaluate_portfolio_cluster_guard(
+            current_positions, _rotation_regime, risk_capital_usd, exit_intents, provider, now
+        )
+        # The exposure constraint remains portfolio-wide; only PB1-owned
+        # positions may receive the generic cluster SELL policy.
+        from trader.us.strategy_ownership import filter_standard_owned_exit_intents
+        _cluster_trims = filter_standard_owned_exit_intents(
+            cluster_guard_result.get("cluster_guard_trim_intents") or [],
+            _standard_exit_positions,
+        )
+        if len(_cluster_trims) != len(cluster_guard_result.get("cluster_guard_trim_intents") or []):
+            logger.warning(
+                "[US_CLUSTER_GUARD][OWNER_SCOPE] blocked_foreign_sleeve_trims=%d",
+                len(cluster_guard_result.get("cluster_guard_trim_intents") or []) - len(_cluster_trims),
+            )
+        cluster_guard_result["cluster_guard_trim_intents"] = _cluster_trims
+        cluster_guard_result["cluster_guard_trim_notional"] = sum(
+            float(i.get("notional_usd") or 0.0) for i in _cluster_trims
+        )
+        if _cluster_trims:
+            exit_intents.extend(_cluster_trims)
         try:
             from trader.us.market_state_overlay import build_defense_trim_intents
             existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
             defense_trim_intents = build_defense_trim_intents(
-                current_positions, market_state_overlay, existing_sell_symbols,
+                _standard_exit_positions, market_state_overlay, existing_sell_symbols,
                 trade_date=trade_date, context=tick_context,
             )
             if defense_trim_intents:
