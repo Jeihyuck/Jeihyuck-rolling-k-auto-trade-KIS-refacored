@@ -3021,8 +3021,11 @@ class OrdersRepo:
         state: str,
         cumulative_filled_qty: int | None,
         authoritative: bool,
+        _conn: Any = None,
     ):
-        attempt = self._execution_claim_repo.find_attempt_for_client_order_key(client_order_key)
+        attempt = self._execution_claim_repo.find_attempt_for_client_order_key(
+            client_order_key, _conn=_conn
+        )
         if attempt is None:
             raise LookupError(
                 f"execution claim attempt not found for client order key {client_order_key}"
@@ -3034,6 +3037,7 @@ class OrdersRepo:
             state=state,
             cumulative_filled_qty=cumulative_filled_qty,
             authoritative=authoritative,
+            _conn=_conn,
         )
 
     def execution_claim_health(self, *, market: str | None = None) -> dict[str, int]:
