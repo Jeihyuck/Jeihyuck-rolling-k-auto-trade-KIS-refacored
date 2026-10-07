@@ -2862,6 +2862,76 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     if not fills:
         return 0
     from trader.us.execution.order_identity import valid_identity
+
+    # One scoped read replaces the two per-fill attribution lookups on the
+    # common exact-order path. Never cache ambiguous/repeated identities or
+    # interpret a DB failure as an absent order; fall back to the old strict
+    # resolver (including normalized-order recovery) in those cases.
+    _batched_orders: dict[tuple[str, str, str], dict] = {}
+    _identity_counts: dict[tuple[str, str, str], int] = {}
+    for _fill in fills:
+        _id = (
+            str(_fill.get("symbol") or "").upper(),
+            str(_fill.get("side") or "").upper(),
+            str(_fill.get("client_order_key") or
+                normalize_us_order_no(_fill.get("order_no")) or ""),
+        )
+        _identity_counts[_id] = _identity_counts.get(_id, 0) + 1
+    if len(fills) > 1:
+        try:
+            _batch_engine = _get_engine_or_none()
+            if _batch_engine is not None:
+                _symbols = sorted({str(f.get("symbol") or "").upper() for f in fills if f.get("symbol")})
+                with _batch_engine.begin() as _conn:
+                    _epoch = _active_us_epoch(_conn)
+                    _sql = """
+                        SELECT trade_date, client_order_key, symbol, exchange, side,
+                               qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                        FROM us_orders WHERE trade_date=:td AND symbol=ANY(:symbols)
+                    """
+                    _params = {"td": td, "symbols": _symbols}
+                    if _epoch:
+                        _sql += " AND trading_epoch_id=:epoch"
+                        _params["epoch"] = _epoch
+                    _rows = [dict(row) for row in _conn.execute(text(_sql), _params).mappings().all()]
+                for _fill in fills:
+                    _key = (
+                        str(_fill.get("symbol") or "").upper(),
+                        str(_fill.get("side") or "").upper(),
+                        str(_fill.get("client_order_key") or
+                            normalize_us_order_no(_fill.get("order_no")) or ""),
+                    )
+                    if _identity_counts.get(_key) != 1 or not _key[2]:
+                        continue
+                    _cok = str(_fill.get("client_order_key") or "")
+                    _on = normalize_us_order_no(_fill.get("order_no"))
+                    _matches = [
+                        row for row in _rows
+                        if str(row.get("symbol") or "").upper() == _key[0]
+                        and str(row.get("side") or "").upper() == _key[1]
+                        and ((_cok and str(row.get("client_order_key") or "") == _cok)
+                             or (_on and normalize_us_order_no(row.get("order_no")) == _on))
+                    ]
+                    if len(_matches) == 1:
+                        _batched_orders[_key] = _matches[0]
+        except Exception as exc:
+            _batched_orders = {}
+            logger.warning("[US_FILLS][BATCH_ORDER_LOOKUP][FALLBACK] err=%s", exc)
+
+    def _order_for_record(fill: dict) -> dict:
+        _key = (
+            str(fill.get("symbol") or "").upper(),
+            str(fill.get("side") or "").upper(),
+            str(fill.get("client_order_key") or
+                normalize_us_order_no(fill.get("order_no")) or ""),
+        )
+        if _key in _batched_orders:
+            return dict(_batched_orders[_key])
+        return load_us_order_for_fill(
+            order_no=fill.get("order_no"), client_order_key=fill.get("client_order_key"),
+            symbol=str(fill.get("symbol") or ""), trade_date=td,
+        )
+
     for f in fills:
         fill_meta = _parse_json_meta(f.get("meta"))
         evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
@@ -2869,10 +2939,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if fill_meta.get("attribution_status") == "UNATTRIBUTED":
             f["meta"] = fill_meta
             continue
-        order = load_us_order_for_fill(
-            order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
-            symbol=str(f.get("symbol") or ""), trade_date=td,
-        )
+        order = _order_for_record(f)
         if order and (
             str(order.get("symbol") or "").upper() != str(f.get("symbol") or "").upper()
             or str(order.get("side") or "").upper() != str(f.get("side") or "").upper()
@@ -2948,12 +3015,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                 remaining_fills.append(f)
                 continue
             try:
-                order = load_us_order_for_fill(
-                    order_no=f.get("order_no"),
-                    client_order_key=f.get("client_order_key"),
-                    symbol=str(f.get("symbol") or ""),
-                    trade_date=td,
-                )
+                order = _order_for_record(f)
                 if not order:
                     f["save_status"] = "FILL_ORDER_NOT_FOUND"
                     logger.error("[US_FILLS][ATOMIC_ACTUAL][ORDER_NOT_FOUND] trade_date=%s order_no=%s symbol=%s side=%s", td, f.get("order_no"), f.get("symbol"), f.get("side"))
