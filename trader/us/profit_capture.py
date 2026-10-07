@@ -115,4 +115,5 @@ def sync_profit_capture_stage_from_order(**event) -> None:
         qty=requested if requested > 0 else None,
         filled_qty=filled if filled >= 0 else None,
         evidence_type=evidence,
+        _conn=event.get("_conn"),
     )

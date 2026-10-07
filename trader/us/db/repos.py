@@ -378,21 +378,21 @@ def claim_execution_action(identity: Any, *, attempt_id: str, requested_qty: int
 
 def record_execution_action_observation(identity: Any, *, attempt_id: str, state: str,
                                         cumulative_filled_qty: int | None,
-                                        authoritative: bool):
+                                        authoritative: bool, _conn: Any = None):
     return _execution_claim_repo().record_observation(
         identity, attempt_id=attempt_id, state=state,
         cumulative_filled_qty=cumulative_filled_qty,
-        authoritative=authoritative,
+        authoritative=authoritative, _conn=_conn,
     )
 
 
 def record_execution_action_observation_by_key(action_key: str, *, attempt_id: str, state: str,
                                               cumulative_filled_qty: int | None,
-                                              authoritative: bool):
+                                              authoritative: bool, _conn: Any = None):
     return record_execution_action_observation(
         action_key, attempt_id=attempt_id, state=state,
         cumulative_filled_qty=cumulative_filled_qty,
-        authoritative=authoritative,
+        authoritative=authoritative, _conn=_conn,
     )
 
 
@@ -1419,7 +1419,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
             epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
             identity_row = conn.execute(
-                text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                text("SELECT meta,trading_epoch_id,exchange,order_no,symbol,side,qty_requested,client_order_key FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
                 {"td": td, "key": key, **epoch_params},
             ).mappings().first()
             state_row = conn.execute(
@@ -1502,15 +1502,149 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     "observed_filled_qty": filled_qty_value,
                     "persisted_filled_qty": old_filled,
                 }
-        result = mark_order_filled_by_reconcile(
-            order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
-            filled_qty=filled_qty_value, requested_qty=requested_qty,
-            cumulative_filled_qty=filled_qty_value,
-            avg_price_usd=fill_price,
-            source="broker_order_observation", evidence_type=evidence_type,
-            trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
-        )
-        if result.get("status") != "OK": return result
+        settlement_atomic_applied = False
+
+        def _legacy_fill_apply():
+            return mark_order_filled_by_reconcile(
+                order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
+                filled_qty=filled_qty_value, requested_qty=requested_qty,
+                cumulative_filled_qty=filled_qty_value,
+                avg_price_usd=fill_price,
+                source="broker_order_observation", evidence_type=evidence_type,
+                trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
+            )
+
+        result = None
+        if (
+            engine is not None
+            and evidence_type in {"KIS_ORDER_CUMULATIVE_ACTUAL", "KIS_TERMINAL_CANCEL"}
+            and filled_qty_value > 0
+        ):
+            try:
+                from trader.settlement.us_cutover import (
+                    build_us_broker_observation,
+                    load_us_runtime_release,
+                    route_us_settlement,
+                )
+
+                settlement_order = {
+                    "env": order_meta.get("env") or os.getenv("KIS_ENV") or "practice",
+                    "trading_epoch_id": (
+                        identity_row.get("trading_epoch_id")
+                        if engine is not None and identity_row is not None
+                        else order_meta.get("trading_epoch_id")
+                    ),
+                    "strategy_owner": order_meta.get("strategy_owner"),
+                    "position_lifecycle_id": (
+                        order_meta.get("position_lifecycle_id")
+                        or order_meta.get("position_cycle_id")
+                    ),
+                    "client_order_key": key,
+                    "qty_requested": int(requested_qty),
+                    "exchange": (
+                        (identity_row.get("exchange") if identity_row is not None else None)
+                        or order_meta.get("exchange")
+                        or (raw_row or {}).get("exchange")
+                        or "NASDAQ"
+                    ),
+                    "order_no": raw_order_no,
+                    "symbol": symbol,
+                    "side": side,
+                    "meta": order_meta,
+                }
+                observation = build_us_broker_observation(
+                    order=settlement_order,
+                    trade_date=td,
+                    cumulative_qty=filled_qty_value,
+                    broker_fill_price=fill_price,
+                    evidence_digest=(
+                        f"kis-order-cumulative:{evidence_type}:{td}:{canonical_order_no}:"
+                        f"{filled_qty_value}:{fill_price}"
+                    ),
+                )
+                release = load_us_runtime_release(engine, observation)
+                atomic_result: dict[str, Any] = {}
+
+                def _atomic_fill_apply(conn, _obs, _decision):
+                    applied = mark_order_filled_by_reconcile(
+                        order_no=raw_order_no,
+                        client_order_key=key,
+                        symbol=symbol,
+                        side=side,
+                        filled_qty=filled_qty_value,
+                        requested_qty=requested_qty,
+                        cumulative_filled_qty=filled_qty_value,
+                        avg_price_usd=fill_price,
+                        source="broker_order_observation",
+                        evidence_type=evidence_type,
+                        trade_date=td,
+                        meta={**meta_patch, "fill_price_source": fill_price_source},
+                        _conn=conn,
+                        _skip_claim_update=False,
+                    )
+                    if not isinstance(applied, dict) or applied.get("status") != "OK":
+                        raise RuntimeError(
+                            "US_ATOMIC_ECONOMIC_APPLY_FAILED:"
+                            + str((applied or {}).get("status") if isinstance(applied, dict) else applied)
+                        )
+                    atomic_result["value"] = applied
+
+                routed = route_us_settlement(
+                    engine=engine,
+                    observation=observation,
+                    release=release,
+                    apply_atomic_economic_delta=_atomic_fill_apply,
+                    apply_legacy=_legacy_fill_apply,
+                )
+                if routed.mode == "ATOMIC_SETTLEMENT":
+                    settlement_atomic_applied = True
+                    result = atomic_result.get("value") or {
+                        "status": "OK",
+                        "order_status": (
+                            "FILLED"
+                            if filled_qty_value >= int(requested_qty)
+                            else "PARTIALLY_FILLED"
+                        ),
+                        "settlement_replay": True,
+                    }
+                else:
+                    result = routed.legacy_result
+                logger.info(
+                    "[SETTLEMENT_CUTOVER][US] symbol=%s owner=%s mode=%s cumulative=%s",
+                    symbol,
+                    observation.strategy_owner,
+                    routed.mode,
+                    filled_qty_value,
+                )
+            except Exception as exc:
+                # Fail closed on activation/provenance errors.  When activation
+                # is not requested, the runtime release resolves to LEGACY
+                # above; reaching this path means the cutover contract itself
+                # could not be trusted.
+                if os.getenv("NULLIM_US_SETTLEMENT_ACTIVATE", "0").strip() == "1":
+                    logger.exception(
+                        "[SETTLEMENT_CUTOVER][US][BLOCKED] symbol=%s err=%s",
+                        symbol, exc,
+                    )
+                    return {
+                        "status": "SETTLEMENT_CUTOVER_BLOCKED",
+                        "error": str(exc),
+                        "requires_reconcile": True,
+                        "retry_order": False,
+                        "entry_fence": True,
+                    }
+                logger.warning(
+                    "[SETTLEMENT_CUTOVER][US][LEGACY_FALLBACK] symbol=%s err=%s",
+                    symbol, exc,
+                )
+                result = _legacy_fill_apply()
+        else:
+            result = _legacy_fill_apply()
+
+        if not isinstance(result, dict) or result.get("status") != "OK":
+            return result if isinstance(result, dict) else {
+                "status": "RECONCILE_UPDATE_FAILED", "error": str(result)
+            }
     if status not in {"PARTIALLY_FILLED", "FILLED"}:
         if engine is None:
             matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
@@ -1603,7 +1737,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             and broker_remaining_qty == 0
             and action_remaining_qty == int(requested_qty) - observation_qty
         )
-    if action_key and attempt_id:
+    if action_key and attempt_id and not locals().get("settlement_atomic_applied", False):
         claim_state = {
             "ACK": "ACKED",
             "OPEN": "ACKED",
@@ -2064,7 +2198,8 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
 
 
 def load_us_profit_capture_state(trade_date: str, symbols: list[str],
-                                 lifecycle_by_symbol: dict[str, str] | None = None) -> dict[str, dict]:
+                                 lifecycle_by_symbol: dict[str, str] | None = None,
+                                 _conn: Any = None) -> dict[str, dict]:
     """Load TP1/TP2/TP3 state for the current position lifecycle.
 
     TP completion belongs to a position lifecycle, not to a trading date. Rows
@@ -2103,7 +2238,7 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                     if candidate.get(key):
                         state[key] = candidate[key]
         if engine is not None:
-            with engine.connect() as conn:
+            def _read_profit_capture(conn):
                 epoch_id = _active_us_epoch(conn)
                 sql = """SELECT DISTINCT ON (stage)
                     stage,stage_status,client_order_key,raw_broker_order_no,
@@ -2115,7 +2250,12 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                     sql += " AND trading_epoch_id=:epoch_id"
                     params["epoch_id"] = epoch_id
                 sql += " ORDER BY stage,trade_date DESC,updated_at DESC"
-                rows = conn.execute(text(sql), params).mappings().all()
+                return conn.execute(text(sql), params).mappings().all()
+            if _conn is not None:
+                rows = _read_profit_capture(_conn)
+            else:
+                with engine.connect() as conn:
+                    rows = _read_profit_capture(conn)
             state={"position_lifecycle_id":lifecycle,"meta":{}}
             for row in rows:
                 stage=str(row["stage"]); status=str(row["stage_status"])
@@ -2141,6 +2281,7 @@ def mark_us_profit_capture_stage(
     broker_order_no: str | None = None,
     filled_qty: int | None = None,
     evidence_type: str | None = None,
+    _conn: Any = None,
 ) -> None:
     """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
     sym = str(symbol or "").strip().upper()
@@ -2153,7 +2294,9 @@ def mark_us_profit_capture_stage(
     lifecycle = str(position_lifecycle_id or "").strip()
     if not lifecycle:
         return
-    existing = load_us_profit_capture_state(td, [sym], {sym: lifecycle}).get(sym, {})
+    existing = load_us_profit_capture_state(
+        td, [sym], {sym: lifecycle}, _conn=_conn
+    ).get(sym, {})
     now_iso = datetime.now(timezone.utc).isoformat()
     status_upper = str(status or "PENDING").upper()
     evidence_upper = str(evidence_type or "").upper()
@@ -2218,11 +2361,12 @@ def mark_us_profit_capture_stage(
         meta[f"{stg}_notional_usd"] = float(notional_usd)
     existing["meta"] = meta
     normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
-    _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     engine = _get_engine_or_none()
+    if engine is None or _conn is None:
+        _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     if engine is not None:
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
-        with engine.begin() as conn:
+        def _write_profit_capture(conn):
             epoch_id = _active_us_epoch(conn)
             params = {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
                       "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
@@ -2256,6 +2400,11 @@ def mark_us_profit_capture_stage(
                      cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
                      state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
             conn.execute(text(sql), params)
+        if _conn is not None:
+            _write_profit_capture(_conn)
+        else:
+            with engine.begin() as conn:
+                _write_profit_capture(conn)
 
 
 def mark_us_position_exit_stage(
@@ -4283,6 +4432,7 @@ def _active_fill_cumulatives_for_order(
 
 def _record_actual_fill_execution_claim(
     order_meta: dict, *, cumulative_qty: int, requested_qty: int, evidence: str,
+    _conn: Any = None,
 ) -> str | None:
     if not _is_kis_order_cumulative_evidence(evidence):
         return None
@@ -4297,6 +4447,7 @@ def _record_actual_fill_execution_claim(
             state="FILLED" if cumulative_qty >= requested_qty else "PARTIALLY_FILLED",
             cumulative_filled_qty=cumulative_qty,
             authoritative=True,
+            _conn=_conn,
         )
         return None
     except Exception as exc:
@@ -4313,6 +4464,7 @@ def mark_order_filled_by_reconcile(
     source: str = "balance_reconcile", trade_date: str | None = None,
     meta: dict | None = None, requested_qty: int | None = None,
     cumulative_filled_qty: int | None = None, evidence_type: str | None = None,
+    _conn: Any = None, _skip_claim_update: bool = False,
 ) -> dict:
     """Strictly update exactly one order and create at most one synthetic fill."""
     from datetime import datetime, timezone
@@ -4433,221 +4585,235 @@ def mark_order_filled_by_reconcile(
             }
         return result
     try:
-        with engine.begin() as conn:
-            active_epoch_id = _active_us_epoch(conn)
-            epoch_select = ", trading_epoch_id" if active_epoch_id else ""
-            epoch_clause = " AND trading_epoch_id=:active_epoch_id" if active_epoch_id else ""
-            order_params = {"td": td, "order_no": on, "cok": cok, "symbol": sym}
-            if active_epoch_id:
-                order_params["active_epoch_id"] = active_epoch_id
-            rows = conn.execute(text("""
-                SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
-                       qty_requested, qty_filled""" + epoch_select + """
-                FROM us_orders WHERE trade_date=:td AND
-                  ((:order_no <> '' AND order_no=:order_no) OR
-                   (:cok <> '' AND client_order_key=:cok)
-                   OR (:order_no <> '' AND symbol=:symbol))
-            """ + epoch_clause + " FOR UPDATE"), order_params).mappings().all()
-            matches = [dict(row) for row in rows if
-                       (cok and str(row.get("client_order_key") or "") == cok)
-                       or (on and normalize_us_order_no(row.get("order_no")) == normalize_us_order_no(on))]
-            check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
-                                                requested_symbol=sym, requested_side=side_u, matches=matches)
-            if check["status"] != "OK": return check
-            order = check["order"]
-            order_epoch_id = _assert_us_order_epoch(order, active_epoch_id)
-            on = str(order.get("order_no") or on)
-            requested = int(requested_qty or order.get("qty_requested") or qty)
-            previous = int(order.get("qty_filled") or 0)
-            observed_cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
-            evidence = evidence_type or ("KIS_ORDER_CUMULATIVE_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
-            synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
-            resolved_client_order_key = cok or order["client_order_key"] or ""
-            active = _active_fill_cumulatives_for_order(
+        if _conn is None:
+            with engine.begin() as conn:
+                return mark_order_filled_by_reconcile(
+                    order_no=order_no, client_order_key=client_order_key,
+                    symbol=symbol, side=side, filled_qty=filled_qty,
+                    avg_price_usd=avg_price_usd, source=source,
+                    trade_date=trade_date, meta=meta, requested_qty=requested_qty,
+                    cumulative_filled_qty=cumulative_filled_qty, evidence_type=evidence_type,
+                    _conn=conn, _skip_claim_update=_skip_claim_update,
+                )
+        conn = _conn
+        active_epoch_id = _active_us_epoch(conn)
+        epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+        epoch_clause = " AND trading_epoch_id=:active_epoch_id" if active_epoch_id else ""
+        order_params = {"td": td, "order_no": on, "cok": cok, "symbol": sym}
+        if active_epoch_id:
+            order_params["active_epoch_id"] = active_epoch_id
+        rows = conn.execute(text("""
+            SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
+                   qty_requested, qty_filled""" + epoch_select + """
+            FROM us_orders WHERE trade_date=:td AND
+              ((:order_no <> '' AND order_no=:order_no) OR
+               (:cok <> '' AND client_order_key=:cok)
+               OR (:order_no <> '' AND symbol=:symbol))
+        """ + epoch_clause + " FOR UPDATE"), order_params).mappings().all()
+        matches = [dict(row) for row in rows if
+                   (cok and str(row.get("client_order_key") or "") == cok)
+                   or (on and normalize_us_order_no(row.get("order_no")) == normalize_us_order_no(on))]
+        check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
+                                            requested_symbol=sym, requested_side=side_u, matches=matches)
+        if check["status"] != "OK": return check
+        order = check["order"]
+        order_epoch_id = _assert_us_order_epoch(order, active_epoch_id)
+        on = str(order.get("order_no") or on)
+        requested = int(requested_qty or order.get("qty_requested") or qty)
+        previous = int(order.get("qty_filled") or 0)
+        observed_cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
+        evidence = evidence_type or ("KIS_ORDER_CUMULATIVE_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
+        synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+        resolved_client_order_key = cok or order["client_order_key"] or ""
+        active = _active_fill_cumulatives_for_order(
+            trade_date=td,
+            order_no=on,
+            client_order_key=resolved_client_order_key,
+            symbol=sym,
+            side=side_u,
+            conn=conn,
+            trading_epoch_id=order_epoch_id,
+        )
+        if not synthetic and observed_cumulative > requested:
+            return {"status": "EVIDENCE_QUANTITY_OVERFLOW", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "requested_qty": requested, "entry_fence": True}
+        if not synthetic and _is_kis_order_cumulative_evidence(evidence) and observed_cumulative < int(active.get("actual", 0) or 0):
+            return {"status": "EVIDENCE_QUANTITY_REGRESSION", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "previous_actual_cumulative": int(active.get("actual", 0) or 0), "entry_fence": True}
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0 and observed_cumulative != int(active.get("actual_individual", 0) or 0):
+            return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                    "order_cumulative": observed_cumulative, "execution_actual_qty": int(active.get("actual_individual", 0) or 0)}
+        if not synthetic and observed_cumulative < int(active.get("synthetic", 0) or 0):
+            return {"status": "EVIDENCE_QUANTITY_CONFLICT", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "synthetic_cumulative": int(active.get("synthetic", 0) or 0)}
+        cumulative = max(previous, min(observed_cumulative, requested))
+        remaining = max(0, requested - cumulative)
+        status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
+        merged = {
+            **_parse_json_meta(order.get("meta")),
+            **(meta or {}),
+            "remaining_qty": remaining,
+        }
+        if order_epoch_id:
+            merged["trading_epoch_id"] = order_epoch_id
+        promotion = {"superseded": 0, "conflict": 0}
+        if not synthetic:
+            promotion = _supersede_synthetic_fills_for_actual(
                 trade_date=td,
                 order_no=on,
                 client_order_key=resolved_client_order_key,
-                symbol=sym,
-                side=side_u,
+                cumulative=observed_cumulative,
                 conn=conn,
                 trading_epoch_id=order_epoch_id,
             )
-            if not synthetic and observed_cumulative > requested:
-                return {"status": "EVIDENCE_QUANTITY_OVERFLOW", "requires_reconcile": True, "retry_order": False,
-                        "observed_actual_cumulative": observed_cumulative, "requested_qty": requested, "entry_fence": True}
-            if not synthetic and _is_kis_order_cumulative_evidence(evidence) and observed_cumulative < int(active.get("actual", 0) or 0):
-                return {"status": "EVIDENCE_QUANTITY_REGRESSION", "requires_reconcile": True, "retry_order": False,
-                        "observed_actual_cumulative": observed_cumulative, "previous_actual_cumulative": int(active.get("actual", 0) or 0), "entry_fence": True}
-            if not synthetic and int(active.get("actual_individual", 0) or 0) > 0 and observed_cumulative != int(active.get("actual_individual", 0) or 0):
-                return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
-                        "order_cumulative": observed_cumulative, "execution_actual_qty": int(active.get("actual_individual", 0) or 0)}
-            if not synthetic and observed_cumulative < int(active.get("synthetic", 0) or 0):
-                return {"status": "EVIDENCE_QUANTITY_CONFLICT", "requires_reconcile": True, "retry_order": False,
-                        "observed_actual_cumulative": observed_cumulative, "synthetic_cumulative": int(active.get("synthetic", 0) or 0)}
-            cumulative = max(previous, min(observed_cumulative, requested))
-            remaining = max(0, requested - cumulative)
-            status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
-            merged = {
-                **_parse_json_meta(order.get("meta")),
-                **(meta or {}),
-                "remaining_qty": remaining,
+        update_params = {
+            "status": status,
+            "qty": cumulative,
+            "price": price,
+            "meta": _json_param(merged),
+            "ts": now_utc,
+            "id": order["id"],
+            "trading_epoch_id": order_epoch_id,
+        }
+        update_sql = """UPDATE us_orders SET status = :status, qty_filled = :qty,
+            avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts
+            WHERE id = :id"""
+        if order_epoch_id:
+            update_sql += " AND trading_epoch_id=:trading_epoch_id"
+        conn.execute(text(update_sql), update_params)
+        if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+            _cost_basis = _safe_float_meta(merged, [
+                "cost_basis_price_usd", "pre_sell_avg_cost", "pre_sell_cost_basis_price_usd",
+                "broker_avg_price", "avg_cost", "entry_price",
+            ])
+            _realized_pnl = None
+            _realized_pct = None
+            if side_u == "SELL" and _cost_basis and _cost_basis > 0 and price > 0:
+                _realized_pnl = round((float(price) - float(_cost_basis)) * int(observed_cumulative), 4)
+                _realized_pct = round(((float(price) - float(_cost_basis)) / float(_cost_basis)) * 100.0, 4)
+            mark_params = {
+                "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
+                "remaining": remaining, "requested": requested, "ts": now_utc,
+                "avg_cost_at_sell": _cost_basis,
+                "realized_pnl_usd": _realized_pnl,
+                "realized_pnl_pct": _realized_pct,
+                "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
             }
             if order_epoch_id:
-                merged["trading_epoch_id"] = order_epoch_id
-            promotion = {"superseded": 0, "conflict": 0}
-            if not synthetic:
-                promotion = _supersede_synthetic_fills_for_actual(
-                    trade_date=td,
-                    order_no=on,
-                    client_order_key=resolved_client_order_key,
-                    cumulative=observed_cumulative,
-                    conn=conn,
-                    trading_epoch_id=order_epoch_id,
-                )
-            update_params = {
-                "status": status,
-                "qty": cumulative,
-                "price": price,
-                "meta": _json_param(merged),
-                "ts": now_utc,
-                "id": order["id"],
-                "trading_epoch_id": order_epoch_id,
-            }
-            update_sql = """UPDATE us_orders SET status = :status, qty_filled = :qty,
-                avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts
-                WHERE id = :id"""
+                mark_params["trading_epoch_id"] = order_epoch_id
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            conn.execute(
+                _mark_filled_by_reconcile_stmt(
+                    epoch_scoped=bool(order_epoch_id),
+                    include_pnl_columns=pnl_columns_available,
+                ),
+                mark_params,
+            )
+        fill_epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if order_epoch_id else ""
+        fill_epoch_params = {"trading_epoch_id": order_epoch_id} if order_epoch_id else {}
+        actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
+            AND :order_no <> '' AND order_no=:order_no
+            AND symbol=:symbol AND side=:side
+        """ + fill_epoch_clause + """
+            AND NOT COALESCE((meta->>'is_synthetic')::boolean,
+                (meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
+            AND COALESCE((meta->>'cumulative_filled_qty')::integer, qty)=:cumulative LIMIT 1"""),
+            {"td": td, "order_no": on, "symbol": sym, "side": side_u,
+             "cumulative": observed_cumulative, **fill_epoch_params}).first()
+        delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
+        delta = max(0, observed_cumulative - delta_base)
+        fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
+            fill_delta = 0
+        if fill_delta and not actual:
+            fill_meta = (_actual_reconcile_fill_meta(source=source, side=side_u, qty=fill_delta,
+                          avg_price_usd=price, base_meta={**merged, "fill_evidence_type": evidence,
+                          "cumulative_filled_qty": observed_cumulative})
+                         if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
+                            client_order_key=resolved_client_order_key, side=side_u, qty=fill_delta,
+                            avg_price_usd=price, base_meta={**merged, "cumulative_filled_qty": observed_cumulative}))
+            fill_meta["cumulative_filled_qty"] = observed_cumulative
+            fill_meta["fill_evidence_type"] = evidence
+            fill_meta["is_synthetic"] = synthetic
             if order_epoch_id:
-                update_sql += " AND trading_epoch_id=:trading_epoch_id"
-            conn.execute(text(update_sql), update_params)
-            if not synthetic and _is_kis_order_cumulative_evidence(evidence):
-                _cost_basis = _safe_float_meta(merged, [
-                    "cost_basis_price_usd", "pre_sell_avg_cost", "pre_sell_cost_basis_price_usd",
-                    "broker_avg_price", "avg_cost", "entry_price",
-                ])
-                _realized_pnl = None
-                _realized_pct = None
-                if side_u == "SELL" and _cost_basis and _cost_basis > 0 and price > 0:
-                    _realized_pnl = round((float(price) - float(_cost_basis)) * int(observed_cumulative), 4)
-                    _realized_pct = round(((float(price) - float(_cost_basis)) / float(_cost_basis)) * 100.0, 4)
-                mark_params = {
-                    "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
-                    "remaining": remaining, "requested": requested, "ts": now_utc,
-                    "avg_cost_at_sell": _cost_basis,
-                    "realized_pnl_usd": _realized_pnl,
-                    "realized_pnl_pct": _realized_pct,
-                    "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
-                }
-                if order_epoch_id:
-                    mark_params["trading_epoch_id"] = order_epoch_id
-                pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
-                conn.execute(
-                    _mark_filled_by_reconcile_stmt(
-                        epoch_scoped=bool(order_epoch_id),
-                        include_pnl_columns=pnl_columns_available,
-                    ),
-                    mark_params,
-                )
-            fill_epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if order_epoch_id else ""
-            fill_epoch_params = {"trading_epoch_id": order_epoch_id} if order_epoch_id else {}
-            actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
-                AND :order_no <> '' AND order_no=:order_no
-                AND symbol=:symbol AND side=:side
-            """ + fill_epoch_clause + """
-                AND NOT COALESCE((meta->>'is_synthetic')::boolean,
-                    (meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
-                AND COALESCE((meta->>'cumulative_filled_qty')::integer, qty)=:cumulative LIMIT 1"""),
-                {"td": td, "order_no": on, "symbol": sym, "side": side_u,
-                 "cumulative": observed_cumulative, **fill_epoch_params}).first()
-            delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
-            delta = max(0, observed_cumulative - delta_base)
-            fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
-            if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
-                fill_delta = 0
-            if fill_delta and not actual:
-                fill_meta = (_actual_reconcile_fill_meta(source=source, side=side_u, qty=fill_delta,
-                              avg_price_usd=price, base_meta={**merged, "fill_evidence_type": evidence,
-                              "cumulative_filled_qty": observed_cumulative})
-                             if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
-                                client_order_key=resolved_client_order_key, side=side_u, qty=fill_delta,
-                                avg_price_usd=price, base_meta={**merged, "cumulative_filled_qty": observed_cumulative}))
-                fill_meta["cumulative_filled_qty"] = observed_cumulative
-                fill_meta["fill_evidence_type"] = evidence
-                fill_meta["is_synthetic"] = synthetic
-                if order_epoch_id:
-                    fill_meta["trading_epoch_id"] = order_epoch_id
-                fill = {"symbol": sym, "side": side_u, "qty": fill_delta, "price_usd": price,
-                        "order_no": on, "client_order_key": resolved_client_order_key,
-                        "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence, "meta": fill_meta}
-                insert_params = {
-                    "td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
-                    "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
-                    "cok": resolved_client_order_key, "ts": now_utc,
-                    "meta": _json_param(fill_meta),
-                    "avg_cost_at_sell": fill_meta.get("cost_basis_price_usd"),
-                    "realized_pnl_usd": fill_meta.get("realized_pnl_usd"),
-                    "realized_pnl_pct": fill_meta.get("realized_pnl_pct"),
-                    "idem": _us_fill_idempotency_key_text(fill, td),
-                }
-                pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
-                if order_epoch_id:
-                    insert_params["trading_epoch_id"] = order_epoch_id
-                    if pnl_columns_available:
-                        insert_sql = """INSERT INTO us_fills
-                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
-                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
-                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
-                    else:
-                        insert_sql = """INSERT INTO us_fills
-                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
-                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
-                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                fill_meta["trading_epoch_id"] = order_epoch_id
+            fill = {"symbol": sym, "side": side_u, "qty": fill_delta, "price_usd": price,
+                    "order_no": on, "client_order_key": resolved_client_order_key,
+                    "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence, "meta": fill_meta}
+            insert_params = {
+                "td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
+                "cok": resolved_client_order_key, "ts": now_utc,
+                "meta": _json_param(fill_meta),
+                "avg_cost_at_sell": fill_meta.get("cost_basis_price_usd"),
+                "realized_pnl_usd": fill_meta.get("realized_pnl_usd"),
+                "realized_pnl_pct": fill_meta.get("realized_pnl_pct"),
+                "idem": _us_fill_idempotency_key_text(fill, td),
+            }
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            if order_epoch_id:
+                insert_params["trading_epoch_id"] = order_epoch_id
+                if pnl_columns_available:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
                 else:
-                    if pnl_columns_available:
-                        insert_sql = """INSERT INTO us_fills
-                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
-                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
-                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
-                    else:
-                        insert_sql = """INSERT INTO us_fills
-                            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
-                            VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
-                            ON CONFLICT (fill_idempotency_key) DO NOTHING"""
-                conn.execute(text(insert_sql), insert_params)
-            rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
-            """ + fill_epoch_clause + """
-                AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-                {"td": td, "order_no": on, **fill_epoch_params}).mappings().all()
-            execution_qty = 0; cumulative_qty = 0; synthetic_qty = 0
-            for fill_after in rows_after:
-                meta_after = _parse_json_meta(fill_after.get("meta"))
-                qty_after = int(fill_after.get("qty") or 0)
-                evidence_after = str(meta_after.get("fill_evidence_type") or "")
-                if is_synthetic_fill_meta(meta_after):
-                    synthetic_qty = max(synthetic_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
-                elif _is_kis_execution_evidence(evidence_after):
-                    execution_qty += qty_after
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+            else:
+                if pnl_columns_available:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
                 else:
-                    cumulative_qty = max(cumulative_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
-            active_total = execution_qty if execution_qty > 0 else cumulative_qty if cumulative_qty > 0 else synthetic_qty
-            if cumulative != active_total:
-                raise FillAccountingInvariantError({"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
-                        "order_qty_filled": cumulative, "active_fill_qty": active_total})
-            result = {"status": "OK", "order_status": status, "qty_filled": cumulative,
-                    "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual),
-                    "synthetic_superseded_count": int(promotion.get("superseded", 0)),
-                    "evidence_quantity_conflict_count": int(promotion.get("conflict", 0)),
-                    "fill_accounting": {"status": "OK", "order_qty_filled": cumulative, "active_fill_qty": active_total}}
-            if side_u == "SELL" and merged.get("profit_capture_stage"):
-                from trader.us.profit_capture import sync_profit_capture_stage_from_order
-                sync_profit_capture_stage_from_order(
-                    trade_date=td, symbol=sym, position_lifecycle_id=str(merged.get("position_lifecycle_id") or ""),
-                    client_order_key=resolved_client_order_key, broker_order_no=on,
-                    profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
-                    evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
-                )
-        claim_error = _record_actual_fill_execution_claim(
-            merged, cumulative_qty=cumulative, requested_qty=requested, evidence=evidence,
-        )
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+            conn.execute(text(insert_sql), insert_params)
+        rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
+        """ + fill_epoch_clause + """
+            AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+            {"td": td, "order_no": on, **fill_epoch_params}).mappings().all()
+        execution_qty = 0; cumulative_qty = 0; synthetic_qty = 0
+        for fill_after in rows_after:
+            meta_after = _parse_json_meta(fill_after.get("meta"))
+            qty_after = int(fill_after.get("qty") or 0)
+            evidence_after = str(meta_after.get("fill_evidence_type") or "")
+            if is_synthetic_fill_meta(meta_after):
+                synthetic_qty = max(synthetic_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
+            elif _is_kis_execution_evidence(evidence_after):
+                execution_qty += qty_after
+            else:
+                cumulative_qty = max(cumulative_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
+        active_total = execution_qty if execution_qty > 0 else cumulative_qty if cumulative_qty > 0 else synthetic_qty
+        if cumulative != active_total:
+            raise FillAccountingInvariantError({"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                    "order_qty_filled": cumulative, "active_fill_qty": active_total})
+        result = {"status": "OK", "order_status": status, "qty_filled": cumulative,
+                "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual),
+                "synthetic_superseded_count": int(promotion.get("superseded", 0)),
+                "evidence_quantity_conflict_count": int(promotion.get("conflict", 0)),
+                "fill_accounting": {"status": "OK", "order_qty_filled": cumulative, "active_fill_qty": active_total}}
+        if side_u == "SELL" and merged.get("profit_capture_stage"):
+            from trader.us.profit_capture import sync_profit_capture_stage_from_order
+            sync_profit_capture_stage_from_order(
+                trade_date=td, symbol=sym, position_lifecycle_id=str(merged.get("position_lifecycle_id") or ""),
+                client_order_key=resolved_client_order_key, broker_order_no=on,
+                profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
+                evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
+                _conn=conn,
+            )
+        claim_error = None
+        if not _skip_claim_update:
+            claim_error = _record_actual_fill_execution_claim(
+                merged, cumulative_qty=cumulative, requested_qty=requested,
+                evidence=evidence, _conn=conn,
+            )
         if claim_error:
             return {
                 **result,
@@ -4658,9 +4824,13 @@ def mark_order_filled_by_reconcile(
             }
         return result
     except FillAccountingInvariantError as exc:
+        if _conn is not None:
+            raise
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
         return exc.payload
     except Exception as exc:
+        if _conn is not None:
+            raise
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
         return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -647,6 +648,34 @@ def reconcile_ack_orders_with_balance(
         post_qty_for_delta = int((kis_position_by_symbol.get(symbol) or {}).get("qty") or 0)
         delta_confirmation = confirm_order_by_balance_delta(side, qty, pre_qty_for_delta, post_qty_for_delta)
 
+        atomic_scope_active = False
+        atomic_scope_unknown = False
+        try:
+            runtime_engine = _get_engine_or_none()
+            order_meta_for_scope = _order_meta(order)
+            order_epoch = str(
+                order.get("trading_epoch_id")
+                or order_meta_for_scope.get("trading_epoch_id")
+                or ""
+            ).strip()
+            if runtime_engine is not None and order_epoch:
+                from trader.settlement.us_cutover import load_us_runtime_release_for_scope
+                scope_release = load_us_runtime_release_for_scope(
+                    runtime_engine,
+                    env=str(order.get("env") or env or "practice"),
+                    trading_epoch_id=order_epoch,
+                )
+                atomic_scope_active = bool(scope_release.writer_allowed)
+            elif os.getenv("NULLIM_US_SETTLEMENT_ACTIVATE", "0").strip() == "1":
+                atomic_scope_unknown = True
+        except Exception as exc:
+            if os.getenv("NULLIM_US_SETTLEMENT_ACTIVATE", "0").strip() == "1":
+                atomic_scope_unknown = True
+                logger.exception(
+                    "[SETTLEMENT_CUTOVER][US][SCOPE_ERROR] symbol=%s err=%s",
+                    symbol, exc,
+                )
+
         fill_confirmed = False
         fill_price = fallback_fill_price
         fill_price_source = fallback_price_source or "unavailable"
@@ -845,6 +874,16 @@ def reconcile_ack_orders_with_balance(
             continue
 
         if delta_confirmation["status"] in {"BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL"}:
+            if atomic_scope_active or atomic_scope_unknown:
+                unresolved_count += 1
+                symbols_by_status["unresolved"].append(symbol)
+                logger.warning(
+                    "[SETTLEMENT_CUTOVER][US][BALANCE_LEGACY_BLOCKED] symbol=%s "
+                    "reason=%s action=WAIT_EXACT_BROKER_FILL",
+                    symbol,
+                    "ATOMIC_WRITER_ACTIVE" if atomic_scope_active else "ATOMIC_SCOPE_UNVERIFIED",
+                )
+                continue
             filled_by_balance = int(delta_confirmation.get("filled_qty_by_balance") or 0)
             try:
                 from trader.settlement.shadow import shadow_us_reconcile
@@ -915,6 +954,16 @@ def reconcile_ack_orders_with_balance(
                 order_qty=qty,
             )
             if buy_allowed and fill_price_candidate > 0:
+                if atomic_scope_active or atomic_scope_unknown:
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
+                    logger.warning(
+                        "[SETTLEMENT_CUTOVER][US][BUY_BALANCE_LEGACY_BLOCKED] symbol=%s "
+                        "reason=%s action=WAIT_EXACT_BROKER_FILL",
+                        symbol,
+                        "ATOMIC_WRITER_ACTIVE" if atomic_scope_active else "ATOMIC_SCOPE_UNVERIFIED",
+                    )
+                    continue
                 logger.info(
                     "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=BUY qty=%d price_source=%s price=%.4f source=balance_reconcile_buy reason=%s",
                     symbol,
