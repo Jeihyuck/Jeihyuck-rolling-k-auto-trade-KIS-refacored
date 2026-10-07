@@ -120,3 +120,52 @@ def test_accounting_excludes_nested_http_metrics():
     accounted, residual = calculate_latency_accounting(200000, stages)
     assert accounted == 150000
     assert residual == 50000
+
+
+def test_twelve_consecutive_market_context_ticks_under_persistent_io_latency():
+    """Continuous 12-tick daily IO: completed bars fetched only once per version.
+
+    This is a bounded IO regression, *not* the end-to-end PB1 BUY ACK gate.
+    Live quotes and order/broker truth remain separately refreshed each tick.
+    """
+    import time
+
+    class SlowCompletedProvider(CompletedProvider):
+        def get_completed_daily_prices(self, *args, **kwargs):
+            time.sleep(0.002)  # persistent DB/provider latency, every attempted SQL fetch
+            return super().get_completed_daily_prices(*args, **kwargs)
+
+    provider = SlowCompletedProvider()
+    cached = None
+    starts = []
+    for tick in range(12):
+        started = time.monotonic()
+        ret = market._market_returns(
+            provider, "2026-10-06", [],
+            completed_market_context=cached, data_version="fixture-version-1",
+        )
+        starts.append(time.monotonic() - started)
+        cached = ret["_completed_market_context"]
+        assert cached["quality"] == "OK"
+        assert ret["_completed_market_cache_hit"] is (tick > 0)
+    assert len(provider.calls) == len(market._MARKET_RETURN_SYMBOLS)
+    assert all(duration < starts[0] for duration in starts[1:])
+    assert sum(starts[1:]) < starts[0]
+
+
+def test_sustained_cache_invalidates_one_periodic_refresh_and_recovers():
+    provider = CompletedProvider()
+    cached = None
+    n = len(market._MARKET_RETURN_SYMBOLS)
+    for tick in range(12):
+        if tick == 6:
+            # Simulate a completed-price revision with the same trading day.
+            version = "corrected-v2"
+        else:
+            version = "original-v1" if tick < 6 else "corrected-v2"
+        ret = market._market_returns(
+            provider, "2026-10-06", [],
+            completed_market_context=cached, data_version=version,
+        )
+        cached = ret["_completed_market_context"]
+    assert len(provider.calls) == 2 * n
