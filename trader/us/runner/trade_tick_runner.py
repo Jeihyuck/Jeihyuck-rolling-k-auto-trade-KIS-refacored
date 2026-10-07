@@ -27,14 +27,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _ACCOUNTED_TOP_LEVEL_STAGES = (
-    "prep_status_ms", "watchlist_load_ms", "position_reconcile_ms",
-    "exit_engine_ms", "market_state_ms", "tqqq_infinite_ms",
-    "entry_engine_ms", "risk_gate_ms", "order_route_ms",
+    # These intervals run sequentially. Provider HTTP time is a nested
+    # diagnostic and must NOT be added again to these wall-clock intervals.
+    "cash_fetch_ms", "position_reconcile_ms", "fill_fetch_stage_ms",
+    "fill_persist_ms", "order_reconcile_ms", "exit_engine_ms",
+    "market_state_ms", "tqqq_infinite_ms", "entry_engine_ms",
+    "order_route_ms", "post_route_reconcile_ms",
 )
 
 
 def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float]) -> tuple[float, float]:
-    """Account only non-nested stage timers and keep the remainder bounded."""
+    """Use distinct wall-clock spans, excluding nested KIS/DB submetrics."""
     total = max(0.0, float(total_ms))
     accounted = min(total, sum(max(0.0, float(stage_metrics.get(key, 0.0)))
                                for key in _ACCOUNTED_TOP_LEVEL_STAGES))
@@ -1931,9 +1934,12 @@ def run_trade_tick(
             logger.error("[US_TICK][ERROR] fills exception: %s", exc)
             fills_error_count += 1
         finally:
+            tick_context.metrics["fill_fetch_stage_ms"] = (
+                time.monotonic() - _fill_fetch_started
+            ) * 1000.0
             tick_context.metrics["fill_fetch_ms"] = max(
                 float(tick_context.metrics.get("fill_fetch_ms", 0.0)),
-                (time.monotonic() - _fill_fetch_started) * 1000.0,
+                tick_context.metrics["fill_fetch_stage_ms"],
             )
 
     # temp_error_count, temp_recovered_count, kis_temp_errors_by_api는 함수 시작부에서 사전 초기화됨
@@ -2707,6 +2713,7 @@ def run_trade_tick(
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
     _entry_engine_started = time.monotonic()
+    tick_context.metrics["pre_entry_elapsed_ms"] = (_entry_engine_started - tick_started_at) * 1000.0
     entry_intents: list[dict] = []
     entry_eval_error_count = 0
     entry_contract_integrity_block_count = 0
@@ -3694,6 +3701,7 @@ def run_trade_tick(
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
     ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
 
+    _post_route_reconcile_started = time.monotonic()
     if not offline and ack_cnt > 0:
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
@@ -3717,6 +3725,9 @@ def run_trade_tick(
             ack_recon = dict(ack_recon_after_route)
     else:
         ack_recon_after_route = dict(ack_recon_before_route)
+    tick_context.metrics["post_route_reconcile_ms"] = (
+        time.monotonic() - _post_route_reconcile_started
+    ) * 1000.0 if not offline and ack_cnt > 0 else 0.0
 
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
@@ -4031,6 +4042,8 @@ def run_trade_tick(
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
         "balance_retry_calls": int(tick_context.counters.get("balance_retry_calls", 0)),
         "fill_fetch_ms": float(tick_context.metrics.get("fill_fetch_ms", 0)),
+        "fill_fetch_stage_ms": float(tick_context.metrics.get("fill_fetch_stage_ms", 0)),
+        "pre_entry_elapsed_ms": float(tick_context.metrics.get("pre_entry_elapsed_ms", 0)),
         "cash_fetch_ms": float(tick_context.metrics.get("cash_fetch_ms", 0)),
         "entry_budget_sec": float(tick_context.metrics.get("entry_budget_sec", 0)),
         "execution_tail_reserve_sec": float(tick_context.metrics.get("execution_tail_reserve_sec", resolve_us_execution_tail_reserve_sec())),
@@ -4052,6 +4065,7 @@ def run_trade_tick(
         "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
         "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
         "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "post_route_reconcile_ms": float(tick_context.metrics.get("post_route_reconcile_ms", 0)),
         "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
         "fill_rows_received": len(fills_today),
         "fill_rows_changed": int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0),
@@ -4067,6 +4081,18 @@ def run_trade_tick(
     accounted_stage_ms, unaccounted_ms = calculate_latency_accounting(tick_total_ms, latency_metrics)
     latency_metrics["accounted_stage_ms"] = accounted_stage_ms
     latency_metrics["unaccounted_ms"] = unaccounted_ms
+    latency_metrics["pre_entry_accounted_ms"] = round(sum(
+        max(0.0, latency_metrics.get(k, 0.0)) for k in (
+            "cash_fetch_ms", "position_reconcile_ms", "fill_fetch_stage_ms",
+            "fill_persist_ms", "order_reconcile_ms", "exit_engine_ms",
+            "market_state_ms", "tqqq_infinite_ms",
+        )
+    ), 3)
+    latency_metrics["pre_entry_residual_ms"] = round(max(
+        0.0, latency_metrics["pre_entry_elapsed_ms"] -
+        latency_metrics["pre_entry_accounted_ms"]
+    ), 3)
+    latency_metrics["slot_overrun_300s"] = int(tick_total_ms > 300000)
     latency_log = logger.warning if unaccounted_ms > 2000 else logger.info
     latency_log(
         "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
