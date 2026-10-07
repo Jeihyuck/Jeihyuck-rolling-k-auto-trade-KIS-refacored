@@ -1202,7 +1202,12 @@ def classify_ack_orders_with_final_balance(
 
     try:
         balance = _get_balance_force_refresh(provider)
-        if not isinstance(balance, dict) or str(balance.get("balance_parse_status") or "OK").upper() != "OK":
+        if (
+            not isinstance(balance, dict)
+            or str(balance.get("balance_parse_status") or "OK").upper() != "OK"
+            or balance.get("balance_complete") is False
+            or balance.get("balance_authoritative") is False
+        ):
             raise RuntimeError("close_broker_balance_not_authoritative")
         final_positions = _build_kis_position_by_symbol(balance.get("positions", []))
     except Exception as exc:
@@ -1267,6 +1272,8 @@ def classify_ack_orders_with_final_balance(
                 final_status = "partial_fill_cancelled" if broker_status in {"CANCELLED", "CANCELED"} else "partial_fill_terminal"
             else:
                 final_status = "rejected" if broker_status in {"REJECTED", "REJECT"} else "cancelled_or_expired"
+        elif broker_present and order.get("_sources") == ["broker"] and broker_remaining == 0:
+            final_status = "ack_unresolved_error"  # unattributed terminal fill/order
         elif broker_present and broker_fill_explicit and qty > 0 and broker_fill >= qty and broker_remaining == 0:
             final_status = "broker_fill_confirmed"
         elif broker_present and broker_remaining == 0 and fill_qty > 0 and fill_qty < qty:

@@ -737,7 +737,9 @@ def same_day_semantic_sell_exists(intent: dict) -> bool:
             return True
     return False
 
-def _tp_unsubmitted_attempt_may_release_stage(intent: dict, trade_date: str) -> bool:
+def _tp_unsubmitted_attempt_may_release_stage(
+    intent: dict, trade_date: str, broker_position: dict | None = None,
+) -> bool:
     """Only release this TP attempt if *all* durable submit sources prove absence.
 
     Failure to read orders/journal/claims is unknown, not proof of zero.
@@ -745,7 +747,13 @@ def _tp_unsubmitted_attempt_may_release_stage(intent: dict, trade_date: str) -> 
     """
     symbol = str(intent.get("symbol") or "").upper().strip()
     key = str(intent.get("client_order_key") or "").strip()
-    if not symbol or not key or not trade_date:
+    if not symbol or not key or not trade_date or not isinstance(broker_position, dict):
+        return False
+    # An open broker SELL can reduce orderable below holdings even if the
+    # local order row is stale. Never clear its TP stage on that evidence.
+    holding = int(broker_position.get("qty") or broker_position.get("holding_qty") or 0)
+    orderable = broker_position.get("orderable_qty")
+    if orderable is None or holding > int(orderable):
         return False
     try:
         from trader.us.db.repos import (
@@ -1496,7 +1504,7 @@ def route_order(
                     "broker_submit": False,
                     "pre_submit_tp_block": True,
                     "safe_to_release_tp_pending": _tp_unsubmitted_attempt_may_release_stage(
-                        intent, trade_date
+                        intent, trade_date, broker_pos
                     ),
                     "intent": intent,
                     "broker_position": broker_pos,
