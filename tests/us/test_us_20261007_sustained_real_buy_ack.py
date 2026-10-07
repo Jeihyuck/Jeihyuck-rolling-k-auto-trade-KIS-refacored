@@ -7,8 +7,11 @@ not an extrapolation of real 300s wall-clock p95.
 from __future__ import annotations
 
 import time
+import os
+import pytest
 
 from trader.us.runner.trade_tick_runner import run_trade_tick
+from tests.us.test_us_postgres_integration_real import pg_engine
 
 
 TICKERS = (
@@ -17,8 +20,9 @@ TICKERS = (
 ).split()
 
 
+@pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires real PostgreSQL broker-claim fixture")
 def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, pg_engine,
 ):
     from trader.us.db import repos
     from trader.us.execution import order_router
@@ -40,8 +44,19 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     }.items():
         monkeypatch.setenv(key, value)
 
-    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    # Real postgres and the production claim acquisition code are kept on.
+    # A DB-offline run is expected to block BUY, never fabricate a mock ACK.
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *_a, **_kw: "incident-epoch")
     repos.reset_memory_stores()
+    from sqlalchemy import event
+    sql_executions = {"read": 0, "write": 0}
+    def record_statement(_conn, _cursor, statement, _params, _context, _many):
+        command = str(statement).lstrip().split(maxsplit=1)[0].upper()
+        if command in {"SELECT", "WITH"}:
+            sql_executions["read"] += 1
+        elif command in {"INSERT", "UPDATE", "DELETE"}:
+            sql_executions["write"] += 1
+    event.listen(pg_engine, "before_cursor_execute", record_statement)
     # A real practice order is routed to this stub, never the network.
     class Broker:
         stats = {}
@@ -54,6 +69,8 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
         def place_us_sell_order(self, symbol, exchange, qty, price):
             self.sell_calls.append((symbol, exchange, qty, price))
             return {"rt_cd": "0", "output": {"ODNO": f"MOCK-SELL-{len(self.sell_calls)}"}}
+        def get_orderable_cash(self, symbol, exchange, price):
+            return 15000.0
         def get_balance(self, force_refresh=False):
             return {"positions": [], "balance_parse_status": "OK",
                     "balance_authoritative": True, "balance_complete": True}
@@ -206,3 +223,5 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     assert len(delay_events) >= 20, delay_events
     assert len({call[0] for call in broker.buy_calls}) == 10
     assert broker.sell_calls == []
+    assert sql_executions["read"] > 0, sql_executions
+    assert sql_executions["write"] > 0, sql_executions
