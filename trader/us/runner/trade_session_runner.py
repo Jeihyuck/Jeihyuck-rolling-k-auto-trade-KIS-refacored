@@ -461,6 +461,8 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "orders_ack": int(payload.get("orders_ack", 0) or 0),
             "orders_rejected": int(payload.get("orders_rejected", 0) or 0),
             "entry_degraded": payload.get("entry_degraded", 0),
+            "entry_liveness_status": payload.get("entry_liveness_status", "UNKNOWN"),
+            "reconcile_liveness_status": payload.get("reconcile_liveness_status", "UNKNOWN"),
             "entry_degraded_reason": payload.get("entry_degraded_reason", ""),
             "entry_eval_status": payload.get("entry_eval_status", ""),
             "runtime_integrity_status": payload.get("runtime_integrity_status", "UNKNOWN"),
@@ -530,7 +532,30 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         elif mismatch:
             health_status, health_ok, health_reason = "WARNING_RECONCILE_MISMATCH", False, "us_fill_or_reconcile_mismatch"
         elif liveness_failures:
-            health_status, health_ok, health_reason = "FAILED_RUNTIME_INTEGRITY", False, "protective_sell_liveness_failure"
+            affected = [sessions[name] for name in liveness_failures]
+            sell_bad = any(
+                str(row.get("sell_liveness_status") or "").upper()
+                in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"}
+                or bool(row.get("exit_route_liveness_failure"))
+                for row in affected
+            )
+            reconcile_bad = any(
+                str(row.get("reconcile_liveness_status") or "").upper() == "RECONCILE_REQUIRED"
+                or str(row.get("runtime_integrity_status") or "").upper() == "RECONCILE_REQUIRED"
+                for row in affected
+            )
+            entry_bad = any(
+                str(row.get("entry_liveness_status") or "").upper() == "LIVENESS_DEGRADED"
+                or bool(row.get("entry_degraded"))
+                for row in affected
+            )
+            health_reason = (
+                "protective_sell_liveness_failure" if sell_bad
+                else "reconcile_liveness_failure" if reconcile_bad
+                else "entry_liveness_degraded" if entry_bad
+                else "runtime_integrity_degraded"
+            )
+            health_status, health_ok = "FAILED_RUNTIME_INTEGRITY", False
         else:
             health_status, health_ok, health_reason = "OK", True, ""
         existing.update({"ok": health_ok, "status": health_status, "reason": health_reason,
@@ -2027,6 +2052,14 @@ def run_trade_session(
             "sell_liveness_status",
             {"OK": 0, "LIVENESS_DEGRADED": 1, "RECONCILE_REQUIRED": 2},
         )
+        entry_liveness_status = _worst_tick_health_status(
+            results, "entry_liveness_status",
+            {"OK": 0, "LIVENESS_DEGRADED": 1},
+        )
+        reconcile_liveness_status = _worst_tick_health_status(
+            results, "reconcile_liveness_status",
+            {"OK": 0, "RECONCILE_REQUIRED": 1},
+        )
         exit_route_liveness_failure = any(
             bool((tick or {}).get("exit_route_liveness_failure"))
             for tick in results
@@ -2047,6 +2080,8 @@ def run_trade_session(
             "tick_latency": tick_latency,
             "runtime_integrity_status": runtime_integrity_status,
             "sell_liveness_status": sell_liveness_status,
+            "entry_liveness_status": entry_liveness_status,
+            "reconcile_liveness_status": reconcile_liveness_status,
             "exit_route_liveness_failure": exit_route_liveness_failure,
             **_prov,
             "trade_date": trade_date,

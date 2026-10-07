@@ -4114,11 +4114,18 @@ def run_trade_tick(
         else "LIVENESS_DEGRADED" if exit_route_liveness_failure
         else "OK"
     )
+    entry_liveness_status = "LIVENESS_DEGRADED" if entry_degraded else "OK"
+    reconcile_liveness_status = (
+        "RECONCILE_REQUIRED" if runtime_integrity_status == "RECONCILE_REQUIRED"
+        else "OK"
+    )
     return {
         **latency_metrics,
         "status": status,
         "runtime_integrity_status": runtime_integrity_status,
         "sell_liveness_status": sell_liveness_status,
+        "entry_liveness_status": entry_liveness_status,
+        "reconcile_liveness_status": reconcile_liveness_status,
         "exit_route_reconcile_required": exit_route_reconcile_required,
         "exit_route_liveness_failure": exit_route_liveness_failure,
         "entry_block_reason": entry_block_reason,

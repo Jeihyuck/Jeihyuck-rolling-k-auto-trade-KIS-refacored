@@ -1822,19 +1822,33 @@ def run_daily_report(
             continue
         _runtime_status = str(_row.get("runtime_integrity_status") or "").upper()
         _sell_status = str(_row.get("sell_liveness_status") or "").upper()
+        _entry_status = str(_row.get("entry_liveness_status") or "").upper()
+        _reconcile_status = str(_row.get("reconcile_liveness_status") or "").upper()
+        _sell_bad = _sell_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"} or bool(_row.get("exit_route_liveness_failure"))
+        _reconcile_bad = _reconcile_status == "RECONCILE_REQUIRED" or _runtime_status == "RECONCILE_REQUIRED"
+        _entry_bad = _entry_status == "LIVENESS_DEGRADED" or bool(_row.get("entry_degraded"))
         if (
             _runtime_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED", "INTEGRITY_DEGRADED"}
-            or _sell_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"}
-            or bool(_row.get("exit_route_liveness_failure"))
+            or _sell_bad or _reconcile_bad or _entry_bad
         ):
+            _failure_reason = (
+                "protective_sell_liveness_failure" if _sell_bad
+                else "reconcile_liveness_failure" if _reconcile_bad
+                else "entry_liveness_degraded" if _entry_bad
+                else "runtime_integrity_degraded"
+            )
             runtime_liveness_failures.append({
                 "session": _name,
                 "runtime_integrity_status": _runtime_status or "UNKNOWN",
                 "sell_liveness_status": _sell_status or "UNKNOWN",
+                "entry_liveness_status": _entry_status or "UNKNOWN",
+                "reconcile_liveness_status": _reconcile_status or "UNKNOWN",
+                "failure_reason": _failure_reason,
             })
     report["runtime_liveness_failures"] = runtime_liveness_failures
     if session == "close" and runtime_liveness_failures:
-        report["errors"].append("CLOSE_INTEGRITY_FAILED: protective_sell_liveness_failure")
+        for _reason in sorted({row["failure_reason"] for row in runtime_liveness_failures}):
+            report["errors"].append(f"CLOSE_INTEGRITY_FAILED: {_reason}")
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
         report["close_integrity_status"] = (
             "RECONCILE_REQUIRED"
