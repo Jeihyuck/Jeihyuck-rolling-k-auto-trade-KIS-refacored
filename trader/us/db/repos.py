@@ -1419,7 +1419,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
             epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
             identity_row = conn.execute(
-                text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
+                text("SELECT meta,trading_epoch_id,exchange,order_no,symbol,side,qty_requested,client_order_key FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause),
                 {"td": td, "key": key, **epoch_params},
             ).mappings().first()
             state_row = conn.execute(
@@ -1502,15 +1502,149 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     "observed_filled_qty": filled_qty_value,
                     "persisted_filled_qty": old_filled,
                 }
-        result = mark_order_filled_by_reconcile(
-            order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
-            filled_qty=filled_qty_value, requested_qty=requested_qty,
-            cumulative_filled_qty=filled_qty_value,
-            avg_price_usd=fill_price,
-            source="broker_order_observation", evidence_type=evidence_type,
-            trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
-        )
-        if result.get("status") != "OK": return result
+        settlement_atomic_applied = False
+
+        def _legacy_fill_apply():
+            return mark_order_filled_by_reconcile(
+                order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
+                filled_qty=filled_qty_value, requested_qty=requested_qty,
+                cumulative_filled_qty=filled_qty_value,
+                avg_price_usd=fill_price,
+                source="broker_order_observation", evidence_type=evidence_type,
+                trade_date=td, meta={**meta_patch, "fill_price_source": fill_price_source},
+            )
+
+        result = None
+        if (
+            engine is not None
+            and evidence_type == "KIS_ORDER_CUMULATIVE_ACTUAL"
+            and filled_qty_value > 0
+        ):
+            try:
+                from trader.settlement.us_cutover import (
+                    build_us_broker_observation,
+                    load_us_runtime_release,
+                    route_us_settlement,
+                )
+
+                settlement_order = {
+                    "env": order_meta.get("env") or os.getenv("KIS_ENV") or "practice",
+                    "trading_epoch_id": (
+                        identity_row.get("trading_epoch_id")
+                        if engine is not None and identity_row is not None
+                        else order_meta.get("trading_epoch_id")
+                    ),
+                    "strategy_owner": order_meta.get("strategy_owner"),
+                    "position_lifecycle_id": (
+                        order_meta.get("position_lifecycle_id")
+                        or order_meta.get("position_cycle_id")
+                    ),
+                    "client_order_key": key,
+                    "qty_requested": int(requested_qty),
+                    "exchange": (
+                        (identity_row.get("exchange") if identity_row is not None else None)
+                        or order_meta.get("exchange")
+                        or (raw_row or {}).get("exchange")
+                        or "NASDAQ"
+                    ),
+                    "order_no": raw_order_no,
+                    "symbol": symbol,
+                    "side": side,
+                    "meta": order_meta,
+                }
+                observation = build_us_broker_observation(
+                    order=settlement_order,
+                    trade_date=td,
+                    cumulative_qty=filled_qty_value,
+                    broker_fill_price=fill_price,
+                    evidence_digest=(
+                        f"kis-order-cumulative:{td}:{canonical_order_no}:"
+                        f"{filled_qty_value}:{fill_price}"
+                    ),
+                )
+                release = load_us_runtime_release(engine, observation)
+                atomic_result: dict[str, Any] = {}
+
+                def _atomic_fill_apply(conn, _obs, _decision):
+                    applied = mark_order_filled_by_reconcile(
+                        order_no=raw_order_no,
+                        client_order_key=key,
+                        symbol=symbol,
+                        side=side,
+                        filled_qty=filled_qty_value,
+                        requested_qty=requested_qty,
+                        cumulative_filled_qty=filled_qty_value,
+                        avg_price_usd=fill_price,
+                        source="broker_order_observation",
+                        evidence_type=evidence_type,
+                        trade_date=td,
+                        meta={**meta_patch, "fill_price_source": fill_price_source},
+                        _conn=conn,
+                        _skip_claim_update=False,
+                    )
+                    if not isinstance(applied, dict) or applied.get("status") != "OK":
+                        raise RuntimeError(
+                            "US_ATOMIC_ECONOMIC_APPLY_FAILED:"
+                            + str((applied or {}).get("status") if isinstance(applied, dict) else applied)
+                        )
+                    atomic_result["value"] = applied
+
+                routed = route_us_settlement(
+                    engine=engine,
+                    observation=observation,
+                    release=release,
+                    apply_atomic_economic_delta=_atomic_fill_apply,
+                    apply_legacy=_legacy_fill_apply,
+                )
+                if routed.mode == "ATOMIC_SETTLEMENT":
+                    settlement_atomic_applied = True
+                    result = atomic_result.get("value") or {
+                        "status": "OK",
+                        "order_status": (
+                            "FILLED"
+                            if filled_qty_value >= int(requested_qty)
+                            else "PARTIALLY_FILLED"
+                        ),
+                        "settlement_replay": True,
+                    }
+                else:
+                    result = routed.legacy_result
+                logger.info(
+                    "[SETTLEMENT_CUTOVER][US] symbol=%s owner=%s mode=%s cumulative=%s",
+                    symbol,
+                    observation.strategy_owner,
+                    routed.mode,
+                    filled_qty_value,
+                )
+            except Exception as exc:
+                # Fail closed on activation/provenance errors.  When activation
+                # is not requested, the runtime release resolves to LEGACY
+                # above; reaching this path means the cutover contract itself
+                # could not be trusted.
+                if os.getenv("NULLIM_US_SETTLEMENT_ACTIVATE", "0").strip() == "1":
+                    logger.exception(
+                        "[SETTLEMENT_CUTOVER][US][BLOCKED] symbol=%s err=%s",
+                        symbol, exc,
+                    )
+                    return {
+                        "status": "SETTLEMENT_CUTOVER_BLOCKED",
+                        "error": str(exc),
+                        "requires_reconcile": True,
+                        "retry_order": False,
+                        "entry_fence": True,
+                    }
+                logger.warning(
+                    "[SETTLEMENT_CUTOVER][US][LEGACY_FALLBACK] symbol=%s err=%s",
+                    symbol, exc,
+                )
+                result = _legacy_fill_apply()
+        else:
+            result = _legacy_fill_apply()
+
+        if not isinstance(result, dict) or result.get("status") != "OK":
+            return result if isinstance(result, dict) else {
+                "status": "RECONCILE_UPDATE_FAILED", "error": str(result)
+            }
     if status not in {"PARTIALLY_FILLED", "FILLED"}:
         if engine is None:
             matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
@@ -1603,7 +1737,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             and broker_remaining_qty == 0
             and action_remaining_qty == int(requested_qty) - observation_qty
         )
-    if action_key and attempt_id:
+    if action_key and attempt_id and not locals().get("settlement_atomic_applied", False):
         claim_state = {
             "ACK": "ACKED",
             "OPEN": "ACKED",
