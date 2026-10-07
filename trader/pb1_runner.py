@@ -1128,6 +1128,8 @@ def submit_kr_close_policy_orders(
 ) -> list[dict[str, Any]]:
     """Submit close-policy SELLs with durable identity and duplicate fencing."""
     results: list[dict[str, Any]] = []
+    if not list(policy_orders or []):
+        return results
     required_repo_methods = (
         "has_open_order_for_code",
         "create_intent_idempotent",
