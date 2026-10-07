@@ -758,7 +758,6 @@ def _tp_unsubmitted_attempt_may_release_stage(
     try:
         from trader.us.db.repos import (
             load_pending_ack_orders_result, load_active_execution_claim_attempts,
-            _parse_json_meta,
         )
         from trader.us.execution.order_journal import load_order_events
         pending = load_pending_ack_orders_result(trade_date)

@@ -204,6 +204,8 @@ def test_broker_open_overrides_local_filled():
         provider=CloseProvider(), trade_date=DATE, orders=[row],
     )
     assert result["orders"][0]["final_status"] == "partial_fill_open"
+    assert result["manual_reconcile_required"] == 1
+    assert result["orders"][0]["broker_local_fill_qty_conflict"] is True
 
 
 def test_partially_filled_then_cancelled_preserves_three_shares():

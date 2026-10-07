@@ -1247,6 +1247,9 @@ def classify_ack_orders_with_final_balance(
             if not qty:
                 qty = broker_requested
         if broker_fill is not None:
+            local_filled = int(order.get("qty_filled") or order.get("filled_qty") or 0)
+            if local_filled > broker_fill:
+                order["broker_local_fill_qty_conflict"] = True
             fill_qty = max(fill_qty, broker_fill)
         identity = validate_reconcile_identity(
             trade_date=trade_date, order_no=str(order.get("order_no") or ""),
@@ -1330,6 +1333,11 @@ def classify_ack_orders_with_final_balance(
                 symbol, order.get("order_no") or order.get("ack_no") or "",
                 qty, fill_qty, broker_remaining if broker_remaining is not None else max(0, qty - fill_qty),
             )
+        if order.get("broker_local_fill_qty_conflict"):
+            # Broker open truth remains visible, but local FILLED evidence
+            # exceeding broker cumulative qty requires manual reconciliation.
+            pending += 1
+            counts["broker_local_fill_qty_conflict"] = counts.get("broker_local_fill_qty_conflict", 0) + 1
         counts[final_status] = counts.get(final_status, 0) + 1
         classified.append({
             "time": str(order.get("created_at") or order.get("time") or ""),
@@ -1343,6 +1351,7 @@ def classify_ack_orders_with_final_balance(
             "submit_attempt_id": str(order.get("submit_attempt_id") or ""),
             "broker_filled_qty": broker_fill,
             "broker_remaining_qty": broker_remaining,
+            "broker_local_fill_qty_conflict": bool(order.get("broker_local_fill_qty_conflict")),
             "evidence_sources": list(order.get("_sources") or []),
             "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
             "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else ("position_absent_confirmed_sell" if final_status == "position_absent_confirmed_sell" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),

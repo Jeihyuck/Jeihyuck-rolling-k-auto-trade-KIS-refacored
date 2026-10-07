@@ -3834,6 +3834,15 @@ def load_pending_ack_orders_result(trade_date: str, env: str = "practice") -> di
     )
     engine = _get_engine_or_none()
     if engine is None:
+        offline_fixture = bool(
+            os.getenv("PYTEST_CURRENT_TEST")
+            or os.getenv("US_OFFLINE") == "1"
+            or os.getenv("OFFLINE") == "1"
+            or str(env or "").lower() in {"test", "offline"}
+        )
+        if not offline_fixture:
+            return {"status": "DB_ERROR", "orders": [],
+                    "error": "pending_attempt_db_engine_unavailable"}
         return {"status": "OK", "orders": [
             dict(o) for o in _MEM_ORDERS
             if o.get("trade_date") == td
