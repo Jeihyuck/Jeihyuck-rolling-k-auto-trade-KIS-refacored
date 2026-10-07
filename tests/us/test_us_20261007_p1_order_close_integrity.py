@@ -263,3 +263,55 @@ def test_close_same_semantic_action_two_broker_attempts_not_collapsed(monkeypatc
     result = classify_ack_orders_with_final_balance(provider=provider, trade_date=DATE)
     assert result["open_order_pending_count"] == 2
     assert {row["submit_attempt_id"] for row in result["orders"]} == {"attempt-a", "attempt-b"}
+
+
+def test_real_router_pre_submit_msft_tp2_does_not_call_kis_sell(monkeypatch):
+    """Exercise the production risk/router path rather than the TP helper alone."""
+    from unittest.mock import patch
+    from trader.us.execution.order_router import route_order
+
+    for name, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice", "DRY_RUN": "0",
+        "TRADING_REGION": "US", "US_AGENT_ENABLED": "1",
+        "US_PAPER_TRADING_ENABLED": "1", "US_SESSION_WINDOW_VALID": "1",
+        "US_PREP_CONTRACT_OK": "1", "US_BALANCE_AVAILABLE": "1",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    class KIS:
+        sell_calls = []
+
+        def get_balance(self, force_refresh=False):
+            return {"positions": [{
+                "symbol": "MSFT", "qty": 1, "orderable_qty": 1,
+                "avg_price_usd": 100.0, "currency": "USD",
+            }]}
+
+        def place_us_sell_order(self, symbol, exchange, qty, price):
+            self.sell_calls.append((symbol, exchange, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "UNEXPECTED"}}
+
+    kis = KIS()
+    intent = _tp_intent()
+    intent.update({
+        "exchange": "NASDAQ", "notional_usd": 106.0,
+        "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "position_action": "PARTIAL_EXIT_SELL",
+    })
+    with (
+        patch("trader.us.execution.order_router.same_day_semantic_sell_exists", return_value=False),
+        patch("trader.us.db.repos.save_order_intent", return_value=True),
+        patch("trader.us.db.repos.load_today_order_keys", return_value=set()),
+        patch("trader.us.db.repos.mark_order_intent_blocked"),
+        patch("trader.us.execution.order_router.resolve_dry_run_for_us_order", return_value=False),
+        patch("trader.us.execution.order_router._tp_unsubmitted_attempt_may_release_stage", return_value=False),
+        patch("trader.us.execution.risk_gate.check_pending_sell_order_hard"),
+    ):
+        result = route_order(
+            intent, kis_client=kis, current_position_symbols={"MSFT"},
+            total_portfolio_usd=10000.0, available_cash_usd=10000.0,
+        )
+    assert result["status"] == "BLOCKED", result
+    assert result["guard_reason"] == "fresh_tp_stage_quantity_or_runner_limit", result
+    assert result["safe_to_release_tp_pending"] is False
+    assert kis.sell_calls == []
