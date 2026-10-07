@@ -4665,13 +4665,13 @@ def mark_order_filled_by_reconcile(
                 evidence=evidence, _conn=conn,
             )
         if claim_error:
-        return {
-            **result,
-            "status": "EXECUTION_CLAIM_UPDATE_FAILED",
-            "execution_claim_update_error": claim_error,
-            "requires_reconcile": True,
-            "retry_order": False,
-        }
+            return {
+                **result,
+                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
+                "execution_claim_update_error": claim_error,
+                "requires_reconcile": True,
+                "retry_order": False,
+            }
         return result
     except FillAccountingInvariantError as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
