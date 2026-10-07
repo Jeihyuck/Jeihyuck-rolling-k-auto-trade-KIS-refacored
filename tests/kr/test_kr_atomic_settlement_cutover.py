@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import json
@@ -238,3 +239,112 @@ def test_production_atomic_callback_projects_exit_and_pyramid_state_in_same_tran
     assert "positions_repo.mark_pyramid_add_fill(" in source
     assert "_conn=conn" in source
     assert "atomic_buy_applied = route_result.mode == \"ATOMIC_SETTLEMENT\"" in source
+
+
+def test_runtime_release_stays_atomic_during_partial_in_flight(monkeypatch, tmp_path):
+    from trader.settlement.core import settle_atomic
+    from trader.settlement.release_gate import REQUIRED_PROOFS
+
+    engine = _engine()
+    partial = replace(
+        _obs(),
+        requested_qty=3,
+        cumulative_qty=1,
+        evidence_digest="partial-1",
+    )
+    settle_atomic(engine, partial, lambda _conn, _obs, _decision: None)
+
+    revision = "b" * 40
+    proof_path = tmp_path / "kr-release-partial.json"
+    proof_path.write_text(json.dumps({
+        "market": "KR",
+        "env": partial.env,
+        "trading_epoch_id": partial.trading_epoch_id,
+        "account_scope": partial.account_scope,
+        "run_revision": revision,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "proofs": {name: True for name in REQUIRED_PROOFS},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_RELEASE_PROOF_FILE", str(proof_path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+
+    decision = load_kr_runtime_release(engine, partial)
+    assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
+    assert decision.writer_allowed is True
+
+
+def test_runtime_release_stays_atomic_during_price_pending(monkeypatch, tmp_path):
+    from trader.settlement.core import settle_atomic
+    from trader.settlement.release_gate import REQUIRED_PROOFS
+
+    engine = _engine()
+    price_pending = replace(
+        _obs(),
+        cumulative_qty=3,
+        execution_price=None,
+        evidence_digest="price-pending-1",
+    )
+    settle_atomic(engine, price_pending, lambda _conn, _obs, _decision: None)
+
+    revision = "c" * 40
+    proof_path = tmp_path / "kr-release-price-pending.json"
+    proof_path.write_text(json.dumps({
+        "market": "KR",
+        "env": price_pending.env,
+        "trading_epoch_id": price_pending.trading_epoch_id,
+        "account_scope": price_pending.account_scope,
+        "run_revision": revision,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "proofs": {name: True for name in REQUIRED_PROOFS},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.setenv("NULLIM_KR_SETTLEMENT_RELEASE_PROOF_FILE", str(proof_path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+
+    decision = load_kr_runtime_release(engine, price_pending)
+    assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
+    assert decision.writer_allowed is True
+
+
+def test_kr_buy_cost_uses_settlement_notional_and_supports_late_price_only_delta():
+    from trader.db.repos import PositionsRepo
+    from tests.kr.test_kr_20261006_execution_convergence import _db, _open_position
+
+    engine = _db()
+    repo = PositionsRepo(engine)
+    position = _open_position(engine, code="005930", qty=3, avg=100.0)
+    cycle = str(position["position_cycle_id"])
+    epoch = str(position["portfolio_epoch_id"])
+    ts = datetime(2026, 10, 7, 0, 10, tzinfo=timezone.utc)
+
+    with engine.begin() as conn:
+        repo.apply_fill(
+            env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+            code="005930", market="J", side="BUY", qty=2, price=999.0,
+            fee=0.0, tax=0.0, filled_at=ts,
+            portfolio_epoch_id=epoch, position_cycle_id=cycle,
+            buy_cost_delta_override=220.0, _conn=conn,
+        )
+        repo.apply_fill(
+            env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+            code="005930", market="J", side="BUY", qty=0, price=777.0,
+            fee=0.0, tax=0.0, filled_at=ts,
+            portfolio_epoch_id=epoch, position_cycle_id=cycle,
+            buy_cost_delta_override=30.0, _conn=conn,
+        )
+
+    stored = repo.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="005930", position_cycle_id=cycle, portfolio_epoch_id=epoch,
+    )
+    assert stored["qty"] == 5
+    assert stored["total_cost"] == pytest.approx(550.0)
+    assert stored["avg_buy_price"] == pytest.approx(110.0)
+
+
+def test_production_atomic_buy_uses_decision_notional_not_current_execution_price():
+    source = open("trader/reconcile_kis.py", encoding="utf-8").read()
+    assert "buy_cost_delta_override=float(decision.notional_delta)" in source
+    assert "decision.qty_delta > 0 or decision.notional_delta != 0" in source
+    assert "and (incremental_daily_qty > 0 or atomic_writer_active)" in source
