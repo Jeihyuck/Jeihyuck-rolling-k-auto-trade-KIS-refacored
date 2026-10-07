@@ -149,7 +149,7 @@ def test_runtime_release_requires_fresh_scoped_proof_and_revision(monkeypatch, t
     from trader.settlement.release_gate import REQUIRED_PROOFS
 
     engine = _engine()
-    obs = _obs()
+    obs = _obs(cumulative=5, price=Decimal("100"))
     settle_atomic(engine, obs, lambda _conn, _obs, _decision: None)
 
     revision = "b" * 40
