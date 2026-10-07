@@ -100,8 +100,48 @@ class _FakeFillsRepo:
 
 
 class _FakeOrdersRepo:
+    def __init__(self):
+        self.open_sell = False
+        self.intents = {}
+        self.submitted = []
+        self.unresolved = []
+        self.errors = []
+
     def list_today_buy_orders(self, env, code=None):
         return []
+
+    def has_open_order_for_code(self, env, code, side, trade_date=None):
+        return bool(self.open_sell and side == "SELL")
+
+    def consume_fail_open_marker(self, op_name):
+        return False
+
+    def create_intent_idempotent(self, **kwargs):
+        key = kwargs["client_order_key"]
+        if key in self.intents:
+            return self.intents[key]["order_id"], False
+        order_id = f"order-{len(self.intents) + 1}"
+        self.intents[key] = {**kwargs, "order_id": order_id}
+        return order_id, True
+
+    def mark_submitted(self, env, client_order_key, kis_odno, response_json, **kwargs):
+        self.submitted.append({
+            "env": env, "client_order_key": client_order_key,
+            "kis_odno": kis_odno, "response_json": response_json, **kwargs,
+        })
+        return "SUBMITTED"
+
+    def mark_unresolved_ack(self, env, client_order_key, error_payload, **kwargs):
+        self.unresolved.append({
+            "env": env, "client_order_key": client_order_key,
+            "error_payload": error_payload, **kwargs,
+        })
+
+    def mark_error(self, env, client_order_key, error_payload):
+        self.errors.append({
+            "env": env, "client_order_key": client_order_key,
+            "error_payload": error_payload,
+        })
 
 
 class _FakeKis:
@@ -198,3 +238,73 @@ def test_kr_close_policy_metadata_missing_holds_integration():
     assert result["policy_orders"] == []
     assert result["accepted_policy_sells"] == 0
     assert kis.sell_calls == []
+
+
+def test_kr_close_policy_persists_intent_and_ack_before_repeat():
+    orders = _FakeOrdersRepo()
+    kis = _FakeKis()
+    position = {
+        "code": "010950", "sid": 1, "mode": 1, "market": "KOSPI",
+        "position_cycle_id": "cycle-1", "portfolio_epoch_id": "epoch-1",
+        "position_meta": {
+            "position_book": "DAY_BOOK", "trade_horizon": "DAY_TRADE",
+            "force_eod_close": True,
+        },
+    }
+    kwargs = dict(
+        kis_holdings=[{"code": "010950", "qty": 2}],
+        positions_repo=_FakePositionsRepo([position]),
+        fills_repo=_FakeFillsRepo(),
+        orders_repo=orders,
+        kis_client=kis,
+        env="practice",
+        dry_run=False,
+    )
+    first = pb1_runner.run_kr_close_policy_from_tagged_positions(**kwargs)
+    second = pb1_runner.run_kr_close_policy_from_tagged_positions(**kwargs)
+
+    assert first["accepted_policy_sells"] == 1
+    assert len(orders.intents) == 1
+    assert len(orders.submitted) == 1
+    assert len(kis.sell_calls) == 1
+    assert second["accepted_policy_sells"] == 0
+    assert second["policy_results"][0]["result"] == "BLOCKED_IDEMPOTENT_INTENT"
+
+
+def test_kr_close_policy_open_sell_blocks_broker_submit():
+    orders = _FakeOrdersRepo()
+    orders.open_sell = True
+    kis = _FakeKis()
+    result = pb1_runner.run_kr_close_policy_from_tagged_positions(
+        kis_holdings=[{"code": "010950", "qty": 2}],
+        positions_repo=_FakePositionsRepo([{
+            "code": "010950", "sid": 1, "mode": 1, "market": "KOSPI",
+            "position_cycle_id": "cycle-open", "portfolio_epoch_id": "epoch-open",
+            "position_meta": {
+                "position_book": "DAY_BOOK", "trade_horizon": "DAY_TRADE",
+                "force_eod_close": True,
+            },
+        }]),
+        fills_repo=_FakeFillsRepo(),
+        orders_repo=orders,
+        kis_client=kis,
+        env="practice",
+        dry_run=False,
+    )
+    assert result["accepted_policy_sells"] == 0
+    assert result["policy_results"][0]["result"] == "BLOCKED_OPEN_SELL"
+    assert kis.sell_calls == []
+
+
+def test_close_exit_path_bypasses_generic_budget_and_empty_universe_gates():
+    source = open("trader/pb1_runner.py", encoding="utf-8").read()
+    early_policy = source.index("[KR_CLOSE][POLICY][DONE]")
+    budget_gate = source.index("if should_degrade(remaining_s):")
+    universe_gate = source.index("universe empty -> skip trading cycle")
+    assert early_policy < budget_gate < universe_gate
+
+
+def test_fresh_empty_close_balance_is_authoritative():
+    source = open("trader/pb1_runner.py", encoding="utf-8").read()
+    assert '"output1" in fresh_close_balance' in source
+    assert "authoritative_empty=%s" in source
