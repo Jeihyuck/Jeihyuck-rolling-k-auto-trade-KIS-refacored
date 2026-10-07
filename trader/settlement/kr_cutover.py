@@ -187,12 +187,34 @@ def load_kr_runtime_release_for_scope(
         trading_epoch_id=trading_epoch_id,
         account_scope=account_scope,
     )
-    return assess_release(
+    proofs = SettlementReleaseProof(**flags)
+    decision = assess_release(
         market="KR",
         health=health,
-        proofs=SettlementReleaseProof(**flags),
+        proofs=proofs,
         activation_requested=True,
     )
+    if decision.writer_allowed:
+        return decision
+
+    # Once every independent cutover proof remains valid, normal in-flight
+    # settlement states must not switch the same order back to the legacy
+    # writer. PARTIAL_IN_FLIGHT and PRICE_PENDING are non-corrupt intermediate
+    # states when health.problems is empty; integrity degradation still blocks.
+    continuation_statuses = {"PARTIAL_IN_FLIGHT", "PRICE_PENDING"}
+    all_proofs_valid = all(bool(flags.get(name)) for name in REQUIRED_PROOFS)
+    if (
+        health.status in continuation_statuses
+        and not health.problems
+        and all_proofs_valid
+    ):
+        return SettlementReleaseDecision(
+            market="KR",
+            status="READY_FOR_CONTROLLED_SWITCH",
+            writer_allowed=True,
+            missing=(),
+        )
+    return decision
 
 
 def load_kr_runtime_release(
