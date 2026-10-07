@@ -1816,25 +1816,46 @@ def run_daily_report(
     schedule_health_payload = _load_json_if_exists(os.path.join("reports", "us_schedule_health", f"{trade_date}.json"))
     sessions_payload = schedule_health_payload.get("sessions") if isinstance(schedule_health_payload.get("sessions"), dict) else {}
     runtime_liveness_failures = []
+    runtime_liveness_failure_reasons = []
     for _name in ("am", "afternoon"):
         _row = sessions_payload.get(_name) if isinstance(sessions_payload, dict) else None
         if not isinstance(_row, dict):
             continue
         _runtime_status = str(_row.get("runtime_integrity_status") or "").upper()
         _sell_status = str(_row.get("sell_liveness_status") or "").upper()
+        _entry_status = str(_row.get("entry_liveness_status") or "").upper()
+        _reconcile_status = str(_row.get("reconcile_liveness_status") or "").upper()
+        _sell_bad = _sell_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"} or bool(_row.get("exit_route_liveness_failure"))
+        _reconcile_bad = _reconcile_status == "RECONCILE_REQUIRED" or _runtime_status == "RECONCILE_REQUIRED"
+        _entry_bad = _entry_status == "LIVENESS_DEGRADED" or bool(_row.get("entry_degraded"))
         if (
             _runtime_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED", "INTEGRITY_DEGRADED"}
-            or _sell_status in {"LIVENESS_DEGRADED", "RECONCILE_REQUIRED"}
-            or bool(_row.get("exit_route_liveness_failure"))
+            or _sell_bad or _reconcile_bad or _entry_bad
         ):
+            _failure_reason = (
+                "protective_sell_liveness_failure" if _sell_bad
+                else "reconcile_liveness_failure" if _reconcile_bad
+                else "entry_liveness_degraded" if _entry_bad
+                else "runtime_integrity_degraded"
+            )
+            # Keep the legacy public list shape: existing dashboards compare
+            # these keys exactly. Report the separate causal status alongside.
             runtime_liveness_failures.append({
                 "session": _name,
                 "runtime_integrity_status": _runtime_status or "UNKNOWN",
                 "sell_liveness_status": _sell_status or "UNKNOWN",
             })
+            runtime_liveness_failure_reasons.append({
+                "session": _name,
+                "reason": _failure_reason,
+                "entry_liveness_status": _entry_status or "UNKNOWN",
+                "reconcile_liveness_status": _reconcile_status or "UNKNOWN",
+            })
     report["runtime_liveness_failures"] = runtime_liveness_failures
+    report["runtime_liveness_failure_reasons"] = runtime_liveness_failure_reasons
     if session == "close" and runtime_liveness_failures:
-        report["errors"].append("CLOSE_INTEGRITY_FAILED: protective_sell_liveness_failure")
+        for _reason in sorted({row["reason"] for row in runtime_liveness_failure_reasons}):
+            report["errors"].append(f"CLOSE_INTEGRITY_FAILED: {_reason}")
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
         report["close_integrity_status"] = (
             "RECONCILE_REQUIRED"
