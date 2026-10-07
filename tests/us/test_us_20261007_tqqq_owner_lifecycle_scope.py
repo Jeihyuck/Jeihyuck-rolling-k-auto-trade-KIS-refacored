@@ -101,3 +101,39 @@ def test_cluster_trim_uses_original_holding_owner_not_intent_missing_owner():
         {"symbol": "AMD", "side": "SELL", "reason": "CLUSTER_EXPOSURE_TRIM"},
     ]
     assert [x["symbol"] for x in filter_standard_owned_exit_intents(intents, positions)] == ["AMD"]
+
+
+def test_authoritative_pb1_zero_and_infinite_true_zero_are_independent(monkeypatch):
+    from trader.us import position_lifecycle_state as state
+    from trader.us.strategy_ownership import filter_standard_owned_exit_intents
+    saved = []
+    monkeypatch.setattr(state, "load_latest_open_us_position_lifecycles",
+                        lambda _td: {
+                            "AAPL": _lc("US_STANDARD", "apple-pb1"),
+                            "TQQQ": _lc("TQQQ_INFINITE", "tqqq-infinite"),
+                        })
+    monkeypatch.setattr(state, "_save_lifecycle", lambda symbol, td, value, **_kw:
+                        (saved.append((symbol, value.get("is_open"))) or value))
+    generic = reconcile_us_position_lifecycles(
+        positions=[], trade_date=DATE, now=NOW,
+        authoritative=True, managed_owners={"US_STANDARD"},
+    )
+    assert saved == [("AAPL", False)]
+    assert "TQQQ" not in generic
+    assert filter_standard_owned_exit_intents(
+        [{"symbol": "AAPL", "side": "SELL"}, {"symbol": "TQQQ", "side": "SELL"}],
+        [{"symbol": "AAPL", "strategy_owner": "US_STANDARD"},
+         {"symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE"}],
+    ) == [{"symbol": "AAPL", "side": "SELL"}]
+
+    # In the dedicated sleeve an explicit broker-zero position, not a filtered
+    # PB1 snapshot, must be what closes the Infinite cycle.
+    decision = evaluate(
+        config=InfiniteConfig(),
+        state=InfiniteState(cycle_id="tqqq-infinite", status=Status.EXIT_PENDING),
+        position=PositionSnapshot(qty=0, orderable_qty=0, price=55),
+        trading_date=date(2026, 10, 6),
+        overlay={}, pending_sell=False,
+    )
+    assert decision.action == Action.WAIT
+    assert decision.next_status == Status.COMPLETE
