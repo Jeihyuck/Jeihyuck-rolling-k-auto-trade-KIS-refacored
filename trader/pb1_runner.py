@@ -1126,32 +1126,208 @@ def submit_kr_close_policy_orders(
     env: str = "practice",
     dry_run: bool = False,
 ) -> list[dict[str, Any]]:
+    """Submit close-policy SELLs with durable identity and duplicate fencing."""
     results: list[dict[str, Any]] = []
+    required_repo_methods = (
+        "has_open_order_for_code",
+        "create_intent_idempotent",
+        "mark_submitted",
+        "mark_unresolved_ack",
+        "mark_error",
+    )
+    if not dry_run and (
+        orders_repo is None
+        or any(not hasattr(orders_repo, name) for name in required_repo_methods)
+    ):
+        raise RuntimeError("KR_CLOSE_POLICY_DURABLE_ORDER_REPO_REQUIRED")
+
     for order in list(policy_orders or []):
         code = str((order or {}).get("code") or "").zfill(6)
         qty = int((order or {}).get("qty") or 0)
         if not code or qty <= 0:
             continue
         reason = str((order or {}).get("reason") or "KR_CLOSE_POLICY_SELL")
-        logger.info("[KR_CLOSE][POLICY][SELL][INTENT] code=%s qty=%s reason=%s metadata_source=%s", code, qty, reason, (order or {}).get("metadata_source"))
+        logger.info(
+            "[KR_CLOSE][POLICY][SELL][INTENT] code=%s qty=%s reason=%s metadata_source=%s",
+            code, qty, reason, (order or {}).get("metadata_source"),
+        )
         if dry_run:
-            results.append({**dict(order), "accepted": False, "dry_run": True, "result": "DRY_RUN"})
+            results.append({
+                **dict(order), "accepted": False, "dry_run": True, "result": "DRY_RUN"
+            })
             continue
         if kis_client is None or not hasattr(kis_client, "sell_stock_market"):
             raise RuntimeError("KIS_SELL_SUBMIT_UNAVAILABLE_FOR_KR_CLOSE_POLICY")
-        logger.info("[ORDER][API_CALL][START] side=SELL code=%s source=tagged_close_policy", code)
-        resp = kis_client.sell_stock_market(code, qty)
+
+        trade_date = now_kst().date()
+        try:
+            if orders_repo.has_open_order_for_code(env, code, "SELL", trade_date):
+                logger.warning(
+                    "[KR_CLOSE][POLICY][SELL][BLOCKED] code=%s reason=OPEN_SELL_EXISTS",
+                    code,
+                )
+                results.append({
+                    **dict(order), "accepted": False, "result": "BLOCKED_OPEN_SELL"
+                })
+                continue
+            if hasattr(orders_repo, "consume_fail_open_marker") and orders_repo.consume_fail_open_marker(
+                "orders.get_open_orders"
+            ):
+                logger.error(
+                    "[KR_CLOSE][POLICY][SELL][BLOCKED] code=%s reason=OPEN_ORDER_LOOKUP_FAIL_OPEN",
+                    code,
+                )
+                results.append({
+                    **dict(order), "accepted": False,
+                    "result": "BLOCKED_OPEN_ORDER_LOOKUP_UNCERTAIN",
+                })
+                continue
+        except Exception as exc:
+            logger.exception(
+                "[KR_CLOSE][POLICY][SELL][BLOCKED] code=%s reason=OPEN_ORDER_LOOKUP_FAILED err=%s",
+                code, exc,
+            )
+            results.append({
+                **dict(order), "accepted": False,
+                "result": "BLOCKED_OPEN_ORDER_LOOKUP_FAILED",
+            })
+            continue
+
+        lifecycle = str(order.get("position_cycle_id") or "").strip()
+        if not lifecycle:
+            logger.error(
+                "[KR_CLOSE][POLICY][SELL][BLOCKED] code=%s reason=LIFECYCLE_ID_MISSING",
+                code,
+            )
+            results.append({
+                **dict(order), "accepted": False, "result": "BLOCKED_LIFECYCLE_MISSING"
+            })
+            continue
+        client_order_key = (
+            f"kr-close:{env}:{trade_date.isoformat()}:{code}:{lifecycle}:{reason}"
+        )
+        request_json = {
+            **dict(order),
+            "client_order_key": client_order_key,
+            "strategy_owner": "PB1",
+            "semantic_action": f"SELL:CLOSE_POLICY:{reason}",
+            "position_lifecycle_id": lifecycle,
+            "source": "tagged_close_policy",
+        }
+        try:
+            _order_id, created = orders_repo.create_intent_idempotent(
+                env=env,
+                run_id=os.getenv("TRADER_RUN_ID") or None,
+                strategy="pb1_pullback_close",
+                sid=int(order.get("sid") or 1),
+                mode=int(order.get("mode") or 1),
+                code=code,
+                market=str(order.get("market") or "KRX"),
+                side="SELL",
+                ord_type="MARKET",
+                qty=qty,
+                limit_price=None,
+                stage="CLOSE_POLICY",
+                client_order_key=client_order_key,
+                request_json=request_json,
+                portfolio_epoch_id=order.get("portfolio_epoch_id"),
+                position_cycle_id=lifecycle,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[KR_CLOSE][POLICY][SELL][BLOCKED] code=%s reason=INTENT_PERSIST_FAILED err=%s",
+                code, exc,
+            )
+            results.append({
+                **dict(order), "accepted": False, "result": "BLOCKED_INTENT_PERSIST_FAILED"
+            })
+            continue
+        if not created:
+            logger.warning(
+                "[KR_CLOSE][POLICY][SELL][BLOCKED] code=%s key=%s reason=IDEMPOTENT_INTENT_EXISTS",
+                code, client_order_key,
+            )
+            results.append({
+                **dict(order), "accepted": False, "result": "BLOCKED_IDEMPOTENT_INTENT",
+                "client_order_key": client_order_key,
+            })
+            continue
+
+        logger.info(
+            "[ORDER][API_CALL][START] side=SELL code=%s source=tagged_close_policy key=%s",
+            code, client_order_key,
+        )
+        try:
+            resp = kis_client.sell_stock_market(code, qty)
+        except Exception as exc:
+            orders_repo.mark_unresolved_ack(
+                env, client_order_key,
+                {"error": str(exc), "source": "tagged_close_policy"},
+                submitted_qty=qty,
+            )
+            logger.exception(
+                "[KR_CLOSE][POLICY][SELL][UNRESOLVED_ACK] code=%s key=%s err=%s",
+                code, client_order_key, exc,
+            )
+            results.append({
+                **dict(order), "accepted": False, "result": "UNRESOLVED_ACK",
+                "client_order_key": client_order_key,
+            })
+            continue
+
         ok = _is_accepted_order_response(resp)
-        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
-        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
-        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
-        logger.info("[KIS][ORDER][RESPONSE] side=SELL code=%s rt_cd=%s msg_cd=%s msg1=%s source=tagged_close_policy", code, rt_cd, msg_cd, msg1)
-        logger.info("[TRADE][ORDER][SELL] code=%s result=%s source=tagged_close_policy", code, "ACCEPTED" if ok else "REJECTED")
-        result = dict(resp) if isinstance(resp, dict) else {"resp": resp}
-        result.update({**dict(order), "accepted": ok, "result": "ACCEPTED" if ok else "REJECTED"})
+        response_dict = dict(resp) if isinstance(resp, dict) else {"resp": resp}
+        output = response_dict.get("output") if isinstance(response_dict.get("output"), dict) else {}
+        kis_odno = str(
+            output.get("ODNO")
+            or output.get("odno")
+            or response_dict.get("ODNO")
+            or response_dict.get("odno")
+            or ""
+        ).strip() or None
+        rt_cd = response_dict.get("rt_cd")
+        msg_cd = response_dict.get("msg_cd")
+        msg1 = response_dict.get("msg1")
+
+        if ok:
+            if kis_odno:
+                orders_repo.mark_submitted(
+                    env, client_order_key, kis_odno, response_dict, submitted_qty=qty
+                )
+            else:
+                orders_repo.mark_unresolved_ack(
+                    env, client_order_key, response_dict,
+                    submitted_qty=qty, kis_odno=None,
+                )
+                logger.error(
+                    "[KR_CLOSE][POLICY][SELL][UNRESOLVED_ACK] code=%s key=%s reason=ACCEPTED_WITHOUT_ORDER_NO",
+                    code, client_order_key,
+                )
+        else:
+            orders_repo.mark_error(env, client_order_key, response_dict)
+
+        logger.info(
+            "[KIS][ORDER][RESPONSE] side=SELL code=%s rt_cd=%s msg_cd=%s msg1=%s source=tagged_close_policy key=%s",
+            code, rt_cd, msg_cd, msg1, client_order_key,
+        )
+        logger.info(
+            "[TRADE][ORDER][SELL] code=%s result=%s source=tagged_close_policy",
+            code, "ACCEPTED" if ok else "REJECTED",
+        )
+        result = response_dict
+        result.update({
+            **dict(order),
+            "accepted": ok,
+            "result": (
+                "ACCEPTED" if ok and kis_odno
+                else "UNRESOLVED_ACK" if ok
+                else "REJECTED"
+            ),
+            "client_order_key": client_order_key,
+            "kis_odno": kis_odno,
+        })
         results.append(result)
     return results
-
 
 def run_kr_close_policy_from_tagged_positions(
     *,
@@ -1180,6 +1356,20 @@ def run_kr_close_policy_from_tagged_positions(
         fills_repo=fills_repo,
         positions_repo=positions_repo,
     )
+    position_by_code = {
+        str((row or {}).get("code") or "").zfill(6): dict(row or {})
+        for row in db_positions
+        if str((row or {}).get("code") or "").strip()
+    }
+    for policy_order in policy_orders:
+        position = position_by_code.get(str(policy_order.get("code") or "").zfill(6), {})
+        policy_order.update({
+            "sid": int(position.get("sid") or 1),
+            "mode": int(position.get("mode") or 1),
+            "market": position.get("market") or "KRX",
+            "position_cycle_id": position.get("position_cycle_id"),
+            "portfolio_epoch_id": position.get("portfolio_epoch_id"),
+        })
     policy_results = submit_kr_close_policy_orders(
         policy_orders=policy_orders,
         kis_client=kis_client,
@@ -5723,6 +5913,68 @@ def run_once(
                 "[KR_CLOSE][PREPOLICY_RECONCILE] failed action=CONTINUE_OWNER_POLICY_WITH_GUARDS"
             )
 
+        # Close/exit is a holdings-management path, not an entry-universe path.
+        # Run owner policy immediately after reconciliation so the generic
+        # 60-second budget and empty-universe entry gates cannot suppress exits.
+        holdings_for_policy: list[dict[str, Any]] = []
+        fresh_balance_succeeded = False
+        if kis is not None:
+            try:
+                fresh_close_balance = kis.get_balance() or {}
+                if isinstance(fresh_close_balance, dict):
+                    if "output1" in fresh_close_balance:
+                        holdings_for_policy = list(fresh_close_balance.get("output1") or [])
+                        fresh_balance_succeeded = True
+                    elif "holdings" in fresh_close_balance:
+                        holdings_for_policy = list(fresh_close_balance.get("holdings") or [])
+                        fresh_balance_succeeded = True
+                if fresh_balance_succeeded:
+                    logger.info(
+                        "[KR_CLOSE][POLICY][BALANCE_REFRESH] source=KIS holdings=%s authoritative_empty=%s",
+                        len(holdings_for_policy), int(len(holdings_for_policy) == 0),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[KR_CLOSE][POLICY][BALANCE_REFRESH][FAIL] err=%s action=FALLBACK_PRECHECK_SNAPSHOT",
+                    exc,
+                )
+        if not fresh_balance_succeeded and isinstance(balance_snapshot_raw, dict):
+            holdings_for_policy = list(
+                balance_snapshot_raw.get("output1")
+                or balance_snapshot_raw.get("holdings")
+                or []
+            )
+        close_positions_repo = PositionsRepo(engine)
+        close_fills_repo = FillsRepo(engine)
+        close_orders_repo = OrdersRepo(engine)
+        close_policy_result = run_kr_close_policy_from_tagged_positions(
+            kis_holdings=holdings_for_policy,
+            positions_repo=close_positions_repo,
+            fills_repo=close_fills_repo,
+            orders_repo=close_orders_repo,
+            kis_client=kis,
+            env=env_effective,
+            strategy="pb1_pullback_close",
+            dry_run=parse_bool_any(dry_run, default=True),
+        )
+        policy_orders = list(close_policy_result.get("policy_orders") or [])
+        policy_results = list(close_policy_result.get("policy_results") or [])
+        accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
+        evaluated_positions = int(close_policy_result.get("evaluated_positions") or 0)
+        logger.info(
+            "[KR_CLOSE][POLICY][DONE] evaluated=%s candidates=%s submitted=%s accepted=%s holds=%s",
+            evaluated_positions, len(policy_orders), len(policy_results),
+            accepted_policy_sells, max(0, evaluated_positions - len(policy_orders)),
+        )
+        return [], True, {
+            "buy_orders": 0,
+            "sell_orders": accepted_policy_sells,
+            "sell_orders_ack": accepted_policy_sells,
+            "policy_sell_candidates": len(policy_orders),
+            "exit_evaluated_positions": evaluated_positions,
+            "warning_counts": {},
+        }, phase_for_log, "OK_CLOSE_POLICY"
+
     if should_degrade(remaining_s):
         logger.warning("[PB1][DEGRADED] remaining_s=%.1f -> reconcile+persistent only", remaining_s)
         kis = None
@@ -6587,16 +6839,17 @@ def run_once(
                 try:
                     fresh_close_balance = kis.get_balance() or {}
                     if isinstance(fresh_close_balance, dict):
-                        fresh_holdings = list(
-                            fresh_close_balance.get("output1")
-                            or fresh_close_balance.get("holdings")
-                            or []
-                        )
-                        if fresh_holdings:
-                            holdings_for_policy = fresh_holdings
+                        if "output1" in fresh_close_balance:
+                            holdings_for_policy = list(fresh_close_balance.get("output1") or [])
                             logger.info(
-                                "[KR_CLOSE][POLICY][BALANCE_REFRESH] source=KIS holdings=%s",
-                                len(holdings_for_policy),
+                                "[KR_CLOSE][POLICY][BALANCE_REFRESH] source=KIS holdings=%s authoritative_empty=%s",
+                                len(holdings_for_policy), int(len(holdings_for_policy) == 0),
+                            )
+                        elif "holdings" in fresh_close_balance:
+                            holdings_for_policy = list(fresh_close_balance.get("holdings") or [])
+                            logger.info(
+                                "[KR_CLOSE][POLICY][BALANCE_REFRESH] source=KIS holdings=%s authoritative_empty=%s",
+                                len(holdings_for_policy), int(len(holdings_for_policy) == 0),
                             )
                 except Exception as exc:
                     logger.warning(
