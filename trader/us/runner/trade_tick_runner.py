@@ -2235,7 +2235,20 @@ def run_trade_tick(
             current_positions = []
     try:
         from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        from trader.us.strategy_ownership import owner_for_symbol, STANDARD_OWNER
+        _standard_lifecycle_positions = [
+            p for p in current_positions
+            if owner_for_symbol(p.get("symbol")) == STANDARD_OWNER
+            and str(p.get("strategy_owner") or (p.get("meta") or {}).get("strategy_owner") or STANDARD_OWNER).upper() == STANDARD_OWNER
+        ]
+        _standard_lifecycle_fills = [
+            f for f in fills_today
+            if owner_for_symbol(f.get("symbol")) == STANDARD_OWNER
+            and str(f.get("strategy_owner") or (f.get("meta") or {}).get("strategy_owner") or STANDARD_OWNER).upper() == STANDARD_OWNER
+        ]
         lifecycle_map = reconcile_us_position_lifecycles(
+            # Pass full broker holdings for zero-closure proof. The function
+            # scopes mutation by owner, but must see held foreign/unknown rows.
             positions=current_positions,
             trade_date=trade_date,
             now=now,
@@ -2245,9 +2258,10 @@ def run_trade_tick(
                 and not recon.get("preserve_previous_positions")
                 and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
             ),
-            fills=fills_today,
+            fills=_standard_lifecycle_fills,
+            managed_owners={STANDARD_OWNER},
         )
-        for _p in current_positions:
+        for _p in _standard_lifecycle_positions:
             if _p.get("epoch_visibility_status") == "STALE_EPOCH_VISIBLE_PROTECTIVE":
                 continue
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
@@ -2364,12 +2378,21 @@ def run_trade_tick(
     _exit_engine_started = time.monotonic()
     try:
         from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
-        current_positions, exit_position_meta = enrich_us_positions_for_exit(
-            current_positions,
+        from trader.us.strategy_ownership import exclude_non_standard
+        _standard_exit_positions = exclude_non_standard(current_positions)
+        _enriched_standard, exit_position_meta = enrich_us_positions_for_exit(
+            _standard_exit_positions,
             trade_date=_exit_trade_date,
             env=env,
             provider=provider,
         )
+        _enriched_by_symbol = {
+            str(p.get("symbol") or "").upper(): p for p in _enriched_standard
+        }
+        current_positions = [
+            _enriched_by_symbol.get(str(p.get("symbol") or "").upper(), p)
+            for p in current_positions
+        ]
         logger.info(
             "[US_EXIT][POSITION_RESOLVE] total=%d ok=%d missing=%d sources=%s missing_symbols=%s",
             exit_position_meta.get("total", 0),
@@ -2394,7 +2417,7 @@ def run_trade_tick(
         if not is_default_pb1_engine:
             try:
                 trend_positions, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
-                    positions=current_positions,
+                    positions=exclude_non_standard(current_positions),
                     provider=provider,
                     trade_date=_exit_trade_date,
                     now=now,
@@ -2403,12 +2426,14 @@ def run_trade_tick(
                 )
             except Exception as _trend_exc:
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
-                trend_positions = current_positions
+                trend_positions = exclude_non_standard(current_positions)
             exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
         else:
             from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
             try:
-                exit_snapshots = prepare_exit_position_snapshots(current_positions, provider, now)
+                exit_snapshots = prepare_exit_position_snapshots(
+                    exclude_non_standard(current_positions), provider, now
+                )
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 exit_snapshots = []

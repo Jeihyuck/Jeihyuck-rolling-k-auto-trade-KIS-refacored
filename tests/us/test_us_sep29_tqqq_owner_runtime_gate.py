@@ -786,13 +786,12 @@ def _replay_session_tick_tqqq(
     assert result["tick_latency"]["max_tick_ms"] > 0
     assert result["tick_latency"]["stage_ms"]["order_reconcile_ms"] >= 0
     if include_pb1_position:
+        # PB1 trend/exit must only see its own managed holdings; Infinite
+        # still sees TQQQ through the dedicated run_sleeve path above.
         assert {
             (row["symbol"], row.get("strategy_owner"))
             for row in positions_seen_by_tick
-        } == {
-            ("TQQQ", "TQQQ_INFINITE"),
-            ("HELD_FIXTURE", "US_STANDARD"),
-        }
+        } == {("HELD_FIXTURE", "US_STANDARD")}
     if operational_block is None:
         assert result["runtime_integrity_status"] == "POLICY_ENTRY_BLOCKED"
     elif operational_block == "reconcile":
