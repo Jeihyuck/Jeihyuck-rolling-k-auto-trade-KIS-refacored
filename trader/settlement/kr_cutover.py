@@ -27,7 +27,7 @@ class KrSettlementRouteResult:
 
 
 def _validate_kr_release(
-    observation: SettlementObservation,
+    observation: SettlementObservation | None,
     release: SettlementReleaseDecision,
 ) -> None:
     if observation.market != "KR" or release.market != "KR":
@@ -54,8 +54,13 @@ def route_kr_settlement(
     settle_atomic, so economic mutation and settlement watermark share one DB
     transaction.
     """
-    _validate_kr_release(observation, release)
+    if observation is None:
+        if release.writer_allowed:
+            raise RuntimeError("KR_SETTLEMENT_AUTHORITATIVE_OBSERVATION_REQUIRED")
+    else:
+        _validate_kr_release(observation, release)
     if release.writer_allowed:
+        assert observation is not None
         decision = settle_atomic(engine, observation, apply_atomic_economic_delta)
         return KrSettlementRouteResult(
             mode="ATOMIC_SETTLEMENT",
@@ -64,4 +69,11 @@ def route_kr_settlement(
     return KrSettlementRouteResult(
         mode="LEGACY",
         legacy_result=apply_legacy(),
+    )
+
+
+def shadow_only_kr_release(*, reason: str = "CONTROLLED_SWITCH_NOT_REQUESTED") -> SettlementReleaseDecision:
+    """Merge-safe production default: legacy stays authoritative until proofs are verified."""
+    return SettlementReleaseDecision(
+        market="KR", status="SHADOW_ONLY", writer_allowed=False, missing=(reason,),
     )
