@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import inspect
+import json
 
 import sqlalchemy as sa
 import pytest
@@ -10,7 +12,7 @@ import pytest
 from trader.settlement.core import SettlementObservation
 from trader.settlement.release_gate import SettlementReleaseDecision
 from trader.settlement.schema import metadata
-from trader.settlement.us_cutover import route_us_settlement
+from trader.settlement.us_cutover import load_us_runtime_release, route_us_settlement
 
 
 def _engine():
@@ -109,3 +111,62 @@ def test_partial_then_late_price_does_not_reapply_quantity():
         apply_legacy=lambda: None,
     )
     assert seen == [(2, 0), (0, 2)]
+
+
+
+def test_us_reconcile_mutators_accept_caller_owned_transaction():
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db import repos
+
+    assert "_conn" in inspect.signature(repos.mark_order_filled_by_reconcile).parameters
+    assert "_conn" in inspect.signature(repos.mark_us_profit_capture_stage).parameters
+    assert "_conn" in inspect.signature(DurableExecutionClaimRepo.record_observation).parameters
+
+
+def test_production_broker_observation_is_connected_to_single_writer_router():
+    from trader.us.db import repos
+
+    source = inspect.getsource(repos.apply_broker_order_observation)
+    assert "route_us_settlement(" in source
+    assert "load_us_runtime_release" in source
+    assert "mark_order_filled_by_reconcile(" in source
+    assert "_conn=conn" in source
+    assert "SETTLEMENT_CUTOVER_BLOCKED" in source
+
+
+def test_runtime_release_env_flag_alone_cannot_activate(monkeypatch):
+    engine = _engine()
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.delenv("NULLIM_US_SETTLEMENT_RELEASE_PROOF_FILE", raising=False)
+    decision = load_us_runtime_release(engine, _obs())
+    assert decision.writer_allowed is False
+    assert decision.status == "ACTIVATION_BLOCKED"
+    assert "release_proof_file_missing" in decision.missing
+
+
+def test_runtime_release_requires_fresh_scoped_proof_and_revision(monkeypatch, tmp_path):
+    from trader.settlement.core import settle_atomic
+    from trader.settlement.release_gate import REQUIRED_PROOFS
+
+    engine = _engine()
+    obs = _obs()
+    settle_atomic(engine, obs, lambda _conn, _obs, _decision: None)
+
+    revision = "b" * 40
+    proof_path = tmp_path / "us-release.json"
+    proof_path.write_text(json.dumps({
+        "market": "US",
+        "env": obs.env,
+        "trading_epoch_id": obs.trading_epoch_id,
+        "account_scope": obs.account_scope,
+        "run_revision": revision,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        "proofs": {name: True for name in REQUIRED_PROOFS},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_ACTIVATE", "1")
+    monkeypatch.setenv("NULLIM_US_SETTLEMENT_RELEASE_PROOF_FILE", str(proof_path))
+    monkeypatch.setenv("GITHUB_SHA", revision)
+
+    decision = load_us_runtime_release(engine, obs)
+    assert decision.status == "READY_FOR_CONTROLLED_SWITCH"
+    assert decision.writer_allowed is True
