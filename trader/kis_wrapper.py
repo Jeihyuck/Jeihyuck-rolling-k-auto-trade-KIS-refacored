@@ -205,11 +205,34 @@ def kis_data_http_allowed_in_diag() -> bool:
     return os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip() == "1"
 
 
+def _token_rate_limit_response(status: int, body: Any, text: str = "") -> tuple[bool, str]:
+    """Recognize only KIS token issuance throttling; never downgrade generic auth failures."""
+    if int(status or 0) not in {401, 403}:
+        return False, ""
+    payload = body if isinstance(body, dict) else {}
+    code = str(payload.get("error_code") or payload.get("msg_cd") or "").strip()
+    description = str(
+        payload.get("error_description")
+        or payload.get("msg1")
+        or text
+        or ""
+    ).strip()
+    lowered = description.lower()
+    limited = (
+        code == "EGW00133"
+        or "1분당 1회" in description
+        or "1분 1회" in description
+        or "1 minute" in lowered
+    )
+    return limited, f"error_code={code or 'UNKNOWN'} description={description[:240]}"
+
+
 # ✅ Export public exceptions
 __all__ = [
     "KisAPI",
     "KisTemporaryError",
     "KisAuthError",
+    "KisTokenRateLimitError",
     "KisPermanentError",
     "KisBalanceUnavailable",
     "NetTemporaryError",
@@ -1683,6 +1706,25 @@ class KisAPI:
                 if status in (401, 403):
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
                                    method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
+                    if "/oauth2/token" in path_lower:
+                        try:
+                            token_error_body = resp.json()
+                        except Exception:
+                            token_error_body = {}
+                        token_limited, token_detail = _token_rate_limit_response(
+                            status, token_error_body, resp.text[:500]
+                        )
+                        if token_limited:
+                            logger.warning(
+                                "[KIS][TOKEN_RATE_LIMIT] status=%s detail=%s retry_after=65",
+                                status,
+                                token_detail,
+                            )
+                            _breaker_record_temp_failure(method, url)
+                            raise KisTokenRateLimitError(
+                                f"KIS_TOKEN_RATE_LIMIT EGW00133 {token_detail}",
+                                retry_after=65,
+                            )
                     if is_order_endpoint(url):
                         # 401/403 is an explicit pre-acceptance auth rejection.
                         # Refresh may prepare the *next* tick, but never resubmit
@@ -2000,10 +2042,21 @@ class KisAPI:
                     return cache_after_lock
                 try:
                     token, expires_in = self._issue_token_and_expire()
+                except KisTokenRateLimitError as exc:
+                    retry_after = max(1, int(getattr(exc, "retry_after", 65) or 65))
+                    logger.warning(
+                        "[토큰] rate limit 감지 -> cache reload before retry retry_after=%s",
+                        retry_after,
+                    )
+                    time.sleep(retry_after)
+                    cache_after_wait = self._load_token_cache_file(cache_path, time.time())
+                    if cache_after_wait:
+                        return cache_after_wait
+                    raise
                 except Exception as exc:
                     msg = str(exc)
                     if "EGW00133" in msg or "1분당 1회" in msg or "1분 1회" in msg or "1 minute" in msg:
-                        logger.warning("[토큰] rate limit/unknown issuance 감지 -> cache reload before reissue retry_after=65")
+                        logger.warning("[토큰] legacy rate-limit text 감지 -> cache reload before retry retry_after=65")
                         time.sleep(65)
                         cache_after_wait = self._load_token_cache_file(cache_path, time.time())
                         if cache_after_wait:
