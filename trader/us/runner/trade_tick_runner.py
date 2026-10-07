@@ -1421,7 +1421,7 @@ def route_exit_orders_immediately(
             if stage:
                 from trader.us.profit_capture import sync_profit_capture_stage_from_order
                 mapped_status = {
-                    "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "FAILED",
+                    "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "AMBIGUOUS_ACK",
                     "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
                     "ACK_DB_FAILED": "AMBIGUOUS_ACK", "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
                 }.get(status, status)

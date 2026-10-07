@@ -796,6 +796,33 @@ def _validate_take_profit_with_fresh_broker_position(
     if actual_return < threshold:
         return {"ok": False, "reason": "threshold_not_met_after_refresh", "return_rate": float(actual_return)}
 
+    # A TP stage is not a generic SELL clamp. Check the SAME frozen rounding and
+    # runner floor as intent creation, now against the actual broker holdings.
+    # Never resize a stale TP automatically: defer to a fresh stage evaluation.
+    from trader.us.market_state_overlay import resolve_profit_capture_stage_quantity
+    stage = str(meta.get("profit_capture_stage") or "").lower()
+    if stage not in {"tp1", "tp2", "tp3"}:
+        return {"ok": False, "reason": "take_profit_stage_missing"}
+    try:
+        stage_fraction = float(meta.get("profit_capture_sell_fraction") or
+            os.getenv(f"US_{stage.upper()}_SELL_PCT", "0.20" if stage == "tp3" else "0.25"))
+        runner_floor = float(meta.get("profit_capture_runner_min_remain_pct") or
+            os.getenv("US_RUNNER_MIN_REMAIN_PCT", "0.40"))
+        target = int(meta.get("profit_capture_stage_target_qty") or 0)
+        filled = int(meta.get("profit_capture_stage_filled_qty") or 0)
+        requested = int(intent.get("qty") or intent.get("quantity") or 0)
+        max_stage_qty = resolve_profit_capture_stage_quantity(
+            holding_qty=fresh_qty, sell_fraction=stage_fraction,
+            runner_min_remain_pct=runner_floor,
+            stage_target_qty=target, stage_filled_qty=filled,
+        )
+        if requested <= 0 or requested > max_stage_qty or requested > int(fresh_orderable or 0):
+            return {"ok": False, "reason": "fresh_tp_stage_quantity_or_runner_limit",
+                    "holding_qty": fresh_qty, "orderable_qty": int(fresh_orderable or 0),
+                    "stage_max_qty": max_stage_qty, "requested_qty": requested}
+    except (ValueError, TypeError, OverflowError) as exc:
+        return {"ok": False, "reason": f"invalid_tp_stage_quantity_contract:{exc}"}
+
     meta.update(provenance)
     meta.update({
         "broker_avg_price": float(broker_avg),
@@ -1419,6 +1446,7 @@ def route_order(
                     "reason": "take_profit_pre_submit_guard_failed",
                     "guard_reason": guard_reason,
                     "broker_submit": False,
+                    "pre_submit_tp_block": True,
                     "intent": intent,
                     "broker_position": broker_pos,
                 }
@@ -1490,8 +1518,17 @@ def route_order(
         if not broker_pos and sell_qty <= 0 and int(intent.get("orderable_qty") or 0) > 0:
             sell_qty = min(qty, int(intent.get("orderable_qty") or qty))
             guard_meta = {**guard_meta, "holding_qty": intent.get("available_qty") or guard_meta.get("holding_qty"), "orderable_qty": intent.get("orderable_qty") or guard_meta.get("orderable_qty"), "sell_qty": sell_qty, "reason": "broker_check_unavailable_intent_fallback"}
-        pending_sell_qty = _pending_sell_qty_for_symbol(symbol, trade_date) if broker_pos is not None else 0
-        available_to_sell = max(0, int(guard_meta.get("orderable_qty") or guard_meta.get("holding_qty") or sell_qty or 0) - pending_sell_qty)
+        # For fresh KIS SELL balance, orderable_qty already reflects broker
+        # reservations. In particular TP stages must not subtract them twice.
+        _is_tp_sell = str(intent.get("reason") or (intent.get("meta") or {}).get("reason") or "").startswith("TAKE_PROFIT")
+        pending_sell_qty = (
+            _pending_sell_qty_for_symbol(symbol, trade_date)
+            if broker_pos is not None and not _is_tp_sell else 0
+        )
+        available_to_sell = max(
+            0, int(guard_meta.get("orderable_qty") or guard_meta.get("holding_qty") or sell_qty or 0)
+            - pending_sell_qty,
+        )
         if pending_sell_qty > 0 and available_to_sell < sell_qty:
             logger.warning(
                 "[US_ORDER][SELL_AVAILABLE_TO_SELL_CLAMP] symbol=%s sell_qty=%d pending_sell_qty=%d available_to_sell=%d",
