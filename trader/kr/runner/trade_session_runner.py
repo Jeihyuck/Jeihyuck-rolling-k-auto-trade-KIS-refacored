@@ -24,7 +24,13 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
-from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, resolve_kr_balance_fail_soft
+from trader.kis_wrapper import (
+    KisAPI,
+    KisBalanceUnavailable,
+    KisTemporaryError,
+    KisTokenRateLimitError,
+    resolve_kr_balance_fail_soft,
+)
 from trader.execution_state import BalanceRecoveryState
 from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
 from trader.kr.artifacts import (
@@ -413,8 +419,13 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
         os.environ["KR_BALANCE_PRECHECK_PATH"] = str(out)
         logger.info("[KR_SESSION][BALANCE_PRECHECK] state=OK source=KIS entry_allowed=1 exit_allowed=1 close_allowed=1 snapshot=%d", int(bool(snapshot)))
         return None
-    except KisBalanceUnavailable as exc:
+    except (KisTemporaryError, KisTokenRateLimitError) as exc:
         env = os.getenv("STRATEGY_ENV", os.getenv("KIS_ENV", "practice"))
+        transient_reason = (
+            "KIS_TOKEN_RATE_LIMIT"
+            if isinstance(exc, KisTokenRateLimitError)
+            else "KIS_BALANCE_TIMEOUT"
+        )
         try:
             fail_soft = resolve_kr_balance_fail_soft(exc, env=env)
             cached = None
@@ -438,7 +449,12 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
             entry_allowed = False
             exit_allowed = bool(cached)
             close_allowed = bool(cached)
-            pre = BalancePrecheck("TIMEOUT", "PERSISTED_CACHE" if cached else ("CACHE" if (exit_allowed or close_allowed) else "NONE"), _now_kst(), entry_allowed, exit_allowed, close_allowed, "STALE_OR_MISSING_BALANCE" if not cached else "BALANCE_TIMEOUT_USING_FRESH_SNAPSHOT", raw_snapshot_available=bool(cached), raw_snapshot=(cached or {}).get("raw_snapshot"), cash=(cached or {}).get("cash"), holdings_count=(cached or {}).get("holdings_count"), positions_summary=(cached or {}).get("positions_summary"))
+            reason = (
+                transient_reason
+                if not cached
+                else f"{transient_reason}_USING_FRESH_SNAPSHOT"
+            )
+            pre = BalancePrecheck("TIMEOUT", "PERSISTED_CACHE" if cached else ("CACHE" if (exit_allowed or close_allowed) else "NONE"), _now_kst(), entry_allowed, exit_allowed, close_allowed, reason, raw_snapshot_available=bool(cached), raw_snapshot=(cached or {}).get("raw_snapshot"), cash=(cached or {}).get("cash"), holdings_count=(cached or {}).get("holdings_count"), positions_summary=(cached or {}).get("positions_summary"))
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(asdict(pre), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
             os.environ["KR_BALANCE_PRECHECK_PATH"] = str(out)
@@ -468,16 +484,20 @@ def recover_temporary_balance(
     session: str, initial: dict[str, Any], *, probe=None, sleep_fn=None,
     now_fn=None, max_attempts: int | None = None,
 ) -> dict[str, Any] | None:
-    """Keep PM/Close alive fail-closed until a fresh broker balance succeeds."""
-    if session not in {"afternoon", "close"} or str(initial.get("status") or "").upper() not in {"WARN", "SAFE_STOP"}:
+    """Keep KR sessions alive fail-closed until a fresh broker balance succeeds."""
+    if session not in {"am", "afternoon", "close"} or str(initial.get("status") or "").upper() not in {"WARN", "SAFE_STOP"}:
         return initial
     probe = probe or (lambda: _assert_balance_available(session))
     sleep_fn = sleep_fn or time_mod.sleep
     now_fn = now_fn or _now_kst
     interval = max(1, int(os.getenv("KR_BALANCE_RECOVERY_INTERVAL_SEC", "60")))
     if max_attempts is None:
-        default_attempts = "12" if session == "close" else "120"
-        env_key = "KR_CLOSE_BALANCE_RECOVERY_MAX_ATTEMPTS" if session == "close" else "KR_BALANCE_RECOVERY_MAX_ATTEMPTS"
+        if session == "close":
+            default_attempts, env_key = "12", "KR_CLOSE_BALANCE_RECOVERY_MAX_ATTEMPTS"
+        elif session == "am":
+            default_attempts, env_key = "15", "KR_AM_BALANCE_RECOVERY_MAX_ATTEMPTS"
+        else:
+            default_attempts, env_key = "120", "KR_BALANCE_RECOVERY_MAX_ATTEMPTS"
         max_attempts = max(1, int(os.getenv(env_key, default_attempts)))
     recovery = BalanceRecoveryState(retry_interval_seconds=interval)
     recovery.failed(now_fn())
@@ -725,7 +745,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         return guarded
     infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
     balance_state = _stage(session, ctx.trade_date, ctx.expected_as_of, "balance_precheck", lambda: _assert_balance_available(session))
-    if (balance_state is not None and session in {"afternoon", "close"}
+    if (balance_state is not None and session in {"am", "afternoon", "close"}
             and int(balance_state.get("exit_allowed", 0)) == 0):
         balance_state = recover_temporary_balance(session, balance_state)
     if balance_state is not None:
