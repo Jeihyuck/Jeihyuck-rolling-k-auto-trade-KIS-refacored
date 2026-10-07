@@ -173,12 +173,29 @@ def load_us_runtime_release_for_scope(
         trading_epoch_id=trading_epoch_id,
         account_scope=account_scope,
     )
-    return assess_release(
+    proofs = SettlementReleaseProof(**flags)
+    decision = assess_release(
         market="US",
         health=health,
-        proofs=SettlementReleaseProof(**flags),
+        proofs=proofs,
         activation_requested=True,
     )
+    if decision.writer_allowed:
+        return decision
+    continuation_statuses = {"PARTIAL_IN_FLIGHT", "PRICE_PENDING"}
+    all_proofs_valid = all(bool(flags.get(name)) for name in REQUIRED_PROOFS)
+    if (
+        health.status in continuation_statuses
+        and not health.problems
+        and all_proofs_valid
+    ):
+        return SettlementReleaseDecision(
+            market="US",
+            status="READY_FOR_CONTROLLED_SWITCH",
+            writer_allowed=True,
+            missing=(),
+        )
+    return decision
 
 
 def load_us_runtime_release(
