@@ -443,6 +443,9 @@ def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeyp
         )
         assert len(order_rows) == 1
         assert order_rows[0]["claim_state"] == "IN_FLIGHT"
+        assert recovery.has_unresolved_tp_claim(
+            "MRVL", "2026-10-07", env="practice", lifecycle_id="life-MRVL",
+        )
         assert recovery.reserve_cancel_request(order_rows[0])
         assert not recovery.reserve_cancel_request(order_rows[0])
         class Provider:
@@ -472,6 +475,9 @@ def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeyp
         assert recovery.load_conflicting_open_tp_orders(
             "MRVL", "2026-10-07", env="practice",
         ) == []
+        assert not recovery.has_unresolved_tp_claim(
+            "MRVL", "2026-10-07", env="practice", lifecycle_id="life-MRVL",
+        )
     finally:
         engine.dispose()
 
@@ -533,3 +539,28 @@ def test_unavailable_broker_components_keep_protective_sell_fenced(monkeypatch, 
     assert result == [
         {"symbol": "MRVL", "status": "FENCED", "reason": "broker_provider_missing"}
     ]
+
+
+def test_orphan_cross_day_tp_claim_blocks_protective_sell(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    calls = []
+    def orphan(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+    result = request_protective_tp_cancel(
+        intents=[dict(_protective("MRVL"), strategy="us_pb1_exit")],
+        provider=object(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [],
+        unresolved_claim=orphan,
+    )
+    assert result[0]["status"] == "FENCED"
+    assert result[0]["reason"] == "unresolved_tp_claim_without_open_order"
+    assert calls[0][1]["lifecycle_id"] == "life-MRVL"
+    assert request_protective_tp_cancel(
+        intents=[dict(_protective("MRVL"), strategy="us_pb1_exit")],
+        provider=object(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [],
+        unresolved_claim=lambda *a, **k: False,
+    ) == []
