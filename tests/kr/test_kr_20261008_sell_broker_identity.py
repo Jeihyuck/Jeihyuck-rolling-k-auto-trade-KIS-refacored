@@ -164,6 +164,7 @@ def test_real_orders_repo_does_not_store_lg_semantic_key_as_kis_broker_identity(
     with engine.connect() as conn:
         row = conn.execute(sa.select(schema.orders).where(schema.orders.c.order_id == order_id)).mappings().one()
     assert row["client_order_key"] == semantic
+    assert row["status"] == "UNRESOLVED_ACK"
     assert row["broker_order_id"] is None
     assert row["kis_odno"] is None
 
