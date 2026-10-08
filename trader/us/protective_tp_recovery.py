@@ -163,6 +163,17 @@ def reserve_cancel_request(order: dict) -> bool:
               AND meta->>'strategy_owner'='US_STANDARD'
               AND status IN ('ACK','OPEN','PARTIALLY_FILLED','RECONCILE_PENDING')
               AND meta->>'protective_tp_cancel_requested_at' IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM us_execution_claims c
+                  WHERE c.trading_epoch_id=us_orders.trading_epoch_id
+                    AND c.trade_date=us_orders.trade_date
+                    AND c.env=us_orders.env
+                    AND c.market='US'
+                    AND c.strategy_owner='US_STANDARD'
+                    AND c.lifecycle_id=:lifecycle
+                    AND c.action=UPPER(us_orders.meta->>'profit_capture_stage')
+                    AND c.action_state IN ('IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED')
+              )
             RETURNING id
         """), {"id": order["id"], "epoch": order["trading_epoch_id"],
                  "symbol": order["symbol"], "order_key": order["client_order_key"],
