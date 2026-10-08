@@ -109,5 +109,5 @@ def test_reconciliation_rejects_both_open_and_previously_promoted_lg_orders_with
             holdings_rows=[{"pdno": "066570", "hldg_qty": "0"}],
             orders_repo=repo, fills_repo=object(), positions_repo=None,
         )
-        assert result["promoted_orders"] == 0
+        assert result["orders"] == 0 and result["fills"] == 0
         assert repo.upserts == []
