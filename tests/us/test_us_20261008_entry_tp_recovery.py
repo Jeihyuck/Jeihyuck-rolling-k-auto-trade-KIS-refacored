@@ -10,7 +10,7 @@ from trader.us import entry_exit_contract as contracts
 from trader.us.market_state_overlay import build_profit_capture_intents
 from trader.us.profit_capture_evidence import authoritative_tp_fill_for_backfill
 from trader.us.protective_tp_recovery import (
-    broker_proves_open_tp_order, protective_symbols, request_protective_tp_cancel,
+    broker_proves_open_tp_order, broker_proves_terminal_after_cancel,\n    protective_symbols, request_protective_tp_cancel,
 )
 
 NOW = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
@@ -200,3 +200,58 @@ def test_pltr_done_zero_counter_backfill_only_on_proven_actual_fill():
     assert authoritative_tp_fill_for_backfill(stage, dict(order, meta={})) is None
     assert authoritative_tp_fill_for_backfill(dict(stage, stage_status="PENDING"), order) is None
     assert authoritative_tp_fill_for_backfill(dict(stage, symbol="NVDA"), order) is None
+
+
+@pytest.mark.parametrize("symbol", ["MRVL", "AMD"])
+def test_cancel_ack_is_not_terminal_but_broker_terminal_reconcile_is(symbol, monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp(symbol)
+    order["meta"]["protective_tp_cancel_requested_at"] = "2026-10-07T17:00:00Z"
+    calls = []
+    class Provider:
+        result = _broker_open()
+        def get_fills_by_order_no(self, **kwargs):
+            return self.result
+    class KIS:
+        def cancel_us_order(self, **kwargs):
+            raise AssertionError("must not retry a reserved cancellation")
+    provider = Provider()
+    args = dict(
+        intents=[_protective(symbol)], provider=provider, kis_client=KIS(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+        reserve=lambda _: (_ for _ in ()).throw(AssertionError("reserve twice")),
+        apply_observation=lambda **kwargs: calls.append(kwargs) or
+                          {"status": "OK", "authoritative": True},
+    )
+    assert request_protective_tp_cancel(**args)[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
+    assert calls == []
+    provider.result = {
+        "status": "CANCELLED", "order_no": "34237",
+        "requested_qty": 2, "filled_qty": 0, "remaining_qty": 0,
+        "filled_qty_present": True, "normalization_result": "normalized",
+    }
+    assert broker_proves_terminal_after_cancel(order, provider.result)
+    assert request_protective_tp_cancel(**args)[0]["status"] == "CANCEL_TERMINAL_RECONCILED"
+    assert calls[0]["client_order_key"] == order["client_order_key"]
+    assert calls[0]["trade_date"] == "2026-10-06"
+    assert calls[0]["evidence_type"] == "KIS_TERMINAL_CANCEL"
+    assert calls[0]["broker_open_qty"] == 0
+
+
+def test_cancel_terminal_missing_broker_fill_keeps_action_fenced(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp()
+    order["meta"]["protective_tp_cancel_requested_at"] = "sent"
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return {"status": "CANCELLED", "order_no": "34237",
+                    "requested_qty": 2, "remaining_qty": 0,
+                    "filled_qty_present": False}
+    assert request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+        apply_observation=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not reconcile unknown fill")),
+    )[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
