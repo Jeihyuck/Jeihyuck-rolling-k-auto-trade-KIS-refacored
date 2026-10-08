@@ -46,3 +46,30 @@ def test_start_run_persists_revision_not_just_session_log(monkeypatch):
             sa.select(schema.runs.c.git_sha).where(schema.runs.c.run_id == run_id)
         ).scalar_one()
     assert result == "d" * 40
+
+
+def test_early_pb1_run_upsert_stamps_sha_even_when_no_later_tick(monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from trader import pb1_runner
+
+    captured = {}
+
+    class FakeRunsRepo:
+        def __init__(self, engine):
+            captured["engine"] = engine
+
+        def upsert_run(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(pb1_runner, "RunsRepo", FakeRunsRepo)
+    monkeypatch.setattr("trader.db.repos._pb1_run_git_sha", lambda *_a, **_kw: "e" * 40)
+    monkeypatch.setenv("TRADER_RUN_ID", "early-run-id")
+    ctx = SimpleNamespace(
+        env="practice", strategy="pb1_pullback_close", gh_run_number=None,
+        started_at=datetime.now(timezone.utc), git_sha=None,
+    )
+    repo, run_id = pb1_runner._register_kr_run_row(engine=object(), ctx=ctx)
+    assert isinstance(repo, FakeRunsRepo)
+    assert run_id == "early-run-id"
+    assert captured["git_sha"] == "e" * 40
