@@ -116,7 +116,7 @@ def _old_tp(symbol: str = "MRVL") -> dict:
             "order_no": "0000034237", "exchange": "NASDAQ",
             "qty_requested": 2, "qty_filled": 0,
             "client_order_key": f"us-tp2-{symbol}",
-            "trading_epoch_id": "epoch-1", "meta": {
+            "trading_epoch_id": "epoch-1", "claim_state": "IN_FLIGHT", "meta": {
                 "profit_capture_stage": "tp2", "strategy_owner": "US_STANDARD",
                 "position_lifecycle_id": f"life-{symbol}",
             }}
@@ -320,3 +320,61 @@ def test_pltr_legacy_repair_dry_run_does_not_write_and_apply_is_scoped():
     assert update["lifecycle"] == "life-pltr"
     assert update["order_key"] == "US_PC_PLTR_TP1"
     assert update["filled_key"] == "tp1_filled_qty"
+
+
+def test_real_pb1_exit_producer_is_recognized_without_owner_tag(monkeypatch):
+    # Production _make_exit_intent reports strategy='us_pb1_exit' and can
+    # omit strategy_owner: recovering MRVL/AMD must not silently be a no-op.
+    for symbol in ("MRVL", "AMD"):
+        intent = _protective(symbol)
+        intent.pop("strategy_owner")
+        intent["strategy"] = "us_pb1_exit"
+        assert protective_symbols([intent]) == {symbol}
+    assert protective_symbols([dict(_protective("MRVL"), strategy_owner="TQQQ_INFINITE",
+                                   strategy="us_pb1_exit")]) == set()
+    assert protective_symbols([{"symbol": "MRVL", "side": "SELL",
+                                "exit_type": "profit_trailing_stop"}]) == set()
+
+
+def test_actual_pb1_protective_producer_emits_accepted_strategy(monkeypatch):
+    from trader.us.pb1 import us_exit_engine as engine
+    monkeypatch.setattr(
+        engine, "should_skip_exit_due_to_pending_sell",
+        lambda symbol, trade_date: (False, "", None),
+    )
+    intent = engine._make_exit_intent(
+        symbol="MRVL", exchange="NASDAQ", qty=4, current_price=100.0,
+        entry_price=110.0, exit_type="profit_trailing_stop",
+        reason="giveback_ratio=0.40", unrealized_pnl_usd=-40.0,
+        pnl_pct=-0.05, holding_qty=10, orderable_qty=10,
+        now=NOW, position_lifecycle_id="life-MRVL",
+    )
+    assert intent and intent["strategy"] == "us_pb1_exit"
+    assert protective_symbols([intent]) == {"MRVL"}
+
+
+def test_missing_execution_claim_blocks_auto_cancel(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = dict(_old_tp(), claim_state=None)
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            raise AssertionError("cannot query broker before claim is confirmed")
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+    )
+    assert result[0]["status"] == "FENCED"
+    assert result[0]["reason"] == "tp_claim_unverified"
+
+
+def test_cross_day_multiple_open_tp_orders_block_new_protective_exit(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp()
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=object(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order, dict(order, id="another")],
+    )
+    assert result[0]["status"] == "FENCED"
+    assert result[0]["reason"] == "multiple_tp_open_or_claims"
