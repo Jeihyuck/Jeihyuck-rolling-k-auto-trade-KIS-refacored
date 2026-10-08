@@ -1116,7 +1116,9 @@ class _RateLimiter:
 
     def wait(self, key: str):
         with self._lock:
-            now = time.time()
+            # Rate limits measure elapsed time. Wall-clock corrections must
+            # never manufacture excessive sleeps inside PB1's fixed tick budget.
+            now = time.monotonic()
             last = self.last_at.get(key, 0.0)
             delta = now - last
             if delta < self.min_interval:
@@ -1126,8 +1128,13 @@ class _RateLimiter:
                     key, sleep_sec,
                 )
                 if not _kr_sleep_with_budget(sleep_sec):
+                    logger.warning(
+                        "[KR_KIS_IO][BUDGET_FAILURE] stage=rate_limiter endpoint=%s "
+                        "wait_sec=%.3f remaining_sec=%.3f",
+                        key, sleep_sec, kr_tick_remaining_sec(),
+                    )
                     raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT")
-            self.last_at[key] = time.time()
+            self.last_at[key] = time.monotonic()
 
 
 def _is_egw002_error(response_data: dict | None, msg_cd: str | None = None) -> bool:
@@ -1291,7 +1298,7 @@ class KisAPI:
     def _wait_before_order_submit(self) -> None:
         if self._rate_limit_safe_enabled():
             self._order_limiter.wait("orders-safe")
-            now = time.time()
+            now = time.monotonic()
             required_gap = float(os.getenv("KIS_ORDER_MIN_GAP_SEC", str(self._order_hashkey_gap_sec or 1.10)) or "1.10")
             last_order_anchor = max(float(self._last_hashkey_at or 0.0), float(self._last_order_submit_at or 0.0))
             delta = now - last_order_anchor
@@ -1303,8 +1310,9 @@ class KisAPI:
                     delta,
                     sleep_sec,
                 )
-                time.sleep(sleep_sec)
-            self._last_order_submit_at = time.time()
+                if not _kr_sleep_with_budget(sleep_sec):
+                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT")
+            self._last_order_submit_at = time.monotonic()
         self._limiter.wait("orders")
 
     def _wait_before_data_request(self, endpoint_name: str) -> None:
@@ -1312,7 +1320,7 @@ class KisAPI:
             return
         self._data_limiter.wait(endpoint_name)
         required_gap = float(os.getenv("KIS_DATA_MIN_GAP_SEC", "0.35") or "0.35")
-        now = time.time()
+        now = time.monotonic()
         delta = now - float(self._last_data_request_at or 0.0)
         if delta < required_gap:
             sleep_sec = required_gap - delta + random.uniform(0, 0.03)
@@ -1323,8 +1331,9 @@ class KisAPI:
                 delta,
                 sleep_sec,
             )
-            time.sleep(sleep_sec)
-        self._last_data_request_at = time.time()
+            if not _kr_sleep_with_budget(sleep_sec):
+                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT")
+        self._last_data_request_at = time.monotonic()
 
     def _endpoint_min_gap_sec(self, endpoint_name: str, url: str = "") -> float:
         endpoint = str(endpoint_name or "").strip().lower().replace("_", "-")
@@ -2209,7 +2218,7 @@ class KisAPI:
         if not hk:
             logger.error(f"[HASHKEY 실패] resp={j}")
             raise Exception(f"HashKey 생성 실패: {j}")
-        self._last_hashkey_at = time.time()
+        self._last_hashkey_at = time.monotonic()
         return hk
 
     # ===== 신규: 예수금/과매수 방지 유틸 =====
@@ -4241,7 +4250,15 @@ class KisAPI:
                 configured_balance_budget, max(0.0, tick_remaining - routing_reserve)
             )
         if balance_budget <= 0.05:
+            logger.warning(
+                "[KR_KIS_IO][BUDGET_FAILURE] stage=balance_pre_fetch "
+                "tick_remaining_sec=%.3f reserve_sec=%.3f configured_sec=%.3f "
+                "budget_sec=%.3f action=FAIL_CLOSED",
+                tick_remaining, routing_reserve, configured_balance_budget, balance_budget,
+            )
             raise KisBalanceUnavailable("KR_BALANCE_BUDGET_EXHAUSTED_BEFORE_FETCH")
+        balance_started_mono = time.monotonic()
+        balance_fetch_outcome = "INVALID_OR_EMPTY"
         self._kr_stage_deadline = time.monotonic() + balance_budget
         logger.info(
             "[KR_BALANCE][DEADLINE] budget_sec=%.3f tick_remaining=%.3f routing_reserve=%.3f",
@@ -4262,22 +4279,35 @@ class KisAPI:
                 self._balance_cache = cache_value
                 self._balance_cache_at = now_kst()
                 snap = normalized
+                balance_fetch_outcome = "FRESH_OK"
         except KisBalanceUnavailable as e:
+            balance_fetch_outcome = "KIS_BALANCE_UNAVAILABLE"
             logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise
         except RuntimeError:
+            balance_fetch_outcome = "RUNTIME_ERROR"
             raise
         except KisTemporaryError as e:
+            balance_fetch_outcome = "KIS_TEMPORARY"
             logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise KisBalanceUnavailable(str(e)) from e
         except Exception as e:
+            balance_fetch_outcome = "OTHER_EXCEPTION"
             logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise KisBalanceUnavailable(str(e)) from e
         finally:
             self._kr_stage_deadline = prior_stage_deadline
+            logger.info(
+                "[KR_KIS_IO][BALANCE_FETCH_DONE] outcome=%s elapsed_sec=%.3f "
+                "allocated_budget_sec=%.3f tick_remaining_sec=%.3f",
+                balance_fetch_outcome,
+                max(0.0, time.monotonic() - balance_started_mono),
+                balance_budget,
+                kr_tick_remaining_sec(prior_stage_deadline),
+            )
         snap_copy = _deepcopy_json(snap)
         if return_source and return_raw:
             return snap_copy, source, _deepcopy_json(raw_snapshot or snap_copy)
