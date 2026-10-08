@@ -141,6 +141,46 @@ def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -
                 "trade_date": trade_date, "epoch": epoch}).mappings()]
 
 
+
+def has_unresolved_tp_claim(
+    symbol: str, trade_date: str, *, env: str, lifecycle_id: str,
+) -> bool:
+    """Do not permit a new SELL when an unresolved TP claim has no order row.
+
+    The claim is keyed by lifecycle/epoch/owner; it intentionally does not
+    trust the existence or status of a local order row as proof of no broker
+    order. Without broker terminal reconciliation, an orphan claim is fenced.
+    """
+    from sqlalchemy import text
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+
+    if not symbol or not lifecycle_id:
+        raise ValueError("US TP claim recovery requires explicit symbol and lifecycle")
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US TP claim recovery requires durable database")
+    with engine.connect() as conn:
+        epoch = _active_us_epoch(conn)
+        if not epoch:
+            raise RuntimeError("US TP claim recovery requires an active epoch")
+        return bool(conn.execute(text("""
+            SELECT EXISTS (
+                SELECT 1 FROM us_execution_claims c
+                WHERE c.trading_epoch_id=:epoch
+                  AND c.env=:env AND c.market='US'
+                  AND c.strategy_owner='US_STANDARD'
+                  AND c.lifecycle_id=:lifecycle
+                  AND c.trade_date<=:trade_date
+                  AND c.action IN ('TP1','TP2','TP3')
+                  AND c.action_state IN ('IN_FLIGHT','UNCERTAIN')
+            )
+        """), {
+            "epoch": epoch, "env": env,
+            "lifecycle": lifecycle_id, "trade_date": trade_date,
+        }).scalar())
+
+
+
 def reserve_cancel_request(order: dict) -> bool:
     """One durable write before KIS cancel. No repeated cancel after ambiguity."""
     from sqlalchemy import text
@@ -187,6 +227,7 @@ def request_protective_tp_cancel(
     find_open: Callable[..., list[dict]] = load_conflicting_open_tp_orders,
     reserve: Callable[[dict], bool] = reserve_cancel_request,
     apply_observation: Callable[..., dict] | None = None,
+    unresolved_claim: Callable[..., bool] = has_unresolved_tp_claim,
 ) -> list[dict]:
     """One cancel request per tick at most, with independently verified order proof."""
     if os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1":
@@ -213,8 +254,18 @@ def request_protective_tp_cancel(
         try:
             orders = find_open(symbol, trade_date, env=env)
             if not orders:
-                # No pending TP row for this epoch/lifecycle. Ordinary router
-                # broker-order/risk fences still apply to every protective SELL.
+                # A missing local order is not proof that KIS has no order.
+                # The old-date claim is the last durable line of defense.
+                lifecycle = lifecycle_by_symbol.get(symbol)
+                if not lifecycle:
+                    results.append({"symbol": symbol, "status": "FENCED",
+                                    "reason": "protective_lifecycle_unverified"})
+                    continue
+                if unresolved_claim(
+                    symbol, trade_date, env=env, lifecycle_id=lifecycle,
+                ):
+                    results.append({"symbol": symbol, "status": "FENCED",
+                                    "reason": "unresolved_tp_claim_without_open_order"})
                 continue
             if len(orders) != 1:
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
