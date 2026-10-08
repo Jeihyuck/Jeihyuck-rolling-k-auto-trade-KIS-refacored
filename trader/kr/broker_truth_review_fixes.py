@@ -22,7 +22,7 @@ from typing import Any
 
 import sqlalchemy as sa
 
-from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo
+from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, _assert_kr_buy_entry_contract, _kr_entry_exit_plan_sha256
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
 import trader.kr.broker_truth_hardening as base
@@ -314,7 +314,14 @@ def _recover_proven_policy_positions_fixed(
         if broker_qty <= 0:
             continue
         family = str(position.get("exit_policy_family") or "").strip().upper()
-        if family and family != "POLICY_MISSING":
+        # 2026-10-08: a RECOVERY holding can have a valid family name while
+        # the frozen BUY-to-SELL contract is still entirely absent.
+        # Do not treat a family label as evidence of an attached contract.
+        missing_recovery_plan = (
+            str(position.get("position_origin") or "").upper() == "RECOVERY"
+            and not base._json_dict(position.get("entry_exit_plan_json"))
+        )
+        if family and family != "POLICY_MISSING" and not missing_recovery_plan:
             continue
 
         with engine.connect() as conn:
@@ -362,6 +369,7 @@ def _recover_proven_policy_positions_fixed(
                 plan = base._json_dict(request.get("entry_exit_plan"))
                 if meta or plan:
                     group["buy_order"] = {
+                        "order_id": str(row.get("order_id") or ""),
                         "request_json": request,
                         "entry_meta_json": row.get("order_entry_meta_json"),
                     }
@@ -391,6 +399,62 @@ def _recover_proven_policy_positions_fixed(
 
         source_cycle, source_epoch, group, meta, plan = candidates[0]
         position_meta = base._json_dict(position.get("position_meta"))
+        source_order = group["buy_order"]
+        source_request = base._json_dict(source_order.get("request_json"))
+        source_order_id = str(source_order.get("order_id") or "")
+        if missing_recovery_plan:
+            # Only repair a RECOVERY cycle if its existing, independent proof
+            # identifies precisely the BUY fill lifecycle selected above.
+            verified = str(position_meta.get("provenance_verified") or "").lower() in {"true", "1"}
+            if (
+                not verified
+                or str(position_meta.get("recovered_from_cycle_id") or "") != source_cycle
+                or str(position_meta.get("recovered_from_epoch_id") or "") != source_epoch
+                or not source_order_id
+                or not source_request.get("entry_contract_sha256")
+            ):
+                review.append(code)
+                logger.error(
+                    "[KR_BROKER_TRUTH][POLICY_REVIEW_REQUIRED] code=%s "
+                    "reason=RECOVERY_SOURCE_PROOF_MISSING action=KEEP_FROZEN_CONTRACT",
+                    code,
+                )
+                continue
+        if source_request.get("enforce_entry_contract") is True:
+            try:
+                _assert_kr_buy_entry_contract(source_request)
+            except RuntimeError:
+                review.append(code)
+                logger.exception(
+                    "[KR_BROKER_TRUTH][POLICY_REVIEW_REQUIRED] code=%s "
+                    "reason=SOURCE_ENTRY_CONTRACT_INVALID action=KEEP_FROZEN_CONTRACT", code,
+                )
+                continue
+
+        recovered_plan_sha = _kr_entry_exit_plan_sha256(plan)
+        existing_entry_meta = base._json_dict(position.get("entry_meta_json"))
+        source_contract_sha = str(
+            source_request.get("parent_entry_contract_sha256")
+            or source_request.get("entry_contract_sha256") or ""
+        )
+        if missing_recovery_plan and (
+            (existing_entry_meta.get("entry_exit_plan_sha256")
+             and existing_entry_meta["entry_exit_plan_sha256"] != recovered_plan_sha)
+            or (existing_entry_meta.get("entry_contract_sha256")
+                and existing_entry_meta["entry_contract_sha256"] != source_contract_sha)
+        ):
+            review.append(code)
+            logger.error(
+                "[KR_BROKER_TRUTH][POLICY_REVIEW_REQUIRED] code=%s "
+                "reason=RECOVERY_CONTRACT_HASH_CONFLICT action=KEEP_FROZEN_CONTRACT", code,
+            )
+            continue
+        recovered_entry_meta = {**existing_entry_meta, **meta}
+        recovered_entry_meta["entry_exit_plan_sha256"] = recovered_plan_sha
+        if source_contract_sha:
+            recovered_entry_meta["entry_contract_sha256"] = source_contract_sha
+        if source_order_id:
+            recovered_entry_meta["source_buy_order_id"] = source_order_id
         position_meta.update(
             {
                 "provenance_verified": True,
@@ -416,7 +480,7 @@ def _recover_proven_policy_positions_fixed(
                 else meta.get("force_eod_close") or False
             ),
             "entry_exit_plan_json": plan,
-            "entry_meta_json": meta,
+            "entry_meta_json": recovered_entry_meta,
             "policy_source": "recovered_net_fill_provenance",
             "policy_version": plan.get("policy_version") or meta.get("policy_version"),
         }
