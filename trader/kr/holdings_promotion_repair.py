@@ -75,6 +75,62 @@ def repair_promoted_buy_watermark(*, engine, env: str, order: dict) -> bool:
         positions = list(conn.execute(
             sa.select(schema.positions).where(predicate).with_for_update()
         ).mappings().all())
+        recovery_alias = False
+        if not positions:
+            # 10/08: KIS balance restoration can create a different RECOVERY
+            # cycle for an already-applied BUY. Never replay the qty. Only
+            # restore its watermark if the exact frozen contract was recovered
+            # using one proven source cycle and the broker account qty is exact.
+            from trader.db.repos import _assert_kr_buy_entry_contract, _kr_entry_exit_plan_sha256
+            if request.get("enforce_entry_contract") is not True or int(pre) != 0:
+                return False
+            try:
+                _assert_kr_buy_entry_contract(request)
+            except (RuntimeError, TypeError, ValueError):
+                return False
+            possible = list(conn.execute(
+                sa.select(schema.positions).where(sa.and_(
+                    schema.positions.c.env == env,
+                    schema.positions.c.strategy == order.get("strategy"),
+                    schema.positions.c.code == code,
+                    schema.positions.c.portfolio_epoch_id == portfolio_epoch,
+                    schema.positions.c.status == "OPEN",
+                )).with_for_update()
+            ).mappings().all())
+            if len(possible) != 1:
+                return False
+            row = dict(possible[0])
+            origin_meta = _as_dict(row.get("position_meta"))
+            frozen_meta = _as_dict(row.get("entry_meta_json"))
+            source_plan = _as_dict(request.get("entry_exit_plan"))
+            if not (
+                str(row.get("position_origin") or "").upper() == "RECOVERY"
+                and origin_meta.get("provenance_verified") is True
+                and str(origin_meta.get("recovered_from_cycle_id") or "") == cycle
+                and str(origin_meta.get("recovered_from_epoch_id") or "") == portfolio_epoch
+                and _as_dict(row.get("entry_exit_plan_json")) == source_plan
+                and str(frozen_meta.get("entry_exit_plan_sha256") or "") == _kr_entry_exit_plan_sha256(source_plan)
+                and str(frozen_meta.get("entry_contract_sha256") or "") == request.get("entry_contract_sha256")
+                and int(row.get("qty") or 0) == int(post) == confirmed
+            ):
+                return False
+            # Prevent accepting an apparently matching quantity from a later
+            # order in another lifecycle or a manual/unknown submit.
+            later_any_cycle = conn.execute(sa.select(schema.orders.c.order_id).where(sa.and_(
+                schema.orders.c.env == env,
+                schema.orders.c.strategy == order.get("strategy"),
+                schema.orders.c.code == code,
+                schema.orders.c.created_at > order["created_at"],
+                schema.orders.c.order_id != order_id,
+                schema.orders.c.status.in_((
+                    "SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+                    "PARTIAL_FILLED", "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+                )),
+            )).limit(1)).first()
+            if later_any_cycle:
+                return False
+            positions = [row]
+            recovery_alias = True
         if len(positions) != 1 or int(positions[0].get("qty") or 0) != int(post):
             return False
 
@@ -106,6 +162,12 @@ def repair_promoted_buy_watermark(*, engine, env: str, order: dict) -> bool:
         ))).mappings().all())
         if not rows or sum(int(r["qty"] or 0) for r in rows) != confirmed:
             return False
+        if recovery_alias and any(
+            str(r.get("position_cycle_id") or "") != cycle
+            or str(r.get("portfolio_epoch_id") or "") != portfolio_epoch
+            for r in rows
+        ):
+            return False
 
         qty = confirmed
         notional = sum(float(r["price"] or 0) * int(r["qty"] or 0) for r in rows)
@@ -130,7 +192,8 @@ def repair_promoted_buy_watermark(*, engine, env: str, order: dict) -> bool:
             schema.positions.c.position_id == positions[0]["position_id"]
         ).values(entry_meta_json=meta, updated_at=sa.func.now()))
         log.warning(
-            "[KR_BROKER_TRUTH][BUY_WATERMARK][REPAIRED] code=%s order_id=%s qty=%s source=exact_promoted_holding",
+            "[KR_BROKER_TRUTH][BUY_WATERMARK][REPAIRED] code=%s order_id=%s qty=%s source=%s",
             code, order_id, qty,
+            "proven_recovery_alias_no_qty_apply" if recovery_alias else "exact_promoted_holding",
         )
         return True
