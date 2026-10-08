@@ -474,3 +474,48 @@ def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeyp
         ) == []
     finally:
         engine.dispose()
+
+
+def test_cancel_rejection_stays_fenced_and_does_not_release_claim(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return _broker_open()
+    class KIS:
+        count = 0
+        def cancel_us_order(self, **kwargs):
+            self.count += 1
+            return {"rt_cd": "1", "msg1": "broker reject"}
+    kis = KIS()
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=kis,
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [_old_tp()], reserve=lambda _: True,
+    )
+    assert kis.count == 1
+    assert result[0]["status"] == "CANCEL_RESULT_UNKNOWN_RECONCILE_REQUIRED"
+    assert result[0]["broker_submit"] is False
+
+
+def test_late_partial_fill_on_terminal_cancel_preserves_filled_quantity(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp()
+    order["meta"]["protective_tp_cancel_requested_at"] = "sent"
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return {"status": "CANCELLED", "order_no": "34237",
+                    "requested_qty": 2, "filled_qty": 1, "remaining_qty": 0,
+                    "filled_qty_present": True, "normalization_result": "normalized"}
+    passed = []
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+        apply_observation=lambda **kwargs: passed.append(kwargs)
+                          or {"status": "OK", "authoritative": True},
+    )
+    assert result[0]["status"] == "CANCEL_TERMINAL_RECONCILED"
+    assert len(passed) == 1
+    assert passed[0]["filled_qty"] == 1
+    assert passed[0]["remaining_qty"] == 0
+    assert passed[0]["evidence_type"] == "KIS_TERMINAL_CANCEL"
