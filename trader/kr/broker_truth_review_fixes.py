@@ -24,6 +24,8 @@ import sqlalchemy as sa
 
 from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo, _assert_kr_buy_entry_contract, _kr_entry_exit_plan_sha256
 from trader.db.schema import schema_for_engine
+from trader.account_state import get_account_key
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 from trader.time_utils import now_kst
 import trader.kr.broker_truth_hardening as base
 
@@ -280,17 +282,24 @@ def _recover_proven_policy_positions_fixed(
     recovered: list[str] = []
     review: list[str] = []
     with engine.connect() as conn:
+        active_epoch = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        position_predicate = sa.and_(
+            schema.positions.c.env == env,
+            schema.positions.c.strategy == strategy,
+            schema.positions.c.status == "OPEN",
+            schema.positions.c.qty > 0,
+        )
+        if active_epoch is not None:
+            position_predicate = sa.and_(
+                position_predicate, schema.positions.c.trading_epoch_id == active_epoch
+            )
         positions = [
             dict(row)
             for row in conn.execute(
-                sa.select(schema.positions).where(
-                    sa.and_(
-                        schema.positions.c.env == env,
-                        schema.positions.c.strategy == strategy,
-                        schema.positions.c.status == "OPEN",
-                        schema.positions.c.qty > 0,
-                    )
-                )
+                sa.select(schema.positions).where(position_predicate)
             ).mappings().all()
         ]
 
@@ -325,6 +334,20 @@ def _recover_proven_policy_positions_fixed(
             continue
 
         with engine.connect() as conn:
+            evidence_predicate = sa.and_(
+                schema.fills.c.env == env,
+                schema.fills.c.code == code,
+                schema.orders.c.env == env,
+                schema.orders.c.strategy == strategy,
+                schema.fills.c.position_cycle_id.is_not(None),
+                schema.fills.c.portfolio_epoch_id.is_not(None),
+            )
+            if active_epoch is not None:
+                evidence_predicate = sa.and_(
+                    evidence_predicate,
+                    schema.fills.c.trading_epoch_id == active_epoch,
+                    schema.orders.c.trading_epoch_id == active_epoch,
+                )
             rows = [
                 dict(row)
                 for row in conn.execute(
@@ -336,16 +359,7 @@ def _recover_proven_policy_positions_fixed(
                         schema.orders.c.portfolio_epoch_id.label("order_epoch_id"),
                     )
                     .join(schema.orders, schema.orders.c.order_id == schema.fills.c.order_id)
-                    .where(
-                        sa.and_(
-                            schema.fills.c.env == env,
-                            schema.fills.c.code == code,
-                            schema.orders.c.env == env,
-                            schema.orders.c.strategy == strategy,
-                            schema.fills.c.position_cycle_id.is_not(None),
-                            schema.fills.c.portfolio_epoch_id.is_not(None),
-                        )
-                    )
+                    .where(evidence_predicate)
                     .order_by(schema.fills.c.filled_at.asc())
                 ).mappings().all()
             ]
@@ -373,6 +387,10 @@ def _recover_proven_policy_positions_fixed(
                 if meta or plan:
                     buy_record = {
                         "order_id": str(row.get("order_id") or ""),
+                        "order_cycle_id": str(row.get("order_cycle_id") or ""),
+                        "order_epoch_id": str(row.get("order_epoch_id") or ""),
+                        "fill_cycle_id": str(row.get("position_cycle_id") or ""),
+                        "fill_epoch_id": str(row.get("portfolio_epoch_id") or ""),
                         "request_json": request,
                         "entry_meta_json": row.get("order_entry_meta_json"),
                     }
@@ -427,6 +445,29 @@ def _recover_proven_policy_positions_fixed(
         position_meta = base._json_dict(position.get("position_meta"))
         source_request = base._json_dict(source_order.get("request_json"))
         source_order_id = str(source_order.get("order_id") or "")
+        if missing_recovery_plan and (
+            any(
+                str(actual or "") != expected
+                for actual, expected in (
+                    (source_order.get("order_cycle_id"), source_cycle),
+                    (source_order.get("order_epoch_id"), source_epoch),
+                    (source_order.get("fill_cycle_id"), source_cycle),
+                    (source_order.get("fill_epoch_id"), source_epoch),
+                    (source_request.get("position_cycle_id"), source_cycle),
+                    (source_request.get("portfolio_epoch_id"), source_epoch),
+                )
+            )
+            or (
+                active_epoch is not None
+                and str(source_request.get("trading_epoch_id") or "") != str(active_epoch)
+            )
+        ):
+            review.append(code)
+            logger.error(
+                "[KR_BROKER_TRUTH][POLICY_REVIEW_REQUIRED] code=%s "
+                "reason=SOURCE_REQUEST_LIFECYCLE_MISMATCH action=KEEP_FROZEN_CONTRACT", code,
+            )
+            continue
         if missing_recovery_plan:
             # Only repair a RECOVERY cycle if its existing, independent proof
             # identifies precisely the BUY fill lifecycle selected above.
