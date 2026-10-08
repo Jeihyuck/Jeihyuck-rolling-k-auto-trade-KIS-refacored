@@ -493,22 +493,12 @@ def _kr_sell_holdings_promotion_unproven(order: dict, response: dict) -> bool:
     """
     if str(order.get("side") or "").upper() != "SELL":
         return False
-    if (
-        str(response.get("rt_cd") or "").upper() != "UNRESOLVED_ACK"
-        and str(response.get("msg_cd") or "").upper() != "BROKER_SUBMIT_OUTCOME_UNKNOWN"
-    ):
-        return False
-    output = _json_dict(response.get("output"))
-    identifiers = (
-        output.get("ODNO"),
-        order.get("broker_order_id"),
-        order.get("kis_odno"),
-    )
-    # A genuine KIS KR order number (not a semantic/client id) provides
-    # addressable broker-order evidence for later explicit reconciliation.
-    return not any(
-        str(value or "").strip().isdigit() and len(str(value).strip()) == 10
-        for value in identifiers
+    # Even a numeric KIS order number is only addressable submission
+    # identity, *not* proof of a fill. Route actual executions through exact
+    # daily-ccld reconciliation, never through aggregate holdings inference.
+    return (
+        str(response.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
+        or str(response.get("msg_cd") or "").upper() == "BROKER_SUBMIT_OUTCOME_UNKNOWN"
     )
 
 
