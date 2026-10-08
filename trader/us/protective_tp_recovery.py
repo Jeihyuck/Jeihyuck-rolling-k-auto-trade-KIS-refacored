@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, timedelta
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -111,23 +110,34 @@ def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -
     engine = _get_engine_or_none()
     if engine is None:
         raise RuntimeError("US TP recovery requires durable database")
-    earliest = (date.fromisoformat(trade_date) - timedelta(days=10)).isoformat()
     with engine.connect() as conn:
         epoch = _active_us_epoch(conn)
         if not epoch:
             raise RuntimeError("US TP recovery requires an active trading epoch")
         return [dict(row) for row in conn.execute(text("""
-            SELECT id,trade_date,symbol,order_no,qty_requested,qty_filled,
-                   client_order_key,exchange,meta,trading_epoch_id
-            FROM us_orders
-            WHERE symbol=:symbol AND side='SELL' AND env=:env
-              AND trade_date BETWEEN :earliest AND :trade_date
-              AND trading_epoch_id=:epoch
-              AND status IN ('ACK','OPEN','PARTIALLY_FILLED','RECONCILE_PENDING')
-              AND COALESCE(meta->>'profit_capture_stage','') IN ('tp1','tp2','tp3')
-              AND qty_requested > qty_filled AND NULLIF(order_no,'') IS NOT NULL
-            ORDER BY created_at
-        """), {"symbol": symbol, "env": env, "earliest": earliest,
+            SELECT o.id,o.trade_date,o.symbol,o.order_no,o.status,
+                   o.qty_requested,o.qty_filled,o.client_order_key,
+                   o.exchange,o.meta,o.trading_epoch_id,
+                   c.action_state AS claim_state
+            FROM us_orders o
+            LEFT JOIN us_execution_claims c
+              ON c.trading_epoch_id=o.trading_epoch_id
+             AND c.trade_date=o.trade_date
+             AND c.env=o.env AND c.market='US'
+             AND c.strategy_owner='US_STANDARD'
+             AND c.lifecycle_id=o.meta->>'position_lifecycle_id'
+             AND c.action=UPPER(o.meta->>'profit_capture_stage')
+            WHERE o.symbol=:symbol AND o.side='SELL' AND o.env=:env
+              AND o.trade_date<=:trade_date AND o.trading_epoch_id=:epoch
+              AND COALESCE(o.meta->>'profit_capture_stage','') IN ('tp1','tp2','tp3')
+              AND o.qty_requested > o.qty_filled AND NULLIF(o.order_no,'') IS NOT NULL
+              AND (
+                o.status IN ('ACK','OPEN','PARTIALLY_FILLED','RECONCILE_PENDING')
+                OR (o.meta->>'protective_tp_cancel_requested_at' IS NOT NULL
+                    AND c.action_state IN ('IN_FLIGHT','UNCERTAIN'))
+              )
+            ORDER BY o.created_at
+        """), {"symbol": symbol, "env": env,
                 "trade_date": trade_date, "epoch": epoch}).mappings()]
 
 
@@ -186,9 +196,12 @@ def request_protective_tp_cancel(
     for symbol in sorted(protective_symbols(intents)):
         try:
             orders = find_open(symbol, trade_date, env=env)
+            if not orders:
+                # No pending TP row for this epoch/lifecycle. Ordinary router
+                # broker-order/risk fences still apply to every protective SELL.
+                continue
             if len(orders) != 1:
-                # Multiple broker-open orders are ambiguous, not safe to cancel automatically.
-                results.append({"symbol": symbol, "status": "FENCED", "reason": "open_tp_count_not_one"})
+                results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
             meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
@@ -204,6 +217,9 @@ def request_protective_tp_cancel(
                 order_no=str(order["order_no"]), symbol=symbol,
                 trade_date=str(order["trade_date"]),
             )
+            if order.get("claim_state") not in {"IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED"}:
+                results.append({"symbol": symbol, "status": "FENCED", "reason": "tp_claim_unverified"})
+                continue
             if meta.get("protective_tp_cancel_requested_at"):
                 # Revisit the original trade date, even after the local session
                 # rolls forward. Never infer terminal status from the cancel ACK.
