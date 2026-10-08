@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 _PROTECTIVE_EXITS = frozenset({
     "hard_stop", "hard_stop_loss", "hard_stop_full_exit",
-    "soft_stop", "soft_stop_loss", "persistent_soft_stop",
+    "soft_stop", "soft_stop_loss", "persistent_soft_stop", "persistent_soft_stop_full_exit",
     "profit_trailing_stop", "trailing_stop", "giveback",
 })
 
@@ -28,7 +28,7 @@ def protective_symbols(intents: list[dict]) -> set[str]:
         if (
             str(intent.get("side") or "").upper() == "SELL"
             and str(intent.get("exit_type") or "").lower() in _PROTECTIVE_EXITS
-            and str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or "US_STANDARD").upper()
+            and str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or "").upper()
                 == "US_STANDARD"
         ):
             symbol = str(intent.get("symbol") or "").upper()
@@ -63,7 +63,7 @@ def broker_proves_open_tp_order(order: dict, broker: dict) -> bool:
         return False
     broker_no = str(broker.get("order_no") or "").lstrip("0")
     local_no = str(order.get("order_no") or "").lstrip("0")
-    return not broker_no or bool(local_no and broker_no == local_no)
+    return bool(local_no and broker_no and broker_no == local_no)
 
 
 def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -> list[dict]:
@@ -130,6 +130,16 @@ def request_protective_tp_cancel(
     if kis_client is None or provider is None:
         return [{"status": "RECOVERY_UNAVAILABLE", "reason": "broker_provider_missing"}]
     results: list[dict] = []
+    # Bind a broker TP reservation to the exact protective lifecycle, not merely
+    # the ticker (which could have been closed and repurchased).
+    lifecycle_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("position_lifecycle_id")
+                or (intent.get("meta") or {}).get("position_lifecycle_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+        and str(intent.get("exit_type") or "").lower() in _PROTECTIVE_EXITS
+    }
     for symbol in sorted(protective_symbols(intents)):
         try:
             orders = find_open(symbol, trade_date, env=env)
@@ -139,7 +149,13 @@ def request_protective_tp_cancel(
                 continue
             order = orders[0]
             meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
-            if str(meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD":
+            if (
+                str(meta.get("strategy_owner") or "").upper() != "US_STANDARD"
+                or not lifecycle_by_symbol.get(symbol)
+                or str(meta.get("position_lifecycle_id") or "") != lifecycle_by_symbol[symbol]
+            ):
+                results.append({"symbol": symbol, "status": "FENCED",
+                                "reason": "owner_or_lifecycle_unverified"})
                 continue
             evidence = provider.get_fills_by_order_no(
                 order_no=str(order["order_no"]), symbol=symbol,
