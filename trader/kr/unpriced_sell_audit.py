@@ -65,7 +65,7 @@ def audit_kr_unpriced_sell_orders(engine, *, env: str, trade_date: date) -> dict
                 sa.select(schema.orders).where(sa.and_(
                     schema.orders.c.env == env,
                     schema.orders.c.side == "SELL",
-                    schema.orders.c.status == "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+                    schema.orders.c.status.in_(("FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED", "PARTIAL_FILLED")),
                     schema.orders.c.created_at >= start,
                     schema.orders.c.created_at < end,
                 ))
