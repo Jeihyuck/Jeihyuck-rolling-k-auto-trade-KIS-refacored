@@ -111,3 +111,19 @@ def test_reconciliation_rejects_both_open_and_previously_promoted_lg_orders_with
         )
         assert result["orders"] == 0 and result["fills"] == 0
         assert repo.upserts == []
+
+
+def test_unresolved_broker_identity_never_substitutes_semantic_client_key():
+    from trader.db.repos import _kr_unresolved_broker_identity
+
+    response = {
+        "rt_cd": "UNRESOLVED_ACK",
+        "msg_cd": "BROKER_SUBMIT_OUTCOME_UNKNOWN",
+    }
+    assert _kr_unresolved_broker_identity(
+        "practice:pb1_pullback_close:2026-10-08:066570:EXIT:SELL:retry2", response,
+    ) is None
+    assert _kr_unresolved_broker_identity(None, response) is None
+    assert _kr_unresolved_broker_identity("0000006722", response) == "0000006722"
+    # Do not rewrite normal/known KIS acknowledgements or other order owners.
+    assert _kr_unresolved_broker_identity("KIS-LEGACY-ORDER", {"rt_cd": "0"}) == "KIS-LEGACY-ORDER"
