@@ -1298,7 +1298,7 @@ class KisAPI:
     def _wait_before_order_submit(self) -> None:
         if self._rate_limit_safe_enabled():
             self._order_limiter.wait("orders-safe")
-            now = time.time()
+            now = time.monotonic()
             required_gap = float(os.getenv("KIS_ORDER_MIN_GAP_SEC", str(self._order_hashkey_gap_sec or 1.10)) or "1.10")
             last_order_anchor = max(float(self._last_hashkey_at or 0.0), float(self._last_order_submit_at or 0.0))
             delta = now - last_order_anchor
@@ -1310,8 +1310,9 @@ class KisAPI:
                     delta,
                     sleep_sec,
                 )
-                time.sleep(sleep_sec)
-            self._last_order_submit_at = time.time()
+                if not _kr_sleep_with_budget(sleep_sec):
+                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT")
+            self._last_order_submit_at = time.monotonic()
         self._limiter.wait("orders")
 
     def _wait_before_data_request(self, endpoint_name: str) -> None:
@@ -1319,7 +1320,7 @@ class KisAPI:
             return
         self._data_limiter.wait(endpoint_name)
         required_gap = float(os.getenv("KIS_DATA_MIN_GAP_SEC", "0.35") or "0.35")
-        now = time.time()
+        now = time.monotonic()
         delta = now - float(self._last_data_request_at or 0.0)
         if delta < required_gap:
             sleep_sec = required_gap - delta + random.uniform(0, 0.03)
@@ -1330,8 +1331,9 @@ class KisAPI:
                 delta,
                 sleep_sec,
             )
-            time.sleep(sleep_sec)
-        self._last_data_request_at = time.time()
+            if not _kr_sleep_with_budget(sleep_sec):
+                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT")
+        self._last_data_request_at = time.monotonic()
 
     def _endpoint_min_gap_sec(self, endpoint_name: str, url: str = "") -> float:
         endpoint = str(endpoint_name or "").strip().lower().replace("_", "-")
@@ -2216,7 +2218,7 @@ class KisAPI:
         if not hk:
             logger.error(f"[HASHKEY 실패] resp={j}")
             raise Exception(f"HashKey 생성 실패: {j}")
-        self._last_hashkey_at = time.time()
+        self._last_hashkey_at = time.monotonic()
         return hk
 
     # ===== 신규: 예수금/과매수 방지 유틸 =====
