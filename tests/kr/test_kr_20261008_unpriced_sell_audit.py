@@ -62,3 +62,25 @@ def test_operator_cli_reports_explicit_empty_date_and_zero_exit(monkeypatch, cap
     assert data["env"] == "practice"
     assert data["market"] == "KR"
     assert data["unpriced_sell_count"] == 0
+
+
+def test_sqlite_kst_evening_unpriced_sell_remains_on_original_trade_date():
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=str(uuid4()), env="practice", strategy=STRATEGY,
+            sid=1, mode=1, code="010120", side="SELL",
+            ord_type="LIMIT", stage="FULL_EXIT", qty=1,
+            client_order_key="kst-evening-20261008", kis_odno="0000006722",
+            status="FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+            request_json={}, response_json={
+                "confirmed_fill_qty": 1, "confirmed_fill_price": None,
+            },
+            created_at=datetime(2026, 10, 8, 20, 17, tzinfo=ZoneInfo("Asia/Seoul")),
+        ))
+    today = audit_kr_unpriced_sell_orders(engine, env="practice", trade_date=date(2026, 10, 8))
+    tomorrow = audit_kr_unpriced_sell_orders(engine, env="practice", trade_date=date(2026, 10, 9))
+    assert today["unpriced_sell_count"] == 1
+    assert tomorrow["unpriced_sell_count"] == 0
