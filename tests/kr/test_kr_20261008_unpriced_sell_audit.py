@@ -27,7 +27,7 @@ def test_kst_unpriced_sells_never_count_missing_execution_price_as_zero_pnl():
         ]:
             conn.execute(sa.insert(schema.orders).values(
                 order_id=str(uuid4()), env="practice", strategy=STRATEGY,
-                sid=1, mode=1, code=code, side="SELL", stage="FULL_EXIT",
+                sid=1, mode=1, code=code, side="SELL", stage="FULL_EXIT", ord_type="LIMIT",
                 status="FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED", qty=qty,
                 client_order_key=f"test:{code}", kis_odno=order_no,
                 request_json={}, response_json=response, created_at=created,
