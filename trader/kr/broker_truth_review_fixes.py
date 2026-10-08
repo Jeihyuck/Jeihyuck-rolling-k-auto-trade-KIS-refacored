@@ -411,6 +411,8 @@ def _recover_proven_policy_positions_fixed(
                 or str(position_meta.get("recovered_from_cycle_id") or "") != source_cycle
                 or str(position_meta.get("recovered_from_epoch_id") or "") != source_epoch
                 or not source_order_id
+                or source_request.get("enforce_entry_contract") is not True
+                or source_request.get("pre_order_holding_qty") != 0
                 or not source_request.get("entry_contract_sha256")
             ):
                 review.append(code)
