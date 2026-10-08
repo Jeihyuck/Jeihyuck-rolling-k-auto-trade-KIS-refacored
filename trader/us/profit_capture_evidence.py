@@ -35,6 +35,10 @@ def authoritative_tp_fill_for_backfill(stage: dict[str, Any], order: dict[str, A
     if not epoch or epoch != str(order.get("trading_epoch_id") or ""):
         return None
     meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+    stage_lifecycle = str(stage.get("position_lifecycle_id") or "").strip()
+    order_lifecycle = str(meta.get("position_lifecycle_id") or "").strip()
+    if not stage_lifecycle or stage_lifecycle != order_lifecycle:
+        return None
     if str(meta.get("profit_capture_stage") or "").lower() != tp:
         return None
     if str(meta.get("fill_evidence_type") or "").upper() not in _ACTUAL_FILL_EVIDENCE:
