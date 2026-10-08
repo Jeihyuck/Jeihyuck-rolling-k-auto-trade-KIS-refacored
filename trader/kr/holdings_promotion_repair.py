@@ -88,14 +88,20 @@ def repair_promoted_buy_watermark(*, engine, env: str, order: dict) -> bool:
                 _assert_kr_buy_entry_contract(request)
             except (RuntimeError, TypeError, ValueError):
                 return False
+            alias_predicate = sa.and_(
+                schema.positions.c.env == env,
+                schema.positions.c.strategy == order.get("strategy"),
+                schema.positions.c.code == code,
+                schema.positions.c.portfolio_epoch_id == portfolio_epoch,
+                schema.positions.c.status == "OPEN",
+            )
+            if active_epoch is not None:
+                alias_predicate = sa.and_(
+                    alias_predicate,
+                    schema.positions.c.trading_epoch_id == active_epoch,
+                )
             possible = list(conn.execute(
-                sa.select(schema.positions).where(sa.and_(
-                    schema.positions.c.env == env,
-                    schema.positions.c.strategy == order.get("strategy"),
-                    schema.positions.c.code == code,
-                    schema.positions.c.portfolio_epoch_id == portfolio_epoch,
-                    schema.positions.c.status == "OPEN",
-                )).with_for_update()
+                sa.select(schema.positions).where(alias_predicate).with_for_update()
             ).mappings().all())
             if len(possible) != 1:
                 return False
