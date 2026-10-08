@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 _PROTECTIVE_EXITS = frozenset({
     "hard_stop", "hard_stop_loss", "hard_stop_full_exit",
     "soft_stop", "soft_stop_loss", "persistent_soft_stop", "persistent_soft_stop_full_exit",
-    "profit_trailing_stop", "trailing_stop", "giveback",
+    "profit_trailing_stop", "trailing_stop", "giveback", "profit_protect",
 })
 
 
