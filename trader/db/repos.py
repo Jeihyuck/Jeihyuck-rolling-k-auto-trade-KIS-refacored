@@ -3437,8 +3437,9 @@ class OrdersRepo:
         if submitted_qty is not None and int(submitted_qty) > 0:
             values["qty"] = int(submitted_qty)
         if kis_odno:
-            values["kis_odno"] = kis_odno
-            values["broker_order_id"] = kis_odno
+            actual_order_no = _kr_unresolved_broker_identity(kis_odno, safe_payload)
+            values["kis_odno"] = actual_order_no
+            values["broker_order_id"] = actual_order_no
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=get_account_key(env=env),
