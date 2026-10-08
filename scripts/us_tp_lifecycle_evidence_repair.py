@@ -29,6 +29,8 @@ JOIN us_orders AS o
  AND o.symbol = l.symbol
  AND o.client_order_key = l.client_order_key
  AND o.trading_epoch_id = l.trading_epoch_id
+ AND NULLIF(l.position_lifecycle_id, '') IS NOT NULL
+ AND o.meta->>'position_lifecycle_id' = l.position_lifecycle_id
 WHERE l.trade_date >= :since
   AND l.trading_epoch_id = :epoch
   AND l.stage_status = 'DONE'
@@ -57,6 +59,7 @@ WHERE trade_date = :trade_date AND symbol = :symbol
       SELECT 1 FROM us_orders o
       WHERE o.trade_date = :trade_date AND o.symbol = :symbol
         AND o.client_order_key = :order_key AND o.trading_epoch_id = :epoch
+        AND o.meta->>'position_lifecycle_id' = :lifecycle
         AND o.status = 'FILLED' AND o.side = 'SELL'
         AND o.qty_requested = :filled AND o.qty_filled = :filled
         AND o.meta->>'profit_capture_stage' = :stage
@@ -79,6 +82,7 @@ def repair(engine, *, since: str, apply: bool = False) -> dict:
         for row in rows:
             stage = {
                 "trade_date": str(row["trade_date"]), "symbol": row["symbol"],
+                "position_lifecycle_id": str(row["position_lifecycle_id"] or ""),
                 "stage": row["stage"], "stage_status": row["stage_status"],
                 "client_order_key": row["client_order_key"],
                 "requested_qty": row["requested_qty"],
