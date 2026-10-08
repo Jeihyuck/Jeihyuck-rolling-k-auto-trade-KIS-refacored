@@ -2596,6 +2596,49 @@ def run_trade_tick(
     if _infinite_reserved:
         exit_intents = [i for i in exit_intents if str(i.get("symbol") or "").upper() != _infinite_config.symbol]
 
+    # Opt-in protective liveness recovery: a KIS-confirmed, broker-open TP
+    # reservation may be requested for cancellation before the next tick.
+    # A cancel ACK NEVER releases the TP claim or authorizes a replacement
+    # SELL in this tick; only terminal broker reconciliation may do that.
+    if (
+        os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
+        and kis_order_allowed and not signal_only
+    ):
+        try:
+            from trader.us.protective_tp_recovery import request_protective_tp_cancel
+            recovery_results = request_protective_tp_cancel(
+                intents=exit_intents, provider=provider,
+                kis_client=routing_kis_client, trade_date=trade_date, env=env,
+            )
+            cancel_waiting_symbols = set()
+            for recovery in recovery_results:
+                logger.warning("[US_PROTECTIVE_TP][RECOVERY_DECISION] %s", recovery)
+                if recovery.get("symbol") and str(recovery.get("status") or "") in {
+                    "FENCED", "CANCEL_ACK_RECONCILE_REQUIRED",
+                    "CANCEL_RESULT_UNKNOWN_RECONCILE_REQUIRED",
+                    "CANCEL_PENDING_RECONCILE_REQUIRED",
+                    "CANCEL_TERMINAL_RECONCILED",
+                }:
+                    cancel_waiting_symbols.add(str(recovery["symbol"]).upper())
+            if cancel_waiting_symbols:
+                # A cancellation request is never terminal broker evidence.
+                # Do not submit a protective replacement until a later tick
+                # has re-evaluated the reconciled prior order.
+                exit_intents = [
+                    intent for intent in exit_intents
+                    if str(intent.get("symbol") or "").upper() not in cancel_waiting_symbols
+                ]
+        except Exception as recovery_error:
+            logger.error("[US_PROTECTIVE_TP][RECOVERY_UNAVAILABLE_FENCED] %s", recovery_error)
+            # With recovery explicitly enabled, an exception must never fall
+            # through to a new protective SELL with an unknown old TP claim.
+            from trader.us.protective_tp_recovery import protective_symbols
+            blocked = protective_symbols(exit_intents)
+            exit_intents = [
+                intent for intent in exit_intents
+                if str(intent.get("symbol") or "").upper() not in blocked
+            ]
+
     # Suppress at intent generation (rather than only in the router) so all
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
     exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)

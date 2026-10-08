@@ -1,0 +1,582 @@
+"""Oct 8 incidents: legacy immutable BUY TP, stuck broker-open TP, DONE/0 proof."""
+from __future__ import annotations
+
+import copy
+from datetime import datetime, timezone
+
+import pytest
+
+from trader.us import entry_exit_contract as contracts
+from trader.us.market_state_overlay import build_profit_capture_intents
+from trader.us.profit_capture_evidence import authoritative_tp_fill_for_backfill
+from trader.us.protective_tp_recovery import (
+    broker_proves_open_tp_order, broker_proves_terminal_after_cancel,
+    protective_symbols, request_protective_tp_cancel,
+)
+
+NOW = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
+
+
+def frozen(symbol: str, *, legacy: bool = True) -> dict:
+    contract = contracts.build_us_entry_exit_contract({
+        "symbol": symbol, "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "entry_strategy": "us_pb1", "entry_reason": "ENTRY_PULLBACK",
+        "reasons": ["ENTRY_PULLBACK"], "book": "SWING_BOOK",
+    })
+    if legacy:
+        contract = copy.deepcopy(contract)
+        contract["management"]["profit_capture"].pop("partial_exit_allowed")
+        contract.pop("sha256")
+        contract["sha256"] = contracts._sha(contract)
+    assert contracts.verify_us_entry_exit_contract(contract)
+    return contract
+
+
+def position(symbol: str, contract: dict) -> dict:
+    return {
+        "symbol": symbol, "qty": 20, "holding_qty": 20, "orderable_qty": 20,
+        "current_price_usd": 104.0, "position_lifecycle_id": f"life-{symbol}",
+        "broker_avg_price": 100.0, "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_asof": NOW.isoformat(), "broker_avg_price_currency": "USD",
+        "balance_source": "kis_balance_authoritative", "authoritative_positions": True,
+        "meta": {"entry_exit_contract": contract},
+    }
+
+
+@pytest.mark.parametrize("symbol", ["AAPL", "QQQ", "NVDA", "MPC", "PLTR"])
+def test_legacy_buy_contract_uses_original_tp_without_rehash_or_global_partial(symbol, monkeypatch):
+    old = frozen(symbol)
+    before = copy.deepcopy(old)
+    monkeypatch.setenv("US_TP1_PCT", "0.50")
+    monkeypatch.setenv("US_SELL_PARTIAL_ALLOWED", "0")
+    config = contracts.contract_profit_capture(position(symbol, old))
+    assert config["legacy_scoped_tp_partial_compat"] is True
+    assert config["partial_exit_allowed"] is True
+    intents = build_profit_capture_intents(
+        [position(symbol, old)],
+        {"profit_capture_enabled": True, "market_state": "NORMAL"},
+        now=NOW, trade_date="2026-10-07", profit_capture_state={},
+    )
+    assert len(intents) == 1
+    assert intents[0]["reason"] == "TAKE_PROFIT_TP1"
+    assert intents[0]["partial_exit_allowed"] is True
+    assert intents[0]["meta"]["source_entry_contract_sha256"] == old["sha256"]
+    assert intents[0]["meta"]["tp_threshold_fraction"] == "0.03"
+    assert old == before
+
+
+def test_valid_but_missing_frozen_tp_stages_blocks_without_global_fallback(monkeypatch):
+    contract = frozen("AAPL")
+    contract["management"]["profit_capture"].pop("stages")
+    contract.pop("sha256")
+    contract["sha256"] = contracts._sha(contract)
+    monkeypatch.setenv("US_TP1_PCT", "0.01")
+    intents = build_profit_capture_intents(
+        [position("AAPL", contract)],
+        {"profit_capture_enabled": True}, now=NOW,
+        trade_date="2026-10-07", profit_capture_state={},
+    )
+    assert intents == []
+
+
+def test_contract_read_error_fails_closed_not_global_tp(monkeypatch):
+    contract = frozen("NVDA")
+    def fail(_):
+        raise RuntimeError("db corrupt")
+    monkeypatch.setattr(contracts, "contract_profit_capture", fail)
+    assert build_profit_capture_intents(
+        [position("NVDA", contract)],
+        {"profit_capture_enabled": True}, now=NOW,
+        trade_date="2026-10-07", profit_capture_state={},
+    ) == []
+
+
+def test_explicit_frozen_partial_denial_is_not_overridden():
+    contract = frozen("AAPL", legacy=False)
+    contract["management"]["profit_capture"]["partial_exit_allowed"] = False
+    contract.pop("sha256")
+    contract["sha256"] = contracts._sha(contract)
+    assert build_profit_capture_intents(
+        [position("AAPL", contract)],
+        {"profit_capture_enabled": True}, now=NOW,
+        trade_date="2026-10-07", profit_capture_state={},
+    ) == []
+
+
+def _protective(symbol: str = "MRVL") -> dict:
+    return {
+        "symbol": symbol, "side": "SELL", "exit_type": "profit_trailing_stop",
+        "strategy_owner": "US_STANDARD", "qty": 4,
+        "position_lifecycle_id": f"life-{symbol}",
+    }
+
+
+def _old_tp(symbol: str = "MRVL") -> dict:
+    return {"id": "id-1", "symbol": symbol, "trade_date": "2026-10-06",
+            "order_no": "0000034237", "exchange": "NASDAQ",
+            "qty_requested": 2, "qty_filled": 0,
+            "client_order_key": f"us-tp2-{symbol}",
+            "trading_epoch_id": "epoch-1", "claim_state": "IN_FLIGHT", "meta": {
+                "profit_capture_stage": "tp2", "strategy_owner": "US_STANDARD",
+                "position_lifecycle_id": f"life-{symbol}",
+            }}
+
+
+def _broker_open(*, remaining: int = 2, status: str = "OPEN") -> dict:
+    return {"status": status, "order_no": "34237", "requested_qty": 2,
+            "filled_qty": 2 - remaining, "remaining_qty": remaining,
+            "filled_qty_present": True, "normalization_result": "normalized"}
+
+
+@pytest.mark.parametrize("symbol", ["MRVL", "AMD"])
+def test_protective_tp_recovery_requires_opt_in_and_broker_proof(monkeypatch, symbol):
+    order = _old_tp(symbol)
+    provider_calls = []
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            provider_calls.append(kwargs)
+            return _broker_open()
+    class KIS:
+        cancels = []
+        def cancel_us_order(self, **kwargs):
+            self.cancels.append(kwargs)
+            return {"rt_cd": "0"}
+    kis = KIS()
+    args = {"intents": [_protective(symbol)], "provider": Provider(), "kis_client": kis,
+            "trade_date": "2026-10-07", "env": "practice",
+            "find_open": lambda *a, **k: [order], "reserve": lambda x: True}
+    monkeypatch.delenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", raising=False)
+    assert request_protective_tp_cancel(**args) == []
+    assert kis.cancels == []
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    assert request_protective_tp_cancel(**args)[0]["status"] == "CANCEL_ACK_RECONCILE_REQUIRED"
+    assert kis.cancels == [{"symbol": symbol, "exchange": "NASDAQ", "order_no": "0000034237"}]
+    assert provider_calls[0]["trade_date"] == "2026-10-06"
+
+
+def test_broker_open_validation_prevents_double_sell_and_ambiguous_cancel(monkeypatch):
+    order = _old_tp()
+    assert broker_proves_open_tp_order(order, _broker_open())
+    assert not broker_proves_open_tp_order(order, _broker_open(remaining=0, status="CANCELLED"))
+    assert not broker_proves_open_tp_order(order, dict(_broker_open(), filled_qty_present=False))
+    assert not broker_proves_open_tp_order(order, dict(_broker_open(), order_no="99999"))
+    assert protective_symbols([dict(_protective(), symbol="TQQQ")]) == set()
+    assert protective_symbols([dict(_protective(), strategy_owner="TQQQ_INFINITE")]) == set()
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    class KIS:
+        called = False
+        def cancel_us_order(self, **kwargs):
+            self.called = True
+    kis = KIS()
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return {"status": "OPEN", "requested_qty": 2, "remaining_qty": 2}
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=kis,
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order], reserve=lambda _: True,
+    )
+    assert result[0]["status"] == "FENCED"
+    assert kis.called is False
+
+
+def _filled_stage_and_order():
+    stage = {"stage": "tp1", "stage_status": "DONE",
+             "trade_date": "2026-09-23", "symbol": "PLTR",
+             "client_order_key": "US_PC_PLTR_TP1", "requested_qty": 4,
+             "position_lifecycle_id": "life-pltr",
+             "cumulative_filled_qty": 0, "trading_epoch_id": "active-epoch"}
+    order = {"trade_date": "2026-09-23", "symbol": "PLTR",
+             "client_order_key": "US_PC_PLTR_TP1", "qty_requested": 4,
+             "qty_filled": 4, "side": "SELL", "status": "FILLED",
+             "trading_epoch_id": "active-epoch",
+             "meta": {"profit_capture_stage": "tp1", "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                      "position_lifecycle_id": "life-pltr",
+                       "cumulative_filled_qty": 4}}
+    return stage, order
+
+
+def test_pltr_done_zero_counter_backfill_only_on_proven_actual_fill():
+    stage, order = _filled_stage_and_order()
+    assert authoritative_tp_fill_for_backfill(stage, order) == 4
+    assert authoritative_tp_fill_for_backfill(stage, dict(order, status="ACK")) is None
+    assert authoritative_tp_fill_for_backfill(stage, dict(order, trading_epoch_id="other")) is None
+    assert authoritative_tp_fill_for_backfill(stage, dict(order, qty_filled=2)) is None
+    assert authoritative_tp_fill_for_backfill(stage, dict(order, meta={})) is None
+    assert authoritative_tp_fill_for_backfill(dict(stage, stage_status="PENDING"), order) is None
+    assert authoritative_tp_fill_for_backfill(dict(stage, symbol="NVDA"), order) is None
+    # An identical client key alone is not sufficient proof of position identity.
+    assert authoritative_tp_fill_for_backfill(
+        dict(stage, position_lifecycle_id="another-lifecycle"), order,
+    ) is None
+    assert authoritative_tp_fill_for_backfill(
+        stage, dict(order, meta={**order["meta"], "position_lifecycle_id": "wrong"}),
+    ) is None
+    assert authoritative_tp_fill_for_backfill(
+        stage, dict(order, meta={k: v for k, v in order["meta"].items()
+                                 if k != "position_lifecycle_id"}),
+    ) is None
+    assert authoritative_tp_fill_for_backfill(
+        dict(stage, position_lifecycle_id=""), order,
+    ) is None
+
+
+@pytest.mark.parametrize("symbol", ["MRVL", "AMD"])
+def test_cancel_ack_is_not_terminal_but_broker_terminal_reconcile_is(symbol, monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp(symbol)
+    order["meta"]["protective_tp_cancel_requested_at"] = "2026-10-07T17:00:00Z"
+    calls = []
+    class Provider:
+        result = _broker_open()
+        def get_fills_by_order_no(self, **kwargs):
+            return self.result
+    class KIS:
+        def cancel_us_order(self, **kwargs):
+            raise AssertionError("must not retry a reserved cancellation")
+    provider = Provider()
+    args = dict(
+        intents=[_protective(symbol)], provider=provider, kis_client=KIS(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+        reserve=lambda _: (_ for _ in ()).throw(AssertionError("reserve twice")),
+        apply_observation=lambda **kwargs: calls.append(kwargs) or
+                          {"status": "OK", "authoritative": True},
+    )
+    assert request_protective_tp_cancel(**args)[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
+    assert calls == []
+    provider.result = {
+        "status": "CANCELLED", "order_no": "34237",
+        "requested_qty": 2, "filled_qty": 0, "remaining_qty": 0,
+        "filled_qty_present": True, "normalization_result": "normalized",
+    }
+    assert broker_proves_terminal_after_cancel(order, provider.result)
+    assert request_protective_tp_cancel(**args)[0]["status"] == "CANCEL_TERMINAL_RECONCILED"
+    assert calls[0]["client_order_key"] == order["client_order_key"]
+    assert calls[0]["trade_date"] == "2026-10-06"
+    assert calls[0]["evidence_type"] == "KIS_TERMINAL_CANCEL"
+    assert calls[0]["broker_open_qty"] == 0
+
+
+def test_cancel_terminal_missing_broker_fill_keeps_action_fenced(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp()
+    order["meta"]["protective_tp_cancel_requested_at"] = "sent"
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return {"status": "CANCELLED", "order_no": "34237",
+                    "requested_qty": 2, "remaining_qty": 0,
+                    "filled_qty_present": False}
+    assert request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+        apply_observation=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not reconcile unknown fill")),
+    )[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
+
+
+def test_pltr_legacy_repair_dry_run_does_not_write_and_apply_is_scoped(monkeypatch):
+    from scripts import us_tp_lifecycle_evidence_repair as script
+    from scripts.us_tp_lifecycle_evidence_repair import repair
+    monkeypatch.setattr(script, "_active_us_epoch", lambda conn, required: "active-epoch")
+    stage, order = _filled_stage_and_order()
+    db_row = {
+        "trade_date": stage["trade_date"], "symbol": stage["symbol"],
+        "stage": stage["stage"], "stage_status": stage["stage_status"],
+        "position_lifecycle_id": stage["position_lifecycle_id"],
+        "client_order_key": stage["client_order_key"],
+        "requested_qty": stage["requested_qty"],
+        "cumulative_filled_qty": stage["cumulative_filled_qty"],
+        "trading_epoch_id": stage["trading_epoch_id"],
+        "order_trade_date": order["trade_date"], "order_symbol": order["symbol"],
+        "order_key": order["client_order_key"],
+        "qty_requested": order["qty_requested"], "qty_filled": order["qty_filled"],
+        "status": order["status"], "side": order["side"],
+        "order_meta": order["meta"], "order_epoch": order["trading_epoch_id"],
+    }
+
+    class Cursor:
+        rowcount = 1
+        def mappings(self):
+            return self
+        def all(self):
+            return [db_row]
+
+    class Connection:
+        def __init__(self):
+            self.executed = []
+        def execute(self, statement, params):
+            self.executed.append((str(statement), params))
+            return Cursor()
+
+    class Context:
+        def __init__(self, connection):
+            self.connection = connection
+        def __enter__(self):
+            return self.connection
+        def __exit__(self, *args):
+            return None
+
+    class Engine:
+        def __init__(self):
+            self.connection = Connection()
+        def begin(self):
+            return Context(self.connection)
+
+    dry = Engine()
+    result = repair(dry, since="2026-09-22")
+    assert result["provable"] == [("2026-09-23", "PLTR", "tp1", 4)]
+    assert result["applied"] == 0
+    assert len(dry.connection.executed) == 1
+    applied = Engine()
+    result = repair(applied, since="2026-09-22", apply=True)
+    assert result["applied"] == 1
+    assert len(applied.connection.executed) == 2
+    update = applied.connection.executed[1][1]
+    assert update["epoch"] == "active-epoch"
+    assert update["lifecycle"] == "life-pltr"
+    assert update["order_key"] == "US_PC_PLTR_TP1"
+    assert update["filled_key"] == "tp1_filled_qty"
+
+
+def test_real_pb1_exit_producer_is_recognized_without_owner_tag(monkeypatch):
+    # Production _make_exit_intent reports strategy='us_pb1_exit' and can
+    # omit strategy_owner: recovering MRVL/AMD must not silently be a no-op.
+    for symbol in ("MRVL", "AMD"):
+        intent = _protective(symbol)
+        intent.pop("strategy_owner")
+        intent["strategy"] = "us_pb1_exit"
+        assert protective_symbols([intent]) == {symbol}
+    assert protective_symbols([dict(_protective("MRVL"), strategy_owner="TQQQ_INFINITE",
+                                   strategy="us_pb1_exit")]) == set()
+    assert protective_symbols([{"symbol": "MRVL", "side": "SELL",
+                                "exit_type": "profit_trailing_stop"}]) == set()
+
+
+def test_actual_pb1_protective_producer_emits_accepted_strategy(monkeypatch):
+    from trader.us.pb1 import us_exit_engine as engine
+    monkeypatch.setattr(
+        engine, "should_skip_exit_due_to_pending_sell",
+        lambda symbol, trade_date: (False, "", None),
+    )
+    intent = engine._make_exit_intent(
+        symbol="MRVL", exchange="NASDAQ", qty=4, current_price=100.0,
+        entry_price=110.0, exit_type="profit_trailing_stop",
+        reason="giveback_ratio=0.40", unrealized_pnl_usd=-40.0,
+        pnl_pct=-0.05, holding_qty=10, orderable_qty=10,
+        now=NOW, position_lifecycle_id="life-MRVL",
+    )
+    assert intent and intent["strategy"] == "us_pb1_exit"
+    assert protective_symbols([intent]) == {"MRVL"}
+
+
+def test_missing_execution_claim_blocks_auto_cancel(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = dict(_old_tp(), claim_state=None)
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            raise AssertionError("cannot query broker before claim is confirmed")
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+    )
+    assert result[0]["status"] == "FENCED"
+    assert result[0]["reason"] == "tp_claim_unverified"
+
+
+def test_cross_day_multiple_open_tp_orders_block_new_protective_exit(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp()
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=object(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order, dict(order, id="another")],
+    )
+    assert result[0]["status"] == "FENCED"
+    assert result[0]["reason"] == "multiple_tp_open_or_claims"
+
+
+def test_protective_producer_profit_protect_is_eligible():
+    intent = dict(_protective(), strategy="us_pb1_exit",
+                  exit_type="profit_protect")
+    intent.pop("strategy_owner")
+    assert protective_symbols([intent]) == {"MRVL"}
+
+
+@pytest.mark.skipif(
+    not __import__("os").getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="Postgres recovery integration requires CI PostgreSQL",
+)
+def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeypatch):
+    import os
+    from sqlalchemy import create_engine, text
+    from trader.us import protective_tp_recovery as recovery
+    from trader.us.db import repos
+
+    engine = create_engine(os.environ["PBCORE_TEST_POSTGRES_URL"], future=True, pool_size=1)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("""
+                CREATE TEMP TABLE us_orders (
+                    id TEXT,trade_date TEXT,symbol TEXT,side TEXT,env TEXT,
+                    status TEXT,order_no TEXT,qty_requested INT,qty_filled INT,
+                    client_order_key TEXT,exchange TEXT,meta JSONB,
+                    trading_epoch_id TEXT,created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW())
+            """)
+            conn.exec_driver_sql("""
+                CREATE TEMP TABLE us_execution_claims (
+                    trading_epoch_id TEXT,trade_date TEXT,env TEXT,market TEXT,
+                    strategy_owner TEXT,lifecycle_id TEXT,action TEXT,
+                    action_state TEXT)
+            """)
+            conn.execute(text("""
+                INSERT INTO us_orders (
+                    id,trade_date,symbol,side,env,status,order_no,qty_requested,
+                    qty_filled,client_order_key,exchange,meta,trading_epoch_id)
+                VALUES ('mrvl-tp2','2026-10-06','MRVL','SELL','practice','OPEN',
+                        '0000034237',2,0,'tp2-mrvl','NASDAQ',
+                        '{"profit_capture_stage":"tp2",
+                          "strategy_owner":"US_STANDARD",
+                          "position_lifecycle_id":"life-MRVL"}'::jsonb,
+                        'epoch-ci')
+            """))
+            conn.execute(text("""
+                INSERT INTO us_execution_claims (
+                    trading_epoch_id,trade_date,env,market,strategy_owner,
+                    lifecycle_id,action,action_state)
+                VALUES ('epoch-ci','2026-10-06','practice','US','US_STANDARD',
+                        'life-MRVL','TP2','IN_FLIGHT')
+            """))
+        monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+        monkeypatch.setattr(repos, "_active_us_epoch", lambda conn: "epoch-ci")
+        monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+
+        order_rows = recovery.load_conflicting_open_tp_orders(
+            "MRVL", "2026-10-07", env="practice",
+        )
+        assert len(order_rows) == 1
+        assert order_rows[0]["claim_state"] == "IN_FLIGHT"
+        assert recovery.has_unresolved_tp_claim(
+            "MRVL", "2026-10-07", env="practice", lifecycle_id="life-MRVL",
+        )
+        assert recovery.reserve_cancel_request(order_rows[0])
+        assert not recovery.reserve_cancel_request(order_rows[0])
+        class Provider:
+            def get_fills_by_order_no(self, **kwargs):
+                assert kwargs["trade_date"] == "2026-10-06"
+                return _broker_open()
+        class KIS:
+            def cancel_us_order(self, **kwargs):
+                raise AssertionError("reserved cancel must not POST again")
+        result = recovery.request_protective_tp_cancel(
+            intents=[dict(_protective(), strategy="us_pb1_exit")],
+            provider=Provider(), kis_client=KIS(),
+            trade_date="2026-10-07", env="practice",
+        )
+        assert result[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
+
+        # Only a terminal broker observation + settled claim permits a fresh
+        # protective route; local state cannot silently unlock on cancel ACK.
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE us_orders SET status='CANCELLED' WHERE id='mrvl-tp2'"
+            ))
+            conn.execute(text(
+                "UPDATE us_execution_claims SET action_state='RETRYABLE'"
+                " WHERE lifecycle_id='life-MRVL'"
+            ))
+        assert recovery.load_conflicting_open_tp_orders(
+            "MRVL", "2026-10-07", env="practice",
+        ) == []
+        assert not recovery.has_unresolved_tp_claim(
+            "MRVL", "2026-10-07", env="practice", lifecycle_id="life-MRVL",
+        )
+    finally:
+        engine.dispose()
+
+
+def test_cancel_rejection_stays_fenced_and_does_not_release_claim(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return _broker_open()
+    class KIS:
+        count = 0
+        def cancel_us_order(self, **kwargs):
+            self.count += 1
+            return {"rt_cd": "1", "msg1": "broker reject"}
+    kis = KIS()
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=kis,
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [_old_tp()], reserve=lambda _: True,
+    )
+    assert kis.count == 1
+    assert result[0]["status"] == "CANCEL_RESULT_UNKNOWN_RECONCILE_REQUIRED"
+    assert result[0]["broker_submit"] is False
+
+
+def test_late_partial_fill_on_terminal_cancel_preserves_filled_quantity(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    order = _old_tp()
+    order["meta"]["protective_tp_cancel_requested_at"] = "sent"
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            return {"status": "CANCELLED", "order_no": "34237",
+                    "requested_qty": 2, "filled_qty": 1, "remaining_qty": 0,
+                    "filled_qty_present": True, "normalization_result": "normalized"}
+    passed = []
+    result = request_protective_tp_cancel(
+        intents=[_protective()], provider=Provider(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [order],
+        apply_observation=lambda **kwargs: passed.append(kwargs)
+                          or {"status": "OK", "authoritative": True},
+    )
+    assert result[0]["status"] == "CANCEL_TERMINAL_RECONCILED"
+    assert len(passed) == 1
+    assert passed[0]["filled_qty"] == 1
+    assert passed[0]["remaining_qty"] == 0
+    assert passed[0]["evidence_type"] == "KIS_TERMINAL_CANCEL"
+
+
+@pytest.mark.parametrize("missing", ["provider", "kis_client"])
+def test_unavailable_broker_components_keep_protective_sell_fenced(monkeypatch, missing):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    kwargs = {"provider": object(), "kis_client": object()}
+    kwargs[missing] = None
+    result = request_protective_tp_cancel(
+        intents=[dict(_protective("MRVL"), strategy="us_pb1_exit")],
+        trade_date="2026-10-07", env="practice", **kwargs,
+    )
+    assert result == [
+        {"symbol": "MRVL", "status": "FENCED", "reason": "broker_provider_missing"}
+    ]
+
+
+def test_orphan_cross_day_tp_claim_blocks_protective_sell(monkeypatch):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    calls = []
+    def orphan(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+    result = request_protective_tp_cancel(
+        intents=[dict(_protective("MRVL"), strategy="us_pb1_exit")],
+        provider=object(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [],
+        unresolved_claim=orphan,
+    )
+    assert result[0]["status"] == "FENCED"
+    assert result[0]["reason"] == "unresolved_tp_claim_without_open_order"
+    assert calls[0][1]["lifecycle_id"] == "life-MRVL"
+    assert request_protective_tp_cancel(
+        intents=[dict(_protective("MRVL"), strategy="us_pb1_exit")],
+        provider=object(), kis_client=object(),
+        trade_date="2026-10-07", env="practice",
+        find_open=lambda *a, **k: [],
+        unresolved_claim=lambda *a, **k: False,
+    ) == []

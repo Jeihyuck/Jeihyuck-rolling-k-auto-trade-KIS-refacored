@@ -949,12 +949,23 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 continue
             entry_contract = extract_us_entry_exit_contract(p, meta_state)
             pc = contract_profit_capture(p)
-            if entry_contract and pc:
+            if entry_contract:
                 contract_sha = entry_contract.get("sha256")
-                # Profit-capture stages own their partial-exit semantics. Older
-                # v2 contracts did not persist this scoped field, so presence of
-                # a valid frozen TP stage contract defaults to staged-partial.
-                contract_partial_exit_allowed = bool(pc.get("partial_exit_allowed", True))
+                # A claimed immutable contract must never silently fall back
+                # to today's ENV TP settings if its frozen policy is missing.
+                if not pc or "partial_exit_allowed" not in pc:
+                    logger.error(
+                        "[US_PROFIT_CAPTURE][FROZEN_POLICY_MISSING] symbol=%s decision=BLOCK",
+                        sym,
+                    )
+                    continue
+                contract_partial_exit_allowed = bool(pc["partial_exit_allowed"])
+                if not contract_partial_exit_allowed:
+                    logger.error(
+                        "[US_PROFIT_CAPTURE][FROZEN_PARTIAL_EXIT_DENIED] symbol=%s decision=BLOCK",
+                        sym,
+                    )
+                    continue
                 if not pc.get("enabled", True):
                     continue
                 local_runner_min = float(pc.get("runner_min_remain_pct", runner_min))
@@ -966,10 +977,25 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                         float(stage.get("sell_fraction")),
                         str(stage.get("reason")),
                     ))
-                if len(frozen_stages) == 3:
-                    stages = frozen_stages
+                if (
+                    len(frozen_stages) != 3
+                    or [step[3] for step in frozen_stages]
+                        != ["TAKE_PROFIT_TP1", "TAKE_PROFIT_TP2", "TAKE_PROFIT_TP3"]
+                ):
+                    logger.error(
+                        "[US_PROFIT_CAPTURE][FROZEN_STAGES_INVALID] symbol=%s decision=BLOCK",
+                        sym,
+                    )
+                    continue
+                stages = frozen_stages
         except Exception as exc:
-            logger.warning("[US_PROFIT_CAPTURE][ENTRY_CONTRACT_WARN] symbol=%s err=%s", sym, exc)
+            # Never place a global-policy TP when the buy-time contract
+            # could not be read or validated due to a runtime error.
+            logger.exception(
+                "[US_PROFIT_CAPTURE][ENTRY_CONTRACT_READ_FAILED] symbol=%s decision=BLOCK err=%s",
+                sym, exc,
+            )
+            continue
         try:
             executable = as_decimal(price, name="executable_price")
             broker_avg, avg_provenance = authoritative_broker_avg(p, now=now)
