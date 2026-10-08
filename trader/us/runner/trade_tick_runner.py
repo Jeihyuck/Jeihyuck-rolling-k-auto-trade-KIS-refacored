@@ -2613,8 +2613,13 @@ def run_trade_tick(
             cancel_waiting_symbols = set()
             for recovery in recovery_results:
                 logger.warning("[US_PROTECTIVE_TP][RECOVERY_DECISION] %s", recovery)
-                if str(recovery.get("status") or "").startswith("CANCEL_"):
-                    cancel_waiting_symbols.add(str(recovery.get("symbol") or "").upper())
+                if recovery.get("symbol") and str(recovery.get("status") or "") in {
+                    "FENCED", "CANCEL_ACK_RECONCILE_REQUIRED",
+                    "CANCEL_RESULT_UNKNOWN_RECONCILE_REQUIRED",
+                    "CANCEL_PENDING_RECONCILE_REQUIRED",
+                    "CANCEL_TERMINAL_RECONCILED",
+                }:
+                    cancel_waiting_symbols.add(str(recovery["symbol"]).upper())
             if cancel_waiting_symbols:
                 # A cancellation request is never terminal broker evidence.
                 # Do not submit a protective replacement until a later tick
@@ -2625,6 +2630,14 @@ def run_trade_tick(
                 ]
         except Exception as recovery_error:
             logger.error("[US_PROTECTIVE_TP][RECOVERY_UNAVAILABLE_FENCED] %s", recovery_error)
+            # With recovery explicitly enabled, an exception must never fall
+            # through to a new protective SELL with an unknown old TP claim.
+            from trader.us.protective_tp_recovery import protective_symbols
+            blocked = protective_symbols(exit_intents)
+            exit_intents = [
+                intent for intent in exit_intents
+                if str(intent.get("symbol") or "").upper() not in blocked
+            ]
 
     # Suppress at intent generation (rather than only in the router) so all
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
