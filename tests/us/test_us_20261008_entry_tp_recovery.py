@@ -519,3 +519,17 @@ def test_late_partial_fill_on_terminal_cancel_preserves_filled_quantity(monkeypa
     assert passed[0]["filled_qty"] == 1
     assert passed[0]["remaining_qty"] == 0
     assert passed[0]["evidence_type"] == "KIS_TERMINAL_CANCEL"
+
+
+@pytest.mark.parametrize("missing", ["provider", "kis_client"])
+def test_unavailable_broker_components_keep_protective_sell_fenced(monkeypatch, missing):
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    kwargs = {"provider": object(), "kis_client": object()}
+    kwargs[missing] = None
+    result = request_protective_tp_cancel(
+        intents=[dict(_protective("MRVL"), strategy="us_pb1_exit")],
+        trade_date="2026-10-07", env="practice", **kwargs,
+    )
+    assert result == [
+        {"symbol": "MRVL", "status": "FENCED", "reason": "broker_provider_missing"}
+    ]
