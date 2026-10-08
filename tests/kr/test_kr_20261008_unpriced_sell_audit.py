@@ -94,7 +94,7 @@ def test_unpriced_partial_sell_is_not_a_false_clear_daily_audit():
     with engine.begin() as conn:
         conn.execute(sa.insert(schema.orders).values(
             order_id=str(uuid4()), env="practice", strategy=STRATEGY,
-            sid=1, mode=1, code="010120", side="SELL", stage="TP1",
+            sid=1, mode=1, code="010120", side="SELL", ord_type="LIMIT", stage="TP1",
             status="PARTIAL_FILLED", qty=7, client_order_key="partial:010120",
             kis_odno="0000006722", request_json={},
             response_json={"confirmed_fill_qty": 3, "confirmed_fill_price": None},
