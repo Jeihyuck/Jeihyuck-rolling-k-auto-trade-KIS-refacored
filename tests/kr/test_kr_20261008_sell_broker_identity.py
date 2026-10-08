@@ -177,3 +177,35 @@ def test_real_orders_repo_does_not_store_lg_semantic_key_as_kis_broker_identity(
         row = conn.execute(sa.select(schema.orders).where(schema.orders.c.order_id == order_id)).mappings().one()
     assert row["status"] == "UNRESOLVED_ACK"
     assert row["broker_order_id"] is None and row["kis_odno"] is None
+
+
+def test_unresolved_sell_status_without_provider_response_markers_stays_fenced():
+    from trader.reconcile_kis import _promote_open_buy_orders_from_holdings
+
+    order = {
+        "order_id": "tagged-close-lost-ack",
+        "client_order_key": "practice:tagged-close:066570:exit",
+        "code": "066570", "side": "SELL", "status": "UNRESOLVED_ACK",
+        "qty": 5, "strategy": "pb1_pullback_close", "kis_odno": None,
+        "response_json": {"error": "tagged-close submit error", "source": "tagged_close"},
+        "request_json": {"pre_order_holding_qty": 5},
+    }
+    assert _kr_sell_holdings_promotion_unproven(order, order["response_json"])
+
+    class Orders:
+        def get_open_orders(self, env):
+            return [order]
+
+        def list_recent_holdings_promoted_orders_for_repair(self, *args, **kwargs):
+            return []
+
+        def upsert_reconciled_order(self, **kwargs):
+            raise AssertionError("UNRESOLVED_ACK without response markers must not be promoted")
+
+    result = _promote_open_buy_orders_from_holdings(
+        env="practice", strategy="pb1_pullback_close", ctx_run_id=None,
+        tick_ts=__import__("datetime").datetime.now(),
+        holdings_rows=[{"pdno": "066570", "hldg_qty": "0"}],
+        orders_repo=Orders(), fills_repo=object(), positions_repo=None,
+    )
+    assert result["orders"] == 0 and result["fills"] == 0
