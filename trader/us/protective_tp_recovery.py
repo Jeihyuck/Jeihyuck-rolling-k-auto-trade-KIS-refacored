@@ -224,13 +224,13 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED",
                                 "reason": "owner_or_lifecycle_unverified"})
                 continue
+            if order.get("claim_state") not in {"IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED"}:
+                results.append({"symbol": symbol, "status": "FENCED", "reason": "tp_claim_unverified"})
+                continue
             evidence = provider.get_fills_by_order_no(
                 order_no=str(order["order_no"]), symbol=symbol,
                 trade_date=str(order["trade_date"]),
             )
-            if order.get("claim_state") not in {"IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED"}:
-                results.append({"symbol": symbol, "status": "FENCED", "reason": "tp_claim_unverified"})
-                continue
             if meta.get("protective_tp_cancel_requested_at"):
                 # Revisit the original trade date, even after the local session
                 # rolls forward. Never infer terminal status from the cancel ACK.
