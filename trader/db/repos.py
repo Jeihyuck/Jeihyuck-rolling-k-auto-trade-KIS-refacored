@@ -1601,6 +1601,23 @@ def _is_in_failed_transaction_error(exc: Exception) -> bool:
     return False
 
 
+def _kr_unresolved_broker_identity(
+    kis_odno: str | None, response_json: dict | None
+) -> str | None:
+    """UNKNOWN KR submission: semantic client key must not impersonate KIS ODNO."""
+    response = response_json or {}
+    if not isinstance(response, dict):
+        return kis_odno
+    unresolved = (
+        str(response.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
+        or str(response.get("msg_cd") or "").upper() == "BROKER_SUBMIT_OUTCOME_UNKNOWN"
+    )
+    if not unresolved:
+        return kis_odno
+    odno = str(kis_odno or "").strip()
+    return odno if len(odno) == 10 and odno.isascii() and odno.isdigit() else None
+
+
 @lru_cache(maxsize=1)
 def _pb1_checkout_sha() -> str | None:
     """Resolve the loaded WSL checkout, not a remote branch's moving HEAD."""
@@ -3341,10 +3358,15 @@ class OrdersRepo:
         submitted_qty: int | None = None,
     ) -> str:
         safe_response_json = json_sanitize(response_json or {})
+        verified_order_no = _kr_unresolved_broker_identity(kis_odno, safe_response_json)
+        unresolved_identity = (
+            str(safe_response_json.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
+            or str(safe_response_json.get("msg_cd") or "").upper() == "BROKER_SUBMIT_OUTCOME_UNKNOWN"
+        )
         values = {
             "status": "SUBMITTED",
-            "kis_odno": kis_odno,
-            "broker_order_id": kis_odno or client_order_key,
+            "kis_odno": verified_order_no,
+            "broker_order_id": verified_order_no if unresolved_identity else (kis_odno or client_order_key),
             "response_json": safe_response_json,
             "submitted_at": func.now(),
             "updated_at": func.now(),
@@ -3454,8 +3476,14 @@ class OrdersRepo:
         if submitted_qty is not None and int(submitted_qty) > 0:
             values["qty"] = int(submitted_qty)
         if kis_odno:
-            values["kis_odno"] = kis_odno
-            values["broker_order_id"] = kis_odno
+            # This method itself establishes UNRESOLVED_ACK even if the
+            # caller's error payload omits rt_cd/msg_cd. Never persist a
+            # semantic client key as a broker-order identifier.
+            actual_order_no = _kr_unresolved_broker_identity(
+                kis_odno, {"rt_cd": "UNRESOLVED_ACK"}
+            )
+            values["kis_odno"] = actual_order_no
+            values["broker_order_id"] = actual_order_no
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=get_account_key(env=env),
@@ -4223,9 +4251,20 @@ class OrdersRepo:
         acked_at: datetime | None,
     ) -> str:
         db_url = str(self.engine.url)
-        broker_order_id = kis_odno or client_order_key
         safe_request_json = json_sanitize(request_json or {})
         safe_response_json = json_sanitize(response_json or {})
+        if str(side or "").upper() == "SELL" and (
+            str(safe_response_json.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
+            or str(safe_response_json.get("msg_cd") or "").upper() == "BROKER_SUBMIT_OUTCOME_UNKNOWN"
+        ):
+            kis_odno = _kr_unresolved_broker_identity(kis_odno, safe_response_json)
+            broker_order_id = kis_odno
+            # The provider has not acknowledged acceptance. Never upgrade
+            # unknown submit to ACKED/ACCEPTED using a client key substitute.
+            if str(status or "").upper() in {"ACK", "ACKED", "ACCEPTED", "SUBMITTED"}:
+                status = "UNRESOLVED_ACK"
+        else:
+            broker_order_id = kis_odno or client_order_key
         account_id = get_account_key(env=env)
 
         with self.engine.begin() as conn:

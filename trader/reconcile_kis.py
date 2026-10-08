@@ -484,6 +484,25 @@ def _verified_order_sell_average_from_ccld_fills(
     return notional / float(quantity)
 
 
+def _kr_sell_holdings_promotion_unproven(order: dict, response: dict) -> bool:
+    """Do not turn an *unknown* broker submit into a filled SELL by balance delta.
+
+    2026-10-08 LG전자: an internal client key occupied kis_odno while the
+    response said BROKER_SUBMIT_OUTCOME_UNKNOWN. Other orders/manual trades can
+    change aggregate holdings; that is not execution proof for this order.
+    """
+    if str(order.get("side") or "").upper() != "SELL":
+        return False
+    # Even a numeric KIS order number is only addressable submission
+    # identity, *not* proof of a fill. Route actual executions through exact
+    # daily-ccld reconciliation, never through aggregate holdings inference.
+    return (
+        str(order.get("status") or "").upper() == "UNRESOLVED_ACK"
+        or str(response.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
+        or str(response.get("msg_cd") or "").upper() == "BROKER_SUBMIT_OUTCOME_UNKNOWN"
+    )
+
+
 def _promote_open_buy_orders_from_holdings(
     *,
     env: str,
@@ -555,6 +574,13 @@ def _promote_open_buy_orders_from_holdings(
 
         request_json = _json_dict(order.get("request_json"))
         response_json = _json_dict(order.get("response_json"))
+        if _kr_sell_holdings_promotion_unproven(order, response_json):
+            logger.error(
+                "[RECONCILE][SELL][BROKER_IDENTITY_MISSING] code=%s order_id=%s "
+                "status=%s action=KEEP_UNRESOLVED_NO_HOLDINGS_PROMOTION",
+                code, order.get("order_id"), status,
+            )
+            continue
 
         # Once the shared KR writer is actually released for this account/epoch,
         # holdings-only inference must never fall through to the legacy economic
