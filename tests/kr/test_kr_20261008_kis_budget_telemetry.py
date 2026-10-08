@@ -59,3 +59,57 @@ def test_balance_pre_fetch_budget_exhaustion_never_calls_broker(monkeypatch, cap
         api.get_balance_cached(force=True)
     assert "stage=balance_pre_fetch" in caplog.text
     assert "action=FAIL_CLOSED" in caplog.text
+
+
+def test_order_submit_gap_uses_monotonic_and_budgeted_sleep(monkeypatch):
+    clock = {"mono": 50.5, "wall": -500000.0}
+    monkeypatch.setattr(
+        kis, "time",
+        SimpleNamespace(
+            monotonic=lambda: clock["mono"], time=lambda: clock["wall"],
+            sleep=lambda _s: pytest.fail("unbudgeted sleep"),
+        ),
+    )
+    sleeps = []
+    monkeypatch.setattr(kis, "_kr_sleep_with_budget", lambda seconds: sleeps.append(seconds) or True)
+    monkeypatch.setattr(kis.random, "uniform", lambda _a, _b: 0.0)
+    monkeypatch.setenv("KIS_ORDER_MIN_GAP_SEC", "1")
+    class NoopLimiter:
+        def wait(self, _endpoint):
+            return None
+
+    api = kis.KisAPI.__new__(kis.KisAPI)
+    api._order_limiter = NoopLimiter()
+    api._limiter = NoopLimiter()
+    api._order_hashkey_gap_sec = 1.0
+    api._last_hashkey_at = 50.0
+    api._last_order_submit_at = 0.0
+    api._rate_limit_safe_enabled = lambda: True
+
+    api._wait_before_order_submit()
+    assert sleeps == [pytest.approx(0.5)]
+    assert api._last_order_submit_at == 50.5
+
+
+def test_order_gap_deadline_failure_does_not_advance_submit_marker(monkeypatch):
+    clock = {"mono": 50.5}
+    monkeypatch.setattr(
+        kis, "time", SimpleNamespace(monotonic=lambda: clock["mono"], time=lambda: 0.0),
+    )
+    monkeypatch.setattr(kis, "_kr_sleep_with_budget", lambda _s: False)
+    monkeypatch.setattr(kis.random, "uniform", lambda _a, _b: 0.0)
+    monkeypatch.setenv("KIS_ORDER_MIN_GAP_SEC", "1")
+    class NoopLimiter:
+        def wait(self, _endpoint):
+            return None
+    api = kis.KisAPI.__new__(kis.KisAPI)
+    api._order_limiter = NoopLimiter()
+    api._limiter = NoopLimiter()
+    api._order_hashkey_gap_sec = 1.0
+    api._last_hashkey_at = 50.0
+    api._last_order_submit_at = 0.0
+    api._rate_limit_safe_enabled = lambda: True
+
+    with pytest.raises(kis.KisTemporaryError, match="KR_TICK_DEADLINE_EXHAUSTED_DURING_RATE_LIMIT"):
+        api._wait_before_order_submit()
+    assert api._last_order_submit_at == 0.0
