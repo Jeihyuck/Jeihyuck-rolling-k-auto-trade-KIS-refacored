@@ -3437,7 +3437,12 @@ class OrdersRepo:
         if submitted_qty is not None and int(submitted_qty) > 0:
             values["qty"] = int(submitted_qty)
         if kis_odno:
-            actual_order_no = _kr_unresolved_broker_identity(kis_odno, safe_payload)
+            # This method itself establishes UNRESOLVED_ACK even if the
+            # caller's error payload omits rt_cd/msg_cd. Never persist a
+            # semantic client key as a broker-order identifier.
+            actual_order_no = _kr_unresolved_broker_identity(
+                kis_odno, {"rt_cd": "UNRESOLVED_ACK"}
+            )
             values["kis_odno"] = actual_order_no
             values["broker_order_id"] = actual_order_no
         with self.engine.begin() as conn:
