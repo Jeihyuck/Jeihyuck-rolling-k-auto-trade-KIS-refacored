@@ -87,3 +87,27 @@ def audit_kr_unpriced_sell_orders(engine, *, env: str, trade_date: date) -> dict
         "unproven_broker_order_count": sum(not it["broker_order_identified"] for it in items),
         "orders": sorted(items, key=lambda x: (x["code"], x["order_id"])),
     }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Read-only operator audit: python -m trader.kr.unpriced_sell_audit."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Audit KR quantity-only SELLs missing execution price")
+    parser.add_argument("--env", required=True, choices=("practice", "real"))
+    parser.add_argument("--trade-date", required=True, help="KST YYYY-MM-DD")
+    args = parser.parse_args(argv)
+    from trader.db.engine import get_engine
+
+    trade_date = date.fromisoformat(args.trade_date)
+    engine = get_engine()
+    try:
+        report = audit_kr_unpriced_sell_orders(engine, env=args.env, trade_date=trade_date)
+    finally:
+        engine.dispose()
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 2 if report["unpriced_sell_count"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
