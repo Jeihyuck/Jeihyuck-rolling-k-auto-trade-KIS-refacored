@@ -387,3 +387,90 @@ def test_protective_producer_profit_protect_is_eligible():
                   exit_type="profit_protect")
     intent.pop("strategy_owner")
     assert protective_symbols([intent]) == {"MRVL"}
+
+
+@pytest.mark.skipif(
+    not __import__("os").getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="Postgres recovery integration requires CI PostgreSQL",
+)
+def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeypatch):
+    import os
+    from sqlalchemy import create_engine, text
+    from trader.us import protective_tp_recovery as recovery
+    from trader.us.db import repos
+
+    engine = create_engine(os.environ["PBCORE_TEST_POSTGRES_URL"], future=True, pool_size=1)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("""
+                CREATE TEMP TABLE us_orders (
+                    id TEXT,trade_date TEXT,symbol TEXT,side TEXT,env TEXT,
+                    status TEXT,order_no TEXT,qty_requested INT,qty_filled INT,
+                    client_order_key TEXT,exchange TEXT,meta JSONB,
+                    trading_epoch_id TEXT,created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW())
+            """)
+            conn.exec_driver_sql("""
+                CREATE TEMP TABLE us_execution_claims (
+                    trading_epoch_id TEXT,trade_date TEXT,env TEXT,market TEXT,
+                    strategy_owner TEXT,lifecycle_id TEXT,action TEXT,
+                    action_state TEXT)
+            """)
+            conn.execute(text("""
+                INSERT INTO us_orders (
+                    id,trade_date,symbol,side,env,status,order_no,qty_requested,
+                    qty_filled,client_order_key,exchange,meta,trading_epoch_id)
+                VALUES ('mrvl-tp2','2026-10-06','MRVL','SELL','practice','OPEN',
+                        '0000034237',2,0,'tp2-mrvl','NASDAQ',
+                        '{"profit_capture_stage":"tp2",
+                          "strategy_owner":"US_STANDARD",
+                          "position_lifecycle_id":"life-MRVL"}'::jsonb,
+                        'epoch-ci')
+            """))
+            conn.execute(text("""
+                INSERT INTO us_execution_claims (
+                    trading_epoch_id,trade_date,env,market,strategy_owner,
+                    lifecycle_id,action,action_state)
+                VALUES ('epoch-ci','2026-10-06','practice','US','US_STANDARD',
+                        'life-MRVL','TP2','IN_FLIGHT')
+            """))
+        monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+        monkeypatch.setattr(repos, "_active_us_epoch", lambda conn: "epoch-ci")
+        monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+
+        order_rows = recovery.load_conflicting_open_tp_orders(
+            "MRVL", "2026-10-07", env="practice",
+        )
+        assert len(order_rows) == 1
+        assert order_rows[0]["claim_state"] == "IN_FLIGHT"
+        assert recovery.reserve_cancel_request(order_rows[0])
+        assert not recovery.reserve_cancel_request(order_rows[0])
+        class Provider:
+            def get_fills_by_order_no(self, **kwargs):
+                assert kwargs["trade_date"] == "2026-10-06"
+                return _broker_open()
+        class KIS:
+            def cancel_us_order(self, **kwargs):
+                raise AssertionError("reserved cancel must not POST again")
+        result = recovery.request_protective_tp_cancel(
+            intents=[dict(_protective(), strategy="us_pb1_exit")],
+            provider=Provider(), kis_client=KIS(),
+            trade_date="2026-10-07", env="practice",
+        )
+        assert result[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
+
+        # Only a terminal broker observation + settled claim permits a fresh
+        # protective route; local state cannot silently unlock on cancel ACK.
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE us_orders SET status='CANCELLED' WHERE id='mrvl-tp2'"
+            ))
+            conn.execute(text(
+                "UPDATE us_execution_claims SET action_state='RETRYABLE'"
+                " WHERE lifecycle_id='life-MRVL'"
+            ))
+        assert recovery.load_conflicting_open_tp_orders(
+            "MRVL", "2026-10-07", env="practice",
+        ) == []
+    finally:
+        engine.dispose()
