@@ -5079,7 +5079,7 @@ def _register_kr_run_row(*, engine, ctx: RunContext) -> tuple[RunsRepo, str]:
         ts_start=ctx.started_at,
         # Earlier exits may never call start_run. Stamp revision on this
         # first durable row instead of only on the later session tick row.
-        git_sha=_pb1_run_git_sha(getattr(ctx, "git_sha", None), strategy=ctx.strategy),
+        git_sha=_pb1_run_git_sha(getattr(ctx, "git_sha", None), strategy="pb1_pullback_close"),
     )
     return runs_repo, run_id
 
