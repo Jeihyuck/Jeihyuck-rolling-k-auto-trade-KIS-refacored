@@ -358,7 +358,10 @@ def _recover_proven_policy_positions_fixed(
                 continue
             group = groups.setdefault(
                 (cycle, epoch),
-                {"net": 0, "buy_order": None, "first_buy_at": None},
+                {
+                    "net": 0, "buy_order": None, "root_buy_order": None,
+                    "root_buy_count": 0, "first_buy_at": None,
+                },
             )
             side = str(row.get("side") or "").upper()
             q = base._qty(row.get("qty"))
@@ -368,11 +371,24 @@ def _recover_proven_policy_positions_fixed(
                 meta = base._json_dict(request.get("entry_meta")) or base._json_dict(row.get("order_entry_meta_json"))
                 plan = base._json_dict(request.get("entry_exit_plan"))
                 if meta or plan:
-                    group["buy_order"] = {
+                    buy_record = {
                         "order_id": str(row.get("order_id") or ""),
                         "request_json": request,
                         "entry_meta_json": row.get("order_entry_meta_json"),
                     }
+                    group["buy_order"] = buy_record
+                    # A pyramid BUY intentionally has a nonzero baseline,
+                    # and must not replace the immutable zero-baseline root.
+                    if (
+                        request.get("enforce_entry_contract") is True
+                        and request.get("pre_order_holding_qty") == 0
+                        and plan
+                    ):
+                        root_ids = group.setdefault("root_buy_ids", set())
+                        if buy_record["order_id"] not in root_ids:
+                            root_ids.add(buy_record["order_id"])
+                            group["root_buy_count"] += 1
+                        group["root_buy_order"] = buy_record
                     if group["first_buy_at"] is None:
                         group["first_buy_at"] = row.get("filled_at")
 
@@ -380,12 +396,22 @@ def _recover_proven_policy_positions_fixed(
         for (cycle, epoch), group in groups.items():
             if int(group.get("net") or 0) != broker_qty or not group.get("buy_order"):
                 continue
-            meta, plan = base._entry_contract(group["buy_order"])
+            # For an empty RECOVERY plan the root order must be uniquely
+            # provable. For older POLICY_MISSING rows preserve legacy
+            # selection unless an unambiguous root is available.
+            root_count = int(group.get("root_buy_count") or 0)
+            if missing_recovery_plan and root_count != 1:
+                continue
+            source_buy = (
+                group.get("root_buy_order")
+                if root_count == 1 else group["buy_order"]
+            )
+            meta, plan = base._entry_contract(source_buy)
             recovered_family = str(plan.get("exit_policy_family") or meta.get("exit_policy_family") or "").strip()
             recovered_horizon = str(plan.get("trade_horizon") or meta.get("trade_horizon") or "").strip()
             if not recovered_family or recovered_family.upper() == "POLICY_MISSING" or not recovered_horizon:
                 continue
-            candidates.append((cycle, epoch, group, meta, plan))
+            candidates.append((cycle, epoch, group, meta, plan, source_buy))
 
         if len(candidates) != 1:
             review.append(code)
@@ -397,9 +423,8 @@ def _recover_proven_policy_positions_fixed(
             )
             continue
 
-        source_cycle, source_epoch, group, meta, plan = candidates[0]
+        source_cycle, source_epoch, group, meta, plan, source_order = candidates[0]
         position_meta = base._json_dict(position.get("position_meta"))
-        source_order = group["buy_order"]
         source_request = base._json_dict(source_order.get("request_json"))
         source_order_id = str(source_order.get("order_id") or "")
         if missing_recovery_plan:
@@ -425,7 +450,7 @@ def _recover_proven_policy_positions_fixed(
         if source_request.get("enforce_entry_contract") is True:
             try:
                 _assert_kr_buy_entry_contract(source_request)
-            except RuntimeError:
+            except (RuntimeError, TypeError, ValueError):
                 review.append(code)
                 logger.exception(
                     "[KR_BROKER_TRUTH][POLICY_REVIEW_REQUIRED] code=%s "
