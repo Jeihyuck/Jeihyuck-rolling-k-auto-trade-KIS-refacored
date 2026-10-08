@@ -6,6 +6,9 @@ import hashlib
 import json
 import logging, os
 import time
+import subprocess
+from pathlib import Path
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
 
@@ -1598,6 +1601,37 @@ def _is_in_failed_transaction_error(exc: Exception) -> bool:
     return False
 
 
+@lru_cache(maxsize=1)
+def _pb1_checkout_sha() -> str | None:
+    """Resolve the loaded WSL checkout, not a remote branch's moving HEAD."""
+    try:
+        run = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        sha = str(run.stdout or "").strip().lower() if run.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sha if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha) else None
+
+
+def _pb1_run_git_sha(explicit_sha: str | None, *, strategy: str) -> str | None:
+    """Record actual execution revision on KR PB1 runs; never invent one."""
+    if explicit_sha:
+        return str(explicit_sha)
+    if str(strategy or "").strip().lower() != "pb1_pullback_close":
+        return None
+    for env_var in ("KR_RUN_REVISION", "NULLIM_RUN_REVISION", "GITHUB_SHA", "RUN_REVISION"):
+        candidate = str(os.getenv(env_var) or "").strip().lower()
+        if len(candidate) == 40 and all(c in "0123456789abcdef" for c in candidate):
+            return candidate
+    return _pb1_checkout_sha()
+
+
 class RunsRepo:
     _TERMINAL_STATUS_TOKENS = (
         "FINISH",
@@ -2006,7 +2040,7 @@ class RunsRepo:
             "phase": phase,
             "event_name": event_name,
             "dry_run": dry_run_value,
-            "git_sha": git_sha,
+            "git_sha": _pb1_run_git_sha(git_sha, strategy=strategy),
             "workflow": workflow,
             "workflow_run_id": workflow_run_id,
             "workflow_attempt": workflow_attempt,
