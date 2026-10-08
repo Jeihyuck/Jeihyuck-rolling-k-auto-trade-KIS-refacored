@@ -1,6 +1,8 @@
 name: "US KIS Order Evidence (Read Only)"
 
 "on":
+  issues:
+    types: [opened]
   pull_request:
     branches: [dual-agent]
     paths:
@@ -30,6 +32,7 @@ concurrency:
 jobs:
   offline-contract:
     name: "KIS evidence offline contract"
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +55,7 @@ jobs:
 
   inspect:
     name: "KIS practice order inquiry - no orders / no DB writes"
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dual-agent' }}
+    if: ${{ github.ref == 'refs/heads/dual-agent' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'issues' && github.event.action == 'opened' && github.event.issue.user.login == 'Jeihyuck' && github.event.issue.title == '[KIS READONLY] Exact order inquiry')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -95,6 +98,37 @@ jobs:
           [[ "${KIS_ENV}" == "practice" ]]
           [[ "${DRY_RUN}" == "1" ]]
           [[ "${US_KIS_ORDER_ALLOWED}" == "0" ]]
+      - name: Validate request and resolve safe inputs
+        shell: bash
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from scripts.us_kis_order_inspect import parse_targets, validate_trade_date
+
+          if os.getenv("GITHUB_EVENT_NAME") == "issues":
+              raw = os.environ.get("ISSUE_BODY", "")
+              if len(raw) > 500:
+                  raise SystemExit("Issue request exceeds allowed size")
+              data = json.loads(raw)
+              if not isinstance(data, dict) or set(data) != {"trade_date", "targets"}:
+                  raise SystemExit("Issue body must be a JSON object with only trade_date and targets")
+              trade_date, targets = data["trade_date"], data["targets"]
+          else:
+              trade_date, targets = os.getenv("TRADE_DATE"), os.getenv("TARGETS")
+          if not isinstance(trade_date, str) or not isinstance(targets, str):
+              raise SystemExit("Inputs must be strings")
+          trade_date = validate_trade_date(trade_date)
+          pairs = parse_targets(targets)
+          safe_targets = ",".join(f"{symbol}:{number}" for symbol, number in pairs)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"TRADE_DATE={trade_date}\n")
+              output.write(f"TARGETS={safe_targets}\n")
+          print(f"[KIS_READONLY] validated trade_date={trade_date} target_count={len(pairs)}")
+          PY
       - name: Query KIS and active-epoch database, read only
         shell: bash
         run: |
