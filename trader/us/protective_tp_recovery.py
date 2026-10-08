@@ -66,6 +66,30 @@ def broker_proves_open_tp_order(order: dict, broker: dict) -> bool:
     return bool(local_no and broker_no and broker_no == local_no)
 
 
+def broker_proves_terminal_after_cancel(order: dict, broker: dict) -> bool:
+    """Only an explicit broker terminal fill/zero-open observation permits reconciliation."""
+    if not isinstance(order, dict) or not isinstance(broker, dict):
+        return False
+    if str(broker.get("status") or "").upper() not in {"CANCELLED", "CANCELED", "FILLED"}:
+        return False
+    if broker.get("filled_qty_present") is not True:
+        return False
+    try:
+        requested = int(order.get("qty_requested"))
+        broker_requested = int(broker.get("requested_qty"))
+        filled = int(broker.get("filled_qty"))
+        remaining = int(broker.get("remaining_qty"))
+    except (TypeError, ValueError):
+        return False
+    if requested <= 0 or requested != broker_requested or filled < int(order.get("qty_filled") or 0):
+        return False
+    if remaining != 0 or (str(broker.get("status") or "").upper() == "FILLED" and filled != requested):
+        return False
+    if str(order.get("order_no") or "").lstrip("0") != str(broker.get("order_no") or "").lstrip("0"):
+        return False
+    return str(broker.get("normalization_result") or "").lower() == "normalized"
+
+
 def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -> list[dict]:
     """Only the active epoch and matching strategy-owned broker-order rows."""
     from sqlalchemy import text
@@ -123,6 +147,7 @@ def request_protective_tp_cancel(
     trade_date: str, env: str,
     find_open: Callable[..., list[dict]] = load_conflicting_open_tp_orders,
     reserve: Callable[[dict], bool] = reserve_cancel_request,
+    apply_observation: Callable[..., dict] | None = None,
 ) -> list[dict]:
     """One cancel request per tick at most, with independently verified order proof."""
     if os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1":
@@ -161,6 +186,40 @@ def request_protective_tp_cancel(
                 order_no=str(order["order_no"]), symbol=symbol,
                 trade_date=str(order["trade_date"]),
             )
+            if meta.get("protective_tp_cancel_requested_at"):
+                # Revisit the original trade date, even after the local session
+                # rolls forward. Never infer terminal status from the cancel ACK.
+                if not broker_proves_terminal_after_cancel(order, evidence):
+                    results.append({"symbol": symbol, "status": "CANCEL_PENDING_RECONCILE_REQUIRED"})
+                    break
+                if apply_observation is None:
+                    from trader.us.db.repos import apply_broker_order_observation as _apply
+                else:
+                    _apply = apply_observation
+                from trader.us.db.repos import normalize_us_order_no
+                status = str(evidence["status"]).upper().replace("CANCELED", "CANCELLED")
+                settled = _apply(
+                    trade_date=str(order["trade_date"]),
+                    client_order_key=str(order["client_order_key"]),
+                    raw_order_no=str(order["order_no"]),
+                    canonical_order_no=normalize_us_order_no(order["order_no"]),
+                    symbol=symbol, side="SELL",
+                    requested_qty=int(order["qty_requested"]),
+                    filled_qty=int(evidence["filled_qty"]), remaining_qty=0,
+                    broker_status=status,
+                    evidence_type="KIS_TERMINAL_CANCEL" if status == "CANCELLED" else "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    raw_row=evidence, broker_open_qty=0,
+                )
+                accepted = (
+                    isinstance(settled, dict)
+                    and settled.get("status") == "OK"
+                    and settled.get("authoritative") is True
+                    and not settled.get("requires_reconcile")
+                )
+                results.append({"symbol": symbol,
+                                "status": "CANCEL_TERMINAL_RECONCILED" if accepted
+                                          else "CANCEL_PENDING_RECONCILE_REQUIRED"})
+                break
             if not broker_proves_open_tp_order(order, evidence):
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "broker_open_proof_missing"})
                 continue
