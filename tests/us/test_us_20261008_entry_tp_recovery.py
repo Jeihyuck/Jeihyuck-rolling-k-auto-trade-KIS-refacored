@@ -184,13 +184,15 @@ def _filled_stage_and_order():
     stage = {"stage": "tp1", "stage_status": "DONE",
              "trade_date": "2026-09-23", "symbol": "PLTR",
              "client_order_key": "US_PC_PLTR_TP1", "requested_qty": 4,
+             "position_lifecycle_id": "life-pltr",
              "cumulative_filled_qty": 0, "trading_epoch_id": "active-epoch"}
     order = {"trade_date": "2026-09-23", "symbol": "PLTR",
              "client_order_key": "US_PC_PLTR_TP1", "qty_requested": 4,
              "qty_filled": 4, "side": "SELL", "status": "FILLED",
              "trading_epoch_id": "active-epoch",
              "meta": {"profit_capture_stage": "tp1", "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
-                      "cumulative_filled_qty": 4}}
+                      "position_lifecycle_id": "life-pltr",
+                       "cumulative_filled_qty": 4}}
     return stage, order
 
 
@@ -203,6 +205,20 @@ def test_pltr_done_zero_counter_backfill_only_on_proven_actual_fill():
     assert authoritative_tp_fill_for_backfill(stage, dict(order, meta={})) is None
     assert authoritative_tp_fill_for_backfill(dict(stage, stage_status="PENDING"), order) is None
     assert authoritative_tp_fill_for_backfill(dict(stage, symbol="NVDA"), order) is None
+    # An identical client key alone is not sufficient proof of position identity.
+    assert authoritative_tp_fill_for_backfill(
+        dict(stage, position_lifecycle_id="another-lifecycle"), order,
+    ) is None
+    assert authoritative_tp_fill_for_backfill(
+        stage, dict(order, meta={**order["meta"], "position_lifecycle_id": "wrong"}),
+    ) is None
+    assert authoritative_tp_fill_for_backfill(
+        stage, dict(order, meta={k: v for k, v in order["meta"].items()
+                                 if k != "position_lifecycle_id"}),
+    ) is None
+    assert authoritative_tp_fill_for_backfill(
+        dict(stage, position_lifecycle_id=""), order,
+    ) is None
 
 
 @pytest.mark.parametrize("symbol", ["MRVL", "AMD"])
@@ -268,7 +284,7 @@ def test_pltr_legacy_repair_dry_run_does_not_write_and_apply_is_scoped(monkeypat
     db_row = {
         "trade_date": stage["trade_date"], "symbol": stage["symbol"],
         "stage": stage["stage"], "stage_status": stage["stage_status"],
-        "position_lifecycle_id": "life-pltr",
+        "position_lifecycle_id": stage["position_lifecycle_id"],
         "client_order_key": stage["client_order_key"],
         "requested_qty": stage["requested_qty"],
         "cumulative_filled_qty": stage["cumulative_filled_qty"],
