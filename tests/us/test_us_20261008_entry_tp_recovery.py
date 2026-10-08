@@ -258,3 +258,65 @@ def test_cancel_terminal_missing_broker_fill_keeps_action_fenced(monkeypatch):
         apply_observation=lambda **kwargs: (_ for _ in ()).throw(
             AssertionError("must not reconcile unknown fill")),
     )[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
+
+
+def test_pltr_legacy_repair_dry_run_does_not_write_and_apply_is_scoped():
+    from scripts.us_tp_lifecycle_evidence_repair import repair
+    stage, order = _filled_stage_and_order()
+    db_row = {
+        "trade_date": stage["trade_date"], "symbol": stage["symbol"],
+        "stage": stage["stage"], "stage_status": stage["stage_status"],
+        "position_lifecycle_id": "life-pltr",
+        "client_order_key": stage["client_order_key"],
+        "requested_qty": stage["requested_qty"],
+        "cumulative_filled_qty": stage["cumulative_filled_qty"],
+        "trading_epoch_id": stage["trading_epoch_id"],
+        "order_trade_date": order["trade_date"], "order_symbol": order["symbol"],
+        "order_key": order["client_order_key"],
+        "qty_requested": order["qty_requested"], "qty_filled": order["qty_filled"],
+        "status": order["status"], "side": order["side"],
+        "order_meta": order["meta"], "order_epoch": order["trading_epoch_id"],
+    }
+
+    class Cursor:
+        rowcount = 1
+        def mappings(self):
+            return self
+        def all(self):
+            return [db_row]
+
+    class Connection:
+        def __init__(self):
+            self.executed = []
+        def execute(self, statement, params):
+            self.executed.append((str(statement), params))
+            return Cursor()
+
+    class Context:
+        def __init__(self, connection):
+            self.connection = connection
+        def __enter__(self):
+            return self.connection
+        def __exit__(self, *args):
+            return None
+
+    class Engine:
+        def __init__(self):
+            self.connection = Connection()
+        def begin(self):
+            return Context(self.connection)
+
+    dry = Engine()
+    result = repair(dry, since="2026-09-22")
+    assert result["provable"] == [("2026-09-23", "PLTR", "tp1", 4)]
+    assert result["applied"] == 0
+    assert len(dry.connection.executed) == 1
+    applied = Engine()
+    result = repair(applied, since="2026-09-22", apply=True)
+    assert result["applied"] == 1
+    assert len(applied.connection.executed) == 2
+    update = applied.connection.executed[1][1]
+    assert update["epoch"] == "active-epoch"
+    assert update["lifecycle"] == "life-pltr"
+    assert update["order_key"] == "US_PC_PLTR_TP1"
+    assert update["filled_key"] == "tp1_filled_qty"
