@@ -135,3 +135,61 @@ def test_recovery_refuses_ambiguous_or_tampered_buy_contract(failure):
     assert row["position_cycle_id"] == recovery_cycle
     assert row["entry_exit_plan_json"] == {}
     assert row["qty"] == 140
+
+
+@pytest.mark.parametrize(("code", "qty"), [("036540", 140), ("003670", 8)])
+def test_exact_recovery_alias_repairs_buy_watermark_without_rebuy(code, qty):
+    from trader.kr.holdings_promotion_repair import repair_promoted_buy_watermark
+
+    engine, schema, plan, request, recovery_cycle = _incident(code=code, qty=qty)
+    with engine.begin() as conn:
+        row = conn.execute(sa.select(schema.orders)).mappings().one()
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == row["order_id"]
+        ).values(
+            response_json={
+                "promotion_source": "kis_holdings",
+                "confirmed_fill_qty": qty,
+                "holding_qty": qty,
+                "pre_order_holding_qty": 0,
+            }
+        ))
+    holdings = [{"pdno": code, "hldg_qty": str(qty)}]
+    # The watermark cannot authorize a RECOVERY alias before exact contract repair.
+    with engine.connect() as conn:
+        original = dict(conn.execute(sa.select(schema.orders)).mappings().one())
+    assert not repair_promoted_buy_watermark(engine=engine, env="practice", order=original)
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine, env="practice", strategy=STRATEGY, holdings_rows=holdings,
+    )
+    assert result["recovered"] == [code]
+    assert repair_promoted_buy_watermark(engine=engine, env="practice", order=original)
+    assert repair_promoted_buy_watermark(engine=engine, env="practice", order=original)
+
+    with engine.connect() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert str(pos["position_cycle_id"]) == recovery_cycle
+    assert pos["qty"] == qty
+    assert pos["entry_exit_plan_json"] == plan
+    assert pos["entry_meta_json"]["broker_truth_buy_applied_orders"][str(original["order_id"])]["qty"] == qty
+
+
+def test_recovery_alias_rejects_tampered_source_cycle_before_applying_watermark():
+    from trader.kr.holdings_promotion_repair import repair_promoted_buy_watermark
+
+    engine, schema, _, _, _ = _incident(code="036540", qty=140, proven_cycle=False)
+    with engine.begin() as conn:
+        row = conn.execute(sa.select(schema.orders)).mappings().one()
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == row["order_id"]
+        ).values(response_json={
+            "promotion_source": "kis_holdings", "confirmed_fill_qty": 140,
+            "holding_qty": 140, "pre_order_holding_qty": 0,
+        }))
+    with engine.connect() as conn:
+        order = dict(conn.execute(sa.select(schema.orders)).mappings().one())
+    assert not repair_promoted_buy_watermark(engine=engine, env="practice", order=order)
+    with engine.connect() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert pos["qty"] == 140
+    assert pos["entry_exit_plan_json"] == {}
