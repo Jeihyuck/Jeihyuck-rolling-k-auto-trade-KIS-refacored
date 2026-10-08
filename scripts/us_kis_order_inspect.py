@@ -137,6 +137,8 @@ def inspect(trade_date: str, targets: list[tuple[str, str]]) -> dict:
     from trader.us.execution.kis_us_client import KisUSClient
     try:
         with engine.connect() as conn:
+            # Enforce PostgreSQL read-only semantics even if the configured role can write.
+            conn.exec_driver_sql("SET TRANSACTION READ ONLY")
             epochs = conn.execute(text("""
                 SELECT trading_epoch_id FROM trading_epochs
                  WHERE env = 'practice' AND account_id = :account_id AND status = 'ACTIVE'
