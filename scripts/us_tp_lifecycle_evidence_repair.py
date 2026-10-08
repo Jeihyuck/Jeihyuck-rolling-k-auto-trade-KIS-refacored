@@ -1,6 +1,6 @@
 """Read-only by default; repair historical DONE/0 TP counters using KIS actual fills.
 
-Usage: US_DB_URL=... python scripts/us_tp_lifecycle_evidence_repair.py --since 2026-09-22
+Usage: US_DB_URL=... PYTHONPATH=. python -m scripts.us_tp_lifecycle_evidence_repair --since 2026-09-22
 Apply only after reviewing the exact output and setting
 US_TP_LIFECYCLE_REPAIR_CONFIRM=YES with --apply.
 
@@ -14,6 +14,7 @@ import os
 from sqlalchemy import create_engine, text
 
 from trader.us.profit_capture_evidence import authoritative_tp_fill_for_backfill
+from trader.us.db.repos import _active_us_epoch
 
 
 CANDIDATES = text("""
@@ -29,6 +30,7 @@ JOIN us_orders AS o
  AND o.client_order_key = l.client_order_key
  AND o.trading_epoch_id = l.trading_epoch_id
 WHERE l.trade_date >= :since
+  AND l.trading_epoch_id = :epoch
   AND l.stage_status = 'DONE'
   AND l.cumulative_filled_qty = 0
   AND l.trading_epoch_id IS NOT NULL
@@ -68,7 +70,12 @@ WHERE trade_date = :trade_date AND symbol = :symbol
 def repair(engine, *, since: str, apply: bool = False) -> dict:
     repaired, provable, rejected = 0, [], 0
     with engine.begin() as conn:
-        rows = conn.execute(CANDIDATES, {"since": since}).mappings().all()
+        # Never replay historical practice/real generations when epochs reset.
+        # This script is intentionally scoped to the currently active US epoch.
+        epoch = _active_us_epoch(conn, required=True)
+        if not epoch:
+            raise RuntimeError("ACTIVE_US_TRADING_EPOCH_REQUIRED")
+        rows = conn.execute(CANDIDATES, {"since": since, "epoch": epoch}).mappings().all()
         for row in rows:
             stage = {
                 "trade_date": str(row["trade_date"]), "symbol": row["symbol"],
