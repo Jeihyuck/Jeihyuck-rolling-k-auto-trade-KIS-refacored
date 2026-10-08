@@ -263,3 +263,49 @@ def test_malformed_enforced_root_quantity_is_review_required_not_reconcile_crash
     with engine.connect() as conn:
         pos = conn.execute(sa.select(schema.positions)).mappings().one()
     assert pos["entry_exit_plan_json"] == {} and pos["qty"] == 8
+
+
+def test_recovery_alias_rejects_position_outside_active_trading_epoch(monkeypatch):
+    import trader.kr.holdings_promotion_repair as repair
+
+    engine, schema, plan, _, _ = _incident(code="036540", qty=140)
+    active_epoch = str(uuid4())
+    with engine.begin() as conn:
+        order = conn.execute(sa.select(schema.orders)).mappings().one()
+        request = dict(order["request_json"])
+        request["trading_epoch_id"] = active_epoch
+        request["entry_contract_sha256"] = _kr_buy_entry_contract_hash(request)
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == order["order_id"]
+        ).values(
+            trading_epoch_id=active_epoch,
+            request_json=request,
+            response_json={
+                "promotion_source": "kis_holdings",
+                "confirmed_fill_qty": 140,
+                "holding_qty": 140,
+                "pre_order_holding_qty": 0,
+            }
+        ))
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+        conn.execute(sa.update(schema.positions).where(
+            schema.positions.c.position_id == pos["position_id"]
+        ).values(
+            # A stale RECOVERY alias has no active trading epoch.
+            trading_epoch_id=None,
+            entry_exit_plan_json=plan,
+            entry_meta_json={
+                "entry_contract_sha256": request["entry_contract_sha256"],
+                "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(plan),
+            },
+        ))
+    monkeypatch.setattr(repair, "active_trading_epoch_id", lambda *_args, **_kwargs: active_epoch)
+    monkeypatch.setattr(repair, "trading_epoch_enforced", lambda: True)
+    with engine.connect() as conn:
+        order = dict(conn.execute(sa.select(schema.orders)).mappings().one())
+    assert not repair.repair_promoted_buy_watermark(
+        engine=engine, env="practice", order=order,
+    )
+    with engine.connect() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert "broker_truth_buy_applied_orders" not in pos["entry_meta_json"]
