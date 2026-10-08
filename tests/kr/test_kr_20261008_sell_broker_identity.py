@@ -21,10 +21,10 @@ def test_unknown_sell_submit_with_internal_client_key_cannot_promote_holdings_de
     # The apparent holdings delta MUST NOT become a confirmed order fill.
     assert _kr_sell_holdings_promotion_unproven(order, response) is True
 
-    # A genuinely identified broker order is eligible for subsequent broker-
-    # matched reconciliation, though its fill quantity must still be verified.
+    # A genuine KIS number can support a later exact broker-execution match,
+    # but NEVER upgrades an unknown submit based only on aggregate holdings.
     order["broker_order_id"] = "0000006722"
-    assert _kr_sell_holdings_promotion_unproven(order, response) is False
+    assert _kr_sell_holdings_promotion_unproven(order, response) is True
 
 
 def test_confirmed_broker_ack_does_not_change_existing_sell_promotion_policy():
