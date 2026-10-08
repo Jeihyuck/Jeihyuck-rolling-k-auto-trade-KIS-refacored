@@ -10,7 +10,8 @@ from trader.us import entry_exit_contract as contracts
 from trader.us.market_state_overlay import build_profit_capture_intents
 from trader.us.profit_capture_evidence import authoritative_tp_fill_for_backfill
 from trader.us.protective_tp_recovery import (
-    broker_proves_open_tp_order, broker_proves_terminal_after_cancel,\n    protective_symbols, request_protective_tp_cancel,
+    broker_proves_open_tp_order, broker_proves_terminal_after_cancel,
+    protective_symbols, request_protective_tp_cancel,
 )
 
 NOW = datetime(2026, 10, 7, 15, 0, tzinfo=timezone.utc)
@@ -105,7 +106,8 @@ def test_explicit_frozen_partial_denial_is_not_overridden():
 def _protective(symbol: str = "MRVL") -> dict:
     return {
         "symbol": symbol, "side": "SELL", "exit_type": "profit_trailing_stop",
-        "strategy_owner": "US_STANDARD", "qty": 4,\n        "position_lifecycle_id": f"life-{symbol}",
+        "strategy_owner": "US_STANDARD", "qty": 4,
+        "position_lifecycle_id": f"life-{symbol}",
     }
 
 
@@ -115,7 +117,8 @@ def _old_tp(symbol: str = "MRVL") -> dict:
             "qty_requested": 2, "qty_filled": 0,
             "client_order_key": f"us-tp2-{symbol}",
             "trading_epoch_id": "epoch-1", "meta": {
-                "profit_capture_stage": "tp2", "strategy_owner": "US_STANDARD",\n                "position_lifecycle_id": f"life-{symbol}",
+                "profit_capture_stage": "tp2", "strategy_owner": "US_STANDARD",
+                "position_lifecycle_id": f"life-{symbol}",
             }}
 
 
