@@ -193,3 +193,73 @@ def test_recovery_alias_rejects_tampered_source_cycle_before_applying_watermark(
         pos = conn.execute(sa.select(schema.positions)).mappings().one()
     assert pos["qty"] == 140
     assert pos["entry_exit_plan_json"] == {}
+
+
+def test_recovery_uses_root_buy_contract_not_later_pyramid_buy():
+    from datetime import timedelta
+
+    engine, schema, plan, root_request, _ = _incident(code="036540", qty=120)
+    with engine.begin() as conn:
+        root_order = conn.execute(sa.select(schema.orders)).mappings().one()
+        root_fill = conn.execute(sa.select(schema.fills)).mappings().one()
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+        conn.execute(sa.update(schema.positions).where(
+            schema.positions.c.position_id == pos["position_id"]
+        ).values(qty=140, total_cost=14_000_000.0))
+        add_request = {
+            "entry_exit_plan": {
+                **plan, "risk_plan": {"initial_stop": 5.0, "risk_R": 9999.0},
+            },
+            "entry_meta": {"entry_reason": "ENTRY_PYRAMID", "trade_horizon": "SWING"},
+            "pre_order_holding_qty": 120,
+        }
+        add_id = str(uuid4())
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=add_id, position_cycle_id=root_order["position_cycle_id"],
+            portfolio_epoch_id=root_order["portfolio_epoch_id"], env="practice",
+            strategy=STRATEGY, sid=1, mode=1,
+            code="036540", market="KOSPI", side="BUY", ord_type="LIMIT",
+            qty=20, stage="PB1-ADD", status="FILLED",
+            client_order_key="pyramid-after-root", kis_odno="0000011752",
+            request_json=add_request, created_at=root_order["created_at"] + timedelta(seconds=1),
+        ))
+        conn.execute(sa.insert(schema.fills).values(
+            fill_id=str(uuid4()), env="practice", order_id=add_id,
+            kis_odno="0000011752", trade_id="pyramid-after-root-fill",
+            code="036540", market="KOSPI", side="BUY", qty=20, price=100000.0,
+            fee=0.0, tax=0.0,
+            filled_at=root_fill["filled_at"] + timedelta(seconds=1),
+            position_cycle_id=root_order["position_cycle_id"],
+            portfolio_epoch_id=root_order["portfolio_epoch_id"],
+            raw_json={"source": "daily_ccld"},
+        ))
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+        holdings_rows=[{"pdno": "036540", "hldg_qty": "140"}],
+    )
+    assert result == {"recovered": ["036540"], "review_required": []}
+    with engine.connect() as conn:
+        pos_after = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert pos_after["qty"] == 140
+    assert pos_after["entry_exit_plan_json"] == plan
+    assert pos_after["entry_meta_json"]["source_buy_order_id"] == str(root_order["order_id"])
+    assert pos_after["entry_meta_json"]["entry_contract_sha256"] == root_request["entry_contract_sha256"]
+
+
+def test_malformed_enforced_root_quantity_is_review_required_not_reconcile_crash():
+    engine, schema, _, _, _ = _incident(code="003670", qty=8)
+    with engine.begin() as conn:
+        order = conn.execute(sa.select(schema.orders)).mappings().one()
+        request = dict(order["request_json"])
+        request["requested_qty"] = "not-an-integer"
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == order["order_id"]
+        ).values(request_json=request))
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+        holdings_rows=[{"pdno": "003670", "hldg_qty": "8"}],
+    )
+    assert result == {"recovered": [], "review_required": ["003670"]}
+    with engine.connect() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert pos["entry_exit_plan_json"] == {} and pos["qty"] == 8
