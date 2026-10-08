@@ -59,7 +59,7 @@ def broker_proves_open_tp_order(order: dict, broker: dict) -> bool:
         return False
     if str(broker.get("status") or "").upper() not in {"OPEN", "PARTIALLY_FILLED"}:
         return False
-    if str(broker.get("normalization_result") or "normalized").lower() != "normalized":
+    if str(broker.get("normalization_result") or "").lower() != "normalized":
         return False
     broker_no = str(broker.get("order_no") or "").lstrip("0")
     local_no = str(order.get("order_no") or "").lstrip("0")
