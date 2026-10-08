@@ -5067,6 +5067,8 @@ def _handle_balance_unknown_precheck(
 
 def _register_kr_run_row(*, engine, ctx: RunContext) -> tuple[RunsRepo, str]:
     """Persist the early KR run row used by run_once before any order/reconcile work."""
+    from trader.db.repos import _pb1_run_git_sha
+
     runs_repo = RunsRepo(engine)
     run_id = os.getenv("TRADER_RUN_ID", "local")
     runs_repo.upsert_run(
@@ -5075,6 +5077,7 @@ def _register_kr_run_row(*, engine, ctx: RunContext) -> tuple[RunsRepo, str]:
         strategy=ctx.strategy,
         workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
         ts_start=ctx.started_at,
+        git_sha=_pb1_run_git_sha(getattr(ctx, "git_sha", None), strategy="pb1_pullback_close"),
     )
     return runs_repo, run_id
 
