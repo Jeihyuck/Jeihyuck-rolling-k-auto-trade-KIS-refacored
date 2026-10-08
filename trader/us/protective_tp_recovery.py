@@ -135,10 +135,15 @@ def reserve_cancel_request(order: dict) -> bool:
                     'protective_tp_cancel_reason', 'BROKER_PROVEN_OPEN_CONFLICT'),
                 updated_at=NOW()
             WHERE id=:id AND trading_epoch_id=:epoch
+              AND symbol=:symbol AND client_order_key=:order_key
+              AND meta->>'position_lifecycle_id'=:lifecycle
+              AND meta->>'strategy_owner'='US_STANDARD'
               AND status IN ('ACK','OPEN','PARTIALLY_FILLED','RECONCILE_PENDING')
               AND meta->>'protective_tp_cancel_requested_at' IS NULL
             RETURNING id
-        """), {"id": order["id"], "epoch": order["trading_epoch_id"]})
+        """), {"id": order["id"], "epoch": order["trading_epoch_id"],
+                 "symbol": order["symbol"], "order_key": order["client_order_key"],
+                 "lifecycle": str((order.get("meta") or {}).get("position_lifecycle_id") or "")})
         return result.first() is not None
 
 
