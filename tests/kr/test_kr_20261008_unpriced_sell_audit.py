@@ -84,3 +84,23 @@ def test_sqlite_kst_evening_unpriced_sell_remains_on_original_trade_date():
     tomorrow = audit_kr_unpriced_sell_orders(engine, env="practice", trade_date=date(2026, 10, 9))
     assert today["unpriced_sell_count"] == 1
     assert tomorrow["unpriced_sell_count"] == 0
+
+
+def test_unpriced_partial_sell_is_not_a_false_clear_daily_audit():
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    created = datetime(2026, 10, 8, 13, 17, tzinfo=ZoneInfo("Asia/Seoul"))
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=str(uuid4()), env="practice", strategy=STRATEGY,
+            sid=1, mode=1, code="010120", side="SELL", stage="TP1",
+            status="PARTIAL_FILLED", qty=7, client_order_key="partial:010120",
+            kis_odno="0000006722", request_json={},
+            response_json={"confirmed_fill_qty": 3, "confirmed_fill_price": None},
+            created_at=created,
+        ))
+    report = audit_kr_unpriced_sell_orders(engine, env="practice", trade_date=date(2026, 10, 8))
+    assert report["unpriced_sell_count"] == 1
+    assert report["orders"][0]["confirmed_qty"] == 3
+    assert report["orders"][0]["realized_pnl_status"] == "UNRESOLVED_NOT_ZERO"
