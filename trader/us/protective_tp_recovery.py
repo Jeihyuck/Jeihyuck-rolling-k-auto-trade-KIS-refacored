@@ -23,17 +23,30 @@ _PROTECTIVE_EXITS = frozenset({
 
 
 def protective_symbols(intents: list[dict]) -> set[str]:
+    """Identify only STANDARD protective sells from their actual owner/producer.
+
+    The production us_exit_engine._make_exit_intent emits strategy='us_pb1_exit'
+    without a top-level strategy_owner.  Never require an owner tag that this
+    producer does not write; never infer standard ownership for TQQQ or an
+    unknown producer. The persisted TP order owner/lifecycle is checked again
+    before any cancel request.
+    """
     result: set[str] = set()
     for intent in intents:
-        if (
-            str(intent.get("side") or "").upper() == "SELL"
-            and str(intent.get("exit_type") or "").lower() in _PROTECTIVE_EXITS
-            and str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or "").upper()
-                == "US_STANDARD"
-        ):
-            symbol = str(intent.get("symbol") or "").upper()
-            if symbol and symbol != "TQQQ":
-                result.add(symbol)
+        if str(intent.get("side") or "").upper() != "SELL":
+            continue
+        if str(intent.get("exit_type") or "").lower() not in _PROTECTIVE_EXITS:
+            continue
+        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+        owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
+        producer = str(intent.get("strategy") or meta.get("strategy") or "").lower()
+        if owner not in {"", "US_STANDARD"}:
+            continue
+        if owner != "US_STANDARD" and producer != "us_pb1_exit":
+            continue
+        symbol = str(intent.get("symbol") or "").upper()
+        if symbol and symbol != "TQQQ":
+            result.add(symbol)
     return result
 
 
