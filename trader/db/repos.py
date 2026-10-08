@@ -1625,11 +1625,16 @@ def _pb1_run_git_sha(explicit_sha: str | None, *, strategy: str) -> str | None:
         return str(explicit_sha)
     if str(strategy or "").strip().lower() != "pb1_pullback_close":
         return None
+    # Local pinned checkout is the execution source of truth. A GitHub or
+    # deployment environment variable may refer to a different revision.
+    checkout_sha = _pb1_checkout_sha()
+    if checkout_sha:
+        return checkout_sha
     for env_var in ("KR_RUN_REVISION", "NULLIM_RUN_REVISION", "GITHUB_SHA", "RUN_REVISION"):
         candidate = str(os.getenv(env_var) or "").strip().lower()
         if len(candidate) == 40 and all(c in "0123456789abcdef" for c in candidate):
             return candidate
-    return _pb1_checkout_sha()
+    return None
 
 
 class RunsRepo:
