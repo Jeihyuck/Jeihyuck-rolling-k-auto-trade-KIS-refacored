@@ -48,8 +48,15 @@ def audit_kr_unpriced_sell_orders(engine, *, env: str, trade_date: date) -> dict
     """
     if env not in {"practice", "real"} or not isinstance(trade_date, date):
         raise ValueError("explicit supported env and KST trade_date required")
-    start = datetime.combine(trade_date, time.min, _KST).astimezone(timezone.utc)
-    end = (datetime.combine(trade_date, time.min, _KST) + timedelta(days=1)).astimezone(timezone.utc)
+    # SQLite stores timezone-aware order timestamps as naive wall-clock
+    # values in this repository; PostgreSQL retains real timestamptz UTC.
+    # Use the same storage convention for *both* query boundaries.
+    if engine.dialect.name == "sqlite":
+        start = datetime.combine(trade_date, time.min)
+        end = start + timedelta(days=1)
+    else:
+        start = datetime.combine(trade_date, time.min, _KST).astimezone(timezone.utc)
+        end = (datetime.combine(trade_date, time.min, _KST) + timedelta(days=1)).astimezone(timezone.utc)
     schema = schema_for_engine(engine)
     with engine.connect() as conn:
         orders = [
