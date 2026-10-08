@@ -1,0 +1,113 @@
+name: "US KIS Order Evidence (Read Only)"
+
+"on":
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "scripts/us_kis_order_inspect.py"
+      - "tests/us/test_us_kis_order_inspect.py"
+      - ".github/workflows/us-kis-order-evidence.yml"
+  workflow_dispatch:
+    inputs:
+      trade_date:
+        description: "Exact original US order trade date (YYYY-MM-DD), not today's date"
+        type: string
+        required: true
+        default: "2026-10-06"
+      targets:
+        description: "Up to 10 exact SYMBOL:ORDER_NUMBER pairs, separated by commas"
+        type: string
+        required: true
+        default: "MRVL:34237,AMD:35281"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: us-kis-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  offline-contract:
+    name: "KIS evidence offline contract"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify read-only contract
+        env:
+          KIS_ENV: practice
+          DRY_RUN: "1"
+          DISABLE_REAL_TRADING: "1"
+          US_KIS_ORDER_ALLOWED: "0"
+          PYTHONPATH: "."
+        run: |
+          python -m py_compile scripts/us_kis_order_inspect.py
+          python -m pytest -q tests/us/test_us_kis_order_inspect.py
+
+  inspect:
+    name: "KIS practice order inquiry - no orders / no DB writes"
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/dual-agent' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: "."
+      TRADING_REGION: US
+      KIS_ENV: practice
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      US_KIS_ORDER_ALLOWED: "0"
+      US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED: "0"
+      OFFLINE_MODE: "0"
+      KIS_HTTP_BLOCK: "0"
+      TARGETS: ${{ inputs.targets }}
+      TRADE_DATE: ${{ inputs.trade_date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Confirm read-only practice account configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${KIS_APP_KEY:?missing KIS_APP_KEY}"
+          : "${KIS_APP_SECRET:?missing KIS_APP_SECRET}"
+          : "${CANO:?missing CANO}"
+          : "${ACNT_PRDT_CD:?missing ACNT_PRDT_CD}"
+          : "${PBCORE_DB_URL:?missing PBCORE_DB_URL}"
+          [[ "${KIS_ENV}" == "practice" ]]
+          [[ "${DRY_RUN}" == "1" ]]
+          [[ "${US_KIS_ORDER_ALLOWED}" == "0" ]]
+      - name: Query KIS and active-epoch database, read only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m scripts.us_kis_order_inspect \
+            --trade-date "${TRADE_DATE}" \
+            --targets "${TARGETS}" \
+            --output artifacts/us-kis-order-inspection.json
+      - name: Upload minimal evidence report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-kis-order-evidence
+          path: artifacts/us-kis-order-inspection.json
+          if-no-files-found: warn
+          retention-days: 7
