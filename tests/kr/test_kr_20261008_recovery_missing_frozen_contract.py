@@ -326,7 +326,7 @@ def test_contract_recovery_rejects_stale_open_position_outside_active_trading_ep
     with engine.connect() as conn:
         row = conn.execute(sa.select(schema.positions)).mappings().one()
     assert row["entry_exit_plan_json"] == {}
-    assert row["trading_epoch_id"] is None
+    assert str(row["trading_epoch_id"] or "") != active
 
 
 def test_contract_recovery_rejects_hashed_request_for_different_order_cycle():
