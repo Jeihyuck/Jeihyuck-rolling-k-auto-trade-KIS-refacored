@@ -497,7 +497,8 @@ def _kr_sell_holdings_promotion_unproven(order: dict, response: dict) -> bool:
     # identity, *not* proof of a fill. Route actual executions through exact
     # daily-ccld reconciliation, never through aggregate holdings inference.
     return (
-        str(response.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
+        str(order.get("status") or "").upper() == "UNRESOLVED_ACK"
+        or str(response.get("rt_cd") or "").upper() == "UNRESOLVED_ACK"
         or str(response.get("msg_cd") or "").upper() == "BROKER_SUBMIT_OUTCOME_UNKNOWN"
     )
 
