@@ -187,5 +187,25 @@ def contract_day_config(position: dict) -> dict:
 
 
 def contract_profit_capture(position: dict) -> dict:
+    """Read the immutable buy-time TP policy; adapt legacy v2 in memory only.
+
+    The first v2 buy contracts predate the scoped TP partial-exit bit.  A
+    verified three-stage frozen contract authorizes partial TP exits even if
+    the unrelated generic management.partial_exit_allowed flag is False.
+    Never mutate or re-sign the original position contract.
+    """
     contract = extract_us_entry_exit_contract(position, _dict(position).get("meta"))
-    return dict((contract.get("management") or {}).get("profit_capture") or {}) if contract else {}
+    if not contract:
+        return {}
+    policy = dict((contract.get("management") or {}).get("profit_capture") or {})
+    if "partial_exit_allowed" not in policy:
+        stages = policy.get("stages")
+        if (
+            isinstance(stages, list)
+            and len(stages) == 3
+            and [stage.get("reason") for stage in stages if isinstance(stage, dict)]
+                == ["TAKE_PROFIT_TP1", "TAKE_PROFIT_TP2", "TAKE_PROFIT_TP3"]
+        ):
+            policy["partial_exit_allowed"] = True
+            policy["legacy_scoped_tp_partial_compat"] = True
+    return policy
