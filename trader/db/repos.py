@@ -4220,6 +4220,10 @@ class OrdersRepo:
         ):
             kis_odno = _kr_unresolved_broker_identity(kis_odno, safe_response_json)
             broker_order_id = kis_odno
+            # The provider has not acknowledged acceptance. Never upgrade
+            # unknown submit to ACKED/ACCEPTED using a client key substitute.
+            if str(status or "").upper() in {"ACK", "ACKED", "ACCEPTED", "SUBMITTED"}:
+                status = "UNRESOLVED_ACK"
         else:
             broker_order_id = kis_odno or client_order_key
         account_id = get_account_key(env=env)
