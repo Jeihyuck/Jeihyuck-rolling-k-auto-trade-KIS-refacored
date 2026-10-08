@@ -260,8 +260,10 @@ def test_cancel_terminal_missing_broker_fill_keeps_action_fenced(monkeypatch):
     )[0]["status"] == "CANCEL_PENDING_RECONCILE_REQUIRED"
 
 
-def test_pltr_legacy_repair_dry_run_does_not_write_and_apply_is_scoped():
+def test_pltr_legacy_repair_dry_run_does_not_write_and_apply_is_scoped(monkeypatch):
+    from scripts import us_tp_lifecycle_evidence_repair as script
     from scripts.us_tp_lifecycle_evidence_repair import repair
+    monkeypatch.setattr(script, "_active_us_epoch", lambda conn, required: "active-epoch")
     stage, order = _filled_stage_and_order()
     db_row = {
         "trade_date": stage["trade_date"], "symbol": stage["symbol"],
@@ -378,3 +380,10 @@ def test_cross_day_multiple_open_tp_orders_block_new_protective_exit(monkeypatch
     )
     assert result[0]["status"] == "FENCED"
     assert result[0]["reason"] == "multiple_tp_open_or_claims"
+
+
+def test_protective_producer_profit_protect_is_eligible():
+    intent = dict(_protective(), strategy="us_pb1_exit",
+                  exit_type="profit_protect")
+    intent.pop("strategy_owner")
+    assert protective_symbols([intent]) == {"MRVL"}
