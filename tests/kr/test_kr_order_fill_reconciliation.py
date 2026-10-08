@@ -69,15 +69,19 @@ def test_sell_qty_confirmed_without_execution_price_does_not_fabricate_fill():
     assert orders.saved[-1]["response_json"]["realized_pnl_status"] == "REALIZED_PNL_UNRESOLVED"
 
 
-def test_unresolved_sell_reconciles_to_confirmed_fill_without_resubmit():
+def test_unresolved_sell_with_unbound_price_must_wait_for_exact_broker_proof():
+    # A price field without order-matched KIS execution identity is not an
+    # authenticated fill. In particular the 2026-10-08 LG Electronics unknown
+    # ACK must never be finalized from a later unrelated holdings delta.
+    # True order-matched daily-ccld executions are reconciled separately.
     result, orders, fills = _reconcile_sell(
         {"execution_detail": {"ccld_unpr": "266700"}},
         status="UNRESOLVED_ACK",
     )
-    assert result["fills"] == 1
-    assert orders.saved[-1]["status"] == "FILLED"
-    assert fills.saved[-1]["qty"] == 14
-    assert fills.saved[-1]["price"] == 266700
+    assert result["fills"] == 0
+    assert result["orders"] == 0
+    assert orders.saved == []
+    assert fills.saved == []
 
 
 def test_sell_uses_actual_broker_execution_price():
