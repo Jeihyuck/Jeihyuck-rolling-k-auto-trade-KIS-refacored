@@ -73,3 +73,30 @@ def test_early_pb1_run_upsert_stamps_sha_even_when_no_later_tick(monkeypatch):
     assert isinstance(repo, FakeRunsRepo)
     assert run_id == "early-run-id"
     assert captured["git_sha"] == "e" * 40
+
+
+def test_early_pb1_run_with_legacy_default_strategy_still_stamps_real_revision(monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from trader import pb1_runner
+
+    recorded = {}
+
+    class FakeRunsRepo:
+        def __init__(self, engine):
+            pass
+
+        def upsert_run(self, **kwargs):
+            recorded.update(kwargs)
+
+    monkeypatch.setattr(pb1_runner, "RunsRepo", FakeRunsRepo)
+    monkeypatch.setattr("trader.db.repos._pb1_run_git_sha", lambda sha, *, strategy: (
+        "f" * 40 if strategy == "pb1_pullback_close" else None
+    ))
+    monkeypatch.setenv("TRADER_RUN_ID", "legacy-ctx-early-run")
+    ctx = SimpleNamespace(
+        env="practice", strategy="best_k_meta",
+        gh_run_number=None, started_at=datetime.now(timezone.utc), git_sha=None,
+    )
+    pb1_runner._register_kr_run_row(engine=object(), ctx=ctx)
+    assert recorded["git_sha"] == "f" * 40
