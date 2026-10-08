@@ -48,3 +48,17 @@ def test_audit_is_fail_closed_for_unspecified_scope():
     import pytest
     with pytest.raises(ValueError):
         audit_kr_unpriced_sell_orders(engine, env="unknown", trade_date=date(2026, 10, 8))
+
+
+def test_operator_cli_reports_explicit_empty_date_and_zero_exit(monkeypatch, capsys):
+    from trader.kr.unpriced_sell_audit import main
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(engine).metadata.create_all(engine)
+    monkeypatch.setattr("trader.db.engine.get_engine", lambda: engine)
+    assert main(["--env", "practice", "--trade-date", "2026-10-08"]) == 0
+    import json
+    data = json.loads(capsys.readouterr().out)
+    assert data["env"] == "practice"
+    assert data["market"] == "KR"
+    assert data["unpriced_sell_count"] == 0
