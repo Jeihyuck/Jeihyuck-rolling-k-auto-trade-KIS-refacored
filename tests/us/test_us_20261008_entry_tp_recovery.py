@@ -105,7 +105,7 @@ def test_explicit_frozen_partial_denial_is_not_overridden():
 def _protective(symbol: str = "MRVL") -> dict:
     return {
         "symbol": symbol, "side": "SELL", "exit_type": "profit_trailing_stop",
-        "strategy_owner": "US_STANDARD", "qty": 4,
+        "strategy_owner": "US_STANDARD", "qty": 4,\n        "position_lifecycle_id": f"life-{symbol}",
     }
 
 
@@ -115,7 +115,7 @@ def _old_tp(symbol: str = "MRVL") -> dict:
             "qty_requested": 2, "qty_filled": 0,
             "client_order_key": f"us-tp2-{symbol}",
             "trading_epoch_id": "epoch-1", "meta": {
-                "profit_capture_stage": "tp2", "strategy_owner": "US_STANDARD",
+                "profit_capture_stage": "tp2", "strategy_owner": "US_STANDARD",\n                "position_lifecycle_id": f"life-{symbol}",
             }}
 
 
