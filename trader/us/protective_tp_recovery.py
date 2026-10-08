@@ -192,7 +192,12 @@ def request_protective_tp_cancel(
     if os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1":
         return []
     if kis_client is None or provider is None:
-        return [{"status": "RECOVERY_UNAVAILABLE", "reason": "broker_provider_missing"}]
+        # Do not fall through to a protective replacement when neither
+        # broker-open truth nor cancellation outcome can be established.
+        return [
+            {"symbol": symbol, "status": "FENCED", "reason": "broker_provider_missing"}
+            for symbol in sorted(protective_symbols(intents))
+        ]
     results: list[dict] = []
     # Bind a broker TP reservation to the exact protective lifecycle, not merely
     # the ticker (which could have been closed and repurchased).
