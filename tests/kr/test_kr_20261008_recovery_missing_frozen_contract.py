@@ -309,3 +309,70 @@ def test_recovery_alias_rejects_position_outside_active_trading_epoch(monkeypatc
     with engine.connect() as conn:
         pos = conn.execute(sa.select(schema.positions)).mappings().one()
     assert "broker_truth_buy_applied_orders" not in pos["entry_meta_json"]
+
+
+def test_contract_recovery_rejects_stale_open_position_outside_active_trading_epoch(monkeypatch):
+    import trader.kr.broker_truth_review_fixes as review
+    engine, schema, _, _, _ = _incident(code="036540", qty=140)
+    active = str(uuid4())
+    monkeypatch.setattr(review, "active_trading_epoch_id", lambda *_a, **_kw: active)
+    monkeypatch.setattr(review, "trading_epoch_enforced", lambda: True)
+    # A historical open row without the active epoch must never be adopted.
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+        holdings_rows=[{"pdno": "036540", "hldg_qty": "140"}],
+    )
+    assert result["recovered"] == []
+    with engine.connect() as conn:
+        row = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert row["entry_exit_plan_json"] == {}
+    assert row["trading_epoch_id"] is None
+
+
+def test_contract_recovery_rejects_hashed_request_for_different_order_cycle():
+    engine, schema, _, _, _ = _incident(code="003670", qty=8)
+    with engine.begin() as conn:
+        order = conn.execute(sa.select(schema.orders)).mappings().one()
+        request = dict(order["request_json"])
+        request["position_cycle_id"] = str(uuid4())
+        # This is a perfectly self-consistent request hash, but it is for
+        # another lifecycle than the actual persisted order and linked fill.
+        request["entry_contract_sha256"] = _kr_buy_entry_contract_hash(request)
+        conn.execute(
+            sa.update(schema.orders)
+            .where(schema.orders.c.order_id == order["order_id"])
+            .values(request_json=request)
+        )
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+        holdings_rows=[{"pdno": "003670", "hldg_qty": "8"}],
+    )
+    assert result == {"recovered": [], "review_required": ["003670"]}
+    with engine.connect() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert pos["entry_exit_plan_json"] == {}
+    assert pos["qty"] == 8
+
+
+def test_contract_recovery_rejects_source_evidence_from_stale_epoch(monkeypatch):
+    import trader.kr.broker_truth_review_fixes as review
+    engine, schema, _, _, _ = _incident(code="036540", qty=140)
+    active = str(uuid4())
+    stale = str(uuid4())
+    with engine.begin() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+        conn.execute(sa.update(schema.positions).where(
+            schema.positions.c.position_id == pos["position_id"]
+        ).values(trading_epoch_id=active))
+        for tbl in (schema.orders, schema.fills):
+            conn.execute(sa.update(tbl).values(trading_epoch_id=stale))
+    monkeypatch.setattr(review, "active_trading_epoch_id", lambda *_a, **_kw: active)
+    monkeypatch.setattr(review, "trading_epoch_enforced", lambda: True)
+    result = _recover_proven_policy_positions_fixed(
+        engine=engine, env="practice", strategy=STRATEGY,
+        holdings_rows=[{"pdno": "036540", "hldg_qty": "140"}],
+    )
+    assert result == {"recovered": [], "review_required": ["036540"]}
+    with engine.connect() as conn:
+        pos = conn.execute(sa.select(schema.positions)).mappings().one()
+    assert pos["entry_exit_plan_json"] == {}
