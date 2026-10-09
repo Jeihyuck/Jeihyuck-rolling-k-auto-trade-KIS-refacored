@@ -221,6 +221,30 @@ def reserve_cancel_request(order: dict) -> bool:
         return result.first() is not None
 
 
+def classify_stale_tp_conflict(order: dict, *, current_trade_date: str) -> str:
+    """Report cross-day TP debt; never infer a terminal broker order from age.
+
+    This is diagnostic-only.  Historical KIS ccnl `nccs_qty` and a failed
+    MTS cancellation are not sufficient to set CANCELLED or drop a claim.
+    """
+    from datetime import date
+
+    if str(order.get("claim_state") or "").upper() not in {
+        "IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED",
+    }:
+        return "NOT_ACTIVE_CLAIM"
+    try:
+        age_days = (date.fromisoformat(str(current_trade_date)) -
+                    date.fromisoformat(str(order.get("trade_date") or ""))).days
+    except ValueError:
+        return "INVALID_TRADE_DATE_FENCED"
+    if age_days < 0:
+        return "FUTURE_TRADE_DATE_FENCED"
+    if age_days >= 1:
+        return "STALE_TP_BROKER_TERMINAL_PROOF_REQUIRED"
+    return "SAME_DAY_TP_CLAIM"
+
+
 def request_protective_tp_cancel(
     *, intents: list[dict], provider: Any, kis_client: Any,
     trade_date: str, env: str,
@@ -271,6 +295,17 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
+            stale_classification = classify_stale_tp_conflict(
+                order, current_trade_date=trade_date,
+            )
+            if stale_classification != "SAME_DAY_TP_CLAIM":
+                logger.warning(
+                    "[US_PROTECTIVE_TP][STALE_CLAIM_AUDIT] symbol=%s order_no=%s "
+                    "original_trade_date=%s current_trade_date=%s classification=%s "
+                    "action=RETAIN_FENCE_UNTIL_BROKER_TERMINAL_PROOF",
+                    symbol, order.get("order_no"), order.get("trade_date"),
+                    trade_date, stale_classification,
+                )
             meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
             if (
                 str(meta.get("strategy_owner") or "").upper() != "US_STANDARD"
