@@ -682,6 +682,7 @@ def reconcile_ack_orders_with_balance(
         fill_qty = qty
 
         fills_resp: dict = {}
+        fills_lookup_error: str | None = None
         try:
             fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
             if fills_resp and isinstance(fills_resp, dict):
@@ -805,6 +806,7 @@ def reconcile_ack_orders_with_balance(
             symbols_by_status["unresolved"].append(symbol)
             continue
         except Exception as exc:
+            fills_lookup_error = f"{type(exc).__name__}: {exc}"
             logger.warning(
                 "[US_RECONCILE][ACK_RECONCILE][WARN] fills_by_order_no failed symbol=%s: %s",
                 symbol, exc,
@@ -1047,10 +1049,18 @@ def reconcile_ack_orders_with_balance(
                 max(0, int(pre_qty_for_delta or 0) - current_orderable),
             )
             continue
+        # Missing broker evidence must never be reported as an authoritative zero fill.
+        # Preserve reconciliation fencing even when the KIS query budget expires.
+        evidence_reason = (
+            "broker_fill_query_unavailable"
+            if fills_lookup_error is not None
+            else "no_fill_no_open_order_no_balance_delta"
+        )
+        fill_quantity_text = "unknown" if fills_lookup_error is not None else "0"
         logger.error(
             "[US_RECONCILE][ACK_UNRESOLVED_ERROR] symbol=%s order_no=%s requested_qty=%s "
-            "filled_qty=0 remaining_qty=%s reason=no_fill_no_open_order_no_balance_delta manual_reconcile_required=1",
-            symbol, order_no, qty, remaining_qty or "unknown",
+            "filled_qty=%s remaining_qty=%s reason=%s manual_reconcile_required=1",
+            symbol, order_no, qty, fill_quantity_text, remaining_qty or "unknown", evidence_reason,
         )
         unresolved_count += 1
         symbols_by_status["unresolved"].append(symbol)

@@ -41,7 +41,9 @@ def _broker_recovery_health_errors(health: dict | None) -> list[str]:
         ("recovery_health_error_count", "BROKER_RECOVERY_HEALTH_ERRORS"),
         ("unattributed_broker_fills", "BROKER_FILLS_UNATTRIBUTED"),
         ("broker_fill_rebound_failure_count", "BROKER_FILL_REBOUND_FAILED"),
-        ("duplicate_semantic_submit_detection_count", "DUPLICATE_SEMANTIC_SUBMIT"),
+        # This legacy metric counts blocked execution-claim conflicts, NOT broker submits.
+        # Keep it fatal, but do not report it as an actual duplicate order submission.
+        ("duplicate_semantic_submit_detection_count", "EXECUTION_CLAIM_CONFLICT_BLOCKED"),
         ("broker_local_cumulative_fill_mismatch_count", "BROKER_LOCAL_FILL_MISMATCH"),
         ("unresolved_execution_actions", "UNRESOLVED_EXECUTION_ACTIONS"),
         ("filled_sell_missing_cost_basis_count", "FILLED_SELL_COST_BASIS_MISSING"),
