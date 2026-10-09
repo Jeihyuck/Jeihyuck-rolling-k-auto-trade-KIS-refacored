@@ -1892,6 +1892,12 @@ def run_daily_report(
     dated_json_path = f"{dated_dir}/us_daily_report.json"
     
     # Generate markdown
+    # Independent read-only audit; do not modify order/fill states or
+    # normalize different source populations into misleading equality.
+    if session in (None, "close"):
+        from trader.us.runner.close_audit import audit_us_close_report
+        report["cross_source_close_audit"] = audit_us_close_report(report)
+
     md_lines = [
         f"# US Daily Report — {trade_date}",
         "",
