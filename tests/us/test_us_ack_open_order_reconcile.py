@@ -54,7 +54,7 @@ def test_ack_broker_fill_budget_exhaustion_remains_unknown_and_fenced(monkeypatc
 
     class Provider:
         def get_balance(self):
-            raise RuntimeError("balance stage budget exhausted before fetch")
+            return {"positions": [{"symbol": "NVDA", "qty": 1, "orderable_qty": 1, "avg_price": 170}]}
 
         def get_fills_by_order_no(self, **_kwargs):
             raise RuntimeError("tick deadline budget exhausted before KIS request")
