@@ -1056,10 +1056,11 @@ def reconcile_ack_orders_with_balance(
             if fills_lookup_error is not None
             else "no_fill_no_open_order_no_balance_delta"
         )
+        fill_quantity_text = "unknown" if fills_lookup_error is not None else "0"
         logger.error(
             "[US_RECONCILE][ACK_UNRESOLVED_ERROR] symbol=%s order_no=%s requested_qty=%s "
-            "filled_qty=unknown remaining_qty=%s reason=%s manual_reconcile_required=1",
-            symbol, order_no, qty, remaining_qty or "unknown", evidence_reason,
+            "filled_qty=%s remaining_qty=%s reason=%s manual_reconcile_required=1",
+            symbol, order_no, qty, fill_quantity_text, remaining_qty or "unknown", evidence_reason,
         )
         unresolved_count += 1
         symbols_by_status["unresolved"].append(symbol)
