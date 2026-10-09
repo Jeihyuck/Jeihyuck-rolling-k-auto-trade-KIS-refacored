@@ -4166,6 +4166,20 @@ def run_trade_tick(
         "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
         tick_total_ms, accounted_stage_ms, unaccounted_ms,
     )
+    if unaccounted_ms > 2000 or latency_metrics["slot_overrun_300s"]:
+        # Diagnostic-only: expose non-overlapping stage timers without adding
+        # I/O or changing owner decisions, broker fences, or order priorities.
+        logger.warning(
+            "[US_TICK][PHASE_BUDGET] tick=%s total_ms=%.1f residual_ms=%.1f "
+            "pre_entry_residual_ms=%.1f exit_engine_ms=%.1f order_reconcile_ms=%.1f "
+            "fill_persist_ms=%.1f market_state_ms=%.1f entry_engine_ms=%.1f "
+            "tqqq_infinite_ms=%.1f slot_overrun_300s=%d",
+            tick_index, tick_total_ms, unaccounted_ms,
+            latency_metrics["pre_entry_residual_ms"], latency_metrics["exit_engine_ms"],
+            latency_metrics["order_reconcile_ms"], latency_metrics["fill_persist_ms"],
+            latency_metrics["market_state_ms"], latency_metrics["entry_engine_ms"],
+            latency_metrics["tqqq_infinite_ms"], latency_metrics["slot_overrun_300s"],
+        )
     logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
                 tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
     from trader.us.runner.status_contract import classify_runtime_integrity
