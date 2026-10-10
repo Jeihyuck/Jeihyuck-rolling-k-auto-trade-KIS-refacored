@@ -1054,6 +1054,19 @@ def generate_entry_intents(
             and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
             and str((entry_meta or {}).get("entry_style_selected") or "").upper() in {"VCP", "ENTRY_VCP"}
         ):
+            # Reject unproven daily VCP *before* spending the limited HTTP budget.
+            preliminary_proof = entry_meta or {}
+            if (
+                preliminary_proof.get("vcp_pass") is not True
+                or preliminary_proof.get("trend_template_pass") is not True
+                or preliminary_proof.get("vcp_evidence_source") != "completed_daily_ohlcv"
+                or (_as_float_or_none(preliminary_proof.get("pivot_price")) or 0) <= 0
+                or (_as_float_or_none(preliminary_proof.get("vcp_daily_avg_volume20")) or 0) <= 0
+            ):
+                track_skip(symbol, "ENTRY_SETUP_PROOF_INVALID", {
+                    "contract_reason": "vcp_completed_daily_proof_missing",
+                })
+                continue
             vcp_rest_cap = max(0, int(os.getenv("US_VCP_LIVE_REST_MAX_PER_TICK", "1")))
             if vcp_live_rest_used >= vcp_rest_cap:
                 track_skip(symbol, "vcp_live_rest_budget_exhausted")
