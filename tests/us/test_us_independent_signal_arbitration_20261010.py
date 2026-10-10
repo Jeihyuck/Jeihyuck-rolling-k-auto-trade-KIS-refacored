@@ -134,3 +134,102 @@ def test_duplicate_locked_symbol_with_conflicting_styles_never_reaches_broker(mo
         "duplicate_locked_watchlist_symbol",
         "duplicate_locked_watchlist_symbol",
     ]
+
+
+@pytest.mark.parametrize(
+    ("style", "expected_signal", "proof", "expect_volume_probe"),
+    [
+        ("pb1_pullback", "pullback", {}, False),
+        ("momentum", "momentum", {
+            "independent_entry_contract_v1": True,
+            "entry_signal_proof_source": "completed_daily_ohlcv",
+            "momentum_pass": True, "standalone_momentum_score": .90,
+        }, False),
+        ("breakout", "breakout", {
+            "independent_entry_contract_v1": True,
+            "entry_signal_proof_source": "completed_daily_ohlcv",
+            "breakout_pass": True, "breakout_pivot_price": 95,
+        }, False),
+        ("vcp", "vcp", {
+            "vcp_pass": True, "trend_template_pass": True,
+            "pivot_price": 100,
+            "vcp_daily_avg_volume20": 100000,
+            "vcp_evidence_source": "completed_daily_ohlcv",
+        }, True),
+    ],
+)
+def test_all_four_independent_families_create_one_owner_safe_buy_intent(
+    monkeypatch, style, expected_signal, proof, expect_volume_probe
+):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trader.us.db import repos
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+    from trader.us.execution.order_router import route_order
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    for key, val in {
+        "KIS_ENV": "practice",
+        "US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED": "1",
+        "US_MINERVINI_VCP_PROOF_ENABLED": "1",
+        "US_VCP_LIVE_REST_MAX_PER_TICK": "1",
+        "US_MIN_ENTRY_SCORE": ".01",
+        "US_MAX_NEW_ENTRIES_PER_TICK": "1",
+        "US_MAX_ORDER_USD": "5000",
+        "US_MAX_POSITION_WEIGHT": "1",
+        "US_MIN_CASH_BUFFER_USD": "0",
+        "US_MAX_DAILY_NOTIONAL_USD": "50000",
+    }.items():
+        monkeypatch.setenv(key, val)
+    row = {
+        "symbol": "AAPL", "exchange": "NASDAQ", "score": .90,
+        "score_final": .90, "entry_style_selected": style,
+        "entry_style_raw": style,
+        "momentum_score": .80, "breakout_score": .80,
+        "pullback_score": .65, "vcp_score": .9,
+        "rank_final30": 1,
+        "reasons": ["ENTRY_" + ("PULLBACK" if style == "pb1_pullback" else style.upper())],
+        "filters_passed": ["score", "liquidity"],
+        "score_breakdown": {"trend": .9},
+        **proof,
+    }
+    db_row = {
+        "symbol": "AAPL", "exchange": "NASDAQ", "score": .90,
+        "strategy": style, "meta": _merge_us_daily_metrics_meta(row),
+    }
+    locked = canonicalize_us_watchlist_row(db_row)
+    class Provider:
+        calls = 0
+        def get_current_price(self, symbol, exchange):
+            return {"last": "101"}
+        def get_current_price_with_volume(self, symbol, exchange):
+            self.calls += 1
+            return {
+                "last": "101", "tvol": "180000",
+                "quality": "fresh", "stale": False,
+                "source": "KIS_LIVE", "age_sec": 0.0,
+            }
+    p = Provider()
+    diag = {}
+    intents = generate_entry_intents(
+        tickers=None, watchlist_entries=[locked], provider=p,
+        sold_today=set(), available_cash_usd=10000,
+        position_count=0, capital_usd_cap=10000,
+        current_position_symbols=set(),
+        now=datetime(2026, 10, 9, 10, 5, tzinfo=ZoneInfo("America/New_York")),
+        max_new_entries=1, diagnostics=diag,
+    )
+    assert len(intents) == 1, diag
+    assert p.calls == int(expect_volume_probe)
+    intent = intents[0]
+    assert intent["strategy_owner"] == "US_STANDARD"
+    assert intent["entry_signal_type"] == expected_signal
+    routed = route_order(
+        intent, signal_only=True,
+        current_position_symbols=set(), allowed_symbols={"AAPL"},
+    )
+    assert routed["status"] == "SIGNAL_ONLY"
+    assert verify_us_entry_exit_contract(
+        routed["intent"]["meta"]["entry_exit_contract"]
+    )
