@@ -115,3 +115,61 @@ def test_standard_style_prep_db_live_buy_frozen_contract(monkeypatch, raw_style,
 def test_tqqq_still_belongs_to_its_own_infinite_sleeve():
     assert owner_for_symbol("TQQQ") == "TQQQ_INFINITE"
     assert owner_for_symbol("AAPL") == "US_STANDARD"
+
+
+@pytest.mark.parametrize(
+    ("style", "entry_reason"),
+    [
+        ("pb1_pullback", "ENTRY_PULLBACK"),
+        ("momentum", "ENTRY_MOMENTUM"),
+        ("breakout", "ENTRY_BREAKOUT"),
+        ("vcp", "ENTRY_VCP"),
+    ],
+)
+def test_each_family_restarts_with_its_original_frozen_stop_and_tp(
+    monkeypatch, style, entry_reason,
+):
+    """Frozen BUY policy wins even if today's env and PREP change on restart."""
+    from trader.us.entry_exit_contract import (
+        build_us_entry_exit_contract, contract_profit_capture,
+        verify_us_entry_exit_contract,
+    )
+    from trader.us.pb1.us_exit_engine import evaluate_exit
+
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
+    monkeypatch.setenv("US_TP1_PCT", "0.03")
+    monkeypatch.setenv("US_TP2_PCT", "0.05")
+    monkeypatch.setenv("US_TP3_PCT", "0.08")
+
+    frozen = build_us_entry_exit_contract({
+        "symbol": "AAPL", "strategy_owner": "US_STANDARD",
+        "entry_style_selected": entry_reason, "entry_reason": entry_reason,
+        "entry_style_raw": style,
+    })
+    assert verify_us_entry_exit_contract(frozen)
+    frozen_sha = frozen["sha256"]
+    original_tp = contract_profit_capture({"meta": {"entry_exit_contract": frozen}})
+    assert [round(stage["threshold_fraction"], 4) for stage in original_tp["stages"]] == [
+        .03, .05, .08,
+    ]
+
+    # New session/changed global env must not overwrite the original
+    # contract for any strategy owner under US_STANDARD.
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.25")
+    monkeypatch.setenv("US_TP1_PCT", "0.20")
+    monkeypatch.setenv("US_TP2_PCT", "0.30")
+    monkeypatch.setenv("US_TP3_PCT", "0.40")
+
+    position = {
+        "symbol": "AAPL", "exchange": "NASDAQ",
+        "qty": 5, "orderable_qty": 5, "entry_price": 100,
+        "max_price": 100,
+        "meta": {"entry_exit_contract": frozen, "entry_exit_contract_sha256": frozen_sha},
+    }
+    signal = evaluate_exit(position=position, current_price=91.0)
+    assert signal is not None
+    assert signal["exit_type"] == "hard_stop_loss"
+    assert signal["qty"] == 5
+    assert frozen["sha256"] == frozen_sha
+    restart_tp = contract_profit_capture(position)
+    assert restart_tp == original_tp
