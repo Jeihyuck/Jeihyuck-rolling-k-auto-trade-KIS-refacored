@@ -93,7 +93,9 @@ jobs:
             trader/us/runner/trade_tick_runner.py
       - name: Run all US tests including real PostgreSQL recovery
         run: |
-          python -m pytest -q tests/test_kis_ws_price.py tests/us
+          # Do not leak the Actions push event to tests of live dispatcher
+          # session policies; each test supplies the explicit event fixture.
+          env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q tests/test_kis_ws_price.py tests/us
       - name: Run all broker-free offline scenario replays
         run: |
           python -m trader.us.harness.runner --scenario all --offline
