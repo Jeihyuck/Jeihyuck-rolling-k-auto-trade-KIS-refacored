@@ -70,3 +70,10 @@ def test_kr_vcp_without_pivot_break_is_not_entry(monkeypatch):
     evidence = {**_proof(), "pivot": 110.0}
     row = _replay(monkeypatch, evidence)
     assert row["entry_style_selected"] == "PULLBACK"
+
+
+def test_kr_missing_minervini_evidence_does_not_promote_vcp(monkeypatch):
+    evidence = {**_proof(), "vcp_ok": None}
+    row = _replay(monkeypatch, evidence)
+    assert row["entry_style_selected"] == "PULLBACK"
+    assert row.get("vcp_pass") is not True
