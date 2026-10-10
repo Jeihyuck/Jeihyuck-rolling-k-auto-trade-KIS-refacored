@@ -3,11 +3,12 @@ name: US Four-Strategy Merge Gate
 on:
   push:
     branches:
-      - fix/us-20261010-independent-signal-eligibility
+      - review/us-20261010-vcp-prebreakout-arming
   pull_request:
     branches:
       - dual-agent
       - fix/us-20261010-vcp-broker-volume-trigger
+      - fix/us-20261010-independent-signal-eligibility
     paths:
       - 'trader/us/**'
       - 'trader/strategies/pb1_minervini_v2.py'
@@ -43,7 +44,8 @@ jobs:
             tests/us/test_us_four_strategy_proof_provenance_roundtrip_20261010.py \
             tests/us/test_us_momentum_breakout_proof_20261010.py \
             tests/us/test_us_minervini_daily_proof_20261010.py \
-            tests/us/test_us_verified_vcp_entry_selection_20261010.py
+            tests/us/test_us_verified_vcp_entry_selection_20261010.py \
+            tests/us/test_us_vcp_prebreakout_policy_review_20261010.py
 
   full-us-offline-harness:
     name: Full US PostgreSQL and Offline Harness
@@ -91,9 +93,8 @@ jobs:
             trader/us/runner/trade_tick_runner.py
       - name: Run all US tests including real PostgreSQL recovery
         run: |
-          # The runner's push event is not a trading dispatcher event. Tests
-          # install their own explicit event fixtures, so do not inherit the
-          # ambient Actions event or workflow name into dispatcher policy.
+          # Do not leak the Actions push event to tests of live dispatcher
+          # session policies; each test supplies the explicit event fixture.
           env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q tests/test_kis_ws_price.py tests/us
       - name: Run all broker-free offline scenario replays
         run: |

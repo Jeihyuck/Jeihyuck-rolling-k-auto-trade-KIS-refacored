@@ -214,6 +214,7 @@ _US_DAILY_METRIC_FIELDS = (
         "vcp_live_volume", "vcp_live_quote_source",
         "independent_eligible_entry_styles", "independent_arbitration_mode",
         "independent_proof_status",
+        "vcp_setup_armed_before_breakout",
 )
 
 def _merge_us_daily_metrics_meta(row: dict) -> dict:
