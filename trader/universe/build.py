@@ -207,13 +207,13 @@ def _load_seed_rows(path: Path) -> list[dict]:
                     code = str(row.get("code") or "").strip()
                     if not code:
                         continue
-                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
+                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None, "market": str(row.get("market") or "").strip().upper() or None})
             else:
                 f.seek(0)
                 for line in f:
                     code = line.strip()
                     if code:
-                        rows.append({"code": code.zfill(6), "name": None})
+                        rows.append({"code": code.zfill(6), "name": None, "market": None})
     except Exception:
         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
         return []
@@ -391,48 +391,69 @@ def _load_static_seed() -> dict | None:
 
 
 def _load_emergency_seed() -> dict | None:
+    """Use only explicitly market-labeled emergency rows.
+
+    The historical code-only seed is NOT ordered by listing venue, so the old
+    index<=150 heuristic silently misclassified KOSDAQ as KOSPI (and vice versa).
+    Unknown/unlabeled entries fail closed instead of contaminating RS benchmarks,
+    market-state gates, orders and position ownership.
+    """
     emergency_path = Path("data") / "universe_seed.csv"
     rows = _load_seed_rows(emergency_path)
     if not rows:
         return None
 
-    selected_codes = [str(row.get("code") or "").zfill(6) for row in rows if row.get("code")]
-    selected_codes = _dedup([code for code in selected_codes if code])
-    target_total = TARGETS["KOSPI"] + TARGETS["KOSDAQ"]
-    selected_codes = selected_codes[:target_total]
+    invalid = [
+        str(row.get("code") or "")
+        for row in rows
+        if str(row.get("market") or "").strip().upper() not in TARGETS
+    ]
+    if invalid:
+        logger.error(
+            "[UNIVERSE][EMERGENCY_SEED][UNVERIFIED_MARKET] path=%s invalid=%s "
+            "sample=%s action=FAIL_CLOSED require_explicit_code_market_csv",
+            emergency_path, len(invalid), invalid[:10],
+        )
+        return None
 
     members: list[dict] = []
     selected_by_market: dict[str, list[dict]] = {"KOSPI": [], "KOSDAQ": []}
-    split = TARGETS["KOSPI"]
-    for idx, code in enumerate(selected_codes, start=1):
-        market = "KOSPI" if idx <= split else "KOSDAQ"
+    seen: set[str] = set()
+    for row in rows:
+        code = str(row.get("code") or "").zfill(6)
+        market = str(row["market"]).strip().upper()
+        if not TICKER_PATTERN.fullmatch(code) or code in seen:
+            continue
+        seen.add(code)
+        if len(selected_by_market[market]) >= TARGETS[market]:
+            continue
         rank = len(selected_by_market[market]) + 1
-        member = {
+        members.append({
             "code": code,
             "market": market,
             "weight": None,
             "rank": rank,
-            "meta_json": {"name": None, "source": "emergency_seed"},
-        }
-        members.append(member)
-        selected_by_market[market].append({"code": code, "rank": rank, "name": None})
+            "meta_json": {"name": row.get("name"), "source": "emergency_seed_explicit_market"},
+        })
+        selected_by_market[market].append({
+            "code": code, "rank": rank, "name": row.get("name"),
+        })
 
     if not members:
         return None
 
-    payload = _normalize_payload(
-        {
-            "selected": [m["code"] for m in members],
-            "selected_by_market": selected_by_market,
-        }
-    )
+    payload = _normalize_payload({
+        "selected": [m["code"] for m in members],
+        "selected_by_market": selected_by_market,
+    })
     return {
         "payload": payload,
         "members": members,
         "source": "fallback:emergency_seed",
         "params": {
             "path": str(emergency_path),
-            "target_total": target_total,
+            "target_total": sum(TARGETS.values()),
+            "market_source": "explicit_seed_csv",
         },
     }
 
