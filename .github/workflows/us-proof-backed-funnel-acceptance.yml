@@ -1,0 +1,64 @@
+name: US Proof-backed Funnel Acceptance
+
+on:
+  push:
+    branches:
+      - obs/us-20261010-strategy-funnel-stage-counts
+  pull_request:
+    branches:
+      - fix/us-20261010-independent-signal-eligibility
+      - dual-agent
+    paths:
+      - 'trader/us/watchlist_builder.py'
+      - 'trader/us/runner/prep_runner.py'
+      - 'tests/us/**'
+      - '.github/workflows/us-proof-backed-funnel-acceptance.yml'
+
+jobs:
+  proof-backed-funnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TRADING_REGION: "US"
+      KIS_ENV: practice
+      US_PAPER_TRADING_ENABLED: "1"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      US_KIS_ORDER_ALLOWED: "0"
+      PYTHONPATH: "."
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install psycopg2-binary
+      - name: Compile proof and runtime paths
+        run: |
+          python -m py_compile trader/us/watchlist_builder.py trader/us/runner/prep_runner.py
+      - name: Proof observed vs absent, zero, partial and complete
+        run: |
+          python -m pytest -q tests/us/test_us_four_style_funnel_observability_20261010.py
+      - name: Full US PostgreSQL and broker-free regression tests
+        run: |
+          env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q tests/test_kis_ws_price.py tests/us
+      - name: US offline harness
+        run: |
+          python -m trader.us.harness.runner --scenario all --offline
