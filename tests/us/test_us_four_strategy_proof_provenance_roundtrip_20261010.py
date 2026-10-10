@@ -88,3 +88,11 @@ def test_false_proofs_remain_false_through_frozen_contract():
     assert frozen["entry_provenance"]["momentum_pass"] is False
     assert frozen["entry_provenance"]["breakout_pass"] is False
     assert frozen["entry_provenance"]["vcp_pass"] is False
+
+
+def test_tqqq_owner_remains_disjoint_from_four_standard_strategy_contracts():
+    infinite = {
+        "symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE",
+        "entry_style_selected": "momentum", "momentum_pass": True,
+    }
+    assert build_us_entry_exit_contract(infinite) == {}
