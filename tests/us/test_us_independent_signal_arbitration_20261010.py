@@ -256,3 +256,70 @@ def test_vcp_without_live_eligible_prep_proof_cannot_crowd_out_momentum(
     assert selected == expected
     assert ("vcp" in row["independent_eligible_entry_styles"]) is vcp_allowed
     assert row["independent_proof_status"]["vcp"] is vcp_allowed
+
+
+@pytest.mark.parametrize(
+    ("family", "style"),
+    [
+        ("pullback", "ENTRY_PULLBACK"),
+        ("momentum", "ENTRY_MOMENTUM"),
+        ("breakout", "ENTRY_BREAKOUT"),
+        ("vcp", "ENTRY_VCP"),
+    ],
+)
+def test_four_families_real_router_mock_broker_ack_single_claim(monkeypatch, family, style):
+    """Four families traverse real order-claim code; stub KIS gets only one BUY.
+
+    Signal-only tests cannot prove ACK liveness or idempotency. Use the same
+    SQLite-backed durable claim fixture as the router's operational regression
+    suite, and leave all brokerage/network operations stubbed.
+    """
+    from trader.us.execution.order_router import route_order
+    from tests.us.test_us_route_order_claim_boundary import _route_fixture, _intent
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+
+    engine, claim_repo, broker = _route_fixture(monkeypatch)
+    intent = _intent(
+        "2026-10-09",
+        client_order_key="four-style-broker-ack-" + family,
+    )
+    intent.update({
+        "strategy": "us_pb1",
+        "entry_strategy": "us_pb1",
+        "entry_style_selected": style,
+        "entry_signal_type": family,
+        "entry_reason": style,
+        "position_state": "NOT_HELD",
+        "position_action": "NEW_POSITION_BUY",
+        "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY",
+        "exit_policy": "US_SWING_DEFAULT",
+    })
+    intent["meta"] = {
+        "strategy_owner": "US_STANDARD",
+        "entry_style_selected": style,
+        "entry_style_raw": family,
+        "entry_signal_type": family,
+        "entry_reason": style,
+        "entry_strategy": "us_pb1",
+        "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY",
+        "exit_policy": "US_SWING_DEFAULT",
+        "position_state": "NOT_HELD",
+        "position_action": "NEW_POSITION_BUY",
+    }
+    try:
+        first = route_order(intent, kis_client=broker)
+        assert first["status"] == "ACK", first
+        assert broker.calls == 1
+        contract = first["intent"]["meta"]["entry_exit_contract"]
+        assert verify_us_entry_exit_contract(contract)
+        assert contract["entry_provenance"]["entry_style_selected"] == style
+        # A distinct strategy style must not cause a second broker request for
+        # the same symbol/lifecycle/action on a retry.
+        second = route_order({**intent, "client_order_key": "retry-"+family}, kis_client=broker)
+        assert second["status"] != "ACK", second
+        assert broker.calls == 1
+        assert claim_repo.health()["unresolved_execution_actions"] == 1
+    finally:
+        engine.dispose()
