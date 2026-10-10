@@ -198,10 +198,8 @@ def _select_entry_style(
             and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
         )
         if not proof_valid or row.get("momentum_pass") is not True:
-            # Standalone Momentum requires its own completed-daily proof.
-            # The existing Momentum-Pullback hybrid remains a Pullback-family
-            # entry and must not inherit standalone Momentum's new proof gate.
             scores.pop("momentum", None)
+            scores.pop("momentum_pullback", None)
         if not proof_valid or row.get("breakout_pass") is not True:
             scores.pop("breakout", None)
     verified_vcp_prep_proof = (
