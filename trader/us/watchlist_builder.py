@@ -260,8 +260,21 @@ def summarize_us_entry_style_funnel(
     """
     def status(row: dict, family: str) -> bool | None:
         proof = row.get("independent_proof_status")
+        valid_independent_source = (
+            row.get("independent_entry_contract_v1") is True
+            and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+        )
+        valid_vcp_source = (
+            row.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            and _safe_float(row.get("vcp_daily_avg_volume20"), 0.0) > 0
+        )
+        # Even the arbitration result is *not proof that a signal was
+        # evaluated* if the upstream producer never produced valid evidence.
         if isinstance(proof, dict) and type(proof.get(family)) is bool:
-            return proof[family]
+            if family in {"momentum", "breakout"} and valid_independent_source:
+                return proof[family]
+            if family == "vcp" and valid_vcp_source:
+                return proof[family]
         # Upstream signal producer may be enabled while arbitration is off.
         # In that case the completed-daily contract is still a valid signal
         # observation, but not evidence that an independent BUY was allowed.
