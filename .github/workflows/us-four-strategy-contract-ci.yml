@@ -1,0 +1,43 @@
+name: US Four Strategy Contract CI
+
+on:
+  push:
+    branches:
+      - fix/us-20261010-four-strategy-proof-provenance
+  pull_request:
+    branches:
+      - dual-agent
+    paths:
+      - "trader/us/db/repos.py"
+      - "trader/us/score_columns.py"
+      - "trader/us/entry_exit_contract.py"
+      - "tests/us/test_us_four_strategy_proof_provenance_roundtrip_20261010.py"
+      - ".github/workflows/us-four-strategy-contract-ci.yml"
+
+jobs:
+  proof-to-immutable-buy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      TRADING_REGION: US
+      KIS_ENV: practice
+      US_PAPER_TRADING_ENABLED: "1"
+      ALLOW_REAL_ORDER: "0"
+      DRY_RUN: "1"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+      - name: Four families: data proof to immutable contract
+        run: |
+          python -m pytest -q \
+            tests/us/test_us_four_strategy_proof_provenance_roundtrip_20261010.py \
+            tests/us/test_us_momentum_breakout_proof_20261010.py \
+            tests/us/test_us_minervini_daily_proof_20261010.py \
+            tests/us/test_us_verified_vcp_entry_selection_20261010.py \
+            tests/us/test_us_contract_chain_p0_20260919.py
