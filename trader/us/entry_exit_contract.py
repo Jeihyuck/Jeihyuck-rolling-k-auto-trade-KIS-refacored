@@ -93,14 +93,17 @@ def extract_us_entry_exit_contract(*sources: Any) -> dict:
 
 def build_us_entry_exit_contract(*sources: Any) -> dict:
     merged = _merged(*sources)
-    existing = extract_us_entry_exit_contract(*sources)
-    if existing:
-        return existing
-
+    # Owner/symbol scope is authoritative even when a caller supplies a
+    # cryptographically valid US_STANDARD contract in nested meta.  Never
+    # allow TQQQ_INFINITE to inherit another sleeve's frozen exit policy.
     owner = str(merged.get("strategy_owner") or merged.get("sleeve_id") or "US_STANDARD").upper()
     symbol = str(merged.get("symbol") or "").upper()
     if owner == "TQQQ_INFINITE" or symbol == "TQQQ":
         return {}
+
+    existing = extract_us_entry_exit_contract(*sources)
+    if existing:
+        return existing
 
     reasons = merged.get("reasons")
     if not isinstance(reasons, list):
