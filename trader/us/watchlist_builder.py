@@ -204,9 +204,17 @@ def _select_entry_style(
             scores.pop("momentum", None)
         if not proof_valid or row.get("breakout_pass") is not True:
             scores.pop("breakout", None)
+    verified_vcp_prep_proof = (
+        os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") != "1"
+        or (
+            row.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            and _safe_float(row.get("vcp_daily_avg_volume20"), 0.0) > 0
+        )
+    )
     if (
         row.get("vcp_pass") is True
         and row.get("trend_template_pass") is True
+        and verified_vcp_prep_proof
         and vcp_score is not None
     ):
         pivot = _safe_float(row.get("pivot_price"), 0.0)
