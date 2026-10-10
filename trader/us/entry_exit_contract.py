@@ -101,14 +101,16 @@ def extract_us_entry_exit_contract(*sources: Any) -> dict:
 
 def build_us_entry_exit_contract(*sources: Any) -> dict:
     merged = _merged(*sources)
-    existing = extract_us_entry_exit_contract(*sources)
-    if existing:
-        return existing
-
+    # Enforce owner/symbol isolation before any valid frozen-contract reuse.
+    # TQQQ_INFINITE must never inherit a US_STANDARD contract from nested meta.
     owner = str(merged.get("strategy_owner") or merged.get("sleeve_id") or "US_STANDARD").upper()
     symbol = str(merged.get("symbol") or "").upper()
     if owner == "TQQQ_INFINITE" or symbol == "TQQQ":
         return {}
+
+    existing = extract_us_entry_exit_contract(*sources)
+    if existing:
+        return existing
 
     reasons = merged.get("reasons")
     if not isinstance(reasons, list):
