@@ -69,7 +69,12 @@ def main() -> int:
     started = time.monotonic()
     try:
         market_map = _load_krx_listing_market_map()
-        emergency = _load_emergency_seed()
+        # Reuse one verified listing snapshot: do not double HTTP-fetch KRX or
+        # obtain inconsistent venues during the same read-only probe.
+        from unittest.mock import patch
+        with patch("trader.universe.build._load_krx_listing_market_map",
+                   return_value=market_map):
+            emergency = _load_emergency_seed()
         report = build_report(
             seed, market_map, elapsed_s=time.monotonic() - started,
             emergency=emergency,
