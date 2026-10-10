@@ -168,14 +168,35 @@ def _compute_vcp_score(row: dict) -> float:
     return round((atr_score * 0.5 + trend_score * 0.5), 4)
 
 
-def _select_entry_style(row: dict, pb1_score: float, momentum_score: float, pullback_score: float, breakout_score: float) -> str:
-    """entry 스타일 선택."""
+def _select_entry_style(
+    row: dict,
+    pb1_score: float,
+    momentum_score: float,
+    pullback_score: float,
+    breakout_score: float,
+    vcp_score: float | None = None,
+) -> str:
+    """Select among independently qualified entry styles.
+
+    VCP requires confirmed Minervini-style contraction, trend-template and
+    a verifiable pivot break; the score-only ATR proxy is NOT a VCP signal.
+    Absence of that evidence keeps historical PB1/Momentum/Breakout behavior.
+    """
     scores = {
         "momentum_pullback": momentum_score * 0.4 + pullback_score * 0.6,
         "breakout": breakout_score,
         "pb1_pullback": pb1_score,
         "momentum": momentum_score,
     }
+    if (
+        row.get("vcp_pass") is True
+        and row.get("trend_template_pass") is True
+        and vcp_score is not None
+    ):
+        pivot = _safe_float(row.get("pivot_price"), 0.0)
+        close = _safe_float(row.get("close") or row.get("price"), 0.0)
+        if pivot > 0 and close >= pivot:
+            scores["vcp"] = vcp_score
     return max(scores, key=lambda k: scores[k])
 
 
@@ -199,7 +220,7 @@ def _compute_agent_b_score(row: dict, daily_rows: list[dict]) -> tuple[float, li
     )
     agent_b_score = max(0.0, min(1.0, agent_b_score))
 
-    entry_style = _select_entry_style(row, pb1_score, momentum_score, pullback_score, breakout_score)
+    entry_style = _select_entry_style(row, pb1_score, momentum_score, pullback_score, breakout_score, vcp_score)
 
     reasons: list[str] = []
     ma20 = row.get("ma20")
