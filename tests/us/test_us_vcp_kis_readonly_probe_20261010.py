@@ -28,6 +28,7 @@ def test_readonly_probe_requires_two_fresh_monotonic_broker_observations():
         ([sample(1000)], True, "requires_two_independent_get_responses"),
         ([sample(1000), sample(1100)], False, "outside_us_regular_session"),
         ([sample(1100), sample(1000)], True, "sample_1_volume_decreased_same_session"),
+        ([sample(1100), sample(1100)], True, "no_observed_same_session_volume_increase"),
         ([sample(0), sample(1000)], True, "sample_0_no_day_volume"),
         ([sample(1000), sample(1200, source="KIS_WEBSOCKET")], True, "sample_1_unverified_source"),
         ([sample(1000), sample(1200, age=40)], True, "sample_1_stale_timestamp"),
