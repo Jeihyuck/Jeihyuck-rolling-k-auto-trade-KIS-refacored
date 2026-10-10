@@ -323,6 +323,10 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
         "rank_final30", "agent_a_score", "agent_b_score",
         "theme_cluster", "sector", "industry", "market_state",
         "rotation_regime", "market_regime",
+        "independent_entry_contract_v1", "momentum_pass", "standalone_momentum_score",
+        "breakout_pass", "breakout_pivot_price", "entry_signal_proof_source",
+        "vcp_pass", "trend_template_pass", "pivot_price",
+        "vcp_evidence", "vcp_evidence_source", "vcp_evidence_status",
     )
     for field in provenance_fields:
         value = src.get(field)

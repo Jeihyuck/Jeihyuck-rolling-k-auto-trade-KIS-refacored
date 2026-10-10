@@ -18,6 +18,10 @@ _PROVENANCE_FIELDS = (
     "reasons", "filters_passed", "score_breakdown", "explanation_quality",
     "rank_final30", "score_final", "trend_score", "theme_cluster", "sector",
     "industry", "market_state", "market_regime", "rotation_regime",
+    "independent_entry_contract_v1", "momentum_pass", "standalone_momentum_score",
+    "breakout_pass", "breakout_pivot_price", "entry_signal_proof_source",
+    "vcp_pass", "trend_template_pass", "pivot_price",
+    "vcp_evidence", "vcp_evidence_source", "vcp_evidence_status",
 )
 
 
