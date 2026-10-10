@@ -410,7 +410,7 @@ def _load_krx_listing_market_map() -> dict[str, str]:
     ambiguous: set[str] = set()
     for code_raw, market_raw in zip(listing[code_col], listing[market_col]):
         code = _normalize_code(code_raw)
-        venue = str(market_raw or "").strip().upper()
+        venue = str(market_raw).strip().upper()
         if not TICKER_PATTERN.fullmatch(code) or venue not in TARGETS:
             continue
         old = mapping.get(code)
