@@ -43,6 +43,25 @@ def _merged(*sources: Any) -> dict:
     return out
 
 
+
+def _is_infinite_sleeve_context(*sources: Any) -> bool:
+    """Never reuse a US_STANDARD frozen contract in the TQQQ Infinite sleeve.
+
+    Inspect every explicit source and its nested meta, not just a last-write-
+    wins merged dict: a stale contract/meta can carry a conflicting owner.
+    The asset symbol is authoritative even when a copied owner says STANDARD.
+    """
+    for source in sources:
+        data = _dict(source)
+        for context in (data, _dict(data.get("meta"))):
+            if str(context.get("symbol") or "").strip().upper() == "TQQQ":
+                return True
+            for field in ("strategy_owner", "sleeve_id"):
+                if str(context.get(field) or "").strip().upper() == "TQQQ_INFINITE":
+                    return True
+    return False
+
+
 def _sha(payload: dict) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -63,6 +82,7 @@ def verify_us_entry_exit_contract(contract: Any) -> bool:
 
 def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
     """Return NONE, VALID, or INVALID for an explicitly claimed v2 contract."""
+    foreign_owner = _is_infinite_sleeve_context(*sources)
     claimed = False
     for source in sources:
         data = _dict(source)
@@ -75,6 +95,10 @@ def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
                 claimed = True
                 parsed = _dict(candidate)
                 if parsed and verify_us_entry_exit_contract(parsed):
+                    if foreign_owner:
+                        # A correctly signed STANDARD contract is still invalid
+                        # for an Infinite-owned position.
+                        continue
                     if digest and digest != parsed.get("sha256"):
                         continue
                     return "VALID"
@@ -82,6 +106,8 @@ def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
 
 
 def extract_us_entry_exit_contract(*sources: Any) -> dict:
+    if _is_infinite_sleeve_context(*sources):
+        return {}
     for source in sources:
         data = _dict(source)
         for candidate in (data.get("entry_exit_contract"), _dict(data.get("meta")).get("entry_exit_contract")):
@@ -92,6 +118,10 @@ def extract_us_entry_exit_contract(*sources: Any) -> dict:
 
 
 def build_us_entry_exit_contract(*sources: Any) -> dict:
+    # Owner-first: never return a pre-existing STANDARD contract before
+    # checking the destination position's dedicated Infinite sleeve.
+    if _is_infinite_sleeve_context(*sources):
+        return {}
     merged = _merged(*sources)
     existing = extract_us_entry_exit_contract(*sources)
     if existing:
