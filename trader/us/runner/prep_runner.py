@@ -801,6 +801,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "top50_count": contract.get("top50_count", watchlist_result.get("top50_count", 0)),
         "final30_count": contract.get("final30_count", wl_final30),
         "final30_scored_count": contract.get("final30_scored_count", wl_final30),
+        "strategy_funnel": watchlist_result.get("strategy_funnel", {}),
         "score_nonzero_count": contract.get("score_nonzero_count", score_nonzero_count),
         "contract_ok": contract_ok,
         "cluster_contract_ok": cluster_contract_ok,
