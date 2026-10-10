@@ -86,13 +86,26 @@ def run_probe(symbol: str, exchange: str, *, samples: int, interval: float) -> d
     os.environ["US_KIS_PRICE_CACHE_TTL_SEC"] = "0"
     client = KisUSClient(env="practice", offline=False)
     et = ZoneInfo("America/New_York")
+    from trader.us.market_calendar import (
+        is_us_regular_market_open,
+        us_calendar_load_error,
+        us_calendar_supported_years,
+    )
+    # Do not validate a KIS quote on a weekend, full holiday, early-close
+    # afternoon or an unsupported/corrupt trading calendar. Weekday-only tests
+    # incorrectly treat all those periods as active regular US sessions.
+    if us_calendar_load_error():
+        return {"status": "INCONCLUSIVE", "read_only": True,
+                "reason_type": "US_MARKET_CALENDAR_UNAVAILABLE"}
     observed: list[dict] = []
     session_days: set[str] = set()
     regular_flags: list[bool] = []
     for index in range(samples):
         now_et = datetime.now(et)
-        regular = (now_et.weekday() < 5 and
-                   day_time(9, 30) <= now_et.time() < day_time(16, 0))
+        regular = (
+            now_et.year in us_calendar_supported_years()
+            and is_us_regular_market_open(now_et)
+        )
         regular_flags.append(regular)
         session_days.add(now_et.date().isoformat())
         started = time.monotonic()
