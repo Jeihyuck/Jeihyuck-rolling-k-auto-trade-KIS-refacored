@@ -44,6 +44,7 @@ def summarize_quotes(samples: list[dict], *, regular_session: bool) -> dict:
     if len(samples) < 2:
         issues.append("requires_two_independent_get_responses")
     previous_volume: float | None = None
+    observed_volume_increase = False
     for i, sample in enumerate(samples):
         age = sample.get("age_sec")
         age = 0.0 if age == 0 else _positive(age)
@@ -56,10 +57,17 @@ def summarize_quotes(samples: list[dict], *, regular_session: bool) -> dict:
         volume = _positive(sample.get("tvol"))
         if volume is None:
             issues.append(f"sample_{i}_no_day_volume")
-        elif previous_volume is not None and volume < previous_volume:
-            issues.append(f"sample_{i}_volume_decreased_same_session")
+        elif previous_volume is not None:
+            if volume < previous_volume:
+                issues.append(f"sample_{i}_volume_decreased_same_session")
+            elif volume > previous_volume:
+                observed_volume_increase = True
         if volume is not None:
             previous_volume = volume
+    if len(samples) >= 2 and not observed_volume_increase:
+        # Two equal total-volume responses may simply be the previous session's
+        # repeated quote. A quiet symbol is INCONCLUSIVE, never a false PASS.
+        issues.append("no_observed_same_session_volume_increase")
     return {
         "status": "OBSERVATIONS_PASS" if not issues else "INCONCLUSIVE",
         "sample_count": len(samples),
