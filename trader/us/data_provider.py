@@ -814,43 +814,6 @@ class USDataProvider:
             )
             return None
 
-    def get_current_price_with_volume(self, symbol: str, exchange: str) -> dict:
-        """Fetch broker-verified intraday volume for a confirmed VCP only.
-
-        The US websocket carries reliable LAST but our current parser provides
-        no accumulated volume. Do not treat its tvol=0 placeholder, a daily
-        candle or a stale DB price as current breakout-volume evidence. The
-        caller imposes a strict per-tick REST budget and fail-closed gate.
-        """
-        if self._stage_cancelled():
-            from trader.us.execution.kis_us_client import KisUSTemporaryError
-            raise KisUSTemporaryError("VCP quote stage cancelled")
-        if self._offline:
-            # Never imply the test stub is real observed broker volume.
-            return {"last": "0", "tvol": "0", "quality": "offline",
-                    "stale": True, "source": "OFFLINE_NO_BROKER_VOLUME"}
-        ctx = self._tick_context
-        if ctx is not None:
-            ctx.count("quote_http_calls")
-        result = self._get_client().get_us_price(symbol, exchange)
-        if self._stage_cancelled():
-            from trader.us.execution.kis_us_client import KisUSTemporaryError
-            raise KisUSTemporaryError("VCP quote stage cancelled after REST")
-        output = result.get("output") if isinstance(result, dict) else {}
-        if not isinstance(output, dict):
-            output = {}
-        quality = str(result.get("_quote_quality") or "UNKNOWN").upper()
-        return {
-            "last": output.get("last"),
-            "tvol": output.get("tvol"),
-            "quality": quality.lower(),
-            "stale": quality in {"STALE", "SUSPECT", "DEGRADED", "UNKNOWN"},
-            "source": str(result.get("_quote_source") or "UNKNOWN"),
-            "asof_epoch": result.get("_quote_asof_epoch"),
-            "age_sec": result.get("_quote_age_sec"),
-            "symbol": symbol,
-        }
-
     def get_current_price(self, symbol: str, exchange: str) -> dict:
         """현재가 조회 (KIS → DB stale fallback)."""
         if self._stage_cancelled():
@@ -1002,6 +965,43 @@ class USDataProvider:
             if ctx is not None:
                 ctx.metrics["price_fetch_ms"] = float(ctx.metrics.get("price_fetch_ms", 0.0)) + (__import__("time").monotonic() - started) * 1000.0
 
+
+    def get_current_price_with_volume(self, symbol: str, exchange: str) -> dict:
+        """Fetch broker-verified intraday volume for a confirmed VCP only.
+
+        The US websocket carries reliable LAST but our current parser provides
+        no accumulated volume. Do not treat its tvol=0 placeholder, a daily
+        candle or a stale DB price as current breakout-volume evidence. The
+        caller imposes a strict per-tick REST budget and fail-closed gate.
+        """
+        if self._stage_cancelled():
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            raise KisUSTemporaryError("VCP quote stage cancelled")
+        if self._offline:
+            # Never imply the test stub is real observed broker volume.
+            return {"last": "0", "tvol": "0", "quality": "offline",
+                    "stale": True, "source": "OFFLINE_NO_BROKER_VOLUME"}
+        ctx = self._tick_context
+        if ctx is not None:
+            ctx.count("quote_http_calls")
+        result = self._get_client().get_us_price(symbol, exchange)
+        if self._stage_cancelled():
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            raise KisUSTemporaryError("VCP quote stage cancelled after REST")
+        output = result.get("output") if isinstance(result, dict) else {}
+        if not isinstance(output, dict):
+            output = {}
+        quality = str(result.get("_quote_quality") or "UNKNOWN").upper()
+        return {
+            "last": output.get("last"),
+            "tvol": output.get("tvol"),
+            "quality": quality.lower(),
+            "stale": quality in {"STALE", "SUSPECT", "DEGRADED", "UNKNOWN"},
+            "source": str(result.get("_quote_source") or "UNKNOWN"),
+            "asof_epoch": result.get("_quote_asof_epoch"),
+            "age_sec": result.get("_quote_age_sec"),
+            "symbol": symbol,
+        }
 
     def get_completed_daily_prices_result(
         self,
