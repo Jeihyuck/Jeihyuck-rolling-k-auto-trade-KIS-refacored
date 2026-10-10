@@ -1,0 +1,46 @@
+name: US Four-Strategy Merge Gate
+
+on:
+  push:
+    branches:
+      - fix/us-20261010-independent-signal-eligibility
+  pull_request:
+    branches:
+      - dual-agent
+      - fix/us-20261010-vcp-broker-volume-trigger
+    paths:
+      - 'trader/us/**'
+      - 'trader/strategies/pb1_minervini_v2.py'
+      - 'tests/us/**'
+      - '.github/workflows/us-four-strategy-merge-gate.yml'
+
+jobs:
+  invariant-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KIS_ENV: practice
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED: "1"
+      US_MINERVINI_VCP_PROOF_ENABLED: "1"
+      US_VCP_LIVE_REST_MAX_PER_TICK: "1"
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+      - name: Four-family proof, idempotency, frozen-exit and VCP live gates
+        run: |
+          python -m pytest -q \
+            tests/us/test_us_independent_signal_arbitration_20261010.py \
+            tests/us/test_us_vcp_live_broker_trigger_20261010.py \
+            tests/us/test_us_independent_live_proof_gate_20261010.py \
+            tests/us/test_us_four_strategy_proof_provenance_roundtrip_20261010.py \
+            tests/us/test_us_momentum_breakout_proof_20261010.py \
+            tests/us/test_us_minervini_daily_proof_20261010.py \
+            tests/us/test_us_verified_vcp_entry_selection_20261010.py
