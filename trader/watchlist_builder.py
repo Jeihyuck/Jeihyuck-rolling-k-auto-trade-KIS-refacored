@@ -57,6 +57,25 @@ from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_kr_rs_score_100(value: Any) -> float:
+    """Normalize known KR RS ratio (0..1) or percentage (0..100) to points.
+
+    Both Final30 weighted RS and the technical-score RS component consume
+    0..100. DerivedMinervini and `rs_pctile` persist 0..1. Mixed scoring
+    units previously suppressed Momentum/Breakout qualification.
+    """
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(numeric):
+        return 0.0
+    if 0.0 < numeric <= 1.0:
+        numeric *= 100.0
+    return min(100.0, max(0.0, numeric))
+
+
 FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]]
 
 
@@ -2880,7 +2899,12 @@ class WatchlistBuilder:
             item["institution_net_buy_5d"] = inst_ratio
             item["flow_factor_score"] = flow_factor_score
 
-            ai_rs_score = float(item.get("ai_rs_score", item.get("rs_pctile", 0.0)) or 0.0)
+            # Final30 AI-RS factor is also 0..100. Without this boundary
+            # normalization a .99 percentile ratio contributes .297 points
+            # instead of 29.7 to the existing 30%-weighted final score.
+            ai_rs_score = _normalize_kr_rs_score_100(
+                item.get("ai_rs_score", item.get("rs_pctile", 0.0))
+            )
             trend_score = float(item.get("trend_score", 0.0) or 0.0)
             pullback_score = max(0.0, min(100.0, 100.0 - float(item.get("pullback_pct", 0.0) or 0.0) * 400.0))
             liquidity_score = float(item.get("liquidity_score", 0.0) or 0.0)
@@ -3800,10 +3824,7 @@ class WatchlistBuilder:
         # Without normalization, a 99th-percentile stock contributes 0.30
         # rather than 29.70 points to the technical score. Respect already
         # normalized 0..100 producers unchanged.
-        rs_component_raw = rs_score if rs_score > 0 else rs_pct
-        if 0.0 < rs_component_raw <= 1.0:
-            rs_component_raw *= 100.0
-        rs_component = max(0.0, min(rs_component_raw, 100.0))
+        rs_component = _normalize_kr_rs_score_100(rs_score if rs_score > 0 else rs_pct)
         
         # 2. VCP Component
         vcp_score = _safe_float(_row_get(row, "vcp_score", 0.0))
