@@ -3,9 +3,20 @@ from trader.us.watchlist_builder import summarize_us_entry_style_funnel
 
 
 def row(style, *, signals=None, **extra):
-    result = {"entry_style_selected": style, **extra}
+    result = {"entry_style_selected": style}
     if signals is not None:
-        result["independent_proof_status"] = dict(signals)
+        result.update({
+            "independent_entry_contract_v1": True,
+            "entry_signal_proof_source": "completed_daily_ohlcv",
+            "vcp_evidence_source": "completed_daily_ohlcv",
+            "vcp_daily_avg_volume20": 20000,
+            "vcp_pass": signals.get("vcp") is True,
+            "trend_template_pass": signals.get("vcp") is True,
+            "pivot_price": 100.0,
+            "close": 101.0,
+            "independent_proof_status": dict(signals),
+        })
+    result.update(extra)
     return result
 
 
@@ -92,4 +103,22 @@ def test_empty_stage_is_not_reported_as_proven_zero():
     report = summarize_us_entry_style_funnel([], [], [])["final30"]
     assert report["total"] == 0
     assert report["momentum_proof_pass"] is None
+    assert all(v == "NOT_EVALUATED" for v in report["proof_coverage"].values())
+
+
+def test_untrusted_arbitration_false_without_completed_daily_source_is_unknown():
+    # A flag can be false because the proof producer failed, not because the
+    # independent signal was actually evaluated and rejected.
+    rows = [
+        row("momentum", signals={"momentum": False, "breakout": False, "vcp": False},
+            independent_entry_contract_v1=False, entry_signal_proof_source="unknown",
+            vcp_evidence_source="unknown"),
+        row("breakout", signals={"momentum": True, "breakout": True, "vcp": True},
+            independent_entry_contract_v1=False, entry_signal_proof_source=None,
+            vcp_daily_avg_volume20=0),
+    ]
+    report = summarize_us_entry_style_funnel(rows, [], [])["broader_scored"]
+    assert report["momentum_proof_pass"] is None
+    assert report["breakout_proof_pass"] is None
+    assert report["vcp_proof_pass"] is None
     assert all(v == "NOT_EVALUATED" for v in report["proof_coverage"].values())
