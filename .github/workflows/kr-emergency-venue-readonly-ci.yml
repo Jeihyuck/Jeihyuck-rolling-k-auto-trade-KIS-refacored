@@ -4,9 +4,15 @@ on:
   push:
     branches:
       - fix/kr-20261010-verified-fdr-emergency-market
+      - feat/kr-20261010-vcp-style-provenance
+      - feat/kr-20261010-minervini-proof-bridge
+      - fix/kr-20261010-rs-tech-score-unit
   pull_request:
     branches:
       - fix/kr-20261010-regime-market-and-rs-contract
+      - fix/kr-20261010-verified-fdr-emergency-market
+      - feat/kr-20261010-vcp-style-provenance
+      - feat/kr-20261010-minervini-proof-bridge
       - dual-agent
     paths:
       - "scripts/kr_emergency_venue_readonly_probe.py"
