@@ -436,6 +436,51 @@ def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, ent
         return False, "ENTRY_EXPLAIN_CONTRACT_ERROR"
     return True, ""
 
+def _validate_us_independent_new_buy_proof(
+    entry_meta: dict | None, canonical_style: str,
+) -> tuple[bool, str]:
+    """Reject unproven independent BUY signals before broker/risk routing.
+
+    Pullback and established hybrid contracts remain unchanged. Only newly
+    enabled independent Momentum/Breakout, or explicit VCP, require their own
+    completed-PREP setup proof. Add-to-existing positions use their frozen
+    lifecycle contract and are not revalidated here.
+    """
+    data = entry_meta or {}
+    style = str(canonical_style or "").strip().upper()
+    if style == "ENTRY_VCP":
+        pivot = _as_float_or_none(data.get("pivot_price"))
+        if (
+            data.get("vcp_pass") is not True
+            or data.get("trend_template_pass") is not True
+            or pivot is None or pivot <= 0
+        ):
+            return False, "vcp_evidence_missing_or_invalid"
+        if os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1":
+            if data.get("vcp_evidence_source") != "completed_daily_ohlcv":
+                return False, "vcp_completed_daily_evidence_missing"
+        return True, ""
+
+    if os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") != "1":
+        return True, ""
+    if style not in {"ENTRY_MOMENTUM", "ENTRY_BREAKOUT"}:
+        return True, ""
+    if (
+        data.get("independent_entry_contract_v1") is not True
+        or data.get("entry_signal_proof_source") != "completed_daily_ohlcv"
+    ):
+        return False, "independent_prep_proof_missing"
+    if style == "ENTRY_MOMENTUM":
+        score = _as_float_or_none(data.get("standalone_momentum_score"))
+        if data.get("momentum_pass") is not True or score is None or score < 0:
+            return False, "momentum_prep_proof_missing"
+    else:
+        pivot = _as_float_or_none(data.get("breakout_pivot_price"))
+        if data.get("breakout_pass") is not True or pivot is None or pivot <= 0:
+            return False, "breakout_prep_proof_missing"
+    return True, ""
+
+
 def _can_reenter_after_soft_exit(symbol: str, entry_meta: dict, now: datetime | None = None) -> bool:
     """Allow limited same-day reentry only after a recoverable soft/profit-trailing exit.
 
@@ -1178,6 +1223,19 @@ def generate_entry_intents(
                 continue
             entry_meta["entry_style_selected"] = provenance_state.get("normalized_style")
             entry_style_for_contract = str(provenance_state.get("normalized_style") or "")
+            proof_ok, proof_reason = _validate_us_independent_new_buy_proof(
+                entry_meta, entry_style_for_contract,
+            )
+            if not proof_ok:
+                track_skip(symbol, "ENTRY_SETUP_PROOF_INVALID", {
+                    "entry_style": entry_style_for_contract,
+                    "contract_reason": proof_reason,
+                })
+                logger.error(
+                    "[US_ENTRY][INDEPENDENT_PROOF_BLOCK] symbol=%s family=%s reason=%s",
+                    symbol, entry_style_for_contract, proof_reason,
+                )
+                continue
             ok_contract, contract_reason = _validate_new_buy_explain_contract(
                 symbol, entry_meta, entry_style_for_contract, signal_score=score
             )
