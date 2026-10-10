@@ -22,6 +22,10 @@ import sys
 import time
 from datetime import datetime, time as day_time
 from zoneinfo import ZoneInfo
+from pathlib import Path
+
+# Running `python scripts/this_file.py` does not otherwise add repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _positive(value: object) -> float | None:
