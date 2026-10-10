@@ -282,11 +282,12 @@ NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_p
 NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
 
 # ── entry style 허용값 상수 ─────────────────────────────────────────────────────
-ALLOWED_ENTRY_STYLES = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+ALLOWED_ENTRY_STYLES = {"BREAKOUT", "PULLBACK", "MOMENTUM", "VCP"}
 ENTRY_STYLE_SCORE_KEYS = {
     "BREAKOUT": "breakout_score",
     "PULLBACK": "pullback_score",
     "MOMENTUM": "momentum_score",
+    "VCP": "vcp_score",
 }
 FINAL30_CANONICAL_NUMERIC_FIELDS = (
     "close",
@@ -777,6 +778,7 @@ def _normalize_entry_style_value(value: Any) -> str:
         "MOM": "MOMENTUM",
         "ENTRY_MOMENTUM": "MOMENTUM",
         "MOMENTUM_CONTINUATION": "MOMENTUM",
+        "ENTRY_VCP": "VCP",
     }
     return aliases.get(raw, raw)
 
@@ -3852,6 +3854,11 @@ class WatchlistBuilder:
                 entry_style_selected = "MOMENTUM"
             else:
                 entry_style_selected = top_style
+        # VCP is an independent setup only with explicit proven pattern evidence.
+        # A generic volatility score is NOT sufficient to label VCP.
+        raw_vcp_style = str(_row_get(row, "entry_style_selected", "") or "").strip().upper()
+        if raw_vcp_style in {"VCP", "ENTRY_VCP"} and _row_get(row, "vcp_pass", False) is True:
+            entry_style_selected = "VCP"
         _row_set(row, "entry_style_selected", entry_style_selected)
         _row_set(row, "breakout_pass", breakout_score >= 55.0)
         _row_set(row, "pullback_pass", pullback_score >= 55.0)
@@ -4257,7 +4264,7 @@ def assert_final30_scored_contract(
     
     # Check entry_style validity
     if "entry_style_selected" in df.columns:
-        valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+        valid_styles = ALLOWED_ENTRY_STYLES
         invalid_count = sum(
             1 for v in df["entry_style_selected"] 
             if pd.notna(v) and str(v).upper() not in valid_styles
@@ -5262,7 +5269,7 @@ def _publish_kr_core_artifact_if_valid(
     ma20_null = int(df["ma20"].isna().sum()) if "ma20" in df.columns else -1
     score_final_nonzero = int(pd.to_numeric(df.get("score_final", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not df.empty else 0
     tech_score_nonzero = int(pd.to_numeric(df.get("tech_score", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not df.empty else 0
-    valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+    valid_styles = ALLOWED_ENTRY_STYLES
     entry_style_invalid = int(df["entry_style_selected"].apply(lambda v: str(v or "").strip().upper() not in valid_styles).sum()) if "entry_style_selected" in df.columns else len(artifact_rows)
     if not (
         len(artifact_rows) == 30
