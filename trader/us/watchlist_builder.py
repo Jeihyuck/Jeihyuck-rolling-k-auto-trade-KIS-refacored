@@ -209,7 +209,10 @@ def _select_entry_style(
     ):
         pivot = _safe_float(row.get("pivot_price"), 0.0)
         close = _safe_float(row.get("close") or row.get("price"), 0.0)
-        vcp_prebreakout_arming = os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+        vcp_prebreakout_arming = (
+            os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+            and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+        )
         if vcp_prebreakout_arming:
             # This is a POLICY REVIEW opt-in. A real Minervini setup often
             # waits below the pivot until the live session confirms breakout.
