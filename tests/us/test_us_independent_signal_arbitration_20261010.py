@@ -66,7 +66,7 @@ def test_each_independently_proven_family_can_win_one_symbol(monkeypatch, style,
         ({"independent_entry_contract_v1": None}, False),
         ({"entry_signal_proof_source": None}, False),
         ({"entry_signal_proof_source": "stale_or_unknown"}, False),
-        ({"momentum_pass": False, "breakout_pass": False}, True),
+        ({"momentum_pass": False, "breakout_pass": False}, False),
     ],
 )
 def test_independent_proofs_do_not_pass_on_missing_source(monkeypatch, override, eligible):
