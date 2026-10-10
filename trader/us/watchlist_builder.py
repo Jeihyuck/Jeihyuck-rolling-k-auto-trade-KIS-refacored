@@ -188,6 +188,17 @@ def _select_entry_style(
         "pb1_pullback": pb1_score,
         "momentum": momentum_score,
     }
+    # New independent execution path is opt-in and requires fresh, completed-
+    # daily PREP signal proof. Do not silently promote raw scores to BUY setups.
+    if (
+        os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") == "1"
+        and row.get("independent_entry_contract_v1") is True
+    ):
+        if row.get("momentum_pass") is not True:
+            scores.pop("momentum", None)
+            scores.pop("momentum_pullback", None)
+        if row.get("breakout_pass") is not True:
+            scores.pop("breakout", None)
     if (
         row.get("vcp_pass") is True
         and row.get("trend_template_pass") is True
