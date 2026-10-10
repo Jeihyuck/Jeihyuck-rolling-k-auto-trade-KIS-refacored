@@ -3795,7 +3795,15 @@ class WatchlistBuilder:
         # 1. RS Component
         rs_pct = _safe_float(_row_get(row, "rs_percentile", 0.0))
         rs_score = _safe_float(_row_get(row, "rs_score", rs_pct))
-        rs_component = max(0.0, min(rs_score if rs_score > 0 else rs_pct, 100.0))
+        # DerivedMinervini stores RS as a percentile ratio (0..1), while
+        # this 30%-weighted component is explicitly scored on 0..100.
+        # Without normalization, a 99th-percentile stock contributes 0.30
+        # rather than 29.70 points to the technical score. Respect already
+        # normalized 0..100 producers unchanged.
+        rs_component_raw = rs_score if rs_score > 0 else rs_pct
+        if 0.0 < rs_component_raw <= 1.0:
+            rs_component_raw *= 100.0
+        rs_component = max(0.0, min(rs_component_raw, 100.0))
         
         # 2. VCP Component
         vcp_score = _safe_float(_row_get(row, "vcp_score", 0.0))
