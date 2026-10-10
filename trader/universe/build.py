@@ -482,7 +482,7 @@ def _load_emergency_seed() -> dict | None:
                 )
                 return None
             verified_rows.append({**row, "market": venue})
-        if len(verified_rows) < max(1, int(len(rows) * 0.95)):
+        if len(verified_rows) / len(rows) < 0.95:
             logger.error(
                 "[UNIVERSE][EMERGENCY_SEED][LOW_KRX_COVERAGE] "
                 "seed=%d verified=%d dropped=%d action=FAIL_CLOSED",
