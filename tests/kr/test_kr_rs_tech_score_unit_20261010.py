@@ -2,7 +2,7 @@
 import pytest
 
 from trader.pb1_engine import PB1Engine
-from trader.watchlist_builder import WatchlistBuilder
+from trader.watchlist_builder import WatchlistBuilder, _normalize_kr_rs_score_100
 
 
 def _candidate(rs: float):
@@ -68,3 +68,23 @@ def test_zero_rs_is_zero_not_arbitrarily_inflated():
     builder = object.__new__(WatchlistBuilder)
     score = builder._compute_tech_score(_candidate(0.0))
     assert score == pytest.approx(.20*10 + .20*100 + .20*85 + .10*80)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (0.98974358974359, 98.974358974359),
+        (98.974358974359, 98.974358974359),
+        (0.6, 60.0),
+        (60.0, 60.0),
+        (0.0, 0.0),
+        (None, 0.0),
+        (float("nan"), 0.0),
+        (float("inf"), 0.0),
+    ],
+)
+def test_final30_ai_rs_factor_uses_the_same_0_to_100_units(raw, expected):
+    score100 = _normalize_kr_rs_score_100(raw)
+    assert score100 == pytest.approx(expected, abs=1e-9)
+    # Existing policy: 30% RS weight. Do not relax thresholds or reweight.
+    assert 0.30 * score100 == pytest.approx(0.30 * expected, abs=1e-9)
