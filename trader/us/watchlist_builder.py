@@ -245,6 +245,78 @@ def _select_entry_style(
     return max(scores, key=lambda k: scores[k])
 
 
+def summarize_us_entry_style_funnel(
+    broader_scored: list[dict],
+    top50: list[dict],
+    final30: list[dict],
+) -> dict:
+    """Report the PREP strategy funnel without modifying selection or risk gates.
+
+    Momentum-Pullback is deliberately counted as a hybrid (its frozen exit
+    family is Pullback), not as a standalone Momentum fill. Verified VCP counts
+    require actual proof, rather than a high ATR/volatility proxy alone.
+    """
+    stages = {
+        "broader_scored": broader_scored,
+        "top50": top50,
+        "final30": final30,
+    }
+    result: dict[str, dict] = {}
+    for stage, rows in stages.items():
+        by_style: dict[str, int] = {}
+        for row in rows or []:
+            style = str(row.get("entry_style_selected") or "UNKNOWN").strip().lower()
+            by_style[style] = by_style.get(style, 0) + 1
+        stage_rows = rows or []
+        # Absence of a proof provider is NOT the same as zero passing signals.
+        # On legacy PREP (feature OFF), these fields are genuinely not
+        # evaluated and must never be reported as 0 qualified strategies.
+        known_vcp = [
+            row for row in stage_rows
+            if all(k in row for k in ("vcp_pass", "trend_template_pass", "pivot_price"))
+        ]
+        known_momentum = [row for row in stage_rows if "momentum_pass" in row]
+        known_breakout = [row for row in stage_rows if "breakout_pass" in row]
+
+        def proof_count(observed: list[dict], pred: Any) -> int | None:
+            return sum(1 for item in observed if pred(item)) if observed else None
+
+        result[stage] = {
+            "total": len(stage_rows),
+            "styles": dict(sorted(by_style.items())),
+            "vcp_proof_pass": proof_count(
+                known_vcp, lambda row:
+                    row.get("vcp_pass") is True
+                    and row.get("trend_template_pass") is True
+                    and _safe_float(row.get("pivot_price"), 0.0) > 0,
+            ),
+            "momentum_proof_pass": proof_count(
+                known_momentum, lambda row: row.get("momentum_pass") is True,
+            ),
+            "breakout_proof_pass": proof_count(
+                known_breakout, lambda row: row.get("breakout_pass") is True,
+            ),
+            "proof_evaluated_counts": {
+                "vcp": len(known_vcp),
+                "momentum": len(known_momentum),
+                "breakout": len(known_breakout),
+            },
+            "proof_coverage": {
+                name: (
+                    "NOT_EVALUATED" if count == 0
+                    else "COMPLETE" if count == len(stage_rows)
+                    else "PARTIAL"
+                )
+                for name, count in {
+                    "vcp": len(known_vcp),
+                    "momentum": len(known_momentum),
+                    "breakout": len(known_breakout),
+                }.items()
+            },
+        }
+    return result
+
+
 def _compute_agent_b_score(row: dict, daily_rows: list[dict]) -> tuple[float, list[str], str]:
     """Agent B: Strategy Entry Score."""
     pb1_score = _compute_pb1_score(row, daily_rows)
@@ -595,6 +667,17 @@ def build_us_watchlist(
         bool((bucket_meta or {}).get("selected_by_bucket_champion")),
     )
 
+    strategy_funnel = summarize_us_entry_style_funnel(
+        broader_scored, top50, final30_scored,
+    )
+    logger.info(
+        "[US_STRATEGY_FUNNEL][PREP] trade_date=%s broader=%s top50=%s final30=%s",
+        trade_date,
+        strategy_funnel["broader_scored"],
+        strategy_funnel["top50"],
+        strategy_funnel["final30"],
+    )
+
     logger.info(
         "[US_WATCHLIST][STAGE_COUNTS] upstream_universe=%d filtered_universe=%d"
         " candidate_pool=%d broader_scored=%d top50=%d final30=%d",
@@ -615,6 +698,7 @@ def build_us_watchlist(
         "final30_count": len(final30),
         "final30_scored_count": len(final30_scored),
         "broader_scored": broader_scored,
+        "strategy_funnel": strategy_funnel,
         "top50_scored": top50,
         "final30": final30,
         "final30_scored": final30_scored,
