@@ -44,7 +44,8 @@ jobs:
             tests/us/test_us_four_strategy_proof_provenance_roundtrip_20261010.py \
             tests/us/test_us_momentum_breakout_proof_20261010.py \
             tests/us/test_us_minervini_daily_proof_20261010.py \
-            tests/us/test_us_verified_vcp_entry_selection_20261010.py
+            tests/us/test_us_verified_vcp_entry_selection_20261010.py \
+            tests/us/test_us_vcp_prebreakout_policy_review_20261010.py
 
   full-us-offline-harness:
     name: Full US PostgreSQL and Offline Harness
