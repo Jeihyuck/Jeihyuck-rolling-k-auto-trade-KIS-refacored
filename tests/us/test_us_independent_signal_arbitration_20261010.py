@@ -100,3 +100,37 @@ def test_legacy_selection_unchanged_when_opt_in_off(monkeypatch):
     row = _proof(independent_entry_contract_v1=None)
     assert _choose(row, momentum_score=.98, breakout_score=.50, vcp_score=.1) == "momentum"
     assert "independent_eligible_entry_styles" not in row
+
+
+def test_duplicate_locked_symbol_with_conflicting_styles_never_reaches_broker(monkeypatch):
+    """Last-row-wins would silently replace chosen Momentum with Breakout."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    class Provider:
+        def get_current_price(self, symbol, exchange):
+            raise AssertionError("Ambiguous lock must block before price lookup")
+
+    rows = [
+        {"symbol": "AAPL", "exchange": "NASDAQ",
+         "entry_style_selected": "momentum", "score": .93,
+         "entry_style_raw": "momentum"},
+        {"symbol": "AAPL", "exchange": "NASDAQ",
+         "entry_style_selected": "breakout", "score": .90,
+         "entry_style_raw": "breakout"},
+    ]
+    diag = {}
+    intents = generate_entry_intents(
+        tickers=None, watchlist_entries=rows, provider=Provider(),
+        sold_today=set(), available_cash_usd=10000,
+        position_count=0, capital_usd_cap=10000,
+        current_position_symbols=set(),
+        now=datetime(2026, 10, 9, 10, 5, tzinfo=ZoneInfo("America/New_York")),
+        diagnostics=diag,
+    )
+    assert intents == []
+    assert [x["reason"] for x in diag.get("blocked", [])] == [
+        "duplicate_locked_watchlist_symbol",
+        "duplicate_locked_watchlist_symbol",
+    ]
