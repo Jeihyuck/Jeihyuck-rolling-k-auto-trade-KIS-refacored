@@ -173,3 +173,13 @@ def test_each_family_restarts_with_its_original_frozen_stop_and_tp(
     assert frozen["sha256"] == frozen_sha
     restart_tp = contract_profit_capture(position)
     assert restart_tp == original_tp
+
+
+def test_tqqq_cannot_inherit_any_us_standard_four_family_exit_contract():
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    for style in ("ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_VCP"):
+        assert build_us_entry_exit_contract({
+            "symbol": "TQQQ",
+            "strategy_owner": "TQQQ_INFINITE",
+            "entry_style_selected": style,
+        }) == {}
