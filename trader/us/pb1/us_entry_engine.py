@@ -1572,6 +1572,7 @@ def generate_entry_intents(
         "vcp_live_volume", "vcp_live_quote_source",
         "independent_eligible_entry_styles", "independent_arbitration_mode",
         "independent_proof_status",
+        "vcp_setup_armed_before_breakout",
         ):
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
