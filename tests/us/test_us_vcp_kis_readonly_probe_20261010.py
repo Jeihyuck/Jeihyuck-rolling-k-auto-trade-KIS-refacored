@@ -78,12 +78,14 @@ def test_readonly_probe_uses_market_calendar_not_just_weekday(
         def now(zone):
             return observed.astimezone(zone)
 
+    quote_calls = []
     class ReadOnlyFakeKIS:
         def __init__(self, *, env, offline):
             assert env == "practice" and offline is False
             self.calls = 0
 
         def get_us_price(self, symbol, exchange):
+            quote_calls.append((symbol, exchange))
             self.calls += 1
             return {
                 "output": {"last": "101.0", "tvol": str(100000 + self.calls)},
@@ -103,3 +105,7 @@ def test_readonly_probe_uses_market_calendar_not_just_weekday(
     )
     if not expected_regular:
         assert "outside_us_regular_session" in result["reasons"]
+        assert result["samples"] == []
+        assert quote_calls == [], "closed-session validation must not contact KIS"
+    else:
+        assert len(quote_calls) == 2
