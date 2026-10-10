@@ -9,6 +9,10 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
+
+# Support direct WSL invocation without relying on PYTHONPATH or pip install -e.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from trader.universe.build import (
     _load_seed_rows,
