@@ -22,8 +22,6 @@ jobs:
       KIS_ENV: practice
       DRY_RUN: "1"
       ALLOW_REAL_ORDER: "0"
-      US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED: "1"
-      US_MINERVINI_VCP_PROOF_ENABLED: "1"
       US_VCP_LIVE_REST_MAX_PER_TICK: "1"
       PYTHONPATH: .
     steps:
@@ -34,6 +32,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install -r requirements.txt
+      # Each regression explicitly sets its own feature flags; this exercises
+      # both legacy OFF and four-family ON, without global test contamination.
       - name: Four-family proof, idempotency, frozen-exit and VCP live gates
         run: |
           python -m pytest -q \
