@@ -205,6 +205,11 @@ _US_DAILY_METRIC_FIELDS = (
     "reason_json", "reasons", "filters_passed", "score_breakdown",
     "explanation_quality", "theme_cluster", "sector", "industry",
     "market_state", "rotation_regime", "market_regime",
+    # Independent signal proof: never rely on a PREP-only transient dict.
+    "independent_entry_contract_v1", "momentum_pass", "standalone_momentum_score",
+    "breakout_pass", "breakout_pivot_price", "entry_signal_proof_source",
+    "vcp_pass", "trend_template_pass", "pivot_price",
+    "vcp_evidence", "vcp_evidence_source", "vcp_evidence_status",
 )
 
 def _merge_us_daily_metrics_meta(row: dict) -> dict:
