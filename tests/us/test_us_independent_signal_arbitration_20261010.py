@@ -233,3 +233,26 @@ def test_all_four_independent_families_create_one_owner_safe_buy_intent(
     assert verify_us_entry_exit_contract(
         routed["intent"]["meta"]["entry_exit_contract"]
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "volume20", "expected", "vcp_allowed"),
+    [
+        (None, 100000, "momentum", False),
+        ("completed_daily_ohlcv", None, "momentum", False),
+        ("completed_daily_ohlcv", 0, "momentum", False),
+        ("completed_daily_ohlcv", 100000, "vcp", True),
+    ],
+)
+def test_vcp_without_live_eligible_prep_proof_cannot_crowd_out_momentum(
+    monkeypatch, source, volume20, expected, vcp_allowed,
+):
+    monkeypatch.setenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "1")
+    monkeypatch.setenv("US_MINERVINI_VCP_PROOF_ENABLED", "1")
+    row = _proof(
+        vcp_evidence_source=source, vcp_daily_avg_volume20=volume20,
+    )
+    selected = _choose(row, momentum_score=.83, breakout_score=.60, vcp_score=.99)
+    assert selected == expected
+    assert ("vcp" in row["independent_eligible_entry_styles"]) is vcp_allowed
+    assert row["independent_proof_status"]["vcp"] is vcp_allowed
