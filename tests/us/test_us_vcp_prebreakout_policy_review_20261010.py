@@ -120,3 +120,24 @@ def test_armed_vcp_without_completed_daily_volume_proof_does_not_displace_moment
     assert row["independent_proof_status"]["vcp"] is False
     assert row["independent_proof_status"]["momentum"] is True
     assert "vcp_setup_armed_before_breakout" not in row
+
+
+def test_vcp_outside_arming_band_cannot_suppress_qualified_momentum(monkeypatch):
+    monkeypatch.setenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "1")
+    monkeypatch.setenv("US_MINERVINI_VCP_PROOF_ENABLED", "1")
+    monkeypatch.setenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "1")
+    row = {
+        **_row(94.0),
+        "independent_entry_contract_v1": True,
+        "entry_signal_proof_source": "completed_daily_ohlcv",
+        "momentum_pass": True,
+        "breakout_pass": False,
+    }
+    selected = _select_entry_style(
+        row, pb1_score=.60, momentum_score=.90,
+        pullback_score=.40, breakout_score=.50, vcp_score=.99,
+    )
+    assert selected == "momentum"
+    assert "vcp" not in row["independent_eligible_entry_styles"]
+    assert row["independent_proof_status"]["momentum"] is True
+    assert "vcp_setup_armed_before_breakout" not in row
