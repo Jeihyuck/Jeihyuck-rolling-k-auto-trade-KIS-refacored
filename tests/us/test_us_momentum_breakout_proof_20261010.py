@@ -72,3 +72,10 @@ def test_disabled_flag_does_not_change_existing_style_choice(monkeypatch):
         row, pb1_score=0.65, momentum_score=0.95,
         pullback_score=0.50, breakout_score=0.98,
     ) == "breakout"
+
+
+def test_independent_us_short_history_fails_both_signal_proofs():
+    result = _compute_us_explicit_signal_proofs("ABCD", _daily()[:30])
+    assert result["independent_entry_contract_v1"] is True
+    assert result["momentum_pass"] is False
+    assert result["breakout_pass"] is False
