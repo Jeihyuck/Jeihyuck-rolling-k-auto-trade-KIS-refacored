@@ -24,6 +24,8 @@ _PROVENANCE_FIELDS = (
     "vcp_evidence", "vcp_evidence_source", "vcp_evidence_status",
         "vcp_daily_avg_volume20", "vcp_live_breakout_verified",
         "vcp_live_volume", "vcp_live_quote_source",
+        "independent_eligible_entry_styles", "independent_arbitration_mode",
+        "independent_proof_status",
 )
 
 
@@ -99,7 +101,8 @@ def extract_us_entry_exit_contract(*sources: Any) -> dict:
 
 def build_us_entry_exit_contract(*sources: Any) -> dict:
     merged = _merged(*sources)
-    # Enforce the sleeve owner/symbol fence before reusing inherited contracts.
+    # Enforce owner/symbol isolation before any valid frozen-contract reuse.
+    # TQQQ_INFINITE must never inherit a US_STANDARD contract from nested meta.
     owner = str(merged.get("strategy_owner") or merged.get("sleeve_id") or "US_STANDARD").upper()
     symbol = str(merged.get("symbol") or "").upper()
     if owner == "TQQQ_INFINITE" or symbol == "TQQQ":

@@ -59,6 +59,7 @@ def test_standard_style_prep_db_live_buy_frozen_contract(monkeypatch, raw_style,
         "rank_final30": 1,
         "theme_cluster": "TECH",
     }
+    # Real repository save/load, not a synthetic DB-shaped dictionary.
     repos.reset_memory_stores()
     prep["strategy"] = raw_style
     prep["data_source"] = "completed_daily"
@@ -186,19 +187,21 @@ def test_tqqq_cannot_inherit_any_us_standard_four_family_exit_contract():
         verify_us_entry_exit_contract,
     )
     for style in ("ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_VCP"):
-        frozen = build_us_entry_exit_contract({
-            "symbol": "AAPL", "strategy_owner": "US_STANDARD",
+        standard = build_us_entry_exit_contract({
+            "symbol": "AAPL",
+            "strategy_owner": "US_STANDARD",
             "entry_style_selected": style,
         })
-        assert verify_us_entry_exit_contract(frozen)
-        for owner_row in (
+        assert verify_us_entry_exit_contract(standard)
+        for item in (
             {"symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE"},
             {"symbol": "TQQQ", "strategy_owner": "US_STANDARD"},
             {"symbol": "AAPL", "strategy_owner": "TQQQ_INFINITE"},
         ):
             assert build_us_entry_exit_contract({
-                **owner_row,
-                "meta": {"entry_exit_contract": frozen},
+                **item,
+                "entry_style_selected": style,
+                "meta": {"entry_exit_contract": standard},
             }) == {}
 
 

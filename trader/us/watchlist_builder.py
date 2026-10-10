@@ -188,26 +188,60 @@ def _select_entry_style(
         "pb1_pullback": pb1_score,
         "momentum": momentum_score,
     }
-    # New independent execution path is opt-in and requires fresh, completed-
-    # daily PREP signal proof. Do not silently promote raw scores to BUY setups.
-    if (
-        os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") == "1"
-        and row.get("independent_entry_contract_v1") is True
-    ):
-        if row.get("momentum_pass") is not True:
+    # Each standalone family is evaluated against its own evidence, *before*
+    # comparing eligible candidates. With the opt-in enabled, a missing PREP
+    # proof contract must NOT make Momentum/Breakout eligible by default.
+    independent_mode = os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") == "1"
+    if independent_mode:
+        proof_valid = (
+            row.get("independent_entry_contract_v1") is True
+            and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+        )
+        if not proof_valid or row.get("momentum_pass") is not True:
             scores.pop("momentum", None)
             scores.pop("momentum_pullback", None)
-        if row.get("breakout_pass") is not True:
+        if not proof_valid or row.get("breakout_pass") is not True:
             scores.pop("breakout", None)
+    verified_vcp_prep_proof = (
+        os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") != "1"
+        or (
+            row.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            and _safe_float(row.get("vcp_daily_avg_volume20"), 0.0) > 0
+        )
+    )
     if (
         row.get("vcp_pass") is True
         and row.get("trend_template_pass") is True
+        and verified_vcp_prep_proof
         and vcp_score is not None
     ):
         pivot = _safe_float(row.get("pivot_price"), 0.0)
         close = _safe_float(row.get("close") or row.get("price"), 0.0)
         if pivot > 0 and close >= pivot:
             scores["vcp"] = vcp_score
+    if independent_mode:
+        # Record *each* independently eligible style, not only the selected
+        # winner. This is PREP observability, NOT another BUY order. Existing
+        # US_STANDARD owner, per-symbol order key and risk guards remain shared.
+        row["independent_eligible_entry_styles"] = sorted(scores)
+        row["independent_arbitration_mode"] = "proof_first_one_order_per_symbol"
+        row["independent_proof_status"] = {
+            "momentum": bool(
+                row.get("independent_entry_contract_v1") is True
+                and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+                and row.get("momentum_pass") is True
+            ),
+            "breakout": bool(
+                row.get("independent_entry_contract_v1") is True
+                and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+                and row.get("breakout_pass") is True
+            ),
+            "vcp": bool(
+                row.get("vcp_pass") is True
+                and row.get("trend_template_pass") is True
+                and "vcp" in scores
+            ),
+        }
     return max(scores, key=lambda k: scores[k])
 
 
