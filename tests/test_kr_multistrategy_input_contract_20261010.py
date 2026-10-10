@@ -57,7 +57,7 @@ def test_emergency_universe_rejects_partial_market_labels(monkeypatch):
 def test_seed_reader_carries_explicit_market_label(tmp_path):
     file_path = tmp_path / "market_seed.csv"
     file_path.write_text(
-        "code,market,name\\n036930,KOSDAQ,주성엔지니어링\\n042700,KOSPI,한미반도체\\n",
+        "code,market,name\n036930,KOSDAQ,주성엔지니어링\n042700,KOSPI,한미반도체\n",
         encoding="utf-8",
     )
     rows = build._load_seed_rows(file_path)
