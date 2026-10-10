@@ -2,7 +2,7 @@
 import pytest
 
 from trader.pb1_engine import PB1Engine
-from trader.watchlist_builder import WatchlistBuilder, _normalize_kr_rs_score_100
+from trader.watchlist_builder import WatchlistBuilder, _normalize_kr_rs_score_100, _kr_final30_rs_points
 
 
 def _candidate(rs: float):
@@ -88,3 +88,18 @@ def test_final30_ai_rs_factor_uses_the_same_0_to_100_units(raw, expected):
     assert score100 == pytest.approx(expected, abs=1e-9)
     # Existing policy: 30% RS weight. Do not relax thresholds or reweight.
     assert 0.30 * score100 == pytest.approx(0.30 * expected, abs=1e-9)
+
+
+def test_final30_uses_rs_pctile_when_ai_rs_is_present_but_null():
+    assert _kr_final30_rs_points({
+        "ai_rs_score": None, "rs_pctile": 0.98974358974359,
+    }) == pytest.approx(98.974358974359)
+    assert _kr_final30_rs_points({
+        "ai_rs_score": None, "rs_pctile": None, "rs_percentile": 0.91,
+    }) == pytest.approx(91.0)
+
+
+def test_final30_does_not_override_explicit_zero_ai_rs_with_fallback():
+    assert _kr_final30_rs_points({
+        "ai_rs_score": 0.0, "rs_pctile": 0.99,
+    }) == 0.0
