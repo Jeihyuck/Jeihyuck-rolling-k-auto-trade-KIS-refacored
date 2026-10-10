@@ -250,69 +250,75 @@ def summarize_us_entry_style_funnel(
     top50: list[dict],
     final30: list[dict],
 ) -> dict:
-    """Report the PREP strategy funnel without modifying selection or risk gates.
+    """Observe four-family PREP proofs after #201 evaluators, without trading side effects.
 
-    Momentum-Pullback is deliberately counted as a hybrid (its frozen exit
-    family is Pullback), not as a standalone Momentum fill. Verified VCP counts
-    require actual proof, rather than a high ATR/volatility proxy alone.
+    Proof absence (None/NOT_EVALUATED) and genuine evaluated false (0) must
+    not be conflated. The authoritative independent proof status is computed
+    by _select_entry_style on the upstream candidate row, after verifying
+    completed-daily OHLCV provenance and the VCP pivot gate. Bare legacy
+    *_pass booleans are never trusted as independent strategy proof.
     """
-    stages = {
-        "broader_scored": broader_scored,
-        "top50": top50,
-        "final30": final30,
-    }
+    def status(row: dict, family: str) -> bool | None:
+        proof = row.get("independent_proof_status")
+        if isinstance(proof, dict) and type(proof.get(family)) is bool:
+            return proof[family]
+        # Upstream signal producer may be enabled while arbitration is off.
+        # In that case the completed-daily contract is still a valid signal
+        # observation, but not evidence that an independent BUY was allowed.
+        if family in {"momentum", "breakout"}:
+            if (
+                row.get("independent_entry_contract_v1") is True
+                and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+                and type(row.get(family + "_pass")) is bool
+            ):
+                return row[family + "_pass"]
+            return None
+        if (
+            row.get("vcp_evidence_source") != "completed_daily_ohlcv"
+            or _safe_float(row.get("vcp_daily_avg_volume20"), 0.0) <= 0
+            or type(row.get("vcp_pass")) is not bool
+            or type(row.get("trend_template_pass")) is not bool
+            or "pivot_price" not in row
+        ):
+            return None
+        pivot = _safe_float(row.get("pivot_price"), 0.0)
+        last = _safe_float(row.get("close") or row.get("price"), 0.0)
+        return bool(
+            row.get("vcp_pass") is True
+            and row.get("trend_template_pass") is True
+            and pivot > 0
+            and last >= pivot
+        )
+
+    stages = {"broader_scored": broader_scored, "top50": top50, "final30": final30}
     result: dict[str, dict] = {}
-    for stage, rows in stages.items():
-        by_style: dict[str, int] = {}
-        for row in rows or []:
-            style = str(row.get("entry_style_selected") or "UNKNOWN").strip().lower()
-            by_style[style] = by_style.get(style, 0) + 1
-        stage_rows = rows or []
-        # Absence of a proof provider is NOT the same as zero passing signals.
-        # On legacy PREP (feature OFF), these fields are genuinely not
-        # evaluated and must never be reported as 0 qualified strategies.
-        known_vcp = [
-            row for row in stage_rows
-            if all(k in row for k in ("vcp_pass", "trend_template_pass", "pivot_price"))
-        ]
-        known_momentum = [row for row in stage_rows if "momentum_pass" in row]
-        known_breakout = [row for row in stage_rows if "breakout_pass" in row]
-
-        def proof_count(observed: list[dict], pred: Any) -> int | None:
-            return sum(1 for item in observed if pred(item)) if observed else None
-
+    for stage, stage_rows in stages.items():
+        stage_rows = stage_rows or []
+        styles: dict[str, int] = {}
+        for row in stage_rows:
+            name = str(row.get("entry_style_selected") or "UNKNOWN").strip().lower()
+            styles[name] = styles.get(name, 0) + 1
+        evidence = {
+            family: [s for row in stage_rows if (s := status(row, family)) is not None]
+            for family in ("vcp", "momentum", "breakout")
+        }
+        coverage = {
+            family: (
+                "NOT_EVALUATED" if not votes
+                else "COMPLETE" if len(votes) == len(stage_rows)
+                else "PARTIAL"
+            )
+            for family, votes in evidence.items()
+        }
         result[stage] = {
             "total": len(stage_rows),
-            "styles": dict(sorted(by_style.items())),
-            "vcp_proof_pass": proof_count(
-                known_vcp, lambda row:
-                    row.get("vcp_pass") is True
-                    and row.get("trend_template_pass") is True
-                    and _safe_float(row.get("pivot_price"), 0.0) > 0,
-            ),
-            "momentum_proof_pass": proof_count(
-                known_momentum, lambda row: row.get("momentum_pass") is True,
-            ),
-            "breakout_proof_pass": proof_count(
-                known_breakout, lambda row: row.get("breakout_pass") is True,
-            ),
-            "proof_evaluated_counts": {
-                "vcp": len(known_vcp),
-                "momentum": len(known_momentum),
-                "breakout": len(known_breakout),
+            "styles": dict(sorted(styles.items())),
+            **{
+                family + "_proof_pass": sum(votes) if votes else None
+                for family, votes in evidence.items()
             },
-            "proof_coverage": {
-                name: (
-                    "NOT_EVALUATED" if count == 0
-                    else "COMPLETE" if count == len(stage_rows)
-                    else "PARTIAL"
-                )
-                for name, count in {
-                    "vcp": len(known_vcp),
-                    "momentum": len(known_momentum),
-                    "breakout": len(known_breakout),
-                }.items()
-            },
+            "proof_evaluated_counts": {family: len(votes) for family, votes in evidence.items()},
+            "proof_coverage": coverage,
         }
     return result
 
