@@ -254,3 +254,26 @@ def test_standalone_momentum_proof_does_not_disable_legacy_pullback_hybrid(monke
     assert "breakout" not in row["independent_eligible_entry_styles"]
     assert "vcp" not in row["independent_eligible_entry_styles"]
     assert row["independent_proof_status"]["momentum"] is False
+
+
+@pytest.mark.parametrize(
+    ("source", "volume20", "expected", "vcp_allowed"),
+    [
+        (None, 100000, "momentum", False),
+        ("completed_daily_ohlcv", None, "momentum", False),
+        ("completed_daily_ohlcv", 0, "momentum", False),
+        ("completed_daily_ohlcv", 100000, "vcp", True),
+    ],
+)
+def test_vcp_without_live_eligible_prep_proof_cannot_crowd_out_momentum(
+    monkeypatch, source, volume20, expected, vcp_allowed,
+):
+    monkeypatch.setenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "1")
+    monkeypatch.setenv("US_MINERVINI_VCP_PROOF_ENABLED", "1")
+    row = _proof(
+        vcp_evidence_source=source, vcp_daily_avg_volume20=volume20,
+    )
+    selected = _choose(row, momentum_score=.83, breakout_score=.60, vcp_score=.99)
+    assert selected == expected
+    assert ("vcp" in row["independent_eligible_entry_styles"]) is vcp_allowed
+    assert row["independent_proof_status"]["vcp"] is vcp_allowed
