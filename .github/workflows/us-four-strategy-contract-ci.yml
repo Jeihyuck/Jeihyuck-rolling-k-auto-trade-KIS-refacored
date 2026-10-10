@@ -1,4 +1,5 @@
 name: US Four Strategy Contract CI
+# Read-only proof replay: no broker order submit.
 
 on:
   push:
