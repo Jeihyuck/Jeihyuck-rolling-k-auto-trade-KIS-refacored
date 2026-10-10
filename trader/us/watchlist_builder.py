@@ -209,7 +209,25 @@ def _select_entry_style(
     ):
         pivot = _safe_float(row.get("pivot_price"), 0.0)
         close = _safe_float(row.get("close") or row.get("price"), 0.0)
-        if pivot > 0 and close >= pivot:
+        vcp_prebreakout_arming = os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+        if vcp_prebreakout_arming:
+            # This is a POLICY REVIEW opt-in. A real Minervini setup often
+            # waits below the pivot until the live session confirms breakout.
+            # Arm a near-pivot candidate; never convert it into a BUY without
+            # the #200 live price+day-volume trigger. Reuse the existing
+            # 5% maximum pivot extension as a conservative setup band.
+            from trader.strategies.pb1_minervini_v2 import MinerviniConfig
+            band = MinerviniConfig().max_extension_from_pivot
+            near_pivot = (
+                pivot > 0
+                and pivot * (1.0 - band) <= close <= pivot * (1.0 + band)
+                and row.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            )
+            if near_pivot:
+                scores["vcp"] = vcp_score
+                row["vcp_setup_armed_before_breakout"] = bool(close < pivot)
+        elif pivot > 0 and close >= pivot:
+            # Preserve all previously deployed style-selection behavior.
             scores["vcp"] = vcp_score
     if independent_mode:
         # Record *each* independently eligible style, not only the selected
