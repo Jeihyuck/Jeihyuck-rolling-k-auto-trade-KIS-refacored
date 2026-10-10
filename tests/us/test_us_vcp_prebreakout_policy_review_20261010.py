@@ -94,3 +94,29 @@ def test_armed_identity_survives_prep_db_and_frozen_contract(monkeypatch):
     assert canonical["vcp_setup_armed_before_breakout"] is True
     frozen = build_us_entry_exit_contract(canonical)
     assert frozen["entry_provenance"]["vcp_setup_armed_before_breakout"] is True
+
+
+@pytest.mark.parametrize("invalid_field", ["vcp_evidence_source", "vcp_daily_avg_volume20"])
+def test_armed_vcp_without_completed_daily_volume_proof_does_not_displace_momentum(
+    monkeypatch, invalid_field,
+):
+    """PREP arming must not turn an invalid VCP into a top-ranked blocking row."""
+    monkeypatch.setenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "1")
+    monkeypatch.setenv("US_MINERVINI_VCP_PROOF_ENABLED", "1")
+    monkeypatch.setenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "1")
+    row = {
+        **_row(98.0),
+        "independent_entry_contract_v1": True,
+        "entry_signal_proof_source": "completed_daily_ohlcv",
+        "momentum_pass": True,
+        "breakout_pass": False,
+    }
+    row.pop(invalid_field)
+    style = _select_entry_style(
+        row, pb1_score=.60, momentum_score=.90, pullback_score=.40,
+        breakout_score=.50, vcp_score=.95,
+    )
+    assert style == "momentum"
+    assert row["independent_proof_status"]["vcp"] is False
+    assert row["independent_proof_status"]["momentum"] is True
+    assert "vcp_setup_armed_before_breakout" not in row
