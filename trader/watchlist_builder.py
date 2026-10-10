@@ -3164,6 +3164,40 @@ class WatchlistBuilder:
             momentum_score = _prefer_valid_numeric(_row_get(ref, "momentum_score", None), _row_get(row, "momentum_score", None))
             entry_style = _row_get(ref, "entry_style_selected", _row_get(row, "entry_style_selected", None))
 
+            # Opt-in: bridge only fully proven and fresh Minervini/VCP evidence.
+            # Derived VCP scores are measured on 0..15 while Final30 entry
+            # gates expect 0..100. Do not rescale unrelated/precomputed scores.
+            vcp_proof_enabled = os.getenv("PB1_KR_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+            ref_as_of = str(_row_get(ref, "as_of", "") or "")[:10]
+            proof_is_current = ref_as_of == str(as_of)[:10]
+            proven_vcp = bool(
+                vcp_proof_enabled and proof_is_current
+                and _row_get(ref, "vcp_ok", None) is True
+                and _row_get(ref, "minervini_pass", None) is True
+            )
+            if proven_vcp:
+                pivot = _safe_nullable_float(_row_get(ref, "pivot", None))
+                current_close = _safe_nullable_float(close)
+                raw_vcp = _safe_nullable_float(_row_get(ref, "vcp_score", None))
+                if (
+                    pivot is None or pivot <= 0 or current_close is None
+                    or current_close < pivot * 1.003
+                    or raw_vcp is None or not 0 < raw_vcp <= 15.0
+                ):
+                    proven_vcp = False
+                else:
+                    vcp_score = min(100.0, raw_vcp / 15.0 * 100.0)
+                    entry_style = "VCP"
+                    _row_set(row, "vcp_pass", True)
+                    _row_set(row, "pivot_price", pivot)
+                    _row_set(row, "minervini_pass", True)
+                    _row_set(row, "vcp_evidence_as_of", ref_as_of)
+                    logger.info(
+                        "[KR_MINERVINI][VCP_PROOF] symbol=%s verified=1 "
+                        "raw_score=%.3f normalized_score=%.3f pivot=%.2f",
+                        sym, raw_vcp, vcp_score, pivot,
+                    )
+
             # Fallback 1: rs_score가 없으면 rs_percentile 사용
             if (rs_score is None or rs_score <= 0) and rs_percentile is not None and rs_percentile > 0:
                 rs_score = rs_percentile
