@@ -92,7 +92,6 @@ def run_probe(symbol: str, exchange: str, *, samples: int, interval: float) -> d
     os.environ["US_KIS_ORDER_ALLOWED"] = "0"
     os.environ["ALLOW_REAL_ORDER"] = "0"
     os.environ["US_KIS_PRICE_CACHE_TTL_SEC"] = "0"
-    client = KisUSClient(env="practice", offline=False)
     et = ZoneInfo("America/New_York")
     from trader.us.market_calendar import (
         is_us_regular_market_open,
@@ -105,6 +104,26 @@ def run_probe(symbol: str, exchange: str, *, samples: int, interval: float) -> d
     if us_calendar_load_error():
         return {"status": "INCONCLUSIVE", "read_only": True,
                 "reason_type": "US_MARKET_CALENDAR_UNAVAILABLE"}
+    # No broker API call is justified on weekends, holidays, or after an
+    # early close. A closed-market GET cannot prove live cumulative volume.
+    first_observation_et = datetime.now(et)
+    first_session_open = (
+        first_observation_et.year in us_calendar_supported_years()
+        and is_us_regular_market_open(first_observation_et)
+    )
+    if not first_session_open:
+        return {
+            "status": "INCONCLUSIVE",
+            "read_only": True,
+            "reason_type": "OUTSIDE_US_REGULAR_SESSION",
+            "regular_us_session": False,
+            "reasons": ["outside_us_regular_session"],
+            "samples": [],
+            "symbol": symbol,
+            "exchange": exchange,
+            "environment": "practice",
+        }
+    client = KisUSClient(env="practice", offline=False)
     observed: list[dict] = []
     session_days: set[str] = set()
     regular_flags: list[bool] = []
