@@ -436,6 +436,59 @@ def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, ent
         return False, "ENTRY_EXPLAIN_CONTRACT_ERROR"
     return True, ""
 
+def _verify_us_vcp_live_breakout(
+    proof: dict, quote: dict,
+) -> tuple[bool, str, dict]:
+    """Apply the existing Minervini pivot, chase and breakout-volume policy.
+
+    Only an actual recent broker REST daily-accumulated volume can authorize
+    VCP BUY. WebSocket tvol=0 is a placeholder, NOT zero observed volume.
+    """
+    import math
+    from trader.strategies.pb1_minervini_v2 import MinerviniConfig, entry_trigger
+
+    def valid_positive(value: Any) -> float | None:
+        try:
+            number = float(str(value).replace(",", ""))
+            return number if math.isfinite(number) and number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    if not isinstance(quote, dict) or _quote_is_stale(quote):
+        return False, "vcp_live_quote_stale", {}
+    if str(quote.get("source") or "").upper() not in {"KIS_LIVE", "KIS_CACHE"}:
+        return False, "vcp_live_quote_unverified_source", {}
+    age = valid_positive(quote.get("age_sec"))
+    if age is None and quote.get("age_sec") == 0:
+        age = 0.0
+    max_age = max(1.0, float(os.getenv("US_VCP_MAX_QUOTE_AGE_SEC", "15")))
+    if age is None or age > max_age:
+        return False, "vcp_live_quote_age_invalid", {}
+    pivot = valid_positive(proof.get("pivot_price"))
+    avg_volume = valid_positive(proof.get("vcp_daily_avg_volume20"))
+    current_price = valid_positive(quote.get("last"))
+    cumulative_volume = valid_positive(quote.get("tvol"))
+    if pivot is None or avg_volume is None or current_price is None or cumulative_volume is None:
+        return False, "vcp_live_price_volume_missing", {}
+
+    cfg = MinerviniConfig()
+    passed, evidence = entry_trigger(
+        {"pivot": pivot, "vol20": avg_volume, "vcp_ok": True},
+        last_price=current_price,
+        last_volume=cumulative_volume,
+        cfg=cfg,
+    )
+    return passed, "" if passed else "vcp_pivot_volume_or_chase_failed", {
+        "last": current_price,
+        "tvol": cumulative_volume,
+        "source": quote.get("source"),
+        "age_sec": age,
+        "pivot": pivot,
+        "avg_volume20": avg_volume,
+        **evidence,
+    }
+
+
 def _validate_us_independent_new_buy_proof(
     entry_meta: dict | None, canonical_style: str,
 ) -> tuple[bool, str]:
@@ -459,6 +512,8 @@ def _validate_us_independent_new_buy_proof(
         if os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1":
             if data.get("vcp_evidence_source") != "completed_daily_ohlcv":
                 return False, "vcp_completed_daily_evidence_missing"
+            if data.get("vcp_live_breakout_verified") is not True:
+                return False, "vcp_live_breakout_not_verified"
         return True, ""
 
     if os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") != "1":
@@ -655,6 +710,7 @@ def generate_entry_intents(
     price_lookup_count = 0
     price_lookup_attempted = 0
     price_lookup_budget_exhausted = False
+    vcp_live_rest_used = 0
 
     for symbol in symbols:
         if _stop_if_cancelled("phase1_symbol_loop"):
@@ -991,6 +1047,45 @@ def generate_entry_intents(
 
         position_state_for_order = position_state or (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
+        # REST is only used for an independently proven VCP entry. This quote
+        # replaces the decision price before position sizing, risk and routing.
+        if (
+            position_action == "NEW_POSITION_BUY"
+            and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+            and str((entry_meta or {}).get("entry_style_selected") or "").upper() in {"VCP", "ENTRY_VCP"}
+        ):
+            vcp_rest_cap = max(0, int(os.getenv("US_VCP_LIVE_REST_MAX_PER_TICK", "1")))
+            if vcp_live_rest_used >= vcp_rest_cap:
+                track_skip(symbol, "vcp_live_rest_budget_exhausted")
+                continue
+            vcp_live_rest_used += 1
+            if _stop_if_cancelled("before_vcp_volume_http"):
+                break
+            try:
+                live_quote = provider.get_current_price_with_volume(symbol, exchange)
+                passed, live_reason, live_evidence = _verify_us_vcp_live_breakout(
+                    entry_meta or {}, live_quote,
+                )
+            except Exception as exc:
+                passed, live_reason, live_evidence = False, "vcp_live_quote_unavailable", {}
+                logger.warning(
+                    "[US_ENTRY][VCP_LIVE_QUOTE_ERROR] symbol=%s reason=%s",
+                    symbol, type(exc).__name__,
+                )
+            if not passed:
+                track_skip(symbol, "VCP_LIVE_TRIGGER_INVALID", {"contract_reason": live_reason})
+                logger.info("[US_ENTRY][VCP_LIVE_BLOCK] symbol=%s reason=%s", symbol, live_reason)
+                continue
+            price = live_evidence["last"]
+            entry_meta["vcp_live_breakout_verified"] = True
+            entry_meta["vcp_live_volume"] = live_evidence["tvol"]
+            entry_meta["vcp_live_quote_source"] = live_evidence["source"]
+            logger.info(
+                "[US_ENTRY][VCP_LIVE_PROOF] symbol=%s price=%.4f "
+                "cum_volume=%.0f avg_volume20=%.0f pivot=%.4f",
+                symbol, price, live_evidence["tvol"],
+                live_evidence["avg_volume20"], live_evidence["pivot"],
+            )
         held_lifecycle_id = None
         if position_state_for_order == "HELD":
             allow_add = allow_add_to_existing and os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
