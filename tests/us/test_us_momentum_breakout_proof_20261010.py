@@ -50,14 +50,16 @@ def test_independent_style_gates_both_missing_signals(monkeypatch):
 
 def test_independent_momentum_and_breakout_compete_on_validated_scores(monkeypatch):
     monkeypatch.setenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "1")
-    momentum = {"independent_entry_contract_v1": True, "momentum_pass": True,
-                "breakout_pass": False}
+    momentum = {"independent_entry_contract_v1": True,
+                "entry_signal_proof_source": "completed_daily_ohlcv",
+                "momentum_pass": True, "breakout_pass": False}
     assert _select_entry_style(
         momentum, pb1_score=0.65, momentum_score=0.95,
         pullback_score=0.50, breakout_score=0.98,
     ) == "momentum"
-    breakout = {"independent_entry_contract_v1": True, "momentum_pass": False,
-                "breakout_pass": True}
+    breakout = {"independent_entry_contract_v1": True,
+                "entry_signal_proof_source": "completed_daily_ohlcv",
+                "momentum_pass": False, "breakout_pass": True}
     assert _select_entry_style(
         breakout, pb1_score=0.65, momentum_score=0.95,
         pullback_score=0.50, breakout_score=0.98,
