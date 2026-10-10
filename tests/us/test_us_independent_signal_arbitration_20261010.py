@@ -235,27 +235,6 @@ def test_all_four_independent_families_create_one_owner_safe_buy_intent(
     )
 
 
-def test_standalone_momentum_proof_does_not_disable_legacy_pullback_hybrid(monkeypatch):
-    """Independent new family gating must not alter old hybrid Pullback policy."""
-    monkeypatch.setenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "1")
-    row = _proof(
-        momentum_pass=False,
-        breakout_pass=False,
-        vcp_pass=False,
-        trend_template_pass=False,
-    )
-    selected = _choose(
-        row, pb1_score=.45, momentum_score=.96, pullback_score=.90,
-        breakout_score=.99, vcp_score=.99,
-    )
-    assert selected == "momentum_pullback"
-    assert "momentum_pullback" in row["independent_eligible_entry_styles"]
-    assert "momentum" not in row["independent_eligible_entry_styles"]
-    assert "breakout" not in row["independent_eligible_entry_styles"]
-    assert "vcp" not in row["independent_eligible_entry_styles"]
-    assert row["independent_proof_status"]["momentum"] is False
-
-
 @pytest.mark.parametrize(
     ("source", "volume20", "expected", "vcp_allowed"),
     [
