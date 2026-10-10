@@ -76,6 +76,15 @@ def _normalize_kr_rs_score_100(value: Any) -> float:
     return min(100.0, max(0.0, numeric))
 
 
+def _kr_final30_rs_points(row: dict) -> float:
+    """Fallback only on missing RS, never replace an explicit score of zero."""
+    for key in ("ai_rs_score", "rs_pctile", "rs_percentile"):
+        value = row.get(key)
+        if value is not None and value != "":
+            return _normalize_kr_rs_score_100(value)
+    return 0.0
+
+
 FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]]
 
 
@@ -2902,9 +2911,7 @@ class WatchlistBuilder:
             # Final30 AI-RS factor is also 0..100. Without this boundary
             # normalization a .99 percentile ratio contributes .297 points
             # instead of 29.7 to the existing 30%-weighted final score.
-            ai_rs_score = _normalize_kr_rs_score_100(
-                item.get("ai_rs_score", item.get("rs_pctile", 0.0))
-            )
+            ai_rs_score = _kr_final30_rs_points(item)
             trend_score = float(item.get("trend_score", 0.0) or 0.0)
             pullback_score = max(0.0, min(100.0, 100.0 - float(item.get("pullback_pct", 0.0) or 0.0) * 400.0))
             liquidity_score = float(item.get("liquidity_score", 0.0) or 0.0)
