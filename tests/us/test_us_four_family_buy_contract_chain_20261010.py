@@ -203,3 +203,91 @@ def test_tqqq_cannot_inherit_any_us_standard_four_family_exit_contract():
                 "entry_style_selected": style,
                 "meta": {"entry_exit_contract": standard},
             }) == {}
+
+
+@pytest.mark.skipif(
+    not __import__("os").getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="real isolated PostgreSQL integration URL not configured",
+)
+@pytest.mark.parametrize(
+    ("style", "entry_reason"),
+    [
+        ("pb1_pullback", "ENTRY_PULLBACK"),
+        ("momentum", "ENTRY_MOMENTUM"),
+        ("breakout", "ENTRY_BREAKOUT"),
+        ("vcp", "ENTRY_VCP"),
+    ],
+)
+def test_four_family_actual_postgres_locked_save_load_contract(monkeypatch, style, entry_reason):
+    """Verify the actual SQL writer AND reader, not a synthetic meta mapping."""
+    import os
+    from pathlib import Path
+    from sqlalchemy import create_engine, text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import (
+        build_us_entry_exit_contract,
+        verify_us_entry_exit_contract,
+    )
+
+    url = os.environ["PBCORE_TEST_POSTGRES_URL"]
+    schema = "us_four_family_contract_20261011"
+    admin = create_engine(url, future=True)
+    with admin.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+    admin.dispose()
+
+    engine = create_engine(
+        url, future=True,
+        connect_args={"options": f"-csearch_path={schema},public"},
+    )
+    try:
+        with engine.begin() as conn:
+            for migration in (
+                "migrations/0038_us_agent_tables.sql",
+                "migrations/0039_us_prep_locked_watchlist_contract.sql",
+            ):
+                conn.exec_driver_sql(Path(migration).read_text(encoding="utf-8"))
+
+        monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
+        entry = {
+            "symbol": "AAPL",
+            "exchange": "NASDAQ",
+            "strategy": "us_pb1",
+            "score": 0.92,
+            "score_final": 0.92,
+            "entry_style_selected": style,
+            "entry_style_raw": style,
+            "entry_reason": entry_reason,
+            "pullback_score": 0.70,
+            "momentum_score": 0.80,
+            "breakout_score": 0.75,
+            "vcp_score": 0.90,
+            "vcp_pass": style == "vcp",
+            "trend_template_pass": style == "vcp",
+            "pivot_price": 99.0 if style == "vcp" else None,
+            "reasons": [entry_reason],
+            "filters_passed": ["score", "liquidity"],
+            "rank_final30": 1,
+        }
+        saved = repos.clear_and_save_locked_us_watchlist(
+            [entry], "2026-10-09", f"four-families-pg-{style}", "OK"
+        )
+        assert saved["saved_count"] == 1
+        persisted = repos.load_locked_us_watchlist(
+            trade_date="2026-10-09", min_count=1,
+        )
+        assert len(persisted) == 1
+        row = persisted[0]
+        assert row["entry_style_selected"] == style
+        assert row["entry_reason"] == entry_reason
+        frozen = build_us_entry_exit_contract(row)
+        assert verify_us_entry_exit_contract(frozen)
+        assert frozen["strategy_owner"] == "US_STANDARD"
+        assert frozen["entry_provenance"]["entry_style_selected"] == style
+    finally:
+        engine.dispose()
+        admin = create_engine(url, future=True)
+        with admin.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        admin.dispose()
