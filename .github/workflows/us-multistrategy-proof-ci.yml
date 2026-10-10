@@ -1,0 +1,38 @@
+name: US Multistrategy Proof CI
+
+on:
+  push:
+    branches:
+      - feat/us-20261010-minervini-daily-proof
+  pull_request:
+    branches:
+      - dual-agent
+    paths:
+      - "trader/us/candidate_pool_builder.py"
+      - "trader/us/watchlist_builder.py"
+      - "tests/us/test_us_minervini_daily_proof_20261010.py"
+      - "tests/us/test_us_verified_vcp_entry_selection_20261010.py"
+      - ".github/workflows/us-multistrategy-proof-ci.yml"
+
+jobs:
+  verified-vcp-provenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KIS_ENV: practice
+      US_PAPER_TRADING_ENABLED: "1"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Run explicit 4-family VCP evidence regression
+        run: |
+          python -m pytest -q tests/us/test_us_verified_vcp_entry_selection_20261010.py tests/us/test_us_minervini_daily_proof_20261010.py
