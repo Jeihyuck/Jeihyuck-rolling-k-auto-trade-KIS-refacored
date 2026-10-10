@@ -59,14 +59,19 @@ def test_standard_style_prep_db_live_buy_frozen_contract(monkeypatch, raw_style,
         "rank_final30": 1,
         "theme_cluster": "TECH",
     }
-    from trader.us.db.repos import _merge_us_daily_metrics_meta
-    db_row = {
-        "symbol": "AAPL", "exchange": "NASDAQ",
-        "strategy": raw_style, "score": .92,
-        "meta": _merge_us_daily_metrics_meta(prep),
-        "prep_status": "OK", "run_id": "four-entry-families-test",
-        "data_source": "completed_daily",
-    }
+    repos.reset_memory_stores()
+    prep["strategy"] = raw_style
+    prep["data_source"] = "completed_daily"
+    saved = repos.clear_and_save_locked_us_watchlist(
+        entries=[prep], trade_date="2026-10-09",
+        run_id="four-entry-families-test", prep_status="OK",
+    )
+    assert saved["saved_count"] == 1
+    rows = repos.load_locked_us_watchlist("2026-10-09", min_count=1)
+    assert len(rows) == 1
+    db_row = rows[0]
+    assert db_row["run_id"] == "four-entry-families-test"
+    assert db_row["meta"]["entry_style_selected"] == raw_style
     preflight = validate_us_entry_provenance_contract([db_row])
     assert preflight["ok"] is True, preflight
 
@@ -176,10 +181,22 @@ def test_each_family_restarts_with_its_original_frozen_stop_and_tp(
 
 
 def test_tqqq_cannot_inherit_any_us_standard_four_family_exit_contract():
-    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.entry_exit_contract import (
+        build_us_entry_exit_contract,
+        verify_us_entry_exit_contract,
+    )
     for style in ("ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_VCP"):
-        assert build_us_entry_exit_contract({
-            "symbol": "TQQQ",
-            "strategy_owner": "TQQQ_INFINITE",
+        frozen = build_us_entry_exit_contract({
+            "symbol": "AAPL", "strategy_owner": "US_STANDARD",
             "entry_style_selected": style,
-        }) == {}
+        })
+        assert verify_us_entry_exit_contract(frozen)
+        for owner_row in (
+            {"symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE"},
+            {"symbol": "TQQQ", "strategy_owner": "US_STANDARD"},
+            {"symbol": "AAPL", "strategy_owner": "TQQQ_INFINITE"},
+        ):
+            assert build_us_entry_exit_contract({
+                **owner_row,
+                "meta": {"entry_exit_contract": frozen},
+            }) == {}
