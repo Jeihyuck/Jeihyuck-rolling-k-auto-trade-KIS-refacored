@@ -104,3 +104,45 @@ def test_flag_off_keeps_the_legacy_buy_and_sell_contract(monkeypatch):
     identity = engine._resolve_entry_identity_from_mapping(row)
     assert identity["entry_reason"] == "ENTRY_PULLBACK"
     assert identity["exit_policy_family"] == "PULLBACK_EXIT"
+
+
+@pytest.mark.parametrize(
+    ("style", "expected_reason", "expected_horizon", "expected_exit"),
+    [
+        ("PULLBACK", "ENTRY_PULLBACK", "SWING", "SWING_STAGED_EXIT"),
+        ("MOMENTUM", "ENTRY_MOMENTUM", "DAY_TRADE", "INTRADAY_PROFIT_PROTECT"),
+        ("BREAKOUT", "ENTRY_BREAKOUT", "DAY_TRADE", "INTRADAY_PROFIT_PROTECT"),
+        ("VCP", "ENTRY_VCP", "SWING", "SWING_STAGED_EXIT"),
+    ],
+)
+def test_actual_trade_plan_mapping_respects_verified_buy_style(
+    monkeypatch, style, expected_reason, expected_horizon, expected_exit,
+):
+    """Prove the real KR frozen plan, not only the serializer argument contract."""
+    from trader.trade_plan import validate_entry_exit_plan
+    monkeypatch.setenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "1")
+    monkeypatch.setenv("PB1_ALLOW_STYLE_MAPPED_ENTRY_EXIT_PLAN", "1")
+    engine = PB1Engine.__new__(PB1Engine)
+    row = {
+        "entry_style_selected": style, "entry_reason": "ENTRY_PULLBACK",
+        "as_of": "2026-10-08", "candidate_family_proof_as_of": "2026-10-08",
+        "candidate_family_screens": {style: True},
+        "vcp_pass": True, "minervini_pass": True,
+        "vcp_evidence_as_of": "2026-10-08",
+        "atr_pct": 0.04, "initial_stop": 95., "close": 100.,
+    }
+    candidate = SimpleNamespace(code="083450", market="KOSPI", features=row)
+    result = engine._prepare_entry_exit_plan(candidate, entry_price_for_plan=100.)
+    assert result is not None
+    plan, meta = result
+    assert validate_entry_exit_plan(plan)
+    assert plan["entry_style_selected"] == expected_reason
+    assert plan["entry_reason"] == expected_reason
+    assert plan["trade_horizon"] == expected_horizon
+    assert plan["exit_policy_family"] == expected_exit
+    assert meta["entry_reason"] == expected_reason
+    assert meta["exit_policy_family"] == expected_exit
+    assert plan["risk_plan"]["initial_stop"] == 95.
+    assert plan["profit_plan"]["runner_enabled"] is True
+    assert plan["protection_plan"]["hard_stop_enabled"] is True
+    assert plan["force_eod_close"] is (expected_horizon == "DAY_TRADE")
