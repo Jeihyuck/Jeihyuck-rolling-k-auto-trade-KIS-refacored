@@ -152,3 +152,34 @@ def merge_verified_candidate_screens(
         "selected_count": len(selected),
         "fairness_mode": "verified_family_peer_percentile_no_quotas",
     }
+
+
+def apply_verified_family_final_arbitration(rows: list[dict]) -> list[dict]:
+    """One chosen qualifying style per candidate, no Pullback-only score bonus.
+
+    Stage-level family percentiles are comparable across independent setups.
+    Keep half of the original general quality/risk score when ranking Final30;
+    the other half reflects the strongest *verified* family. Existing entry
+    checks and owner-specific exit contracts still apply downstream.
+    """
+    for row in rows:
+        family_ranks = dict(row.get("candidate_family_quality_percentiles") or {})
+        screens = dict(row.get("candidate_family_screens") or {})
+        eligible = {family: float(value) for family, value in family_ranks.items()
+                    if screens.get(family) is True and math.isfinite(float(value))}
+        if not eligible:
+            continue  # Legacy fallback still goes through unchanged risk gates.
+        winner = max(sorted(eligible), key=lambda family: eligible[family])
+        base = float(row.get("score_final") or row.get("final_score") or 0.0)
+        fair_score = round(base * 0.5 + 100.0 * eligible[winner] * 0.5, 4)
+        row["entry_style_selected"] = winner
+        row["score_final"] = fair_score
+        row["final_score"] = fair_score
+        row["selected_family_quality_percentile"] = eligible[winner]
+        meta = row.get("meta")
+        if isinstance(meta, dict):
+            meta["entry_style_selected"] = winner
+            meta["candidate_family_quality_percentiles"] = family_ranks
+            meta["candidate_family_screens"] = screens
+            meta["selected_family_quality_percentile"] = eligible[winner]
+    return rows
