@@ -23,6 +23,14 @@ DERIVED_SCORES = {
     "083450": 40.0, "115450": 66.1929824561404,
     "131970": 30.0, "373220": 40.0,
 }
+# Source: public.derived_minervini 2026-10-08, env=practice (read-only).
+# Keep actual RS and ATR gates, rather than pretending these were risk-free.
+DERIVED_RISK = {
+    "083450": {"rs_percentile": .969230769230769, "atr_pct": .044798, "ma50": 46611.0, "ma150": 45242.667},
+    "115450": {"rs_percentile": .871794871794872, "atr_pct": .095996, "ma50": 2141.940, "ma150": 2572.413},
+    "131970": {"rs_percentile": .876923076923077, "atr_pct": .073253, "ma50": 82074.0, "ma150": 104134.0},
+    "373220": {"rs_percentile": .676923076923077, "atr_pct": .034917, "ma50": 355610.0, "ma150": 382776.667},
+}
 
 
 def _bars(code, *, index_only=False):
@@ -42,20 +50,21 @@ def _entry_replay(code, monkeypatch):
     screens = completed_daily_candidate_proofs(df, expected_as_of=asof)
     assert screens["BREAKOUT"] is True
     proof = completed_breakout_evidence(df, expected_as_of=asof)
+    risk = DERIVED_RISK[code]
     row = {
         "code": code, "close": proof["close"], "volume": proof["volume"],
         "volume_avg20": proof["average_volume20"],
         "candidate_family_screens": screens, "candidate_breakout_evidence": proof,
-        "rs_percentile": 0.97, "atr_pct": 0.04, "score_final": 85.,
+        "rs_percentile": risk["rs_percentile"], "atr_pct": risk["atr_pct"], "score_final": 85.,
         "pullback_score": 32., "momentum_score": 75.,
         "ma20": float(df["close"].tail(20).mean()),
-        "ma50": float(df["close"].tail(50).mean()),
-        "ma150": None, "meta": {},
+        "ma50": risk["ma50"],
+        "ma150": risk["ma150"], "meta": {},
     }
     fake_derived = {
         code: {"symbol": code, "as_of": "2026-10-08", "close": proof["close"],
                "breakout_score": DERIVED_SCORES[code],
-               "rs_percentile": .97, "trend_score": 80.,
+               "rs_percentile": risk["rs_percentile"], "atr_pct": risk["atr_pct"], "trend_score": 80.,
                "vcp_score": 0., "momentum_score": 75., "pullback_score": 32.}
     }
     builder = WatchlistBuilder.__new__(WatchlistBuilder)
