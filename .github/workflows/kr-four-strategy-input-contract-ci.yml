@@ -1,0 +1,47 @@
+name: KR Four-Strategy Input Contract CI
+
+on:
+  push:
+    branches:
+      - fix/kr-20261010-rs-tech-score-unit
+  pull_request:
+    branches:
+      - dual-agent
+      - feat/kr-20261010-minervini-proof-bridge
+    paths:
+      - "trader/watchlist_builder.py"
+      - "trader/pb1_engine.py"
+      - "trader/universe/build.py"
+      - "tests/kr/test_kr_rs_tech_score_unit_20261010.py"
+      - "tests/kr/test_kr_minervini_evidence_bridge_20261010.py"
+      - "tests/kr/test_kr_vcp_strategy_provenance_20261010.py"
+      - "tests/kr/test_kr_multistrategy_input_contract_20261010.py"
+      - ".github/workflows/kr-four-strategy-input-contract-ci.yml"
+
+jobs:
+  kr-independent-entry-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      PB1_KR_MINERVINI_VCP_PROOF_ENABLED: "0"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Run KR four-family input and immutable provenance checks
+        run: |
+          python -m pytest -q \
+            tests/kr/test_kr_rs_tech_score_unit_20261010.py \
+            tests/kr/test_kr_multistrategy_input_contract_20261010.py \
+            tests/kr/test_kr_vcp_strategy_provenance_20261010.py \
+            tests/kr/test_kr_minervini_evidence_bridge_20261010.py
