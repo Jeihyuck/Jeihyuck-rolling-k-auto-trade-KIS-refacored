@@ -220,6 +220,8 @@ def _compute_us_explicit_signal_proofs(symbol: str, daily_rows: list[dict]) -> d
         "independent_entry_contract_v1": True,
         "momentum_pass": False,
         "standalone_momentum_score": None,
+        "pullback_pass": False,
+        "pullback_completed_close": None,
         "breakout_pass": False,
         "breakout_pivot_price": None,
         "entry_signal_proof_source": "completed_daily_ohlcv",
@@ -230,6 +232,23 @@ def _compute_us_explicit_signal_proofs(symbol: str, daily_rows: list[dict]) -> d
     close = _safe_float(latest.get("clos") if latest.get("clos") is not None else latest.get("close"))
     if close <= 0:
         return proof
+    # PB1 must prove its own completed-bar pullback, just like Momentum and
+    # Breakout. The old default-quality 0.5 is never independent evidence.
+    if len(rows) >= 160:
+        closes = [
+            _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))
+            for row in rows[-160:]
+        ]
+        if min(closes) > 0:
+            ma20 = sum(closes[-20:]) / 20
+            ma50 = sum(closes[-50:]) / 50
+            ma150 = sum(closes[-150:]) / 150
+            distance20 = (close - ma20) / ma20
+            proof["pullback_completed_close"] = close
+            proof["pullback_pass"] = bool(
+                -0.15 <= distance20 <= 0.05
+                and close > ma50 and ma50 >= ma150
+            )
     from trader.us.strategy.us_momentum import USMomentumStrategy
     daily = [
         {**row, "clos": _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))}
@@ -563,8 +582,32 @@ def build_us_candidate_pool(
 
     all_selected = combined + fallback_rows
 
-    # 점수 기준 정렬 후 pool_max 제한
-    all_selected = sorted(all_selected, key=lambda r: -r["candidate_score"])[:pool_max]
+    # Fair four-family mode: rescue every qualified setup before the pool cap.
+    # Unverified VCP proxies never count as proofs; real venue/quality gates stay.
+    if os.getenv("US_FOUR_FAMILY_FAIR_ARBITRATION_ENABLED", "0") == "1":
+        if os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") != "1":
+            raise RuntimeError("US_FOUR_FAMILY_REQUIRES_COMPLETED_BAR_PROOFS")
+        proven = [r for r in scored_rows if (
+            r.get("independent_entry_contract_v1") is True
+            and r.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+            and any(r.get(k) is True for k in ("pullback_pass", "momentum_pass", "breakout_pass"))
+        ) or (
+            r.get("vcp_pass") is True
+            and r.get("trend_template_pass") is True
+            and r.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            and _safe_float(r.get("pivot_price")) > 0
+        )]
+        if len(proven) > pool_max:
+            raise RuntimeError(f"US_FOUR_FAMILY_POOL_CAP_INSUFFICIENT qualified={len(proven)} cap={pool_max}")
+        seen = {r["symbol"] for r in proven}
+        legacy = sorted(all_selected, key=lambda r: -r["candidate_score"])
+        all_selected = (sorted(proven, key=lambda r: -r["candidate_score"]) + [
+            r for r in legacy if r["symbol"] not in seen
+        ])[:pool_max]
+        logger.info("[US_FOUR_FAMILY][POOL_UNION] qualified=%d selected=%d", len(proven), len(all_selected))
+    else:
+        # Historical selection is unchanged when the opt-in is disabled.
+        all_selected = sorted(all_selected, key=lambda r: -r["candidate_score"])[:pool_max]
     selected_count = len(all_selected)
     quality_contract = evaluate_candidate_pool_quality(all_selected, strict_rows, relaxed_rows, fallback_rows, scored_rows)
 

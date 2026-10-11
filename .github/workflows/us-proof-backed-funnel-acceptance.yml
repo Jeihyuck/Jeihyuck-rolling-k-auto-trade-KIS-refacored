@@ -4,12 +4,13 @@ on:
   push:
     branches:
       - obs/us-20261010-strategy-funnel-stage-counts
+      - fix/us-20261011-four-family-fair-arbitration
   pull_request:
     branches:
       - fix/us-20261010-independent-signal-eligibility
       - dual-agent
     paths:
-      - 'trader/us/watchlist_builder.py'
+      - 'trader/us/**'
       - 'trader/us/runner/prep_runner.py'
       - 'tests/us/**'
       - '.github/workflows/us-proof-backed-funnel-acceptance.yml'
