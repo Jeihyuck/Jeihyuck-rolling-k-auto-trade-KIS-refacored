@@ -1,0 +1,50 @@
+name: KR Emergency Venue Readonly CI
+
+on:
+  push:
+    branches:
+      - fix/kr-20261010-verified-fdr-emergency-market
+      - feat/kr-20261010-vcp-style-provenance
+      - feat/kr-20261010-minervini-proof-bridge
+      - fix/kr-20261010-rs-tech-score-unit
+  pull_request:
+    branches:
+      - fix/kr-20261010-regime-market-and-rs-contract
+      - fix/kr-20261010-verified-fdr-emergency-market
+      - feat/kr-20261010-vcp-style-provenance
+      - feat/kr-20261010-minervini-proof-bridge
+      - dual-agent
+    paths:
+      - "scripts/kr_emergency_venue_readonly_probe.py"
+      - "tests/kr/test_kr_emergency_venue_readonly_probe_20261010.py"
+      - "tests/kr/test_kr_venue_verified_emergency_20261010.py"
+      - "trader/universe/build.py"
+      - ".github/workflows/kr-emergency-venue-readonly-ci.yml"
+
+jobs:
+  venue-verify-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      KIS_ENV: practice
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      US_KIS_ORDER_ALLOWED: "0"
+      KIS_HTTP_BLOCK: "1"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Verify read-only script and emergency fallback code
+        run: |
+          python -m py_compile scripts/kr_emergency_venue_readonly_probe.py trader/universe/build.py
+          python -m pytest -q \
+            tests/kr/test_kr_emergency_venue_readonly_probe_20261010.py \
+            tests/kr/test_kr_venue_verified_emergency_20261010.py \
+            tests/kr/test_kr_multistrategy_input_contract_20261010.py
