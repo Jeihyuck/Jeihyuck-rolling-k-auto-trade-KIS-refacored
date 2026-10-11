@@ -1102,7 +1102,7 @@ def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int
             "candidate_family_screens", "candidate_family_proof_as_of", "candidate_breakout_evidence",
             "candidate_family_quality_percentiles", "breakout_completed_proof_valid",
             "breakout_score_source", "breakout_derived_score_before_reconciliation",
-            "breakout_pivot_price", "vcp_pass", "minervini_pass",
+            "breakout_pivot_price", "vcp_pass", "minervini_pass", "vcp_evidence_as_of",
         ):
             value = row.get(proof_key)
             if value is None:
