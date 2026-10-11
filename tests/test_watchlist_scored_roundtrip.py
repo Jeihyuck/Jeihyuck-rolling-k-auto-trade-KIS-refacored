@@ -511,17 +511,24 @@ def test_real_supabase_breakout_proof_persists_through_scored_db_to_pb1_buy(monk
     engine_db = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(engine_db).metadata.create_all(engine_db)
     repo = WatchlistRepo(engine_db)
+    # The real strict Final30 contract requires EXACTLY 30, not one row.
+    # Fill the other 29 with synthetic locked, internally valid rows while
+    # preserving one genuine 63-bar Supabase Breakout proof unchanged.
+    members = [_scored_member(i) for i in range(2, 31)]
+    for other in members:
+        other["as_of"] = "2026-10-08"
+    members.insert(0, member)
     repo.save_watchlist(
         env="practice", strategy="pb1_watchlist_final_scored",
-        as_of=date(2026, 10, 8), members=[member],
+        as_of=date(2026, 10, 8), members=members,
     )
     stored, loaded_asof = repo.load_watchlist_scored(
         env="practice", strategy="pb1_watchlist_final_scored",
         as_of=date(2026, 10, 8), allow_latest_fallback=False,
     )
     assert loaded_asof == date(2026, 10, 8)
-    assert len(stored) == 1
-    saved = stored[0]
+    assert len(stored) == 30
+    saved = next(row for row in stored if row["code"] == "083450")
     assert saved["breakout_score"] == 100.0
     assert saved["candidate_family_screens"]["BREAKOUT"] is True
     assert saved["breakout_completed_proof_valid"] is True
