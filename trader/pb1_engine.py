@@ -15039,14 +15039,30 @@ class PB1Engine:
             # must not become a new independent BUY. Existing sleeves and
             # position exits remain unchanged; this is the new-entry gate.
             screens = dict(features.get("candidate_family_screens") or {})
+            prepared_as_of = str(features.get("as_of") or "").strip()[:10]
+            proof_as_of = str(features.get("candidate_family_proof_as_of") or "").strip()[:10]
+            if style in {"PULLBACK", "MOMENTUM", "BREAKOUT"} and (
+                not prepared_as_of or proof_as_of != prepared_as_of
+            ):
+                return False, ["completed_daily_proof_date_mismatch"], {
+                    "setup_source": "four_family_asof_gate", "entry_style": style,
+                }
             if style in {"PULLBACK", "MOMENTUM", "BREAKOUT"} and screens.get(style) is not True:
                 return False, ["completed_daily_family_proof_missing"], {
                     "setup_source": "four_family_proof_gate", "entry_style": style,
                 }
             if style == "BREAKOUT":
+                proof = dict(features.get("candidate_breakout_evidence") or {})
+                pivot55 = float(proof.get("pivot55") or 0)
+                close = float(proof.get("close") or 0)
+                volume = float(proof.get("volume") or 0)
+                avg_volume = float(proof.get("average_volume20") or 0)
                 if (features.get("breakout_completed_proof_valid") is not True
                         or features.get("breakout_score_source") != "completed_daily_pb1_55d"
-                        or float(features.get("breakout_pivot_price") or 0) <= 0):
+                        or float(features.get("breakout_pivot_price") or 0) != pivot55
+                        or proof.get("source") != "completed_daily_ohlcv"
+                        or str(proof.get("as_of") or "") != prepared_as_of.replace("-", "")
+                        or not (close > pivot55 > 0 and volume >= 1.5 * avg_volume > 0)):
                     return False, ["completed_daily_breakout_score_proof_missing"], {
                         "setup_source": "four_family_breakout_proof_gate",
                     }

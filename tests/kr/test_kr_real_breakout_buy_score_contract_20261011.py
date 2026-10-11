@@ -52,7 +52,9 @@ def _entry_replay(code, monkeypatch):
     proof = completed_breakout_evidence(df, expected_as_of=asof)
     risk = DERIVED_RISK[code]
     row = {
-        "code": code, "close": proof["close"], "volume": proof["volume"],
+        "code": code, "as_of": "2026-10-08",
+        "candidate_family_proof_as_of": "2026-10-08",
+        "close": proof["close"], "volume": proof["volume"],
         "volume_avg20": proof["average_volume20"],
         "candidate_family_screens": screens, "candidate_breakout_evidence": proof,
         "rs_percentile": risk["rs_percentile"], "atr_pct": risk["atr_pct"], "score_final": 85.,
@@ -101,8 +103,10 @@ def test_real_oct_breakout_proof_uses_existing_pb1_score_and_buy_policy(code, mo
     assert contract["entry_reason"] == "ENTRY_BREAKOUT"
 
     for modified in [
+        {**row, "candidate_family_proof_as_of": "2026-10-07"},
         {**row, "breakout_completed_proof_valid": False},
         {**row, "breakout_score_source": "derived_minervini"},
+        {**row, "candidate_breakout_evidence": {**row["candidate_breakout_evidence"], "volume": 0}},
         {**row, "candidate_family_screens": {"BREAKOUT": False}},
         {**row, "breakout_score": 54.9},
         {**row, "rs_percentile": 0.40},

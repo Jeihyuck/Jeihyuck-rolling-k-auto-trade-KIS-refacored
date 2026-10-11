@@ -2480,6 +2480,7 @@ class WatchlistBuilder:
         meta["momentum_pass"] = momentum_pass
         if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
             meta["candidate_family_screens"] = dict(item.get("candidate_family_screens") or {})
+            meta["candidate_family_proof_as_of"] = item.get("candidate_family_proof_as_of")
             meta["candidate_breakout_evidence"] = dict(item.get("candidate_breakout_evidence") or {})
             for proof_field in (
                 "breakout_completed_proof_valid", "breakout_score_source",
@@ -2514,6 +2515,7 @@ class WatchlistBuilder:
             "momentum_score": momentum_score,
             "entry_style_selected": entry_style_selected,
             "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
+            "candidate_family_proof_as_of": item.get("candidate_family_proof_as_of"),
             "candidate_breakout_evidence": dict(item.get("candidate_breakout_evidence") or {}),
             "breakout_completed_proof_valid": bool(item.get("breakout_completed_proof_valid")),
             "breakout_score_source": item.get("breakout_score_source"),
@@ -2635,6 +2637,7 @@ class WatchlistBuilder:
             if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
                 from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
                 item["candidate_family_screens"] = completed_daily_candidate_proofs(df, expected_as_of=as_of)
+                item["candidate_family_proof_as_of"] = as_of.isoformat()
                 from trader.kr_four_family_candidate_admission import completed_breakout_evidence
                 item["candidate_breakout_evidence"] = completed_breakout_evidence(df, expected_as_of=as_of)
             candidates.append(item)

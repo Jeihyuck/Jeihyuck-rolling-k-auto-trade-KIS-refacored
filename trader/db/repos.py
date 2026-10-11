@@ -1099,7 +1099,7 @@ def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int
     if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
         original_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
         for proof_key in (
-            "candidate_family_screens", "candidate_breakout_evidence",
+            "candidate_family_screens", "candidate_family_proof_as_of", "candidate_breakout_evidence",
             "candidate_family_quality_percentiles", "breakout_completed_proof_valid",
             "breakout_score_source", "breakout_derived_score_before_reconciliation",
             "breakout_pivot_price", "vcp_pass", "minervini_pass",

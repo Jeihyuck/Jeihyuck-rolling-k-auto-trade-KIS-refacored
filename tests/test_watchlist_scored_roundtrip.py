@@ -494,6 +494,7 @@ def test_real_supabase_breakout_proof_persists_through_scored_db_to_pb1_buy(monk
         "close": proof["close"], "last_close": proof["close"],
         "volume": proof["volume"], "volume_avg20": proof["average_volume20"],
         "candidate_family_screens": {"PULLBACK": False, "MOMENTUM": True, "BREAKOUT": True, "VCP": False},
+        "candidate_family_proof_as_of": "2026-10-08",
         "candidate_breakout_evidence": proof,
         "breakout_completed_proof_valid": True,
         "breakout_score_source": "completed_daily_pb1_55d",
@@ -502,7 +503,7 @@ def test_real_supabase_breakout_proof_persists_through_scored_db_to_pb1_buy(monk
     member["meta"] = {
         **member["meta"],
         **{key: member[key] for key in (
-            "candidate_family_screens", "candidate_breakout_evidence",
+            "candidate_family_screens", "candidate_family_proof_as_of", "candidate_breakout_evidence",
             "breakout_completed_proof_valid", "breakout_score_source",
             "breakout_pivot_price", "breakout_score",
         )},
@@ -531,6 +532,7 @@ def test_real_supabase_breakout_proof_persists_through_scored_db_to_pb1_buy(monk
     saved = next(row for row in stored if row["code"] == "083450")
     assert saved["breakout_score"] == 100.0
     assert saved["candidate_family_screens"]["BREAKOUT"] is True
+    assert saved["candidate_family_proof_as_of"] == "2026-10-08"
     assert saved["breakout_completed_proof_valid"] is True
     assert saved["breakout_score_source"] == "completed_daily_pb1_55d"
 
