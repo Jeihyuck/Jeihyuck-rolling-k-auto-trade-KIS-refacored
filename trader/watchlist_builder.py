@@ -2505,6 +2505,10 @@ class WatchlistBuilder:
             "entry_style_selected": entry_style_selected,
             "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
             "candidate_breakout_evidence": dict(item.get("candidate_breakout_evidence") or {}),
+            "breakout_completed_proof_valid": bool(item.get("breakout_completed_proof_valid")),
+            "breakout_score_source": item.get("breakout_score_source"),
+            "breakout_derived_score_before_reconciliation": item.get("breakout_derived_score_before_reconciliation"),
+            "breakout_pivot_price": item.get("breakout_pivot_price"),
             "candidate_family_quality_percentiles": dict(item.get("candidate_family_quality_percentiles") or {}),
             "entry_component": entry_component,
             "breakout_pass": breakout_pass,
@@ -3285,6 +3289,54 @@ class WatchlistBuilder:
             _row_set(row, "volume_avg20", volume_avg20)
             _row_set(row, "atr_pct", atr_pct)
             _row_set(row, "breakout_score", breakout_score)
+            # The derived Minervini breakout score is not the same contract
+            # as PB1's completed-55D breakout BUY score. Only on an actual,
+            # same-session OHLCV proof do we recompute using the existing
+            # PB1 scorer; do not modify its >=55 entry requirement.
+            if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+                screens = dict(_row_get(row, "candidate_family_screens", {}) or {})
+                evidence = dict(_row_get(row, "candidate_breakout_evidence", {}) or {})
+                snapshot_close = _safe_float(evidence.get("close"))
+                snapshot_volume = _safe_float(evidence.get("volume"))
+                pivot55 = _safe_float(evidence.get("pivot55"))
+                average_volume = _safe_float(evidence.get("average_volume20"))
+                evidence_valid = bool(
+                    screens.get("BREAKOUT") is True
+                    and evidence.get("source") == "completed_daily_ohlcv"
+                    and evidence.get("as_of") == as_of.strftime("%Y%m%d")
+                    and snapshot_close > pivot55 > 0
+                    and snapshot_volume >= 1.5 * average_volume > 0
+                    and abs(_safe_float(close) - snapshot_close) < 0.00001 * snapshot_close
+                )
+                _row_set(row, "breakout_completed_proof_valid", evidence_valid)
+                if evidence_valid:
+                    proof_score_input = {
+                        "code": sym, "close": snapshot_close,
+                        "pivot_price": pivot55,
+                        "high_20d": evidence.get("prior_high20"),
+                        "high_55d": pivot55,
+                        "volume": snapshot_volume, "volume_avg20": average_volume,
+                    }
+                    reconciled = self._compute_breakout_score(proof_score_input)
+                    if reconciled is not None and reconciled >= 0:
+                        _row_set(row, "breakout_derived_score_before_reconciliation", breakout_score)
+                        _row_set(row, "breakout_score", reconciled)
+                        _row_set(row, "breakout_score_source", "completed_daily_pb1_55d")
+                        _row_set(row, "breakout_pivot_price", pivot55)
+                        _row_set(row, "pivot", pivot55)
+                        _row_set(row, "high_55d", pivot55)
+                        _row_set(row, "high_20d", evidence.get("prior_high20"))
+                        _row_set(row, "breakout_trigger_ok", bool(
+                            reconciled >= 60.0 and snapshot_close >= pivot55
+                        ))
+                        logger.info(
+                            "[KR_BREAKOUT][SCORE_RECONCILED] code=%s as_of=%s"
+                            " derived=%s pb1=%.4f pivot=%.3f volume_ratio=%.3f",
+                            sym, as_of, breakout_score, reconciled,
+                            pivot55, _safe_float(evidence.get("volume_ratio20")),
+                        )
+                    else:
+                        _row_set(row, "breakout_completed_proof_valid", False)
             _row_set(row, "pullback_score", pullback_score)
             _row_set(row, "momentum_score", momentum_score)
             if entry_style:
