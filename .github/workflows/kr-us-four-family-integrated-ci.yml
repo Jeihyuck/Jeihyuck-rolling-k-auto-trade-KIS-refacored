@@ -59,6 +59,7 @@ jobs:
             tests/integration/test_kr_us_four_family_real_ohlcv_20261011.py \
             tests/kr/test_kr_four_family_candidate_admission_20261011.py \
             tests/kr/test_kr_real_breakout_buy_score_contract_20261011.py \
+            tests/test_watchlist_scored_roundtrip.py \
             tests/kr/test_kr_supabase_real_ohlcv_replay_20261011.py \
             tests/us/test_us_four_family_fair_arbitration_20261011.py \
             tests/us/test_us_four_family_pullback_locked_proof_20261011.py \
