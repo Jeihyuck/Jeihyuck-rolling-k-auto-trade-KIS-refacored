@@ -79,7 +79,15 @@ def test_real_oct_breakout_proof_uses_existing_pb1_score_and_buy_policy(code, mo
     engine.require_volume = False
     engine.env = "practice"
     row["entry_style_selected"] = "BREAKOUT"
-    ok, why, contract = engine._evaluate_final30_entry_setup(code, row, market="KOSPI")
+    engine._precomputed_final30_map = {code: dict(row)}
+    engine._precomputed_derived_map = {}
+    engine._precomputed_universe_map = {}
+    mapped, checks, rejected_reasons, usable, data_ok = engine._map_precomputed_candidate_row(code)
+    assert checks["has_breakout_score"] == 1, rejected_reasons
+    assert mapped["candidate_family_screens"]["BREAKOUT"] is True
+    assert mapped["breakout_completed_proof_valid"] is True
+    assert mapped["breakout_score_source"] == "completed_daily_pb1_55d"
+    ok, why, contract = engine._evaluate_final30_entry_setup(code, mapped, market="KOSPI")
     assert ok is True, why
     assert contract["entry_reason"] == "ENTRY_BREAKOUT"
 
