@@ -253,6 +253,7 @@ def test_standby_respects_top50_and_final30_active_capacity(monkeypatch):
         _arbiter_row(
             close=101., symbol=f"ACTIVE{i}", score_final=.20 + i / 1000.,
             momentum_pass=True, standalone_momentum_score=.90,
+            vcp_pass=False,
         )
         for i in range(35)
     ]
