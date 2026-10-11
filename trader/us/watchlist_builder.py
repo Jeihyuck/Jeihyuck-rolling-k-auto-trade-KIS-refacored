@@ -245,6 +245,97 @@ def _select_entry_style(
     return max(scores, key=lambda k: scores[k])
 
 
+def summarize_us_entry_style_funnel(
+    broader_scored: list[dict],
+    top50: list[dict],
+    final30: list[dict],
+) -> dict:
+    """Observe four-family PREP proofs after #201 evaluators, without trading side effects.
+
+    Proof absence (None/NOT_EVALUATED) and genuine evaluated false (0) must
+    not be conflated. The authoritative independent proof status is computed
+    by _select_entry_style on the upstream candidate row, after verifying
+    completed-daily OHLCV provenance and the VCP pivot gate. Bare legacy
+    *_pass booleans are never trusted as independent strategy proof.
+    """
+    def status(row: dict, family: str) -> bool | None:
+        proof = row.get("independent_proof_status")
+        valid_independent_source = (
+            row.get("independent_entry_contract_v1") is True
+            and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+        )
+        valid_vcp_source = (
+            row.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            and _safe_float(row.get("vcp_daily_avg_volume20"), 0.0) > 0
+        )
+        # Even the arbitration result is *not proof that a signal was
+        # evaluated* if the upstream producer never produced valid evidence.
+        if isinstance(proof, dict) and type(proof.get(family)) is bool:
+            if family in {"momentum", "breakout"} and valid_independent_source:
+                return proof[family]
+            if family == "vcp" and valid_vcp_source:
+                return proof[family]
+        # Upstream signal producer may be enabled while arbitration is off.
+        # In that case the completed-daily contract is still a valid signal
+        # observation, but not evidence that an independent BUY was allowed.
+        if family in {"momentum", "breakout"}:
+            if (
+                row.get("independent_entry_contract_v1") is True
+                and row.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+                and type(row.get(family + "_pass")) is bool
+            ):
+                return row[family + "_pass"]
+            return None
+        if (
+            row.get("vcp_evidence_source") != "completed_daily_ohlcv"
+            or _safe_float(row.get("vcp_daily_avg_volume20"), 0.0) <= 0
+            or type(row.get("vcp_pass")) is not bool
+            or type(row.get("trend_template_pass")) is not bool
+            or "pivot_price" not in row
+        ):
+            return None
+        pivot = _safe_float(row.get("pivot_price"), 0.0)
+        last = _safe_float(row.get("close") or row.get("price"), 0.0)
+        return bool(
+            row.get("vcp_pass") is True
+            and row.get("trend_template_pass") is True
+            and pivot > 0
+            and last >= pivot
+        )
+
+    stages = {"broader_scored": broader_scored, "top50": top50, "final30": final30}
+    result: dict[str, dict] = {}
+    for stage, stage_rows in stages.items():
+        stage_rows = stage_rows or []
+        styles: dict[str, int] = {}
+        for row in stage_rows:
+            name = str(row.get("entry_style_selected") or "UNKNOWN").strip().lower()
+            styles[name] = styles.get(name, 0) + 1
+        evidence = {
+            family: [s for row in stage_rows if (s := status(row, family)) is not None]
+            for family in ("vcp", "momentum", "breakout")
+        }
+        coverage = {
+            family: (
+                "NOT_EVALUATED" if not votes
+                else "COMPLETE" if len(votes) == len(stage_rows)
+                else "PARTIAL"
+            )
+            for family, votes in evidence.items()
+        }
+        result[stage] = {
+            "total": len(stage_rows),
+            "styles": dict(sorted(styles.items())),
+            **{
+                family + "_proof_pass": sum(votes) if votes else None
+                for family, votes in evidence.items()
+            },
+            "proof_evaluated_counts": {family: len(votes) for family, votes in evidence.items()},
+            "proof_coverage": coverage,
+        }
+    return result
+
+
 def _compute_agent_b_score(row: dict, daily_rows: list[dict]) -> tuple[float, list[str], str]:
     """Agent B: Strategy Entry Score."""
     pb1_score = _compute_pb1_score(row, daily_rows)
@@ -595,6 +686,17 @@ def build_us_watchlist(
         bool((bucket_meta or {}).get("selected_by_bucket_champion")),
     )
 
+    strategy_funnel = summarize_us_entry_style_funnel(
+        broader_scored, top50, final30_scored,
+    )
+    logger.info(
+        "[US_STRATEGY_FUNNEL][PREP] trade_date=%s broader=%s top50=%s final30=%s",
+        trade_date,
+        strategy_funnel["broader_scored"],
+        strategy_funnel["top50"],
+        strategy_funnel["final30"],
+    )
+
     logger.info(
         "[US_WATCHLIST][STAGE_COUNTS] upstream_universe=%d filtered_universe=%d"
         " candidate_pool=%d broader_scored=%d top50=%d final30=%d",
@@ -615,6 +717,7 @@ def build_us_watchlist(
         "final30_count": len(final30),
         "final30_scored_count": len(final30_scored),
         "broader_scored": broader_scored,
+        "strategy_funnel": strategy_funnel,
         "top50_scored": top50,
         "final30": final30,
         "final30_scored": final30_scored,
