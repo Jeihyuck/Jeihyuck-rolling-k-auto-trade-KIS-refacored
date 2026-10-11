@@ -220,6 +220,8 @@ def _compute_us_explicit_signal_proofs(symbol: str, daily_rows: list[dict]) -> d
         "independent_entry_contract_v1": True,
         "momentum_pass": False,
         "standalone_momentum_score": None,
+        "pullback_pass": False,
+        "pullback_completed_close": None,
         "breakout_pass": False,
         "breakout_pivot_price": None,
         "entry_signal_proof_source": "completed_daily_ohlcv",
@@ -230,6 +232,23 @@ def _compute_us_explicit_signal_proofs(symbol: str, daily_rows: list[dict]) -> d
     close = _safe_float(latest.get("clos") if latest.get("clos") is not None else latest.get("close"))
     if close <= 0:
         return proof
+    # PB1 must prove its own completed-bar pullback, just like Momentum and
+    # Breakout. The old default-quality 0.5 is never independent evidence.
+    if len(rows) >= 160:
+        closes = [
+            _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))
+            for row in rows[-160:]
+        ]
+        if min(closes) > 0:
+            ma20 = sum(closes[-20:]) / 20
+            ma50 = sum(closes[-50:]) / 50
+            ma150 = sum(closes[-150:]) / 150
+            distance20 = (close - ma20) / ma20
+            proof["pullback_completed_close"] = close
+            proof["pullback_pass"] = bool(
+                -0.15 <= distance20 <= 0.05
+                and close > ma50 and ma50 >= ma150
+            )
     from trader.us.strategy.us_momentum import USMomentumStrategy
     daily = [
         {**row, "clos": _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))}
