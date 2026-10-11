@@ -662,6 +662,22 @@ def generate_entry_intents(
     )
     
     # entries를 symbol → entry dict로 변환 (빠른 조회용)
+    # A multi-style PREP must arbitrate to ONE locked row per symbol.
+    # Reject duplicate locked symbols instead of silently taking the last
+    # candidate's entry reason / frozen exit policy.
+    from collections import Counter
+    _locked_counts = Counter(
+        str(e.get("symbol") or "").strip().upper() for e in entries
+    ) if watchlist_entries else Counter()
+    ambiguous_locked_symbols = {
+        symbol for symbol, count in _locked_counts.items()
+        if symbol and count > 1
+    }
+    if ambiguous_locked_symbols:
+        logger.error(
+            "[US_ENTRY][DUPLICATE_LOCKED_SYMBOL] symbols=%s action=FAIL_CLOSED",
+            sorted(ambiguous_locked_symbols),
+        )
     entries_map = {e["symbol"]: e for e in entries} if entries else {}
     
     # Price lookup 최적화 설정
@@ -722,6 +738,12 @@ def generate_entry_intents(
             )
             raise TypeError(f"[US_ENTRY][INPUT_CONTRACT_FAIL] symbol must be str, got {type(symbol).__name__}")
         
+        # A duplicated locked symbol is ambiguous even when ranks/styles differ.
+        # Do not let last-row-wins metadata reach BUY or its immutable exit.
+        if symbol.strip().upper() in ambiguous_locked_symbols:
+            track_skip(symbol, "duplicate_locked_watchlist_symbol")
+            continue
+
         # 동일 tick 내 중복 symbol 차단
         if symbol in seen_symbols:
             track_skip(symbol, "duplicate_in_tick")
@@ -1054,8 +1076,7 @@ def generate_entry_intents(
             and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
             and str((entry_meta or {}).get("entry_style_selected") or "").upper() in {"VCP", "ENTRY_VCP"}
         ):
-            # Do not consume the limited broker HTTP budget for a VCP whose
-            # immutable completed-daily setup proof is already invalid.
+            # Reject unproven daily VCP *before* spending the limited HTTP budget.
             preliminary_proof = entry_meta or {}
             if (
                 preliminary_proof.get("vcp_pass") is not True
@@ -1549,6 +1570,8 @@ def generate_entry_intents(
             "vcp_evidence", "vcp_evidence_source", "vcp_evidence_status",
         "vcp_daily_avg_volume20", "vcp_live_breakout_verified",
         "vcp_live_volume", "vcp_live_quote_source",
+        "independent_eligible_entry_styles", "independent_arbitration_mode",
+        "independent_proof_status",
         ):
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
