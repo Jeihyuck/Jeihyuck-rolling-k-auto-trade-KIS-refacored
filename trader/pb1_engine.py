@@ -3028,9 +3028,39 @@ class PB1Engine:
             warning_counts=warning_counts,
         )
 
+    @classmethod
+    def _verified_kr_four_family_style(cls, payload: dict[str, Any] | None) -> str | None:
+        """Only a dated, proven Final30 winner may override stale legacy entry_reason.
+
+        The independent family flag is default-off.  Old PB1 and positions that
+        lack completed-daily proof keep their original provenance and exit plan.
+        """
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") != "1":
+            return None
+        row = payload if isinstance(payload, dict) else {}
+        normalized = cls._normalize_entry_reason(row.get("entry_style_selected"))
+        day = str(row.get("as_of") or "").strip()[:10]
+        if not day:
+            return None
+        family = normalized.removeprefix("ENTRY_")
+        if family in {"PULLBACK", "MOMENTUM", "BREAKOUT"}:
+            screens = row.get("candidate_family_screens") or {}
+            if not isinstance(screens, dict):
+                return None
+            if (str(row.get("candidate_family_proof_as_of") or "").strip()[:10] == day
+                    and screens.get(family) is True):
+                return normalized
+        if family == "VCP" and (
+            row.get("vcp_pass") is True
+            and row.get("minervini_pass") is True
+            and str(row.get("vcp_evidence_as_of") or "").strip()[:10] == day
+        ):
+            return normalized
+        return None
+
     def _resolve_entry_identity_from_mapping(self, source: dict[str, Any] | None) -> dict[str, str]:
         payload = source if isinstance(source, dict) else {}
-        entry_reason = self._normalize_entry_reason(
+        entry_reason = self._verified_kr_four_family_style(payload) or self._normalize_entry_reason(
             payload.get("entry_reason")
             or payload.get("entry_style_selected")
             or payload.get("entry_signal")
@@ -7042,7 +7072,8 @@ class PB1Engine:
             or identity.get("entry_reason")
         )
         entry_reason = (
-            cf.features.get("entry_reason")
+            (identity.get("entry_reason") if self._verified_kr_four_family_style(cf.features) else None)
+            or cf.features.get("entry_reason")
             or cf.features.get("decision_reason")
             or identity.get("entry_reason")
             or entry_style_selected
