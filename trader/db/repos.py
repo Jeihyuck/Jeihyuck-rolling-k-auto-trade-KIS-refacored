@@ -1091,6 +1091,24 @@ def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int
     }
     payload_meta = json_sanitize(normalize_final30_contract_row(payload_with_meta))
     payload_meta = _normalize_final30_score_fields(payload_meta)
+
+    # Independent family proof is immutable strategy provenance, not a
+    # negotiable default. Legacy normalization's explicit score allowlist
+    # must not discard proof needed by the live PB1 new-BUY fence.
+    # Copy only actual supplied values; NEVER synthesize missing evidence.
+    if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+        original_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        for proof_key in (
+            "candidate_family_screens", "candidate_breakout_evidence",
+            "candidate_family_quality_percentiles", "breakout_completed_proof_valid",
+            "breakout_score_source", "breakout_derived_score_before_reconciliation",
+            "breakout_pivot_price", "vcp_pass", "minervini_pass",
+        ):
+            value = row.get(proof_key)
+            if value is None:
+                value = original_meta.get(proof_key)
+            if value is not None:
+                payload_meta[proof_key] = json_sanitize(value)
     return {
         "env": None,
         "strategy": None,
