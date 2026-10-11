@@ -4,12 +4,15 @@ on:
   push:
     branches:
       - fix/kr-20261010-rs-tech-score-unit
+      - fix/kr-20261011-four-family-candidate-admission
   pull_request:
     branches:
       - dual-agent
       - feat/kr-20261010-minervini-proof-bridge
     paths:
       - "trader/watchlist_builder.py"
+      - "trader/candidate_pool_builder.py"
+      - "trader/kr_four_family_candidate_admission.py"
       - "trader/pb1_engine.py"
       - "trader/universe/**"
       - "tests/kr/**"
