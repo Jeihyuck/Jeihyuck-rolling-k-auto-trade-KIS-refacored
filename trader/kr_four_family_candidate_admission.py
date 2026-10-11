@@ -64,31 +64,72 @@ def merge_verified_candidate_screens(
     *,
     target_size: int,
 ) -> tuple[list[dict], dict]:
-    """Union verified screens with legacy choices; fail instead of silently truncating signals."""
+    """Evaluate *all* verified setups; preserve strongest cross-family signals.
+
+    The Top50 is a capacity constraint, not a strategy quota. Rank each proof
+    against its own family's peers, and explicitly report qualified setups
+    that could not be admitted. No downstream BUY authorization is implied.
+    """
     if target_size <= 0:
         raise ValueError("four_family_pool_target_nonpositive")
-    by_code = {}
+    by_code: dict[str, dict] = {}
     for row in prefilter_survivors:
         code = str(row.get("code") or "").zfill(6)
         if code != "000000":
             by_code[code] = row
-    proven = [
-        row for row in by_code.values()
-        if any((row.get("candidate_family_screens") or {}).values())
-    ]
-    proven.sort(key=lambda r: (-float(r.get("score") or 0), str(r.get("code") or "")))
-    if len(proven) > target_size:
-        raise RuntimeError(f"FOUR_FAMILY_POOL_CAP_INSUFFICIENT proof_count={len(proven)} target={target_size}")
-    selected, seen = list(proven), {str(r.get("code") or "").zfill(6) for r in proven}
+    families = ("PULLBACK", "MOMENTUM", "BREAKOUT", "VCP")
+    proven = [r for r in by_code.values()
+              if any((r.get("candidate_family_screens") or {}).values())]
+
+    def quality(row: dict) -> float:
+        # Same upstream quality scale within a candidate stage, only the
+        # *within-family percentile* competes across different strategies.
+        for key in ("tech_score", "candidate_score", "score"):
+            val = row.get(key)
+            try:
+                number = float(val)
+            except (ValueError, TypeError):
+                continue
+            if math.isfinite(number) and number > 0:
+                return number
+        return 0.0
+
+    peers = {
+        family: sorted(quality(r) for r in proven
+                       if (r.get("candidate_family_screens") or {}).get(family))
+        for family in families
+    }
+
+    for row in proven:
+        quality_by_family = {}
+        for family in families:
+            if not (row.get("candidate_family_screens") or {}).get(family):
+                continue
+            distribution = peers[family]
+            q = quality(row)
+            quality_by_family[family] = round(
+                sum(v <= q for v in distribution) / len(distribution), 6
+            )
+        row["candidate_family_quality_percentiles"] = quality_by_family
+
+    proven.sort(key=lambda r: (
+        -max(r["candidate_family_quality_percentiles"].values()),
+        -quality(r),
+        str(r.get("code") or ""),
+    ))
+    selected = proven[:target_size]
+    seen = {str(r.get("code") or "").zfill(6) for r in selected}
+    capacity_rejected = proven[target_size:]
+    for row in capacity_rejected:
+        row.setdefault("reject_reasons", []).append("qualified_but_capacity_rejected")
     for row in legacy_selected:
         code = str(row.get("code") or "").zfill(6)
         if code not in seen and code in by_code and len(selected) < target_size:
             selected.append(row)
             seen.add(code)
-    # Fill from equally screened survivors only if legacy selection had a shortage.
     original_target = min(target_size, max(len(legacy_selected), len(proven)))
     if len(selected) < original_target:
-        for row in sorted(by_code.values(), key=lambda r: (-float(r.get("score") or 0), str(r.get("code") or ""))):
+        for row in sorted(by_code.values(), key=lambda r: (-quality(r), str(r.get("code") or ""))):
             code = str(row.get("code") or "").zfill(6)
             if code not in seen:
                 selected.append(row)
@@ -97,11 +138,17 @@ def merge_verified_candidate_screens(
                 break
     return selected, {
         "eligible_by_family": {
-            family: sum(bool((r.get("candidate_family_screens") or {}).get(family)) for r in by_code.values())
-            for family in ("PULLBACK", "MOMENTUM", "BREAKOUT", "VCP")
+            family: sum(bool((r.get("candidate_family_screens") or {}).get(family))
+                        for r in by_code.values())
+            for family in families
         },
         "eligible_total": len(proven),
-        "protected_count": sum(str(r.get("code") or "").zfill(6) in seen for r in proven),
+        "protected_count": len(proven) - len(capacity_rejected),
+        "capacity_rejected_count": len(capacity_rejected),
+        "capacity_rejected_sample": [
+            str(r.get("code") or "") for r in capacity_rejected[:12]
+        ],
         "legacy_count": len(legacy_selected),
         "selected_count": len(selected),
+        "fairness_mode": "verified_family_peer_percentile_no_quotas",
     }
