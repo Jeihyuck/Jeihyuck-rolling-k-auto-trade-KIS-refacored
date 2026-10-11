@@ -292,12 +292,16 @@ class CandidatePoolBuilder:
                 composite_score = avg_value * 0.7 + trend_score * 1e9 * 0.3
                 
                 candidate_family_screens = {}
+                candidate_breakout_evidence = {}
                 if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
                     from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
                     candidate_family_screens = completed_daily_candidate_proofs(df, expected_as_of=as_of)
+                    from trader.kr_four_family_candidate_admission import completed_breakout_evidence
+                    candidate_breakout_evidence = completed_breakout_evidence(df, expected_as_of=as_of)
 
                 scored.append({
                     "candidate_family_screens": candidate_family_screens,
+                    "candidate_breakout_evidence": candidate_breakout_evidence,
                     "code": code,
                     "score": composite_score,
                     "avg_value": avg_value,

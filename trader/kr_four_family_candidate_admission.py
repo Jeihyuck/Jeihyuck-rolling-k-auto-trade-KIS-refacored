@@ -8,6 +8,43 @@ from __future__ import annotations
 import math
 
 
+def _bar_date_key(value) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y%m%d")
+    raw = str(value).strip()
+    if len(raw) >= 10 and raw[4] in {"-", "/"} and raw[7] in {"-", "/"}:
+        return raw[:10].replace("-", "").replace("/", "")
+    if len(raw) >= 8 and raw[:8].isdigit():
+        return raw[:8]
+    return ""
+
+
+def completed_breakout_evidence(df, *, expected_as_of) -> dict:
+    """Return auditable, completed-bar 55D breakout inputs, never a BUY pass."""
+    screens = completed_daily_candidate_proofs(df, expected_as_of=expected_as_of)
+    if not screens["BREAKOUT"]:
+        return {}
+    bars = df.tail(63)
+    high20 = max(float(v) for v in bars["high"].iloc[-21:-1])
+    pivot55 = max(float(v) for v in bars["high"].iloc[-56:-1])
+    price = float(bars["close"].iloc[-1])
+    volume = float(bars["volume"].iloc[-1])
+    avgvol20 = sum(float(v) for v in bars["volume"].iloc[-21:-1]) / 20.0
+    return {
+        "source": "completed_daily_ohlcv",
+        "as_of": _bar_date_key(expected_as_of),
+        "close": price,
+        "volume": volume,
+        "average_volume20": avgvol20,
+        "prior_high20": high20,
+        "prior_high55": pivot55,
+        "pivot55": pivot55,
+        "volume_ratio20": volume / avgvol20,
+    }
+
+
 def completed_daily_candidate_proofs(df, *, expected_as_of=None) -> dict[str, bool]:
     """Conservative OHLCV screens for three KR entry families.
 
@@ -18,16 +55,16 @@ def completed_daily_candidate_proofs(df, *, expected_as_of=None) -> dict[str, bo
     if df is None or len(df) < 63:
         return empty
     if expected_as_of is not None:
-        date_column = "date" if "date" in df.columns else "xymd" if "xymd" in df.columns else None
-        if date_column is None:
-            return empty
-        last_date = df[date_column].iloc[-1]
-        if hasattr(last_date, "strftime"):
-            actual_date = last_date.strftime("%Y%m%d")
+        expected_date = _bar_date_key(expected_as_of)
+        date_column = next((key for key in ("date", "xymd", "datetime", "stck_bsop_date")
+                            if key in df.columns), None)
+        if date_column is not None:
+            actual_date = _bar_date_key(df[date_column].iloc[-1])
         else:
-            actual_date = str(last_date).strip().replace("-", "")[:8]
-        expected_date = expected_as_of.strftime("%Y%m%d") if hasattr(expected_as_of, "strftime") else str(expected_as_of).strip().replace("-", "")[:8]
-        if actual_date != expected_date:
+            # KIS/FinanceDataReader may provide trading days only as the
+            # DataFrame datetime index. Never accept a numeric RangeIndex.
+            actual_date = _bar_date_key(df.index[-1])
+        if not expected_date or actual_date != expected_date:
             return empty
     needed = {"close", "high", "low", "volume"}
     if not needed.issubset(df.columns):
