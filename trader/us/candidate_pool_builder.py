@@ -205,6 +205,55 @@ def _compute_verified_us_minervini_vcp(daily_rows: list[dict]) -> dict:
         return {**failed, "vcp_evidence_status": "compute_error"}
 
 
+def _compute_us_explicit_signal_proofs(symbol: str, daily_rows: list[dict]) -> dict:
+    """Prove Momentum and completed-bar Breakout without submitting orders.
+
+    This PREP-only evaluator reuses the existing USMomentumStrategy score()
+    logic. Both results still use the US_STANDARD order and risk path.
+    """
+    rows = _valid_daily_rows(daily_rows)
+    proof = {
+        "independent_entry_contract_v1": True,
+        "momentum_pass": False,
+        "standalone_momentum_score": None,
+        "breakout_pass": False,
+        "breakout_pivot_price": None,
+        "entry_signal_proof_source": "completed_daily_ohlcv",
+    }
+    if len(rows) < 63:
+        return proof
+    latest = rows[-1]
+    close = _safe_float(latest.get("clos") if latest.get("clos") is not None else latest.get("close"))
+    if close <= 0:
+        return proof
+    from trader.us.strategy.us_momentum import USMomentumStrategy
+    daily = [
+        {**row, "clos": _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))}
+        for row in rows
+    ]
+    standalone_score = USMomentumStrategy(run_id="PREP_SIGNAL_ONLY").score(
+        symbol, daily, {"last": close}
+    )
+    if standalone_score is not None:
+        proof["momentum_pass"] = True
+        proof["standalone_momentum_score"] = float(standalone_score)
+
+    prior55 = rows[-56:-1]
+    highs = [_safe_float(row.get("high")) for row in prior55]
+    prior_vols = [
+        _safe_float(row.get("tvol") if row.get("tvol") is not None else row.get("volume"))
+        for row in rows[-21:-1]
+    ]
+    volume = _safe_float(latest.get("tvol") if latest.get("tvol") is not None else latest.get("volume"))
+    if len(highs) != 55 or min(highs) <= 0 or len(prior_vols) != 20 or min(prior_vols) <= 0 or volume <= 0:
+        return proof
+    pivot = max(highs)
+    proof["breakout_pivot_price"] = pivot
+    if close > pivot and volume >= (sum(prior_vols) / 20.0) * 1.5:
+        proof["breakout_pass"] = True
+    return proof
+
+
 def _score_symbol_candidate(
     sym_data: dict,
     daily_rows: list[dict],
@@ -426,6 +475,8 @@ def build_us_candidate_pool(
                 daily = provider.get_daily_prices(symbol, exchange, count=required_bars, as_of_date=as_of_date)
                 daily_quality = "OK" if len(daily or []) >= required_bars else "INSUFFICIENT_HISTORY"
             row = _score_symbol_candidate(sym_data, daily, all_rs20, all_rs60, all_rs120)
+            if os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") == "1":
+                row.update(_compute_us_explicit_signal_proofs(symbol, daily))
             if os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1":
                 proof = _compute_verified_us_minervini_vcp(daily)
                 row.update(proof)

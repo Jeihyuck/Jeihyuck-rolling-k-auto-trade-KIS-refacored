@@ -1344,6 +1344,10 @@ def generate_entry_intents(
         # only the thin book/horizon policy fields.
         durable_meta = intent.setdefault("meta", {})
         durable_meta.update({
+            "entry_signal_evidence": (
+                (entry_meta or {}).get("entry_signal_evidence")
+                or ((entry_meta or {}).get("meta") or {}).get("entry_signal_evidence")
+            ),
             "entry_style_selected": intent.get("entry_style_selected"),
             "entry_style_raw": intent.get("entry_style_raw"),
             "entry_component": intent.get("entry_component"),

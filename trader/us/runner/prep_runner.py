@@ -762,6 +762,20 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                     "daily_metrics_as_of": row.get("daily_metrics_as_of"),
                     "daily_metrics_source": row.get("daily_metrics_source"),
                     "daily_history_quality": row.get("daily_history_quality"),
+                    # Persist the original source proofs across the locked DB
+                    # boundary; their absence never grants entry eligibility.
+                    "entry_signal_evidence": {
+                        "independent_entry_contract_v1": row.get("independent_entry_contract_v1"),
+                        "momentum_pass": row.get("momentum_pass"),
+                        "standalone_momentum_score": row.get("standalone_momentum_score"),
+                        "breakout_pass": row.get("breakout_pass"),
+                        "breakout_pivot_price": row.get("breakout_pivot_price"),
+                        "vcp_pass": row.get("vcp_pass"),
+                        "trend_template_pass": row.get("trend_template_pass"),
+                        "pivot_price": row.get("pivot_price"),
+                        "vcp_evidence_status": row.get("vcp_evidence_status"),
+                        "vcp_evidence_as_of": row.get("daily_metrics_as_of"),
+                    },
                 },
             }
             for row in final30_scored
