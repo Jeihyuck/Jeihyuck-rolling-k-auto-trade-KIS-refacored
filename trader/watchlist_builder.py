@@ -2485,7 +2485,7 @@ class WatchlistBuilder:
             for proof_field in (
                 "breakout_completed_proof_valid", "breakout_score_source",
                 "breakout_derived_score_before_reconciliation", "breakout_pivot_price",
-                "candidate_family_quality_percentiles",
+                "candidate_family_quality_percentiles", "vcp_pass", "minervini_pass", "vcp_evidence_as_of",
             ):
                 if proof_field in item:
                     meta[proof_field] = item[proof_field]

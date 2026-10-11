@@ -141,3 +141,32 @@ def test_missing_ohlcv_provenance_blocks_all_new_style_families(monkeypatch):
         }, "KOSPI")
         assert result[0] is False
         assert result[1]
+
+
+def test_kr_minervini_vcp_requires_full_verified_source_and_exact_asof(monkeypatch):
+    """A volatility proxy or bare vcp_pass may never enter as Minervini."""
+    monkeypatch.setenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "1")
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.require_volume = False
+    engine.env = "practice"
+    base = {
+        "as_of": "2026-10-08", "entry_style_selected": "VCP",
+        "vcp_pass": True, "minervini_pass": True,
+        "vcp_evidence_as_of": "2026-10-08",
+        "vcp_score": 80., "rs_percentile": .95, "atr_pct": .04,
+        "close": 70000., "current_price": 70000.,
+    }
+    ok, reasons, meta = engine._evaluate_final30_entry_setup("083450", base, "KOSDAQ")
+    assert ok, reasons
+    assert meta["entry_reason"] == "ENTRY_VCP"
+    for diff in (
+        {"vcp_pass": False}, {"minervini_pass": False},
+        {"vcp_evidence_as_of": "2026-10-07"},
+        {"vcp_evidence_as_of": None},
+        {"vcp_score": 44.9},
+        {"rs_percentile": .40}, {"atr_pct": .20},
+    ):
+        allowed, rejection, _ = engine._evaluate_final30_entry_setup(
+            "083450", {**base, **diff}, "KOSDAQ"
+        )
+        assert allowed is False and rejection

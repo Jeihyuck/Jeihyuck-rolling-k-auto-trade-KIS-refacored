@@ -15066,7 +15066,13 @@ class PB1Engine:
                     return False, ["completed_daily_breakout_score_proof_missing"], {
                         "setup_source": "four_family_breakout_proof_gate",
                     }
-            if style == "VCP" and features.get("vcp_pass") is not True:
+            if style == "VCP" and (
+                features.get("vcp_pass") is not True
+                or features.get("minervini_pass") is not True
+                or not str(features.get("as_of") or "").strip()[:10]
+                or str(features.get("vcp_evidence_as_of") or "").strip()[:10]
+                   != str(features.get("as_of") or "").strip()[:10]
+            ):
                 return False, ["verified_vcp_proof_missing"], {
                     "setup_source": "four_family_vcp_proof_gate",
                 }
