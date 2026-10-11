@@ -1999,6 +1999,9 @@ class WatchlistBuilder:
 
         # 다시 점수 붙이기 (안전하게)
         top50 = self._attach_scores(top50, "B_TOP50")
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import apply_verified_family_final_arbitration
+            top50 = apply_verified_family_final_arbitration(top50)
         self._assert_nonzero_scores(top50, "TOP50", score_key="tech_score")
         
         logger.info(
@@ -2017,6 +2020,9 @@ class WatchlistBuilder:
         logger.info("[WATCHLIST][PIPELINE][C_FINAL30] kept=%s from=%s", len(final30), len(top50))
 
         final30 = self._attach_scores(final30, "C_FINAL30")
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import apply_verified_family_final_arbitration
+            final30 = apply_verified_family_final_arbitration(final30)
         self._assert_nonzero_scores(final30, "FINAL30", score_key="score_final")
 
         final30_scored = pd.DataFrame(final30).copy(deep=True)
@@ -2498,6 +2504,7 @@ class WatchlistBuilder:
             "momentum_score": momentum_score,
             "entry_style_selected": entry_style_selected,
             "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
+            "candidate_family_quality_percentiles": dict(item.get("candidate_family_quality_percentiles") or {}),
             "entry_component": entry_component,
             "breakout_pass": breakout_pass,
             "pullback_pass": pullback_pass,
