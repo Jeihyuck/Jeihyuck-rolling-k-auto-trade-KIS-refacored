@@ -46,11 +46,15 @@ def test_proven_breakouts_absent_from_legacy_get_protected_without_quota():
     assert funnel["protected_count"] == len(proven)
 
 
-def test_never_silently_discard_proven_signals_on_tight_cap():
+def test_overcapacity_is_reported_without_silent_signal_loss_or_failing_prep():
     proof = {"BREAKOUT": True}
     rows = [{"code": str(i).zfill(6), "candidate_family_screens": proof} for i in range(100, 105)]
-    with pytest.raises(RuntimeError, match="FOUR_FAMILY_POOL_CAP_INSUFFICIENT"):
-        merge_verified_candidate_screens([], rows, target_size=4)
+    selected, report = merge_verified_candidate_screens([], rows, target_size=4)
+    assert len(selected) == 4
+    assert report["eligible_total"] == 5
+    assert report["capacity_rejected_count"] == 1
+    assert report["capacity_rejected_sample"]
+    assert sum("qualified_but_capacity_rejected" in r.get("reject_reasons", []) for r in rows) == 1
 
 
 def test_incomplete_data_not_a_valid_setup():
