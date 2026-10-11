@@ -1984,6 +1984,17 @@ class WatchlistBuilder:
             reverse=True,
         )
         top50 = top50_source[: self.topk]
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import merge_verified_candidate_screens
+            for row in pool120:
+                screens = dict(_row_get(row, "candidate_family_screens", {}) or {})
+                if _row_get(row, "entry_style_selected", "") == "VCP" and _row_get(row, "vcp_pass", False) is True:
+                    screens["VCP"] = True  # Never turn a generic ATR contraction proxy into a VCP.
+                _row_set(row, "candidate_family_screens", screens)
+            top50, top50_funnel = merge_verified_candidate_screens(
+                top50, pool120, target_size=self.topk,
+            )
+            logger.info("[WATCHLIST][FOUR_FAMILY][TOP50_UNION] %s", top50_funnel)
         logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(top50), len(pool120))
 
         # 다시 점수 붙이기 (안전하게)
@@ -2486,6 +2497,7 @@ class WatchlistBuilder:
             "pullback_score": pullback_score,
             "momentum_score": momentum_score,
             "entry_style_selected": entry_style_selected,
+            "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
             "entry_component": entry_component,
             "breakout_pass": breakout_pass,
             "pullback_pass": pullback_pass,
@@ -2598,6 +2610,9 @@ class WatchlistBuilder:
             item["turnover_pct"] = float(turnover_pct)
             item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
             item["meta"] = {"as_of": as_of.isoformat(), "market": item["market"], "market_code": item["market_code"], "rs_benchmark": item["rs_benchmark"]}
+            if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+                from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
+                item["candidate_family_screens"] = completed_daily_candidate_proofs(df)
             candidates.append(item)
             universe_items.append(item)
 
