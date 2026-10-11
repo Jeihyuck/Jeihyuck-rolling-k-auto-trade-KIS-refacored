@@ -57,6 +57,34 @@ from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_kr_rs_score_100(value: Any) -> float:
+    """Normalize known KR RS ratio (0..1) or percentage (0..100) to points.
+
+    Both Final30 weighted RS and the technical-score RS component consume
+    0..100. DerivedMinervini and `rs_pctile` persist 0..1. Mixed scoring
+    units previously suppressed Momentum/Breakout qualification.
+    """
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(numeric):
+        return 0.0
+    if 0.0 < numeric <= 1.0:
+        numeric *= 100.0
+    return min(100.0, max(0.0, numeric))
+
+
+def _kr_final30_rs_points(row: dict) -> float:
+    """Fallback only on missing RS, never replace an explicit score of zero."""
+    for key in ("ai_rs_score", "rs_pctile", "rs_percentile"):
+        value = row.get(key)
+        if value is not None and value != "":
+            return _normalize_kr_rs_score_100(value)
+    return 0.0
+
+
 FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]]
 
 
@@ -282,11 +310,12 @@ NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_p
 NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
 
 # ── entry style 허용값 상수 ─────────────────────────────────────────────────────
-ALLOWED_ENTRY_STYLES = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+ALLOWED_ENTRY_STYLES = {"BREAKOUT", "PULLBACK", "MOMENTUM", "VCP"}
 ENTRY_STYLE_SCORE_KEYS = {
     "BREAKOUT": "breakout_score",
     "PULLBACK": "pullback_score",
     "MOMENTUM": "momentum_score",
+    "VCP": "vcp_score",
 }
 FINAL30_CANONICAL_NUMERIC_FIELDS = (
     "close",
@@ -777,6 +806,7 @@ def _normalize_entry_style_value(value: Any) -> str:
         "MOM": "MOMENTUM",
         "ENTRY_MOMENTUM": "MOMENTUM",
         "MOMENTUM_CONTINUATION": "MOMENTUM",
+        "ENTRY_VCP": "VCP",
     }
     return aliases.get(raw, raw)
 
@@ -1954,6 +1984,17 @@ class WatchlistBuilder:
             reverse=True,
         )
         top50 = top50_source[: self.topk]
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import merge_verified_candidate_screens
+            for row in pool120:
+                screens = dict(_row_get(row, "candidate_family_screens", {}) or {})
+                if _row_get(row, "entry_style_selected", "") == "VCP" and _row_get(row, "vcp_pass", False) is True:
+                    screens["VCP"] = True  # Never turn a generic ATR contraction proxy into a VCP.
+                _row_set(row, "candidate_family_screens", screens)
+            top50, top50_funnel = merge_verified_candidate_screens(
+                top50, pool120, target_size=self.topk,
+            )
+            logger.info("[WATCHLIST][FOUR_FAMILY][TOP50_UNION] %s", top50_funnel)
         logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(top50), len(pool120))
 
         # 다시 점수 붙이기 (안전하게)
@@ -2456,6 +2497,7 @@ class WatchlistBuilder:
             "pullback_score": pullback_score,
             "momentum_score": momentum_score,
             "entry_style_selected": entry_style_selected,
+            "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
             "entry_component": entry_component,
             "breakout_pass": breakout_pass,
             "pullback_pass": pullback_pass,
@@ -2568,6 +2610,9 @@ class WatchlistBuilder:
             item["turnover_pct"] = float(turnover_pct)
             item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
             item["meta"] = {"as_of": as_of.isoformat(), "market": item["market"], "market_code": item["market_code"], "rs_benchmark": item["rs_benchmark"]}
+            if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+                from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
+                item["candidate_family_screens"] = completed_daily_candidate_proofs(df)
             candidates.append(item)
             universe_items.append(item)
 
@@ -2878,7 +2923,10 @@ class WatchlistBuilder:
             item["institution_net_buy_5d"] = inst_ratio
             item["flow_factor_score"] = flow_factor_score
 
-            ai_rs_score = float(item.get("ai_rs_score", item.get("rs_pctile", 0.0)) or 0.0)
+            # Final30 AI-RS factor is also 0..100. Without this boundary
+            # normalization a .99 percentile ratio contributes .297 points
+            # instead of 29.7 to the existing 30%-weighted final score.
+            ai_rs_score = _kr_final30_rs_points(item)
             trend_score = float(item.get("trend_score", 0.0) or 0.0)
             pullback_score = max(0.0, min(100.0, 100.0 - float(item.get("pullback_pct", 0.0) or 0.0) * 400.0))
             liquidity_score = float(item.get("liquidity_score", 0.0) or 0.0)
@@ -3161,6 +3209,40 @@ class WatchlistBuilder:
             pullback_score = _prefer_valid_numeric(_row_get(ref, "pullback_score", None), _row_get(row, "pullback_score", None))
             momentum_score = _prefer_valid_numeric(_row_get(ref, "momentum_score", None), _row_get(row, "momentum_score", None))
             entry_style = _row_get(ref, "entry_style_selected", _row_get(row, "entry_style_selected", None))
+
+            # Opt-in: bridge only fully proven and fresh Minervini/VCP evidence.
+            # Derived VCP scores are measured on 0..15 while Final30 entry
+            # gates expect 0..100. Do not rescale unrelated/precomputed scores.
+            vcp_proof_enabled = os.getenv("PB1_KR_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+            ref_as_of = str(_row_get(ref, "as_of", "") or "")[:10]
+            proof_is_current = ref_as_of == str(as_of)[:10]
+            proven_vcp = bool(
+                vcp_proof_enabled and proof_is_current
+                and _row_get(ref, "vcp_ok", None) is True
+                and _row_get(ref, "minervini_pass", None) is True
+            )
+            if proven_vcp:
+                pivot = _safe_nullable_float(_row_get(ref, "pivot", None))
+                current_close = _safe_nullable_float(close)
+                raw_vcp = _safe_nullable_float(_row_get(ref, "vcp_score", None))
+                if (
+                    pivot is None or pivot <= 0 or current_close is None
+                    or current_close < pivot * 1.003
+                    or raw_vcp is None or not 0 < raw_vcp <= 15.0
+                ):
+                    proven_vcp = False
+                else:
+                    vcp_score = min(100.0, raw_vcp / 15.0 * 100.0)
+                    entry_style = "VCP"
+                    _row_set(row, "vcp_pass", True)
+                    _row_set(row, "pivot_price", pivot)
+                    _row_set(row, "minervini_pass", True)
+                    _row_set(row, "vcp_evidence_as_of", ref_as_of)
+                    logger.info(
+                        "[KR_MINERVINI][VCP_PROOF] symbol=%s verified=1 "
+                        "raw_score=%.3f normalized_score=%.3f pivot=%.2f",
+                        sym, raw_vcp, vcp_score, pivot,
+                    )
 
             # Fallback 1: rs_score가 없으면 rs_percentile 사용
             if (rs_score is None or rs_score <= 0) and rs_percentile is not None and rs_percentile > 0:
@@ -3759,7 +3841,12 @@ class WatchlistBuilder:
         # 1. RS Component
         rs_pct = _safe_float(_row_get(row, "rs_percentile", 0.0))
         rs_score = _safe_float(_row_get(row, "rs_score", rs_pct))
-        rs_component = max(0.0, min(rs_score if rs_score > 0 else rs_pct, 100.0))
+        # DerivedMinervini stores RS as a percentile ratio (0..1), while
+        # this 30%-weighted component is explicitly scored on 0..100.
+        # Without normalization, a 99th-percentile stock contributes 0.30
+        # rather than 29.70 points to the technical score. Respect already
+        # normalized 0..100 producers unchanged.
+        rs_component = _normalize_kr_rs_score_100(rs_score if rs_score > 0 else rs_pct)
         
         # 2. VCP Component
         vcp_score = _safe_float(_row_get(row, "vcp_score", 0.0))
@@ -3852,6 +3939,11 @@ class WatchlistBuilder:
                 entry_style_selected = "MOMENTUM"
             else:
                 entry_style_selected = top_style
+        # VCP is an independent setup only with explicit proven pattern evidence.
+        # A generic volatility score is NOT sufficient to label VCP.
+        raw_vcp_style = str(_row_get(row, "entry_style_selected", "") or "").strip().upper()
+        if raw_vcp_style in {"VCP", "ENTRY_VCP"} and _row_get(row, "vcp_pass", False) is True:
+            entry_style_selected = "VCP"
         _row_set(row, "entry_style_selected", entry_style_selected)
         _row_set(row, "breakout_pass", breakout_score >= 55.0)
         _row_set(row, "pullback_pass", pullback_score >= 55.0)
@@ -4257,7 +4349,7 @@ def assert_final30_scored_contract(
     
     # Check entry_style validity
     if "entry_style_selected" in df.columns:
-        valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+        valid_styles = ALLOWED_ENTRY_STYLES
         invalid_count = sum(
             1 for v in df["entry_style_selected"] 
             if pd.notna(v) and str(v).upper() not in valid_styles
@@ -5262,7 +5354,7 @@ def _publish_kr_core_artifact_if_valid(
     ma20_null = int(df["ma20"].isna().sum()) if "ma20" in df.columns else -1
     score_final_nonzero = int(pd.to_numeric(df.get("score_final", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not df.empty else 0
     tech_score_nonzero = int(pd.to_numeric(df.get("tech_score", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not df.empty else 0
-    valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+    valid_styles = ALLOWED_ENTRY_STYLES
     entry_style_invalid = int(df["entry_style_selected"].apply(lambda v: str(v or "").strip().upper() not in valid_styles).sum()) if "entry_style_selected" in df.columns else len(artifact_rows)
     if not (
         len(artifact_rows) == 30
