@@ -294,7 +294,7 @@ class CandidatePoolBuilder:
                 candidate_family_screens = {}
                 if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
                     from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
-                    candidate_family_screens = completed_daily_candidate_proofs(df)
+                    candidate_family_screens = completed_daily_candidate_proofs(df, expected_as_of=as_of)
 
                 scored.append({
                     "candidate_family_screens": candidate_family_screens,
