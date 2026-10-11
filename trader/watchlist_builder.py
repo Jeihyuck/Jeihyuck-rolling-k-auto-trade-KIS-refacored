@@ -2504,6 +2504,7 @@ class WatchlistBuilder:
             "momentum_score": momentum_score,
             "entry_style_selected": entry_style_selected,
             "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
+            "candidate_breakout_evidence": dict(item.get("candidate_breakout_evidence") or {}),
             "candidate_family_quality_percentiles": dict(item.get("candidate_family_quality_percentiles") or {}),
             "entry_component": entry_component,
             "breakout_pass": breakout_pass,
@@ -2620,6 +2621,8 @@ class WatchlistBuilder:
             if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
                 from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
                 item["candidate_family_screens"] = completed_daily_candidate_proofs(df, expected_as_of=as_of)
+                from trader.kr_four_family_candidate_admission import completed_breakout_evidence
+                item["candidate_breakout_evidence"] = completed_breakout_evidence(df, expected_as_of=as_of)
             candidates.append(item)
             universe_items.append(item)
 
