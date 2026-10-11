@@ -25,7 +25,7 @@ _PROVENANCE_FIELDS = (
         "vcp_daily_avg_volume20", "vcp_live_breakout_verified",
         "vcp_live_volume", "vcp_live_quote_source",
         "independent_eligible_entry_styles", "independent_arbitration_mode",
-        "independent_proof_status",
+        "independent_proof_status", "vcp_setup_armed_before_breakout",
 )
 
 

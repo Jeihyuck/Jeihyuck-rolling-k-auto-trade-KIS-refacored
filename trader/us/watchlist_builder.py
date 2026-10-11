@@ -217,7 +217,23 @@ def _select_entry_style(
     ):
         pivot = _safe_float(row.get("pivot_price"), 0.0)
         close = _safe_float(row.get("close") or row.get("price"), 0.0)
-        if pivot > 0 and close >= pivot:
+        arming_enabled = (
+            os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+            and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+        )
+        if arming_enabled:
+            from trader.us.four_family_arbitration import verified_vcp_arming_eligibility
+            verified, waiting_for_pivot = verified_vcp_arming_eligibility(row)
+            if verified:
+                scores["vcp"] = vcp_score
+                if waiting_for_pivot:
+                    row["vcp_setup_armed_before_breakout"] = True
+                else:
+                    row.pop("vcp_setup_armed_before_breakout", None)
+            else:
+                row.pop("vcp_setup_armed_before_breakout", None)
+        elif pivot > 0 and close >= pivot:
+            # Preserve unarmed legacy PREP selector behavior.
             scores["vcp"] = vcp_score
     if independent_mode:
         # Record *each* independently eligible style, not only the selected
@@ -296,6 +312,12 @@ def summarize_us_entry_style_funnel(
             return None
         pivot = _safe_float(row.get("pivot_price"), 0.0)
         last = _safe_float(row.get("close") or row.get("price"), 0.0)
+        if (
+            os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+            and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+        ):
+            from trader.us.four_family_arbitration import verified_vcp_arming_eligibility
+            return verified_vcp_arming_eligibility(row)[0]
         return bool(
             row.get("vcp_pass") is True
             and row.get("trend_template_pass") is True
@@ -592,8 +614,24 @@ def build_us_watchlist(
     _apply_concentration_penalty(broader_scored, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters)
     logger.info("[US_DUAL_AGENT][SCORE] broader_scored=%d", len(broader_scored))
 
+    # A pre-pivot VCP is an armed watch candidate, NOT yet an executable BUY.
+    # Keep every qualified family, but fill limited candidate capacity using
+    # actual confirmed non-VCP entry proofs before standby-only VCP setups.
+    standby_capacity_priority = (
+        os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+        and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+        and os.getenv("US_FOUR_FAMILY_FAIR_ARBITRATION_ENABLED", "0") == "1"
+    )
+    if standby_capacity_priority:
+        from trader.us.four_family_arbitration import is_vcp_standby_only
+        sorted_broader = sorted(
+            broader_scored,
+            key=lambda r: (is_vcp_standby_only(r), -r["score_final"]),
+        )
+    else:
+        sorted_broader = sorted(broader_scored, key=lambda r: -r["score_final"])
+
     # top50 선택 (ETF는 최대 5개까지)
-    sorted_broader = sorted(broader_scored, key=lambda r: -r["score_final"])
 
     top50: list[dict] = []
     etf_count = 0
@@ -624,9 +662,19 @@ def build_us_watchlist(
 
     # final30: bucket champion selection.  Do not simply take top score rows;
     # regime quotas and cluster caps prevent AI/tech concentration during rotations.
-    top50_sorted = sorted(top50, key=lambda r: -r["score_final"])
+    if standby_capacity_priority:
+        top50_sorted = sorted(top50, key=lambda r: (is_vcp_standby_only(r), -r["score_final"]))
+        # Bucket selectors may internally re-rank by score. Exclude standby
+        # rows from the primary active selection entirely, then allow the
+        # existing cap-safe refill to take standby when capacity remains.
+        active_top50 = [r for r in top50_sorted if not is_vcp_standby_only(r)]
+        active_broader = [r for r in sorted_broader if not is_vcp_standby_only(r)]
+        bucket_input = active_top50 if len(active_top50) >= finaln else active_broader
+    else:
+        top50_sorted = sorted(top50, key=lambda r: -r["score_final"])
+        bucket_input = top50_sorted if len(top50_sorted) >= finaln else sorted_broader
     final30, bucket_meta = select_bucket_champions(
-        top50_sorted if len(top50_sorted) >= finaln else sorted_broader,
+        bucket_input,
         finaln,
         str(rotation_context.get("rotation_regime") or "NEUTRAL"),
         blocked_clusters=blocked_clusters,
