@@ -137,6 +137,74 @@ def _score_to_01(value: float, low: float = -0.5, high: float = 0.5) -> float:
     return round(min(1.0, max(0.0, (value - low) / (high - low))), 4)
 
 
+def _compute_verified_us_minervini_vcp(daily_rows: list[dict]) -> dict:
+    """Evaluate a *proven* VCP from completed US OHLCV, never ATR-only proxies.
+
+    Reuse the existing pure Minervini pattern detector, but not the KR-specific
+    turnover/risk parameters. Fail closed on short/incomplete price or volume
+    history. Called only at US PREP when explicitly enabled.
+    """
+    failed = {
+        "vcp_pass": False,
+        "trend_template_pass": False,
+        "pivot_price": None,
+        "vcp_evidence_source": "completed_daily_ohlcv",
+    }
+    rows = _valid_daily_rows(daily_rows)
+    if len(rows) < 260:
+        return {**failed, "vcp_evidence_status": "insufficient_history"}
+    ohlcv = []
+    for row in rows:
+        high = _safe_float(row.get("high"))
+        low = _safe_float(row.get("low"))
+        close = _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))
+        volume = _safe_float(row.get("tvol") if row.get("tvol") is not None else row.get("volume"))
+        if high <= 0 or low <= 0 or close <= 0 or volume <= 0 or high < close or close < low:
+            return {**failed, "vcp_evidence_status": "incomplete_ohlcv"}
+        ohlcv.append({
+            "date": str(row.get("xymd") or row.get("date")),
+            "high": high, "low": low, "close": close, "volume": volume,
+        })
+    try:
+        import pandas as pd
+        from trader.strategies.pb1_minervini_v2 import (
+            MinerviniConfig, compute_features, detect_vcp, compute_pivot,
+        )
+        df = pd.DataFrame(ohlcv)
+        cfg = MinerviniConfig()
+        features = compute_features(df)
+        vcp = detect_vcp(df, cfg)
+        pivot, pivot_info = compute_pivot(df, cfg)
+        close = float(features["close"])
+        ma50, ma150, ma200 = (
+            float(features["ma50"]), float(features["ma150"]), float(features["ma200"])
+        )
+        high_52w = float(features["hi_52w"])
+        trend_ok = bool(
+            close > ma50 > ma150 > ma200 > 0
+            and float(features["ma200_slope"]) > 0
+            and high_52w > 0 and close >= high_52w * 0.75
+        )
+        pivot_valid = bool(pivot_info.get("valid") and pivot > 0)
+        return {
+            **failed,
+            "vcp_pass": vcp.get("vcp_ok") is True,
+            "trend_template_pass": trend_ok,
+            "pivot_price": float(pivot) if pivot_valid else None,
+            "vcp_evidence_status": str(vcp.get("reason") or "unknown"),
+            "vcp_evidence": {
+                "contractions": vcp.get("contractions"),
+                "volume_dryup": vcp.get("vol_dryup"),
+                "tight_close": vcp.get("tight_close"),
+                "pivot_valid": pivot_valid,
+                "daily_bars": len(ohlcv),
+            },
+        }
+    except (KeyError, TypeError, ValueError, ArithmeticError, ImportError) as exc:
+        logger.warning("[US_MINERVINI][PROOF_FAIL] reason=%s", type(exc).__name__)
+        return {**failed, "vcp_evidence_status": "compute_error"}
+
+
 def _score_symbol_candidate(
     sym_data: dict,
     daily_rows: list[dict],
@@ -358,6 +426,15 @@ def build_us_candidate_pool(
                 daily = provider.get_daily_prices(symbol, exchange, count=required_bars, as_of_date=as_of_date)
                 daily_quality = "OK" if len(daily or []) >= required_bars else "INSUFFICIENT_HISTORY"
             row = _score_symbol_candidate(sym_data, daily, all_rs20, all_rs60, all_rs120)
+            if os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1":
+                proof = _compute_verified_us_minervini_vcp(daily)
+                row.update(proof)
+                logger.info(
+                    "[US_MINERVINI][PREP_PROOF] symbol=%s vcp_pass=%d trend_pass=%d "
+                    "pivot=%s status=%s",
+                    symbol, int(proof["vcp_pass"]), int(proof["trend_template_pass"]),
+                    proof["pivot_price"], proof["vcp_evidence_status"],
+                )
             if daily_result is not None:
                 row.update({
                     "daily_bar_count": int(daily_result.get("valid_bar_count") or row.get("daily_bar_count") or 0),
