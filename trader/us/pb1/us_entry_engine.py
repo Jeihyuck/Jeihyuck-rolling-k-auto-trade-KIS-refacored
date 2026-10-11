@@ -1370,6 +1370,20 @@ def generate_entry_intents(
             "market_regime": intent.get("market_regime"),
         })
 
+        # The frozen BUY→SELL contract is built by the order router from
+        # the intent, *not* directly from the locked watchlist DB row.
+        # Preserve proven entry eligibility here, including explicit False,
+        # so Momentum/Breakout/VCP evidence survives the real submit path.
+        for proof_key in (
+            "independent_entry_contract_v1",
+            "momentum_pass", "standalone_momentum_score",
+            "breakout_pass", "breakout_pivot_price", "entry_signal_proof_source",
+            "vcp_pass", "trend_template_pass", "pivot_price",
+            "vcp_evidence", "vcp_evidence_source", "vcp_evidence_status",
+        ):
+            if entry_meta is not None and proof_key in entry_meta:
+                durable_meta[proof_key] = entry_meta[proof_key]
+
         if _stop_if_cancelled("before_order_preflight"):
             break
         if intent_acceptor is not None:
