@@ -766,6 +766,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                     # boundary; their absence never grants entry eligibility.
                     "entry_signal_evidence": {
                         "independent_entry_contract_v1": row.get("independent_entry_contract_v1"),
+                        "pullback_pass": row.get("pullback_pass"),
+                        "pullback_completed_close": row.get("pullback_completed_close"),
                         "momentum_pass": row.get("momentum_pass"),
                         "standalone_momentum_score": row.get("standalone_momentum_score"),
                         "breakout_pass": row.get("breakout_pass"),
