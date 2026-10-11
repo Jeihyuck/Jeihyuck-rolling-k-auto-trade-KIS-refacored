@@ -40,18 +40,26 @@ def _us_candidate(label):
 def test_kr_real_breakouts_survive_top50_without_fake_vcp():
     legacy = [{"code": str(400000 + i), "score": 90-i, "candidate_family_screens": {}} for i in range(50)]
     proofs = []
-    for code in ("000150", "000250", "006120", "096530", "277810"):
+    for code in ("006120", "096530"):
         bars = KR["samples"][code]["bars"]
         assert bars[-1][0] < KR["test_trade_date"].replace("-", "")
         df = pd.DataFrame(bars, columns=["date", "close", "high", "low", "volume"])
-        signals = completed_daily_candidate_proofs(df)
+        signals = completed_daily_candidate_proofs(df, expected_as_of=KR["latest_completed"])
         assert signals["BREAKOUT"] is True
         assert signals["VCP"] is False
         proofs.append({"code": code, "score": 0, "candidate_family_screens": signals})
     ranked, report = merge_verified_candidate_screens(legacy, legacy+proofs, target_size=50)
     assert len(ranked) == 50
     assert {r["code"] for r in proofs} <= {r["code"] for r in ranked}
-    assert report["eligible_by_family"]["BREAKOUT"] == 5
+    assert report["eligible_by_family"]["BREAKOUT"] == 2
+
+
+def test_kr_stale_ohlcv_will_not_create_october_buy_eligibility():
+    for code in ("000150", "000250", "277810"):
+        bars = KR["samples"][code]["bars"]
+        assert bars[-1][0] == "20260226"
+        df = pd.DataFrame(bars, columns=["date", "close", "high", "low", "volume"])
+        assert not any(completed_daily_candidate_proofs(df, expected_as_of=KR["latest_completed"]).values())
 
 
 def test_us_real_signal_qualifications_survive_raw_pb1_score_bias():
