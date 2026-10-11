@@ -1,0 +1,81 @@
+name: KR Four-Strategy Full Acceptance
+
+on:
+  push:
+    branches:
+      - fix/kr-20261010-rs-tech-score-unit
+      - fix/kr-20261011-four-family-candidate-admission
+  pull_request:
+    branches:
+      - dual-agent
+      - feat/kr-20261010-minervini-proof-bridge
+    paths:
+      - "trader/watchlist_builder.py"
+      - "trader/candidate_pool_builder.py"
+      - "trader/kr_four_family_candidate_admission.py"
+      - "trader/pb1_engine.py"
+      - "trader/universe/**"
+      - "tests/kr/**"
+      - ".github/workflows/kr-four-strategy-full-acceptance.yml"
+
+jobs:
+  kr-four-style-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      MARKET: KR
+      REGION: KR
+      PB1_MARKET_SCOPE: KRX
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      DB_LOCK_TIMEOUT_MS: "5000"
+      DB_STATEMENT_TIMEOUT_MS: "15000"
+      DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y ripgrep
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-mock psycopg2-binary ruff
+      - name: Byte compile and safety lints
+        run: |
+          python -m compileall -q trader
+          ruff check trader/prep_runner.py --select F821
+          bash scripts/check_kr_legacy_regime.sh
+      - name: Full KR four-style regression suite
+        run: |
+          python -m pytest -q tests/kr
+      - name: Historical watchlist to locked BUY and sell contracts
+        run: |
+          python -m pytest -q \
+            tests/test_kr_final30_contract.py \
+            tests/test_watchlist_scored_roundtrip.py \
+            tests/test_entry_guard_final30.py \
+            tests/test_final30_load_required.py \
+            tests/test_pb1_exit_signature.py \
+            tests/test_pb1_entry_plan_persistence.py \
+            tests/test_reconcile_entry_exit_plan_restore.py \
+            tests/test_position_cycle_lifecycle.py \
+            tests/test_kr_prep_market_benchmark_runtime.py

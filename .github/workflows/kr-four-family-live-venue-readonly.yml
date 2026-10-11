@@ -1,0 +1,44 @@
+name: KR KRX Live Venue Readonly Acceptance
+
+on:
+  push:
+    branches:
+      - test/kr-us-20261011-four-family-combined-acceptance
+    paths:
+      - 'scripts/kr_emergency_venue_readonly_probe.py'
+      - 'trader/universe/**'
+      - '.github/workflows/kr-four-family-live-venue-readonly.yml'
+  workflow_dispatch:
+
+jobs:
+  real-fdr-listing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      DRY_RUN: '1'
+      US_KIS_ORDER_ALLOWED: '0'
+      ALLOW_REAL_ORDER: '0'
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install readonly listing parser
+        run: |
+          python -m pip install -r requirements.txt
+      - name: Check actual KRX listing for KR Breakout proof symbols
+        run: |
+          python - <<'PY'
+          from trader.universe.build import _load_krx_listing_market_map
+          # Read only; no DB write or broker order.
+          m = _load_krx_listing_market_map()
+          for code in ('083450', '115450', '131970', '373220'):
+              print(f'{code}: {m.get(code, "UNKNOWN")}')
+              assert m.get(code) in ('KOSPI','KOSDAQ')
+          PY
+      - name: Read actual KRX listing and check full emergency seed venue coverage
+        run: |
+          python scripts/kr_emergency_venue_readonly_probe.py

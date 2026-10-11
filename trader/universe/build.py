@@ -207,13 +207,13 @@ def _load_seed_rows(path: Path) -> list[dict]:
                     code = str(row.get("code") or "").strip()
                     if not code:
                         continue
-                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None})
+                    rows.append({"code": code.zfill(6), "name": (row.get("name") or "").strip() or None, "market": str(row.get("market") or "").strip().upper() or None})
             else:
                 f.seek(0)
                 for line in f:
                     code = line.strip()
                     if code:
-                        rows.append({"code": code.zfill(6), "name": None})
+                        rows.append({"code": code.zfill(6), "name": None, "market": None})
     except Exception:
         logger.exception("[UNIVERSE][FALLBACK][STATIC][READ_FAIL] path=%s", path)
         return []
@@ -390,49 +390,155 @@ def _load_static_seed() -> dict | None:
     }
 
 
+def _load_krx_listing_market_map() -> dict[str, str]:
+    """Use FDR's current KRX listing as an authoritative exchange reference.
+
+    For emergency PREP only, never intraday. Reject ambiguous records instead
+    of assuming a ticker's market from the order of a static seed list.
+    """
+    import FinanceDataReader as fdr
+    from trader.universe.providers.fdr_marketcap_top import (
+        CODE_COLUMNS, MARKET_COLUMNS, _find_column, _normalize_code,
+    )
+
+    listing = fdr.StockListing("KRX")
+    if listing is None or len(listing) < 1500:
+        raise RuntimeError("krx_listing_incomplete")
+    code_col = _find_column(listing.columns, CODE_COLUMNS, "code")
+    market_col = _find_column(listing.columns, MARKET_COLUMNS, "market")
+    mapping: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for code_raw, market_raw in zip(listing[code_col], listing[market_col]):
+        code = _normalize_code(code_raw)
+        venue = str(market_raw).strip().upper()
+        if not TICKER_PATTERN.fullmatch(code) or venue not in TARGETS:
+            continue
+        old = mapping.get(code)
+        if old is not None and old != venue:
+            ambiguous.add(code)
+        else:
+            mapping[code] = venue
+    for code in ambiguous:
+        mapping.pop(code, None)
+    if len(mapping) < 1500:
+        raise RuntimeError("krx_listing_venue_coverage_incomplete")
+    logger.info(
+        "[UNIVERSE][EMERGENCY_SEED][KRX_VERIFIED] listing_rows=%d "
+        "known_venues=%d ambiguous=%d",
+        len(listing), len(mapping), len(ambiguous),
+    )
+    return mapping
+
+
 def _load_emergency_seed() -> dict | None:
+    """Fail closed on unknown market; optionally verify legacy seed with KRX.
+
+    The historical seed is code-only, unsorted by listing exchange, and cannot
+    ever be partitioned safely by array position. An explicit market CSV is
+    accepted as-is; otherwise allow *only* opt-in current KRX listing truth.
+    """
     emergency_path = Path("data") / "universe_seed.csv"
     rows = _load_seed_rows(emergency_path)
     if not rows:
         return None
 
-    selected_codes = [str(row.get("code") or "").zfill(6) for row in rows if row.get("code")]
-    selected_codes = _dedup([code for code in selected_codes if code])
-    target_total = TARGETS["KOSPI"] + TARGETS["KOSDAQ"]
-    selected_codes = selected_codes[:target_total]
+    unverified = [
+        str(row.get("code") or "")
+        for row in rows
+        if str(row.get("market") or "").strip().upper() not in TARGETS
+    ]
+    verification_source = "explicit_seed_csv"
+    if unverified:
+        if os.getenv("UNIVERSE_EMERGENCY_VERIFY_KRX", "0") != "1":
+            logger.error(
+                "[UNIVERSE][EMERGENCY_SEED][UNVERIFIED_MARKET] path=%s invalid=%d "
+                "sample=%s action=FAIL_CLOSED set_UNIVERSE_EMERGENCY_VERIFY_KRX_1_after_testing",
+                emergency_path, len(unverified), unverified[:10],
+            )
+            return None
+        try:
+            venue_map = _load_krx_listing_market_map()
+        except Exception as exc:
+            logger.error(
+                "[UNIVERSE][EMERGENCY_SEED][KRX_UNAVAILABLE] reason=%s "
+                "action=FAIL_CLOSED",
+                exc,
+            )
+            return None
+        verified_rows: list[dict] = []
+        unknown: list[str] = []
+        for row in rows:
+            code = str(row.get("code") or "").zfill(6)
+            venue = venue_map.get(code)
+            if venue is None:
+                unknown.append(code)
+                continue
+            declared = str(row.get("market") or "").strip().upper()
+            if declared in TARGETS and declared != venue:
+                logger.error(
+                    "[UNIVERSE][EMERGENCY_SEED][VENUE_CONFLICT] code=%s "
+                    "declared=%s verified=%s action=FAIL_CLOSED",
+                    code, declared, venue,
+                )
+                return None
+            verified_rows.append({**row, "market": venue})
+        if len(verified_rows) / len(rows) < 0.95:
+            logger.error(
+                "[UNIVERSE][EMERGENCY_SEED][LOW_KRX_COVERAGE] "
+                "seed=%d verified=%d dropped=%d action=FAIL_CLOSED",
+                len(rows), len(verified_rows), len(unknown),
+            )
+            return None
+        if unknown:
+            logger.warning(
+                "[UNIVERSE][EMERGENCY_SEED][DROPPED_UNKNOWN] "
+                "count=%d examples=%s",
+                len(unknown), unknown[:10],
+            )
+        rows = verified_rows
+        verification_source = "krx_listing_verified"
 
     members: list[dict] = []
     selected_by_market: dict[str, list[dict]] = {"KOSPI": [], "KOSDAQ": []}
-    split = TARGETS["KOSPI"]
-    for idx, code in enumerate(selected_codes, start=1):
-        market = "KOSPI" if idx <= split else "KOSDAQ"
+    seen: set[str] = set()
+    for row in rows:
+        code = str(row.get("code") or "").zfill(6)
+        market = str(row["market"]).strip().upper()
+        if not TICKER_PATTERN.fullmatch(code) or code in seen:
+            continue
+        seen.add(code)
+        if len(selected_by_market[market]) >= TARGETS[market]:
+            continue
         rank = len(selected_by_market[market]) + 1
-        member = {
+        members.append({
             "code": code,
             "market": market,
             "weight": None,
             "rank": rank,
-            "meta_json": {"name": None, "source": "emergency_seed"},
-        }
-        members.append(member)
-        selected_by_market[market].append({"code": code, "rank": rank, "name": None})
+            "meta_json": {
+                "name": row.get("name"), "source": "emergency_seed",
+                "market_verification": verification_source,
+            },
+        })
+        selected_by_market[market].append({
+            "code": code, "rank": rank, "name": row.get("name"),
+        })
 
     if not members:
         return None
 
-    payload = _normalize_payload(
-        {
-            "selected": [m["code"] for m in members],
-            "selected_by_market": selected_by_market,
-        }
-    )
+    payload = _normalize_payload({
+        "selected": [m["code"] for m in members],
+        "selected_by_market": selected_by_market,
+    })
     return {
         "payload": payload,
         "members": members,
         "source": "fallback:emergency_seed",
         "params": {
             "path": str(emergency_path),
-            "target_total": target_total,
+            "target_total": sum(TARGETS.values()),
+            "market_source": verification_source,
         },
     }
 
