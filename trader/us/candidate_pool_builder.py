@@ -601,9 +601,9 @@ def build_us_candidate_pool(
             raise RuntimeError(f"US_FOUR_FAMILY_POOL_CAP_INSUFFICIENT qualified={len(proven)} cap={pool_max}")
         seen = {r["symbol"] for r in proven}
         legacy = sorted(all_selected, key=lambda r: -r["candidate_score"])
-        all_selected = sorted(proven, key=lambda r: -r["candidate_score"]) + [
+        all_selected = (sorted(proven, key=lambda r: -r["candidate_score"]) + [
             r for r in legacy if r["symbol"] not in seen
-        ][:max(pool_min, min(pool_max, len(legacy)))]
+        ])[:pool_max]
         logger.info("[US_FOUR_FAMILY][POOL_UNION] qualified=%d selected=%d", len(proven), len(all_selected))
     else:
         # Historical selection is unchanged when the opt-in is disabled.
