@@ -582,8 +582,32 @@ def build_us_candidate_pool(
 
     all_selected = combined + fallback_rows
 
-    # 점수 기준 정렬 후 pool_max 제한
-    all_selected = sorted(all_selected, key=lambda r: -r["candidate_score"])[:pool_max]
+    # Fair four-family mode: rescue every qualified setup before the pool cap.
+    # Unverified VCP proxies never count as proofs; real venue/quality gates stay.
+    if os.getenv("US_FOUR_FAMILY_FAIR_ARBITRATION_ENABLED", "0") == "1":
+        if os.getenv("US_INDEPENDENT_MOMENTUM_BREAKOUT_ENABLED", "0") != "1":
+            raise RuntimeError("US_FOUR_FAMILY_REQUIRES_COMPLETED_BAR_PROOFS")
+        proven = [r for r in scored_rows if (
+            r.get("independent_entry_contract_v1") is True
+            and r.get("entry_signal_proof_source") == "completed_daily_ohlcv"
+            and any(r.get(k) is True for k in ("pullback_pass", "momentum_pass", "breakout_pass"))
+        ) or (
+            r.get("vcp_pass") is True
+            and r.get("trend_template_pass") is True
+            and r.get("vcp_evidence_source") == "completed_daily_ohlcv"
+            and _safe_float(r.get("pivot_price")) > 0
+        )]
+        if len(proven) > pool_max:
+            raise RuntimeError(f"US_FOUR_FAMILY_POOL_CAP_INSUFFICIENT qualified={len(proven)} cap={pool_max}")
+        seen = {r["symbol"] for r in proven}
+        legacy = sorted(all_selected, key=lambda r: -r["candidate_score"])
+        all_selected = sorted(proven, key=lambda r: -r["candidate_score"]) + [
+            r for r in legacy if r["symbol"] not in seen
+        ][:max(pool_min, min(pool_max, len(legacy)))]
+        logger.info("[US_FOUR_FAMILY][POOL_UNION] qualified=%d selected=%d", len(proven), len(all_selected))
+    else:
+        # Historical selection is unchanged when the opt-in is disabled.
+        all_selected = sorted(all_selected, key=lambda r: -r["candidate_score"])[:pool_max]
     selected_count = len(all_selected)
     quality_contract = evaluate_candidate_pool_quality(all_selected, strict_rows, relaxed_rows, fallback_rows, scored_rows)
 
