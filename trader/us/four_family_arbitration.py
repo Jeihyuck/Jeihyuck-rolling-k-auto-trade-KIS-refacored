@@ -54,6 +54,13 @@ def is_vcp_standby_only(row: dict) -> bool:
     )
 
 
+def prioritize_qualified_buy_candidates(rows: list[dict]) -> list[dict]:
+    """Protect active verified BUY opportunity across the 50/30 capacity cut."""
+    return sorted(
+        rows, key=lambda row: (is_vcp_standby_only(row), -float(row.get("score_final") or 0.)),
+    )
+
+
 def eligible_family_scores(row: dict) -> dict[str, float]:
     """Require verified completed-bar provenance for every participating family."""
     result = {}

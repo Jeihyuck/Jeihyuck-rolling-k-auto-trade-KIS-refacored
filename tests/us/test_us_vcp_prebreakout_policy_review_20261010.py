@@ -146,7 +146,7 @@ def test_vcp_outside_arming_band_cannot_suppress_qualified_momentum(monkeypatch)
 # Regressions added after integrating #205's final four-family arbiter.
 from trader.us.four_family_arbitration import (
     eligible_family_scores, is_vcp_standby_only, rank_verified_families,
-    verified_vcp_arming_eligibility,
+    verified_vcp_arming_eligibility, prioritize_qualified_buy_candidates,
 )
 
 
@@ -244,3 +244,31 @@ def test_arming_flag_off_keeps_existing_final_arbiter_qualification(monkeypatch)
     row = _arbiter_row(close=94.)
     assert "vcp" in eligible_family_scores(row)
     assert row.get("vcp_setup_armed_before_breakout") is None
+
+
+def test_standby_respects_top50_and_final30_active_capacity(monkeypatch):
+    monkeypatch.setenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "1")
+    monkeypatch.setenv("US_MINERVINI_VCP_PROOF_ENABLED", "1")
+    active = [
+        _arbiter_row(
+            close=101., symbol=f"ACTIVE{i}", score_final=.20 + i / 1000.,
+            momentum_pass=True, standalone_momentum_score=.90,
+        )
+        for i in range(35)
+    ]
+    standby = [
+        _arbiter_row(close=98., symbol=f"WAIT{i}", score_final=.99)
+        for i in range(30)
+    ]
+    ranked, counts = rank_verified_families(active + standby)
+    assert counts["selected"]["momentum"] == 35
+    assert counts["selected"]["vcp"] == 30
+    assert len(ranked) == 65
+    candidate50 = prioritize_qualified_buy_candidates(ranked)[:50]
+    assert sum(not is_vcp_standby_only(row) for row in candidate50) == 35
+    # The final bucket selector receives only these active entries first.
+    active_pool = [row for row in candidate50 if not is_vcp_standby_only(row)]
+    assert len(active_pool) == 35
+    assert all(row["entry_style_selected"] == "momentum" for row in active_pool)
+    # Standby competes only after active entries are taken.
+    assert len([row for row in candidate50 if is_vcp_standby_only(row)]) == 15

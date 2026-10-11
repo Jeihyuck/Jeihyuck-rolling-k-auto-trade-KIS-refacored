@@ -620,11 +620,10 @@ def build_us_watchlist(
         and os.getenv("US_FOUR_FAMILY_FAIR_ARBITRATION_ENABLED", "0") == "1"
     )
     if standby_capacity_priority:
-        from trader.us.four_family_arbitration import is_vcp_standby_only
-        sorted_broader = sorted(
-            broader_scored,
-            key=lambda r: (is_vcp_standby_only(r), -r["score_final"]),
+        from trader.us.four_family_arbitration import (
+            is_vcp_standby_only, prioritize_qualified_buy_candidates,
         )
+        sorted_broader = prioritize_qualified_buy_candidates(broader_scored)
     else:
         sorted_broader = sorted(broader_scored, key=lambda r: -r["score_final"])
 
@@ -660,7 +659,7 @@ def build_us_watchlist(
     # final30: bucket champion selection.  Do not simply take top score rows;
     # regime quotas and cluster caps prevent AI/tech concentration during rotations.
     if standby_capacity_priority:
-        top50_sorted = sorted(top50, key=lambda r: (is_vcp_standby_only(r), -r["score_final"]))
+        top50_sorted = prioritize_qualified_buy_candidates(top50)
         # Bucket selectors may internally re-rank by score. Exclude standby
         # rows from the primary active selection entirely, then allow the
         # existing cap-safe refill to take standby when capacity remains.
