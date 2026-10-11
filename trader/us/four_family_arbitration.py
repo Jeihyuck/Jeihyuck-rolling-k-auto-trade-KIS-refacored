@@ -71,8 +71,11 @@ def eligible_family_scores(row: dict) -> dict[str, float]:
     row.pop("vcp_setup_armed_before_breakout", None)
     if vcp_qualified:
         result["vcp"] = max(0., min(1., float(row.get("vcp_score") or 0.)))
-        if vcp_standby:
-            row["vcp_setup_armed_before_breakout"] = True
+        if (
+            os.getenv("US_VCP_PREBREAKOUT_ARMING_ENABLED", "0") == "1"
+            and os.getenv("US_MINERVINI_VCP_PROOF_ENABLED", "0") == "1"
+        ):
+            row["vcp_setup_armed_before_breakout"] = bool(vcp_standby)
     return result
 
 

@@ -226,10 +226,7 @@ def _select_entry_style(
             verified, waiting_for_pivot = verified_vcp_arming_eligibility(row)
             if verified:
                 scores["vcp"] = vcp_score
-                if waiting_for_pivot:
-                    row["vcp_setup_armed_before_breakout"] = True
-                else:
-                    row.pop("vcp_setup_armed_before_breakout", None)
+                row["vcp_setup_armed_before_breakout"] = bool(waiting_for_pivot)
             else:
                 row.pop("vcp_setup_armed_before_breakout", None)
         elif pivot > 0 and close >= pivot:
