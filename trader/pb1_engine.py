@@ -6904,6 +6904,7 @@ class PB1Engine:
             "ENTRY_BREAKOUT": float(cf.features.get("breakout_score") or 0.0),
             "ENTRY_PULLBACK": float(cf.features.get("pullback_score") or 0.0),
             "ENTRY_MOMENTUM": float(cf.features.get("momentum_score") or 0.0),
+            "ENTRY_VCP": float(cf.features.get("vcp_score") or 0.0),
         }
         if selected_family in score_lookup and score_lookup[selected_family] > 0:
             return selected_family
@@ -6921,6 +6922,10 @@ class PB1Engine:
             return "ENTRY_PULLBACK"
         if raw in {"ENTRY_MOMENTUM", "MOMENTUM", "ENTRY_MOMENTUM_CONTINUATION"}:
             return "ENTRY_MOMENTUM"
+        if raw in {"ENTRY_VCP", "VCP", "ENTRY_VCP_CONFIRMED"}:
+            return "ENTRY_VCP"
+        if raw in {"ENTRY_MINERVINI", "MINERVINI"}:
+            return "ENTRY_MINERVINI"
         return "ENTRY_GENERIC"
 
     @classmethod
@@ -6957,6 +6962,9 @@ class PB1Engine:
             return normalized_reason, "PULLBACK_EXIT"
         if normalized_reason == "ENTRY_MOMENTUM":
             return normalized_reason, "MOMENTUM_EXIT"
+        if normalized_reason in {"ENTRY_VCP", "ENTRY_MINERVINI"}:
+            # Follow the existing trade_plan mapping: VCP / Minervini are swing.
+            return normalized_reason, "SWING_STAGED_EXIT"
         return normalized_reason, "GENERIC_EXIT"
 
     def _build_entry_metadata(
@@ -6972,6 +6980,8 @@ class PB1Engine:
             "ENTRY_BREAKOUT": cf.features.get("breakout_score"),
             "ENTRY_PULLBACK": cf.features.get("pullback_score"),
             "ENTRY_MOMENTUM": cf.features.get("momentum_score"),
+            "ENTRY_VCP": cf.features.get("vcp_score"),
+            "ENTRY_MINERVINI": cf.features.get("vcp_score"),
         }
         normalized_entry_style = identity["entry_style_selected"]
         resolved_entry_reason = identity["entry_reason"]
@@ -10192,6 +10202,10 @@ class PB1Engine:
             return "BREAKOUT", "ENTRY_BREAKOUT", "BREAKOUT_TRIGGER"
         if normalized_style == "ENTRY_MOMENTUM":
             return "MOMENTUM", "ENTRY_MOMENTUM", "MOMENTUM_CONTINUATION"
+        if normalized_style == "ENTRY_VCP":
+            return "VCP", "ENTRY_VCP", "VCP_BREAKOUT"
+        if normalized_style == "ENTRY_MINERVINI":
+            return "MINERVINI", "ENTRY_MINERVINI", "MINERVINI_TREND"
 
         # Legacy/incomplete candidates may not carry a valid Final30 style.
         # Preserve the old evidence-based fallback only for those cases.
