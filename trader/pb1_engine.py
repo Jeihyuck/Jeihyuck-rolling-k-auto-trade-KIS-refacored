@@ -3028,9 +3028,39 @@ class PB1Engine:
             warning_counts=warning_counts,
         )
 
+    @classmethod
+    def _verified_kr_four_family_style(cls, payload: dict[str, Any] | None) -> str | None:
+        """Only a dated, proven Final30 winner may override stale legacy entry_reason.
+
+        The independent family flag is default-off.  Old PB1 and positions that
+        lack completed-daily proof keep their original provenance and exit plan.
+        """
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") != "1":
+            return None
+        row = payload if isinstance(payload, dict) else {}
+        normalized = cls._normalize_entry_reason(row.get("entry_style_selected"))
+        day = str(row.get("as_of") or "").strip()[:10]
+        if not day:
+            return None
+        family = normalized.removeprefix("ENTRY_")
+        if family in {"PULLBACK", "MOMENTUM", "BREAKOUT"}:
+            screens = row.get("candidate_family_screens") or {}
+            if not isinstance(screens, dict):
+                return None
+            if (str(row.get("candidate_family_proof_as_of") or "").strip()[:10] == day
+                    and screens.get(family) is True):
+                return normalized
+        if family == "VCP" and (
+            row.get("vcp_pass") is True
+            and row.get("minervini_pass") is True
+            and str(row.get("vcp_evidence_as_of") or "").strip()[:10] == day
+        ):
+            return normalized
+        return None
+
     def _resolve_entry_identity_from_mapping(self, source: dict[str, Any] | None) -> dict[str, str]:
         payload = source if isinstance(source, dict) else {}
-        entry_reason = self._normalize_entry_reason(
+        entry_reason = self._verified_kr_four_family_style(payload) or self._normalize_entry_reason(
             payload.get("entry_reason")
             or payload.get("entry_style_selected")
             or payload.get("entry_signal")
@@ -7042,7 +7072,8 @@ class PB1Engine:
             or identity.get("entry_reason")
         )
         entry_reason = (
-            cf.features.get("entry_reason")
+            (identity.get("entry_reason") if self._verified_kr_four_family_style(cf.features) else None)
+            or cf.features.get("entry_reason")
             or cf.features.get("decision_reason")
             or identity.get("entry_reason")
             or entry_style_selected
@@ -15034,6 +15065,48 @@ class PB1Engine:
     def _evaluate_final30_entry_setup(self, code: str, features: dict, market: str) -> tuple[bool, list[str], dict]:
         style = str(features.get("entry_style_selected") or "").strip().upper()
         meta: dict[str, Any] = {}
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            # Evidence-first safety invariant. A strong derived score alone
+            # must not become a new independent BUY. Existing sleeves and
+            # position exits remain unchanged; this is the new-entry gate.
+            screens = dict(features.get("candidate_family_screens") or {})
+            prepared_as_of = str(features.get("as_of") or "").strip()[:10]
+            proof_as_of = str(features.get("candidate_family_proof_as_of") or "").strip()[:10]
+            if style in {"PULLBACK", "MOMENTUM", "BREAKOUT"} and (
+                not prepared_as_of or proof_as_of != prepared_as_of
+            ):
+                return False, ["completed_daily_proof_date_mismatch"], {
+                    "setup_source": "four_family_asof_gate", "entry_style": style,
+                }
+            if style in {"PULLBACK", "MOMENTUM", "BREAKOUT"} and screens.get(style) is not True:
+                return False, ["completed_daily_family_proof_missing"], {
+                    "setup_source": "four_family_proof_gate", "entry_style": style,
+                }
+            if style == "BREAKOUT":
+                proof = dict(features.get("candidate_breakout_evidence") or {})
+                pivot55 = float(proof.get("pivot55") or 0)
+                close = float(proof.get("close") or 0)
+                volume = float(proof.get("volume") or 0)
+                avg_volume = float(proof.get("average_volume20") or 0)
+                if (features.get("breakout_completed_proof_valid") is not True
+                        or features.get("breakout_score_source") != "completed_daily_pb1_55d"
+                        or float(features.get("breakout_pivot_price") or 0) != pivot55
+                        or proof.get("source") != "completed_daily_ohlcv"
+                        or str(proof.get("as_of") or "") != prepared_as_of.replace("-", "")
+                        or not (close > pivot55 > 0 and volume >= 1.5 * avg_volume > 0)):
+                    return False, ["completed_daily_breakout_score_proof_missing"], {
+                        "setup_source": "four_family_breakout_proof_gate",
+                    }
+            if style == "VCP" and (
+                features.get("vcp_pass") is not True
+                or features.get("minervini_pass") is not True
+                or not str(features.get("as_of") or "").strip()[:10]
+                or str(features.get("vcp_evidence_as_of") or "").strip()[:10]
+                   != str(features.get("as_of") or "").strip()[:10]
+            ):
+                return False, ["verified_vcp_proof_missing"], {
+                    "setup_source": "four_family_vcp_proof_gate",
+                }
         if not parse_bool_any(os.getenv("PB1_STYLE_GATE_ENABLED"), default=True):
             ok, reasons = evaluate_pb1_setup(features, market=market, require_volume=self.require_volume, mode="relaxed", relax_ma_filter=PB1_RELAX_MA_FILTER, relax_ma20_slope=PB1_RELAX_MA20_SLOPE)
             return bool(ok), list(reasons or []), {"setup_source": "pb1_pullback_legacy"}

@@ -1984,10 +1984,24 @@ class WatchlistBuilder:
             reverse=True,
         )
         top50 = top50_source[: self.topk]
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import merge_verified_candidate_screens
+            for row in pool120:
+                screens = dict(_row_get(row, "candidate_family_screens", {}) or {})
+                if _row_get(row, "entry_style_selected", "") == "VCP" and _row_get(row, "vcp_pass", False) is True:
+                    screens["VCP"] = True  # Never turn a generic ATR contraction proxy into a VCP.
+                _row_set(row, "candidate_family_screens", screens)
+            top50, top50_funnel = merge_verified_candidate_screens(
+                top50, pool120, target_size=self.topk,
+            )
+            logger.info("[WATCHLIST][FOUR_FAMILY][TOP50_UNION] %s", top50_funnel)
         logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(top50), len(pool120))
 
         # 다시 점수 붙이기 (안전하게)
         top50 = self._attach_scores(top50, "B_TOP50")
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import apply_verified_family_final_arbitration
+            top50 = apply_verified_family_final_arbitration(top50)
         self._assert_nonzero_scores(top50, "TOP50", score_key="tech_score")
         
         logger.info(
@@ -2006,6 +2020,9 @@ class WatchlistBuilder:
         logger.info("[WATCHLIST][PIPELINE][C_FINAL30] kept=%s from=%s", len(final30), len(top50))
 
         final30 = self._attach_scores(final30, "C_FINAL30")
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import apply_verified_family_final_arbitration
+            final30 = apply_verified_family_final_arbitration(final30)
         self._assert_nonzero_scores(final30, "FINAL30", score_key="score_final")
 
         final30_scored = pd.DataFrame(final30).copy(deep=True)
@@ -2461,6 +2478,17 @@ class WatchlistBuilder:
         meta["breakout_pass"] = breakout_pass
         meta["pullback_pass"] = pullback_pass
         meta["momentum_pass"] = momentum_pass
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            meta["candidate_family_screens"] = dict(item.get("candidate_family_screens") or {})
+            meta["candidate_family_proof_as_of"] = item.get("candidate_family_proof_as_of")
+            meta["candidate_breakout_evidence"] = dict(item.get("candidate_breakout_evidence") or {})
+            for proof_field in (
+                "breakout_completed_proof_valid", "breakout_score_source",
+                "breakout_derived_score_before_reconciliation", "breakout_pivot_price",
+                "candidate_family_quality_percentiles", "vcp_pass", "minervini_pass", "vcp_evidence_as_of",
+            ):
+                if proof_field in item:
+                    meta[proof_field] = item[proof_field]
         meta.update(regime_fields)
         return {
             "as_of": str(item.get("as_of") or ""),
@@ -2486,6 +2514,14 @@ class WatchlistBuilder:
             "pullback_score": pullback_score,
             "momentum_score": momentum_score,
             "entry_style_selected": entry_style_selected,
+            "candidate_family_screens": dict(item.get("candidate_family_screens") or {}),
+            "candidate_family_proof_as_of": item.get("candidate_family_proof_as_of"),
+            "candidate_breakout_evidence": dict(item.get("candidate_breakout_evidence") or {}),
+            "breakout_completed_proof_valid": bool(item.get("breakout_completed_proof_valid")),
+            "breakout_score_source": item.get("breakout_score_source"),
+            "breakout_derived_score_before_reconciliation": item.get("breakout_derived_score_before_reconciliation"),
+            "breakout_pivot_price": item.get("breakout_pivot_price"),
+            "candidate_family_quality_percentiles": dict(item.get("candidate_family_quality_percentiles") or {}),
             "entry_component": entry_component,
             "breakout_pass": breakout_pass,
             "pullback_pass": pullback_pass,
@@ -2598,6 +2634,12 @@ class WatchlistBuilder:
             item["turnover_pct"] = float(turnover_pct)
             item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
             item["meta"] = {"as_of": as_of.isoformat(), "market": item["market"], "market_code": item["market_code"], "rs_benchmark": item["rs_benchmark"]}
+            if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+                from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
+                item["candidate_family_screens"] = completed_daily_candidate_proofs(df, expected_as_of=as_of)
+                item["candidate_family_proof_as_of"] = as_of.isoformat()
+                from trader.kr_four_family_candidate_admission import completed_breakout_evidence
+                item["candidate_breakout_evidence"] = completed_breakout_evidence(df, expected_as_of=as_of)
             candidates.append(item)
             universe_items.append(item)
 
@@ -3260,6 +3302,66 @@ class WatchlistBuilder:
             _row_set(row, "volume_avg20", volume_avg20)
             _row_set(row, "atr_pct", atr_pct)
             _row_set(row, "breakout_score", breakout_score)
+            # The derived Minervini breakout score is not the same contract
+            # as PB1's completed-55D breakout BUY score. Only on an actual,
+            # same-session OHLCV proof do we recompute using the existing
+            # PB1 scorer; do not modify its >=55 entry requirement.
+            if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+                screens = dict(_row_get(row, "candidate_family_screens", {}) or {})
+                evidence = dict(_row_get(row, "candidate_breakout_evidence", {}) or {})
+                snapshot_close = _safe_float(evidence.get("close"))
+                snapshot_volume = _safe_float(evidence.get("volume"))
+                pivot55 = _safe_float(evidence.get("pivot55"))
+                average_volume = _safe_float(evidence.get("average_volume20"))
+                evidence_valid = bool(
+                    screens.get("BREAKOUT") is True
+                    and evidence.get("source") == "completed_daily_ohlcv"
+                    and evidence.get("as_of") == as_of.strftime("%Y%m%d")
+                    and snapshot_close > pivot55 > 0
+                    and snapshot_volume >= 1.5 * average_volume > 0
+                    and abs(_safe_float(close) - snapshot_close) < 0.00001 * snapshot_close
+                )
+                _row_set(row, "breakout_completed_proof_valid", evidence_valid)
+                if evidence_valid:
+                    proof_score_input = {
+                        "code": sym, "close": snapshot_close,
+                        "pivot_price": pivot55,
+                        "high_20d": evidence.get("prior_high20"),
+                        "high_55d": pivot55,
+                        "volume": snapshot_volume, "volume_avg20": average_volume,
+                    }
+                    reconciled = self._compute_breakout_score(proof_score_input)
+                    if reconciled is not None and reconciled >= 0:
+                        _row_set(row, "breakout_derived_score_before_reconciliation", breakout_score)
+                        _row_set(row, "breakout_score", reconciled)
+                        _row_set(row, "breakout_score_source", "completed_daily_pb1_55d")
+                        _row_set(row, "breakout_pivot_price", pivot55)
+                        _row_set(row, "pivot", pivot55)
+                        _row_set(row, "high_55d", pivot55)
+                        _row_set(row, "high_20d", evidence.get("prior_high20"))
+                        _row_set(row, "breakout_trigger_ok", bool(
+                            reconciled >= 60.0 and snapshot_close >= pivot55
+                        ))
+                        nested = dict(_row_get(row, "meta", {}) or {})
+                        nested.update({
+                            "candidate_family_screens": screens,
+                            "candidate_breakout_evidence": evidence,
+                            "breakout_completed_proof_valid": True,
+                            "breakout_derived_score_before_reconciliation": breakout_score,
+                            "breakout_score_source": "completed_daily_pb1_55d",
+                            "breakout_score": reconciled,
+                            "breakout_pivot_price": pivot55,
+                            "pivot": pivot55,
+                        })
+                        _row_set(row, "meta", nested)
+                        logger.info(
+                            "[KR_BREAKOUT][SCORE_RECONCILED] code=%s as_of=%s"
+                            " derived=%s pb1=%.4f pivot=%.3f volume_ratio=%.3f",
+                            sym, as_of, breakout_score, reconciled,
+                            pivot55, _safe_float(evidence.get("volume_ratio20")),
+                        )
+                    else:
+                        _row_set(row, "breakout_completed_proof_valid", False)
             _row_set(row, "pullback_score", pullback_score)
             _row_set(row, "momentum_score", momentum_score)
             if entry_style:
