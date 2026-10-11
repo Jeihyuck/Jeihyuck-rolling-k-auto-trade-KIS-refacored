@@ -15036,7 +15036,11 @@ class PB1Engine:
         ma20 = f("ma20")
         ma50 = f("ma50")
         atr = f("atr_pct")
-        rs = f("rs_percentile") or f("rs_pctile")
+        # FINAL30 RS is stored as a 0..1 percentile ratio, while KR entry
+        # thresholds (PB1_*_MIN_RS) are specified on the 0..100 scale.
+        # Preserve the source value for provenance and normalize only for gates.
+        rs_raw = f("rs_percentile") or f("rs_pctile")
+        rs = rs_raw * 100.0 if 0.0 < rs_raw <= 1.0 else rs_raw
         reasons: list[str] = []
 
         if style == "MOMENTUM":
