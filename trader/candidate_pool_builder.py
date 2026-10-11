@@ -291,7 +291,13 @@ class CandidatePoolBuilder:
                 # 복합 점수 (유동성 70% + 추세 30%)
                 composite_score = avg_value * 0.7 + trend_score * 1e9 * 0.3
                 
+                candidate_family_screens = {}
+                if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+                    from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
+                    candidate_family_screens = completed_daily_candidate_proofs(df)
+
                 scored.append({
+                    "candidate_family_screens": candidate_family_screens,
                     "code": code,
                     "score": composite_score,
                     "avg_value": avg_value,
@@ -546,6 +552,12 @@ class CandidatePoolBuilder:
                 len(selected_rows),
             )
 
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            from trader.kr_four_family_candidate_admission import merge_verified_candidate_screens
+            selected_rows, family_funnel = merge_verified_candidate_screens(
+                selected_rows, scored, target_size=self.target_size,
+            )
+            logger.info("[CANDIDATE_POOL][FOUR_FAMILY][UNION] %s", family_funnel)
         selected_rows = selected_rows[: max(min_size, min(self.target_size, len(selected_rows)))]
         result_codes = [str(item.get("code", "")) for item in selected_rows]
 
