@@ -2612,7 +2612,7 @@ class WatchlistBuilder:
             item["meta"] = {"as_of": as_of.isoformat(), "market": item["market"], "market_code": item["market_code"], "rs_benchmark": item["rs_benchmark"]}
             if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
                 from trader.kr_four_family_candidate_admission import completed_daily_candidate_proofs
-                item["candidate_family_screens"] = completed_daily_candidate_proofs(df)
+                item["candidate_family_screens"] = completed_daily_candidate_proofs(df, expected_as_of=as_of)
             candidates.append(item)
             universe_items.append(item)
 
