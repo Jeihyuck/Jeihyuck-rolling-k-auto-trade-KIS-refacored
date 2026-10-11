@@ -1,0 +1,44 @@
+name: US VCP Readonly Preflight CI
+
+on:
+  push:
+    branches:
+      - fix/us-20261010-vcp-broker-volume-trigger
+  pull_request:
+    branches:
+      - fix/us-20261010-live-independent-proof-gate
+      - dual-agent
+    paths:
+      - "scripts/us_vcp_kis_volume_readonly_probe.py"
+      - "tests/us/test_us_vcp_kis_readonly_probe_20261010.py"
+      - "tests/us/test_us_vcp_live_broker_trigger_20261010.py"
+      - ".github/workflows/us-vcp-practice-readonly-preflight-ci.yml"
+
+jobs:
+  readonly-vcp-volume-invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      KIS_ENV: practice
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      US_KIS_ORDER_ALLOWED: "0"
+      KIS_HTTP_BLOCK: "1"
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install project and test requirements
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Byte-compile readonly script and VCP order boundary
+        run: |
+          python -m py_compile scripts/us_vcp_kis_volume_readonly_probe.py trader/us/pb1/us_entry_engine.py
+      - name: Validate without vendor connection or broker order
+        run: |
+          python -m pytest -q \
+            tests/us/test_us_vcp_kis_readonly_probe_20261010.py \
+            tests/us/test_us_vcp_live_broker_trigger_20261010.py

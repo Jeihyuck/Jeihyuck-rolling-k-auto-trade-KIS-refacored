@@ -27,7 +27,8 @@ from trader.us.pb1.us_entry_engine import _validate_us_independent_new_buy_proof
                             "entry_signal_proof_source": "completed_daily_ohlcv",
                             "breakout_pass": True}, False),
         ("ENTRY_VCP", {"vcp_pass": True, "trend_template_pass": True,
-                       "pivot_price": 100, "vcp_evidence_source": "completed_daily_ohlcv"}, True),
+                       "pivot_price": 100, "vcp_evidence_source": "completed_daily_ohlcv",
+                       "vcp_live_breakout_verified": True}, True),
         ("ENTRY_VCP", {"vcp_pass": True, "trend_template_pass": False,
                        "pivot_price": 100, "vcp_evidence_source": "completed_daily_ohlcv"}, False),
         ("ENTRY_VCP", {"vcp_pass": True, "trend_template_pass": True,
@@ -56,7 +57,7 @@ def test_verified_vcp_never_requires_pb1_pullback_conditions(monkeypatch):
     result = _validate_us_independent_new_buy_proof({
         "vcp_pass": True, "trend_template_pass": True,
         "pivot_price": 100, "vcp_evidence_source": "completed_daily_ohlcv",
-        "pullback_score": 0,
+        "vcp_live_breakout_verified": True, "pullback_score": 0,
     }, "ENTRY_VCP")
     assert result == (True, "")
 

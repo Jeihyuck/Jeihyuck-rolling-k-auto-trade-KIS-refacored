@@ -148,6 +148,7 @@ def _compute_verified_us_minervini_vcp(daily_rows: list[dict]) -> dict:
         "vcp_pass": False,
         "trend_template_pass": False,
         "pivot_price": None,
+        "vcp_daily_avg_volume20": None,
         "vcp_evidence_source": "completed_daily_ohlcv",
     }
     rows = _valid_daily_rows(daily_rows)
@@ -191,6 +192,9 @@ def _compute_verified_us_minervini_vcp(daily_rows: list[dict]) -> dict:
             "vcp_pass": vcp.get("vcp_ok") is True,
             "trend_template_pass": trend_ok,
             "pivot_price": float(pivot) if pivot_valid else None,
+            # This is completed DAILY average volume, never an intraday quote.
+            # The live BUY gate compares it with fresh broker day volume.
+            "vcp_daily_avg_volume20": float(features["vol20"]) if float(features["vol20"]) > 0 else None,
             "vcp_evidence_status": str(vcp.get("reason") or "unknown"),
             "vcp_evidence": {
                 "contractions": vcp.get("contractions"),
