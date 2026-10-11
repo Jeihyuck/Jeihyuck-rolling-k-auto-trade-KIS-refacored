@@ -15034,6 +15034,26 @@ class PB1Engine:
     def _evaluate_final30_entry_setup(self, code: str, features: dict, market: str) -> tuple[bool, list[str], dict]:
         style = str(features.get("entry_style_selected") or "").strip().upper()
         meta: dict[str, Any] = {}
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            # Evidence-first safety invariant. A strong derived score alone
+            # must not become a new independent BUY. Existing sleeves and
+            # position exits remain unchanged; this is the new-entry gate.
+            screens = dict(features.get("candidate_family_screens") or {})
+            if style in {"PULLBACK", "MOMENTUM", "BREAKOUT"} and screens.get(style) is not True:
+                return False, ["completed_daily_family_proof_missing"], {
+                    "setup_source": "four_family_proof_gate", "entry_style": style,
+                }
+            if style == "BREAKOUT":
+                if (features.get("breakout_completed_proof_valid") is not True
+                        or features.get("breakout_score_source") != "completed_daily_pb1_55d"
+                        or float(features.get("breakout_pivot_price") or 0) <= 0):
+                    return False, ["completed_daily_breakout_score_proof_missing"], {
+                        "setup_source": "four_family_breakout_proof_gate",
+                    }
+            if style == "VCP" and features.get("vcp_pass") is not True:
+                return False, ["verified_vcp_proof_missing"], {
+                    "setup_source": "four_family_vcp_proof_gate",
+                }
         if not parse_bool_any(os.getenv("PB1_STYLE_GATE_ENABLED"), default=True):
             ok, reasons = evaluate_pb1_setup(features, market=market, require_volume=self.require_volume, mode="relaxed", relax_ma_filter=PB1_RELAX_MA_FILTER, relax_ma20_slope=PB1_RELAX_MA20_SLOPE)
             return bool(ok), list(reasons or []), {"setup_source": "pb1_pullback_legacy"}
