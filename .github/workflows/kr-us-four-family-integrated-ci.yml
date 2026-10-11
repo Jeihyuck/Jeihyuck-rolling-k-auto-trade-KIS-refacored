@@ -60,6 +60,7 @@ jobs:
             tests/kr/test_kr_four_family_candidate_admission_20261011.py \
             tests/kr/test_kr_supabase_real_ohlcv_replay_20261011.py \
             tests/us/test_us_four_family_fair_arbitration_20261011.py \
+            tests/us/test_us_four_family_pullback_locked_proof_20261011.py \
             tests/us/test_us_supabase_real_ohlcv_replay_20261011.py \
             tests/us/test_us_four_family_buy_contract_chain_20261010.py \
             tests/us/test_us_independent_live_proof_gate_20261010.py
