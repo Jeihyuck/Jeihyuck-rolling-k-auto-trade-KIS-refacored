@@ -2478,6 +2478,16 @@ class WatchlistBuilder:
         meta["breakout_pass"] = breakout_pass
         meta["pullback_pass"] = pullback_pass
         meta["momentum_pass"] = momentum_pass
+        if os.getenv("PB1_KR_FOUR_FAMILY_CANDIDATE_ENABLED", "0") == "1":
+            meta["candidate_family_screens"] = dict(item.get("candidate_family_screens") or {})
+            meta["candidate_breakout_evidence"] = dict(item.get("candidate_breakout_evidence") or {})
+            for proof_field in (
+                "breakout_completed_proof_valid", "breakout_score_source",
+                "breakout_derived_score_before_reconciliation", "breakout_pivot_price",
+                "candidate_family_quality_percentiles",
+            ):
+                if proof_field in item:
+                    meta[proof_field] = item[proof_field]
         meta.update(regime_fields)
         return {
             "as_of": str(item.get("as_of") or ""),
@@ -3329,6 +3339,18 @@ class WatchlistBuilder:
                         _row_set(row, "breakout_trigger_ok", bool(
                             reconciled >= 60.0 and snapshot_close >= pivot55
                         ))
+                        nested = dict(_row_get(row, "meta", {}) or {})
+                        nested.update({
+                            "candidate_family_screens": screens,
+                            "candidate_breakout_evidence": evidence,
+                            "breakout_completed_proof_valid": True,
+                            "breakout_derived_score_before_reconciliation": breakout_score,
+                            "breakout_score_source": "completed_daily_pb1_55d",
+                            "breakout_score": reconciled,
+                            "breakout_pivot_price": pivot55,
+                            "pivot": pivot55,
+                        })
+                        _row_set(row, "meta", nested)
                         logger.info(
                             "[KR_BREAKOUT][SCORE_RECONCILED] code=%s as_of=%s"
                             " derived=%s pb1=%.4f pivot=%.3f volume_ratio=%.3f",
