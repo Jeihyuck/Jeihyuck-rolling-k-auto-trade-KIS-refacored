@@ -578,6 +578,17 @@ def build_us_watchlist(
         }
         broader_scored.append(scored_row)
 
+    if os.getenv("US_FOUR_FAMILY_FAIR_ARBITRATION_ENABLED", "0") == "1":
+        from trader.us.four_family_arbitration import rank_verified_families
+        broader_scored, independent_funnel = rank_verified_families(broader_scored)
+        logger.info("[US_FOUR_FAMILY][FAIR_FUNNEL] %s", independent_funnel)
+        if len(broader_scored) < finaln:
+            # No synthetic Pullback fallback is ever permitted to fill an
+            # otherwise unqualified Final30 and accidentally reach live BUY.
+            raise RuntimeError(
+                f"US_FOUR_FAMILY_SIGNALS_UNDERFILLED qualified={len(broader_scored)} required={finaln}"
+            )
+
     _apply_concentration_penalty(broader_scored, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters)
     logger.info("[US_DUAL_AGENT][SCORE] broader_scored=%d", len(broader_scored))
 

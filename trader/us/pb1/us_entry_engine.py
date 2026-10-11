@@ -501,6 +501,23 @@ def _validate_us_independent_new_buy_proof(
     """
     data = entry_meta or {}
     style = str(canonical_style or "").strip().upper()
+    if (
+        style == "ENTRY_PULLBACK"
+        and os.getenv("US_FOUR_FAMILY_FAIR_ARBITRATION_ENABLED", "0") == "1"
+    ):
+        # Independent mode requires the same completed-bar proof on live BUY
+        # that was required to win PREP arbitration. Legacy PB1 and existing
+        # frozen position lifecycle remain untouched when the flag is off.
+        last_close = _as_float_or_none(data.get("pullback_completed_close"))
+        if (
+            data.get("independent_entry_contract_v1") is not True
+            or data.get("entry_signal_proof_source") != "completed_daily_ohlcv"
+            or data.get("pullback_pass") is not True
+            or last_close is None or last_close <= 0
+        ):
+            return False, "pullback_completed_bar_proof_missing"
+        return True, ""
+
     if style == "ENTRY_VCP":
         pivot = _as_float_or_none(data.get("pivot_price"))
         if (
