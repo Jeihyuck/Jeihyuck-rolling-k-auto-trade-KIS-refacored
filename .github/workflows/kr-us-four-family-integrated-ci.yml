@@ -3,7 +3,9 @@ name: KR-US Four Family Integrated Acceptance
 on:
   push:
     branches:
+      - dual-agent
       - test/kr-us-20261011-four-family-combined-acceptance
+  workflow_dispatch:
   pull_request:
     branches:
       - fix/us-20261011-four-family-fair-arbitration
@@ -67,6 +69,7 @@ jobs:
             tests/us/test_us_supabase_real_ohlcv_replay_20261011.py \
             tests/us/test_us_four_family_buy_contract_chain_20261010.py \
             tests/us/test_us_four_family_frozen_tp_settlement_guard_20261011.py \
+            tests/us/test_tqqq_infinite_owner_first_frozen_contract_20261010.py \
             tests/us/test_us_independent_live_proof_gate_20261010.py
       - name: KR locked entry, exit and no-duplicate-order contracts
         run: |
