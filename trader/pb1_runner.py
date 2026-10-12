@@ -6096,6 +6096,13 @@ def run_once(
     precomputed_derived_df = pd.DataFrame()
     precomputed_universe_df = pd.DataFrame()
     trade_use_precomputed_features = False
+    protective_exit_only = (
+        os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
+        and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
+        and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
+        and os.getenv("FORCE_PB1_PHASE", "").lower() == "exit"
+        and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
+    )
     try:
         injected_final30_df = pd.DataFrame()
         if str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}:
@@ -6145,13 +6152,6 @@ def run_once(
             except RuntimeError as exc:
                 logger.error("[PB1][UNIVERSE][FAIL] as_of=%s err=%s", as_of, exc)
                 raise
-            protective_exit_only = (
-                os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
-                and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
-                and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
-                and str(phase_name_for_lock) == "exit"
-                and str(session_kind_for_lock) in {"am", "afternoon"}
-            )
             if getattr(universe_ctx, "is_empty", False) and not protective_exit_only:
                 logger.info(
                     "[PB1][SKIP] empty universe -> no candidates today; phase=%s window=%s",
