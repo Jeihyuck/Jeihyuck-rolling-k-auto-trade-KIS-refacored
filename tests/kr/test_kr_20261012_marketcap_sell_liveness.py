@@ -340,6 +340,63 @@ def test_pb1_protective_exit_pass_visits_standard_holdings_only(monkeypatch):
     assert engine._exit_summary_payload["submitted"] == 0
 
 
+@pytest.mark.parametrize("session", ["am", "afternoon"])
+def test_protective_sell_skips_close_fastpath_and_universe_precheck(monkeypatch, session):
+    """Regression for PR209 P1 review: exit phase must reach PB1 owner exit."""
+    import inspect
+    from trader import pb1_runner
+
+    for key, value in {
+        "PB1_PREP_FAILED_SELL_ONLY": "1",
+        "PB1_EXIT_ONLY_MODE": "1",
+        "PB1_ENTRY_ENABLED": "0",
+        "FORCE_PB1_PHASE": "exit",
+        "PB1_SESSION": session,
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    assert pb1_runner._is_missing_prep_protective_exit(
+        phase_name="exit", session_kind=session,
+    )
+    assert not pb1_runner._is_missing_prep_protective_exit(
+        phase_name="entry", session_kind=session,
+    )
+    assert not pb1_runner._is_missing_prep_protective_exit(
+        phase_name="exit", session_kind="close",
+    )
+
+    # Run_once must determine protective mode before *either* early return:
+    # generic close-policy reconciliation and entry-universe construction.
+    source = inspect.getsource(pb1_runner.run_once)
+    early = source.index("protective_exit_only = _is_missing_prep_protective_exit(")
+    close_route = source.index("exit_reconcile_first = (")
+    universe_gate = source.index("if not loop_mode and not protective_exit_only:")
+    assert early < close_route < universe_gate
+    assert "close_or_exit_phase and not close_liquidation_enabled and not protective_exit_only" in source
+
+
+def test_protective_sell_invalid_arm_rejected(monkeypatch):
+    from trader import pb1_runner
+    monkeypatch.setenv("PB1_PREP_FAILED_SELL_ONLY", "1")
+    monkeypatch.setenv("PB1_EXIT_ONLY_MODE", "1")
+    monkeypatch.setenv("PB1_ENTRY_ENABLED", "0")
+    monkeypatch.setenv("FORCE_PB1_PHASE", "exit")
+    monkeypatch.setenv("PB1_SESSION", "am")
+    assert pb1_runner._is_missing_prep_protective_exit(phase_name="exit", session_kind="am")
+    for key, value in (
+        ("PB1_ENTRY_ENABLED", "1"),
+        ("PB1_EXIT_ONLY_MODE", "0"),
+        ("PB1_PREP_FAILED_SELL_ONLY", "0"),
+        ("FORCE_PB1_PHASE", "entry"),
+        ("PB1_SESSION", "close"),
+    ):
+        with monkeypatch.context() as isolated:
+            isolated.setenv(key, value)
+            assert not pb1_runner._is_missing_prep_protective_exit(
+                phase_name="exit", session_kind="am"
+            )
+
+
 def test_exit_only_recovery_does_not_repurpose_close_policy_or_touch_kr_infinite(monkeypatch):
     from trader import pb1_runner
 
