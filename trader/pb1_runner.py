@@ -6145,13 +6145,25 @@ def run_once(
             except RuntimeError as exc:
                 logger.error("[PB1][UNIVERSE][FAIL] as_of=%s err=%s", as_of, exc)
                 raise
-            if getattr(universe_ctx, "is_empty", False):
+            protective_exit_only = (
+                os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
+                and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
+                and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
+                and str(phase_name_for_lock) == "exit"
+                and str(session_kind_for_lock) in {"am", "afternoon"}
+            )
+            if getattr(universe_ctx, "is_empty", False) and not protective_exit_only:
                 logger.info(
                     "[PB1][SKIP] empty universe -> no candidates today; phase=%s window=%s",
                     phase_for_log,
                     window_label,
                 )
                 return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
+            if protective_exit_only:
+                logger.warning(
+                    "[PB1][PREP_FAILURE][SELL_ONLY] no_final30=1 entry_disabled=1 "
+                    "action=CONTINUE_HOLDINGS_EXIT_PASS"
+                )
             mode_input = (os.getenv("MODE") or "").strip().lower()
             if mode_input == "trade" and universe_ctx and universe_ctx.members:
                 locked_rows = list((universe_ctx.meta or {}).get("locked_final30_rows") or [])
@@ -6817,7 +6829,10 @@ def run_once(
         close_liquidation_enabled_for_engine = str(
             os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "0"))
         ).strip().lower() not in {"0", "false", "no"}
-        if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
+        # PREP-failure AM/PM is not the close lifecycle: execute the PB1
+        # holdings TP/SL exit pass, not the SWING-CARRY close policy.
+        if (_is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine)
+                and not protective_exit_only):
             if close_liquidation_enabled_for_engine:
                 holdings_for_liquidation = None
                 if isinstance(balance_snapshot_raw, dict):
