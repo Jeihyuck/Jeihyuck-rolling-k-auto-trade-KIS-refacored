@@ -6105,7 +6105,10 @@ def run_once(
     )
     try:
         injected_final30_df = pd.DataFrame()
-        if str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}:
+        if not protective_exit_only and (
+            str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"}
+            or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}
+        ):
             injected_final30_df = _load_kr_injected_final30_df(trade_date=trade_date.isoformat(), expected_as_of=str(run_ctx.get("derived_as_of") or as_of), env=env_effective, engine=engine)
             if not injected_final30_df.empty:
                 precomputed_final30_df = injected_final30_df.copy()
