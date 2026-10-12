@@ -1347,7 +1347,7 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
             no_fallback,
             build_if_missing,
         )
-        built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy)
+        built = build_universe(as_of_date=as_of_s, env=env, strategy=strategy, prep_recovery=True)
         logger.info("[UNIVERSE][DB][UPSERT/SAVE] env=%s strategy=%s as_of=%s members=%d", env, strategy, as_of_s, len(built))
         logger.info("[UNIVERSE][AUTO_BUILD][DONE] as_of=%s members=%d", as_of_s, len(built))
         logger.info(

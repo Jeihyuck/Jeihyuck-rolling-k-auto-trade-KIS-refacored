@@ -2293,6 +2293,48 @@ class UniverseRepo:
             "sample_codes": [m.get("code") for m in members[:5]],
         }
 
+    def get_latest_successful_universe_snapshot(
+        self, *, env: str, strategy: str, as_of_date: str
+    ) -> dict | None:
+        """Return the latest committed SUCCESS snapshot, never a failed/restarting run.
+
+        A PREP caller must additionally require an exact as-of match before use.
+        """
+        strategy_key = self._strategy_key(env, strategy)
+        stmt = (
+            select(
+                self._schema.universe_runs.c.run_id,
+                self._schema.universe_runs.c.as_of,
+                self._schema.universe_runs.c.provider,
+                self._schema.universe_runs.c.status,
+            )
+            .where(
+                self._schema.universe_runs.c.strategy == strategy_key,
+                self._schema.universe_runs.c.as_of <= _as_date(as_of_date),
+                self._schema.universe_runs.c.status == "SUCCESS",
+            )
+            .order_by(
+                self._schema.universe_runs.c.as_of.desc(),
+                self._schema.universe_runs.c.created_ts.desc(),
+            )
+            .limit(10)
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        for row in rows:
+            run_id = str(row["run_id"])
+            members = self._fetch_members_for_run(run_id, env=env, strategy=strategy)
+            if members:
+                return {
+                    "run_id": run_id,
+                    "as_of": row["as_of"],
+                    "provider": row["provider"],
+                    "status": row["status"],
+                    "members_count": len(members),
+                    "members": members,
+                }
+        return None
+
     def get_latest_universe_members(
         self,
         *,

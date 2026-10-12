@@ -167,30 +167,69 @@ def _load_fallback_universe_from_db(
     env: str,
     strategy: str,
     as_of_date: str,
+    snapshot: dict | None = None,
+    require_exact_as_of: bool = False,
 ) -> list[dict]:
-    # Check if fallback is disabled
+    """Use only a committed, venue-verified DB snapshot; never guess KRX venues.
+
+    PREP recovery requires the *exact* last completed trading session and >=100
+    distinct symbols.  Historical snapshots from a different session are not
+    silently relabeled as today's inputs.
+    """
     if os.getenv("UNIVERSE_NO_FALLBACK", "0") == "1":
         logger.error("[UNIVERSE][NO_FALLBACK] fallback disabled by env")
         return []
-    
-    snapshot = repo.get_latest_successful_universe_snapshot(env=env, strategy=strategy, as_of_date=as_of_date)
-    if not snapshot:
+
+    snapshot = snapshot if snapshot is not None else repo.get_latest_successful_universe_snapshot(
+        env=env, strategy=strategy, as_of_date=as_of_date,
+    )
+    if not snapshot or str(snapshot.get("status") or "").upper() != "SUCCESS":
+        logger.error("[UNIVERSE][FALLBACK][DB][NO_SUCCESS] env=%s as_of=%s", env, as_of_date)
+        return []
+    snapshot_as_of = str(snapshot.get("as_of") or "")
+    if require_exact_as_of and snapshot_as_of != as_of_date:
         logger.error(
-            "[UNIVERSE][FALLBACK][DB][MISS] env=%s strategy=%s as_of=%s",
-            env,
-            strategy,
-            as_of_date,
+            "[UNIVERSE][FALLBACK][DB][STALE] expected=%s stored=%s action=FAIL_CLOSED",
+            as_of_date, snapshot_as_of,
+        )
+        return []
+
+    if require_exact_as_of and str(snapshot.get("provider") or "") not in {
+        "kis_marketcap_top", "seed_static",
+    }:
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][UNVERIFIED_PROVIDER] provider=%s action=FAIL_CLOSED",
+            snapshot.get("provider"),
+        )
+        return []
+
+    members = list(snapshot.get("members") or [])
+    min_members = (
+        max(30, int(os.getenv("UNIVERSE_PREP_VERIFIED_DB_MIN_MEMBERS", "100")))
+        if require_exact_as_of else 1
+    )
+    codes: set[str] = set()
+    for member in members:
+        code = str(member.get("code") or "")
+        market = str(member.get("market") or "").upper()
+        if not TICKER_PATTERN.fullmatch(code) or market not in TARGETS or code in codes:
+            logger.error(
+                "[UNIVERSE][FALLBACK][DB][INVALID_MEMBER] code=%s market=%s action=FAIL_CLOSED",
+                code, market,
+            )
+            return []
+        codes.add(code)
+    if len(members) < min_members:
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][INSUFFICIENT] members=%s min=%s action=FAIL_CLOSED",
+            len(members), min_members,
         )
         return []
     logger.warning(
-        "[UNIVERSE][FALLBACK][DB] using run_id=%s as_of=%s members=%s",
-        snapshot.get("run_id"),
-        snapshot.get("as_of"),
-        snapshot.get("members_count"),
+        "[UNIVERSE][FALLBACK][DB][VERIFIED] run_id=%s as_of=%s members=%s provider=%s",
+        snapshot.get("run_id"), snapshot_as_of, len(members), snapshot.get("provider"),
     )
-    return snapshot.get("members") or []
-
-
+    return members
 
 
 def _load_seed_rows(path: Path) -> list[dict]:
@@ -593,10 +632,26 @@ def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict |
     return None, "fdr_disabled"
 
 
-def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None) -> list[dict]:
+def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None, *, prep_recovery: bool = False) -> list[dict]:
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
+
+    # Cache before start_universe_run: a retry with the same as-of may reuse a
+    # previously successful run_id and temporarily change its status to RUNNING.
+    prep_recovery_enabled = (
+        prep_recovery
+        and os.getenv("UNIVERSE_PREP_VERIFIED_DB_FALLBACK", "1") == "1"
+        and os.getenv("UNIVERSE_NO_FALLBACK", "0") != "1"
+    )
+    preexisting_snapshot: dict | None = None
+    if prep_recovery_enabled:
+        try:
+            preexisting_snapshot = repo.get_latest_successful_universe_snapshot(
+                env=env, strategy=strategy, as_of_date=as_of_date,
+            )
+        except Exception as exc:
+            logger.warning("[UNIVERSE][FALLBACK][DB][PREFETCH_FAIL] err=%s", exc)
 
     payload: dict | None = None
     members: list[dict] = []
@@ -752,31 +807,43 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
     if not members:
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
         error_reason = f"provider_empty:{last_reason or source}"
+        allow_fallback = is_db_only_mode() or resolve_strategy_mode() == "LIVE" or prep_recovery_enabled
+        fallback_members: list[dict] = []
+        if allow_fallback:
+            fallback_members = _load_fallback_universe_from_db(
+                repo=repo, env=env, strategy=strategy, as_of_date=as_of_date,
+                snapshot=preexisting_snapshot if prep_recovery_enabled else None,
+                require_exact_as_of=prep_recovery_enabled,
+            )
+        if fallback_members:
+            if prep_recovery_enabled:
+                # Restore SUCCESS when a reused run_id was temporarily RUNNING;
+                # the verified member set is from the exact completed session.
+                if not run_id:
+                    raise RuntimeError("universe_recovery_run_id_missing")
+                repo.store_universe_snapshot(
+                    run_id=run_id, env=env, strategy=strategy,
+                    as_of_date=as_of_date, provider="verified_db_snapshot",
+                    members=fallback_members, reason="exact_asof_verified_db_recovery",
+                    requested_as_of=as_of_date, actual_as_of=as_of_date,
+                    build_reason="exact_asof_verified_db_recovery",
+                    universe_name=strategy,
+                )
+            logger.warning("[UNIVERSE][RECOVERY][OK] as_of=%s members=%s", as_of_date, len(fallback_members))
+            return fallback_members
+
+        logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
         try:
             if run_id and hasattr(repo, "record_universe_run_failure"):
                 repo.record_universe_run_failure(
-                    run_id=run_id,
-                    env=env,
-                    strategy=strategy,
-                    as_of_date=as_of_date,
-                    provider=source,
-                    error_reason=error_reason,
-                    members_count=0,
+                    run_id=run_id, env=env, strategy=strategy,
+                    as_of_date=as_of_date, provider=source,
+                    error_reason=error_reason, members_count=0,
                 )
             else:
-                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] run_id=%s not available or method missing", run_id)
+                logger.warning("[UNIVERSE][RUN][FAIL_LOG][SKIP] run_id=%s not available", run_id)
         except Exception:
-            logger.exception("[UNIVERSE][RUN][FAIL_LOG] env=%s strategy=%s as_of=%s", env, strategy, as_of_date)
-        allow_fallback = is_db_only_mode() or resolve_strategy_mode() == "LIVE"
-        if allow_fallback:
-            fallback_members = _load_fallback_universe_from_db(
-                repo=repo,
-                env=env,
-                strategy=strategy,
-                as_of_date=as_of_date,
-            )
-            if fallback_members:
-                return fallback_members
+            logger.exception("[UNIVERSE][RUN][FAIL_LOG] as_of=%s", as_of_date)
         raise RuntimeError("universe_members_empty")
 
     try:

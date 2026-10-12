@@ -60,20 +60,17 @@ def resolve_kr_trade_date(now_kst: datetime | None = None) -> date:
 
 
 def resolve_kr_expected_as_of(trade_date: date) -> date:
-    d = None
-    source = "LOCAL_CALENDAR"
-    if KR_CALENDAR_PYKRX_ENABLED:
-        d = _krx_nearest_business_day(trade_date - timedelta(days=1), prev=True)
-        source = "KRX_CALENDAR"
-    if d is None:
-        if KR_CALENDAR_PYKRX_ENABLED:
-            logger.warning("[KR_CALENDAR][FALLBACK_WEEKDAY_ONLY] reason=KRX_CALENDAR_UNAVAILABLE")
-        d = _weekday_prev_trade_date(trade_date)
-        source = "WEEKDAY_FALLBACK" if KR_CALENDAR_PYKRX_ENABLED else "LOCAL_WEEKDAY"
+    """Use the same holiday-aware KRX as-of contract as PREP/PM verification.
+
+    In particular, 2026-10-12 must resolve to 2026-10-08, not the
+    Friday 2026-10-09 exchange holiday.  No weekday-only silent fallback.
+    """
+    from trader.time_utils import resolve_prev_krx_trading_day
+
+    resolved = resolve_prev_krx_trading_day(trade_date)
     logger.info(
-        "[KR_CALENDAR][EXPECTED_ASOF] trade_date=%s expected_as_of=%s source=%s",
+        "[KR_CALENDAR][EXPECTED_ASOF] trade_date=%s expected_as_of=%s source=KRX_CANONICAL",
         trade_date.isoformat(),
-        d.isoformat(),
-        source,
+        resolved.isoformat(),
     )
-    return d
+    return resolved

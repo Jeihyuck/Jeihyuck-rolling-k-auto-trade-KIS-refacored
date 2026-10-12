@@ -58,6 +58,36 @@ def _load_final30_snapshot(env: str, as_of: str, strategy: str) -> tuple[pd.Data
     return df, verdict
 
 
+def _same_trade_date_prep_ready(*, env: str, as_of: str, trade_date: str) -> bool:
+    """An as-of snapshot from a prior trade date must never skip a new PREP.
+
+    E.g. both 2026-10-09 and 2026-10-12 may use 2026-10-08 as-of.
+    """
+    try:
+        event = LedgerEventsRepo(get_engine()).get_prep_event(
+            env=env, strategy="pb1", as_of=as_of, trade_date=trade_date,
+        )
+        payload = dict((event or {}).get("payload_json") or {})
+        ready = (
+            str(payload.get("trade_date") or "") == trade_date
+            and str(payload.get("as_of") or "") == as_of
+            and str(payload.get("status") or "").upper()
+            in {"READY", "READY_FROM_BUILD", "READY_FROM_CANONICAL"}
+            and int(payload.get("quality_ok") or 0) == 1
+            and int(payload.get("trade_can_proceed") or 0) == 1
+            and int(payload.get("final30_count") or 0) == 30
+        )
+        logger.info(
+            "[PREP][DUPLICATE_GUARD][TRADE_DATE] as_of=%s trade_date=%s same_day_ready=%s",
+            as_of, trade_date, int(ready),
+        )
+        return ready
+    except Exception as exc:
+        # A failed read can permit a fresh PREP, never a false duplicate skip.
+        logger.warning("[PREP][DUPLICATE_GUARD][TRADE_DATE_LOOKUP_FAIL] err=%s", exc)
+        return False
+
+
 def _upsert_duplicate_ready_event(
     *,
     env: str,
@@ -289,6 +319,7 @@ def main() -> int:
         and quality_ok == 1
         and trade_can_proceed == 1
         and canonical_status == "OK"
+        and _same_trade_date_prep_ready(env=env, as_of=as_of, trade_date=trade_date)
     )
     should_skip = int(is_ready and not allow_duplicate)
     skip_reason = "canonical_prep_already_ready" if should_skip else ""
