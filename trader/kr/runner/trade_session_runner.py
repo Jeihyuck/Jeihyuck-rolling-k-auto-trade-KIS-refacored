@@ -702,7 +702,6 @@ def _arm_prep_failure_protective_exit(
         "CANONICAL_PREP_ARTIFACT_INVALID",
         "DB_FINAL30_INVALID",
         "PREP_CONTRACT_MISSING",
-        "PRECHECK_TIMEOUT",
     }:
         return False
 
