@@ -118,6 +118,20 @@ def test_marketcap_nonzero_broker_response_rejected_even_if_rows_exist():
         provider.get_marketcap_top_with_meta("KOSPI", 150)
 
 
+def test_outdated_marketcap_env_tr_override_fails_closed_without_broker_call():
+    class NeverCall(_FakeKis):
+        def _safe_request(self, *args, **kwargs):
+            pytest.fail("an invalid market-cap TR override must fail before KIS GET")
+
+    p = KISMarketcapTopProvider(
+        kis=NeverCall(), env="practice",
+        tr_ids={"practice": "FHPST01700000"},  # old fluctuation TR
+    )
+    assert p.get_marketcap_top("KOSPI", 150) == []
+    with pytest.raises(ValueError, match="TR id missing"):
+        p.get_marketcap_top_with_meta("KOSPI", 150)
+
+
 def test_prep_failure_sell_only_explicitly_disables_buy_and_force_liquidation(monkeypatch):
     from trader.kr.runner.trade_session_runner import _arm_prep_failure_protective_exit
 
