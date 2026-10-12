@@ -47,7 +47,15 @@ class KISMarketcapTopProvider:
         self.params = dict(self.DEFAULT_PARAMS)
 
     def _pick_tr_id(self) -> str | None:
-        return self.tr_ids.get(self.env) or self.tr_ids.get("practice")
+        configured = self.tr_ids.get(self.env) or self.tr_ids.get("practice")
+        if configured != "FHPST01740000":
+            logger.error(
+                "[KIS][MKTCAP][TR_CONTRACT_INVALID] env=%s configured=%s "
+                "required=FHPST01740000 action=FAIL_CLOSED",
+                self.env, configured,
+            )
+            return None
+        return configured
 
     def _market_code(self, market: str) -> str:
         # The API's market division remains J for both KOSPI and KOSDAQ.
