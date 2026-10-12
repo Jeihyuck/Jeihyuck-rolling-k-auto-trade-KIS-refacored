@@ -6306,7 +6306,11 @@ def run_once(
                     "[TRADE_AFTERNOON][PREP_READY_DB_OK] db_prep_done=1 final30_rows=%s contract_ok=1 action=enable_entry",
                     final30_rows_for_mode,
                 )
-            mode_entry_enabled = bool(is_market_open and is_entry_window and db_prep_done_for_mode == 1 and final30_rows_for_mode > 0)
+            mode_entry_enabled = bool(
+                not protective_exit_only
+                and is_market_open and is_entry_window
+                and db_prep_done_for_mode == 1 and final30_rows_for_mode > 0
+            )
             mode_exit_only = bool((not mode_entry_enabled) and (is_close_window or not is_market_open or final30_rows_for_mode == 0))
             mode_reason = "entry_window" if mode_entry_enabled else ("close_window" if is_close_window else "market_closed_or_prep_missing")
             logger.info(
