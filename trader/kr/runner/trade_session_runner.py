@@ -863,6 +863,16 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
     if not summary_reason:
         summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
+    if protective_exit_only and status == "OK":
+        # A successful protective SELL pass does not mean PREP or BUY was ready.
+        # Keep the failure visible in session markers, reporting and alerts.
+        status = "WARN"
+        summary_reason = "PREP_UNAVAILABLE_SELL_ONLY"
+        logger.warning(
+            "[KR_SESSION][DEGRADED_SELL_ONLY] session=%s prep_ready=0 "
+            "entry_evaluated=0 exits_evaluated=1",
+            session,
+        )
     blocked = 0
     if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":
         blocked = 1
@@ -872,8 +882,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             status = "WARN"
             summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
             logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
-    entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR", "SKIP_LOCKED"} or not pb1_result_present else "DONE"
-    entry_reason = (pb1_reason or summary_reason) if entry_status == "ABORT" else None
+    entry_status = "ABORT" if protective_exit_only or exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR", "SKIP_LOCKED"} or not pb1_result_present else "DONE"
+    entry_reason = (("PREP_UNAVAILABLE_SELL_ONLY" if protective_exit_only else (pb1_reason or summary_reason)) if entry_status == "ABORT" else None)
     sell_orders_ack = extract_sell_orders_ack(pb1_result)
     logger.info("[KR_SESSION][SELL_ACK] session=%s sell_orders_ack=%s source=pb1_result", session, sell_orders_ack)
     marker = compute_session_marker(build_session_result(
