@@ -9902,6 +9902,9 @@ class PB1Engine:
                 and not bool(self.dry_run)
                 and not bool(self.force_block_live)
                 and bool(self.trading_day)
+                and str(os.getenv("KR_ORDER_ARMED") or "0") == "1"
+                and str(os.getenv("LIVE_TRADING_ENABLED") or "0") == "1"
+                and str(os.getenv("DISABLE_LIVE_TRADING") or "0") == "0"
                 and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
             )
             if sell_only:
