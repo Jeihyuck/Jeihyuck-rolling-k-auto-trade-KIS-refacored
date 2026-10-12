@@ -113,6 +113,11 @@ def test_afternoon_entry_never_bypasses_failed_prep_provenance():
     assert "get_prep_event(" in workflow
     assert "trade_date=today" in workflow
     assert "PREP_NOT_READY_FOR_TRADE_DATE" in workflow
-    assert "|| steps.verify_final30.outputs.final30_rows == '30'" not in workflow
-    assert "steps.verify_final30.outputs.prep_ready == '1'" in workflow
+    # Inspect only the new-BUY PM path. The existing exit-only Close path
+    # deliberately accepts a 30-row snapshot even when PREP is not ready.
+    pm_entry_block = workflow.split("      - name: Run PM entry loop", 1)[1].split(
+        "      - name: Run PM exit-only loop", 1
+    )[0]
+    assert "|| steps.verify_final30.outputs.final30_rows == '30'" not in pm_entry_block
+    assert "steps.verify_final30.outputs.prep_ready == '1'" in pm_entry_block
     assert "steps.verify_final30.outputs.prep_ready != '1'" in workflow
