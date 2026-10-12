@@ -240,6 +240,21 @@ def test_kr_session_dispatches_missing_prep_to_sell_only_and_reports_degraded(
         "am", day, as_of, "practice", "KR", runner._now_kst(),
         False, "CANONICAL_PREP_ARTIFACT_INVALID", None, False,
     )
+    # The real session runner mutates process environment; register snapshots
+    # so subsequent tests never inherit our synthetic missing-PREP SELL mode.
+    for key in (
+        "STRATEGY_ENV", "KIS_ENV", "STRATEGY_MODE", "DRY_RUN",
+        "DISABLE_LIVE_TRADING", "LIVE_TRADING_ENABLED",
+        "KR_LIVE_TRADING_ENABLED", "KR_ORDER_ARMED", "PB1_SESSION",
+        "PB1_ENTRY_ENABLED", "PB1_FORCE_ENTRY_WINDOW_OVERRIDE",
+        "PB1_DIAG_FULL_EXEC", "ENTRY_ENABLED", "ALLOW_NEW_BUY",
+        "PB1_EXIT_ENABLED", "PB1_EXIT_ONLY_MODE", "PB1_PREP_FAILED_SELL_ONLY",
+        "PB1_CLOSE_LIQUIDATION_ENABLED", "FORCE_PB1_PHASE",
+        "FORCE_MARKET_WINDOW", "FORCE_ENTRY_DISABLED_REASON",
+        "PB1_SESSION_RESULT_PATH", "PB1_LAST_RESULT_STATUS",
+        "PB1_LAST_EXIT_REASON",
+    ):
+        monkeypatch.setenv(key, os.environ.get(key, ""))
     monkeypatch.setattr(runner, "ROOT", tmp_path)
     monkeypatch.setattr(runner, "_session_context", lambda session, env: ctx)
     monkeypatch.setattr(
