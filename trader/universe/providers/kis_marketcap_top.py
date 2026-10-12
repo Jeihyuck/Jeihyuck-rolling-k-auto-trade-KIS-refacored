@@ -20,6 +20,10 @@ class KISMarketcapTopProvider:
     # and volume filters deliberately mean "no extra filter" so fixing the API
     # contract does not silently change the universe-selection policy.
     DEFAULT_PARAMS = {
+        # KIS FHPST01700000 returns rt_cd=2 / ERROR INPUT FIELD NOT FOUND
+        # [FID_RANK_SORT_CLS_CODE] if this required field is omitted.  Keep the
+        # existing 20174 screen and per-market target sizes unchanged.
+        "FID_RANK_SORT_CLS_CODE": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
         "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20174"),
         "FID_DIV_CLS_CODE": os.getenv("KIS_MKTCAP_DIV_CLS_CODE", "0"),
         "FID_INPUT_ISCD": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
