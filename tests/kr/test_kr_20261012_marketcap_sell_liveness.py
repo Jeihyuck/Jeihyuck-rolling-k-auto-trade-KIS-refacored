@@ -68,6 +68,17 @@ def test_prep_failure_sell_only_explicitly_disables_buy_and_force_liquidation(mo
     from trader.kr.runner.trade_session_runner import _arm_prep_failure_protective_exit
 
     monkeypatch.delenv("KR_PREP_FAILURE_PROTECT_SELL_ENABLED", raising=False)
+    # The helper mutates process env exactly as a live isolated WSL session
+    # would; restore every flag to avoid leaking a SELL-only mode to other tests.
+    for key in (
+        "PB1_ENTRY_ENABLED", "ENTRY_ENABLED", "ALLOW_NEW_BUY",
+        "PB1_EXIT_ENABLED", "PB1_EXIT_ONLY_MODE",
+        "PB1_PREP_FAILED_SELL_ONLY", "PB1_CLOSE_LIQUIDATION_ENABLED",
+        "FORCE_PB1_PHASE", "FORCE_MARKET_WINDOW",
+        "FORCE_ENTRY_DISABLED_REASON", "PB1_FORCE_ENTRY_WINDOW_OVERRIDE",
+        "PB1_DIAG_FULL_EXEC",
+    ):
+        monkeypatch.setenv(key, os.getenv(key, ""))
     assert _arm_prep_failure_protective_exit(
         session="afternoon",
         precheck={"status": "FAIL", "reason": "CANONICAL_PREP_ARTIFACT_INVALID"},
