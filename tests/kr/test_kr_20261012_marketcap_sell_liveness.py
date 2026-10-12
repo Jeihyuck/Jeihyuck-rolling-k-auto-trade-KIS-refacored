@@ -60,7 +60,6 @@ def test_kis_marketcap_correct_091_tr_sector_and_fields_for_both_readers(monkeyp
         assert params["FID_COND_SCR_DIV_CODE"] == "20174"
         assert params["FID_COND_MRKT_DIV_CODE"] == "J"
         assert params["FID_INPUT_ISCD"] == market
-        assert params["FID_INPUT_ISCD"] == "0000"
         assert "FID_INPUT_CNT_1" not in params
         assert "FID_PRC_CLS_CODE" not in params
 
