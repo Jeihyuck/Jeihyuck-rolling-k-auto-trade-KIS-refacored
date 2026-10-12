@@ -225,6 +225,52 @@ def test_prep_failed_sell_only_allows_sell_gate_but_never_buy(monkeypatch):
     assert "order_blocked" in engine._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT")
 
 
+def test_pb1_protective_exit_pass_visits_standard_holdings_only(monkeypatch):
+    """Exercise the real PB1 held-position exit-pass selection, without an order."""
+    from trader.pb1_engine import PB1Engine
+    from types import SimpleNamespace
+    import pandas as pd
+
+    class Holding:
+        def __init__(self, code):
+            self.code = code
+            self.holding_qty = 2
+
+        def to_position_dict(self):
+            return {
+                "code": self.code, "qty": 2,
+                "holding_days": 3, "market": "KOSPI",
+                "avg_buy_price": 100_000, "last_price": 95_000,
+            }
+
+    evaluated = []
+    engine = PB1Engine.__new__(PB1Engine)
+    engine._exit_holdings_meta = {"source": "authoritative_kis_balance"}
+    engine._display_code = lambda code: code
+    engine._fetch_exit_ohlcv = lambda code: (pd.DataFrame(), {"source": "none"})
+    engine.window_internal = "day"
+    engine.env = "practice"
+
+    def fake_owner_exit(pos, features, frame, phase):
+        evaluated.append((pos["code"], phase))
+        return {
+            "exit_ok": True, "submitted": 0, "submit_attempted": 0,
+            "orderable_qty": pos["qty"], "primary_reason": "EXIT_HARD_STOP",
+            "order_result": "ORDER_SKIPPED_MOCK_BROKER",
+            "order_skip_reasons": ["MOCK_BROKER_NOT_ARMED"],
+        }
+
+    engine._plan_exit_event = fake_owner_exit
+    result = engine._run_exit_always(
+        holdings_for_exit=[Holding("005930"), Holding("122630")],
+        marks_fallback={},
+    )
+    assert len(result) == 1
+    assert evaluated == [("005930", "manage")]
+    assert engine._exit_summary_payload["evaluated_count"] == 1
+    assert engine._exit_summary_payload["submitted"] == 0
+
+
 def test_exit_only_recovery_does_not_repurpose_close_policy_or_touch_kr_infinite(monkeypatch):
     from trader import pb1_runner
 
