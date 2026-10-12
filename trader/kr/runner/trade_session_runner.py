@@ -708,6 +708,8 @@ def _arm_prep_failure_protective_exit(
 
     os.environ.update({
         "PB1_ENTRY_ENABLED": "0",
+        "PB1_FORCE_ENTRY_WINDOW_OVERRIDE": "0",
+        "PB1_DIAG_FULL_EXEC": "0",
         "ENTRY_ENABLED": "0",
         "ALLOW_NEW_BUY": "0",
         "PB1_EXIT_ENABLED": "1",
