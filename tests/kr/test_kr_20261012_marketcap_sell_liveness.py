@@ -225,6 +225,61 @@ def test_prep_failed_sell_only_allows_sell_gate_but_never_buy(monkeypatch):
     assert "order_blocked" in engine._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT")
 
 
+def test_kr_session_dispatches_missing_prep_to_sell_only_and_reports_degraded(
+    monkeypatch, tmp_path,
+):
+    """Execute the real AM wrapper with mocked PB1 and broker; zero BUY."""
+    from datetime import date
+    import json
+    import sys
+    from types import SimpleNamespace
+    from trader.kr.runner import trade_session_runner as runner
+
+    day = date(2026, 10, 12)
+    as_of = date(2026, 10, 8)
+    ctx = runner.KrSessionContext(
+        "am", day, as_of, "practice", "KR", runner._now_kst(),
+        False, "CANONICAL_PREP_ARTIFACT_INVALID", None, False,
+    )
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "_session_context", lambda session, env: ctx)
+    monkeypatch.setattr(
+        runner, "_guard_trade_session",
+        lambda session, ctx: {
+            "status": "FAIL", "reason": "CANONICAL_PREP_ARTIFACT_INVALID",
+        },
+    )
+    monkeypatch.setattr(runner, "_assert_balance_available", lambda session: None)
+    monkeypatch.setattr(runner, "_stage", lambda session, td, asof, stage, callback: callback())
+    monkeypatch.delenv("KR_PREP_FAILURE_PROTECT_SELL_ENABLED", raising=False)
+
+    observed = {}
+    def pretend_pb1_main():
+        observed.update({
+            "entry": os.environ["PB1_ENTRY_ENABLED"],
+            "exit_only": os.environ["PB1_EXIT_ONLY_MODE"],
+            "phase": os.environ["FORCE_PB1_PHASE"],
+        })
+        result_path = Path(os.environ["PB1_SESSION_RESULT_PATH"])
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps({
+            "status": "OK_NO_TRADE", "exit_reason": "session_end",
+            "sell_orders_ack": 0, "sell_orders": 0, "buy_orders": 0,
+        }), encoding="utf-8")
+        return 0
+
+    monkeypatch.setitem(sys.modules, "trader.pb1_runner", SimpleNamespace(main=pretend_pb1_main))
+    result = runner._run_pb1_session("am", "practice")
+    assert observed == {"entry": "0", "exit_only": "1", "phase": "exit"}
+    assert result["status"] == "WARN"
+    assert result["reason"] == "PREP_UNAVAILABLE_SELL_ONLY"
+    assert result["completed"] is False
+    assert result["retryable"] is True
+    assert result["orders_intent"] == 0
+    assert result["orders_ack"] == 0
+    assert result["engine_started"] is True
+
+
 def test_pb1_protective_exit_pass_visits_standard_holdings_only(monkeypatch):
     """Exercise the real PB1 held-position exit-pass selection, without an order."""
     from trader.pb1_engine import PB1Engine
