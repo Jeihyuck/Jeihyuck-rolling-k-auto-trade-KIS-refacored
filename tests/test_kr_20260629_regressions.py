@@ -41,7 +41,7 @@ def test_kr_prep_outside_window_does_not_quarantine_artifacts(monkeypatch):
     assert called["quarantine"] == 0
 
 
-def test_marketcap_provider_includes_required_rank_sort_field_without_fake_count():
+def test_marketcap_provider_uses_real_market_cap_tr_without_fluctuation_sort_field():
     from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 
     captured = {}
@@ -67,8 +67,9 @@ def test_marketcap_provider_includes_required_rank_sort_field_without_fake_count
 
     provider = KISMarketcapTopProvider(kis=FakeKis())
     assert provider.get_marketcap_top("KOSPI", 30) == ["005930"]
-    assert captured["FID_RANK_SORT_CLS_CODE"] == "1"
+    assert "FID_RANK_SORT_CLS_CODE" not in captured
     assert captured["FID_COND_MRKT_DIV_CODE"] == "J"
+    assert captured["FID_INPUT_ISCD"] == "0001"
     assert "FID_INPUT_CNT_1" not in captured
     assert "FID_PRC_CLS_CODE" not in captured
 
