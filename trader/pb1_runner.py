@@ -5805,7 +5805,25 @@ def run_once(
     remaining_s = _remaining_seconds()
     close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "0"))).strip().lower() not in {"0", "false", "no"}
     close_or_exit_phase = phase_for_log == "exit" or window_label == "close"
-    exit_reconcile_first = close_or_exit_phase and not close_liquidation_enabled
+    # Evaluate this BEFORE the legacy exit->close-policy fast path. AM/PM
+    # missing-PREP SELL protection must reach the ordinary PB1 TP/SL owner.
+    protective_exit_only = (
+        os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
+        and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
+        and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
+        and os.getenv("FORCE_PB1_PHASE", "").lower() == "exit"
+        and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
+        and run_ctx.get("phase_name") == "exit"
+    )
+    exit_reconcile_first = (
+        close_or_exit_phase and not close_liquidation_enabled and not protective_exit_only
+    )
+    if protective_exit_only:
+        logger.warning(
+            "[PB1][PREP_FAILURE][EXIT_ROUTE] session=%s "
+            "skip_close_policy=1 skip_entry_universe=1 new_buy=0",
+            os.getenv("PB1_SESSION"),
+        )
     if close_or_exit_phase and close_liquidation_enabled:
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled emergency_path=1")
 
@@ -6003,7 +6021,7 @@ def run_once(
         except Exception:
             logger.exception("[PB1][DEGRADED] failed")
 
-    if not loop_mode:
+    if not loop_mode and not protective_exit_only:
         if is_db_only_mode():
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY_KEY") or os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             _log_db_only_universe_precheck(
@@ -6096,13 +6114,6 @@ def run_once(
     precomputed_derived_df = pd.DataFrame()
     precomputed_universe_df = pd.DataFrame()
     trade_use_precomputed_features = False
-    protective_exit_only = (
-        os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
-        and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
-        and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
-        and os.getenv("FORCE_PB1_PHASE", "").lower() == "exit"
-        and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
-    )
     try:
         injected_final30_df = pd.DataFrame()
         if not protective_exit_only and (
