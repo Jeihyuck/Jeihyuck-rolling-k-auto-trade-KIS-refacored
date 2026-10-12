@@ -36,7 +36,7 @@ class _FakeKis:
         self._limiter = Limiter()
 
     def _headers(self, tr_id):
-        assert tr_id == "FHPST01700000"
+        assert tr_id == "FHPST01740000"
         return {"tr_id": tr_id}
 
     def _safe_request(self, method, url, *, headers, params, timeout):
@@ -55,10 +55,11 @@ def test_kis_marketcap_required_sort_sent_by_both_actual_methods_and_markets(mon
     assert provider.get_marketcap_top_with_meta("KOSDAQ", 150)[0]["code"] == "005930"
 
     assert len(fake.params) == 2
-    for params, market in zip(fake.params, ("J", "Q")):
-        assert params["FID_RANK_SORT_CLS_CODE"] == "1"
+    for params, market in zip(fake.params, ("0001", "1001")):
+        assert "FID_RANK_SORT_CLS_CODE" not in params
         assert params["FID_COND_SCR_DIV_CODE"] == "20174"
-        assert params["FID_COND_MRKT_DIV_CODE"] == market
+        assert params["FID_COND_MRKT_DIV_CODE"] == "J"
+        assert params["FID_INPUT_ISCD"] == market
         assert params["FID_INPUT_ISCD"] == "0000"
         assert "FID_INPUT_CNT_1" not in params
         assert "FID_PRC_CLS_CODE" not in params
