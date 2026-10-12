@@ -13,27 +13,24 @@ logger = logging.getLogger(__name__)
 class KISMarketcapTopProvider:
     DEFAULT_ENDPOINT = "/uapi/domestic-stock/v1/ranking/market-cap"
     DEFAULT_TR_IDS = {
-        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
-        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
+        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01740000"),
+        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01740000"),
     }
-    # KIS [국내주식-091] requires every field below to be present.  Blank price
-    # and volume filters deliberately mean "no extra filter" so fixing the API
-    # contract does not silently change the universe-selection policy.
+    # KIS domestic market-cap rank [091] (FHPST01740000) request contract.
+    # FID_RANK_SORT_CLS_CODE belongs to a *different* ranking API, namely
+    # fluctuation FHPST01700000. Never mix their query contracts.
+    # Blank filters mean no extra filter; existing selection policy unchanged.
     DEFAULT_PARAMS = {
-        # KIS FHPST01700000 returns rt_cd=2 / ERROR INPUT FIELD NOT FOUND
-        # [FID_RANK_SORT_CLS_CODE] if this required field is omitted.  Keep the
-        # existing 20174 screen and per-market target sizes unchanged.
-        "FID_RANK_SORT_CLS_CODE": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
         "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20174"),
         "FID_DIV_CLS_CODE": os.getenv("KIS_MKTCAP_DIV_CLS_CODE", "0"),
-        "FID_INPUT_ISCD": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
+        # Selected explicitly by market in _build_params; never submit 0000 for both.
         "FID_TRGT_CLS_CODE": os.getenv("KIS_MKTCAP_TARGET_CLS_CODE", "0"),
         "FID_TRGT_EXLS_CLS_CODE": os.getenv("KIS_MKTCAP_TARGET_EXCLUDE_CLS_CODE", "0"),
         "FID_INPUT_PRICE_1": os.getenv("KIS_MKTCAP_INPUT_PRICE_1", ""),
         "FID_INPUT_PRICE_2": os.getenv("KIS_MKTCAP_INPUT_PRICE_2", ""),
         "FID_VOL_CNT": os.getenv("KIS_MKTCAP_VOL_CNT", ""),
     }
-    MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
+    MARKET_CODE_MAP = {"KOSPI": "0001", "KOSDAQ": "1001"}
 
     def __init__(
         self,
@@ -53,7 +50,8 @@ class KISMarketcapTopProvider:
         return self.tr_ids.get(self.env) or self.tr_ids.get("practice")
 
     def _market_code(self, market: str) -> str:
-        return self.MARKET_CODE_MAP.get(market.upper(), "J")
+        # The API's market division remains J for both KOSPI and KOSDAQ.
+        return "J"
 
     def _build_params(self, market: str, n: int) -> dict:
         # The market-cap ranking API has no FID_INPUT_CNT_1 field.  The provider
@@ -61,6 +59,7 @@ class KISMarketcapTopProvider:
         return {
             **self.params,
             "FID_COND_MRKT_DIV_CODE": self._market_code(market),
+            "FID_INPUT_ISCD": self.MARKET_CODE_MAP[market.upper()],
         }
 
     def validate_params(self, market: str, n: int) -> None:
