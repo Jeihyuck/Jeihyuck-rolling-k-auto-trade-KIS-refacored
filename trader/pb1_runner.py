@@ -1476,6 +1476,24 @@ def _is_close_or_exit_only_session(*, phase_name: str | None, session_kind: str 
         or str(os.getenv("ENTRY_ENABLED", "1")).strip() == "0"
     )
 
+def _is_missing_prep_protective_exit(*, phase_name: str, session_kind: str) -> bool:
+    """Only the explicit missing-PREP AM/PM, exit-only session can bypass
+    entry-universe and generic close-policy early returns.
+
+    The broker, balance, order arm, strategy-owner and risk gates remain
+    independent; this predicate only selects the existing PB1 exit path.
+    """
+    return (
+        os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
+        and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
+        and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
+        and os.getenv("FORCE_PB1_PHASE", "").lower() == "exit"
+        and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
+        and str(session_kind or "").lower() in {"am", "afternoon"}
+        and str(phase_name or "").lower() == "exit"
+    )
+
+
 def _guard_empty_final30_for_engine_boot(
     precomputed_final30_df: pd.DataFrame | None,
     *,
@@ -5807,13 +5825,9 @@ def run_once(
     close_or_exit_phase = phase_for_log == "exit" or window_label == "close"
     # Evaluate this BEFORE the legacy exit->close-policy fast path. AM/PM
     # missing-PREP SELL protection must reach the ordinary PB1 TP/SL owner.
-    protective_exit_only = (
-        os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
-        and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
-        and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
-        and os.getenv("FORCE_PB1_PHASE", "").lower() == "exit"
-        and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
-        and run_ctx.get("phase_name") == "exit"
+    protective_exit_only = _is_missing_prep_protective_exit(
+        phase_name=str(run_ctx.get("phase_name") or ""),
+        session_kind=str(run_ctx.get("session_kind") or os.getenv("PB1_SESSION") or ""),
     )
     exit_reconcile_first = (
         close_or_exit_phase and not close_liquidation_enabled and not protective_exit_only
