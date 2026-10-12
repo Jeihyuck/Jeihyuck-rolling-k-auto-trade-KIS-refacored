@@ -669,16 +669,29 @@ jobs:
           try:
               from trader.db.repos import LedgerEventsRepo
               repo = LedgerEventsRepo(get_engine())
-              ev = repo.get_prep_done_event(env=env, as_of=expected_as_of_str)
+              ev = repo.get_prep_event(
+                  env=env, strategy="pb1", as_of=expected_as_of_str, trade_date=today,
+              )
               if ev:
-                  prep_done = 1
-                  prep_branch = str((ev.get("payload_json") or {}).get("producer_branch", ""))
+                  payload = dict(ev.get("payload_json") or {})
+                  prep_done = int(
+                      str(payload.get("trade_date") or "") == today.isoformat()
+                      and str(payload.get("status") or "").upper() in
+                      {"READY", "READY_FROM_BUILD", "READY_FROM_CANONICAL", "WARN"}
+                      and int(payload.get("quality_ok") or 0) == 1
+                      and int(payload.get("trade_can_proceed") or 0) == 1
+                      and int(payload.get("final30_count") or 0) == 30
+                  )
+                  prep_branch = str(payload.get("producer_branch") or "")
           except Exception as exc:
               print(f"[TRADE_AFTERNOON][PREP_DONE_CHECK][FAIL] err={exc}")
 
           print(f"[TRADE_AFTERNOON][PREP_PROVENANCE][CHECK] expected_branch={expected_branch} final30_branch={prep_branch} prep_done={prep_done}")
 
           provenance_ok = True
+          if rows == 30 and prep_done != 1:
+              print(f"[TRADE_AFTERNOON][ORDER_BLOCKED] reason=PREP_NOT_READY_FOR_TRADE_DATE trade_date={today} as_of={expected_as_of_str}")
+              provenance_ok = False
           if rows == 30 and prep_done == 1 and prep_branch and prep_branch != expected_branch:
               print(f"[TRADE_AFTERNOON][PREP_PROVENANCE][FAIL] reason=PREP_PROVENANCE_MISMATCH expected={expected_branch} actual={prep_branch}")
               print(f"[TRADE_AFTERNOON][ORDER_BLOCKED] reason=PREP_PROVENANCE_MISMATCH")
@@ -769,7 +782,7 @@ jobs:
 
       - name: Run PM entry loop
         id: pm_loop
-        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && (steps.verify_final30.outputs.prep_ready == '1' || steps.verify_final30.outputs.final30_rows == '30') }}
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready == '1' }}
         continue-on-error: true
         timeout-minutes: 135
         working-directory: repo
@@ -812,7 +825,7 @@ jobs:
 
       - name: Run PM exit-only loop (PREP not ready - manage existing holdings)
         id: exit_only_pm
-        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' && steps.verify_final30.outputs.final30_rows != '30' }}
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' }}
         continue-on-error: true
         timeout-minutes: 135
         working-directory: repo
