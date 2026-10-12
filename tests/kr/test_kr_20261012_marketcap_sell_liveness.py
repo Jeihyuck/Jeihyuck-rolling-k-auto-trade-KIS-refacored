@@ -159,6 +159,8 @@ def test_exit_only_recovery_does_not_repurpose_close_policy_or_touch_kr_infinite
     assert "if getattr(universe_ctx, \"is_empty\", False) and not protective_exit_only:" in source
     assert "and not protective_exit_only):" in source
     assert "not protective_exit_only" in source
+    # Never invoke entry-only Final30 injection if PREP has definitively failed.
+    assert "if not protective_exit_only and (" in source
     # Existing PB1 owner guard excludes the infinite sleeve from generic exits.
     assert 'str(holding.code).zfill(6) != "122630"' in Path(
         "trader/pb1_engine.py"
