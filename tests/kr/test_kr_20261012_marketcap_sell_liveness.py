@@ -17,8 +17,8 @@ class _Response:
         return {
             "rt_cd": "0",
             "output": [
-                {"stck_shrn_iscd": "005930", "hts_kor_isnm": "Samsung"},
-                {"stck_shrn_iscd": "000660", "hts_kor_isnm": "SK Hynix"},
+                {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "Samsung"},
+                {"mksc_shrn_iscd": "000660", "hts_kor_isnm": "SK Hynix"},
             ],
         }
 
@@ -46,8 +46,8 @@ class _FakeKis:
         return _Response()
 
 
-def test_kis_marketcap_required_sort_sent_by_both_actual_methods_and_markets(monkeypatch):
-    # Reproduce Oct12 broker rt_cd=2 / FID_RANK_SORT_CLS_CODE missing.
+def test_kis_marketcap_correct_091_tr_sector_and_fields_for_both_readers(monkeypatch):
+    # Oct12 error was caused by a fluctuation TR ID sent to the market-cap URL.
     monkeypatch.delenv("KIS_MKTCAP_SORT_CODE", raising=False)
     fake = _FakeKis()
     provider = KISMarketcapTopProvider(kis=fake, env="practice")
@@ -63,6 +63,59 @@ def test_kis_marketcap_required_sort_sent_by_both_actual_methods_and_markets(mon
         assert params["FID_INPUT_ISCD"] == "0000"
         assert "FID_INPUT_CNT_1" not in params
         assert "FID_PRC_CLS_CODE" not in params
+
+
+def test_kis_marketcap_pagination_reads_exact_150_and_preserves_market(monkeypatch):
+    class PageResponse:
+        def __init__(self, start, finish, continuation):
+            self.headers = {"tr_cont": continuation}
+            self.start, self.finish = start, finish
+
+        def json(self):
+            return {
+                "rt_cd": "0",
+                "output": [
+                    {"mksc_shrn_iscd": f"{i:06d}", "hts_kor_isnm": f"Stock {i}"}
+                    for i in range(self.start, self.finish)
+                ],
+            }
+
+    class PageKis(_FakeKis):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+
+        def _safe_request(self, method, url, *, headers, params, timeout):
+            assert params["FID_INPUT_ISCD"] == "1001"
+            assert params["FID_COND_MRKT_DIV_CODE"] == "J"
+            assert headers["tr_id"] == "FHPST01740000"
+            if self.count:
+                assert headers.get("tr_cont") == "N"
+            else:
+                assert "tr_cont" not in headers
+            self.count += 1
+            return PageResponse(1 + (self.count-1)*60, 1 + min(self.count*60, 150),
+                                "M" if self.count < 3 else "")
+
+    provider = KISMarketcapTopProvider(kis=PageKis())
+    rows = provider.get_marketcap_top_with_meta("KOSDAQ", 150)
+    assert len(rows) == 150
+    assert len({item["code"] for item in rows}) == 150
+    assert provider.kis.count == 3
+
+
+def test_marketcap_nonzero_broker_response_rejected_even_if_rows_exist():
+    class Rejected(_FakeKis):
+        def _safe_request(self, method, url, *, headers, params, timeout):
+            class Response:
+                def json(self):
+                    return {"rt_cd": "2", "msg1": "BROKER_REJECT", "output": [{"mksc_shrn_iscd": "005930"}]}
+            return Response()
+
+    provider = KISMarketcapTopProvider(kis=Rejected())
+    assert provider.get_marketcap_top("KOSPI", 150) == []
+    with pytest.raises(RuntimeError, match="broker_reject"):
+        provider.get_marketcap_top_with_meta("KOSPI", 150)
 
 
 def test_prep_failure_sell_only_explicitly_disables_buy_and_force_liquidation(monkeypatch):
