@@ -13,23 +13,24 @@ logger = logging.getLogger(__name__)
 class KISMarketcapTopProvider:
     DEFAULT_ENDPOINT = "/uapi/domestic-stock/v1/ranking/market-cap"
     DEFAULT_TR_IDS = {
-        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
-        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
+        "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01740000"),
+        "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01740000"),
     }
-    # KIS [국내주식-091] requires every field below to be present.  Blank price
-    # and volume filters deliberately mean "no extra filter" so fixing the API
-    # contract does not silently change the universe-selection policy.
+    # KIS domestic market-cap rank [091] (FHPST01740000) request contract.
+    # FID_RANK_SORT_CLS_CODE belongs to a *different* ranking API, namely
+    # fluctuation FHPST01700000. Never mix their query contracts.
+    # Blank filters mean no extra filter; existing selection policy unchanged.
     DEFAULT_PARAMS = {
         "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20174"),
         "FID_DIV_CLS_CODE": os.getenv("KIS_MKTCAP_DIV_CLS_CODE", "0"),
-        "FID_INPUT_ISCD": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
+        # Selected explicitly by market in _build_params; never submit 0000 for both.
         "FID_TRGT_CLS_CODE": os.getenv("KIS_MKTCAP_TARGET_CLS_CODE", "0"),
         "FID_TRGT_EXLS_CLS_CODE": os.getenv("KIS_MKTCAP_TARGET_EXCLUDE_CLS_CODE", "0"),
         "FID_INPUT_PRICE_1": os.getenv("KIS_MKTCAP_INPUT_PRICE_1", ""),
         "FID_INPUT_PRICE_2": os.getenv("KIS_MKTCAP_INPUT_PRICE_2", ""),
         "FID_VOL_CNT": os.getenv("KIS_MKTCAP_VOL_CNT", ""),
     }
-    MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
+    MARKET_CODE_MAP = {"KOSPI": "0001", "KOSDAQ": "1001"}
 
     def __init__(
         self,
@@ -46,10 +47,19 @@ class KISMarketcapTopProvider:
         self.params = dict(self.DEFAULT_PARAMS)
 
     def _pick_tr_id(self) -> str | None:
-        return self.tr_ids.get(self.env) or self.tr_ids.get("practice")
+        configured = self.tr_ids.get(self.env) or self.tr_ids.get("practice")
+        if configured != "FHPST01740000":
+            logger.error(
+                "[KIS][MKTCAP][TR_CONTRACT_INVALID] env=%s configured=%s "
+                "required=FHPST01740000 action=FAIL_CLOSED",
+                self.env, configured,
+            )
+            return None
+        return configured
 
     def _market_code(self, market: str) -> str:
-        return self.MARKET_CODE_MAP.get(market.upper(), "J")
+        # The API's market division remains J for both KOSPI and KOSDAQ.
+        return "J"
 
     def _build_params(self, market: str, n: int) -> dict:
         # The market-cap ranking API has no FID_INPUT_CNT_1 field.  The provider
@@ -57,6 +67,7 @@ class KISMarketcapTopProvider:
         return {
             **self.params,
             "FID_COND_MRKT_DIV_CODE": self._market_code(market),
+            "FID_INPUT_ISCD": self.MARKET_CODE_MAP[market.upper()],
         }
 
     def validate_params(self, market: str, n: int) -> None:
@@ -122,6 +133,60 @@ class KISMarketcapTopProvider:
                 buckets.append(out)
         return buckets
 
+    def _fetch_rank_rows(self, market: str, n: int) -> list[dict]:
+        """Use the [091] API with bounded tr_cont pagination.
+
+        Always query the correct market sector; reject nonzero broker rt_cd.
+        """
+        tr_id = self._pick_tr_id()
+        params = self._build_params(market, n)
+        base_headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
+        url = f"{API_BASE_URL}{self.endpoint}"
+        all_rows: list[dict] = []
+        seen: set[str] = set()
+        tr_cont = ""
+        for page in range(12):
+            headers = dict(base_headers)
+            if tr_cont:
+                headers["tr_cont"] = tr_cont
+            self.kis._limiter.wait("marketcap-top")  # type: ignore[attr-defined]
+            resp = self.kis._safe_request(  # type: ignore[attr-defined]
+                "GET", url, headers=headers, params=params, timeout=(3.0, 7.0),
+            )
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"marketcap_top invalid_json market={market} page={page}")
+            rt_cd = str(data.get("rt_cd") or "").strip()
+            if rt_cd and rt_cd != "0":
+                raise RuntimeError(
+                    f"marketcap_top broker_reject market={market} page={page} "
+                    f"rt_cd={rt_cd} msg={data.get('msg1')}"
+                )
+            before = len(seen)
+            for row in self._extract_rows(data):
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("mksc_shrn_iscd") or row.get("stck_shrn_iscd")
+                           or row.get("pdno") or row.get("code") or "").strip()
+                if code and code not in seen:
+                    seen.add(code)
+                    all_rows.append(row)
+            response_headers = getattr(resp, "headers", {}) or {}
+            continue_flag = str(response_headers.get("tr_cont") or "").strip().upper()
+            logger.info(
+                "[KIS][MKTCAP][PAGE] market=%s page=%s tr_id=%s fresh=%s total=%s next=%s",
+                market, page + 1, tr_id, len(seen) - before, len(all_rows), continue_flag,
+            )
+            if len(all_rows) >= n or continue_flag != "M":
+                break
+            if len(seen) == before:
+                raise RuntimeError(f"marketcap_top pagination_stalled market={market} page={page}")
+            tr_cont = "N"
+        else:
+            raise RuntimeError(f"marketcap_top page_limit_reached market={market} n={n}")
+        return all_rows
+
+
     def get_marketcap_top(self, market: str, n: int) -> list[str]:
         """
         KIS "국내주식 시가총액 상위" 호출로 시장별 TopN 종목코드 반환.
@@ -133,28 +198,20 @@ class KISMarketcapTopProvider:
             logger.warning("[KIS][MKTCAP][VALIDATION_FAIL] env=%s market=%s err=%s", self.env, market, exc)
             return []
 
-        tr_id = self._pick_tr_id()
-        params = self._build_params(market, n)
-
         try:
-            headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
-            url = f"{API_BASE_URL}{self.endpoint}"
-            self.kis._limiter.wait("marketcap-top")  # type: ignore[attr-defined]
-            resp = self.kis._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))  # type: ignore[attr-defined]
-            data = resp.json()
+            output_rows = self._fetch_rank_rows(market, n)
         except Exception as exc:
             logger.warning("[KIS][MKTCAP][FAIL] env=%s market=%s err=%s", self.env, market, exc)
             return []
 
-        output_rows = self._extract_rows(data if isinstance(data, dict) else {})
         codes = self._normalize_codes(output_rows)
         if not codes:
             logger.warning(
                 "[KIS][MKTCAP][EMPTY] env=%s market=%s rt_cd=%s msg=%s",
                 self.env,
                 market,
-                data.get("rt_cd") if isinstance(data, dict) else None,
-                data.get("msg1") if isinstance(data, dict) else None,
+                "0",
+                "NO_RANK_ROWS",
             )
             return []
         return codes[: max(0, int(n))]
@@ -165,19 +222,11 @@ class KISMarketcapTopProvider:
         실패/빈 응답 시 예외를 던져 상위 호출자가 사유를 명확히 기록하도록 한다.
         """
         self.validate_params(market, n)
-        tr_id = self._pick_tr_id()
-        params = self._build_params(market, n)
-
-        headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
-        url = f"{API_BASE_URL}{self.endpoint}"
-        self.kis._limiter.wait("marketcap-top")  # type: ignore[attr-defined]
-        resp = self.kis._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))  # type: ignore[attr-defined]
-        data = resp.json()
-        output_rows = self._extract_rows(data if isinstance(data, dict) else {})
+        output_rows = self._fetch_rank_rows(market, n)
         normalized = self._normalize_rows(output_rows)
         if not normalized:
             raise RuntimeError(
-                f"marketcap_top empty market={market} rt_cd={data.get('rt_cd') if isinstance(data, dict) else None} msg={data.get('msg1') if isinstance(data, dict) else None}"
+                f"marketcap_top empty market={market} rt_cd=0 msg=NO_RANK_ROWS"
             )
         limit = max(0, int(n))
         return normalized[:limit]

@@ -1476,6 +1476,24 @@ def _is_close_or_exit_only_session(*, phase_name: str | None, session_kind: str 
         or str(os.getenv("ENTRY_ENABLED", "1")).strip() == "0"
     )
 
+def _is_missing_prep_protective_exit(*, phase_name: str, session_kind: str) -> bool:
+    """Only the explicit missing-PREP AM/PM, exit-only session can bypass
+    entry-universe and generic close-policy early returns.
+
+    The broker, balance, order arm, strategy-owner and risk gates remain
+    independent; this predicate only selects the existing PB1 exit path.
+    """
+    return (
+        os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
+        and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
+        and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
+        and os.getenv("FORCE_PB1_PHASE", "").lower() == "exit"
+        and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
+        and str(session_kind or "").lower() in {"am", "afternoon"}
+        and str(phase_name or "").lower() == "exit"
+    )
+
+
 def _guard_empty_final30_for_engine_boot(
     precomputed_final30_df: pd.DataFrame | None,
     *,
@@ -5805,7 +5823,21 @@ def run_once(
     remaining_s = _remaining_seconds()
     close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "0"))).strip().lower() not in {"0", "false", "no"}
     close_or_exit_phase = phase_for_log == "exit" or window_label == "close"
-    exit_reconcile_first = close_or_exit_phase and not close_liquidation_enabled
+    # Evaluate this BEFORE the legacy exit->close-policy fast path. AM/PM
+    # missing-PREP SELL protection must reach the ordinary PB1 TP/SL owner.
+    protective_exit_only = _is_missing_prep_protective_exit(
+        phase_name=str(run_ctx.get("phase_name") or ""),
+        session_kind=str(run_ctx.get("session_kind") or os.getenv("PB1_SESSION") or ""),
+    )
+    exit_reconcile_first = (
+        close_or_exit_phase and not close_liquidation_enabled and not protective_exit_only
+    )
+    if protective_exit_only:
+        logger.warning(
+            "[PB1][PREP_FAILURE][EXIT_ROUTE] session=%s "
+            "skip_close_policy=1 skip_entry_universe=1 new_buy=0",
+            os.getenv("PB1_SESSION"),
+        )
     if close_or_exit_phase and close_liquidation_enabled:
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled emergency_path=1")
 
@@ -6003,7 +6035,7 @@ def run_once(
         except Exception:
             logger.exception("[PB1][DEGRADED] failed")
 
-    if not loop_mode:
+    if not loop_mode and not protective_exit_only:
         if is_db_only_mode():
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY_KEY") or os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             _log_db_only_universe_precheck(
@@ -6098,7 +6130,10 @@ def run_once(
     trade_use_precomputed_features = False
     try:
         injected_final30_df = pd.DataFrame()
-        if str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}:
+        if not protective_exit_only and (
+            str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"}
+            or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}
+        ):
             injected_final30_df = _load_kr_injected_final30_df(trade_date=trade_date.isoformat(), expected_as_of=str(run_ctx.get("derived_as_of") or as_of), env=env_effective, engine=engine)
             if not injected_final30_df.empty:
                 precomputed_final30_df = injected_final30_df.copy()
@@ -6145,13 +6180,18 @@ def run_once(
             except RuntimeError as exc:
                 logger.error("[PB1][UNIVERSE][FAIL] as_of=%s err=%s", as_of, exc)
                 raise
-            if getattr(universe_ctx, "is_empty", False):
+            if getattr(universe_ctx, "is_empty", False) and not protective_exit_only:
                 logger.info(
                     "[PB1][SKIP] empty universe -> no candidates today; phase=%s window=%s",
                     phase_for_log,
                     window_label,
                 )
                 return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
+            if protective_exit_only:
+                logger.warning(
+                    "[PB1][PREP_FAILURE][SELL_ONLY] no_final30=1 entry_disabled=1 "
+                    "action=CONTINUE_HOLDINGS_EXIT_PASS"
+                )
             mode_input = (os.getenv("MODE") or "").strip().lower()
             if mode_input == "trade" and universe_ctx and universe_ctx.members:
                 locked_rows = list((universe_ctx.meta or {}).get("locked_final30_rows") or [])
@@ -6294,7 +6334,11 @@ def run_once(
                     "[TRADE_AFTERNOON][PREP_READY_DB_OK] db_prep_done=1 final30_rows=%s contract_ok=1 action=enable_entry",
                     final30_rows_for_mode,
                 )
-            mode_entry_enabled = bool(is_market_open and is_entry_window and db_prep_done_for_mode == 1 and final30_rows_for_mode > 0)
+            mode_entry_enabled = bool(
+                not protective_exit_only
+                and is_market_open and is_entry_window
+                and db_prep_done_for_mode == 1 and final30_rows_for_mode > 0
+            )
             mode_exit_only = bool((not mode_entry_enabled) and (is_close_window or not is_market_open or final30_rows_for_mode == 0))
             mode_reason = "entry_window" if mode_entry_enabled else ("close_window" if is_close_window else "market_closed_or_prep_missing")
             logger.info(
@@ -6817,7 +6861,10 @@ def run_once(
         close_liquidation_enabled_for_engine = str(
             os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "0"))
         ).strip().lower() not in {"0", "false", "no"}
-        if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
+        # PREP-failure AM/PM is not the close lifecycle: execute the PB1
+        # holdings TP/SL exit pass, not the SWING-CARRY close policy.
+        if (_is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine)
+                and not protective_exit_only):
             if close_liquidation_enabled_for_engine:
                 holdings_for_liquidation = None
                 if isinstance(balance_snapshot_raw, dict):

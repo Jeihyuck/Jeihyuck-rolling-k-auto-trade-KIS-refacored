@@ -685,6 +685,48 @@ def normalize_kr_session_completion(
         retryable = 1
     return str(status or "UNKNOWN"), str(summary_reason or ""), completed, retryable
 
+def _arm_prep_failure_protective_exit(
+    *, session: str, precheck: dict[str, Any] | None,
+) -> bool:
+    """Continue AM/PM *existing-holdings SELL only* on missing PREP.
+
+    The PB1 exit owner/risk/broker lifecycle stays in charge.  A transient
+    missing Final30 must never silently turn the whole session into no-SSELL.
+    Never enable for arbitrary failures or if explicitly disabled.
+    """
+    if session not in {"am", "afternoon"} or not precheck:
+        return False
+    if str(os.getenv("KR_PREP_FAILURE_PROTECT_SELL_ENABLED", "1")).strip().lower() in {"0", "false", "no"}:
+        return False
+    if str(precheck.get("reason") or "") not in {
+        "CANONICAL_PREP_ARTIFACT_INVALID",
+        "DB_FINAL30_INVALID",
+        "PREP_CONTRACT_MISSING",
+    }:
+        return False
+
+    os.environ.update({
+        "PB1_ENTRY_ENABLED": "0",
+        "PB1_FORCE_ENTRY_WINDOW_OVERRIDE": "0",
+        "PB1_DIAG_FULL_EXEC": "0",
+        "ENTRY_ENABLED": "0",
+        "ALLOW_NEW_BUY": "0",
+        "PB1_EXIT_ENABLED": "1",
+        "PB1_EXIT_ONLY_MODE": "1",
+        "PB1_PREP_FAILED_SELL_ONLY": "1",
+        "PB1_CLOSE_LIQUIDATION_ENABLED": "0",
+        "FORCE_PB1_PHASE": "exit",
+        "FORCE_MARKET_WINDOW": "morning" if session == "am" else "day",
+        "FORCE_ENTRY_DISABLED_REASON": "PREP_UNAVAILABLE_SELL_ONLY",
+    })
+    logger.error(
+        "[KR_SESSION][PREP_FAILURE][SELL_ONLY] session=%s reason=%s entry_allowed=0 "
+        "force_liquidation=0 protective_exit=1 broker_and_owner_gates=preserved",
+        session, precheck.get("reason"),
+    )
+    return True
+
+
 def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     ctx = _session_context(session, env)
     _stage(session, ctx.trade_date, ctx.expected_as_of, "prep_contract_load", lambda: None)
@@ -741,9 +783,10 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         int(kr_entry_can_proceed), int(kr_exit_can_proceed), int(kr_close_can_proceed), int(kr_session_can_run),
     )
     guarded = _guard_trade_session(session, ctx)
-    if guarded is not None:
+    protective_exit_only = _arm_prep_failure_protective_exit(session=session, precheck=guarded)
+    if guarded is not None and not protective_exit_only:
         return guarded
-    infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
+    infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed and not protective_exit_only
     balance_state = _stage(session, ctx.trade_date, ctx.expected_as_of, "balance_precheck", lambda: _assert_balance_available(session))
     if (balance_state is not None and session in {"am", "afternoon", "close"}
             and int(balance_state.get("exit_allowed", 0)) == 0):
@@ -820,6 +863,16 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
     if not summary_reason:
         summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
+    if protective_exit_only and status == "OK":
+        # A successful protective SELL pass does not mean PREP or BUY was ready.
+        # Keep the failure visible in session markers, reporting and alerts.
+        status = "WARN"
+        summary_reason = "PREP_UNAVAILABLE_SELL_ONLY"
+        logger.warning(
+            "[KR_SESSION][DEGRADED_SELL_ONLY] session=%s prep_ready=0 "
+            "entry_evaluated=0 exits_evaluated=1",
+            session,
+        )
     blocked = 0
     if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":
         blocked = 1
@@ -829,8 +882,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             status = "WARN"
             summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
             logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
-    entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR", "SKIP_LOCKED"} or not pb1_result_present else "DONE"
-    entry_reason = (pb1_reason or summary_reason) if entry_status == "ABORT" else None
+    entry_status = "ABORT" if protective_exit_only or exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR", "SKIP_LOCKED"} or not pb1_result_present else "DONE"
+    entry_reason = (("PREP_UNAVAILABLE_SELL_ONLY" if protective_exit_only else (pb1_reason or summary_reason)) if entry_status == "ABORT" else None)
     sell_orders_ack = extract_sell_orders_ack(pb1_result)
     logger.info("[KR_SESSION][SELL_ACK] session=%s sell_orders_ack=%s source=pb1_result", session, sell_orders_ack)
     marker = compute_session_marker(build_session_result(

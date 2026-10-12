@@ -9888,7 +9888,29 @@ class PB1Engine:
         elif side.upper() == "SELL" and fail_soft_active and bool(getattr(self, "balance_fail_soft_exit_allowed", False)):
             logger.info("[PB1][EXIT][ALLOW] reason=BALANCE_FAIL_SOFT_EXIT_ALLOWED")
         elif not bool(self.order_allowed):
-            reasons.append("order_blocked")
+            # This is a narrowly scoped SELL-only exception for failed-PREP
+            # AM/PM.  The ordinary BUY gate stays closed.  Fresh KIS balance,
+            # trading-day, broker/open-order, lifecycle and live-gate checks
+            # are still required; never permit an unarmed/DIAG/dry-run SELL.
+            sell_only = (
+                side.upper() == "SELL"
+                and os.getenv("PB1_PREP_FAILED_SELL_ONLY", "0") == "1"
+                and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1"
+                and os.getenv("PB1_ENTRY_ENABLED", "1") == "0"
+                and getattr(self, "phase", None) == "exit"
+                and bool(self.intended_live)
+                and not bool(self.dry_run)
+                and not bool(self.force_block_live)
+                and bool(self.trading_day)
+                and str(os.getenv("KR_ORDER_ARMED") or "0") == "1"
+                and str(os.getenv("LIVE_TRADING_ENABLED") or "0") == "1"
+                and str(os.getenv("DISABLE_LIVE_TRADING") or "0") == "0"
+                and str(os.getenv("PB1_SESSION") or "").lower() in {"am", "afternoon"}
+            )
+            if sell_only:
+                logger.info("[PB1][PREP_FAILURE][SELL_GATE] side=SELL reason=protective_exit_only")
+            else:
+                reasons.append("order_blocked")
         session_recovery_continue = bool(getattr(self, "session_recovery_continue", False) or getattr(self, "am_recovery_continue", False))
         if self.market_window_name == "after" and not (self.force_entry_window_override or session_recovery_continue):
             reasons.append("window_blocked")
