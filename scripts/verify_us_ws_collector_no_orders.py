@@ -14,6 +14,9 @@ import argparse
 import json
 import os
 import time
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def run(*, symbols: list[tuple[str, str]], seconds: float) -> dict:
@@ -52,7 +55,16 @@ def run(*, symbols: list[tuple[str, str]], seconds: float) -> dict:
             else:
                 row["miss"] += 1
         time.sleep(0.35)
+    try:
+        commit_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, timeout=2,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        commit_sha = ""
     result = {
+        "evidence_at_utc": datetime.now(timezone.utc).isoformat(),
+        "commit_sha": commit_sha,
         "mode": "READ_ONLY_PRACTICE_MARKET_DATA",
         "no_order_submit": True,
         "duration_sec": round(time.monotonic() - start, 3),
@@ -77,6 +89,8 @@ def main() -> int:
     p.add_argument("--symbols", default="MSFT:NASDAQ,KO:NYSE",
                    help="Comma-separated TICKER:EXCHANGE pairs; select held symbols")
     p.add_argument("--seconds", type=float, default=20)
+    p.add_argument("--output", type=Path, default=None,
+                   help="Optional JSON evidence output, e.g. reports/us_daily/<date>/ws_collector_smoke.json")
     args = p.parse_args()
     pairs = []
     for field in args.symbols.split(","):
@@ -85,7 +99,11 @@ def main() -> int:
             p.error(f"Invalid symbol/exchange pair: {field!r}")
         pairs.append((sym, exch))
     result = run(symbols=pairs, seconds=max(2.0, min(args.seconds, 120.0)))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    evidence = json.dumps(result, ensure_ascii=False, indent=2)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(evidence + "\n", encoding="utf-8")
+    print(evidence)
     # Quoting can legitimately be absent outside US market hours. Fail closed;
     # never describe an unreceived quote as a verified collector pass.
     return 0 if result["verified_fresh_quote_for_all"] else 2
