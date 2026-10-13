@@ -39,6 +39,16 @@ def _fixture(root, *, sha=SHA, tick_sec=48, sell_sec=8,
         "open_order_pending_total": 0, "manual_reconcile_required": 0,
         "errors": [], **(extra_close or {}),
     }))
+    (daily / "ws_collector_smoke.json").write_text(json.dumps({
+        "commit_sha": sha,
+        "evidence_at_utc": "2026-10-13T03:01:00+00:00",
+        "mode": "READ_ONLY_PRACTICE_MARKET_DATA",
+        "no_order_submit": True,
+        "verified_fresh_quote_for_all": True,
+        "collector_generation": "test-generation",
+        "symbols": {"MSFT": {"exchange": "NASDAQ", "hit": 22, "miss": 1}},
+        "ipc_failures": [],
+    }))
 
 
 def test_nearest_rank_math_for_integer_tick_count():
@@ -104,3 +114,22 @@ def test_clean_label_does_not_hide_claim_conflicts_or_protective_sell_failure(tm
     assert report["result"] == "NOT_MERGE_READY"
     assert "CLOSE_BROKER_CLAIM_OR_LIVENESS_NOT_CLEAN" in report["reasons"]
     assert report["close_claim_unresolved"] == 3
+
+
+def test_missing_collector_wsl_smoke_never_passes(tmp_path):
+    _fixture(tmp_path)
+    (tmp_path / "reports" / "us_daily" / DATE / "ws_collector_smoke.json").unlink()
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "MISSING_OR_INVALID_LIVE_WS_COLLECTOR_EVIDENCE" in report["reasons"]
+
+
+def test_collector_smoke_from_other_sha_or_without_fresh_prices_cannot_pass(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "ws_collector_smoke.json"
+    smoke = json.loads(path.read_text())
+    smoke["commit_sha"] = "b" * 40
+    smoke["verified_fresh_quote_for_all"] = False
+    path.write_text(json.dumps(smoke))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH" in report["reasons"]
