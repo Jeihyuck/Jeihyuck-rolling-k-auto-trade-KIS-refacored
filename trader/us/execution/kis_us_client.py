@@ -1127,6 +1127,28 @@ class KisUSClient:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _broker_date_range_for_us_session(
+        us_trade_date: str, *, observed_at: datetime | None = None,
+    ) -> tuple[str, str]:
+        """Use both KST order dates, but never ask for future KST date on a live tick.
+
+        During the first hours of the NY session the KST calendar has not yet
+        reached the next day. A historical session always retains its full
+        two-date query range for order recovery.
+        """
+        from zoneinfo import ZoneInfo
+        requested = datetime.strptime(
+            str(us_trade_date).replace("-", ""), "%Y%m%d"
+        ).date()
+        end_date = requested + timedelta(days=1)
+        now = observed_at or datetime.now(tz=ZoneInfo("America/New_York"))
+        if now.tzinfo is None:
+            raise ValueError("observed_at must be timezone-aware")
+        if now.astimezone(ZoneInfo("America/New_York")).date() == requested:
+            end_date = min(end_date, now.astimezone(ZoneInfo("Asia/Seoul")).date())
+        return requested.strftime("%Y%m%d"), end_date.strftime("%Y%m%d")
+
+    @staticmethod
     def _broker_order_us_trade_date(row: dict) -> str | None:
         """Return the NY trading date of a KIS inquire-ccnl order timestamp.
 
@@ -1203,11 +1225,11 @@ class KisUSClient:
         # is 2026-10-07 00:14 KST. Query BOTH broker-calendar dates, then
         # match the returned source timestamp to the requested US trade date.
         requested_us_date = datetime.strptime(ord_dt, "%Y%m%d").date().isoformat()
-        broker_end_date = (
-            datetime.strptime(ord_dt, "%Y%m%d") + timedelta(days=1)
-        ).strftime("%Y%m%d")
+        broker_start_date, broker_end_date = self._broker_date_range_for_us_session(
+            ord_dt
+        )
         params = self._build_us_fills_params(
-            ord_dt, "PRACTICE_RANGE", end_dt=broker_end_date
+            broker_start_date, "PRACTICE_RANGE", end_dt=broker_end_date
         )
         logger.info(
             "[US_FILLS][TRADE_DATE_BRIDGE] us_date=%s broker_kst_start=%s broker_kst_end=%s",
