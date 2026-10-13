@@ -580,7 +580,10 @@ def normalize_us_order_status_row(row: dict) -> dict:
         try:
             from zoneinfo import ZoneInfo
             from trader.us.utils.kis_order_time import resolve_kis_us_order_datetime
-            local = resolve_kis_us_order_datetime(trade_date_raw, order_time_raw)
+            local = resolve_kis_us_order_datetime(
+                trade_date_raw, order_time_raw,
+                domestic_order_date=_get_first_valid(row, ("dmst_ord_dt", "DMST_ORD_DT"), None),
+            )
             submitted_at_utc = local.astimezone(timezone.utc).isoformat()
         except Exception:
             time_error = "invalid_kis_order_datetime"
