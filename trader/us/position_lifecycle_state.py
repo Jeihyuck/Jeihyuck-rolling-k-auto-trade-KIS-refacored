@@ -450,6 +450,17 @@ def reconcile_us_position_lifecycles(
         # Resolve latest lifecycle after binding authoritative identity.
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+        # A persisted same-day lifecycle can be reused only with an exact
+        # owner/account/epoch/lifecycle match. A prior-day row must still be
+        # carried into today's row; a stale tick may never overwrite newer
+        # state, and a changed broker holding must be persisted.
+        _persisted_current_lifecycle = (
+            dict(lifecycle)
+            if str(latest.get("trade_date") or "") == str(trade_date)
+            and str(latest.get("trading_epoch_id") or "") == identity["trading_epoch_id"]
+            and _lifecycle_matches_identity(lifecycle, identity)
+            else None
+        )
         if lifecycle and not _lifecycle_matches_identity(lifecycle, identity):
             lifecycle = {}
         if not lifecycle or lifecycle.get("is_open") is False:
@@ -509,7 +520,16 @@ def reconcile_us_position_lifecycles(
                 lifecycle["last_holding_day_counted"] = trade_date
             identity["position_lifecycle_id"] = str(lifecycle.get("lifecycle_id") or "")
         lifecycle["identity_status"] = "IDENTIFIED"
-        lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
+        if _persisted_current_lifecycle is not None and lifecycle == _persisted_current_lifecycle:
+            # Exact no-op: avoiding a remote DB write does not discard a real
+            # late fill. Qty, lifecycle identity, stage or date changes still
+            # take the existing atomic writer route.
+            logger.debug(
+                "[US_POSITION][LIFECYCLE_PERSIST_NOOP] symbol=%s trade_date=%s lifecycle_id=%s",
+                symbol, trade_date, lifecycle.get("lifecycle_id"),
+            )
+        else:
+            lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
         carried_policy = dict(lifecycle.get("entry_policy") or {})
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
