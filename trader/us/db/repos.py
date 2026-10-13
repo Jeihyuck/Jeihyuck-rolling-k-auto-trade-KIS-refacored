@@ -2191,6 +2191,9 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
         )):
             raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
         combined = {**prior, **data}
+        for immutable_field in ("opened_at", "opened_trade_date", "entry_policy"):
+            if prior.get(immutable_field):
+                combined[immutable_field] = prior[immutable_field]
         combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
         if prior.get("is_open") is False:
             combined["is_open"] = False
