@@ -1134,7 +1134,9 @@ class KisUSClient:
         date is America/New_York. Missing source time is *unknown*, not proof
         that an order is outside the requested US session.
         """
-        raw_date = str(row.get("ord_dt") or row.get("ORD_DT") or "").replace("-", "").strip()
+        raw_date = str(
+            row.get("ord_dt") or row.get("ORD_DT") or row.get("trade_date") or ""
+        ).replace("-", "").strip()
         raw_time = str(row.get("ord_tmd") or row.get("ORD_TMD") or "").replace(":", "").strip()
         if not raw_date or not raw_time:
             return None
