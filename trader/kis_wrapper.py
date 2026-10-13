@@ -1666,18 +1666,8 @@ class KisAPI:
             endpoint_category = "price"
         gate = get_kis_gate()
         account_key = f"{str(self.CANO or '').strip()}:{str(self.ACNT_PRDT_CD or '').strip()}"
-        wait_limiter = gate.acquire(
-            environment=str(self.env or "practice"),
-            account_key=account_key,
-            endpoint_category=endpoint_category,
-            priority=endpoint_category in {"order", "balance"},
-        )
-        if wait_limiter > 0:
-            if not _kr_sleep_with_budget(
-                wait_limiter, stage_deadline=getattr(self, "_kr_stage_deadline", None)
-            ):
-                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER")
-
+        # Acquire the account quota *per actual HTTP attempt*, not just once
+        # before a potentially multi-attempt GET request.
         breaker_open, breaker_until = _breaker_check(method, url)
         if breaker_open:
             logger.warning(
@@ -1691,6 +1681,16 @@ class KisAPI:
         configured_timeout = kwargs.pop("timeout", (3.0, 7.0))
         for i in range(1, attempts + 1):
             try:
+                wait_limiter = gate.acquire(
+                    environment=str(self.env or "practice"),
+                    account_key=account_key,
+                    endpoint_category=endpoint_category,
+                    priority=endpoint_category in {"order", "balance"},
+                )
+                if wait_limiter > 0 and not _kr_sleep_with_budget(
+                    wait_limiter, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+                ):
+                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER")
                 stage_deadline = getattr(self, "_kr_stage_deadline", None)
                 request_timeout = _kr_bounded_timeout(
                     configured_timeout, stage_deadline=stage_deadline
@@ -1756,6 +1756,36 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
+                    # KIS frequently encodes EGW00201 as HTTP 500, not 429.
+                    # Inspect the structured body before generic 5xx handling:
+                    # otherwise the shared cooldown is not applied.
+                    rate_body = {}
+                    try:
+                        parsed_rate_body = resp.json()
+                        if isinstance(parsed_rate_body, dict):
+                            rate_body = parsed_rate_body
+                    except Exception:
+                        pass
+                    rate_msg_cd = str(rate_body.get("msg_cd") or "")
+                    if _is_egw002_error(rate_body, rate_msg_cd):
+                        gate.set_global_cooldown(
+                            str(self.env or "practice"), account_key,
+                            seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                        )
+                        logger.warning(
+                            "[KIS][EGW002][HTTP_STATUS_RATE_LIMIT] status=%s endpoint=%s "
+                            "msg_cd=%s attempt=%s/%s",
+                            status, _endpoint_name(url), rate_msg_cd, i, attempts,
+                        )
+                        if is_order_endpoint(url) and str(rate_body.get("rt_cd") or "") == "1":
+                            # Broker explicitly rejected this POST; do not fake
+                            # ambiguous ACK and never submit it twice.
+                            logger.warning(
+                                "[KIS][ORDER][EXPLICIT_REJECT] endpoint=%s rt_cd=1 "
+                                "msg_cd=%s action=RETURN_RESPONSE_NO_RETRY",
+                                _endpoint_name(url), rate_msg_cd,
+                            )
+                            return resp
                     if status == 429:
                         gate.set_global_cooldown(
                             str(self.env or "practice"),
