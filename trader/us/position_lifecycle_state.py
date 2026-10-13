@@ -573,6 +573,24 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
     same = lifecycle.get("lifecycle_id") == lifecycle_id
     previous = _f(lifecycle.get("high_watermark")) if same else 0.0
     new_high = max(previous, _f(current_price), _f(entry_price)) if same else max(_f(current_price), _f(entry_price))
+    # Already durable same-day high-watermark: avoid a redundant UPDATE at
+    # every tick. A prior-day row, missing provenance, or new record must
+    # still be written, and any new price high always goes through the atomic
+    # writer. This cannot discard actual broker fills or position transitions.
+    if (
+        same
+        and new_high == previous
+        and str(latest.get("trade_date") or "") == str(trade_date)
+        and lifecycle.get("high_watermark_source") == "us_position_risk_state"
+        and lifecycle.get("high_watermark_at")
+        and lifecycle.get("is_open") is True
+    ):
+        logger.info(
+            "[US_POSITION][HIGH_WATERMARK_NOOP] symbol=%s lifecycle_id=%s "
+            "saved=%.4f reason=same_cycle_same_day_non_increasing",
+            symbol, lifecycle_id, previous,
+        )
+        return lifecycle
     lifecycle.update({"lifecycle_id": lifecycle_id, "high_watermark": new_high, "high_watermark_at": now_iso if new_high != previous else lifecycle.get("high_watermark_at") or now_iso, "high_watermark_source": "us_position_risk_state"})
     if "is_open" not in lifecycle:
         lifecycle["is_open"] = True
