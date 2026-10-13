@@ -171,6 +171,7 @@ def _load_fallback_universe_from_db(
     as_of_date: str,
     snapshot: dict | None = None,
     require_exact_as_of: bool = False,
+    enforce_fallback_switch: bool = True,
 ) -> list[dict]:
     """Use only a committed, venue-verified DB snapshot; never guess KRX venues.
 
@@ -178,7 +179,7 @@ def _load_fallback_universe_from_db(
     distinct symbols.  Historical snapshots from a different session are not
     silently relabeled as today's inputs.
     """
-    if os.getenv("UNIVERSE_NO_FALLBACK", "0") == "1":
+    if enforce_fallback_switch and os.getenv("UNIVERSE_NO_FALLBACK", "0") == "1":
         logger.error("[UNIVERSE][NO_FALLBACK] fallback disabled by env")
         return []
 
@@ -709,7 +710,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         and os.getenv("UNIVERSE_NO_FALLBACK", "0") != "1"
     )
     preexisting_snapshot: dict | None = None
-    if prep_recovery_enabled:
+    if prep_recovery:
         try:
             preexisting_snapshot = repo.get_latest_successful_universe_snapshot(
                 env=env, strategy=strategy, as_of_date=as_of_date,
@@ -719,10 +720,11 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     # Previous successful dated snapshots are immutable. In particular, force
     # rebuild or provider failure must never downgrade SUCCESS to RUNNING/FAILED.
-    if prep_recovery_enabled and preexisting_snapshot:
+    if prep_recovery and preexisting_snapshot:
         verified_existing = _load_fallback_universe_from_db(
             repo=repo, env=env, strategy=strategy, as_of_date=as_of_date,
             snapshot=preexisting_snapshot, require_exact_as_of=True,
+            enforce_fallback_switch=False,
         )
         if verified_existing:
             logger.info("[UNIVERSE][PREP][REUSE_IMMUTABLE] as_of=%s members=%d run_id=%s",
@@ -883,6 +885,14 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
                 len(dropped_tradeable),
                 dropped_tradeable[: min(5, len(dropped_tradeable))],
             )
+
+    if prep_recovery and members and len(members) < max(100, int(os.getenv("UNIVERSE_PREP_VERIFIED_DB_MIN_MEMBERS", "100"))):
+        logger.error(
+            "[UNIVERSE][KRX_ASOF][QUALITY_FAIL] after_sanitize=%d min=100 action=FAIL_CLOSED",
+            len(members),
+        )
+        last_reason = "krx_asof_insufficient_after_sanitize"
+        members = []
 
     if not members:
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
