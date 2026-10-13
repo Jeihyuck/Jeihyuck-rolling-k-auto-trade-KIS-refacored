@@ -264,9 +264,13 @@ if [[ "$MARKET" == kr ]]; then
     record_expected REQUIRED_EVIDENCE_MISSING "$final30_evidence"
     record_included "$final30_evidence"
   elif [[ "$resolver_rc" == 2 ]]; then
-    fail KRX_PREV_TRADING_DAY_RESOLVE_FAILED 1 "$TRADE_DATE" "$final30_search_file"
+    # A broken/missing PREP is precisely when the operator needs a log mail.
+    # Do not turn missing Final30 or an unavailable previous-day resolver into
+    # an SMTP preflight failure. Record the loss as evidence, ship DEGRADED.
+    record_missing KRX_PREV_TRADING_DAY_RESOLVE_FAILED "$TRADE_DATE"
+    record_missing REQUIRED_EVIDENCE_MISSING "$expected_final30"
   else
-    fail REQUIRED_EVIDENCE_MISSING 1 "$expected_final30" "$final30_search_file"
+    record_missing REQUIRED_EVIDENCE_MISSING "$expected_final30"
   fi
 else
   purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
