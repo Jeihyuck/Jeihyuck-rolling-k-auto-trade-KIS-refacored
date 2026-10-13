@@ -91,6 +91,17 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
             for d in summaries
         ),
         "close_status": str(close.get("status") or ""),
+        "close_integrity_status": str(close.get("close_integrity_status") or ""),
+        "close_claim_unresolved": int(
+            (close.get("execution_claim_health") or {}).get("unresolved_execution_actions") or 0
+        ),
+        "close_claim_conflicts": int(
+            (close.get("execution_claim_health") or {}).get("execution_claim_conflicts") or 0
+        ),
+        "close_broker_recovery_errors": len(close.get("broker_recovery_integrity_errors") or []),
+        "close_runtime_liveness_failures": len(close.get("runtime_liveness_failures") or []),
+        "close_broker_orders_unresolved": int(close.get("broker_orders_unresolved") or 0),
+        "close_unresolved_submit_attempts": int(close.get("unresolved_submit_attempt_count") or 0),
         "close_unresolved_actions": len([
             err for err in (close.get("errors") or [])
             if str(err).startswith("UNRESOLVED_EXECUTION_ACTIONS")
@@ -112,6 +123,15 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         reasons.append("CLOSE_RECONCILIATION_NOT_OK")
     if metrics["close_unresolved_actions"] or metrics["close_manual_reconcile_required"]:
         reasons.append("UNRESOLVED_EXECUTION_OR_MANUAL_RECONCILIATION")
+    if (
+        metrics["close_claim_unresolved"] or metrics["close_claim_conflicts"]
+        or metrics["close_broker_recovery_errors"]
+        or metrics["close_runtime_liveness_failures"]
+        or metrics["close_broker_orders_unresolved"]
+        or metrics["close_unresolved_submit_attempts"]
+        or metrics["close_integrity_status"] in {"RECONCILE_REQUIRED", "FAILED", "ERROR"}
+    ):
+        reasons.append("CLOSE_BROKER_CLAIM_OR_LIVENESS_NOT_CLEAN")
     # A broker-open order is not always a Close failure: it must be explained
     # by authoritative broker evidence, never auto-cleared to satisfy the gate.
     if metrics["close_open_order_pending_total"]:
