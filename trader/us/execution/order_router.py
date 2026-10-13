@@ -1922,8 +1922,9 @@ def route_order(
                 "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=%s attempt=%s delay_ms=%.2f",
                 symbol_upper, intent["submit_attempt_id"], _delay_ms,
             )
-            if context is not None:
-                context.metrics["sell_signal_to_broker_boundary_ms"] = _delay_ms
+            _metrics = getattr(context, "metrics", None)
+            if isinstance(_metrics, dict):
+                _metrics["sell_signal_to_broker_boundary_ms"] = _delay_ms
 
     set_submit_boundary = getattr(kis_client, "set_before_order_http", None)
     clear_submit_boundary = getattr(kis_client, "clear_before_order_http", None)
