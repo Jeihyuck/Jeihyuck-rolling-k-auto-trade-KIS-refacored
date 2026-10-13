@@ -12,6 +12,7 @@ import re
 from datetime import date
 
 import pandas as pd
+from pykrx.stock import get_market_ticker_list
 
 from trader.universe.providers.krx_provider import fetch_with_rollback
 
@@ -58,6 +59,18 @@ class KRXAsOfMarketcapProvider:
                     f"krx_asof_provider_date_mismatch requested={requested} actual={normalized_date}"
                 )
 
+        # Confirm venue membership from the same *dated* market listing API,
+        # not from the order of an unversioned local seed or the request label.
+        listed_codes = {
+            str(code).strip().zfill(6)
+            for code in get_market_ticker_list(requested.strftime("%Y%m%d"), market=venue)
+        }
+        if len(listed_codes) < int(n):
+            raise RuntimeError(
+                f"krx_asof_venue_listing_incomplete market={venue} "
+                f"listed={len(listed_codes)} required={n}"
+            )
+
         cap_col = next((c for c in _CAP_COLUMNS if c in df.columns), None)
         if cap_col is None:
             raise RuntimeError(f"krx_asof_missing_market_cap market={venue}")
@@ -68,7 +81,8 @@ class KRXAsOfMarketcapProvider:
         # pykrx uses 6-digit stock codes as the DataFrame index.
         for code_raw, cap, idx in zip(df.index, caps, range(len(df))):
             code = str(code_raw).strip()
-            if not _CODE.fullmatch(code) or code in seen or pd.isna(cap) or float(cap) <= 0:
+            if (not _CODE.fullmatch(code) or code not in listed_codes
+                    or code in seen or pd.isna(cap) or float(cap) <= 0):
                 continue
             seen.add(code)
             name = str(df.iloc[idx][name_col]).strip() if name_col else ""
