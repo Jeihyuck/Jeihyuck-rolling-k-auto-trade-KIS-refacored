@@ -306,6 +306,16 @@ def request_protective_tp_cancel(
                     symbol, order.get("order_no"), order.get("trade_date"),
                     trade_date, stale_classification,
                 )
+                # Historical CCNL OPEN rows are snapshots, not proof that the
+                # broker still accepts a cancel today. A stale TP must never
+                # proceed to the live cancel path based on that old OPEN.
+                # Fence is retained; actual later fills/cancels still reconcile.
+                results.append({
+                    "symbol": symbol, "status": "FENCED",
+                    "reason": "historical_open_not_current_cancel_proof",
+                    "stale_classification": stale_classification,
+                })
+                continue
             meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
             if (
                 str(meta.get("strategy_owner") or "").upper() != "US_STANDARD"
