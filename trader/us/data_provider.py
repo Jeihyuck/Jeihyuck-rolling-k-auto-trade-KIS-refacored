@@ -893,6 +893,12 @@ class USDataProvider:
                     if ctx is not None:
                         ctx.price_cache[cache_key] = data
                         ctx.count("quote_ws_hits")
+                    logger.info(
+                        "[US_KIS][WS_COLLECTOR_HIT] symbol=%s exchange=%s "
+                        "generation=%s age_sec=%s",
+                        symbol, exchange, fresh.get("collector_generation"),
+                        fresh.get("age_sec"),
+                    )
                     return data
                 logger.info("[US_KIS][WS_COLLECTOR_FALLBACK] symbol=%s reason=missing_or_stale", symbol)
             except Exception as exc:
