@@ -2929,14 +2929,23 @@ class PB1Engine:
             raise
         finally:
             elapsed = time.perf_counter() - started
-            # [2026-04-30] tick 잔여 시간 업데이트 (non-critical DB skip 판단용)
+            # The stage budget is NOT the shared tick budget. Do not extend
+            # KIS I/O availability when a short stage finishes quickly after
+            # most of the outer tick's monotonic deadline has already elapsed.
             if max_sec > 0:
-                remaining = max(0.0, max_sec - elapsed)
+                stage_remaining = max(0.0, max_sec - elapsed)
+                from trader.kis_wrapper import kr_tick_remaining_sec
+                shared_remaining = kr_tick_remaining_sec()
+                remaining = (
+                    min(stage_remaining, max(0.0, shared_remaining))
+                    if math.isfinite(shared_remaining)
+                    else stage_remaining
+                )
                 self._tick_remaining_sec = remaining
                 if remaining < int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5")):
                     logger.info(
-                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f action=skip_noncritical_update",
-                        stage_name, remaining,
+                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f shared_remaining_sec=%s action=skip_noncritical_update",
+                        stage_name, remaining, shared_remaining,
                     )
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
             if error is None and max_sec > 0 and elapsed > max_sec:
@@ -13397,22 +13406,20 @@ class PB1Engine:
             )
         else:
             try:
-                import signal as _signal
-                def _timeout_handler(signum, frame):
-                    raise TimeoutError("noncritical_db_update_timeout")
-                _signal.signal(_signal.SIGALRM, _timeout_handler)
-                _signal.alarm(_noncritical_timeout)
-                try:
-                    self.positions_repo.update_position_fields(
-                        env=self.env,
-                        strategy=self.STRATEGY_NAME,
-                        sid=sid,
-                        mode=mode,
-                        code=code,
-                        fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
-                    )
-                finally:
-                    _signal.alarm(0)
+                # SIGALRM is owned by pb1_runner's shared tick watchdog.
+                # Never install/cancel a nested alarm: that could silently
+                # disarm the actual trading tick timeout. This DB write is
+                # noncritical; broker submission and durable claim come first.
+                # The existing whole-tick watchdog/DB driver timeout apply.
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=sid,
+                    mode=mode,
+                    code=code,
+                    fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
+                )
+
             except Exception as _upd_exc:
                 logger.warning(
                     "[POSITIONS][UPDATE][FAIL_SOFT] code=%s field=last_exit_eval_json err=%s",
@@ -17349,7 +17356,17 @@ class PB1Engine:
         exit_pass_fail_open = self._exit_pass_timeout_fail_open_enabled()
         exit_pass_started = time.perf_counter()
         # exit prewarm: exit_pass 직전에 OHLCV/현재가 캐시를 미리 채운다
-        self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
+        # Full-universe prewarm is a head-of-line blocker: one slow historical
+        # candle or quote delays *every* protective SELL. The existing
+        # _run_exit_always path still loads each owner's required OHLCV before
+        # its own decision. Keep legacy eager prewarm opt-in for diagnostics.
+        if os.getenv("KR_EXIT_BLOCKING_PREWARM", "0") == "1":
+            self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
+        else:
+            logger.info(
+                "[KR_EXIT][PREWARM_DEFERRED] holdings=%s action=EVALUATE_PER_HOLDING_FIRST",
+                len(holdings_for_exit or []),
+            )
         logger.info(
             "[PASS][EXIT][START] phase=%s existing_positions=%s holdings_source=%s",
             self.phase,
