@@ -8,6 +8,17 @@ import pytest
 from trader.universe.providers import krx_marketcap_asof as module
 
 
+@pytest.fixture(autouse=True)
+def _fake_dated_listing(monkeypatch):
+    # Mock an exchange listing for the same as-of date; real KRX HTTP is never
+    # contacted by offline tests.
+    def listed(as_of, market):
+        assert as_of == "20261012"
+        assert market in ("KOSPI", "KOSDAQ")
+        return [f"{100000 + i:06d}" for i in range(200)]
+    monkeypatch.setattr(module, "get_market_ticker_list", listed)
+
+
 def _df(n=180):
     codes = [f"{100000 + i:06d}" for i in range(n)]
     return pd.DataFrame(
@@ -67,3 +78,21 @@ def test_marketcap_column_and_market_validation(monkeypatch):
         module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
     with pytest.raises(ValueError, match="invalid_market"):
         module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("UNKNOWN", "2026-10-12", 150)
+
+
+def test_dated_venue_listing_must_cover_market(monkeypatch):
+    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (_df(), date(2026,10,12), "ok"))
+    monkeypatch.setattr(module, "get_market_ticker_list", lambda *_a, **_kw: ["005930"])
+    with pytest.raises(RuntimeError, match="venue_listing_incomplete"):
+        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
+
+
+def test_codes_outside_verified_market_are_not_admitted(monkeypatch):
+    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (_df(), date(2026,10,12), "ok"))
+    # Large listing, but it contains fewer than 150 of the capitalization
+    # response codes. Strict venue reconciliation must fail, not mislabel.
+    listing = [f"{100000 + i:06d}" for i in range(140)]
+    listing += [f"{400000 + i:06d}" for i in range(60)]
+    monkeypatch.setattr(module, "get_market_ticker_list", lambda *_a, **_kw: listing)
+    with pytest.raises(RuntimeError, match="insufficient"):
+        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
