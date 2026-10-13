@@ -1,0 +1,79 @@
+"""2026-10-13 regression: 300-symbol dated universe and immutable PREP SUCCESS."""
+from __future__ import annotations
+
+import pytest
+
+from trader.universe import build
+
+
+def _rows(market, count=150, *, repeated=None):
+    rows = []
+    for i in range(count):
+        code = repeated if repeated and i == 0 else f"{100000 + (0 if market == 'KOSPI' else 200000) + i:06d}"
+        rows.append({
+            "code": code, "market": market, "name": "SAMPLE",
+            "market_cap": 100000000 - i * 100,
+            "actual_as_of": "2026-10-12",
+        })
+    return rows
+
+
+def test_prep_krx_150_plus_150_preserves_candidate_policy():
+    class Provider:
+        def get_marketcap_top_with_meta(self, market, as_of_date, n):
+            assert as_of_date == "2026-10-12"
+            assert n == 150
+            return _rows(market)
+    result, reason = build._build_from_krx_asof(Provider(), "2026-10-12")
+    assert reason == "krx_marketcap_asof"
+    assert result["source"] == "krx_marketcap_asof"
+    assert result["params"]["actual_as_of"] == "2026-10-12"
+    assert len(result["members"]) == 300
+    assert len({x["code"] for x in result["members"]}) == 300
+    assert len(result["payload"]["selected_by_market"]["KOSPI"]) == 150
+    assert len(result["payload"]["selected_by_market"]["KOSDAQ"]) == 150
+
+
+def test_prep_cross_market_identity_conflict_fails_closed():
+    class Provider:
+        def get_marketcap_top_with_meta(self, market, *_a):
+            return _rows(market, repeated="005930")
+    result, reason = build._build_from_krx_asof(Provider(), "2026-10-12")
+    assert result is None
+    assert reason == "krx_asof_cross_market_duplicate"
+
+
+def test_prep_prior_success_is_not_reset_by_force_rebuild(monkeypatch):
+    as_of = "2026-10-12"
+    saved = [
+        {"code": f"{i:06d}", "market": "KOSPI" if i < 60 else "KOSDAQ", "rank": i}
+        for i in range(1, 151)
+    ]
+    class Repo:
+        def __init__(self, _engine):
+            pass
+        def get_latest_successful_universe_snapshot(self, **_kwargs):
+            return {
+                "run_id": "previous-success", "as_of": as_of,
+                "actual_as_of": as_of, "provider": "krx_marketcap_asof",
+                "status": "SUCCESS", "members": saved,
+            }
+        def start_universe_run(self, **_kw):
+            raise AssertionError("must not change SUCCESS to RUNNING")
+    monkeypatch.setattr(build, "make_engine", lambda: object())
+    monkeypatch.setattr(build, "run_migrations", lambda _engine: None)
+    monkeypatch.setattr(build, "UniverseRepo", Repo)
+    monkeypatch.setenv("UNIVERSE_PREP_VERIFIED_DB_FALLBACK", "1")
+    monkeypatch.delenv("UNIVERSE_NO_FALLBACK", raising=False)
+    monkeypatch.setenv("UNIVERSE_FORCE_REBUILD_ALWAYS", "1")
+    assert len(build.build_universe(as_of, "practice", "best_k_meta", prep_recovery=True)) == 150
+
+
+def test_prep_rejects_undated_kis_provider_override():
+    from unittest.mock import patch
+    with patch.object(build, "make_engine", return_value=object()), patch.object(build, "run_migrations"):
+        with pytest.raises(ValueError, match="exact-date KRX"):
+            build.build_universe(
+                "2026-10-12", "practice", "best_k_meta",
+                provider_override="kis_marketcap_top", prep_recovery=True,
+            )
