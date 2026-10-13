@@ -2231,6 +2231,27 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                              THEN 'false'::jsonb
                              ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
                                            'true'::jsonb)
+                        END,
+                        -- Entry provenance never becomes more recent just
+                        -- because a later worker copied a stale snapshot.
+                        'opened_at',
+                        COALESCE(
+                            us_position_risk_state.state->'lifecycle'->'opened_at',
+                            CAST(:data AS jsonb)->'opened_at'
+                        ),
+                        'opened_trade_date',
+                        COALESCE(
+                            us_position_risk_state.state->'lifecycle'->'opened_trade_date',
+                            CAST(:data AS jsonb)->'opened_trade_date'
+                        ),
+                        'entry_policy',
+                        CASE WHEN COALESCE(
+                               us_position_risk_state.state->'lifecycle'->'entry_policy',
+                               '{}'::jsonb
+                             ) <> '{}'::jsonb
+                             THEN us_position_risk_state.state->'lifecycle'->'entry_policy'
+                             ELSE COALESCE(CAST(:data AS jsonb)->'entry_policy',
+                                           '{}'::jsonb)
                         END
                     ), true
                 ),
