@@ -1409,6 +1409,12 @@ def route_exit_orders_immediately(
     decisions: list[dict] = []
     for intent in sell_intents:
         try:
+            _individual_route_start = time.monotonic()
+            logger.info(
+                "[US_EXIT][ROUTER_ENTER] symbol=%s qty=%s reason=%s",
+                intent.get("symbol"), intent.get("qty"),
+                intent.get("reason") or (intent.get("meta") or {}).get("reason"),
+            )
             result = route_order(
                 intent,
                 current_daily_notional_usd=buy_daily_notional,
@@ -1423,6 +1429,12 @@ def route_exit_orders_immediately(
                 kis_client=kis_client,
             )
             orders.append(result)
+            logger.info(
+                "[US_EXIT][ROUTER_RESULT] symbol=%s elapsed_ms=%.2f status=%s",
+                intent.get("symbol"),
+                (time.monotonic() - _individual_route_start) * 1000.0,
+                result.get("status"),
+            )
             status = str(result.get("status") or "ERROR")
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
@@ -2477,6 +2489,13 @@ def run_trade_tick(
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+    # Measure protective signal readiness separately from broker routing.
+    # This never changes an intent, strategy evaluation, or order/fence state.
+    _early_sell_signal_ready_mono = (
+        time.monotonic()
+        if any(str(i.get("side") or "").upper() == "SELL" for i in exit_intents)
+        else None
+    )
     logger.info("[US_EXIT_EVAL][SUMMARY] session=%s tick=%s positions_evaluated=%d sell_candidates=%d sell_orders=%d", session, tick_index, len(current_positions), len([i for i in exit_intents if str(i.get("side") or "").upper()=="SELL"]), 0)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
     tick_context.metrics["exit_engine_ms"] = (time.monotonic() - _exit_engine_started) * 1000.0
@@ -2659,6 +2678,14 @@ def run_trade_tick(
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
 
+    if _early_sell_signal_ready_mono is not None:
+        _pre_route_delay_ms = (time.monotonic() - _early_sell_signal_ready_mono) * 1000.0
+        tick_context.metrics["sell_intent_ready_to_route_ms"] = _pre_route_delay_ms
+        logger.warning(
+            "[US_EXIT][SIGNAL_READY_TO_ROUTE] tick=%s delay_ms=%.2f "
+            "reason=pre_route_overlay_recovery_and_claim_checks",
+            tick_index, _pre_route_delay_ms,
+        )
     exit_route_result = route_exit_orders_immediately(
         exit_intents,
         buy_daily_notional=buy_daily_notional,
