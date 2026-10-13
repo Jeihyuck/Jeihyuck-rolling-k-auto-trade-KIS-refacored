@@ -90,3 +90,73 @@ def test_late_broker_evidence_is_not_a_collector_generation_event():
         env="practice", generation="fresh", service=_FakeService(),
     )
     assert result["status"] in {"BAD_REQUEST", "DENIED"}
+
+
+def _fork_collector_server(path):
+    from pathlib import Path
+    from trader.marketdata import us_ws_collector as module
+    module.socket_path = lambda env: Path(path)
+    module._account_identity = lambda env: "account-1"
+    module.serve(
+        env="practice", parent_pid=0,
+        service=_FakeService({"last": 141.0, "received_at": time.time()}),
+        max_seconds=4.0,
+    )
+
+
+def _abrupt_ipc_client_exit(path):
+    import os
+    import socket as sock
+    with sock.socket(sock.AF_UNIX, sock.SOCK_STREAM) as conn:
+        conn.connect(str(path))
+        conn.sendall(b'{"cmd":"QUOTE","identity":"account-1"')
+        os._exit(84)
+
+
+def test_collector_survives_killed_tick_client_and_restarts_with_new_generation(tmp_path, monkeypatch):
+    import multiprocessing as mp
+    from pathlib import Path
+
+    ctx = mp.get_context("fork")
+    path = tmp_path / "read-only-collector.sock"
+    monkeypatch.setattr(collector, "_account_identity", lambda env: "account-1")
+    monkeypatch.setattr(collector, "socket_path", lambda env: path)
+    monkeypatch.setenv("US_WS_COLLECTOR_ENABLED", "1")
+
+    def ready():
+        for _ in range(100):
+            try:
+                result = collector._send_request("practice", {"cmd": "HEALTH"}, timeout_sec=0.1)
+                if result and result.get("status") == "OK":
+                    return result
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.02)
+        raise AssertionError("collector failed to start")
+
+    first = ctx.Process(target=_fork_collector_server, args=(str(path),))
+    first.start()
+    try:
+        generation_1 = ready()["generation"]
+        broken_client = ctx.Process(target=_abrupt_ipc_client_exit, args=(str(path),))
+        broken_client.start()
+        broken_client.join(timeout=1.5)
+        assert broken_client.exitcode == 84
+        assert first.is_alive(), "killed trading client must not stop market-data service"
+        assert ready()["generation"] == generation_1
+    finally:
+        if first.is_alive():
+            first.terminate()
+        first.join(timeout=2)
+
+    restarted = ctx.Process(target=_fork_collector_server, args=(str(path),))
+    restarted.start()
+    try:
+        generation_2 = ready()["generation"]
+        assert generation_2 != generation_1, "restarted collector needs a new generation"
+        quote = collector.get_quote("AAPL", "NASDAQ", env="practice", timeout_sec=0.2)
+        assert quote and quote["collector_generation"] == generation_2
+    finally:
+        if restarted.is_alive():
+            restarted.terminate()
+        restarted.join(timeout=2)
