@@ -13393,9 +13393,15 @@ class PB1Engine:
                 display_code, eval_reason, holding_minutes, min_hold_minutes,
             )
         # [2026-04-30] last_exit_eval_json은 non-critical: 남은 tick budget이 부족하면 skip
-        _noncritical_timeout = int(os.getenv("PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC", "2"))
         _skip_threshold = int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"))
+        from trader.kis_wrapper import kr_tick_remaining_sec
         _tick_remaining = getattr(self, "_tick_remaining_sec", None)
+        _live_remaining = kr_tick_remaining_sec()
+        if math.isfinite(_live_remaining):
+            _tick_remaining = (
+                max(0.0, _live_remaining) if _tick_remaining is None
+                else min(float(_tick_remaining), max(0.0, _live_remaining))
+            )
         _should_skip_noncritical = (
             _tick_remaining is not None and float(_tick_remaining) < _skip_threshold
         )
