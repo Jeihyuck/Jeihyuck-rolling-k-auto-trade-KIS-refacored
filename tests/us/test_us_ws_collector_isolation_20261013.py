@@ -190,3 +190,19 @@ def test_tick_cache_revalidates_collector_generation_and_latest_quote(monkeypatc
     assert second["last"] == "101.0"
     assert second["collector_generation"] == "after-restart"
     assert len(calls) >= 3
+
+
+def test_ws_collector_rejects_all_broker_mutation_command_variants(monkeypatch):
+    # A quote IPC client must never gain an order, cancellation or balance
+    # mutation capability, even when it supplies a valid account identity.
+    monkeypatch.setattr(collector, "_account_identity", lambda env: "account-1")
+    service = _FakeService({"last": 100.0, "received_at": time.time()})
+    for command in ("SUBMIT_ORDER", "CANCEL_ORDER", "AMEND_ORDER",
+                    "PLACE_ORDER", "ORDER_FILLED", "RECONCILE_ORDER"):
+        result = collector._reply(
+            {"cmd": command, "identity": "account-1", "env": "practice",
+             "symbol": "MSFT", "exchange": "NASDAQ"},
+            env="practice", generation="g1", service=service,
+        )
+        assert result["status"] == "BAD_REQUEST", command
+    assert service.subscriptions == []
