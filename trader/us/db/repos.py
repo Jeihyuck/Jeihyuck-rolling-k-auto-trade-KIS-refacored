@@ -2039,6 +2039,7 @@ def load_us_position_risk_state_candidates_batch(
     if not symbols:
         return {}
     td = str(on_or_before_trade_date)
+    started = time.monotonic()
     engine = _get_engine_or_none()
     if engine is None:
         return {sym: load_us_position_risk_state_candidates(sym, td) for sym in symbols}
@@ -2071,14 +2072,14 @@ def load_us_position_risk_state_candidates_batch(
             if symbol in grouped:
                 grouped[symbol].append(dict(row))
         logger.info(
-            "[US_RISK_STATE][BATCH_CANDIDATES] symbols=%d rows=%d queries=1",
-            len(symbols), len(rows),
+            "[US_RISK_STATE][BATCH_CANDIDATES] symbols=%d rows=%d queries=1 elapsed_ms=%.2f",
+            len(symbols), len(rows), (time.monotonic() - started) * 1000.0,
         )
         return grouped
     except Exception as exc:
         logger.warning(
-            "[US_RISK_STATE][BATCH_CANDIDATES_WARN] symbols=%d err=%s action=per_symbol_fallback",
-            len(symbols), exc,
+            "[US_RISK_STATE][BATCH_CANDIDATES_WARN] symbols=%d err=%s elapsed_ms=%.2f action=per_symbol_fallback",
+            len(symbols), exc, (time.monotonic() - started) * 1000.0,
         )
         return {sym: load_us_position_risk_state_candidates(sym, td) for sym in symbols}
 
