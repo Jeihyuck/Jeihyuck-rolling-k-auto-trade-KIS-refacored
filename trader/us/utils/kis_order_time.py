@@ -17,6 +17,7 @@ _ET = ZoneInfo("America/New_York")
 
 def resolve_kis_us_order_datetime(
     us_trade_date: str, korea_order_time: str,
+    domestic_order_date: str | None = None,
 ) -> datetime:
     """Unique KST wall-time whose America/New_York date equals KIS ord_dt.
 
@@ -39,6 +40,11 @@ def resolve_kis_us_order_datetime(
             candidates.append(candidate)
     if len(candidates) != 1:
         raise ValueError("KIS order timestamp ambiguous across KST/ET")
+    if domestic_order_date not in (None, ""):
+        domestic_digits = str(domestic_order_date).replace("-", "").strip()
+        if (len(domestic_digits) != 8 or not domestic_digits.isdigit()
+                or candidates[0].strftime("%Y%m%d") != domestic_digits):
+            raise ValueError("KIS domestic order date contradicts US session date")
     return candidates[0]
 
 
