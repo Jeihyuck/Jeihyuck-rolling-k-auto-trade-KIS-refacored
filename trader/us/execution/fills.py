@@ -39,10 +39,8 @@ def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> 
             break
     if date_text and time_text:
         time_text = time_text.zfill(6)[:6]
-        source_time = datetime.strptime(
-            f"{date_text[:8]}{time_text}",
-            "%Y%m%d%H%M%S",
-        ).replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        from trader.us.utils.kis_order_time import resolve_kis_us_order_datetime
+        source_time = resolve_kis_us_order_datetime(date_text[:8], time_text)
         return source_time.isoformat()
     return date_text
 
