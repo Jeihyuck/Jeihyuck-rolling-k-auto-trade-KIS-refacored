@@ -500,8 +500,43 @@ def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_in
     return timestamp
 
 
-def _suppress_pending_sell_exit_intents(exit_intents: list[dict], trade_date: str) -> list[dict]:
-    """Do not repeatedly create SELL intents while a same-day SELL is pending."""
+def _suppress_pending_sell_exit_intents(
+    exit_intents: list[dict], trade_date: str, *, env: str = "practice",
+) -> list[dict]:
+    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP."""
+    def _standard_lifecycle(intent: dict) -> str:
+        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+        owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
+        producer = str(intent.get("strategy") or meta.get("strategy") or "").lower()
+        symbol = str(intent.get("symbol") or "").upper()
+        if symbol == "TQQQ" or owner not in {"", "US_STANDARD"}:
+            return ""
+        if owner != "US_STANDARD" and producer != "us_pb1_exit":
+            return ""
+        return str(
+            intent.get("position_lifecycle_id")
+            or meta.get("position_lifecycle_id") or ""
+        ).strip()
+
+    # One historical claim read, scoped by epoch/owner/lifecycle. No invented
+    # terminal status, no fence release and no KIS REST call on every symbol.
+    historical_fenced: set[str] = set()
+    crossday_ids = [
+        _standard_lifecycle(intent) for intent in exit_intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    ]
+    crossday_ids = [value for value in crossday_ids if value]
+    if crossday_ids:
+        try:
+            from trader.us.protective_tp_recovery import load_crossday_unresolved_tp_lifecycles
+            historical_fenced = load_crossday_unresolved_tp_lifecycles(
+                crossday_ids, trade_date, env=env,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=use_existing_order_gate",
+                exc,
+            )
     try:
         from trader.us.db.repos import has_pending_order_for_symbol_side
     except Exception:
@@ -513,6 +548,14 @@ def _suppress_pending_sell_exit_intents(exit_intents: list[dict], trade_date: st
             kept.append(intent)
             continue
         symbol = str(intent.get("symbol") or "").upper().strip()
+        lifecycle = _standard_lifecycle(intent)
+        if lifecycle and lifecycle in historical_fenced:
+            logger.warning(
+                "[US_EXIT][INTENT_SUPPRESS] symbol=%s lifecycle=%s "
+                "reason=crossday_unresolved_tp_claim action=RETAIN_FENCE_NO_NEW_ORDER",
+                symbol, lifecycle,
+            )
+            continue
         try:
             pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
         except Exception as exc:
@@ -2664,7 +2707,9 @@ def run_trade_tick(
 
     # Suppress at intent generation (rather than only in the router) so all
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
-    exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)
+    exit_intents = _suppress_pending_sell_exit_intents(
+        exit_intents, trade_date, env=env,
+    )
 
     # Route SELL without an unnecessary BUY-only DB budget read. The SELL
     # branch of assert_order_allowed() never consumes the daily BUY notional.
