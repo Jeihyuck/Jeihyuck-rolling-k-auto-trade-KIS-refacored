@@ -508,9 +508,9 @@ def reconcile_us_position_lifecycles(
                 lifecycle["holding_trade_days"] = _i(lifecycle.get("holding_trade_days"), 1) + 1
                 lifecycle["last_holding_day_counted"] = trade_date
             identity["position_lifecycle_id"] = str(lifecycle.get("lifecycle_id") or "")
-        carried_policy = dict(lifecycle.get("entry_policy") or {})
         lifecycle["identity_status"] = "IDENTIFIED"
         lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
+        carried_policy = dict(lifecycle.get("entry_policy") or {})
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
             "opened_trade_date": lifecycle.get("opened_trade_date"),
