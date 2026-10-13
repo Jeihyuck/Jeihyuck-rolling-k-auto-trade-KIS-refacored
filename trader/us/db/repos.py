@@ -2155,6 +2155,4765 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
         logger.warning("[US_RISK_STATE][LOAD_OPEN_LIFECYCLES_WARN] trade_date=%s err=%s", td, exc)
         return {}
 
+
+def save_us_position_lifecycle_atomic(
+    symbol: str, trade_date: str, lifecycle: dict,
+) -> dict:
+    """Persist only the lifecycle JSON leaf, without overwriting TP/stop state.
+
+    The lifecycle row is scoped by active epoch and symbol/date. A different
+    lifecycle, account or owner on the SAME ROW is a hard conflict, not a
+    reason to overwrite broker history. Watermarks cannot regress within a
+    lifecycle. A closed lifecycle cannot be re-opened by a stale worker.
+    This does not authorize reopening or closing based on unavailable broker
+    evidence; the caller must already have validated authoritative holdings.
+    """
+    sym = str(symbol or "").strip().upper()
+    life = dict(lifecycle or {})
+    life_id = str(life.get("lifecycle_id") or "").strip()
+    owner = str(life.get("strategy_owner") or "").strip().upper()
+    acct = str(life.get("account_id") or "").strip()
+    env = str(life.get("env") or "").strip().lower()
+    epoch = str(life.get("trading_epoch_id") or "").strip()
+    if not all((sym, trade_date, life_id, owner, acct, env, epoch)):
+        raise ValueError("lifecycle write missing exact identity")
+    high = float(life.get("high_watermark") or 0)
+    engine = _get_engine_or_none()
+    if engine is None:
+        # Existing offline fixtures use a local store; read and merge the
+        # current version, never treat this as durable broker evidence.
+        key = _risk_state_key(sym, trade_date)
+        old = dict(_MEM_RISK_STATE.get(key) or {})
+        state = dict(old.get("state") or {})
+        previous = dict(state.get("lifecycle") or {})
+        if previous and (
+            str(previous.get("lifecycle_id") or "") not in ("", life_id)
+            or str(previous.get("strategy_owner") or "") not in ("", owner)
+            or str(previous.get("account_id") or "") not in ("", acct)
+        ):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        merged = {**previous, **life}
+        merged["high_watermark"] = max(
+            high, float(previous.get("high_watermark") or 0)
+        )
+        if previous.get("is_open") is False:
+            merged["is_open"] = False
+        state["lifecycle"] = merged
+        old["state"] = state
+        _MEM_RISK_STATE[key] = _normalize_risk_state(sym, trade_date, old)
+        return merged
+    # Single UPSERT: PostgreSQL row lock serializes concurrent writers of
+    # this key. Keep all unrelated state keys, never copy an old full JSONB.
+    with engine.begin() as conn:
+        _ensure_us_position_risk_state_table(conn)
+        current_epoch = str(_us_state_epoch_id(conn) or "")
+        if current_epoch != epoch:
+            raise RuntimeError("US_LIFECYCLE_EPOCH_MISMATCH")
+        result = conn.execute(text("""
+            INSERT INTO us_position_risk_state
+                (trading_epoch_id, trade_date, symbol, state, updated_at)
+            VALUES (:epoch, :td, :symbol,
+                    jsonb_build_object('lifecycle', CAST(:lifecycle AS jsonb)), NOW())
+            ON CONFLICT (trading_epoch_id, trade_date, symbol)
+            DO UPDATE SET
+                state = jsonb_set(
+                    COALESCE(us_position_risk_state.state, '{}'::jsonb),
+                    '{lifecycle}',
+                    (
+                        COALESCE(us_position_risk_state.state->'lifecycle', '{}'::jsonb)
+                        || CAST(:lifecycle AS jsonb)
+                        || jsonb_build_object(
+                             'high_watermark',
+                             GREATEST(
+                                CASE WHEN COALESCE(us_position_risk_state.state
+                                           ->'lifecycle'->>'high_watermark','')
+                                          ~ '^[0-9]+([.][0-9]+)?    symbol: str,
+    trade_date: str,
+    state: dict,
+    *,
+    require_durable: bool = False,
+) -> bool:
+    """Upsert per-symbol US intraday risk state.
+
+    When require_durable is true, memory fallback is never authoritative:
+    a missing/unavailable PostgreSQL engine or a write failure returns False
+    without caching the attempted state.
+    """
+    key = _risk_state_key(symbol, trade_date)
+    normalized = _normalize_risk_state(key[1], trade_date, state)
+    engine = _get_engine_or_none()
+    if engine is None:
+        if require_durable:
+            logger.error(
+                "[US_RISK_STATE][DURABLE_SAVE_UNAVAILABLE] symbol=%s trade_date=%s",
+                key[1], trade_date,
+            )
+            return False
+        _MEM_RISK_STATE[key] = normalized
+        return True
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            epoch_id = _us_state_epoch_id(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO us_position_risk_state (
+                        trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                        first_soft_stop_seen_at, last_soft_stop_seen_at,
+                        lowest_price_since_breach, last_price, last_pnl_pct,
+                        state, updated_at
+                    )
+                    VALUES (
+                        :epoch_id, :td, :symbol, :soft_stop_breach_count,
+                        :first_soft_stop_seen_at, :last_soft_stop_seen_at,
+                        :lowest_price_since_breach, :last_price, :last_pnl_pct,
+                        CAST(:state AS jsonb), NOW()
+                    )
+                    ON CONFLICT (trading_epoch_id, trade_date, symbol) DO UPDATE SET
+                        soft_stop_breach_count = EXCLUDED.soft_stop_breach_count,
+                        first_soft_stop_seen_at = EXCLUDED.first_soft_stop_seen_at,
+                        last_soft_stop_seen_at = EXCLUDED.last_soft_stop_seen_at,
+                        lowest_price_since_breach = EXCLUDED.lowest_price_since_breach,
+                        last_price = EXCLUDED.last_price,
+                        last_pnl_pct = EXCLUDED.last_pnl_pct,
+                        state = EXCLUDED.state,
+                        updated_at = NOW()
+                """),
+                {
+                    "epoch_id": epoch_id,
+                    "td": trade_date,
+                    "symbol": key[1],
+                    "soft_stop_breach_count": normalized["soft_stop_breach_count"],
+                    "first_soft_stop_seen_at": normalized["first_soft_stop_seen_at"],
+                    "last_soft_stop_seen_at": normalized["last_soft_stop_seen_at"],
+                    "lowest_price_since_breach": normalized["lowest_price_since_breach"],
+                    "last_price": normalized["last_price"],
+                    "last_pnl_pct": normalized["last_pnl_pct"],
+                    "state": _json_param(normalized["state"]),
+                },
+            )
+        return True
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][SAVE_WARN] symbol=%s trade_date=%s err=%s", key[1], trade_date, exc)
+        if require_durable:
+            return False
+        _MEM_RISK_STATE[key] = normalized
+        return False
+
+
+
+
+def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | None,
+                                    position_lifecycle_id: str = "LEGACY") -> dict:
+    raw = dict(state or {})
+    meta = dict(raw.get("meta") or {})
+    # Historical rows may contain state nested back into meta on every reconcile.
+    # Flatten that accidental recursion once on read so repeated updates are size-stable.
+    _depth = 0
+    while isinstance(meta.get("meta"), dict) and _depth < 32:
+        nested = dict(meta.pop("meta") or {})
+        nested.update(meta)
+        meta = nested
+        _depth += 1
+    out = {
+        "trade_date": str(trade_date),
+        "symbol": str(symbol or "").strip().upper(),
+        "position_lifecycle_id": str(raw.get("position_lifecycle_id") or position_lifecycle_id),
+        "tp1_done": bool(raw.get("tp1_done") or meta.get("tp1_done")),
+        "tp2_done": bool(raw.get("tp2_done") or meta.get("tp2_done")),
+        "tp3_done": bool(raw.get("tp3_done") or meta.get("tp3_done")),
+        "tp1_pending": bool(raw.get("tp1_pending") or meta.get("tp1_pending")),
+        "tp2_pending": bool(raw.get("tp2_pending") or meta.get("tp2_pending")),
+        "tp3_pending": bool(raw.get("tp3_pending") or meta.get("tp3_pending")),
+        "tp1_order_key": raw.get("tp1_order_key") or meta.get("tp1_order_key"),
+        "tp2_order_key": raw.get("tp2_order_key") or meta.get("tp2_order_key"),
+        "tp3_order_key": raw.get("tp3_order_key") or meta.get("tp3_order_key"),
+        "tp1_at": raw.get("tp1_at") or meta.get("tp1_at"),
+        "tp2_at": raw.get("tp2_at") or meta.get("tp2_at"),
+        "tp3_at": raw.get("tp3_at") or meta.get("tp3_at"),
+        "last_profit_capture_at": raw.get("last_profit_capture_at") or meta.get("last_profit_capture_at"),
+        "meta": meta,
+    }
+    return out
+
+
+def load_us_profit_capture_state(trade_date: str, symbols: list[str],
+                                 lifecycle_by_symbol: dict[str, str] | None = None,
+                                 _conn: Any = None) -> dict[str, dict]:
+    """Load TP1/TP2/TP3 state for the current position lifecycle.
+
+    TP completion belongs to a position lifecycle, not to a trading date. Rows
+    remain date-stamped for audit, while the latest state for each stage is
+    carried forward across restarts and following sessions.
+    """
+    out: dict[str, dict] = {}
+    engine = _get_engine_or_none()
+    for symbol in symbols or []:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            continue
+        lifecycle = str((lifecycle_by_symbol or {}).get(sym) or "LEGACY")
+        if lifecycle == "LEGACY":
+            out[sym] = _normalize_profit_capture_state(trade_date, sym, {}, lifecycle)
+            continue
+        mem_rows = sorted(
+            (
+                (td, value) for (td, stored_sym, stored_lifecycle), value in _MEM_PROFIT_CAPTURE_STATE.items()
+                if stored_sym == sym and stored_lifecycle == lifecycle and str(td) <= str(trade_date)
+            ),
+            key=lambda item: item[0],
+        )
+        state: dict[str, Any] = {"position_lifecycle_id": lifecycle, "meta": {}}
+        for _, value in mem_rows:
+            candidate = dict(value or {})
+            state["meta"].update(dict(candidate.get("meta") or {}))
+            for stage_name in ("tp1", "tp2", "tp3"):
+                if candidate.get(f"{stage_name}_done"):
+                    state[f"{stage_name}_done"] = True
+                    state[f"{stage_name}_pending"] = False
+                elif not state.get(f"{stage_name}_done") and f"{stage_name}_pending" in candidate:
+                    state[f"{stage_name}_pending"] = bool(candidate.get(f"{stage_name}_pending"))
+                for suffix in ("order_key", "at", "broker_order_no"):
+                    key = f"{stage_name}_{suffix}"
+                    if candidate.get(key):
+                        state[key] = candidate[key]
+        if engine is not None:
+            def _read_profit_capture(conn):
+                epoch_id = _active_us_epoch(conn)
+                sql = """SELECT DISTINCT ON (stage)
+                    stage,stage_status,client_order_key,raw_broker_order_no,
+                    cumulative_filled_qty,state,updated_at,trade_date
+                    FROM us_profit_capture_lifecycle
+                    WHERE trade_date<=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle"""
+                params = {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                sql += " ORDER BY stage,trade_date DESC,updated_at DESC"
+                return conn.execute(text(sql), params).mappings().all()
+            if _conn is not None:
+                rows = _read_profit_capture(_conn)
+            else:
+                with engine.connect() as conn:
+                    rows = _read_profit_capture(conn)
+            state={"position_lifecycle_id":lifecycle,"meta":{}}
+            for row in rows:
+                stage=str(row["stage"]); status=str(row["stage_status"])
+                state[f"{stage}_pending"]=status=="PENDING"
+                state[f"{stage}_done"]=status=="DONE"
+                state[f"{stage}_order_key"]=row.get("client_order_key")
+                state["meta"].update(_parse_json_meta(row.get("state")))
+        if state and str(state.get("position_lifecycle_id") or "LEGACY") != lifecycle:
+            state = {}
+        out[sym] = _normalize_profit_capture_state(trade_date, sym, state, lifecycle)
+    return out
+
+
+def mark_us_profit_capture_stage(
+    trade_date: str,
+    symbol: str,
+    stage: str,
+    order_key: str | None = None,
+    qty: int | None = None,
+    notional_usd: float | None = None,
+    status: str = "PENDING",
+    position_lifecycle_id: str = "",
+    broker_order_no: str | None = None,
+    filled_qty: int | None = None,
+    evidence_type: str | None = None,
+    _conn: Any = None,
+) -> None:
+    """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
+    sym = str(symbol or "").strip().upper()
+    td = str(trade_date)
+    if not sym:
+        return
+    stg = str(stage or "").lower().replace("_done", "")
+    if stg not in {"tp1", "tp2", "tp3"}:
+        return
+    lifecycle = str(position_lifecycle_id or "").strip()
+    if not lifecycle:
+        return
+    existing = load_us_profit_capture_state(
+        td, [sym], {sym: lifecycle}, _conn=_conn
+    ).get(sym, {})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    status_upper = str(status or "PENDING").upper()
+    evidence_upper = str(evidence_type or "").upper()
+    try:
+        from trader.us.profit_capture import BROKER_TERMINAL_EVIDENCE
+    except Exception:
+        BROKER_TERMINAL_EVIDENCE = set()
+    meta = dict(existing.get("meta") or {})
+    if qty is not None:
+        meta[f"{stg}_qty"] = max(int(meta.get(f"{stg}_qty") or 0), int(qty))
+    if order_key:
+        order_keys = list(meta.get(f"{stg}_order_keys") or [])
+        if order_key not in order_keys:
+            order_keys.append(order_key)
+        meta[f"{stg}_order_keys"] = order_keys
+    if filled_qty is not None and evidence_upper in BROKER_TERMINAL_EVIDENCE:
+        try:
+            observed_filled = max(0, int(filled_qty))
+        except (TypeError, ValueError):
+            observed_filled = 0
+        if order_key:
+            fills_by_order = dict(meta.get(f"{stg}_fills_by_order_key") or {})
+            fills_by_order[order_key] = max(int(fills_by_order.get(order_key) or 0), observed_filled)
+            meta[f"{stg}_fills_by_order_key"] = fills_by_order
+            meta[f"{stg}_filled_qty"] = sum(int(value or 0) for value in fills_by_order.values())
+        else:
+            meta[f"{stg}_filled_qty"] = max(int(meta.get(f"{stg}_filled_qty") or 0), observed_filled)
+    target_qty = int(meta.get(f"{stg}_qty") or 0)
+    cumulative_filled_qty = int(meta.get(f"{stg}_filled_qty") or 0)
+    actual_stage_complete = (
+        evidence_upper in BROKER_TERMINAL_EVIDENCE
+        and target_qty > 0
+        and cumulative_filled_qty >= target_qty
+    )
+    terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
+    if actual_stage_complete or existing.get(f"{stg}_done"):
+        existing[f"{stg}_done"] = True
+        existing[f"{stg}_pending"] = False
+    elif terminal_failure:
+        existing[f"{stg}_pending"] = False
+        existing[f"{stg}_done"] = False
+    else:
+        existing[f"{stg}_pending"] = status_upper in {
+            "PENDING", "SUBMITTED", "ACK", "ACK_PENDING", "OPEN",
+            "PARTIALLY_FILLED", "AMBIGUOUS_ACK", "BROKER_SUBMIT_RESULT_UNKNOWN",
+            "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED", "DONE", "FILLED",
+        }
+    if order_key:
+        existing[f"{stg}_order_key"] = order_key
+    existing["position_lifecycle_id"] = lifecycle
+    if broker_order_no:
+        existing[f"{stg}_broker_order_no"] = str(broker_order_no)
+    if not terminal_failure:
+        existing[f"{stg}_at"] = existing.get(f"{stg}_at") or now_iso
+    existing["last_profit_capture_at"] = now_iso
+    meta.update({
+        "last_stage": stg,
+        "last_status": status_upper,
+        "last_evidence_type": evidence_upper or None,
+    })
+    if notional_usd is not None:
+        meta[f"{stg}_notional_usd"] = float(notional_usd)
+    existing["meta"] = meta
+    normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
+    engine = _get_engine_or_none()
+    if engine is None or _conn is None:
+        _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
+    if engine is not None:
+        stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
+        def _write_profit_capture(conn):
+            epoch_id = _active_us_epoch(conn)
+            params = {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
+                      "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
+                      "requested":int(qty or meta.get(f"{stg}_qty") or 0),
+                      "filled":int(meta.get(f"{stg}_filled_qty") or 0),
+                      "state":_json_param(normalized)}
+            if epoch_id:
+                params["epoch_id"] = epoch_id
+                sql = """INSERT INTO us_profit_capture_lifecycle
+                    (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                     raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,trading_epoch_id,state,updated_at)
+                    VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,:epoch_id,CAST(:state AS jsonb),NOW())
+                    ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                     stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                     raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                     canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                     requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                     cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                     trading_epoch_id=COALESCE(us_profit_capture_lifecycle.trading_epoch_id,EXCLUDED.trading_epoch_id),
+                     state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
+            else:
+                sql = """INSERT INTO us_profit_capture_lifecycle
+                    (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                     raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
+                    VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
+                    ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                     stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                     raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                     canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                     requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                     cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                     state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""
+            conn.execute(text(sql), params)
+        if _conn is not None:
+            _write_profit_capture(_conn)
+        else:
+            with engine.begin() as conn:
+                _write_profit_capture(conn)
+
+
+def mark_us_position_exit_stage(
+    trade_date: str,
+    symbol: str,
+    stage: str,
+    order_key: str | None = None,
+    status: str = "PENDING",
+    lifecycle_id: str | None = None,
+) -> None:
+    """Persist trend/time exit stage transitions in state.trend."""
+    sym = str(symbol or "").strip().upper()
+    stg = str(stage or "").strip().lower()
+    if stg not in {"trend_trim", "trend_exit", "time_stop_trim", "time_stop_exit"}:
+        return
+    td = str(trade_date)
+    risk = load_us_position_risk_state(sym, td) or load_latest_us_position_risk_state(sym, td) or {}
+    state = dict(risk.get("state") or {})
+    trend = dict(state.get("trend") or {})
+    current_lifecycle = (state.get("lifecycle") or {}).get("lifecycle_id") if isinstance(state.get("lifecycle"), dict) else None
+    if lifecycle_id and trend.get("lifecycle_id") and trend.get("lifecycle_id") != lifecycle_id:
+        if current_lifecycle and current_lifecycle != lifecycle_id:
+            logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s lifecycle_id=%s action=IGNORE_STALE_LIFECYCLE current_lifecycle_id=%s", sym, stg, status, lifecycle_id, current_lifecycle)
+            return
+        trend = {"lifecycle_id": lifecycle_id}
+    status_upper = str(status or "PENDING").upper()
+    terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
+    done = status_upper in {"FILLED", "DONE"}
+    pending = status_upper in {"PENDING", "ACK", "SUBMITTED", "PARTIALLY_FILLED", "ACK_DB_FAILED"}
+    trend[f"{stg}_pending"] = bool(pending and not done and not terminal_failure)
+    if done:
+        trend[f"{stg}_done"] = True
+    elif terminal_failure:
+        trend[f"{stg}_done"] = False
+    if order_key:
+        trend[f"{stg}_order_key"] = order_key
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if done:
+        trend[f"{stg}_trade_date"] = td
+        trend[f"{stg}_at"] = now_iso
+    trend["last_exit_stage"] = stg
+    trend["last_exit_stage_status"] = status_upper
+    trend["updated_at"] = now_iso
+    if lifecycle_id:
+        trend["lifecycle_id"] = lifecycle_id
+    state["trend"] = trend
+    risk["state"] = state
+    save_us_position_risk_state(sym, td, risk)
+    logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s pending=%s done=%s order_key=%s lifecycle_id=%s", sym, stg, status_upper, trend.get(f"{stg}_pending"), trend.get(f"{stg}_done"), order_key, lifecycle_id)
+
+def update_us_soft_stop_risk_state(
+    *,
+    symbol: str,
+    trade_date: str,
+    pnl_pct: float,
+    current_price: float,
+    now: datetime,
+    soft_stop_pct: float,
+) -> dict:
+    """Increment/reset and persist per-symbol soft-stop state."""
+    key_symbol = _risk_state_key(symbol, trade_date)[1]
+    previous = load_us_position_risk_state(key_symbol, trade_date)
+    now_iso = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
+    if float(pnl_pct) <= -float(soft_stop_pct):
+        previous_low = previous.get("lowest_price_since_breach")
+        try:
+            lowest = min(float(previous_low), float(current_price)) if previous_low is not None else float(current_price)
+        except (TypeError, ValueError):
+            lowest = float(current_price)
+        state = {
+            **previous,
+            "soft_stop_breach_count": int(previous.get("soft_stop_breach_count") or 0) + 1,
+            "first_soft_stop_seen_at": previous.get("first_soft_stop_seen_at") or now_iso,
+            "last_soft_stop_seen_at": now_iso,
+            "lowest_price_since_breach": lowest,
+            "last_price": float(current_price),
+            "last_pnl_pct": float(pnl_pct),
+            "updated_at": now_iso,
+        }
+        save_us_position_risk_state(key_symbol, trade_date, state)
+        logger.info(
+            "[US_RISK_STATE][SOFT_STOP] symbol=%s trade_date=%s count=%d pnl_pct=%.4f price=%.4f action=increment",
+            key_symbol, trade_date, state["soft_stop_breach_count"], pnl_pct, current_price,
+        )
+        return _normalize_risk_state(key_symbol, trade_date, state)
+
+    state = {
+        **previous,
+        "soft_stop_breach_count": 0,
+        "first_soft_stop_seen_at": None,
+        "last_soft_stop_seen_at": None,
+        "lowest_price_since_breach": None,
+        "last_price": float(current_price),
+        "last_pnl_pct": float(pnl_pct),
+        "updated_at": now_iso,
+    }
+    save_us_position_risk_state(key_symbol, trade_date, state)
+    logger.info(
+        "[US_RISK_STATE][SOFT_STOP_RESET] symbol=%s trade_date=%s pnl_pct=%.4f price=%.4f action=reset",
+        key_symbol, trade_date, pnl_pct, current_price,
+    )
+    return _normalize_risk_state(key_symbol, trade_date, state)
+
+
+# ---------------------------------------------------------------------------
+# Fills — schema: trade_date, symbol, exchange, side, qty, price_usd,
+#                 order_no, client_order_key, filled_at, meta
+# ---------------------------------------------------------------------------
+
+def _import_broker_actual_order(fill: dict, *, trade_date: str) -> dict:
+    """Create an auditable local order for a valid broker fill with no ACK.
+
+    A broker fill is authoritative.  This deliberately returns an empty dict
+    for malformed evidence, so persistence errors remain distinguishable from
+    an imported-order recovery.
+    """
+    meta = _parse_json_meta(fill.get("meta"))
+    order_no_raw = str(fill.get("order_no_raw") or fill.get("order_no") or "").strip()
+    symbol, side = str(fill.get("symbol") or "").strip().upper(), str(fill.get("side") or "").strip().upper()
+    qty = int(meta.get("cumulative_filled_qty") or fill.get("cumulative_filled_qty") or fill.get("qty") or 0)
+    if not (trade_date and order_no_raw and symbol and side in {"BUY", "SELL"} and qty > 0):
+        return {}
+    key = f"KIS_IMPORTED_{trade_date}_{normalize_us_order_no(order_no_raw)}_{symbol}_{side}"
+    saved = save_order_ack({
+        "client_order_key": key, "symbol": symbol, "exchange": fill.get("exchange") or "NASDAQ",
+        "side": side, "qty_requested": int(meta.get("requested_qty") or fill.get("requested_qty") or qty),
+        "qty_filled": 0, "avg_price_usd": fill.get("price_usd") or fill.get("price"),
+        "order_no": order_no_raw, "status": "BROKER_FILLED_IMPORTED", "dry_run": False,
+        "meta": {**meta, "order_origin": "broker_actual_without_local_order",
+                 "import_reason": "local_order_not_found_after_normalization",
+                 "source": "kis_actual_fill_import", "order_no_raw": order_no_raw,
+                 "order_no_norm": normalize_us_order_no(order_no_raw)},
+    }, trade_date=trade_date)
+    if not saved:
+        return {}
+    logger.warning("[US_FILLS][IMPORTED_ORDER] trade_date=%s order_no=%s symbol=%s side=%s", trade_date, order_no_raw, symbol, side)
+    return load_us_order_for_fill(order_no=order_no_raw, client_order_key=key, symbol=symbol, trade_date=trade_date)
+
+
+def _recovery_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _broker_fill_recovery_candidates(fill: dict, *, trade_date: str) -> tuple[str, list[dict]]:
+    """Find exact or strongly evidenced local submit attempts for a broker fill."""
+    symbol = str(fill.get("symbol") or "").strip().upper()
+    side = str(fill.get("side") or "").strip().upper()
+    fill_meta = _parse_json_meta(fill.get("meta"))
+    raw_fill = fill.get("raw") if isinstance(fill.get("raw"), dict) else {}
+
+    def explicit_int(names: tuple[str, ...], sources: tuple[dict, ...]) -> int | None:
+        for source in sources:
+            for name in names:
+                value = source.get(name)
+                if value in (None, ""):
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                return int(number) if math.isfinite(number) and number >= 0 and number.is_integer() else None
+        return None
+
+    fill_sources = (fill, raw_fill, fill_meta)
+    requested_qty = explicit_int(
+        ("requested_qty", "qty_requested", "ord_qty", "ft_ord_qty"), fill_sources,
+    )
+    cumulative_qty = explicit_int(
+        ("cumulative_filled_qty", "filled_qty", "qty_filled", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty", "qty"),
+        fill_sources,
+    )
+    broker_open_qty = explicit_int(
+        ("broker_open_qty", "remaining_qty", "nccs_qty", "rmn_qty", "ord_remn_qty"),
+        fill_sources,
+    )
+    if requested_qty is None:
+        return "INVALID_BROKER_QUANTITY", []
+    broker_status = str(fill.get("status") or raw_fill.get("status") or "").upper()
+    terminal_cancel = broker_status in {
+        "CANCELED", "CANCELLED", "CANCEL_COMPLETE", "CANCELLED_COMPLETE",
+        "취소", "취소완료",
+    }
+    if (
+        not symbol or side not in {"BUY", "SELL"} or requested_qty <= 0
+        or cumulative_qty is None or cumulative_qty <= 0 or cumulative_qty > requested_qty
+        or broker_open_qty is None
+        or (terminal_cancel and broker_open_qty != 0)
+        or (not terminal_cancel and cumulative_qty + broker_open_qty != requested_qty)
+    ):
+        return "BROKER_IDENTITY_INCOMPLETE", []
+    source_name = str(
+        fill.get("order_timestamp_source")
+        or fill_meta.get("order_timestamp_source")
+        or ""
+    )
+    source_timezone = str(
+        fill.get("order_timestamp_source_timezone")
+        or fill_meta.get("source_timezone")
+        or fill_meta.get("order_timestamp_source_timezone")
+        or ""
+    )
+    broker_timestamp = _recovery_timestamp(
+        fill.get("order_timestamp_utc")
+        or fill_meta.get("order_timestamp_utc")
+        or fill.get("order_timestamp")
+        or fill_meta.get("order_timestamp")
+    )
+    source_timestamp_raw = (
+        fill.get("order_timestamp")
+        or fill_meta.get("order_timestamp")
+    )
+    if not source_timestamp_raw:
+        source_date = fill.get("source_timestamp_date") or fill_meta.get("source_timestamp_date")
+        source_time = fill.get("source_timestamp_time") or fill_meta.get("source_timestamp_time")
+        date_digits = "".join(char for char in str(source_date or "") if char.isdigit())
+        time_digits = "".join(char for char in str(source_time or "") if char.isdigit())
+        if len(date_digits) == 8 and len(time_digits) >= 6:
+            source_timestamp_raw = (
+                f"{date_digits[:4]}-{date_digits[4:6]}-{date_digits[6:8]}"
+                f"T{time_digits[:2]}:{time_digits[2:4]}:{time_digits[4:6]}"
+            )
+    source_timestamp = None
+    if source_timestamp_raw:
+        try:
+            source_timestamp = datetime.fromisoformat(
+                str(source_timestamp_raw).replace("Z", "+00:00")
+            )
+            if source_timestamp.tzinfo is None and source_timezone == "Asia/Seoul":
+                from zoneinfo import ZoneInfo
+                source_timestamp = source_timestamp.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        except (TypeError, ValueError):
+            source_timestamp = None
+    source_timezone_matches = False
+    if source_timestamp is not None and source_timestamp.tzinfo is not None:
+        from zoneinfo import ZoneInfo
+        source_timezone_matches = (
+            source_timestamp.utcoffset()
+            == source_timestamp.astimezone(ZoneInfo("Asia/Seoul")).utcoffset()
+        )
+    timestamps_agree = bool(
+        source_timestamp is not None
+        and source_timestamp.tzinfo is not None
+        and source_timezone_matches
+        and broker_timestamp is not None
+        and abs(
+            (
+                source_timestamp.astimezone(timezone.utc)
+                - broker_timestamp.astimezone(timezone.utc)
+            ).total_seconds()
+        ) < 1
+    )
+    broker_time_is_provenanced = bool(
+        source_name == "KIS_INQUIRE_CCNL_ORD_DT_ORD_TMD"
+        and source_timezone == "Asia/Seoul"
+        and broker_timestamp is not None
+        and timestamps_agree
+    )
+    if broker_time_is_provenanced:
+        from zoneinfo import ZoneInfo
+        broker_time_is_provenanced = (
+            broker_timestamp.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+            == trade_date
+        )
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        order_rows = [
+            dict(row) for row in _MEM_ORDERS
+            if str(row.get("trade_date") or trade_date) == trade_date
+            and str(row.get("symbol") or "").upper() == symbol
+            and str(row.get("side") or "").upper() == side
+            and str(row.get("status") or "").upper()
+            in {"PENDING", "SENT", "ACK", "OPEN", "PARTIALLY_FILLED", "CANCELLED"}
+        ]
+        intent_rows = [
+            dict(row) for row in _MEM_INTENTS
+            if str(row.get("trade_date") or trade_date) == trade_date
+            and str(row.get("symbol") or "").upper() == symbol
+            and str(row.get("side") or "").upper() == side
+            and str(row.get("status") or "").upper() in {"PENDING", "SENT"}
+        ]
+    else:
+        try:
+            with engine.connect() as conn:
+                epoch_id = _active_us_epoch(conn)
+                order_sql = """
+                    SELECT * FROM us_orders
+                    WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                      AND status IN ('PENDING','SENT','ACK','OPEN','PARTIALLY_FILLED','CANCELLED')
+                """
+                intent_sql = """
+                    SELECT * FROM us_order_intents
+                    WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                      AND status IN ('PENDING','SENT')
+                """
+                params = {"td": trade_date, "symbol": symbol, "side": side}
+                if epoch_id:
+                    order_sql += " AND trading_epoch_id=:epoch_id"
+                    intent_sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                order_rows = [dict(row) for row in conn.execute(text(order_sql), params).mappings()]
+                intent_rows = [dict(row) for row in conn.execute(text(intent_sql), params).mappings()]
+        except Exception:
+            logger.exception("[US_FILLS][RECOVERY][LOCAL_LEDGER_UNAVAILABLE]")
+            return "LOCAL_LEDGER_UNAVAILABLE", []
+
+    from trader.us.execution.order_journal import load_order_events
+    try:
+        events = load_order_events(trade_date)
+    except Exception:
+        logger.exception("[US_FILLS][RECOVERY][JOURNAL_UNAVAILABLE]")
+        return "JOURNAL_UNAVAILABLE", []
+    if events is None:
+        return "JOURNAL_UNAVAILABLE", []
+
+    order_by_key = {
+        str(row.get("client_order_key") or ""): row
+        for row in order_rows if str(row.get("client_order_key") or "")
+    }
+    intent_by_key = {
+        str(row.get("client_order_key") or ""): row
+        for row in intent_rows if str(row.get("client_order_key") or "")
+    }
+    candidates: list[dict] = []
+    broker_order_no = normalize_us_order_no(fill.get("order_no") or fill.get("order_no_raw"))
+    broker_client_key = str(fill.get("client_order_key") or "").strip()
+    expected_owner = str(fill.get("strategy_owner") or fill_meta.get("strategy_owner") or "").upper()
+    expected_lifecycle = str(
+        fill.get("position_lifecycle_id") or fill_meta.get("position_lifecycle_id") or ""
+    )
+    window_sec = max(0.0, float(os.getenv("US_AMBIGUOUS_MATCH_WINDOW_SEC", "120")))
+    price_tolerance = max(
+        0.0, float(os.getenv("US_AMBIGUOUS_MATCH_PRICE_TOLERANCE", "0.02")),
+    )
+
+    def price_value(sources: tuple[dict, ...], names: tuple[str, ...]) -> float | None:
+        for source in sources:
+            for name in names:
+                value = source.get(name)
+                if value in (None, ""):
+                    continue
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return price if math.isfinite(price) and price > 0 else None
+        return None
+
+    broker_price = price_value(
+        fill_sources,
+        ("limit_price", "limit_price_usd", "order_price", "order_price_usd"),
+    )
+    from trader.us.symbols import normalize_us_exchange
+
+    def normalized_exchange(value: Any) -> str:
+        raw_exchange = str(value or "").strip()
+        if not raw_exchange:
+            return ""
+        try:
+            return normalize_us_exchange(raw_exchange)
+        except Exception:
+            return raw_exchange.upper()
+
+    potential_candidates: list[dict] = []
+    exact_candidates: list[dict] = []
+    qualified_candidates: list[dict] = []
+    for key in sorted(set(order_by_key) | set(intent_by_key)):
+        local_order = order_by_key.get(key) or {}
+        local_intent = intent_by_key.get(key) or {}
+        local_meta = {
+            **_parse_json_meta(local_intent.get("meta")),
+            **_parse_json_meta(local_order.get("meta")),
+        }
+        key_events = [
+            event for event in events
+            if str(event.get("client_order_key") or "") == key
+            and str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
+        ]
+        if not key_events:
+            continue
+        matching_order_events = [
+            event for event in events
+            if str(event.get("client_order_key") or "") == key
+            and str(event.get("event_type") or "") in {
+                "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED",
+                "ORDER_OPEN", "ORDER_PARTIALLY_FILLED", "ORDER_FILLED",
+            }
+            and broker_order_no
+            and normalize_us_order_no(
+                event.get("broker_order_no") or event.get("raw_broker_order_no")
+            ) == broker_order_no
+        ]
+        if broker_client_key and broker_client_key == key:
+            matching_order_events.extend(key_events[:1])
+        event = key_events[0]
+        event_meta = _parse_json_meta(event.get("meta"))
+        attempts = {
+            str(item.get("submit_attempt_id") or "")
+            for item in key_events if item.get("submit_attempt_id")
+        }
+        action_keys = {
+            str(_parse_json_meta(item.get("meta")).get("execution_action_key") or "")
+            for item in key_events
+        }
+        attempt_id = str(event.get("submit_attempt_id") or "")
+        action_key = str(event_meta.get("execution_action_key") or "")
+        owner_values = {
+            str(value).upper()
+            for value in (
+                local_order.get("strategy_owner"), local_intent.get("strategy_owner"),
+                local_meta.get("strategy_owner"), event.get("strategy_owner"),
+                event_meta.get("strategy_owner"),
+            )
+            if value
+        }
+        lifecycle_values = {
+            str(value)
+            for value in (
+                local_order.get("position_lifecycle_id"),
+                local_intent.get("position_lifecycle_id"),
+                local_meta.get("position_lifecycle_id"),
+                event.get("position_lifecycle_id"), event_meta.get("position_lifecycle_id"),
+            )
+            if value
+        }
+        owner = next(iter(owner_values)) if len(owner_values) == 1 else ""
+        lifecycle = next(iter(lifecycle_values)) if len(lifecycle_values) == 1 else ""
+        base_candidate = {
+            "client_order_key": key,
+            "order": local_order,
+            "intent": local_intent,
+            "meta": {**local_meta, **event_meta},
+            "event": event,
+            "exact_broker_order": bool(matching_order_events),
+            "strategy_owner": owner,
+            "position_lifecycle_id": lifecycle,
+            "submit_attempt_id": attempt_id,
+        }
+        potential_candidates.append(base_candidate)
+        if (
+            len(key_events) != 1 or len(attempts) != 1 or len(action_keys) != 1
+            or not attempt_id or not action_key or not owner or not lifecycle
+            or str(event.get("symbol") or "").upper() != symbol
+            or str(event.get("side") or "").upper() != side
+            or int(event.get("requested_qty") or event.get("qty") or 0) != requested_qty
+        ):
+            continue
+
+        if expected_owner and owner != expected_owner:
+            continue
+        if expected_lifecycle and lifecycle != expected_lifecycle:
+            continue
+        if base_candidate["exact_broker_order"] or broker_client_key == key:
+            exact_candidates.append(base_candidate)
+            continue
+
+        if not broker_time_is_provenanced:
+            continue
+        local_exchange = normalized_exchange(
+            local_order.get("exchange") or local_intent.get("exchange") or event.get("exchange")
+        )
+        broker_exchange = normalized_exchange(
+            fill.get("exchange") or raw_fill.get("exchange") or fill_meta.get("exchange")
+        )
+        if local_exchange and broker_exchange and local_exchange != broker_exchange:
+            continue
+        local_requested_qty = int(
+            local_order.get("qty_requested") or local_intent.get("qty")
+            or event.get("requested_qty") or event.get("qty") or 0
+        )
+        local_filled_qty = int(local_order.get("qty_filled") or 0)
+        if (
+            local_requested_qty != requested_qty
+            or local_filled_qty < 0
+            or local_filled_qty > cumulative_qty
+        ):
+            continue
+        submit_time = _recovery_timestamp(
+            event.get("submitted_at_utc") or event_meta.get("submitted_at_utc")
+        )
+        if submit_time is None:
+            continue
+        if abs((broker_timestamp - submit_time).total_seconds()) > window_sec:
+            continue
+        local_price = price_value(
+            (local_order, local_intent, local_meta, event, event_meta),
+            ("limit_price_usd", "limit_price", "order_price_usd", "order_price"),
+        )
+        if (
+            local_price is not None and broker_price is not None
+            and abs(local_price - broker_price) > price_tolerance
+        ):
+            continue
+        qualified_candidates.append(base_candidate)
+
+    if len(exact_candidates) == 1:
+        return "MATCHED", exact_candidates
+    if len(exact_candidates) > 1:
+        return "AMBIGUOUS", exact_candidates
+    if len(qualified_candidates) == 1:
+        return "MATCHED", qualified_candidates
+    if len(qualified_candidates) > 1 or len(potential_candidates) > 1:
+        return "AMBIGUOUS", qualified_candidates or potential_candidates
+    if potential_candidates:
+        return "UNATTRIBUTED", potential_candidates
+    return "NO_CANDIDATE", []
+
+
+def _rebind_broker_fill_to_local_order(fill: dict, *, trade_date: str) -> tuple[str, dict]:
+    status, candidates = _broker_fill_recovery_candidates(fill, trade_date=trade_date)
+    if status != "MATCHED":
+        return status, {}
+    candidate = candidates[0]
+    local_order, local_intent = candidate["order"], candidate["intent"]
+    meta = {
+        **candidate["meta"],
+        "strategy_owner": candidate["strategy_owner"],
+        "position_lifecycle_id": candidate["position_lifecycle_id"],
+        "submit_attempt_id": candidate["submit_attempt_id"],
+        "execution_action_key": candidate["meta"]["execution_action_key"],
+        "broker_recovery_status": "REBOUND",
+        "broker_recovery_evidence": (
+            "EXACT_BROKER_ORDER_JOURNAL"
+            if candidate["exact_broker_order"] else "UNIQUE_SUBMIT_ATTEMPT_AND_LOCAL_INTENT"
+        ),
+    }
+    order_no = str(fill.get("order_no_raw") or fill.get("order_no") or "").strip()
+    key = candidate["client_order_key"]
+    payload = {
+        **local_intent,
+        **local_order,
+        "client_order_key": key,
+        "symbol": str(fill.get("symbol") or "").upper(),
+        "exchange": fill.get("exchange") or local_order.get("exchange") or local_intent.get("exchange") or "NASDAQ",
+        "side": str(fill.get("side") or "").upper(),
+        "qty_requested": int(local_order.get("qty_requested") or local_intent.get("qty") or 0),
+        "qty_filled": int(local_order.get("qty_filled") or 0),
+        "order_no": order_no,
+        "status": "ACK",
+        "dry_run": False,
+        "meta": meta,
+    }
+    if not save_order_ack(payload, trade_date=trade_date):
+        return "REBOUND_PERSIST_FAILED", {}
+    fill_meta = {**meta, **_parse_json_meta(fill.get("meta"))}
+    fill_meta.update({
+        "strategy_owner": candidate["strategy_owner"],
+        "position_lifecycle_id": candidate["position_lifecycle_id"],
+        "submit_attempt_id": candidate["submit_attempt_id"],
+        "execution_action_key": candidate["meta"]["execution_action_key"],
+        "broker_recovery_status": "REBOUND",
+        "broker_recovery_evidence": meta["broker_recovery_evidence"],
+    })
+    fill["client_order_key"] = key
+    fill["meta"] = fill_meta
+    from trader.us.execution.order_journal import append_order_event
+    append_order_event(
+        "BROKER_ACK_RECOVERED",
+        {**payload, "qty": payload["qty_requested"], "meta": meta},
+        broker_order_no=order_no,
+        broker_status="ACK",
+    )
+    order = load_us_order_for_fill(
+        order_no=order_no, client_order_key=key, symbol=payload["symbol"], trade_date=trade_date,
+    )
+    return ("MATCHED", order) if order else ("REBOUND_PERSIST_FAILED", {})
+
+
+def _mark_unattributed_broker_fill(fill: dict, *, trade_date: str, reason: str, candidate_count: int) -> None:
+    meta = _parse_json_meta(fill.get("meta"))
+    for field in (
+        "strategy_owner", "strategy_name", "strategy_version", "sleeve_id",
+        "position_lifecycle_id", "position_cycle_id", "semantic_action",
+        "reason", "profit_capture_stage", "trend_stage", "avg_cost",
+        "cost_basis_price_usd", "entry_price", "frozen_buy_contract",
+    ):
+        meta.pop(field, None)
+    meta.update({
+        "attribution_status": "UNATTRIBUTED",
+        "attribution_reason": reason,
+        "candidate_count": int(candidate_count),
+        "trade_date": trade_date,
+        "fill_evidence_type": str(fill.get("fill_evidence_type") or meta.get("fill_evidence_type") or ""),
+    })
+    order_no = normalize_us_order_no(fill.get("order_no") or fill.get("order_no_raw")) or "UNKNOWN"
+    symbol = str(fill.get("symbol") or "").upper() or "UNKNOWN"
+    side = str(fill.get("side") or "").upper() or "UNKNOWN"
+    fill["client_order_key"] = f"KIS_UNATTRIBUTED_{trade_date}_{order_no}_{symbol}_{side}"
+    fill["meta"] = meta
+    fill["save_status"] = "UNATTRIBUTED_BROKER_FILL"
+
+
+def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
+    """us_fills 저장."""
+    global _LAST_SAVE_FILLS_ERROR
+    _LAST_SAVE_FILLS_ERROR = None
+    td = trade_date or _today()
+    if not fills:
+        return 0
+    from trader.us.execution.order_identity import valid_identity
+
+    # One scoped read replaces the two per-fill attribution lookups on the
+    # common exact-order path. Never cache ambiguous/repeated identities or
+    # interpret a DB failure as an absent order; fall back to the old strict
+    # resolver (including normalized-order recovery) in those cases.
+    _batched_orders: dict[tuple[str, str, str], dict] = {}
+    _identity_counts: dict[tuple[str, str, str], int] = {}
+    for _fill in fills:
+        _id = (
+            str(_fill.get("symbol") or "").upper(),
+            str(_fill.get("side") or "").upper(),
+            str(_fill.get("client_order_key") or
+                normalize_us_order_no(_fill.get("order_no")) or ""),
+        )
+        _identity_counts[_id] = _identity_counts.get(_id, 0) + 1
+    if len(fills) > 1:
+        try:
+            _batch_engine = _get_engine_or_none()
+            if _batch_engine is not None:
+                _symbols = sorted({str(f.get("symbol") or "").upper() for f in fills if f.get("symbol")})
+                with _batch_engine.begin() as _conn:
+                    _epoch = _active_us_epoch(_conn)
+                    _sql = """
+                        SELECT trade_date, client_order_key, symbol, exchange, side,
+                               qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                        FROM us_orders WHERE trade_date=:td AND symbol=ANY(:symbols)
+                    """
+                    _params = {"td": td, "symbols": _symbols}
+                    if _epoch:
+                        _sql += " AND trading_epoch_id=:epoch"
+                        _params["epoch"] = _epoch
+                    _rows = [dict(row) for row in _conn.execute(text(_sql), _params).mappings().all()]
+                for _fill in fills:
+                    _key = (
+                        str(_fill.get("symbol") or "").upper(),
+                        str(_fill.get("side") or "").upper(),
+                        str(_fill.get("client_order_key") or
+                            normalize_us_order_no(_fill.get("order_no")) or ""),
+                    )
+                    if _identity_counts.get(_key) != 1 or not _key[2]:
+                        continue
+                    _cok = str(_fill.get("client_order_key") or "")
+                    _on = normalize_us_order_no(_fill.get("order_no"))
+                    _matches = [
+                        row for row in _rows
+                        if str(row.get("symbol") or "").upper() == _key[0]
+                        and str(row.get("side") or "").upper() == _key[1]
+                        and ((_cok and str(row.get("client_order_key") or "") == _cok)
+                             or (_on and normalize_us_order_no(row.get("order_no")) == _on))
+                    ]
+                    if len(_matches) == 1:
+                        _batched_orders[_key] = _matches[0]
+        except Exception as exc:
+            _batched_orders = {}
+            logger.warning("[US_FILLS][BATCH_ORDER_LOOKUP][FALLBACK] err=%s", exc)
+
+    def _order_for_record(fill: dict) -> dict:
+        _key = (
+            str(fill.get("symbol") or "").upper(),
+            str(fill.get("side") or "").upper(),
+            str(fill.get("client_order_key") or
+                normalize_us_order_no(fill.get("order_no")) or ""),
+        )
+        if _key in _batched_orders:
+            return dict(_batched_orders[_key])
+        return load_us_order_for_fill(
+            order_no=fill.get("order_no"), client_order_key=fill.get("client_order_key"),
+            symbol=str(fill.get("symbol") or ""), trade_date=td,
+        )
+
+    for f in fills:
+        fill_meta = _parse_json_meta(f.get("meta"))
+        evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+        is_actual_cumulative = _is_kis_order_cumulative_evidence(evidence)
+        if fill_meta.get("attribution_status") == "UNATTRIBUTED":
+            f["meta"] = fill_meta
+            continue
+        order = _order_for_record(f)
+        if order and (
+            str(order.get("symbol") or "").upper() != str(f.get("symbol") or "").upper()
+            or str(order.get("side") or "").upper() != str(f.get("side") or "").upper()
+            or (
+                fill_meta.get("strategy_owner")
+                and str(_parse_json_meta(order.get("meta")).get("strategy_owner") or "").upper()
+                != str(fill_meta.get("strategy_owner")).upper()
+            )
+        ):
+            _mark_unattributed_broker_fill(f, trade_date=td, reason="EXACT_ORDER_IDENTITY_CONFLICT", candidate_count=1)
+            continue
+        if not order and is_actual_cumulative:
+            recovery_status, order = _rebind_broker_fill_to_local_order(f, trade_date=td)
+            if recovery_status == "NO_CANDIDATE":
+                if _get_engine_or_none() is not None:
+                    order = _import_broker_actual_order(f, trade_date=td)
+                    if not order:
+                        f["save_status"] = "BROKER_FILL_IMPORT_PERSIST_FAILED"
+                        continue
+                else:
+                    order_no = str(f.get("order_no") or "").strip()
+                    f["client_order_key"] = f"KIS_{td}_{order_no}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
+                    f_meta = _parse_json_meta(f.get("meta"))
+                    f_meta.update({
+                        "order_origin": "broker_actual_without_local_order",
+                        "import_reason": "no_local_candidate_in_memory_test_store",
+                    })
+                    f["meta"] = f_meta
+                    continue
+            elif recovery_status != "MATCHED":
+                _mark_unattributed_broker_fill(
+                    f, trade_date=td, reason=recovery_status, candidate_count=len(
+                        _broker_fill_recovery_candidates(f, trade_date=td)[1]
+                    ),
+                )
+                continue
+        if valid_identity(order.get("client_order_key")):
+            f["client_order_key"] = order.get("client_order_key")
+        order_meta = _parse_json_meta(order.get("meta"))
+        fill_meta = {**order_meta, **_parse_json_meta(f.get("meta"))}
+        if is_actual_cumulative:
+            fill_meta.setdefault("is_synthetic", False)
+        f["meta"] = fill_meta
+        fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+        evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+        if _is_actual_evidence(evidence) and not valid_identity(f.get("client_order_key")):
+            _mark_unattributed_broker_fill(f, trade_date=td, reason="LOCAL_ORDER_IDENTITY_UNAVAILABLE", candidate_count=0)
+    invalid = [
+        f for f in fills
+        if str((f.get("meta") or {}).get("fill_evidence_type") or f.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_EXECUTION_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL", "KIS_ORDER_CUMULATIVE_ACTUAL"}
+        and not valid_identity(f.get("client_order_key"))
+    ]
+    if invalid:
+        logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_fills count=%d", len(invalid))
+        return 0
+    engine = _get_engine_or_none()
+    atomic_count = 0
+    if engine is not None:
+        # KIS order-level cumulative snapshots are the accounting source of truth.
+        # Persist them through mark_order_filled_by_reconcile() so validation,
+        # actual upsert, synthetic supersession, us_orders.qty_filled, and final
+        # invariant live in one PostgreSQL transaction.  Conflict/overflow/
+        # regression must leave both us_orders and us_fills unchanged.
+        remaining_fills: list[dict] = []
+        original_fill_count = len(fills)
+        for f in fills:
+            fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+            evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+            if not _is_kis_order_cumulative_evidence(evidence):
+                remaining_fills.append(f)
+                continue
+            if fill_meta.get("attribution_status") == "UNATTRIBUTED":
+                remaining_fills.append(f)
+                continue
+            try:
+                order = _order_for_record(f)
+                if not order:
+                    f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                    logger.error("[US_FILLS][ATOMIC_ACTUAL][ORDER_NOT_FOUND] trade_date=%s order_no=%s symbol=%s side=%s", td, f.get("order_no"), f.get("symbol"), f.get("side"))
+                    continue
+                resolved_symbol = str(f.get("symbol") or order.get("symbol") or "").strip().upper()
+                resolved_side = str(f.get("side") or order.get("side") or "").strip().upper()
+                requested_qty = int(fill_meta.get("requested_qty") or f.get("requested_qty") or order.get("qty_requested") or f.get("qty") or 0)
+                cumulative_qty = int(fill_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+                avg_price = float(f.get("price_usd") or f.get("price") or fill_meta.get("avg_price_usd") or 0.0)
+                merged_meta = {**_parse_json_meta(order.get("meta")), **fill_meta}
+                merged_meta.setdefault("source", fill_meta.get("source") or "save_fills_kis_actual")
+                merged_meta.setdefault("fill_evidence_type", evidence)
+                merged_meta.setdefault("is_synthetic", False)
+                mark_result = mark_order_filled_by_reconcile(
+                    order_no=str(f.get("order_no") or order.get("order_no") or ""),
+                    client_order_key=str(f.get("client_order_key") or order.get("client_order_key") or ""),
+                    symbol=resolved_symbol,
+                    side=resolved_side,
+                    filled_qty=cumulative_qty,
+                    requested_qty=requested_qty,
+                    cumulative_filled_qty=cumulative_qty,
+                    evidence_type=evidence,
+                    avg_price_usd=avg_price,
+                    source="save_fills_kis_actual",
+                    trade_date=td,
+                    meta=merged_meta,
+                )
+                status = str((mark_result or {}).get("status") or "RECONCILE_UPDATE_FAILED")
+                f["save_status"] = status
+                f["atomic_reconcile_result"] = mark_result
+                if status == "OK":
+                    atomic_count += 1
+                else:
+                    logger.error(
+                        "[US_FILLS][ATOMIC_ACTUAL][FAILED] status=%s trade_date=%s order_no=%s symbol=%s result=%s",
+                        status, td, f.get("order_no"), resolved_symbol, mark_result,
+                    )
+            except Exception as exc:
+                f["save_status"] = "RECONCILE_UPDATE_FAILED"
+                f["atomic_reconcile_error"] = str(exc)
+                logger.error("[US_FILLS][ATOMIC_ACTUAL][ERROR] %s", exc)
+        if len(remaining_fills) != len(fills):
+            fills = remaining_fills
+            if not fills:
+                logger.info("[US_FILLS][SAVE][ATOMIC_ACTUAL_DONE] confirmed=%d input=%d", atomic_count, original_fill_count)
+                return atomic_count
+    else:
+        remaining_fills = []
+        original_fill_count = len(fills)
+        for f in fills:
+            fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+            evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+            if (
+                not _is_kis_order_cumulative_evidence(evidence)
+                or fill_meta.get("attribution_status") == "UNATTRIBUTED"
+                or f.get("_already_reconciled")
+            ):
+                remaining_fills.append(f)
+                continue
+            order = load_us_order_for_fill(
+                order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
+                symbol=str(f.get("symbol") or ""), trade_date=td,
+            )
+            if not order:
+                remaining_fills.append(f)
+                continue
+            try:
+                prior = _active_fill_cumulatives_for_order(
+                    trade_date=td,
+                    order_no=str(f.get("order_no") or order.get("order_no") or ""),
+                    client_order_key=str(f.get("client_order_key") or order.get("client_order_key") or ""),
+                    symbol=str(f.get("symbol") or "").upper(),
+                    side=str(f.get("side") or "").upper(),
+                )
+                requested_qty = int(
+                    fill_meta.get("requested_qty") or f.get("requested_qty")
+                    or order.get("qty_requested") or f.get("qty") or 0
+                )
+                cumulative_qty = int(
+                    fill_meta.get("cumulative_filled_qty")
+                    or f.get("cumulative_filled_qty") or f.get("qty") or 0
+                )
+                result = mark_order_filled_by_reconcile(
+                    order_no=str(f.get("order_no") or ""),
+                    client_order_key=str(f.get("client_order_key") or ""),
+                    symbol=str(f.get("symbol") or "").upper(),
+                    side=str(f.get("side") or "").upper(),
+                    filled_qty=cumulative_qty,
+                    requested_qty=requested_qty,
+                    cumulative_filled_qty=cumulative_qty,
+                    evidence_type=evidence,
+                    avg_price_usd=float(f.get("price_usd") or f.get("price") or 0),
+                    source="save_fills_kis_actual",
+                    trade_date=td,
+                    meta=fill_meta,
+                )
+                f["save_status"] = str(result.get("status") or "RECONCILE_UPDATE_FAILED")
+                f["atomic_reconcile_result"] = result
+                if result.get("status") == "OK" and int(prior.get("actual") or 0) == 0:
+                    atomic_count += 1
+                else:
+                    remaining_fills.append(f)
+            except Exception as exc:
+                f["save_status"] = "RECONCILE_UPDATE_FAILED"
+                f["atomic_reconcile_error"] = str(exc)
+                remaining_fills.append(f)
+        if len(remaining_fills) != len(fills):
+            fills = remaining_fills
+            if not fills:
+                logger.info("[US_FILLS][SAVE][ATOMIC_ACTUAL_DONE] confirmed=%d input=%d", atomic_count, original_fill_count)
+                return atomic_count
+    if engine is None:
+        existing_keys = {_us_fill_idempotency_key(f, td) for f in _MEM_FILLS if f.get("trade_date") == td}
+        skipped_duplicates = 0
+        inserted = 0
+        for f in fills:
+            key = _us_fill_idempotency_key(f, td)
+            if key in existing_keys:
+                skipped_duplicates += 1
+                for existing_fill in _MEM_FILLS:
+                    if _us_fill_idempotency_key(existing_fill, td) == key:
+                        incoming_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+                        existing_meta = existing_fill.get("meta") if isinstance(existing_fill.get("meta"), dict) else {}
+                        evidence = str(incoming_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+                        incoming_cum = int(incoming_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+                        existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing_fill.get("cumulative_filled_qty") or existing_fill.get("qty") or 0)
+                        if _is_kis_order_cumulative_evidence(evidence) and incoming_cum < existing_cum:
+                            existing_meta["evidence_regression_detected"] = True
+                            existing_meta["regressed_observed_cumulative"] = incoming_cum
+                            existing_fill["meta"] = existing_meta
+                            f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
+                            break
+                        existing_fill["updated_at"] = time.time()
+                        if _is_kis_order_cumulative_evidence(evidence):
+                            existing_fill["qty"] = int(f.get("qty") or incoming_cum)
+                            existing_fill["price_usd"] = float(f.get("price_usd") or f.get("price") or existing_fill.get("price_usd") or 0)
+                            existing_fill["filled_at"] = f.get("filled_at") or f.get("observed_at") or existing_fill.get("filled_at")
+                            existing_meta.update(incoming_meta)
+                            existing_meta["cumulative_filled_qty"] = incoming_cum
+                            existing_meta["observed_at"] = f.get("observed_at") or incoming_meta.get("observed_at") or existing_fill.get("filled_at")
+                            existing_fill["meta"] = existing_meta
+                        if valid_identity(f.get("client_order_key")):
+                            existing_fill["client_order_key"] = f.get("client_order_key")
+                        existing_fill["fill_idempotency_key"] = _us_fill_idempotency_key_text(existing_fill, td)
+                        break
+                continue
+            _MEM_FILLS.append({
+                **f,
+                "trade_date": td,
+                "fill_idempotency_key": _us_fill_idempotency_key_text(f, td),
+                "updated_at": time.time(),
+            })
+            existing_keys.add(key)
+            inserted += 1
+        logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
+        logger.info("[US_FILLS][SAVE][DONE] inserted=%d input=%d", inserted, len(fills))
+        return inserted
+    count = atomic_count
+    skipped_duplicates = 0
+    try:
+        with engine.begin() as conn:
+            trading_epoch_id = _active_us_epoch(conn)
+            for f in fills:
+                idem = _us_fill_idempotency_key_text(f, td)
+                incoming_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+                evidence = str(incoming_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+                incoming_cum = int(incoming_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+
+                order_epoch_id = trading_epoch_id
+                if trading_epoch_id and _is_actual_evidence(evidence):
+                    order_row = conn.execute(
+                        text("""SELECT trading_epoch_id FROM us_orders
+                                WHERE trade_date=:td
+                                  AND ((:cok <> '' AND client_order_key=:cok)
+                                       OR (:order_no <> '' AND order_no=:order_no))
+                                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                                LIMIT 1"""),
+                        {
+                            "td": td,
+                            "cok": str(f.get("client_order_key") or ""),
+                            "order_no": str(f.get("order_no") or ""),
+                        },
+                    ).mappings().first()
+                    if not order_row and str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED":
+                        f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                        skipped_duplicates += 1
+                        continue
+                    if order_row:
+                        order_epoch_id = _assert_us_order_epoch(dict(order_row), trading_epoch_id)
+                    elif _is_actual_evidence(evidence):
+                        order_epoch_id = trading_epoch_id
+
+                existing_select_cols = "qty, meta, trading_epoch_id" if order_epoch_id else "qty, meta"
+                existing = conn.execute(
+                    text(f"""SELECT {existing_select_cols} FROM us_fills
+                             WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
+                    {"fill_idempotency_key": idem},
+                ).mappings().first()
+                if existing and (
+                    order_epoch_id is not None
+                    and str(existing.get("trading_epoch_id") or "") != str(order_epoch_id)
+                ):
+                    f["save_status"] = "FILL_EPOCH_COLLISION"
+                    skipped_duplicates += 1
+                    continue
+
+                if _is_kis_order_cumulative_evidence(evidence) and existing:
+                    existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+                    existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing.get("qty") or 0)
+                    if incoming_cum < existing_cum:
+                        f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
+                        skipped_duplicates += 1
+                        continue
+                fill_meta_to_store = _parse_json_meta(f.get("meta"))
+                params = {
+                    "td": td,
+                    "symbol": f.get("symbol"),
+                    "exchange": f.get("exchange", "NASDAQ"),
+                    "side": f.get("side"),
+                    "qty": int(f.get("qty", 0)),
+                    "price_usd": float(f.get("price_usd") or f.get("price", 0)),
+                    "order_no": f.get("order_no", ""),
+                    "cok": f.get("client_order_key", ""),
+                    "filled_at": f.get("filled_at"),
+                    "fill_idempotency_key": idem,
+                }
+                if order_epoch_id:
+                    fill_meta_to_store["trading_epoch_id"] = order_epoch_id
+                    params["trading_epoch_id"] = order_epoch_id
+                    sql = """
+                        INSERT INTO us_fills
+                            (trade_date, symbol, exchange, side, qty, price_usd,
+                             order_no, client_order_key, filled_at, trading_epoch_id, meta, fill_idempotency_key)
+                        VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
+                                :order_no, :cok, :filled_at, :trading_epoch_id, CAST(:meta AS jsonb), :fill_idempotency_key)
+                        ON CONFLICT (fill_idempotency_key)
+                        DO UPDATE SET
+                            qty = EXCLUDED.qty,
+                            price_usd = EXCLUDED.price_usd,
+                            filled_at = COALESCE(EXCLUDED.filled_at, us_fills.filled_at),
+                            client_order_key = EXCLUDED.client_order_key,
+                            trading_epoch_id = us_fills.trading_epoch_id,
+                            meta = us_fills.meta || EXCLUDED.meta
+                        WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
+                              > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
+                    """
+                else:
+                    sql = """
+                        INSERT INTO us_fills
+                            (trade_date, symbol, exchange, side, qty, price_usd,
+                             order_no, client_order_key, filled_at, meta, fill_idempotency_key)
+                        VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
+                                :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
+                        ON CONFLICT (fill_idempotency_key)
+                        DO UPDATE SET
+                            qty = EXCLUDED.qty,
+                            price_usd = EXCLUDED.price_usd,
+                            filled_at = COALESCE(EXCLUDED.filled_at, us_fills.filled_at),
+                            client_order_key = EXCLUDED.client_order_key,
+                            meta = us_fills.meta || EXCLUDED.meta
+                        WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
+                              > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
+                    """
+                params["meta"] = _json_param(fill_meta_to_store)
+                result = conn.execute(text(sql), params)
+                if int(result.rowcount or 0) > 0:
+                    count += 1
+                else:
+                    skipped_duplicates += 1
+    except Exception as exc:
+        _LAST_SAVE_FILLS_ERROR = str(exc)
+        logger.error("[US_FILLS][SAVE][ERROR] %s", exc)
+    logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
+    logger.info("[US_FILLS][SAVE][DONE] inserted=%d input=%d", count, len(fills))
+    return count
+
+
+
+def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> dict:
+    """Structured fill-save result for close/reconcile callers."""
+    inserted = save_fills(fills, trade_date=trade_date)
+    terminal_statuses = {
+        "UNATTRIBUTED_BROKER_FILL",
+        "BROKER_FILL_IMPORT_PERSIST_FAILED",
+        "BROKER_FILL_RECOVERY_UNAVAILABLE",
+        "EXECUTION_CLAIM_UPDATE_FAILED",
+        "EVIDENCE_QUANTITY_REGRESSION",
+        "EVIDENCE_QUANTITY_CONFLICT",
+        "EVIDENCE_QUANTITY_OVERFLOW",
+        "FILL_ACCOUNTING_INVARIANT_FAILED",
+        "RECONCILE_UPDATE_FAILED",
+        "FILL_ORDER_NOT_FOUND",
+        "RECONCILE_ORDER_IDENTITY_REQUIRED",
+        "RECONCILE_TRADE_DATE_REQUIRED",
+        "RECONCILE_QTY_EVIDENCE_MISSING",
+        "FILL_EPOCH_COLLISION",
+        "ORDER_EPOCH_MISMATCH",
+    }
+    status_counts: dict[str, int] = {}
+    for f in fills or []:
+        status = str(f.get("save_status") or "")
+        if status in terminal_statuses:
+            status_counts[status] = status_counts.get(status, 0) + 1
+    regression_count = status_counts.get("EVIDENCE_QUANTITY_REGRESSION", 0)
+    if _LAST_SAVE_FILLS_ERROR:
+        return {"status": "DB_ERROR", "inserted_count": int(inserted or 0), "updated_count": 0,
+                "unchanged_count": 0, "regression_count": regression_count,
+                "error_status_counts": status_counts, "error": _LAST_SAVE_FILLS_ERROR}
+    if status_counts:
+        priority = [
+            "UNATTRIBUTED_BROKER_FILL",
+            "BROKER_FILL_RECOVERY_UNAVAILABLE",
+            "BROKER_FILL_IMPORT_PERSIST_FAILED",
+            "EXECUTION_CLAIM_UPDATE_FAILED",
+            "EVIDENCE_QUANTITY_OVERFLOW",
+            "EVIDENCE_QUANTITY_CONFLICT",
+            "EVIDENCE_QUANTITY_REGRESSION",
+            "FILL_ACCOUNTING_INVARIANT_FAILED",
+            "RECONCILE_UPDATE_FAILED",
+            "FILL_ORDER_NOT_FOUND",
+            "RECONCILE_ORDER_IDENTITY_REQUIRED",
+            "RECONCILE_TRADE_DATE_REQUIRED",
+            "RECONCILE_QTY_EVIDENCE_MISSING",
+            "FILL_EPOCH_COLLISION",
+            "ORDER_EPOCH_MISMATCH",
+        ]
+        status = next((s for s in priority if status_counts.get(s)), next(iter(status_counts)))
+        return {"status": status, "inserted_count": int(inserted or 0),
+                "updated_count": 0,
+                "unchanged_count": max(0, len(fills or []) - int(inserted or 0) - sum(status_counts.values())),
+                "regression_count": regression_count, "error_status_counts": status_counts}
+    return {"status": "OK", "inserted_count": int(inserted or 0), "updated_count": 0,
+            "unchanged_count": max(0, len(fills or []) - int(inserted or 0)), "regression_count": 0,
+            "error_status_counts": {}}
+
+def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> list[dict]:
+    """당일 DB fills 조회 (signal-only / DB-only 모드용).
+    
+    Args:
+        trade_date: YYYY-MM-DD 형식 거래일 (None이면 오늘)
+        market: "US" (호환성 유지용 파라미터)
+    
+    Returns:
+        fills list (DB 없거나 조회 실패 시 빈 리스트)
+    """
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    
+    if engine is None:
+        # In-memory fallback (test/offline 환경)
+        result = [f for f in _MEM_FILLS if f.get("trade_date") == td]
+        logger.info("[US_FILLS][DB_ONLY][OK] count=%d (in-memory) trade_date=%s", len(result), td)
+        return result
+    
+    try:
+        with engine.begin() as conn:
+            trading_epoch_id = _active_us_epoch(conn)
+            params = {"td": td}
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            pnl_select = (
+                ", avg_cost_at_sell, realized_pnl_usd, realized_pnl_pct"
+                if pnl_columns_available else
+                ", NULL::numeric AS avg_cost_at_sell, NULL::numeric AS realized_pnl_usd, NULL::numeric AS realized_pnl_pct"
+            )
+            if trading_epoch_id:
+                sql = """
+                    SELECT trade_date, symbol, exchange, side, qty, price_usd,
+                           order_no, client_order_key, fill_idempotency_key,
+                           filled_at, trading_epoch_id
+                """ + pnl_select + """, meta
+                    FROM us_fills
+                    WHERE trade_date=:td AND trading_epoch_id=:trading_epoch_id
+                """
+                params["trading_epoch_id"] = trading_epoch_id
+            else:
+                sql = """
+                    SELECT trade_date, symbol, exchange, side, qty, price_usd,
+                           order_no, client_order_key, fill_idempotency_key,
+                           filled_at
+                """ + pnl_select + """, meta
+                    FROM us_fills
+                    WHERE trade_date=:td
+                """
+            sql += " ORDER BY filled_at DESC"
+            rows = conn.execute(text(sql), params)
+            fills = [dict(r._mapping) for r in rows]
+            logger.info("[US_FILLS][DB_ONLY][OK] count=%d trade_date=%s", len(fills), td)
+            return fills
+    except Exception as exc:
+        logger.warning("[US_FILLS][DB_ONLY][WARN] reason=db_unavailable error=%s returning_empty=1", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Positions — schema: as_of, symbol, exchange, qty, avg_cost, current_px,
+#                      unrealized_pnl_usd, meta
+# ---------------------------------------------------------------------------
+
+_US_ENTRY_POLICY_FIELDS = (
+    "book", "horizon", "exit_policy", "entry_strategy",
+    "entry_signal_type", "partial_exit_allowed",
+)
+
+US_ENTRY_POLICY_CONTRACT_VERSION = "us_entry_policy_contract_v1"
+
+
+def _us_entry_policy_from(*sources: Any) -> dict[str, Any]:
+    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+    for source in sources:
+        parsed = _parse_json_meta(source)
+        policy = {field: parsed.get(field) for field in _US_ENTRY_POLICY_FIELDS if parsed.get(field) is not None}
+        if all(policy.get(field) for field in ("book", "horizon", "exit_policy")):
+            canonical = json.dumps(policy, sort_keys=True, separators=(",", ":"), default=str)
+            policy["entry_policy_contract_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            contract = extract_us_entry_exit_contract(parsed, source)
+            if contract:
+                policy["entry_exit_contract"] = contract
+                policy["entry_exit_contract_sha256"] = contract["sha256"]
+                policy["entry_exit_contract_version"] = contract["version"]
+                provenance = contract.get("entry_provenance") or {}
+                for key in ("entry_reason","entry_style_selected","entry_component","reasons","filters_passed","score_breakdown","explanation_quality"):
+                    if provenance.get(key) is not None:
+                        policy[key] = provenance[key]
+            return policy
+    return {}
+
+def _ensure_us_entry_policy_contract(*sources: Any) -> dict[str, Any]:
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    policy: dict[str, Any] = {}
+    for source in sources:
+        parsed = _parse_json_meta(source)
+        for field in _US_ENTRY_POLICY_FIELDS:
+            if field not in policy and parsed.get(field) is not None:
+                policy[field] = parsed[field]
+    policy.setdefault("book", os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK"))
+    policy.setdefault("horizon", os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY"))
+    policy.setdefault("exit_policy", os.getenv("US_DEFAULT_EXIT_POLICY", "US_SWING_DEFAULT"))
+    policy.setdefault("entry_strategy", "us_pb1")
+    canonical_fields = {field: policy.get(field) for field in _US_ENTRY_POLICY_FIELDS if policy.get(field) is not None}
+    canonical = json.dumps(canonical_fields, sort_keys=True, separators=(",", ":"), default=str)
+    policy["entry_policy_contract_sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    policy["entry_policy_contract_version"] = US_ENTRY_POLICY_CONTRACT_VERSION
+
+    contract = build_us_entry_exit_contract(*sources, policy)
+    if contract:
+        policy["entry_exit_contract"] = contract
+        policy["entry_exit_contract_sha256"] = contract["sha256"]
+        policy["entry_exit_contract_version"] = contract["version"]
+        provenance = contract.get("entry_provenance") or {}
+        for key in ("entry_reason","entry_style_selected","entry_component","reasons","filters_passed","score_breakdown","explanation_quality"):
+            if provenance.get(key) is not None:
+                policy[key] = provenance[key]
+    return policy
+
+def _mapping_rows_from_result(result: Any) -> list[dict[str, Any]]:
+    """Return mapping rows when a real SQLAlchemy Result is available.
+
+    Statement-capture tests intentionally return None from execute(); that is
+    not a database failure and must not break snapshot SQL generation. Genuine
+    execute() exceptions are deliberately left to the caller.
+    """
+    mappings = getattr(result, "mappings", None)
+    if not callable(mappings):
+        return []
+    mapped = mappings()
+    all_rows = getattr(mapped, "all", None)
+    rows = all_rows() if callable(all_rows) else list(mapped)
+    return [dict(row) for row in rows]
+
+
+def _load_us_entry_policy_for_position(
+    conn: Any,
+    *,
+    symbol: str,
+    trade_date: str,
+    position_lifecycle_id: str | None = None,
+) -> dict[str, Any]:
+    trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
+
+    # Inspect the latest snapshot regardless of qty. A qty=0 row is an explicit
+    # lifecycle boundary; skipping it (the old qty>0 query) could resurrect a
+    # fully closed cycle's policy on a later repurchase.
+    latest_result = conn.execute(text("""
+        SELECT meta, qty, as_of FROM us_positions
+        WHERE UPPER(symbol)=:symbol AND as_of<=:td
+    """ + epoch_clause + """
+        ORDER BY as_of DESC LIMIT 1
+    """), {"symbol": symbol, "td": trade_date, **epoch_params})
+    latest_rows = _mapping_rows_from_result(latest_result)
+    latest = latest_rows[0] if latest_rows else {}
+    latest_meta = _parse_json_meta(latest.get("meta"))
+    latest_qty = int(latest.get("qty") or 0) if latest else 0
+    latest_as_of = str(latest.get("as_of") or "")[:10]
+    latest_lifecycle = str(latest_meta.get("position_lifecycle_id") or "").strip()
+    current_lifecycle = str(position_lifecycle_id or "").strip()
+
+    # Prefer a durable confirmed BUY contract. When the caller knows the
+    # lifecycle, require an exact lifecycle match. Without that identity, a
+    # recorded qty=0 snapshot is a hard boundary and only a later BUY may seed
+    # policy for a repurchase.
+    buy_result = conn.execute(text("""
+        SELECT meta, trade_date, created_at FROM us_orders
+        WHERE UPPER(symbol)=:symbol AND trade_date<=:td AND side='BUY' AND dry_run=FALSE
+          AND status IN ('SENT','ACK','OPEN','PARTIALLY_FILLED','FILLED')
+    """ + epoch_clause + """
+        ORDER BY trade_date DESC,created_at DESC LIMIT 20
+    """), {"symbol": symbol, "td": trade_date, **epoch_params})
+    buy_orders = _mapping_rows_from_result(buy_result)
+    for row in buy_orders:
+        order_meta = _parse_json_meta(row.get("meta"))
+        order_lifecycle = str(order_meta.get("position_lifecycle_id") or "").strip()
+        if current_lifecycle and order_lifecycle != current_lifecycle:
+            continue
+        order_date = str(row.get("trade_date") or "")[:10]
+        if latest and latest_qty <= 0 and latest_as_of and order_date <= latest_as_of:
+            continue
+        policy = _us_entry_policy_from(order_meta)
+        if policy:
+            policy["entry_policy_source"] = "confirmed_buy_order"
+            return policy
+
+    # Snapshot fallback is allowed only when the latest recorded state is still
+    # open and, if a lifecycle identity is known, it matches that identity.
+    continuity_proven = bool(latest and latest_qty > 0)
+    if current_lifecycle:
+        continuity_proven = continuity_proven and latest_lifecycle == current_lifecycle
+    if continuity_proven:
+        policy = _us_entry_policy_from(latest_meta)
+        if policy:
+            policy["entry_policy_source"] = "prior_position_snapshot"
+            return policy
+    return {}
+
+def save_position_snapshot(positions: list[dict], trade_date: str | None = None, *,
+                           balance_fetch_status: str = "UNKNOWN", balance_parse_status: str = "UNKNOWN",
+                           authoritative_positions: bool = False, preserve_previous_positions: bool = True,
+                           close_source: str = "kis_final_balance") -> int:
+    """us_positions 스냅샷 저장 (upsert). qty>0이면 open position.
+
+    meta에 holding_qty, orderable_qty, sellable_qty, entry_price,
+    entry_price_source, raw_exchange, balance_source를 포함한다.
+    """
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    # An empty authoritative balance is the *only* empty-symbol case that may
+    # close every existing position.  A non-empty payload without usable
+    # symbols is malformed and must never be interpreted as "no positions".
+    symbols = [str(p.get("symbol") or "").upper() for p in positions if p.get("symbol")]
+    stale_close_requested = (
+        authoritative_positions
+        and not preserve_previous_positions
+        and balance_fetch_status == "OK"
+        and balance_parse_status == "OK"
+    )
+    if stale_close_requested and positions and not symbols:
+        raise ValueError("authoritative_positions_missing_symbols")
+
+    if engine is None:
+        if stale_close_requested:
+            current = set(symbols)
+            now = datetime.now(timezone.utc).isoformat()
+            for old in _MEM_POSITIONS:
+                if str(old.get("symbol") or "").upper() not in current:
+                    old["qty"] = 0
+                    old["unrealized_pnl_usd"] = 0.0
+                    old["market_value_usd"] = 0.0
+                    old.setdefault("meta", {}).update({"position_status": "CLOSED_BY_AUTHORITATIVE_BALANCE", "closed_at": now, "close_source": close_source})
+        elif not preserve_previous_positions:
+            _MEM_POSITIONS.clear()
+        for p in positions:
+            meta = dict(p.get("meta") or {})
+            prior_policy = {}
+            current_symbol = str(p.get("symbol") or "").upper()
+            current_lifecycle = str(
+                p.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""
+            ).strip()
+            latest_old = next(
+                (old for old in reversed(_MEM_POSITIONS)
+                 if str(old.get("symbol") or "").upper() == current_symbol),
+                None,
+            )
+            if latest_old is not None and int(latest_old.get("qty") or 0) > 0:
+                latest_old_meta = _parse_json_meta(latest_old.get("meta"))
+                latest_old_lifecycle = str(
+                    latest_old.get("position_lifecycle_id")
+                    or latest_old_meta.get("position_lifecycle_id")
+                    or ""
+                ).strip()
+                if not current_lifecycle or latest_old_lifecycle == current_lifecycle:
+                    prior_policy = _us_entry_policy_from(latest_old_meta, latest_old)
+                    if prior_policy:
+                        prior_policy["entry_policy_source"] = "prior_position_snapshot"
+            policy = _us_entry_policy_from(meta, p) or prior_policy
+            meta.update(policy)
+            meta.update({
+                "holding_qty": p.get("holding_qty") or p.get("qty", 0),
+                "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
+                "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
+                "entry_price": p.get("entry_price") or p.get("avg_price_usd", 0),
+                "entry_price_source": p.get("entry_price_source"),
+                "raw_exchange": p.get("raw_exchange"),
+                "balance_source": p.get("balance_source", "kis_balance_authoritative"),
+                "position_lifecycle_id": p.get("position_lifecycle_id"),
+                "opened_trade_date": p.get("opened_trade_date"),
+                "holding_trade_days": p.get("holding_trade_days"),
+                "high_watermark": p.get("high_watermark"),
+                "high_watermark_at": p.get("high_watermark_at"),
+                "high_watermark_source": p.get("high_watermark_source"),
+                "trend_state": p.get("trend_state"),
+            })
+            for field in (
+                "env", "trading_env", "account_id", "account_key",
+                "trading_epoch_id", "strategy_owner", "sleeve_id",
+                "position_lifecycle_id", "position_cycle_id", "opened_at",
+                "opened_at_source", "opened_trade_date",
+            ):
+                if p.get(field) is not None:
+                    meta[field] = p[field]
+            p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
+            p["meta"] = meta
+            _MEM_POSITIONS.append({
+                **p, "as_of": td,
+                "avg_cost": p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd", 0),
+                "current_px": p.get("current_px") or p.get("current_price") or p.get("current_price_usd", 0),
+                "meta": meta,
+            })
+        return len(positions)
+    count = 0
+    try:
+        with engine.begin() as conn:
+            trading_epoch_id = _active_us_epoch(conn)
+            for p in positions:
+                avg_cost = float(p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd") or 0)
+                current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
+                # meta에 orderable_qty 등 보존
+                meta = dict(p.get("meta") or {})
+                policy = _us_entry_policy_from(meta, p)
+                if not policy:
+                    policy = _load_us_entry_policy_for_position(
+                        conn,
+                        symbol=str(p.get("symbol") or "").upper(),
+                        trade_date=str(td),
+                        position_lifecycle_id=str(
+                            p.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""
+                        ).strip() or None,
+                    )
+                meta.update(policy)
+                meta.update({
+                    "holding_qty": p.get("holding_qty") or p.get("qty", 0),
+                    "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
+                    "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
+                    "entry_price": p.get("entry_price") or avg_cost,
+                    "entry_price_source": p.get("entry_price_source"),
+                    "raw_exchange": p.get("raw_exchange"),
+                    "balance_source": p.get("balance_source", "kis_balance_authoritative"),
+                    "position_lifecycle_id": p.get("position_lifecycle_id"),
+                    "opened_trade_date": p.get("opened_trade_date"),
+                    "holding_trade_days": p.get("holding_trade_days"),
+                    "high_watermark": p.get("high_watermark"),
+                    "high_watermark_at": p.get("high_watermark_at"),
+                    "high_watermark_source": p.get("high_watermark_source"),
+                    "trend_state": p.get("trend_state"),
+                })
+                for field in (
+                    "env", "trading_env", "account_id", "account_key",
+                    "trading_epoch_id", "strategy_owner", "sleeve_id",
+                    "position_lifecycle_id", "position_cycle_id", "opened_at",
+                    "opened_at_source", "opened_trade_date",
+                ):
+                    if p.get(field) is not None:
+                        meta[field] = p[field]
+                p.update({field: meta.get(field) for field in _US_ENTRY_POLICY_FIELDS if meta.get(field) is not None})
+                p["meta"] = meta
+                params = {
+                    "as_of": td,
+                    "symbol": p.get("symbol"),
+                    "exchange": p.get("exchange", "NASDAQ"),
+                    "qty": int(p.get("qty", 0)),
+                    "avg_cost": avg_cost,
+                    "current_px": current_px,
+                    "unrealized_pnl_usd": float(p.get("unrealized_pnl_usd", 0)),
+                }
+                meta_to_store = dict(meta)
+                if trading_epoch_id:
+                    meta_to_store["trading_epoch_id"] = trading_epoch_id
+                    params["trading_epoch_id"] = trading_epoch_id
+                    sql = """
+                        INSERT INTO us_positions
+                            (as_of, symbol, exchange, qty, avg_cost, current_px,
+                             unrealized_pnl_usd, trading_epoch_id, meta)
+                        VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
+                                :unrealized_pnl_usd, :trading_epoch_id, CAST(:meta AS jsonb))
+                        ON CONFLICT (trading_epoch_id, as_of, symbol, exchange) DO UPDATE
+                            SET qty               =EXCLUDED.qty,
+                                avg_cost          =EXCLUDED.avg_cost,
+                                current_px        =EXCLUDED.current_px,
+                                unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                                meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
+                    """
+                else:
+                    sql = """
+                        INSERT INTO us_positions
+                            (as_of, symbol, exchange, qty, avg_cost, current_px,
+                             unrealized_pnl_usd, meta)
+                        VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
+                                :unrealized_pnl_usd, CAST(:meta AS jsonb))
+                        ON CONFLICT (as_of, symbol, exchange) DO UPDATE
+                            SET qty               =EXCLUDED.qty,
+                                avg_cost          =EXCLUDED.avg_cost,
+                                current_px        =EXCLUDED.current_px,
+                                unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                                meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
+                    """
+                params["meta"] = _json_param(meta_to_store)
+                conn.execute(text(sql), params)
+                count += 1
+            if stale_close_requested:
+                params = {"td": td, "symbols": symbols, "source": close_source}
+                sql = """
+                    UPDATE us_positions SET qty=0, unrealized_pnl_usd=0,
+                      meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                        'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
+                        'closed_at',NOW()::text,'close_source',CAST(:source AS text))
+                    WHERE as_of=:td AND qty>0
+                """
+                if trading_epoch_id:
+                    sql += " AND trading_epoch_id=:trading_epoch_id"
+                    params["trading_epoch_id"] = trading_epoch_id
+                sql += " AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))"
+                conn.execute(text(sql), params)
+    except Exception as exc:
+        logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
+        if authoritative_positions:
+            raise
+    logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", count)
+    return count
+
+
+def load_positions(
+    as_of: str | None = None, *, include_epoch_mismatches: bool = False,
+) -> list[dict]:
+    """Return positive positions, optionally surfacing stale-epoch rows as degraded."""
+    td = as_of or _today()
+    engine = _get_engine_or_none()
+    active_epoch = None
+    if engine is None:
+        rows = [p for p in _MEM_POSITIONS
+                if (p.get("as_of") == td or p.get("trade_date") == td)
+                and int(p.get("qty", 0)) > 0]
+        active_epoch = _active_us_epoch()
+    else:
+        try:
+            with engine.begin() as conn:
+                active_epoch = _active_us_epoch(conn)
+                sql = "SELECT * FROM us_positions WHERE as_of=:td AND qty>0"
+                params = {"td": td}
+                if active_epoch and not include_epoch_mismatches:
+                    sql += " AND trading_epoch_id=:trading_epoch_id"
+                    params["trading_epoch_id"] = active_epoch
+                raw = conn.execute(text(sql), params)
+                rows = [dict(r._mapping) for r in raw]
+        except Exception as exc:
+            logger.error("[US_POSITIONS][LOAD][ERROR] %s", exc)
+            return []
+
+    enriched = []
+    for row in rows:
+        r = dict(row)
+        meta = r.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = {}
+        # top-level promote
+        r["orderable_qty"] = meta.get("orderable_qty") or r.get("qty", 0)
+        r["sellable_qty"] = meta.get("sellable_qty") or r.get("orderable_qty", 0)
+        r["holding_qty"] = meta.get("holding_qty") or r.get("qty", 0)
+        r["entry_price"] = r.get("avg_cost") or meta.get("entry_price") or 0
+        r["current_price_usd"] = r.get("current_px") or 0
+        r["entry_price_source"] = meta.get("entry_price_source") or "us_positions_avg_cost"
+        r["balance_source"] = meta.get("balance_source") or "us_positions_db"
+        for field in (
+            "env", "trading_env", "account_id", "account_key", "strategy_owner",
+            "sleeve_id", "position_lifecycle_id", "position_cycle_id",
+            "opened_at", "opened_trade_date", "opened_at_source",
+        ):
+            if r.get(field) is None and meta.get(field) is not None:
+                r[field] = meta[field]
+        epoch_mismatch = bool(
+            active_epoch and str(r.get("trading_epoch_id") or "") != str(active_epoch)
+        )
+        if include_epoch_mismatches and epoch_mismatch:
+            r["epoch_visibility_status"] = "STALE_EPOCH_VISIBLE_PROTECTIVE"
+            r["lifecycle_identity_status"] = "AMBIGUOUS_OR_MISMATCHED"
+            r["sell_management_degraded"] = True
+            logger.error(
+                "[US_POSITIONS][EPOCH_VISIBILITY] symbol=%s position_epoch=%s active_epoch=%s action=VISIBLE_DEGRADED_NO_REBIND",
+                r.get("symbol"), r.get("trading_epoch_id") or "MISSING", active_epoch,
+            )
+        for field in _US_ENTRY_POLICY_FIELDS:
+            if meta.get(field) is not None:
+                r[field] = meta[field]
+        r["entry_policy_contract_sha256"] = meta.get("entry_policy_contract_sha256")
+        r["entry_policy_source"] = meta.get("entry_policy_source")
+        enriched.append(r)
+    return enriched
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        fully_sold_keys = {o.get("client_order_key") for o in _MEM_ORDERS
+                           if o.get("trade_date") == td and o.get("side") == "SELL" and o.get("status") == "FILLED"}
+        return {f["symbol"] for f in _MEM_FILLS if f.get("trade_date") == td and f.get("side") == "SELL"
+                and (not f.get("client_order_key") or f.get("client_order_key") in fully_sold_keys)}
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            if epoch_id:
+                sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                   AND o.trading_epoch_id=f.trading_epoch_id
+                    WHERE f.trade_date=:td AND f.side='SELL'
+                      AND f.trading_epoch_id=:epoch_id
+                      AND (o.id IS NULL OR o.status='FILLED')"""
+                params = {"td": td, "epoch_id": epoch_id}
+            else:
+                sql = """SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""
+                params = {"td": td}
+            rows = conn.execute(text(sql), params)
+            return {r[0] for r in rows}
+    except Exception as exc:
+        logger.error("[US_FILLS][SOLD_TODAY][ERROR] %s", exc)
+        return set()
+
+
+def load_today_order_keys(trade_date: str | None = None) -> set[str]:
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {o["client_order_key"] for o in _MEM_ORDERS
+                if o.get("trade_date") == td and o.get("client_order_key")}
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = "SELECT DISTINCT client_order_key FROM us_orders WHERE trade_date=:td"
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            rows = conn.execute(text(sql), params)
+            return {r[0] for r in rows}
+    except Exception as exc:
+        logger.error("[US_ORDERS][KEYS][ERROR] %s", exc)
+        return set()
+
+
+def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict]:
+    """ACK 상태이면서 qty_filled=0인 주문 목록 반환.
+
+    ACK reconcile에서 미체결 주문의 fill 여부를 재확인하는 데 사용된다.
+    """
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return [
+            o for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and o.get("status") in ("ACK", "SENT", "PARTIALLY_FILLED")
+            and int(o.get("qty_filled", 0) or 0) < int(o.get("qty_requested", 0) or 0)
+        ]
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = """
+                    SELECT *
+                    FROM us_orders
+                    WHERE trade_date = :td
+                      AND status IN ('ACK', 'SENT', 'PARTIALLY_FILLED')
+                      AND COALESCE(qty_filled, 0) < qty_requested
+            """
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at ASC"
+            rows = conn.execute(text(sql), params)
+            return [dict(r._mapping) for r in rows]
+    except Exception as exc:
+        logger.error("[US_ORDERS][PENDING_ACK][ERROR] %s", exc)
+        return []
+
+
+def load_pending_ack_orders_result(trade_date: str, env: str = "practice") -> dict:
+    """Strict pending-attempt query for execution/close integrity.
+
+    Unlike the compatibility list API, a failed DB read cannot mean zero orders.
+    Includes broker-open/partially-filled statuses that older ACK-only queries
+    missed. Every row remains an individual order attempt.
+    """
+    td = trade_date or _today()
+    open_statuses = (
+        "ACK", "SENT", "PARTIALLY_FILLED", "OPEN", "PENDING",
+        "WORKING", "ACK_OPEN", "RECONCILE_PENDING", "ACK_DB_FAILED",
+        "SUBMITTED",
+    )
+    engine = _get_engine_or_none()
+    if engine is None:
+        offline_fixture = bool(
+            os.getenv("PYTEST_CURRENT_TEST")
+            or os.getenv("US_OFFLINE") == "1"
+            or os.getenv("OFFLINE") == "1"
+            or str(env or "").lower() in {"test", "offline"}
+        )
+        if not offline_fixture:
+            return {"status": "DB_ERROR", "orders": [],
+                    "error": "pending_attempt_db_engine_unavailable"}
+        return {"status": "OK", "orders": [
+            dict(o) for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and str(o.get("status") or "").upper() in open_statuses
+            and int(o.get("qty_filled") or 0) < int(o.get("qty_requested") or o.get("qty") or 0)
+        ]}
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = """
+                SELECT * FROM us_orders
+                WHERE trade_date=:td
+                  AND status IN (
+                      'ACK','SENT','PARTIALLY_FILLED','OPEN','PENDING',
+                      'WORKING','ACK_OPEN','RECONCILE_PENDING','ACK_DB_FAILED',
+                      'SUBMITTED'
+                  )
+                  AND COALESCE(qty_filled, 0) < qty_requested
+            """
+            params = {"td": td}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY created_at ASC"
+            return {"status": "OK", "orders": [
+                dict(row) for row in conn.execute(text(sql), params).mappings().all()
+            ]}
+    except Exception as exc:
+        logger.error("[US_ORDERS][PENDING_ATTEMPTS][DB_ERROR] trade_date=%s err=%s", td, exc)
+        return {"status": "DB_ERROR", "orders": [], "error": str(exc)}
+
+
+def _parse_json_meta(value: Any) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _synthetic_reconcile_fill_meta(
+    *,
+    source: str,
+    order_no: str,
+    client_order_key: str,
+    side: str,
+    qty: int,
+    avg_price_usd: float,
+    base_meta: dict | None,
+) -> dict:
+    fill_meta = _parse_json_meta(base_meta)
+    fill_meta.update({
+        "source": source,
+        "is_synthetic": True,
+        "fill_evidence_type": "BALANCE_DELTA_SYNTHETIC",
+        "reconcile_source": source,
+        "order_no": order_no,
+        "client_order_key": client_order_key,
+    })
+    cost_basis = _safe_float_meta(fill_meta, [
+        "cost_basis_price_usd",
+        "pre_sell_avg_cost",
+        "pre_sell_cost_basis_price_usd",
+    ])
+    if side.upper() == "SELL" and cost_basis and cost_basis > 0 and avg_price_usd > 0 and qty > 0:
+        realized = (float(avg_price_usd) - float(cost_basis)) * int(qty)
+        fill_meta.setdefault("cost_basis_price_usd", float(cost_basis))
+        fill_meta.setdefault("cost_basis_source", "pre_sell_position_snapshot")
+        fill_meta["realized_pnl_usd"] = round(realized, 4)
+        fill_meta["realized_pnl_pct"] = round(((float(avg_price_usd) - float(cost_basis)) / float(cost_basis)) * 100.0, 4)
+    return fill_meta
+
+
+def _actual_reconcile_fill_meta(
+    *,
+    source: str,
+    side: str,
+    qty: int,
+    avg_price_usd: float,
+    base_meta: dict | None,
+) -> dict:
+    """Enrich authoritative KIS fills with the same SELL cost-basis/PnL truth as synthetic evidence."""
+    fill_meta = _parse_json_meta(base_meta)
+    fill_meta.update({
+        "source": source,
+        "is_synthetic": False,
+    })
+    cost_basis = _safe_float_meta(fill_meta, [
+        "cost_basis_price_usd",
+        "pre_sell_avg_cost",
+        "pre_sell_cost_basis_price_usd",
+        "broker_avg_price",
+        "avg_cost",
+        "entry_price",
+    ])
+    if side.upper() == "SELL" and cost_basis and cost_basis > 0 and avg_price_usd > 0 and qty > 0:
+        realized = (float(avg_price_usd) - float(cost_basis)) * int(qty)
+        fill_meta.setdefault("cost_basis_price_usd", float(cost_basis))
+        fill_meta.setdefault("cost_basis_source", "pre_sell_position_snapshot")
+        fill_meta["realized_pnl_usd"] = round(realized, 4)
+        fill_meta["realized_pnl_pct"] = round(((float(avg_price_usd) - float(cost_basis)) / float(cost_basis)) * 100.0, 4)
+    return fill_meta
+
+
+def is_synthetic_fill_meta(meta: Any) -> bool:
+    value = _parse_json_meta(meta)
+    return bool(value.get("is_synthetic") or value.get("synthetic") or value.get("synthetic_fill")
+                or value.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
+
+
+def _safe_float_meta(meta: dict, keys: list[str]) -> float | None:
+    for key in keys:
+        value = meta.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    nested = meta.get("meta")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+
+
+def load_us_order_for_fill(
+    *,
+    order_no: str | None,
+    client_order_key: str | None,
+    symbol: str,
+    trade_date: str,
+) -> dict:
+    """Resolve original us_orders row for a KIS fill using order_no/client key."""
+    sym = str(symbol or "").strip().upper()
+    td = str(trade_date)
+    on = str(order_no or "")
+    on_norm = normalize_us_order_no(on)
+    cok = str(client_order_key or "")
+    engine = _get_engine_or_none()
+    if engine is None:
+        matches = []
+        for o in _MEM_ORDERS:
+            if str(o.get("trade_date") or td) != td:
+                continue
+            if sym and str(o.get("symbol") or "").upper() != sym:
+                continue
+            order_no_match = on and (
+                str(o.get("order_no") or "") == on
+                or normalize_us_order_no(o.get("order_no")) == on_norm
+                or normalize_us_order_no(_parse_json_meta(o.get("meta")).get("order_no_norm")) == on_norm
+            )
+            if order_no_match or (cok and str(o.get("client_order_key") or "") == cok):
+                matches.append(o)
+        return dict(matches[0]) if len(matches) == 1 else {}
+    try:
+        with engine.begin() as conn:
+            # Exact lookup remains the fast path.  Bound it to the active
+            # account generation so reused broker order numbers cannot attach
+            # a new fill to a legacy order.
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            epoch_select = ", trading_epoch_id" if epoch_id else ""
+            rows = conn.execute(text("""
+                SELECT trade_date, client_order_key, symbol, exchange, side,
+                       qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
+                FROM us_orders
+                WHERE trade_date = :td AND symbol = :symbol
+                  AND ((:order_no <> '' AND order_no = :order_no)
+                       OR (:cok <> '' AND client_order_key = :cok))
+            """ + epoch_clause + """
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok, **epoch_params}).mappings().all()
+            if len(rows) == 1:
+                return dict(rows[0])
+            if len(rows) > 1:
+                return {}
+            if not on_norm:
+                return {}
+            candidates = conn.execute(text("""
+                SELECT trade_date, client_order_key, symbol, exchange, side,
+                       qty_requested, qty_filled, avg_price_usd, order_no, status""" + epoch_select + """, meta
+                FROM us_orders WHERE trade_date=:td AND symbol=:symbol
+            """ + epoch_clause + """
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            """), {"td": td, "symbol": sym, **epoch_params}).mappings().all()
+            normalized_matches = []
+            for candidate in candidates:
+                candidate_dict = dict(candidate)
+                meta = _parse_json_meta(candidate_dict.get("meta"))
+                if normalize_us_order_no(candidate_dict.get("order_no")) == on_norm or normalize_us_order_no(meta.get("order_no_norm")) == on_norm:
+                    normalized_matches.append(candidate_dict)
+            return normalized_matches[0] if len(normalized_matches) == 1 else {}
+    except Exception as exc:
+        logger.warning("[US_ORDER][LOAD_FOR_FILL_WARN] symbol=%s order_no=%s cok=%s err=%s", sym, on, cok, exc)
+        return {}
+
+def _supersede_synthetic_fills_for_actual(
+    *,
+    trade_date: str,
+    order_no: str,
+    client_order_key: str,
+    cumulative: int,
+    conn: Any | None = None,
+    trading_epoch_id: str | None = None,
+) -> dict:
+    """Deactivate synthetic cumulative evidence once KIS actual evidence arrives.
+
+    When ``conn`` is provided, the caller's open transaction is used so order
+    update, synthetic deactivation and actual insert commit/rollback together.
+    """
+    now_utc = datetime.now(timezone.utc).isoformat()
+    result = {"superseded": 0, "conflict": 0, "active_synthetic_cumulative": 0}
+    if conn is None:
+        for f in _MEM_FILLS:
+            if str(f.get("trade_date") or "") != trade_date:
+                continue
+            if order_no:
+                if str(f.get("order_no") or "") != order_no:
+                    continue
+            elif client_order_key and str(f.get("client_order_key") or "") != client_order_key:
+                continue
+            meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+            if not is_synthetic_fill_meta(meta) or meta.get("accounting_active") is False:
+                continue
+            synth_cum = int(meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+            result["active_synthetic_cumulative"] = max(result["active_synthetic_cumulative"], synth_cum)
+            if cumulative >= synth_cum:
+                meta.update({"superseded_by_kis_actual": True, "superseded_at": now_utc, "accounting_active": False})
+                f["meta"] = meta; result["superseded"] += 1
+            else:
+                result["conflict"] += 1
+        return result
+    if trading_epoch_id is None:
+        trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
+    rows = conn.execute(text("""SELECT id, qty, meta FROM us_fills WHERE trade_date=:td
+        AND (:order_no='' OR order_no=:order_no) AND (:cok='' OR client_order_key=:cok)
+    """ + epoch_clause + """
+        AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
+        AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+        {"td": trade_date, "order_no": order_no, "cok": client_order_key, **epoch_params}).mappings().all()
+    for row in rows:
+        meta = _parse_json_meta(row.get("meta"))
+        synth_cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
+        result["active_synthetic_cumulative"] = max(result["active_synthetic_cumulative"], synth_cum)
+        if cumulative >= synth_cum:
+            meta.update({"superseded_by_kis_actual": True, "superseded_at": now_utc, "accounting_active": False})
+            result["superseded"] += 1
+            conn.execute(text("UPDATE us_fills SET meta=CAST(:meta AS jsonb) WHERE id=:id"), {"meta": _json_param(meta), "id": row["id"]})
+        else:
+            result["conflict"] += 1
+    return result
+
+
+def _active_fill_cumulatives_for_order(
+    *,
+    trade_date: str,
+    order_no: str,
+    client_order_key: str,
+    symbol: str = "",
+    side: str = "",
+    conn: Any | None = None,
+    trading_epoch_id: str | None = None,
+) -> dict:
+    result = {"actual": 0, "synthetic": 0, "actual_individual": 0}
+    if conn is None:
+        for f in _MEM_FILLS:
+            if str(f.get("trade_date") or "") != trade_date:
+                continue
+            if order_no:
+                if str(f.get("order_no") or "") != order_no:
+                    continue
+                if symbol and str(f.get("symbol") or "").upper() != str(symbol).upper():
+                    continue
+                if side and str(f.get("side") or "").upper() != str(side).upper():
+                    continue
+            elif client_order_key and str(f.get("client_order_key") or "") != client_order_key:
+                continue
+            meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+            if meta.get("accounting_active") is False:
+                continue
+            cum = int(meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+            if is_synthetic_fill_meta(meta):
+                result["synthetic"] = max(result["synthetic"], cum)
+            else:
+                result["actual"] = max(result["actual"], cum)
+                evidence = str(meta.get("fill_evidence_type") or "")
+                if _is_kis_execution_evidence(evidence):
+                    result["actual_individual"] += int(f.get("qty") or 0)
+        return result
+    if trading_epoch_id is None:
+        trading_epoch_id = _active_us_epoch(conn)
+    epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if trading_epoch_id else ""
+    epoch_params = {"trading_epoch_id": trading_epoch_id} if trading_epoch_id else {}
+    if order_no:
+        rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
+            AND order_no=:order_no
+            AND (:symbol='' OR symbol=:symbol)
+            AND (:side='' OR side=:side)
+        """ + epoch_clause + """
+            AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+            {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(),
+             "side": str(side).upper(), **epoch_params}).mappings().all()
+    else:
+        rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
+            AND client_order_key=:cok
+        """ + epoch_clause + """
+            AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+            {"td": trade_date, "cok": client_order_key, **epoch_params}).mappings().all()
+    for row in rows:
+        meta = _parse_json_meta(row.get("meta"))
+        cum = int(meta.get("cumulative_filled_qty") or row.get("qty") or 0)
+        if is_synthetic_fill_meta(meta):
+            result["synthetic"] = max(result["synthetic"], cum)
+        else:
+            result["actual"] = max(result["actual"], cum)
+            evidence = str(meta.get("fill_evidence_type") or "")
+            if _is_kis_execution_evidence(evidence):
+                result["actual_individual"] += int(row.get("qty") or 0)
+    return result
+
+
+def _record_actual_fill_execution_claim(
+    order_meta: dict, *, cumulative_qty: int, requested_qty: int, evidence: str,
+    _conn: Any = None,
+) -> str | None:
+    if not _is_kis_order_cumulative_evidence(evidence):
+        return None
+    action_key = str(order_meta.get("execution_action_key") or "")
+    attempt_id = str(order_meta.get("submit_attempt_id") or "")
+    if not action_key or not attempt_id:
+        return None
+    try:
+        record_execution_action_observation_by_key(
+            action_key,
+            attempt_id=attempt_id,
+            state="FILLED" if cumulative_qty >= requested_qty else "PARTIALLY_FILLED",
+            cumulative_filled_qty=cumulative_qty,
+            authoritative=True,
+            _conn=_conn,
+        )
+        return None
+    except Exception as exc:
+        logger.exception(
+            "[US_ORDER][EXECUTION_CLAIM][FILL_UPDATE_FAILED] action_key=%s",
+            action_key,
+        )
+        return str(exc)
+
+
+def mark_order_filled_by_reconcile(
+    *, order_no: str, client_order_key: str, symbol: str | None = None,
+    side: str | None = None, filled_qty: int, avg_price_usd: float,
+    source: str = "balance_reconcile", trade_date: str | None = None,
+    meta: dict | None = None, requested_qty: int | None = None,
+    cumulative_filled_qty: int | None = None, evidence_type: str | None = None,
+    _conn: Any = None, _skip_claim_update: bool = False,
+) -> dict:
+    """Strictly update exactly one order and create at most one synthetic fill."""
+    from datetime import datetime, timezone
+    from trader.us.execution.reconcile import validate_reconcile_identity
+    td = str(trade_date or "").strip()
+    on, cok = str(order_no or "").strip(), str(client_order_key or "").strip()
+    sym, side_u = str(symbol or "").strip().upper(), str(side or "").strip().upper()
+    qty, price = int(filled_qty or 0), float(avg_price_usd or 0)
+    if not td:
+        return {"status": "RECONCILE_TRADE_DATE_REQUIRED"}
+    if not on and not cok:
+        return {"status": "RECONCILE_ORDER_IDENTITY_REQUIRED"}
+    if qty <= 0:
+        return {"status": "RECONCILE_QTY_EVIDENCE_MISSING"}
+    now_utc = datetime.now(timezone.utc).isoformat()
+    engine = _get_engine_or_none()
+    if engine is None:
+        matches = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and
+                   ((on and normalize_us_order_no(o.get("order_no")) == normalize_us_order_no(on)) or
+                    (cok and str(o.get("client_order_key") or "") == cok))]
+        check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
+                                            requested_symbol=sym, requested_side=side_u, matches=matches)
+        if check["status"] != "OK": return check
+        order = check["order"]
+        # All subsequent accounting uses the persisted raw representation so a
+        # replay with unpadded KIS order_no updates the original ACK row/fill.
+        on = str(order.get("order_no") or on)
+        requested = int(requested_qty or order.get("qty_requested") or qty)
+        previous = int(order.get("qty_filled") or 0)
+        observed_cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
+        evidence = evidence_type or ("KIS_ORDER_CUMULATIVE_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
+        synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+        active = _active_fill_cumulatives_for_order(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", symbol=sym, side=side_u)
+        if not synthetic and _is_kis_order_cumulative_evidence(evidence) and observed_cumulative < int(active.get("actual", 0) or 0):
+            return {"status": "EVIDENCE_QUANTITY_REGRESSION", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "previous_actual_cumulative": int(active.get("actual", 0) or 0), "entry_fence": True}
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0 and observed_cumulative != int(active.get("actual_individual", 0) or 0):
+            return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                    "order_cumulative": observed_cumulative, "execution_actual_qty": int(active.get("actual_individual", 0) or 0)}
+        if not synthetic and observed_cumulative < int(active.get("synthetic", 0) or 0):
+            return {"status": "EVIDENCE_QUANTITY_CONFLICT", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "synthetic_cumulative": int(active.get("synthetic", 0) or 0)}
+        cumulative = max(previous, min(observed_cumulative, requested))
+        remaining = max(0, requested - cumulative)
+        status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
+        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}), "remaining_qty": remaining}
+        promotion = {"superseded": 0, "conflict": 0}
+        if not synthetic:
+            promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", cumulative=observed_cumulative)
+        order.update({"status": status, "qty_filled": cumulative, "avg_price_usd": price,
+                      "order_no": order.get("order_no") or on,
+                      "updated_at": now_utc, "meta": order_meta})
+        if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+            for f in _MEM_FILLS:
+                if str(f.get("trade_date") or "") == td and on and str(f.get("order_no") or "") == on and str(f.get("symbol") or "").upper() == sym and str(f.get("side") or "").upper() == side_u and not is_synthetic_fill_meta(f.get("meta")):
+                    f_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+                    if _is_kis_order_cumulative_evidence(str(f_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")):
+                        f["client_order_key"] = cok or order.get("client_order_key") or f.get("client_order_key")
+                        f["qty"] = observed_cumulative
+                        f["price_usd"] = price
+                        f_meta = _actual_reconcile_fill_meta(
+                            source=source, side=side_u, qty=observed_cumulative,
+                            avg_price_usd=price, base_meta=f_meta,
+                        )
+                        f_meta.update({"cumulative_filled_qty": observed_cumulative, "remaining_qty": remaining, "requested_qty": requested, "observed_at": now_utc})
+                        f["meta"] = f_meta
+        actual_exists = any(str(f.get("trade_date") or "") == td and on and str(f.get("order_no") or "") == on
+                            and not is_synthetic_fill_meta(f.get("meta")) and int(((f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}).get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or 0) == observed_cumulative for f in _MEM_FILLS)
+        delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
+        delta = max(0, observed_cumulative - delta_base)
+        fill_delta = (
+            observed_cumulative
+            if not synthetic and _is_kis_order_cumulative_evidence(evidence)
+            else delta
+        )
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
+            fill_delta = 0
+        if fill_delta and not actual_exists:
+            fill_meta = (_actual_reconcile_fill_meta(source=source, side=side_u, qty=fill_delta,
+                         avg_price_usd=price, base_meta={**order_meta, "fill_evidence_type": evidence})
+                         if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
+                             client_order_key=cok, side=side_u, qty=fill_delta, avg_price_usd=price, base_meta=order_meta))
+            fill_meta["cumulative_filled_qty"] = observed_cumulative
+            fill_meta["fill_evidence_type"] = evidence
+            fill_meta["is_synthetic"] = synthetic
+            save_fills([{"trade_date": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                         "side": side_u, "qty": fill_delta, "price_usd": price, "order_no": on,
+                         "client_order_key": cok or order.get("client_order_key"), "filled_at": now_utc,
+                         "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence,
+                         "_already_reconciled": True, "meta": fill_meta}], trade_date=td)
+        result = {"status": "OK", "order_status": status, "qty_filled": cumulative,
+                  "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual_exists),
+                  "synthetic_superseded_count": int(promotion.get("superseded", 0)),
+                  "evidence_quantity_conflict_count": int(promotion.get("conflict", 0))}
+        invariant = verify_order_fill_accounting(trade_date=td, order_no=on)
+        if invariant.get("status") != "OK":
+            return invariant
+        result["fill_accounting"] = invariant
+        if side_u == "SELL" and order_meta.get("profit_capture_stage"):
+            from trader.us.profit_capture import sync_profit_capture_stage_from_order
+            sync_profit_capture_stage_from_order(
+                trade_date=td, symbol=sym,
+                position_lifecycle_id=str(order_meta.get("position_lifecycle_id") or ""),
+                client_order_key=cok or str(order.get("client_order_key") or ""),
+                broker_order_no=on, profit_capture_stage=str(order_meta.get("profit_capture_stage")),
+                order_status=status, evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
+            )
+        claim_error = _record_actual_fill_execution_claim(
+            order_meta, cumulative_qty=cumulative, requested_qty=requested, evidence=evidence,
+        )
+        if claim_error:
+            return {
+                **result,
+                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
+                "execution_claim_update_error": claim_error,
+                "requires_reconcile": True,
+                "retry_order": False,
+            }
+        return result
+    try:
+        if _conn is None:
+            with engine.begin() as conn:
+                return mark_order_filled_by_reconcile(
+                    order_no=order_no, client_order_key=client_order_key,
+                    symbol=symbol, side=side, filled_qty=filled_qty,
+                    avg_price_usd=avg_price_usd, source=source,
+                    trade_date=trade_date, meta=meta, requested_qty=requested_qty,
+                    cumulative_filled_qty=cumulative_filled_qty, evidence_type=evidence_type,
+                    _conn=conn, _skip_claim_update=_skip_claim_update,
+                )
+        conn = _conn
+        active_epoch_id = _active_us_epoch(conn)
+        epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+        epoch_clause = " AND trading_epoch_id=:active_epoch_id" if active_epoch_id else ""
+        order_params = {"td": td, "order_no": on, "cok": cok, "symbol": sym}
+        if active_epoch_id:
+            order_params["active_epoch_id"] = active_epoch_id
+        rows = conn.execute(text("""
+            SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
+                   qty_requested, qty_filled""" + epoch_select + """
+            FROM us_orders WHERE trade_date=:td AND
+              ((:order_no <> '' AND order_no=:order_no) OR
+               (:cok <> '' AND client_order_key=:cok)
+               OR (:order_no <> '' AND symbol=:symbol))
+        """ + epoch_clause + " FOR UPDATE"), order_params).mappings().all()
+        matches = [dict(row) for row in rows if
+                   (cok and str(row.get("client_order_key") or "") == cok)
+                   or (on and normalize_us_order_no(row.get("order_no")) == normalize_us_order_no(on))]
+        check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
+                                            requested_symbol=sym, requested_side=side_u, matches=matches)
+        if check["status"] != "OK": return check
+        order = check["order"]
+        order_epoch_id = _assert_us_order_epoch(order, active_epoch_id)
+        on = str(order.get("order_no") or on)
+        requested = int(requested_qty or order.get("qty_requested") or qty)
+        previous = int(order.get("qty_filled") or 0)
+        observed_cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
+        evidence = evidence_type or ("KIS_ORDER_CUMULATIVE_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
+        synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+        resolved_client_order_key = cok or order["client_order_key"] or ""
+        active = _active_fill_cumulatives_for_order(
+            trade_date=td,
+            order_no=on,
+            client_order_key=resolved_client_order_key,
+            symbol=sym,
+            side=side_u,
+            conn=conn,
+            trading_epoch_id=order_epoch_id,
+        )
+        if not synthetic and observed_cumulative > requested:
+            return {"status": "EVIDENCE_QUANTITY_OVERFLOW", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "requested_qty": requested, "entry_fence": True}
+        if not synthetic and _is_kis_order_cumulative_evidence(evidence) and observed_cumulative < int(active.get("actual", 0) or 0):
+            return {"status": "EVIDENCE_QUANTITY_REGRESSION", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "previous_actual_cumulative": int(active.get("actual", 0) or 0), "entry_fence": True}
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0 and observed_cumulative != int(active.get("actual_individual", 0) or 0):
+            return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                    "order_cumulative": observed_cumulative, "execution_actual_qty": int(active.get("actual_individual", 0) or 0)}
+        if not synthetic and observed_cumulative < int(active.get("synthetic", 0) or 0):
+            return {"status": "EVIDENCE_QUANTITY_CONFLICT", "requires_reconcile": True, "retry_order": False,
+                    "observed_actual_cumulative": observed_cumulative, "synthetic_cumulative": int(active.get("synthetic", 0) or 0)}
+        cumulative = max(previous, min(observed_cumulative, requested))
+        remaining = max(0, requested - cumulative)
+        status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
+        merged = {
+            **_parse_json_meta(order.get("meta")),
+            **(meta or {}),
+            "remaining_qty": remaining,
+        }
+        if order_epoch_id:
+            merged["trading_epoch_id"] = order_epoch_id
+        promotion = {"superseded": 0, "conflict": 0}
+        if not synthetic:
+            promotion = _supersede_synthetic_fills_for_actual(
+                trade_date=td,
+                order_no=on,
+                client_order_key=resolved_client_order_key,
+                cumulative=observed_cumulative,
+                conn=conn,
+                trading_epoch_id=order_epoch_id,
+            )
+        update_params = {
+            "status": status,
+            "qty": cumulative,
+            "price": price,
+            "meta": _json_param(merged),
+            "ts": now_utc,
+            "id": order["id"],
+            "trading_epoch_id": order_epoch_id,
+        }
+        update_sql = """UPDATE us_orders SET status = :status, qty_filled = :qty,
+            avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts
+            WHERE id = :id"""
+        if order_epoch_id:
+            update_sql += " AND trading_epoch_id=:trading_epoch_id"
+        conn.execute(text(update_sql), update_params)
+        if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+            _cost_basis = _safe_float_meta(merged, [
+                "cost_basis_price_usd", "pre_sell_avg_cost", "pre_sell_cost_basis_price_usd",
+                "broker_avg_price", "avg_cost", "entry_price",
+            ])
+            _realized_pnl = None
+            _realized_pct = None
+            if side_u == "SELL" and _cost_basis and _cost_basis > 0 and price > 0:
+                _realized_pnl = round((float(price) - float(_cost_basis)) * int(observed_cumulative), 4)
+                _realized_pct = round(((float(price) - float(_cost_basis)) / float(_cost_basis)) * 100.0, 4)
+            mark_params = {
+                "qty": observed_cumulative, "price": price, "cok": resolved_client_order_key,
+                "remaining": remaining, "requested": requested, "ts": now_utc,
+                "avg_cost_at_sell": _cost_basis,
+                "realized_pnl_usd": _realized_pnl,
+                "realized_pnl_pct": _realized_pct,
+                "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u,
+            }
+            if order_epoch_id:
+                mark_params["trading_epoch_id"] = order_epoch_id
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            conn.execute(
+                _mark_filled_by_reconcile_stmt(
+                    epoch_scoped=bool(order_epoch_id),
+                    include_pnl_columns=pnl_columns_available,
+                ),
+                mark_params,
+            )
+        fill_epoch_clause = " AND trading_epoch_id=:trading_epoch_id" if order_epoch_id else ""
+        fill_epoch_params = {"trading_epoch_id": order_epoch_id} if order_epoch_id else {}
+        actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
+            AND :order_no <> '' AND order_no=:order_no
+            AND symbol=:symbol AND side=:side
+        """ + fill_epoch_clause + """
+            AND NOT COALESCE((meta->>'is_synthetic')::boolean,
+                (meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
+            AND COALESCE((meta->>'cumulative_filled_qty')::integer, qty)=:cumulative LIMIT 1"""),
+            {"td": td, "order_no": on, "symbol": sym, "side": side_u,
+             "cumulative": observed_cumulative, **fill_epoch_params}).first()
+        delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
+        delta = max(0, observed_cumulative - delta_base)
+        fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
+            fill_delta = 0
+        if fill_delta and not actual:
+            fill_meta = (_actual_reconcile_fill_meta(source=source, side=side_u, qty=fill_delta,
+                          avg_price_usd=price, base_meta={**merged, "fill_evidence_type": evidence,
+                          "cumulative_filled_qty": observed_cumulative})
+                         if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
+                            client_order_key=resolved_client_order_key, side=side_u, qty=fill_delta,
+                            avg_price_usd=price, base_meta={**merged, "cumulative_filled_qty": observed_cumulative}))
+            fill_meta["cumulative_filled_qty"] = observed_cumulative
+            fill_meta["fill_evidence_type"] = evidence
+            fill_meta["is_synthetic"] = synthetic
+            if order_epoch_id:
+                fill_meta["trading_epoch_id"] = order_epoch_id
+            fill = {"symbol": sym, "side": side_u, "qty": fill_delta, "price_usd": price,
+                    "order_no": on, "client_order_key": resolved_client_order_key,
+                    "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence, "meta": fill_meta}
+            insert_params = {
+                "td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                "side": side_u, "qty": fill_delta, "price": price, "order_no": on,
+                "cok": resolved_client_order_key, "ts": now_utc,
+                "meta": _json_param(fill_meta),
+                "avg_cost_at_sell": fill_meta.get("cost_basis_price_usd"),
+                "realized_pnl_usd": fill_meta.get("realized_pnl_usd"),
+                "realized_pnl_pct": fill_meta.get("realized_pnl_pct"),
+                "idem": _us_fill_idempotency_key_text(fill, td),
+            }
+            pnl_columns_available = _us_fills_has_realized_pnl_columns(conn)
+            if order_epoch_id:
+                insert_params["trading_epoch_id"] = order_epoch_id
+                if pnl_columns_available:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                else:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,trading_epoch_id,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,:trading_epoch_id,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+            else:
+                if pnl_columns_available:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,avg_cost_at_sell,realized_pnl_usd,realized_pnl_pct,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:avg_cost_at_sell,:realized_pnl_usd,:realized_pnl_pct,:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+                else:
+                    insert_sql = """INSERT INTO us_fills
+                        (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                        VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
+                        ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+            conn.execute(text(insert_sql), insert_params)
+        rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
+        """ + fill_epoch_clause + """
+            AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+            {"td": td, "order_no": on, **fill_epoch_params}).mappings().all()
+        execution_qty = 0; cumulative_qty = 0; synthetic_qty = 0
+        for fill_after in rows_after:
+            meta_after = _parse_json_meta(fill_after.get("meta"))
+            qty_after = int(fill_after.get("qty") or 0)
+            evidence_after = str(meta_after.get("fill_evidence_type") or "")
+            if is_synthetic_fill_meta(meta_after):
+                synthetic_qty = max(synthetic_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
+            elif _is_kis_execution_evidence(evidence_after):
+                execution_qty += qty_after
+            else:
+                cumulative_qty = max(cumulative_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
+        active_total = execution_qty if execution_qty > 0 else cumulative_qty if cumulative_qty > 0 else synthetic_qty
+        if cumulative != active_total:
+            raise FillAccountingInvariantError({"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                    "order_qty_filled": cumulative, "active_fill_qty": active_total})
+        result = {"status": "OK", "order_status": status, "qty_filled": cumulative,
+                "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual),
+                "synthetic_superseded_count": int(promotion.get("superseded", 0)),
+                "evidence_quantity_conflict_count": int(promotion.get("conflict", 0)),
+                "fill_accounting": {"status": "OK", "order_qty_filled": cumulative, "active_fill_qty": active_total}}
+        if side_u == "SELL" and merged.get("profit_capture_stage"):
+            from trader.us.profit_capture import sync_profit_capture_stage_from_order
+            sync_profit_capture_stage_from_order(
+                trade_date=td, symbol=sym, position_lifecycle_id=str(merged.get("position_lifecycle_id") or ""),
+                client_order_key=resolved_client_order_key, broker_order_no=on,
+                profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
+                evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
+                _conn=conn,
+            )
+        claim_error = None
+        if not _skip_claim_update:
+            claim_error = _record_actual_fill_execution_claim(
+                merged, cumulative_qty=cumulative, requested_qty=requested,
+                evidence=evidence, _conn=conn,
+            )
+        if claim_error:
+            return {
+                **result,
+                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
+                "execution_claim_update_error": claim_error,
+                "requires_reconcile": True,
+                "retry_order": False,
+            }
+        return result
+    except FillAccountingInvariantError as exc:
+        if _conn is not None:
+            raise
+        logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
+        return exc.payload
+    except Exception as exc:
+        if _conn is not None:
+            raise
+        logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
+        return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
+
+def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
+    """Verify order qty_filled against active actual/synthetic accounting evidence."""
+    td, on = str(trade_date), str(order_no or "")
+    if not td or not on:
+        return {"status": "FILL_ACCOUNTING_IDENTITY_REQUIRED", "retry_order": False, "entry_fence": True}
+
+    def _qty_from_rows(rows: list[dict]) -> tuple[int, int, int]:
+        execution_qty = 0
+        cumulative_qty = 0
+        synthetic_qty = 0
+        for fill in rows:
+            meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else _parse_json_meta(fill.get("meta"))
+            if meta.get("accounting_active") is False:
+                continue
+            qty = int(fill.get("qty") or 0)
+            evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+            if is_synthetic_fill_meta(meta):
+                synthetic_qty = max(synthetic_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
+            elif _is_kis_execution_evidence(evidence):
+                execution_qty += qty
+            elif _is_kis_order_cumulative_evidence(evidence):
+                cumulative_qty = max(cumulative_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
+            else:
+                cumulative_qty = max(cumulative_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
+        if execution_qty > 0:
+            return execution_qty, 0, execution_qty
+        if cumulative_qty > 0:
+            return cumulative_qty, 0, cumulative_qty
+        return 0, synthetic_qty, synthetic_qty
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        orders = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and str(o.get("order_no") or "") == on]
+        if not orders:
+            return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+        order_qty = int(orders[-1].get("qty_filled") or 0)
+        rows = [f for f in _MEM_FILLS if str(f.get("trade_date") or "") == td and str(f.get("order_no") or "") == on]
+        actual_qty, synthetic_qty, total = _qty_from_rows(rows)
+    else:
+        with engine.begin() as conn:
+            active_epoch_id = _active_us_epoch(conn)
+            order_epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            order_epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "on": on}
+            if active_epoch_id:
+                order_params["epoch_id"] = active_epoch_id
+            row = conn.execute(
+                text("""SELECT qty_filled""" + order_epoch_select + """ FROM us_orders
+                        WHERE trade_date=:td AND order_no=:on""" + order_epoch_clause),
+                order_params,
+            ).mappings().first()
+            if not row:
+                return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+            order_epoch_id = _assert_us_order_epoch(dict(row), active_epoch_id)
+            order_qty = int(row.get("qty_filled") or 0)
+            fill_epoch_clause = " AND trading_epoch_id=:epoch_id" if order_epoch_id else ""
+            fill_params = {"td": td, "on": on}
+            if order_epoch_id:
+                fill_params["epoch_id"] = order_epoch_id
+            rows = [dict(r) for r in conn.execute(
+                text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
+                    """ + fill_epoch_clause + """
+                    AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+                fill_params,
+            ).mappings().all()]
+            actual_qty, synthetic_qty, total = _qty_from_rows(rows)
+    if order_qty != total:
+        return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                "report_consistency": "FAILED", "order_qty_filled": order_qty, "active_fill_qty": total,
+                "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
+    return {"status": "OK", "order_qty_filled": order_qty, "active_fill_qty": total,
+            "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
+
+def load_us_positions_by_symbols(
+    symbols: list[str],
+    as_of: str | None = None,
+) -> dict[str, dict]:
+    """symbol 목록에 대한 us_positions 최신 row 반환. meta top-level promote.
+
+    Args:
+        symbols: 조회할 symbol 목록
+        as_of: YYYY-MM-DD. None이면 오늘.
+
+    Returns:
+        {symbol: position_dict} — qty>0인 것만 포함
+    """
+    if not symbols:
+        return {}
+    td = as_of or _today()
+    engine = _get_engine_or_none()
+
+    rows: list[dict] = []
+    if engine is None:
+        rows = [
+            p for p in _MEM_POSITIONS
+            if p.get("symbol") in symbols
+            and (p.get("as_of") == td or p.get("trade_date") == td)
+            and int(p.get("qty", 0)) > 0
+        ]
+    else:
+        try:
+            with engine.begin() as conn:
+                epoch_id = _active_us_epoch(conn)
+                sql = """
+                        SELECT DISTINCT ON (symbol)
+                            *
+                        FROM us_positions
+                        WHERE symbol = ANY(:syms)
+                          AND as_of <= :td
+                          AND qty > 0
+                """
+                params = {"syms": list(symbols), "td": td}
+                if epoch_id:
+                    sql += " AND trading_epoch_id=:epoch_id"
+                    params["epoch_id"] = epoch_id
+                sql += " ORDER BY symbol, as_of DESC"
+                raw = conn.execute(text(sql), params)
+                rows = [dict(r._mapping) for r in raw]
+        except Exception as exc:
+            logger.error("[US_POSITIONS][BY_SYMBOLS][ERROR] %s", exc)
+            return {}
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        r = dict(row)
+        meta = r.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = {}
+        r["orderable_qty"] = meta.get("orderable_qty") or r.get("qty", 0)
+        r["sellable_qty"] = meta.get("sellable_qty") or r.get("orderable_qty", 0)
+        r["holding_qty"] = meta.get("holding_qty") or r.get("qty", 0)
+        r["entry_price"] = r.get("avg_cost") or meta.get("entry_price") or 0
+        r["current_price_usd"] = r.get("current_px") or 0
+        r["entry_price_source"] = meta.get("entry_price_source") or "us_positions_avg_cost"
+        sym = r.get("symbol")
+        if sym:
+            result[sym] = r
+    return result
+
+
+def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> list[dict]:
+    """Load open (pending/unfilled) orders for a symbol.
+    
+    EXCLUDES DRY_RUN orders - they are not real pending orders.
+    Only real unfilled orders (ACK, SENT, PARTIALLY_FILLED) are considered open.
+    """
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return [o for o in _MEM_ORDERS
+                if o.get("symbol") == symbol and o.get("trade_date") == td
+                and o.get("status") in ("ACK", "SENT", "PARTIALLY_FILLED")
+                and not o.get("dry_run", False)]
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            params = {"symbol": symbol, "td": td}
+            if epoch_id:
+                params["epoch_id"] = epoch_id
+            rows = conn.execute(
+                text("""
+                    SELECT * FROM us_orders
+                    WHERE symbol=:symbol AND trade_date=:td
+                      AND status IN ('ACK','SENT','PARTIALLY_FILLED')
+                      AND dry_run = FALSE
+                """ + epoch_clause),
+                params,
+            )
+            return [dict(r._mapping) for r in rows]
+    except Exception as exc:
+        logger.error("[US_ORDERS][OPEN_SYMBOL][ERROR] %s", exc)
+        return []
+
+
+def has_pending_order(symbol: str, trade_date: str | None = None) -> bool:
+    return len(load_open_orders_by_symbol(symbol, trade_date)) > 0
+
+
+def has_position(symbol: str, as_of: str | None = None) -> bool:
+    positions = load_positions(as_of)
+    return any(p.get("symbol") == symbol and int(p.get("qty", 0)) > 0 for p in positions)
+
+
+# ---------------------------------------------------------------------------
+# Reconcile log — schema: trade_date, status, message, meta
+# 금지 컬럼: position_count, total_pvs_usd, detail → meta에 저장
+# ---------------------------------------------------------------------------
+
+def save_reconcile_log(log: dict, trade_date: str | None = None) -> bool:
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        _MEM_RECONCILE_LOGS.append({**log, "trade_date": td})
+        return True
+    try:
+        meta = {
+            "position_count": log.get("position_count", 0),
+            "total_pvs_usd": float(log.get("total_pvs", 0)),
+            "detail": log.get("detail") or {},
+        }
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO us_reconcile_logs (trade_date, status, message, meta)
+                    VALUES (:td, :status, :message, CAST(:meta AS jsonb))
+                """),
+                {
+                    "td": td,
+                    "status": log.get("status", "OK"),
+                    "message": log.get("message", ""),
+                    "meta": _json_param(meta),
+                },
+            )
+        return True
+    except Exception as exc:
+        logger.error("[US_RECONCILE_LOG][SAVE][ERROR] %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Prep Run Management (미국장 prep → locked watchlist contract)
+# ---------------------------------------------------------------------------
+
+def save_us_prep_run(
+    trade_date: str,
+    agent_name: str = "us_prep",
+    mode: str = "prep",
+    env: str = "practice",
+    run_id: str | None = None,
+) -> str | None:
+    """
+    us_agent_runs 테이블에 prep run 시작을 기록.
+    
+    Returns:
+        run_id (str): 생성된 또는 전달된 run_id
+        None: DB 접근 실패
+    """
+    import uuid
+    actual_run_id = run_id or str(uuid.uuid4())
+    
+    engine = _get_engine_or_none()
+    if engine is None:
+        logger.warning("[US_PREP_RUN][SAVE] No DB, using in-memory run_id=%s", actual_run_id)
+        return actual_run_id
+    
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO us_agent_runs (run_id, trade_date, agent_name, mode, env, status, started_at)
+                    VALUES (:run_id, :trade_date, :agent_name, :mode, :env, 'STARTED', NOW())
+                """),
+                {
+                    "run_id": actual_run_id,
+                    "trade_date": trade_date,
+                    "agent_name": agent_name,
+                    "mode": mode,
+                    "env": env,
+                },
+            )
+        logger.info("[US_PREP_RUN][SAVE] run_id=%s trade_date=%s", actual_run_id, trade_date)
+        return actual_run_id
+    except Exception as exc:
+        logger.error("[US_PREP_RUN][SAVE][ERROR] %s", exc)
+        return None
+
+
+def finish_us_prep_run(
+    run_id: str,
+    status: str,
+    result: dict | None = None,
+) -> bool:
+    """
+    us_agent_runs 테이블의 prep run을 완료 상태로 업데이트.
+    
+    한국장 패턴 적용:
+    - prep result에 quality summary 저장
+    
+    Args:
+        run_id: prep run ID
+        status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
+        result: {
+            "watchlist_raw_count": int,
+            "watchlist_unique_count": int,
+            "watchlist_duplicate_count": int,
+            "score_nonzero_count": int,
+            "score_zero_count": int,
+            "score_missing_count": int,
+            "score_nonzero_ratio": float,
+            "score_contract_ok": bool,
+            "score_contract_errors": list,
+            "score_contract_warnings": list,
+            "trade_can_proceed": bool,
+            "data_error_count": int,
+            "critical_etf_errors": list,
+            "status_reason": str,
+            ...
+        }
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        logger.warning("[US_PREP_RUN][FINISH] No DB, run_id=%s status=%s", run_id, status)
+        return True
+    
+    normalized_status = str(status or "UNKNOWN").upper()
+    normalized_result: dict
+    if isinstance(result, dict):
+        normalized_result = dict(result)
+    elif isinstance(result, str):
+        normalized_result = {
+            "status": normalized_status,
+            "warnings": [],
+            "errors": [result],
+            "message": result,
+        }
+    elif result is None:
+        normalized_result = {}
+    else:
+        normalized_result = {
+            "status": normalized_status,
+            "warnings": [],
+            "errors": [str(result)],
+            "message": str(result),
+        }
+
+    def _to_str_list(value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, (list, tuple, set)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        text = str(value).strip()
+        return [text] if text else []
+
+    normalized_result["warnings"] = _to_str_list(normalized_result.get("warnings"))
+    normalized_result["errors"] = _to_str_list(normalized_result.get("errors"))
+    if not isinstance(normalized_result.get("status"), str) or not str(normalized_result.get("status") or "").strip():
+        normalized_result["status"] = normalized_status
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE us_agent_runs
+                    SET status = :status,
+                        result = CAST(:result AS jsonb),
+                        finished_at = NOW()
+                    WHERE run_id = :run_id
+                """),
+                {
+                    "run_id": run_id,
+                    "status": normalized_status,
+                    "result": _json_param(normalized_result),
+                },
+            )
+        
+        # Quality summary 로깅
+        if normalized_result:
+            watchlist_count = normalized_result.get("watchlist_unique_count") or normalized_result.get("watchlist_count") or 0
+            score_nonzero = normalized_result.get("score_nonzero_count", 0)
+            score_zero = normalized_result.get("score_zero_count", 0)
+            score_missing = normalized_result.get("score_missing_count", 0)
+            score_ratio = normalized_result.get("score_nonzero_ratio", 0.0)
+            trade_can_proceed = normalized_result.get("trade_can_proceed", False)
+            
+            logger.info(
+                "[US_PREP_RUN][FINISH] run_id=%s status=%s watchlist_unique=%d "
+                "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f trade_can_proceed=%d",
+                run_id, normalized_status, watchlist_count, score_nonzero, score_zero, score_missing,
+                score_ratio, int(trade_can_proceed)
+            )
+        else:
+            logger.info("[US_PREP_RUN][FINISH] run_id=%s status=%s", run_id, normalized_status)
+        
+        return True
+    except Exception as exc:
+        logger.error("[US_PREP_RUN][FINISH][ERROR] %s", exc)
+        return False
+
+
+def _set_statement_timeout(conn, timeout_ms: int) -> None:
+    """Set local statement timeout, with a mock-friendly path for unit tests."""
+    sql = f"SELECT set_config('statement_timeout', '{timeout_ms}ms', true)"
+    if conn.__class__.__module__.startswith("unittest.mock"):
+        conn.execute(sql)
+        return
+    conn.execute(
+        text("SELECT set_config('statement_timeout', :timeout_value, true)"),
+        {"timeout_value": f"{timeout_ms}ms"},
+    )
+
+
+def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
+    """
+    당일 최신 prep run 상태 조회.
+    
+    Args:
+        trade_date: 미국장 거래일
+        timeout_sec: DB query timeout (default: 20s)
+    
+    Returns:
+        {
+            "run_id": str,
+            "status": "OK|OK_WITH_WARNINGS|DEGRADED|ERROR|STARTED",
+            "trade_date": str,
+            "result": dict,
+            "started_at": str,
+            "finished_at": str | None
+        }
+        또는 빈 dict {}
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        logger.warning("[US_PREP_STATUS][LOAD] No DB, returning empty")
+        return {}
+    
+    load_started = time.monotonic()
+    
+    try:
+        with engine.begin() as conn:
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 5000))
+            # Use set_config() with true for local scope
+            _set_statement_timeout(conn, timeout_ms)
+            logger.info(
+                "[US_DB][STATEMENT_TIMEOUT] op=load_latest_us_prep_status timeout_ms=%d",
+                timeout_ms,
+            )
+            
+            row = conn.execute(
+                text("""
+                    SELECT run_id, status, trade_date, result, started_at, finished_at
+                    FROM us_agent_runs
+                    WHERE trade_date = :trade_date
+                      AND agent_name IN ('us_prep', 'us_prep_dual_agent')
+                      AND mode = 'prep'
+                    ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC
+                    LIMIT 1
+                """),
+                {"trade_date": trade_date},
+            ).fetchone()
+            
+            if row is None:
+                logger.info(
+                    "[US_PREP_STATUS][LOAD][MISSING] trade_date=%s status=UNKNOWN",
+                    trade_date,
+                )
+                return {}
+            
+            result = dict(row._mapping)
+            elapsed_ms = int((time.monotonic() - load_started) * 1000)
+            logger.info(
+                "[US_PREP_STATUS][LOAD][DONE] trade_date=%s status=%s run_id=%s elapsed_ms=%d",
+                trade_date, result.get("status"), result.get("run_id"), elapsed_ms
+            )
+            return result
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - load_started) * 1000)
+        err_msg = str(exc).lower()
+        if "statement timeout" in err_msg:
+            logger.error(
+                "[US_PREP_STATUS][LOAD][TIMEOUT] timeout_sec=%d elapsed_ms=%d",
+                timeout_sec,
+                elapsed_ms,
+            )
+            # Re-raise timeout errors so guard scripts can detect them
+            raise RuntimeError(f"US prep status load timeout after {timeout_sec}s") from exc
+        logger.error("[US_PREP_STATUS][LOAD][ERROR] %s elapsed_ms=%d", exc, elapsed_ms)
+        # Re-raise DB errors so guard scripts can distinguish from empty results
+        raise RuntimeError(f"US prep status load DB error: {exc}") from exc
+
+
+def load_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
+    """Backward-compatible alias for daily report prep status loading."""
+    return load_latest_us_prep_status(trade_date=trade_date, timeout_sec=timeout_sec)
+
+
+def clear_and_save_locked_us_watchlist(
+    entries: list[dict],
+    trade_date: str,
+    run_id: str,
+    prep_status: str,
+) -> dict:
+    """
+    기존 locked watchlist를 삭제하고 새로운 locked watchlist 저장.
+    
+    한국장 패턴을 미국장에 적용:
+    1. 저장 전 canonicalization
+    2. duplicate symbol dedupe (최고 score 선택)
+    3. raw/unique/duplicate count 분리
+    4. quality contract 검증
+    
+    Args:
+        entries: watchlist entries, each with symbol, exchange, strategy, score, rank, meta
+        trade_date: 미국장 거래일 (YYYY-MM-DD)
+        run_id: prep run_id
+        prep_status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
+    
+    Returns:
+        {
+            "raw_count": int,
+            "unique_count": int,
+            "duplicate_count": int,
+            "saved_count": int,
+            "score_nonzero": int,
+            "score_zero": int,
+            "score_missing": int,
+            "score_nonzero_ratio": float,
+            "contract_ok": bool,
+            "contract_errors": list[str],
+            "contract_warnings": list[str],
+            "trade_can_proceed": bool,
+        }
+    """
+    from trader.us.score_columns import canonicalize_us_watchlist_row, collect_us_score_nonzero_stats
+    from trader.us.symbols import normalize_symbol
+    from trader.us.watchlist_quality import validate_us_locked_watchlist_quality
+    
+    raw_count = len(entries)
+    
+    # ── 1. Canonicalization ────────────────────────────────────────────────────
+    canonical_rows = []
+    for e in entries:
+        try:
+            canonical = canonicalize_us_watchlist_row(e)
+            canonical_rows.append(canonical)
+        except Exception as exc:
+            logger.warning(
+                "[US_WATCHLIST][CANONICALIZE_FAIL] symbol=%s: %s",
+                e.get("symbol"), exc
+            )
+            # 실패해도 원본 추가 (backward compatible)
+            canonical_rows.append(e)
+    
+    # ── 2. Dedupe by symbol (max canonical score 선택) ─────────────────────────
+    best: dict[str, dict] = {}
+    for row in canonical_rows:
+        try:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if not sym:
+                continue
+            # normalize_symbol
+            try:
+                sym = normalize_symbol(sym)
+            except Exception:
+                pass
+            
+            score = float(row.get("score") or 0.0)
+            
+            prev = best.get(sym)
+            if prev is None or score > float(prev.get("score") or 0.0):
+                # meta에 dedupe 정보 추가
+                meta = row.get("meta", {})
+                if isinstance(meta, dict):
+                    if prev:
+                        meta["duplicate_count"] = meta.get("duplicate_count", 0) + 1
+                        prev_score = prev.get("score")
+                        meta["merged_scores"] = meta.get("merged_scores", []) + [prev_score]
+                    meta["selected_by"] = "max_canonical_score"
+                row["meta"] = meta
+                best[sym] = row
+        except Exception as exc:
+            logger.warning(
+                "[US_WATCHLIST][DEDUPE_FAIL] row=%s: %s",
+                row.get("symbol"), exc
+            )
+    
+    deduped_rows = sorted(
+        best.values(),
+        key=lambda r: float(r.get("score") or 0.0),
+        reverse=True,
+    )
+    
+    unique_count = len(deduped_rows)
+    duplicate_count = raw_count - unique_count
+    
+    logger.info(
+        "[US_WATCHLIST][CANONICALIZE] stage=pre_save raw_count=%d unique_count=%d duplicate_count=%d",
+        raw_count, unique_count, duplicate_count
+    )
+    
+    # ── 3. Score stats 수집 ────────────────────────────────────────────────────
+    stats = collect_us_score_nonzero_stats(deduped_rows)
+    score_nonzero = stats["score_nonzero"]
+    score_zero = stats["score_zero"]
+    score_missing = stats["score_missing"]
+    score_nonzero_ratio = stats["score_nonzero_ratio"]
+
+    contract = validate_us_locked_watchlist_quality(deduped_rows, stage="prep_save")
+    contract_ok = bool(contract.get("ok"))
+    contract_errors = list(contract.get("errors") or [])
+    contract_warnings = list(contract.get("warnings") or [])
+    trade_can_proceed = bool(contract.get("trade_can_proceed"))
+    
+    logger.info(
+        "[US_WATCHLIST][QUALITY] stage=pre_save unique=%d score_nonzero=%d score_zero=%d missing=%d ratio=%.4f",
+        unique_count, score_nonzero, score_zero, score_missing, score_nonzero_ratio
+    )
+
+    if raw_count > 0 and score_nonzero == 0 and "[prep_save] watchlist_score_zero_mass: nonzero=0 unique=0 ratio=0.0000" not in contract_errors:
+        logger.error(
+            "[US_WATCHLIST][CONTRACT_FAIL] [prep_save] zero_mass_contract_fail: raw=%d unique=%d score_nonzero=%d",
+            raw_count,
+            unique_count,
+            score_nonzero,
+        )
+    
+    # ── 4. DB 저장 ─────────────────────────────────────────────────────────────
+    engine = _get_engine_or_none()
+    if engine is None:
+        for e in deduped_rows:
+            _MEM_WATCHLIST.append({
+                **e,
+                "trade_date": trade_date,
+                "locked": True,
+                "prep_status": prep_status,
+                "run_id": run_id,
+                "meta": _merge_us_daily_metrics_meta(e),
+            })
+        logger.info("[US_WATCHLIST][LOCK_SAVE] count=%d (in-memory)", unique_count)
+        return {
+            "raw_count": raw_count,
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "saved_count": unique_count,
+            "score_nonzero": score_nonzero,
+            "score_zero": score_zero,
+            "score_missing": score_missing,
+            "score_nonzero_ratio": score_nonzero_ratio,
+            "contract_ok": contract_ok,
+            "contract_errors": contract_errors,
+            "contract_warnings": contract_warnings,
+            "trade_can_proceed": trade_can_proceed,
+        }
+    
+    count = 0
+    try:
+        with engine.begin() as conn:
+            # 기존 locked watchlist 삭제 (같은 trade_date + locked=true 범위)
+            conn.execute(
+                text("DELETE FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
+                {"td": trade_date},
+            )
+            
+            # 새 locked watchlist 저장
+            for rank, e in enumerate(deduped_rows, start=1):
+                data_source = e.get("meta", {}).get("data_source", "kis") if isinstance(e.get("meta"), dict) else "kis"
+                
+                # meta에 rank, prep_run_id 추가
+                meta = _merge_us_daily_metrics_meta(e)
+                if isinstance(meta, dict):
+                    meta["prep_run_id"] = run_id
+                    meta["locked_rank"] = rank
+                
+                conn.execute(
+                    text("""
+                        INSERT INTO us_watchlist 
+                        (trade_date, symbol, exchange, strategy, score, meta, 
+                         prep_status, locked, run_id, data_source)
+                        VALUES (:td, :symbol, :exchange, :strategy, :score, CAST(:meta AS jsonb),
+                                :prep_status, TRUE, :run_id, :data_source)
+                        ON CONFLICT (trade_date, symbol, strategy)
+                        DO UPDATE SET
+                            score = EXCLUDED.score,
+                            meta = EXCLUDED.meta,
+                            prep_status = EXCLUDED.prep_status,
+                            locked = EXCLUDED.locked,
+                            run_id = EXCLUDED.run_id,
+                            data_source = EXCLUDED.data_source,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "td": trade_date,
+                        "symbol": e["symbol"],
+                        "exchange": e.get("exchange", "NASDAQ"),
+                        "strategy": e.get("strategy", "unknown"),
+                        "score": e.get("score"),
+                        "meta": _json_param(meta),
+                        "prep_status": prep_status,
+                        "run_id": run_id,
+                        "data_source": data_source,
+                    },
+                )
+                count += 1
+            
+            # Roundtrip 검증: 저장된 row 수와 deduped unique count가 일치하는지 확인
+            verify_row = conn.execute(
+                text("""
+                    SELECT COUNT(*) as cnt,
+                           COUNT(DISTINCT symbol) as uniq_symbols
+                    FROM us_watchlist
+                    WHERE trade_date = :td AND locked = TRUE AND run_id = :run_id
+                """),
+                {"td": trade_date, "run_id": run_id},
+            ).fetchone()
+            
+            verify_count = verify_row[0] if verify_row else 0
+            uniq_symbols = verify_row[1] if verify_row else 0
+            
+            if verify_count != unique_count:
+                logger.error(
+                    "[US_WATCHLIST][ROUNDTRIP_FAIL] expected=%d saved=%d",
+                    unique_count, verify_count
+                )
+                raise RuntimeError(
+                    f"[US_WATCHLIST][ROUNDTRIP_FAIL] expected={unique_count} saved={verify_count}"
+                )
+            
+            logger.info(
+                "[US_WATCHLIST][ROUNDTRIP_OK] rows=%d uniq_symbols=%d",
+                verify_count, uniq_symbols
+            )
+        
+        logger.info(
+            "[US_WATCHLIST][LOCK_SAVE] trade_date=%s raw=%d unique=%d duplicate=%d score_nonzero=%d",
+            trade_date, raw_count, unique_count, duplicate_count, score_nonzero
+        )
+        
+        return {
+            "raw_count": raw_count,
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "saved_count": unique_count,  # backward compatible
+            "score_nonzero": score_nonzero,
+            "score_zero": score_zero,
+            "score_missing": score_missing,
+            "score_nonzero_ratio": score_nonzero_ratio,
+            "contract_ok": contract_ok,
+            "contract_errors": contract_errors,
+            "contract_warnings": contract_warnings,
+            "trade_can_proceed": trade_can_proceed,
+        }
+    except Exception as exc:
+        logger.error("[US_WATCHLIST][LOCK_SAVE][ERROR] %s", exc)
+        return {
+            "raw_count": raw_count,
+            "unique_count": 0,
+            "duplicate_count": 0,
+            "saved_count": 0,
+            "score_nonzero": 0,
+            "score_zero": 0,
+            "score_missing": 0,
+            "score_nonzero_ratio": 0.0,
+            "contract_ok": False,
+            "contract_errors": [str(exc)],
+            "contract_warnings": [],
+            "trade_can_proceed": False,
+        }
+
+
+def load_locked_us_watchlist(
+    trade_date: str,
+    min_count: int = 1,
+    allow_degraded: bool = True,
+    timeout_sec: int = 20,
+) -> list[dict]:
+    """
+    당일 locked watchlist 조회.
+    
+    한국장 패턴 적용:
+    1. DB 로드
+    2. 로드 후 canonicalization (DB에서 Decimal/string으로 온 score를 복구)
+    3. 최소 count 검증
+    
+    Args:
+        trade_date: 미국장 거래일
+        min_count: 최소 항목 수
+        allow_degraded: DEGRADED 상태 허용 여부
+    
+    Returns:
+        list of dicts with symbol, exchange, strategy, score, meta, prep_status, run_id, data_source
+        빈 리스트 [] if not found or count < min_count
+    """
+    from trader.us.score_columns import canonicalize_us_watchlist_row
+    load_started = time.monotonic()
+    logger.info(
+        "[US_WATCHLIST][LOCK_LOAD][START] trade_date=%s timeout_sec=%d",
+        trade_date,
+        timeout_sec,
+    )
+    
+    engine = _get_engine_or_none()
+    if engine is None:
+        mem_locked = [w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date]
+        elapsed_ms = int((time.monotonic() - load_started) * 1000)
+        logger.info(
+            "[US_WATCHLIST][LOCK_LOAD][DONE] count=%d elapsed_ms=%d source=in_memory",
+            len(mem_locked),
+            elapsed_ms,
+        )
+        return mem_locked
+    
+    try:
+        with engine.begin() as conn:
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 5000))
+            # Use set_config() with true for local scope
+            _set_statement_timeout(conn, timeout_ms)
+            logger.info(
+                "[US_DB][STATEMENT_TIMEOUT] op=load_locked_us_watchlist timeout_ms=%d",
+                timeout_ms,
+            )
+            rows = conn.execute(
+                text("""
+                    SELECT symbol, exchange, strategy, score, meta, 
+                           prep_status, run_id, data_source, created_at, updated_at
+                    FROM us_watchlist
+                    WHERE trade_date = :td
+                      AND locked = TRUE
+                    ORDER BY score DESC NULLS LAST, symbol ASC
+                """),
+                {"td": trade_date},
+            ).fetchall()
+            
+            raw_result = [dict(r._mapping) for r in rows]
+            
+            if len(raw_result) < min_count:
+                elapsed_ms = int((time.monotonic() - load_started) * 1000)
+                logger.warning(
+                    "[US_WATCHLIST][LOCK_LOAD][INSUFFICIENT] trade_date=%s count=%d min=%d elapsed_ms=%d",
+                    trade_date, len(raw_result), min_count, elapsed_ms
+                )
+                logger.info(
+                    "[US_WATCHLIST][LOCK_LOAD][DONE] trade_date=%s count=%d status=INSUFFICIENT elapsed_ms=%d",
+                    trade_date, len(raw_result), elapsed_ms
+                )
+                return []
+            
+            # DEGRADED 체크
+            if raw_result and not allow_degraded:
+                first_status = raw_result[0].get("prep_status")
+                if first_status == "DEGRADED":
+                    elapsed_ms = int((time.monotonic() - load_started) * 1000)
+                    logger.warning(
+                        "[US_WATCHLIST][LOCK_LOAD][DEGRADED_BLOCKED] trade_date=%s status=%s elapsed_ms=%d",
+                        trade_date, first_status, elapsed_ms
+                    )
+                    logger.info(
+                        "[US_WATCHLIST][LOCK_LOAD][DONE] trade_date=%s count=%d status=DEGRADED_BLOCKED elapsed_ms=%d",
+                        trade_date, len(raw_result), elapsed_ms
+                    )
+                    return []
+            
+            # ── Canonicalization (DB 로드 후 score alias 복구) ──────────────────
+            canonical_result = []
+            for row in raw_result:
+                try:
+                    canonical = canonicalize_us_watchlist_row(row)
+                    canonical_result.append(canonical)
+                except Exception as exc:
+                    logger.warning(
+                        "[US_WATCHLIST][LOAD_CANONICALIZE_FAIL] symbol=%s: %s",
+                        row.get("symbol"), exc
+                    )
+                    # 실패해도 원본 추가 (backward compatible)
+                    canonical_result.append(row)
+            
+            # Score stats 로깅
+            from trader.us.score_columns import collect_us_score_nonzero_stats
+            stats = collect_us_score_nonzero_stats(canonical_result)
+            
+            logger.info(
+                "[US_WATCHLIST][LOCK_LOAD][DONE] trade_date=%s count=%d status=%s "
+                "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f elapsed_ms=%d",
+                trade_date, len(canonical_result), 
+                canonical_result[0].get("prep_status") if canonical_result else "N/A",
+                stats["score_nonzero"], stats["score_zero"], stats["score_missing"],
+                stats["score_nonzero_ratio"],
+                int((time.monotonic() - load_started) * 1000),
+            )
+            
+            return canonical_result
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - load_started) * 1000)
+        err_msg = str(exc).lower()
+        if "statement timeout" in err_msg:
+            logger.error(
+                "[US_WATCHLIST][LOCK_LOAD][TIMEOUT] timeout_sec=%d elapsed_ms=%d",
+                timeout_sec,
+                elapsed_ms,
+            )
+            # Re-raise timeout errors so guard scripts can detect them
+            raise RuntimeError(f"US watchlist load timeout after {timeout_sec}s") from exc
+        logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s elapsed_ms=%d", exc, elapsed_ms)
+        # Re-raise DB errors so guard scripts can distinguish from empty results
+        raise RuntimeError(f"US watchlist load DB error: {exc}") from exc
+
+
+def load_locked_us_watchlist_strict(
+    trade_date: str,
+    expected_run_id: str | None = None,
+    min_count: int = 10,
+    allow_degraded: bool = False,
+    require_status: tuple = ("OK", "OK_WITH_WARNINGS"),
+) -> dict:
+    """Strict locked watchlist 조회 및 contract 검증.
+    
+    한국장 PB1처럼 엄격한 입력 검증을 수행합니다.
+    
+    Args:
+        trade_date: 미국장 거래일
+        expected_run_id: 기대하는 prep run_id (있으면 검증)
+        min_count: 최소 항목 수
+        allow_degraded: DEGRADED 상태 허용 여부
+        require_status: 허용되는 prep_status tuple
+        
+    Returns:
+        {
+            "status": "OK" | "ERROR",
+            "rows": list[dict],
+            "run_id": str,
+            "trade_date": str,
+            "count": int,
+            "source": "db_us_locked_watchlist",
+            "errors": list[str],
+            "warnings": list[str],
+        }
+    """
+    engine = _get_engine_or_none()
+    result = {
+        "status": "ERROR",
+        "rows": [],
+        "run_id": "",
+        "trade_date": trade_date,
+        "count": 0,
+        "source": "db_us_locked_watchlist",
+        "errors": [],
+        "warnings": [],
+    }
+    
+    if engine is None:
+        # in-memory fallback
+        mem_locked = [w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date]
+        if len(mem_locked) < min_count:
+            result["errors"].append(f"in-memory count {len(mem_locked)} < min {min_count}")
+            logger.warning("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] in-memory insufficient")
+            return result
+        result["status"] = "OK"
+        result["rows"] = mem_locked
+        result["count"] = len(mem_locked)
+        return result
+    
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT symbol, exchange, strategy, score, rank, meta, 
+                           prep_status, run_id, data_source, locked, created_at, updated_at
+                    FROM us_watchlist
+                    WHERE trade_date = :td
+                      AND locked = TRUE
+                    ORDER BY rank ASC, score DESC NULLS LAST, symbol ASC
+                """),
+                {"td": trade_date},
+            ).fetchall()
+            
+            rows_list = [dict(r._mapping) for r in rows]
+            
+            # 최소 개수 검증
+            if len(rows_list) < min_count:
+                result["errors"].append(f"count {len(rows_list)} < min {min_count}")
+                logger.error(
+                    "[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] trade_date=%s count=%d min=%d",
+                    trade_date, len(rows_list), min_count
+                )
+                return result
+            
+            # run_id 확인
+            run_ids = {r.get("run_id") for r in rows_list if r.get("run_id")}
+            if not run_ids:
+                result["errors"].append("no run_id found in watchlist rows")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] no_run_id")
+                return result
+            
+            if len(run_ids) > 1:
+                result["warnings"].append(f"multiple run_ids: {run_ids}")
+                logger.warning("[US_WATCHLIST][LOCK_LOAD][STRICT][WARN] multiple_run_ids=%s", run_ids)
+            
+            common_run_id = rows_list[0].get("run_id", "")
+            
+            # expected_run_id 검증
+            if expected_run_id and common_run_id != expected_run_id:
+                result["errors"].append(f"run_id mismatch: expected={expected_run_id} actual={common_run_id}")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] run_id_mismatch")
+                return result
+            
+            # prep_status 검증
+            prep_statuses = {r.get("prep_status") for r in rows_list if r.get("prep_status")}
+            if prep_statuses:
+                common_status = rows_list[0].get("prep_status", "")
+                if common_status not in require_status:
+                    if not allow_degraded or common_status != "DEGRADED":
+                        result["errors"].append(f"prep_status={common_status} not in {require_status}")
+                        logger.error(
+                            "[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] prep_status=%s not_allowed",
+                            common_status
+                        )
+                        return result
+            
+            # schema 검증
+            required_fields = ["symbol", "exchange", "score", "rank", "locked"]
+            for idx, row in enumerate(rows_list):
+                for field in required_fields:
+                    if field not in row or row[field] is None:
+                        result["errors"].append(f"row {idx} missing field: {field}")
+                        logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] missing_field=%s row=%d", field, idx)
+                        return result
+            
+            # symbol 중복 검증
+            symbols = [r["symbol"] for r in rows_list]
+            if len(symbols) != len(set(symbols)):
+                result["errors"].append("duplicate symbols found")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] duplicate_symbols")
+                return result
+            
+            # rank 중복 검증
+            ranks = [r.get("rank") for r in rows_list if r.get("rank") is not None]
+            if len(ranks) != len(set(ranks)):
+                result["errors"].append("duplicate ranks found")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] duplicate_ranks")
+                return result
+            
+            # 성공
+            result["status"] = "OK"
+            result["rows"] = rows_list
+            result["run_id"] = common_run_id
+            result["count"] = len(rows_list)
+            
+            logger.info(
+                "[US_WATCHLIST][LOCK_LOAD][STRICT][OK] trade_date=%s run_id=%s count=%d status=%s",
+                trade_date, common_run_id, len(rows_list), rows_list[0].get("prep_status") if rows_list else "N/A"
+            )
+            
+            return result
+            
+    except Exception as exc:
+        result["errors"].append(f"exception: {exc}")
+        logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][ERROR] %s", exc)
+        return result
+
+
+def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:
+    """us_watchlist 항목 수 조회."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        if locked_only:
+            return len([w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date])
+        return len([w for w in _MEM_WATCHLIST if w.get("trade_date") == trade_date])
+    
+    try:
+        with engine.connect() as conn:
+            if locked_only:
+                row = conn.execute(
+                    text("SELECT COUNT(*) as cnt FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
+                    {"td": trade_date},
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    text("SELECT COUNT(*) as cnt FROM us_watchlist WHERE trade_date = :td"),
+                    {"td": trade_date},
+                ).fetchone()
+            return row[0] if row else 0
+    except Exception as exc:
+        logger.error("[US_WATCHLIST][COUNT][ERROR] %s", exc)
+        return 0
+
+
+def _pick_us_orders_side_col(conn: object) -> "str | None":
+    """us_orders 테이블에서 실제 존재하는 side/direction 컬럼을 반환한다.
+
+    후보 우선순위: side > order_side > direction > buy_sell > ord_dvsn
+    없으면 None 반환.
+    """
+    try:
+        rows = conn.execute(
+            text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'us_orders'
+            """)
+        ).fetchall()
+        existing = {r[0] for r in rows}
+    except Exception as exc:
+        logger.warning("[US_AM_ALREADY_RAN][SCHEMA_FETCH_ERROR] %s", exc)
+        return None
+
+    for candidate in ("side", "order_side", "direction", "buy_sell", "ord_dvsn"):
+        if candidate in existing:
+            return candidate
+    return None
+
+
+def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
+    """Check if US AM session already ran for the given trade_date.
+
+    오직 us_agent_runs의 완료 레코드만 확인한다.
+    buy_orders 유무는 already_ran 판단에 사용하지 않는다.
+
+    이유: buy_orders > 0이어도 exit monitoring은 반드시 계속해야 한다.
+    buy_orders 기반 entry 차단은 check_us_am_entry_blocked()를 사용한다.
+
+    FAIL-CLOSED: guard 조회 실패 시 already_ran=True 반환 (중복 실행 차단).
+
+    Returns:
+        dict with keys: already_ran (bool), guard_status, reason
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        # In-memory: 세션 완료 마커가 없으므로 already_ran=False
+        return {"already_ran": False, "guard_status": "IN_MEMORY", "reason": "in_memory_no_session_marker"}
+
+    try:
+        with engine.connect() as conn:
+            # Set statement timeout
+            conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
+
+            # us_agent_runs 완료 레코드만 확인 — buy_orders 체크 제거
+            agent_row = conn.execute(
+                text("""
+                    SELECT run_id, status, finished_at, result
+                    FROM us_agent_runs
+                    WHERE trade_date = :td
+                      AND (mode = 'session-am' OR agent_name = 'am')
+                      AND status = 'OK'
+                      AND COALESCE(result->>'trade_runner_started', '0') IN ('1', 'true', 'True')
+                      AND COALESCE(result->>'trade_status', status) = 'OK'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """),
+                {"td": trade_date},
+            ).fetchone()
+
+            if agent_row:
+                logger.info(
+                    "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found agent_run run_id=%s status=%s",
+                    trade_date, agent_row[0], agent_row[1]
+                )
+                return {
+                    "already_ran": True,
+                    "guard_status": "FOUND_AGENT_RUN",
+                    "reason": f"agent_run_status={agent_row[1]} runner_started=1",
+                }
+
+            # buy_orders 체크를 already_ran에서 제거
+            # 당일 BUY 주문 존재 여부는 check_us_am_entry_blocked()로 별도 확인
+            return {"already_ran": False, "guard_status": "NOT_FOUND", "reason": "no_prior_run"}
+
+    except Exception as exc:
+        logger.exception("[US_AM_ALREADY_RAN][FAILED_CLOSED] duplicate guard failed trade_date=%s", trade_date)
+        return {
+            "already_ran": True,
+            "guard_status": "FAILED_CLOSED",
+            "reason": "duplicate_guard_error",
+            "error": str(exc),
+        }
+
+
+def check_us_am_entry_blocked(trade_date: str, timeout_sec: int = 5) -> dict:
+    """당일 BUY 주문이 이미 있으면 entry를 차단한다 (세션 전체 종료 금지).
+
+    check_us_am_already_ran()과 다르다:
+    - already_ran → 세션 전체 skip (exit monitoring도 꺼짐)  ← 이걸 막는다
+    - entry_blocked → 신규 BUY만 차단, exit monitoring 계속  ← 이 함수의 역할
+
+    FAIL-OPEN: 조회 실패 시 entry_blocked=False (entry 허용) — exit monitoring 우선.
+
+    Returns:
+        dict with keys:
+          entry_blocked (bool): True이면 신규 BUY intent 생성 금지
+          buy_orders_count (int): 당일 BUY 주문 수
+          guard_status: 상태 문자열
+          reason: 차단 사유
+    """
+    try:
+        count = get_today_buy_orders_count(trade_date=trade_date)
+        return {
+            "entry_blocked": count > 0,
+            "buy_orders_count": count,
+            "guard_status": "FOUND_BUY_ORDERS" if count > 0 else "NOT_FOUND",
+            "reason": f"buy_orders_count={count}" if count > 0 else "no_buy_orders",
+        }
+    except Exception as exc:
+        logger.warning(
+            "[US_AM_ENTRY_BLOCKED][WARN] entry block check failed trade_date=%s error=%s "
+            "(fail-open → entry_blocked=False)",
+            trade_date, exc,
+        )
+        return {
+            "entry_blocked": False,
+            "buy_orders_count": 0,
+            "guard_status": "FAILED_OPEN",
+            "reason": "entry_block_check_error",
+        }
+
+
+def get_today_buy_orders_count(trade_date: str | None = None, env: str = "practice") -> int:
+    """당일 BUY 주문 수의 canonical 조회 함수."""
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return sum(
+            1
+            for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
+        )
+
+    try:
+        with engine.connect() as conn:
+            side_col = _pick_us_orders_side_col(conn)
+            if side_col:
+                order_row = conn.execute(
+                    text(f"""
+                        SELECT COUNT(*) AS cnt
+                        FROM us_orders
+                        WHERE trade_date = :td
+                          AND {side_col} = 'BUY'
+                    """),
+                    {"td": td},
+                ).fetchone()
+                count = int(order_row[0]) if order_row else 0
+                logger.info(
+                    "[US_BUY_ORDERS][COUNT] trade_date=%s buy_orders_count=%d (col=%s env=%s)",
+                    td,
+                    count,
+                    side_col,
+                    env,
+                )
+                return count
+            else:
+                logger.warning(
+                    "[US_BUY_ORDERS][SCHEMA_FALLBACK] side column missing trade_date=%s env=%s",
+                    td,
+                    env,
+                )
+            return 0
+
+    except Exception as exc:
+        logger.warning(
+            "[US_BUY_ORDERS][WARN] trade_date=%s env=%s error=%s returning=0",
+            td,
+            env,
+            exc,
+        )
+        return 0
+
+
+def get_today_broker_progress_order_count(trade_date: str | None = None, env: str = "practice") -> int:
+    """Count same-day orders that already reached submitted/ack/fill progression."""
+    td = trade_date or _today()
+    progressed_statuses = {
+        "SUBMITTED", "SENT",
+        "ACK", "ACKED", "ACCEPTED",
+        "PARTIALLY_FILLED", "FILLED",
+    }
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        return sum(
+            1
+            for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and str(o.get("status") or "").upper() in progressed_statuses
+        )
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM us_orders
+                    WHERE trade_date = :td
+                      AND UPPER(COALESCE(status, '')) IN (
+                        'SUBMITTED','SENT','ACK','ACKED','ACCEPTED','PARTIALLY_FILLED','FILLED'
+                      )
+                    """
+                ),
+                {"td": td},
+            ).fetchone()
+            count = int(row[0]) if row else 0
+            logger.info(
+                "[US_BROKER_PROGRESS_ORDERS][COUNT] trade_date=%s progressed_count=%d env=%s",
+                td,
+                count,
+                env,
+            )
+            return count
+    except Exception as exc:
+        logger.warning(
+            "[US_BROKER_PROGRESS_ORDERS][WARN] trade_date=%s env=%s error=%s returning=0",
+            td,
+            env,
+            exc,
+        )
+        return 0
+
+
+def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
+    """Check if US Afternoon session already ran for the given trade_date.
+
+    Checks:
+    1. us_agent_runs for mode='session-afternoon' or agent_name='afternoon'
+
+    FAIL-CLOSED: guard 조회 실패 시 already_ran=True 반환.
+
+    Returns:
+        dict with keys: already_ran (bool), guard_status, reason
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        found = any(
+            o.get("trade_date") == trade_date
+            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
+            for o in _MEM_ORDERS
+        )
+        return {"already_ran": found, "guard_status": "IN_MEMORY", "reason": "in_memory_check"}
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
+
+            agent_row = conn.execute(
+                text("""
+                    SELECT run_id, status, finished_at, result
+                    FROM us_agent_runs
+                    WHERE trade_date = :td
+                      AND (mode = 'session-afternoon' OR agent_name = 'afternoon')
+                      AND status IN ('OK', 'OK_WITH_WARNINGS')
+                      AND COALESCE(result->>'trade_runner_started', '0') IN ('1', 'true', 'True')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """),
+                {"td": trade_date},
+            ).fetchone()
+
+            if agent_row:
+                logger.info(
+                    "[US_AFTERNOON_ALREADY_RAN][CHECK] trade_date=%s found agent_run run_id=%s status=%s",
+                    trade_date, agent_row[0], agent_row[1],
+                )
+                return {
+                    "already_ran": True,
+                    "guard_status": "FOUND_AGENT_RUN",
+                    "reason": f"agent_run_status={agent_row[1]} runner_started=1",
+                }
+
+            return {"already_ran": False, "guard_status": "NOT_FOUND", "reason": "no_prior_run"}
+
+    except Exception as exc:
+        logger.exception(
+            "[US_AFTERNOON_ALREADY_RAN][FAILED_CLOSED] duplicate guard failed trade_date=%s",
+            trade_date,
+        )
+        return {
+            "already_ran": True,
+            "guard_status": "FAILED_CLOSED",
+            "reason": "duplicate_guard_error",
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
+# US Exit Position Resolver DB helpers
+# ---------------------------------------------------------------------------
+
+def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
+    """Verify order qty_filled against active actual/synthetic accounting evidence."""
+    td, on = str(trade_date), str(order_no or "")
+    if not td or not on:
+        return {"status": "FILL_ACCOUNTING_IDENTITY_REQUIRED", "retry_order": False, "entry_fence": True}
+
+    def _qty_from_rows(rows: list[dict]) -> tuple[int, int, int]:
+        execution_qty = 0
+        cumulative_qty = 0
+        synthetic_qty = 0
+        for fill in rows:
+            meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else _parse_json_meta(fill.get("meta"))
+            if meta.get("accounting_active") is False:
+                continue
+            qty = int(fill.get("qty") or 0)
+            evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+            if is_synthetic_fill_meta(meta):
+                synthetic_qty = max(synthetic_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
+            elif _is_kis_execution_evidence(evidence):
+                execution_qty += qty
+            elif _is_kis_order_cumulative_evidence(evidence):
+                cumulative_qty = max(cumulative_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
+            else:
+                cumulative_qty = max(cumulative_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
+        if execution_qty > 0:
+            return execution_qty, 0, execution_qty
+        if cumulative_qty > 0:
+            return cumulative_qty, 0, cumulative_qty
+        return 0, synthetic_qty, synthetic_qty
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        orders = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and str(o.get("order_no") or "") == on]
+        if not orders:
+            return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+        order_qty = int(orders[-1].get("qty_filled") or 0)
+        rows = [f for f in _MEM_FILLS if str(f.get("trade_date") or "") == td and str(f.get("order_no") or "") == on]
+        actual_qty, synthetic_qty, total = _qty_from_rows(rows)
+    else:
+        with engine.begin() as conn:
+            active_epoch_id = _active_us_epoch(conn)
+            order_epoch_select = ", trading_epoch_id" if active_epoch_id else ""
+            order_epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+            order_params = {"td": td, "on": on}
+            if active_epoch_id:
+                order_params["epoch_id"] = active_epoch_id
+            row = conn.execute(
+                text("""SELECT qty_filled""" + order_epoch_select + """ FROM us_orders
+                        WHERE trade_date=:td AND order_no=:on""" + order_epoch_clause),
+                order_params,
+            ).mappings().first()
+            if not row:
+                return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+            order_epoch_id = _assert_us_order_epoch(dict(row), active_epoch_id)
+            order_qty = int(row.get("qty_filled") or 0)
+            fill_epoch_clause = " AND trading_epoch_id=:epoch_id" if order_epoch_id else ""
+            fill_params = {"td": td, "on": on}
+            if order_epoch_id:
+                fill_params["epoch_id"] = order_epoch_id
+            rows = [dict(r) for r in conn.execute(
+                text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
+                    """ + fill_epoch_clause + """
+                    AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+                fill_params,
+            ).mappings().all()]
+            actual_qty, synthetic_qty, total = _qty_from_rows(rows)
+    if order_qty != total:
+        return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                "report_consistency": "FAILED", "order_qty_filled": order_qty, "active_fill_qty": total,
+                "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
+    return {"status": "OK", "order_qty_filled": order_qty, "active_fill_qty": total,
+            "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
+
+def load_us_positions_by_symbols(
+    symbols: list[str],
+    as_of: str | None = None,
+) -> dict[str, dict]:
+    """us_positions에서 심볼별 최신 포지션 조회.
+
+    Parameters
+    ----------
+    symbols : list[str]
+        조회할 심볼 목록 (대문자 정규화)
+    as_of : str | None
+        특정 날짜 기준 (None이면 최신)
+
+    Returns
+    -------
+    dict[symbol, row_dict]
+    """
+    if not symbols:
+        return {}
+
+    normalized = [str(s).strip().upper() for s in symbols if s]
+    engine = _get_engine_or_none()
+
+    if engine is None:
+        # in-memory fallback
+        result: dict[str, dict] = {}
+        for pos in _MEM_POSITIONS:
+            sym = str(pos.get("symbol") or "").strip().upper()
+            if sym in normalized:
+                if sym not in result:
+                    result[sym] = pos
+        return result
+
+    try:
+        with engine.connect() as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            if as_of:
+                rows = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (symbol)
+                            symbol, exchange, qty, avg_cost, trading_epoch_id,
+                            current_px, unrealized_pnl_usd, meta, as_of
+                        FROM us_positions
+                        WHERE symbol = ANY(:syms)
+                          AND qty > 0
+                          AND as_of <= :as_of
+                    """ + epoch_clause + """
+                        ORDER BY symbol, as_of DESC
+                    """),
+                    {"syms": normalized, "as_of": as_of, **epoch_params},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (symbol)
+                            symbol, exchange, qty, avg_cost, trading_epoch_id,
+                            current_px, unrealized_pnl_usd, meta, as_of
+                        FROM us_positions
+                        WHERE symbol = ANY(:syms)
+                          AND qty > 0
+                    """ + epoch_clause + """
+                        ORDER BY symbol, as_of DESC
+                    """),
+                    {"syms": normalized, **epoch_params},
+                ).fetchall()
+
+            result = {}
+            for row in rows:
+                cols = ["symbol", "exchange", "qty", "avg_cost", "trading_epoch_id",
+                        "current_px", "unrealized_pnl_usd", "meta", "as_of"]
+                d = dict(zip(cols, row))
+                sym = str(d.get("symbol") or "").strip().upper()
+                result[sym] = d
+            return result
+    except Exception as exc:
+        logger.warning("[US_DB][load_us_positions_by_symbols][WARN] %s", exc)
+        return {}
+
+
+def load_latest_us_buy_fills_by_symbols(
+    symbols: list[str],
+    trade_date: str | None = None,
+    lookback_days: int = 30,
+) -> dict[str, dict]:
+    """us_fills에서 심볼별 최신 BUY 체결 조회.
+
+    Parameters
+    ----------
+    symbols : list[str]
+        조회할 심볼 목록
+    trade_date : str | None
+        기준 거래일 (None이면 오늘)
+    lookback_days : int
+        조회 기간 (기준일 기준 N일 이내)
+
+    Returns
+    -------
+    dict[symbol, fill_row_dict]
+    """
+    if not symbols:
+        return {}
+
+    normalized = [str(s).strip().upper() for s in symbols if s]
+    engine = _get_engine_or_none()
+
+    if engine is None:
+        # in-memory fallback
+        result: dict[str, dict] = {}
+        for fill in _MEM_FILLS:
+            if str(fill.get("side") or "").upper() != "BUY":
+                continue
+            sym = str(fill.get("symbol") or "").strip().upper()
+            if sym in normalized and sym not in result:
+                result[sym] = fill
+        return result
+
+    try:
+        td = trade_date or _today()
+        with engine.connect() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = """
+                    SELECT DISTINCT ON (symbol)
+                        symbol, exchange, qty, price_usd,
+                        filled_at, trade_date, client_order_key, order_no,
+                        trading_epoch_id, meta
+                    FROM us_fills
+                    WHERE symbol = ANY(:syms)
+                      AND side = 'BUY'
+                      AND trade_date >= (:td::date - :lookback * INTERVAL '1 day')
+                      AND trade_date <= :td::date
+            """
+            params = {"syms": normalized, "td": td, "lookback": lookback_days}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY symbol, filled_at DESC"
+            rows = conn.execute(text(sql), params).fetchall()
+
+            result = {}
+            cols = ["symbol", "exchange", "qty", "price_usd",
+                    "filled_at", "trade_date", "client_order_key", "order_no",
+                    "trading_epoch_id", "meta"]
+            for row in rows:
+                d = dict(zip(cols, row))
+                sym = str(d.get("symbol") or "").strip().upper()
+                result[sym] = d
+            return result
+    except Exception as exc:
+        logger.warning("[US_DB][load_latest_us_buy_fills_by_symbols][WARN] %s", exc)
+        return {}
+
+
+def load_us_position_history_candidates(symbol: str, as_of: str | None = None) -> list[dict]:
+    """Return recent positive position snapshots without collapsing by symbol/epoch."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return []
+    td = str(as_of or _today())
+    engine = _get_engine_or_none()
+    if engine is None:
+        candidates = [
+            dict(row) for row in _MEM_POSITIONS
+            if str(row.get("symbol") or "").strip().upper() == sym
+            and str(row.get("as_of") or row.get("trade_date") or "") <= td
+            and int(row.get("qty") or 0) > 0
+        ]
+        return sorted(candidates, key=lambda row: str(row.get("as_of") or ""), reverse=True)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT *
+                FROM us_positions
+                WHERE UPPER(symbol)=:symbol AND as_of<=:as_of AND qty>0
+                ORDER BY as_of DESC, created_at DESC
+                LIMIT 2000
+            """), {"symbol": sym, "as_of": td}).mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("[US_POSITIONS][HISTORY_CANDIDATES_WARN] symbol=%s err=%s", sym, exc)
+        return []
+
+
+def load_us_buy_fill_history_candidates(
+    symbol: str, trade_date: str | None = None, lookback_days: int = 3650,
+) -> list[dict]:
+    """Return bounded BUY-fill candidates without selecting a symbol-only latest row."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return []
+    td = str(trade_date or _today())
+    engine = _get_engine_or_none()
+    if engine is None:
+        candidates = [
+            dict(row) for row in _MEM_FILLS
+            if str(row.get("symbol") or "").strip().upper() == sym
+            and str(row.get("side") or "").upper() == "BUY"
+            and str(row.get("trade_date") or "") <= td
+        ]
+        return sorted(
+            candidates,
+            key=lambda row: (str(row.get("trade_date") or ""), str(row.get("filled_at") or "")),
+            reverse=True,
+        )[:5000]
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT symbol, exchange, qty, price_usd, filled_at, trade_date,
+                       client_order_key, order_no, trading_epoch_id, meta
+                FROM us_fills
+                WHERE UPPER(symbol)=:symbol AND side='BUY'
+                  AND trade_date >= (CAST(:trade_date AS date) - :lookback * INTERVAL '1 day')
+                  AND trade_date <= CAST(:trade_date AS date)
+                ORDER BY trade_date DESC, filled_at DESC
+                LIMIT 5000
+            """), {"symbol": sym, "trade_date": td, "lookback": max(1, int(lookback_days))}).mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning("[US_FILLS][HISTORY_CANDIDATES_WARN] symbol=%s err=%s", sym, exc)
+        return []
+
+
+def has_pending_order_for_symbol_side(
+    symbol: str,
+    side: str,
+    trade_date: str | None = None,
+    include_statuses: set[str] | None = None,
+) -> bool:
+    """Return True when same symbol/side/date has an unfilled real order."""
+    statuses = include_statuses or {
+        "ACK", "SUBMITTED", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED",
+    }
+    td = trade_date or _today()
+    sym = str(symbol or "").strip().upper()
+    side_u = str(side or "").strip().upper()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return any(
+            str(o.get("symbol") or "").strip().upper() == sym
+            and str(o.get("side") or "").strip().upper() == side_u
+            and str(o.get("trade_date") or "") == td
+            and str(o.get("status") or "").upper() in statuses
+            and not o.get("dry_run", False)
+            for o in _MEM_ORDERS
+        )
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = """
+                    SELECT 1 FROM us_orders
+                    WHERE symbol=:symbol AND side=:side AND trade_date=:td
+                      AND status = ANY(:statuses)
+                      AND dry_run = FALSE
+            """
+            params = {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " LIMIT 1"
+            row = conn.execute(text(sql), params).first()
+            return row is not None
+    except Exception as exc:
+        logger.error("[US_ORDERS][PENDING_SYMBOL_SIDE][ERROR] %s", exc)
+        return False
+
+
+def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | None:
+    """Find the most recent same-day SELL ACK-like order for no-balance reconciliation."""
+    statuses = {"ACK", "SUBMITTED", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    td = trade_date or _today()
+    sym = str(symbol or "").strip().upper()
+    matches = [o for o in _MEM_ORDERS if str(o.get("symbol") or "").strip().upper() == sym and str(o.get("side") or "").upper() == "SELL" and str(o.get("trade_date") or "") == td and str(o.get("status") or "").upper() in statuses]
+    if matches:
+        return matches[-1]
+    engine = _get_engine_or_none()
+    if engine is None:
+        return None
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            sql = """SELECT * FROM us_orders WHERE symbol=:symbol AND side='SELL' AND trade_date=:td
+                  AND status = ANY(:statuses) AND dry_run = FALSE"""
+            params = {"symbol": sym, "td": td, "statuses": list(statuses)}
+            if epoch_id:
+                sql += " AND trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1"
+            row = conn.execute(text(sql), params).first()
+            return dict(row._mapping) if row else None
+    except Exception as exc:
+        logger.error("[US_ORDERS][RECENT_SELL_ACK][ERROR] %s", exc)
+        return None
+
+
+def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
+    """Load US-only order rows for daily report from us_orders.
+
+    Uses trade_date first, then NY-day timestamp fallbacks. US reporting must
+    not read KR/common order tables.
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        return []
+    from sqlalchemy import text
+    from datetime import date, datetime, time, timedelta
+    from zoneinfo import ZoneInfo
+
+    def _rows(result) -> list[dict]:
+        if hasattr(result, "mappings"):
+            return [dict(r) for r in result.mappings().all()]
+        return [dict(r) for r in result]
+
+    ny = ZoneInfo("America/New_York")
+    utc = ZoneInfo("UTC")
+    d = date.fromisoformat(trade_date)
+    start_utc = datetime.combine(d, time.min, tzinfo=ny).astimezone(utc).isoformat()
+    end_utc = datetime.combine(d + timedelta(days=1), time.min, tzinfo=ny).astimezone(utc).isoformat()
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            epoch_id = _active_us_epoch(conn)
+            epoch_clause = " AND trading_epoch_id=:epoch_id" if epoch_id else ""
+            epoch_params = {"epoch_id": epoch_id} if epoch_id else {}
+            queries = [("SELECT * FROM us_orders WHERE trade_date = :td" + epoch_clause,
+                        {"td": trade_date, **epoch_params})]
+            for col in ("created_at", "updated_at", "submitted_at", "acked_at"):
+                queries.append((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts" + epoch_clause,
+                                {"start_ts": start_utc, "end_ts": end_utc, **epoch_params}))
+            for sql, params in queries:
+                try:
+                    rows = _rows(conn.execute(text(sql), params))
+                    if rows:
+                        return rows
+                except Exception:
+                    continue
+    except Exception:
+        logger.exception("[US_ORDERS][REPORT_LOAD][WARN] trade_date=%s", trade_date)
+    return []
+
+
+@dataclass(frozen=True)
+class CommittedBuyNotionalResult:
+    available: bool
+    notional_usd: float
+    row_count: int
+    error: str | None = None
+
+
+def load_today_committed_buy_notional_result(trade_date: str, env: str = "practice", include_pending: bool = True) -> CommittedBuyNotionalResult:
+    """Strict risk-data load that distinguishes a healthy zero from DB failure."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        return CommittedBuyNotionalResult(False, 0.0, 0, "orders_db_engine_unavailable")
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            epoch_id = _active_us_epoch(conn)
+            params = {"td": trade_date}
+            if epoch_id:
+                query = """
+                    SELECT o.*, i.notional_usd AS intent_notional_usd,
+                           i.limit_price_usd AS intent_limit_price_usd,
+                           i.meta AS intent_meta
+                    FROM us_orders o
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key = o.client_order_key
+                     AND i.trading_epoch_id=o.trading_epoch_id
+                    WHERE o.trade_date = :td AND o.trading_epoch_id=:epoch_id
+                """
+                params["epoch_id"] = epoch_id
+            else:
+                query = """
+                    SELECT o.*, i.notional_usd AS intent_notional_usd,
+                           i.limit_price_usd AS intent_limit_price_usd,
+                           i.meta AS intent_meta
+                    FROM us_orders o
+                    LEFT JOIN us_order_intents i
+                      ON i.client_order_key = o.client_order_key
+                    WHERE o.trade_date = :td
+                """
+            result = conn.execute(text(query), params)
+            rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
+    except Exception as exc:
+        return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
+    statuses = {
+        "ACK", "SUBMITTED", "PARTIALLY_FILLED", "FILLED",
+        "RECONCILE_PENDING", "ACK_DB_FAILED", "DRY_RUN",
+    }
+    if include_pending:
+        statuses.add("PENDING")
+    seen: set[str] = set()
+    total = 0.0
+    for index, row in enumerate(rows):
+        if str(row.get("side") or "").upper() != "BUY" or str(row.get("status") or "").upper() not in statuses:
+            continue
+        order_meta = _parse_json_meta(row.get("meta"))
+        intent_meta = _parse_json_meta(row.get("intent_meta"))
+        persisted_env = str(row.get("env") or "").strip().lower()
+        if persisted_env in {"unknown", "unavailable", "legacy_unknown"}:
+            persisted_env = ""
+        row_env = str(
+            persisted_env
+            or order_meta.get("env") or order_meta.get("kis_env")
+            or intent_meta.get("env") or intent_meta.get("kis_env")
+            or ""
+        ).strip().lower()
+        if not row_env:
+            return CommittedBuyNotionalResult(
+                False, 0.0, len(rows),
+                f"committed_buy_environment_unavailable key={row.get('client_order_key')}",
+            )
+        if row_env != str(env or "practice").lower():
+            continue
+        key = str(row.get("client_order_key") or row.get("order_key") or row.get("order_no") or f"row:{index}")
+        if key in seen:
+            continue
+        seen.add(key)
+        explicit_price = (
+            order_meta.get("requested_price_usd") or order_meta.get("order_price_usd")
+            or intent_meta.get("requested_price_usd") or row.get("intent_limit_price_usd")
+        )
+        notional = (
+            row.get("committed_notional_usd")
+            or row.get("intent_notional_usd")
+            or order_meta.get("requested_notional_usd")
+            or intent_meta.get("requested_notional_usd")
+        )
+        if notional in (None, "") and explicit_price not in (None, ""):
+            try:
+                notional = int(row.get("qty_requested") or 0) * float(explicit_price)
+            except (TypeError, ValueError):
+                notional = None
+        try:
+            notional_value = float(notional)
+        except (TypeError, ValueError):
+            notional_value = 0.0
+        if notional_value <= 0:
+            return CommittedBuyNotionalResult(
+                False, 0.0, len(rows),
+                f"committed_buy_notional_unavailable key={key}",
+            )
+        total += notional_value
+    return CommittedBuyNotionalResult(True, total, len(rows), None)
+
+
+def load_today_committed_buy_notional(trade_date: str, env: str = "practice", include_pending: bool = True) -> float:
+    result = load_today_committed_buy_notional_result(trade_date, env, include_pending)
+    if not result.available:
+        raise RuntimeError(result.error or "committed_buy_notional_unavailable")
+    return result.notional_usd
+
+                                     THEN (us_position_risk_state.state
+                                           ->'lifecycle'->>'high_watermark')::numeric
+                                     ELSE 0 END,
+                                CAST(:high AS numeric)
+                             ),
+                             'is_open',
+                             CASE WHEN us_position_risk_state.state
+                                           ->'lifecycle'->'is_open' = 'false'::jsonb
+                                  THEN 'false'::jsonb
+                                  ELSE COALESCE(
+                                    CAST(:lifecycle AS jsonb)->'is_open',
+                                    'true'::jsonb
+                                  ) END
+                        )
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE COALESCE(us_position_risk_state.state->'lifecycle'
+                           ->>'lifecycle_id', '') IN ('', :lid)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'
+                           ->>'strategy_owner', '') IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'
+                           ->>'account_id', '') IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'
+                           ->>'env', '') IN ('', :env)
+        """), {
+            "epoch": epoch, "td": trade_date, "symbol": sym,
+            "lifecycle": _json_param(life), "high": high,
+            "lid": life_id, "owner": owner, "account": acct, "env": env,
+        })
+        if result.rowcount != 1:
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        # Read the value produced under this transaction's row lock. Caller
+        # gets the monotonic merged watermark rather than stale input.
+        row = conn.execute(text("""
+            SELECT state->'lifecycle' AS lifecycle
+              FROM us_position_risk_state
+             WHERE trading_epoch_id=:epoch AND trade_date=:td AND symbol=:symbol
+        """), {"epoch": epoch, "td": trade_date, "symbol": sym}).mappings().first()
+        saved = row.get("lifecycle") if row else None
+        if not isinstance(saved, dict):
+            raise RuntimeError("US_LIFECYCLE_DURABLE_READBACK_FAILED")
+        return saved
+
+
 def save_us_position_risk_state(
     symbol: str,
     trade_date: str,
