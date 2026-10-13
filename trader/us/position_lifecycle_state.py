@@ -412,14 +412,8 @@ def reconcile_us_position_lifecycles(
     open_latest = load_latest_open_us_position_lifecycles(trade_date)
     # Reuse bounded history for exact identity recovery rather than one query
     # per position. Failure retains the legacy per-symbol read semantics.
-    from trader.us.db.repos import (
-        load_latest_us_position_risk_states,
-        load_us_position_risk_state_candidates_batch,
-    )
+    from trader.us.db.repos import load_us_position_risk_state_candidates_batch
     risk_candidates_by_symbol = load_us_position_risk_state_candidates_batch(
-        list(current), trade_date,
-    ) if current else {}
-    latest_risk_by_symbol = load_latest_us_position_risk_states(
         list(current), trade_date,
     ) if current else {}
 
@@ -454,7 +448,8 @@ def reconcile_us_position_lifecycles(
                 identity["strategy_owner"],
             )
             continue
-        latest = latest_risk_by_symbol.get(symbol) or {}
+        # Resolve latest lifecycle after binding authoritative identity.
+        latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
         if lifecycle and not _lifecycle_matches_identity(lifecycle, identity):
             lifecycle = {}
