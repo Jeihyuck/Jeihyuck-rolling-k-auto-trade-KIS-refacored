@@ -28,6 +28,11 @@ def _fixture(root, *, sha=SHA, tick_sec=48, sell_sec=8,
             f"balance_ms=100.0" + chr(10)
             for i in range(1, 17)
         )
+        if session == "am":
+            body += (
+                "[US_KIS][WS_COLLECTOR_HIT] symbol=MSFT exchange=NASDAQ "
+                "generation=test-generation age_sec=0.1" + chr(10)
+            )
         if session == "am" and sell_sec is not None:
             body += (
                 "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
@@ -133,3 +138,16 @@ def test_collector_smoke_from_other_sha_or_without_fresh_prices_cannot_pass(tmp_
     path.write_text(json.dumps(smoke))
     report = evaluate(tmp_path, DATE, SHA)
     assert "LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH" in report["reasons"]
+
+
+def test_smoke_proof_without_actual_trading_quote_hits_fails(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "runtime" / "logs" / "us" / DATE / "am" / "am.log"
+    path.write_text(
+        "\n".join(
+            line for line in path.read_text().splitlines()
+            if "[US_KIS][WS_COLLECTOR_HIT]" not in line
+        )
+    )
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "NO_SESSION_RUNTIME_WS_COLLECTOR_HITS" in report["reasons"]
