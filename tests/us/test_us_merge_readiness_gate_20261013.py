@@ -87,3 +87,20 @@ def test_no_protective_broker_boundary_cannot_pass(tmp_path):
     _fixture(tmp_path, sell_sec=None)
     report = evaluate(tmp_path, DATE, SHA)
     assert "NO_ACTUAL_SELL_BROKER_SUBMISSION_LATENCY_EVIDENCE" in report["reasons"]
+
+
+def test_clean_label_does_not_hide_claim_conflicts_or_protective_sell_failure(tmp_path):
+    _fixture(tmp_path, close_status="OK", extra_close={
+        "close_integrity_status": "RECONCILE_REQUIRED",
+        "execution_claim_health": {
+            "unresolved_execution_actions": 3,
+            "execution_claim_conflicts": 223,
+        },
+        "runtime_liveness_failures": [
+            {"session": "am", "sell_liveness_status": "RECONCILE_REQUIRED"}
+        ],
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_BROKER_CLAIM_OR_LIVENESS_NOT_CLEAN" in report["reasons"]
+    assert report["close_claim_unresolved"] == 3
