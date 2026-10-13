@@ -135,3 +135,20 @@ def test_broker_date_filter_prevents_kst_day_order_cross_contamination(monkeypat
     assert [r["odno"] for r in client.get_us_today_orders("2026-10-06")] == [
         "same-number-prev-us-day",
     ]
+
+
+def test_unfilled_oct6_amd_order_is_normalized_as_open_not_missing(monkeypatch):
+    from trader.us.data_provider import USDataProvider
+    client, seen = _client_with_rows(monkeypatch, [
+        _row("AMD", "0000035281", "20261007", "001429", fill="0"),
+    ])
+    provider = object.__new__(USDataProvider)
+    provider._offline = False
+    provider._get_client = lambda: client
+    orders = provider.get_today_orders("2026-10-06")
+    assert len(orders) == 1
+    assert orders[0]["canonical_order_no"] == "35281"
+    assert orders[0]["status"] == "OPEN"
+    assert orders[0]["us_trade_date"] == "2026-10-06"
+    assert orders[0]["source_timestamp_date"] == "20261007"
+    assert seen[0]["ORD_END_DT"] == "20261007"
