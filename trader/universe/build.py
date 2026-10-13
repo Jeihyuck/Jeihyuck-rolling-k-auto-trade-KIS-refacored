@@ -22,6 +22,7 @@ from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+from trader.universe.providers.krx_marketcap_asof import KRXAsOfMarketcapProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
 from trader.universe.mode import is_db_only_mode, resolve_strategy_mode
@@ -81,7 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", required=True, help="Environment (practice/real)")
     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
-    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
+    parser.add_argument("--provider", default=None, help="Universe provider name")
+    parser.add_argument("--prep-recovery", action="store_true", help="Require exact-date KRX universe and PREP safety gates")
     return parser.parse_args()
 
 
@@ -194,12 +196,17 @@ def _load_fallback_universe_from_db(
         )
         return []
 
-    if require_exact_as_of and str(snapshot.get("provider") or "") not in {
-        "kis_marketcap_top", "seed_static",
-    }:
+    if require_exact_as_of and str(snapshot.get("provider") or "") != "krx_marketcap_asof":
         logger.error(
             "[UNIVERSE][FALLBACK][DB][UNVERIFIED_PROVIDER] provider=%s action=FAIL_CLOSED",
             snapshot.get("provider"),
+        )
+        return []
+
+    if require_exact_as_of and str(snapshot.get("actual_as_of") or "") != as_of_date:
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][UNVERIFIED_DATE] requested=%s actual=%s action=FAIL_CLOSED",
+            as_of_date, snapshot.get("actual_as_of"),
         )
         return []
 
@@ -582,6 +589,60 @@ def _load_emergency_seed() -> dict | None:
     }
 
 
+
+def _build_from_krx_asof(
+    provider: KRXAsOfMarketcapProvider, as_of_date: str,
+) -> tuple[dict | None, str]:
+    """Build exact-asof 150+150 from dated KRX data, never from current KIS top30."""
+    try:
+        rows_by_market = {
+            market: provider.get_marketcap_top_with_meta(market, as_of_date, TARGETS[market])
+            for market in ("KOSPI", "KOSDAQ")
+        }
+    except Exception as exc:
+        logger.warning("[UNIVERSE][KRX_ASOF][FAIL] requested=%s reason=%s", as_of_date, exc)
+        return None, f"krx_asof_failed:{exc}"
+
+    combined = rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]
+    if len(combined) != sum(TARGETS.values()):
+        return None, f"krx_asof_insufficient total={len(combined)}"
+    codes = [item["code"] for item in combined]
+    if len(set(codes)) != len(codes):
+        return None, "krx_asof_cross_market_duplicate"
+    for market, rows in rows_by_market.items():
+        if any(row.get("market") != market or row.get("actual_as_of") != as_of_date for row in rows):
+            return None, f"krx_asof_metadata_mismatch market={market}"
+
+    selected_by_market = {
+        market: [
+            {
+                "code": item["code"],
+                "rank": rank,
+                "name": item.get("name"),
+                "market_cap": item["market_cap"],
+                "actual_as_of": item["actual_as_of"],
+            }
+            for rank, item in enumerate(rows, 1)
+        ]
+        for market, rows in rows_by_market.items()
+    }
+    members = _build_members_from_payload(selected_by_market)
+    payload = _normalize_payload({
+        "selected": codes, "selected_by_market": selected_by_market,
+    })
+    logger.info("[UNIVERSE][KRX_ASOF][COMPLETE] as_of=%s kospi=%d kosdaq=%d",
+                as_of_date, len(rows_by_market["KOSPI"]), len(rows_by_market["KOSDAQ"]))
+    return {
+        "payload": payload, "members": members, "source": "krx_marketcap_asof",
+        "params": {
+            "actual_as_of": as_of_date,
+            "requested_as_of": as_of_date,
+            "provider_contract": "dated_krx_no_rollback",
+            "targets": dict(TARGETS),
+        },
+    }, "krx_marketcap_asof"
+
+
 def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
     try:
         kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
@@ -644,6 +705,8 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         and os.getenv("UNIVERSE_PREP_VERIFIED_DB_FALLBACK", "1") == "1"
         and os.getenv("UNIVERSE_NO_FALLBACK", "0") != "1"
     )
+    if prep_recovery and provider_override not in (None, "krx_marketcap_asof"):
+        raise ValueError("PREP requires exact-date KRX provider; undated override rejected")
     preexisting_snapshot: dict | None = None
     if prep_recovery_enabled:
         try:
@@ -653,9 +716,21 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         except Exception as exc:
             logger.warning("[UNIVERSE][FALLBACK][DB][PREFETCH_FAIL] err=%s", exc)
 
+    # Previous successful dated snapshots are immutable. In particular, force
+    # rebuild or provider failure must never downgrade SUCCESS to RUNNING/FAILED.
+    if prep_recovery_enabled and preexisting_snapshot:
+        verified_existing = _load_fallback_universe_from_db(
+            repo=repo, env=env, strategy=strategy, as_of_date=as_of_date,
+            snapshot=preexisting_snapshot, require_exact_as_of=True,
+        )
+        if verified_existing:
+            logger.info("[UNIVERSE][PREP][REUSE_IMMUTABLE] as_of=%s members=%d run_id=%s",
+                        as_of_date, len(verified_existing), preexisting_snapshot.get("run_id"))
+            return verified_existing
+
     payload: dict | None = None
     members: list[dict] = []
-    source = provider_override or DEFAULT_PROVIDER
+    source = "krx_marketcap_asof" if prep_recovery else (provider_override or DEFAULT_PROVIDER)
     params: dict = {"as_of": as_of_date}
     last_reason: str | None = None
 
@@ -676,7 +751,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         logger.warning("[UNIVERSE][RUN][START_FAIL] err=%s", exc)
         # Continue anyway - operations below will fail gracefully if run_id is None
 
-    allowed_chain = providers_for_env(env)
+    # PREP must not backdate KIS's undated 30-row current ranking or unversioned
+    # static seeds. Preserve the existing KIS chain for non-PREP consumers.
+    allowed_chain = ["krx_marketcap_asof"] if prep_recovery else providers_for_env(env)
     if provider_override:
         if provider_override not in allowed_chain:
             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
@@ -714,7 +791,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             provider_name,
         )
 
-        if provider_name == "kis_marketcap_top":
+        if provider_name == "krx_marketcap_asof":
+            result, reason = _build_from_krx_asof(KRXAsOfMarketcapProvider(), as_of_date)
+        elif provider_name == "kis_marketcap_top":
             if not kis_provider:
                 reason = last_reason or "kis_provider_unavailable"
             else:
@@ -859,7 +938,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             members=members,
             reason=last_reason,
             requested_as_of=as_of_date,
-            actual_as_of=as_of_date,
+            actual_as_of=str(params.get("actual_as_of") or as_of_date),
             build_reason=last_reason,
             universe_name=strategy,
         )
@@ -909,7 +988,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
     as_of = args.date or now_kst().date().isoformat()
-    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
+    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy,
+                   provider_override=args.provider, prep_recovery=args.prep_recovery)
 
 
 if __name__ == "__main__":
