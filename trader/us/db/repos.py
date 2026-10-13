@@ -2227,7 +2227,12 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                 state = jsonb_set(
                     COALESCE(us_position_risk_state.state, '{}'::jsonb),
                     '{lifecycle}',
-                    COALESCE(us_position_risk_state.state->'lifecycle', '{}'::jsonb)
+                    CASE WHEN us_position_risk_state.state->'lifecycle'
+                                   ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                         THEN '{}'::jsonb
+                         ELSE COALESCE(us_position_risk_state.state->'lifecycle',
+                                       '{}'::jsonb)
+                    END
                     || CAST(:data AS jsonb)
                     || jsonb_build_object(
                         'high_watermark',
