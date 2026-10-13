@@ -2176,27 +2176,38 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
     if not sym or not trade_date or not all(fields.values()):
         raise ValueError("US_LIFECYCLE_IDENTITY_REQUIRED")
     high = float(data.get("high_watermark") or 0.0)
+    confirmed_reentry = int(data.get("opened_at_source") == "confirmed_buy_fill"
+                            and bool(data.get("opened_at")))
     engine = _get_engine_or_none()
     if engine is None:
         key = _risk_state_key(sym, trade_date)
         old = dict(_MEM_RISK_STATE.get(key) or {})
         state = dict(old.get("state") or {})
         prior = dict(state.get("lifecycle") or {})
-        if prior and any((
-            str(prior.get(key) or "") not in ("", fields[field])
+        prior_id = str(prior.get("lifecycle_id") or "")
+        new_cycle = bool(prior_id and prior_id != fields["life_id"])
+        same_scope = all(str(prior.get(key) or "") in ("", fields[field])
             for key, field in (
-                ("lifecycle_id", "life_id"), ("strategy_owner", "owner"),
-                ("account_id", "account"), ("env", "env"),
+                ("strategy_owner", "owner"), ("account_id", "account"),
+                ("env", "env"),
             )
-        )):
+        )
+        confirmed_new_cycle = (
+            new_cycle and same_scope and prior.get("is_open") is False
+            and data.get("opened_at_source") == "confirmed_buy_fill"
+            and bool(prior.get("closed_at")) and bool(data.get("opened_at"))
+            and str(data["opened_at"]) > str(prior["closed_at"])
+        )
+        if prior and (not same_scope or (new_cycle and not confirmed_new_cycle)):
             raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
-        combined = {**prior, **data}
-        for immutable_field in ("opened_at", "opened_trade_date", "entry_policy"):
-            if prior.get(immutable_field):
-                combined[immutable_field] = prior[immutable_field]
-        combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
-        if prior.get("is_open") is False:
-            combined["is_open"] = False
+        combined = (dict(data) if confirmed_new_cycle else {**prior, **data})
+        if not confirmed_new_cycle:
+            for immutable_field in ("opened_at", "opened_trade_date", "entry_policy"):
+                if prior.get(immutable_field):
+                    combined[immutable_field] = prior[immutable_field]
+            combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
+            if prior.get("is_open") is False:
+                combined["is_open"] = False
         state["lifecycle"] = combined
         old["state"] = state
         _MEM_RISK_STATE[key] = _normalize_risk_state(sym, trade_date, old)
@@ -2220,16 +2231,22 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                     || CAST(:data AS jsonb)
                     || jsonb_build_object(
                         'high_watermark',
-                        GREATEST(
-                            CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'
-                                                ->>'high_watermark', '') ~ '^[0-9]+([.][0-9]+)?$'
-                                 THEN (us_position_risk_state.state->'lifecycle'
-                                       ->>'high_watermark')::numeric
-                                 ELSE 0 END,
-                            CAST(:high AS numeric)
-                        ),
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                        ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN CAST(:high AS numeric)
+                             ELSE GREATEST(
+                                CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'
+                                                  ->>'high_watermark', '') ~ '^[0-9]+([.][0-9]+)?$'
+                                     THEN (us_position_risk_state.state->'lifecycle'
+                                           ->>'high_watermark')::numeric
+                                     ELSE 0 END,
+                                CAST(:high AS numeric)
+                             ) END,
                         'is_open',
-                        CASE WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN COALESCE(CAST(:data AS jsonb)->'is_open', 'true'::jsonb)
+                             WHEN us_position_risk_state.state->'lifecycle'->'is_open'
                                             = 'false'::jsonb
                              THEN 'false'::jsonb
                              ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
@@ -2239,16 +2256,24 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                         -- because a later worker copied a stale snapshot.
                         'opened_at',
                         COALESCE(
-                            us_position_risk_state.state->'lifecycle'->'opened_at',
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_at'
+                                 ELSE NULL END,
                             CAST(:data AS jsonb)->'opened_at'
                         ),
                         'opened_trade_date',
                         COALESCE(
-                            us_position_risk_state.state->'lifecycle'->'opened_trade_date',
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_trade_date'
+                                 ELSE NULL END,
                             CAST(:data AS jsonb)->'opened_trade_date'
                         ),
                         'entry_policy',
-                        CASE WHEN COALESCE(
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                          ->>'lifecycle_id' = :life_id
+                              AND COALESCE(
                                us_position_risk_state.state->'lifecycle'->'entry_policy',
                                '{}'::jsonb
                              ) <> '{}'::jsonb
@@ -2259,8 +2284,17 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                     ), true
                 ),
                 updated_at = NOW()
-            WHERE COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+            WHERE (
+                COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
                     IN ('', :life_id)
+                OR (
+                    CAST(:confirmed_reentry AS integer) = 1
+                    AND us_position_risk_state.state->'lifecycle'->'is_open' = 'false'::jsonb
+                    AND COALESCE(us_position_risk_state.state->'lifecycle'->>'closed_at', '') <> ''
+                    AND CAST(us_position_risk_state.state->'lifecycle'->>'closed_at' AS timestamptz)
+                        < CAST(:opened_at AS timestamptz)
+                )
+              )
               AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
                     IN ('', :owner)
               AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
@@ -2271,6 +2305,8 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
         """), {
             **fields, "td": trade_date, "sym": sym,
             "data": _json_param(data), "high": high,
+            "confirmed_reentry": confirmed_reentry,
+            "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
         }).mappings().first()
         if not result or not isinstance(result.get("lifecycle"), dict):
             raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
