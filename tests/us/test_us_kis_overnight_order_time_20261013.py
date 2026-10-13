@@ -43,6 +43,7 @@ def test_msft_real_order_status_no_longer_claims_sunday_et_trade_date():
         "ft_ccld_qty": "0", "nccs_qty": "1",
         "sll_buy_dvsn_cd": "01", "ovrs_excg_cd": "NASD",
     }
+    raw["dmst_ord_dt"] = "20261013"
     result = normalize_us_order_status_row(raw)
     assert result["normalization_result"] == "normalized"
     assert result["status"] == "OPEN"
@@ -62,3 +63,23 @@ def test_amd_order_fills_parser_does_not_shift_actual_event_by_one_day():
 def test_invalid_broker_order_datetime_fail_closed():
     with pytest.raises(ValueError):
         resolve_kis_us_order_datetime("20261012", "250099")
+
+
+def test_kis_domestic_date_disagreement_quarantines_order_proof():
+    raw = {
+        "odno": "44796", "pdno": "MSFT", "ord_dt": "20261012",
+        "dmst_ord_dt": "20261012", "ord_tmd": "002821",
+        "ft_ord_qty": "1", "ft_ccld_qty": "0", "nccs_qty": "1",
+        "sll_buy_dvsn_cd": "01",
+    }
+    row = normalize_us_order_status_row(raw)
+    assert row["normalization_result"] == "quarantined"
+    assert row["filter_reason"] == "invalid_kis_order_datetime"
+    with pytest.raises(ValueError, match="domestic order date"):
+        resolve_kis_us_order_datetime("20261012", "002821", "20261012")
+
+
+def test_overnight_fill_timestamp_is_cross_checked_with_domestic_order_date():
+    assert _combine_kis_date_time(
+        "20261012", "002821", domestic_order_date="20261013",
+    ) == "2026-10-13T00:28:21+09:00"
