@@ -85,6 +85,7 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                     payload = ("ERROR", {
                         "status": "ERROR", "reason": "tick_result_ipc_failed",
                         "detail": type(exc).__name__,
+                        "broker_submission_truth": "UNVERIFIED",
                     })
                 break
             if not process.is_alive():
@@ -93,7 +94,10 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                     try:
                         payload = receiver.recv()
                     except (EOFError, OSError, ValueError):
-                        payload = None
+                        payload = ("ERROR", {
+                            "status": "ERROR", "reason": "tick_result_ipc_failed",
+                            "broker_submission_truth": "UNVERIFIED",
+                        })
                 break
         if payload is not None:
             process.join(max(0.0, deadline - time.monotonic()))
