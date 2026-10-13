@@ -2666,19 +2666,10 @@ def run_trade_tick(
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
     exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)
 
-    # Route SELLs immediately before any entry watchlist or entry evaluation work.
-    try:
-        from trader.us.db.repos import load_today_committed_buy_notional
-        buy_daily_notional = load_today_committed_buy_notional(trade_date, env=env, include_pending=True)
-        daily_notional_available = True
-        daily_notional_load_error = ""
-    except Exception as _daily_buy_notional_exc:
-        logger.error("[US_ENTRY][DAILY_NOTIONAL_UNAVAILABLE] error=%s", _daily_buy_notional_exc)
-        daily_notional_available = False
-        daily_notional_load_error = f"{type(_daily_buy_notional_exc).__name__}: {_daily_buy_notional_exc}"
-        # SELL routing does not consume the BUY daily limit.  This sentinel is
-        # used only for the already-separated SELL-first call below.
-        buy_daily_notional = 0.0
+    # Route SELL without an unnecessary BUY-only DB budget read. The SELL
+    # branch of assert_order_allowed() never consumes the daily BUY notional.
+    # A failed budget read must still block BUY (including TQQQ), but must
+    # never delay a valid protective SELL's broker submit path.
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
 
@@ -2692,7 +2683,7 @@ def run_trade_tick(
         )
     exit_route_result = route_exit_orders_immediately(
         exit_intents,
-        buy_daily_notional=buy_daily_notional,
+        buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
         position_count=position_count,
         effective_budget=effective_budget,
         signal_only=signal_only,
@@ -2701,6 +2692,22 @@ def run_trade_tick(
         context=tick_context,
         kis_client=routing_kis_client,
     )
+
+    # BUY-specific committed notional is loaded only after protective sells
+    # have passed the existing router, durability fences and broker boundary.
+    # Do not treat a SELL intent or ACK as new cash/buying power.
+    try:
+        from trader.us.db.repos import load_today_committed_buy_notional
+        buy_daily_notional = load_today_committed_buy_notional(trade_date, env=env, include_pending=True)
+        daily_notional_available = True
+        daily_notional_load_error = ""
+    except Exception as _daily_buy_notional_exc:
+        logger.error("[US_ENTRY][DAILY_NOTIONAL_UNAVAILABLE] error=%s", _daily_buy_notional_exc)
+        daily_notional_available = False
+        daily_notional_load_error = f"{type(_daily_buy_notional_exc).__name__}: {_daily_buy_notional_exc}"
+        # SELL routing does not consume the BUY daily limit.  This sentinel is
+        # used only for the already-separated SELL-first call below.
+        buy_daily_notional = 0.0
 
     infinite_result = {"status": "OFF", "orders": []}
     _tqqq_infinite_started = time.monotonic()
