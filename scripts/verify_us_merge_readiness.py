@@ -68,6 +68,18 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         "mode": ws_smoke.get("mode"),
         "read_only": ws_smoke.get("no_order_submit"),
     }
+    # Reject malformed/empty symbol evidence. all([]) is True in Python and
+    # must never turn a non-dict smoke artifact into operational proof.
+    smoke_symbols = ws_smoke.get("symbols")
+    smoke_symbols_valid = (
+        isinstance(smoke_symbols, dict)
+        and len(smoke_symbols) > 0
+        and all(
+            isinstance(value, dict)
+            and int(value.get("hit") or 0) >= 1
+            for value in smoke_symbols.values()
+        )
+    )
     if ws_smoke and not (
         ws_smoke.get("commit_sha") == expected_sha
         and ws_smoke.get("mode") == "READ_ONLY_PRACTICE_MARKET_DATA"
@@ -75,12 +87,7 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         and ws_smoke.get("verified_fresh_quote_for_all") is True
         and bool(ws_smoke.get("collector_generation"))
         and bool(ws_smoke.get("evidence_at_utc"))
-        and bool(ws_smoke.get("symbols"))
-        and all(
-            int(v.get("hit") or 0) >= 1
-            for v in (ws_smoke.get("symbols") or {}).values()
-            if isinstance(v, dict)
-        )
+        and smoke_symbols_valid
     ):
         reasons.append("LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH")
     if len(expected_sha) != 40 or not all(ch in "0123456789abcdef" for ch in expected_sha.lower()):
@@ -129,6 +136,13 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         ),
         "close_status": str(close.get("status") or ""),
         "close_integrity_status": str(close.get("close_integrity_status") or ""),
+        "close_daily_report_status": str(close.get("daily_report_status") or ""),
+        "close_report_consistency": str(close.get("report_consistency") or ""),
+        "close_reconcile_status": str(close.get("reconcile_status") or ""),
+        "close_ack_reconcile_status": str(close.get("ack_reconcile_status") or ""),
+        "close_fills_status": str(close.get("fills_status") or ""),
+        "close_position_snapshot_error": bool(close.get("position_snapshot_error")),
+        "close_broker_recovery_health": close.get("broker_recovery_health"),
         "close_claim_unresolved": int(
             (close.get("execution_claim_health") or {}).get("unresolved_execution_actions") or 0
         ),
@@ -160,6 +174,39 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         reasons.append("BUY_EVALUATION_DEFERRED_FOR_TIME")
     if metrics["close_status"] not in _ACCEPT_CLOSE:
         reasons.append("CLOSE_RECONCILIATION_NOT_OK")
+    # A nominal status alone does not prove an authoritative Close. The close
+    # runner emits these independently, so missing values are failures.
+    if (
+        metrics["close_integrity_status"] != "OK"
+        or metrics["close_report_consistency"] != "OK"
+        or metrics["close_daily_report_status"] not in _ACCEPT_CLOSE
+        or metrics["close_reconcile_status"] != "OK"
+        or metrics["close_ack_reconcile_status"] != "OK"
+        or metrics["close_fills_status"] != "OK"
+        or metrics["close_position_snapshot_error"]
+    ):
+        reasons.append("CLOSE_AUTHORITATIVE_INTEGRITY_EVIDENCE_MISSING_OR_FAILED")
+    recovery = metrics["close_broker_recovery_health"]
+    if not isinstance(recovery, dict) or recovery.get("available") is not True:
+        reasons.append("CLOSE_BROKER_RECOVERY_HEALTH_UNVERIFIED")
+    else:
+        # Historical IN_FLIGHT claims must stay fenced; changing them to
+        # UNCERTAIN or omitting top-level health cannot disguise unresolved
+        # broker truth or previously detected duplicate submissions.
+        for key in (
+            "unresolved_execution_actions",
+            "duplicate_semantic_submit_detection_count",
+            "recovery_health_error_count",
+            "unattributed_broker_fills",
+            "broker_fill_rebound_failure_count",
+            "broker_local_cumulative_fill_mismatch_count",
+            "filled_sell_missing_cost_basis_count",
+            "stale_pending_exit_stage_after_fill_count",
+            "closed_lifecycle_open_state_count",
+        ):
+            if key not in recovery or recovery[key] is None or int(recovery[key]) != 0:
+                reasons.append("CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN")
+                break
     if metrics["close_unresolved_actions"] or metrics["close_manual_reconcile_required"]:
         reasons.append("UNRESOLVED_EXECUTION_OR_MANUAL_RECONCILIATION")
     if (
