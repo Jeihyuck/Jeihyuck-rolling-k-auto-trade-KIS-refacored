@@ -86,3 +86,21 @@ def test_previous_day_lifecycle_is_carried_forward_and_counted_once(monkeypatch)
     )["SAMPLE"]
     assert len(writes) == 2
     assert third["holding_trade_days"] == second["holding_trade_days"]
+
+
+def test_actual_scale_twenty_one_and_stress_forty_two_holdings_do_not_rewrite(monkeypatch):
+    # The same owner/epoch contract is evaluated across broker-sized holdings.
+    for count in (21, 42):
+        writes = _setup(monkeypatch)
+        positions = [
+            {"symbol": f"SYM{i:02d}", "qty": 1, "entry_price": 100.0,
+             "current_price_usd": 110.0, **IDENTITY}
+            for i in range(count)
+        ]
+        first = _reconcile([dict(pos) for pos in positions])
+        assert len(first) == count
+        assert len(writes) == count
+        second = _reconcile([dict(pos) for pos in positions])
+        assert len(second) == count
+        assert len(writes) == count
+        assert first == second
