@@ -6964,7 +6964,21 @@ def save_us_position_risk_state(
                         lowest_price_since_breach = EXCLUDED.lowest_price_since_breach,
                         last_price = EXCLUDED.last_price,
                         last_pnl_pct = EXCLUDED.last_pnl_pct,
-                        state = EXCLUDED.state,
+                        -- Risk/soft-stop writers may submit a stale full
+                        -- snapshot. Merge other state fields but never let
+                        -- their lifecycle copy roll back a confirmed
+                        -- fill/close or a newer high-watermark.
+                        state = (
+                            COALESCE(us_position_risk_state.state, '{}'::jsonb)
+                            || EXCLUDED.state
+                        ) || CASE
+                            WHEN COALESCE(us_position_risk_state.state, '{}'::jsonb)
+                                  ? 'lifecycle'
+                            THEN jsonb_build_object(
+                                'lifecycle',
+                                us_position_risk_state.state->'lifecycle'
+                            )
+                            ELSE '{}'::jsonb END,
                         updated_at = NOW()
                 """),
                 {
