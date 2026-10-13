@@ -30,7 +30,10 @@ def _trade_date_key(value: Any) -> str:
     return str(value).strip()
 
 
-def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> str:
+def _combine_kis_date_time(
+    date_value: str | None, *time_values: str | None,
+    domestic_order_date: str | None = None,
+) -> str:
     date_text = str(date_value or "").replace("-", "").strip()
     time_text = ""
     for value in time_values:
@@ -40,7 +43,7 @@ def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> 
     if date_text and time_text:
         time_text = time_text.zfill(6)[:6]
         from trader.us.utils.kis_order_time import resolve_kis_us_order_datetime
-        source_time = resolve_kis_us_order_datetime(date_text[:8], time_text)
+        source_time = resolve_kis_us_order_datetime(date_text[:8], time_text, domestic_order_date)
         return source_time.isoformat()
     return date_text
 
@@ -128,6 +131,7 @@ def get_fills_today(
             order_timestamp = _combine_kis_date_time(
                 source_date,
                 source_time,
+                domestic_order_date=_first_nonblank(row, "dmst_ord_dt", "DMST_ORD_DT"),
             )
             order_timestamp_utc = (
                 datetime.fromisoformat(order_timestamp).astimezone(timezone.utc).isoformat()
