@@ -105,6 +105,10 @@ def test_confirmed_new_buy_reentry_same_day_is_new_lifecycle_not_prior_tp(pg_eng
     repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", old)
     closing = {**old, "is_open": False, "closed_at": "2026-10-12T18:00:00+00:00"}
     repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", closing)
+    assert repos.save_us_position_risk_state("KO", "2026-10-12", {
+        "soft_stop_breach_count": 3, "last_price": 90,
+        "state": {"lifecycle": closing, "risk_note": "legacy-cycle"}
+    })
     incoming = _lifecycle(high=103, life="new-life", open=True)
     incoming.update({
         "opened_at": "2026-10-12T19:00:00+00:00",
@@ -119,5 +123,12 @@ def test_confirmed_new_buy_reentry_same_day_is_new_lifecycle_not_prior_tp(pg_eng
     assert float(saved["high_watermark"]) == 103
     assert saved["entry_policy"]["book"] == "NEW"
     assert saved["closed_at"] is None
+    with pg_engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT soft_stop_breach_count FROM us_position_risk_state
+            WHERE trading_epoch_id='atomic-epoch'
+              AND trade_date='2026-10-12' AND symbol='KO'
+        """)).mappings().one()
+    assert row["soft_stop_breach_count"] == 0
     with pytest.raises(RuntimeError, match="US_LIFECYCLE_IDENTITY_CONFLICT"):
         repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", closing)
