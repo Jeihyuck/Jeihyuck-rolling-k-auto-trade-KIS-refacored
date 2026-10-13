@@ -31,7 +31,8 @@ def _snapshot(**changes) -> dict:
     result = {
         "status": "SUCCESS",
         "as_of": AS_OF,
-        "provider": "kis_marketcap_top",
+        "provider": "krx_marketcap_asof",
+        "actual_as_of": AS_OF,
         "run_id": "previous-verified-run",
         "members": _members(),
     }
@@ -66,6 +67,8 @@ def test_verified_db_fallback_rejects_stale_unverified_and_small(monkeypatch):
         _snapshot(as_of="2026-10-07"),
         _snapshot(status="FAILED"),
         _snapshot(provider="emergency_seed"),
+        _snapshot(provider="kis_marketcap_top"),
+        _snapshot(actual_as_of="2026-10-07"),
         _snapshot(members=_members(20)),
         _snapshot(members=[*(_members(194)), {"code": "999999", "market": ""}]),
         _snapshot(members=[*(_members(194)), _members()[0]]),
