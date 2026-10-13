@@ -824,13 +824,57 @@ class USDataProvider:
         if ctx is not None:
             ctx.count("quote_logical_calls")
             if cache_key in ctx.price_cache:
-                ctx.count("quote_cache_hits")
-                return ctx.price_cache[cache_key]
+                cached = ctx.price_cache[cache_key]
+                # A quote that was fresh at tick start may become stale before
+                # an order decision; never renew freshness by returning a cache hit.
+                if "WEBSOCKET" in str(cached.get("source") or "").upper():
+                    received = float(cached.get("asof_epoch") or 0)
+                    freshness = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
+                    if received <= 0 or __import__("time").time() - received > freshness:
+                        ctx.price_cache.pop(cache_key, None)
+                    else:
+                        ctx.count("quote_cache_hits")
+                        return cached
+                else:
+                    ctx.count("quote_cache_hits")
+                    return cached
         started = __import__("time").monotonic()
 
-        # WebSocket-first is live-data only. Offline harnesses must never
-        # request an approval key or start a background socket.
-        if not self._offline:
+        # Opt-in session-owned collector avoids forking an active WS thread.
+        # The collector has no trading/order capability. Its socket may be
+        # missing or stale; failures fall through to the existing REST path.
+        collector_enabled = not self._offline and str(
+            os.getenv("US_WS_COLLECTOR_ENABLED", "0")
+        ).strip().lower() in {"1", "true", "on", "yes"}
+        if collector_enabled:
+            try:
+                from trader.marketdata.us_ws_collector import get_quote
+                fresh = get_quote(
+                    symbol, exchange, env=self._env,
+                    max_age_sec=float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15),
+                )
+                if fresh:
+                    data = {
+                        "last": str(fresh.get("last") or "0"),
+                        "open": "0", "high": "0", "low": "0", "tvol": "0",
+                        "symbol": symbol, "stale": False, "quality": "fresh",
+                        "source": "KIS_WEBSOCKET_COLLECTOR",
+                        "asof_epoch": fresh.get("received_at"),
+                        "age_sec": fresh.get("age_sec"),
+                        "collector_generation": fresh.get("collector_generation"),
+                        "bid": fresh.get("bid"), "ask": fresh.get("ask"),
+                    }
+                    if ctx is not None:
+                        ctx.price_cache[cache_key] = data
+                        ctx.count("quote_ws_hits")
+                    return data
+                logger.info("[US_KIS][WS_COLLECTOR_FALLBACK] symbol=%s reason=missing_or_stale", symbol)
+            except Exception as exc:
+                logger.warning("[US_KIS][WS_COLLECTOR_FALLBACK] symbol=%s err=%s", symbol, exc)
+
+        # Legacy in-process WS remains the default and remains disabled when
+        # collector mode is explicitly selected (no duplicate subscriptions).
+        if not self._offline and not collector_enabled:
             try:
                 from trader.marketdata.kis_ws_price import get_kis_ws_price_service
                 ws_service = get_kis_ws_price_service()
