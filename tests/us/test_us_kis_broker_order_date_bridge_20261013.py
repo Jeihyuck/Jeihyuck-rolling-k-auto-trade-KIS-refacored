@@ -152,3 +152,23 @@ def test_unfilled_oct6_amd_order_is_normalized_as_open_not_missing(monkeypatch):
     assert orders[0]["us_trade_date"] == "2026-10-06"
     assert orders[0]["source_timestamp_date"] == "20261007"
     assert seen[0]["ORD_END_DT"] == "20261007"
+
+
+def test_live_edst_session_does_not_query_future_kst_day():
+    from datetime import datetime, timezone
+    before_kst_midnight = datetime(2026, 10, 6, 13, 30, tzinfo=timezone.utc)
+    after_kst_midnight = datetime(2026, 10, 6, 15, 30, tzinfo=timezone.utc)
+    assert KisUSClient._broker_date_range_for_us_session(
+        "20261006", observed_at=before_kst_midnight
+    ) == ("20261006", "20261006")
+    assert KisUSClient._broker_date_range_for_us_session(
+        "20261006", observed_at=after_kst_midnight
+    ) == ("20261006", "20261007")
+
+
+def test_historical_recovery_always_queries_both_kst_dates():
+    from datetime import datetime, timezone
+    now = datetime(2026, 10, 13, 8, tzinfo=timezone.utc)
+    assert KisUSClient._broker_date_range_for_us_session(
+        "20261006", observed_at=now
+    ) == ("20261006", "20261007")
