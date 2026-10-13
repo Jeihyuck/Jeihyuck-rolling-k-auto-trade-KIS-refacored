@@ -25,13 +25,13 @@ def _fixture(root, *, sha=SHA, tick_sec=48, sell_sec=8,
         folder.mkdir(parents=True)
         body = "".join(
             f"[US_TICK][LATENCY] tick={i} total_ms={tick_sec * 1000} "
-            f"balance_ms=100.0\\n"
+            f"balance_ms=100.0" + chr(10)
             for i in range(1, 17)
         )
         if session == "am" and sell_sec is not None:
             body += (
                 "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
-                f"attempt=synthetic delay_ms={sell_sec * 1000}\\n"
+                f"attempt=synthetic delay_ms={sell_sec * 1000}" + chr(10)
             )
         (folder / f"{session}.log").write_text(body)
     (daily / "close_summary.json").write_text(json.dumps({
