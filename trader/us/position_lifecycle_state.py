@@ -365,12 +365,11 @@ def _confirmed_buy_fill(
 
 
 def _save_lifecycle(symbol: str, trade_date: str, lifecycle: dict, *, base: dict | None = None) -> dict:
-    risk = dict(base or load_us_position_risk_state(symbol, trade_date) or {})
-    state = dict(risk.get("state") or {})
-    state["lifecycle"] = lifecycle
-    risk["state"] = state
-    save_us_position_risk_state(symbol, trade_date, risk)
-    return lifecycle
+    # The generic risk-state writer replaces the whole state JSONB, so an
+    # older tick can otherwise erase a concurrent TP/stop or high-watermark.
+    # Persist this leaf atomically and return the exact merged DB version.
+    from trader.us.db.repos import save_us_position_lifecycle_atomic
+    return save_us_position_lifecycle_atomic(symbol, trade_date, lifecycle)
 
 
 def reconcile_us_position_lifecycles(
