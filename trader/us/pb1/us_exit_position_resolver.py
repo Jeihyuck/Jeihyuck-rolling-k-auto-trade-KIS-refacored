@@ -438,6 +438,7 @@ def _enrich_single_position(
     *,
     trade_date: str | None,
     env: str,
+    preloaded_risk_candidates: list[dict] | None = None,
 ) -> dict:
     """단일 position의 entry_price를 표준 contract로 채운다.
 
@@ -529,8 +530,9 @@ def _enrich_single_position(
     try:
         from trader.us.db.repos import load_us_position_risk_state_candidates
         candidates = (
-            load_us_position_risk_state_candidates(symbol, trade_date)
-            if trade_date and identity_is_current else {}
+            (preloaded_risk_candidates if preloaded_risk_candidates is not None
+             else load_us_position_risk_state_candidates(symbol, trade_date))
+            if trade_date and identity_is_current else []
         )
         latest = _latest_exact_history_candidate(candidates, identity, "trade_date")
         lifecycle = ((latest.get("state") or {}).get("lifecycle") or {}) if isinstance(latest.get("state"), dict) else {}
@@ -650,6 +652,25 @@ def enrich_us_positions_for_exit(
             "sources": {}, "missing_symbols": [], "integrity": {},
         }
 
+    # One bounded historical read for all held positions. The per-position
+    # exact lifecycle/epoch/owner/account check below is deliberately unchanged.
+    # None means the batch is unavailable: do the original individual lookup.
+    risk_candidates_by_symbol: dict[str, list[dict]] | None = None
+    active_symbols = sorted({
+        _normalize_symbol(pos.get("symbol")) for pos in positions
+        if _normalize_symbol(pos.get("symbol")) and _safe_int(pos.get("qty")) > 0
+    })
+    if trade_date and len(active_symbols) > 1:
+        try:
+            from trader.us.db.repos import load_us_position_risk_state_candidates_batch
+            risk_candidates_by_symbol = load_us_position_risk_state_candidates_batch(
+                active_symbols, trade_date
+            )
+        except Exception as exc:
+            logger.warning(
+                "[US_EXIT_RESOLVER][BATCH_CANDIDATES_WARN] symbols=%d err=%s action=per_symbol_fallback",
+                len(active_symbols), exc,
+            )
     enriched_list: list[dict] = []
     source_counts: dict[str, int] = {}
     missing_symbols: list[str] = []
@@ -657,7 +678,13 @@ def enrich_us_positions_for_exit(
     ok_count = 0
 
     for pos in positions:
-        ep = _enrich_single_position(pos, trade_date=trade_date, env=env)
+        ep = _enrich_single_position(
+            pos, trade_date=trade_date, env=env,
+            preloaded_risk_candidates=(
+                risk_candidates_by_symbol.get(_normalize_symbol(pos.get("symbol")))
+                if risk_candidates_by_symbol is not None else None
+            ),
+        )
         qty = ep.get("qty", 0)
 
         # qty <= 0 제외

@@ -2024,6 +2024,66 @@ def load_latest_us_position_risk_states(
         return {sym: load_latest_us_position_risk_state(sym, td) for sym in symbols}
 
 
+
+def load_us_position_risk_state_candidates_batch(
+    symbols: list[str], on_or_before_trade_date: str,
+) -> dict[str, list[dict]]:
+    """Batch the *same* bounded history used by exact lifecycle resolution.
+
+    Each symbol still sees at most 2000 rows, newest first, across historical
+    epochs. The caller MUST apply its existing account/epoch/owner/lifecycle
+    identity filter; this loader does not infer that the newest row is safe.
+    A failed batch query falls back to the original per-symbol read path.
+    """
+    symbols = sorted({str(s or "").strip().upper() for s in symbols if str(s or "").strip()})
+    if not symbols:
+        return {}
+    td = str(on_or_before_trade_date)
+    started = time.monotonic()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {sym: load_us_position_risk_state_candidates(sym, td) for sym in symbols}
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            rows = conn.execute(text("""
+                SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                       first_soft_stop_seen_at, last_soft_stop_seen_at,
+                       lowest_price_since_breach, last_price, last_pnl_pct,
+                       state, updated_at
+                FROM (
+                    SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                           first_soft_stop_seen_at, last_soft_stop_seen_at,
+                           lowest_price_since_breach, last_price, last_pnl_pct,
+                           state, updated_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY symbol
+                               ORDER BY trade_date DESC, updated_at DESC
+                           ) AS candidate_rank
+                    FROM us_position_risk_state
+                    WHERE symbol = ANY(:symbols) AND trade_date <= :trade_date
+                ) ranked
+                WHERE candidate_rank <= 2000
+                ORDER BY symbol, candidate_rank
+            """), {"symbols": symbols, "trade_date": td}).mappings().all()
+        grouped: dict[str, list[dict]] = {sym: [] for sym in symbols}
+        for row in rows:
+            symbol = str(row["symbol"]).upper()
+            if symbol in grouped:
+                grouped[symbol].append(dict(row))
+        logger.info(
+            "[US_RISK_STATE][BATCH_CANDIDATES] symbols=%d rows=%d queries=1 elapsed_ms=%.2f",
+            len(symbols), len(rows), (time.monotonic() - started) * 1000.0,
+        )
+        return grouped
+    except Exception as exc:
+        logger.warning(
+            "[US_RISK_STATE][BATCH_CANDIDATES_WARN] symbols=%d err=%s elapsed_ms=%.2f action=per_symbol_fallback",
+            len(symbols), exc, (time.monotonic() - started) * 1000.0,
+        )
+        return {sym: load_us_position_risk_state_candidates(sym, td) for sym in symbols}
+
+
 def load_us_position_risk_state_candidates(
     symbol: str, on_or_before_trade_date: str,
 ) -> list[dict]:
@@ -2095,6 +2155,197 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
         logger.warning("[US_RISK_STATE][LOAD_OPEN_LIFECYCLES_WARN] trade_date=%s err=%s", td, exc)
         return {}
 
+
+def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: dict) -> dict:
+    """Atomic scoped lifecycle leaf update; preserve unrelated risk state.
+
+    Same lifecycle high-watermark is monotonic; a closed lifecycle cannot be
+    reopened by a stale tick. Another owner/account/lifecycle never takes over
+    an existing same-day row. A new lifecycle after confirmed re-entry is
+    allowed only in a new date row or after explicit reconciliation elsewhere.
+    """
+    sym = str(symbol or "").strip().upper()
+    data = dict(lifecycle or {})
+    fields = {
+        "life_id": str(data.get("lifecycle_id") or ""),
+        "owner": str(data.get("strategy_owner") or "").upper(),
+        "account": str(data.get("account_id") or ""),
+        "env": str(data.get("env") or "").lower(),
+        "epoch": str(data.get("trading_epoch_id") or ""),
+    }
+    if not sym or not trade_date or not all(fields.values()):
+        raise ValueError("US_LIFECYCLE_IDENTITY_REQUIRED")
+    high = float(data.get("high_watermark") or 0.0)
+    confirmed_reentry = int(data.get("opened_at_source") == "confirmed_buy_fill"
+                            and bool(data.get("opened_at")))
+    engine = _get_engine_or_none()
+    if engine is None:
+        key = _risk_state_key(sym, trade_date)
+        old = dict(_MEM_RISK_STATE.get(key) or {})
+        state = dict(old.get("state") or {})
+        prior = dict(state.get("lifecycle") or {})
+        prior_id = str(prior.get("lifecycle_id") or "")
+        new_cycle = bool(prior_id and prior_id != fields["life_id"])
+        same_scope = all(str(prior.get(key) or "") in ("", fields[field])
+            for key, field in (
+                ("strategy_owner", "owner"), ("account_id", "account"),
+                ("env", "env"),
+            )
+        )
+        confirmed_new_cycle = (
+            new_cycle and same_scope and prior.get("is_open") is False
+            and data.get("opened_at_source") == "confirmed_buy_fill"
+            and bool(prior.get("closed_at")) and bool(data.get("opened_at"))
+            and str(data["opened_at"]) > str(prior["closed_at"])
+        )
+        if prior and (not same_scope or (new_cycle and not confirmed_new_cycle)):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        combined = (dict(data) if confirmed_new_cycle else {**prior, **data})
+        if not confirmed_new_cycle:
+            for immutable_field in ("opened_at", "opened_trade_date", "entry_policy"):
+                if prior.get(immutable_field):
+                    combined[immutable_field] = prior[immutable_field]
+            combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
+            if prior.get("is_open") is False:
+                combined["is_open"] = False
+        state["lifecycle"] = combined
+        old["state"] = state
+        if confirmed_new_cycle:
+            old.update({
+                "soft_stop_breach_count": 0,
+                "first_soft_stop_seen_at": None,
+                "last_soft_stop_seen_at": None,
+                "lowest_price_since_breach": None,
+            })
+        # Mirror the PostgreSQL row epoch column in the no-engine store;
+        # absent epoch is never accepted as proof for no-op persistence.
+        normalized = _normalize_risk_state(sym, trade_date, old)
+        normalized["trading_epoch_id"] = fields["epoch"]
+        _MEM_RISK_STATE[key] = normalized
+        return combined
+
+    with engine.begin() as conn:
+        _ensure_us_position_risk_state_table(conn)
+        if str(_us_state_epoch_id(conn) or "") != fields["epoch"]:
+            raise RuntimeError("US_LIFECYCLE_EPOCH_MISMATCH")
+        result = conn.execute(text("""
+            INSERT INTO us_position_risk_state
+                (trading_epoch_id, trade_date, symbol, state, updated_at)
+            VALUES (:epoch, :td, :sym,
+                    jsonb_build_object('lifecycle', CAST(:data AS jsonb)), NOW())
+            ON CONFLICT (trading_epoch_id, trade_date, symbol)
+            DO UPDATE SET
+                soft_stop_breach_count = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN 0
+                    ELSE us_position_risk_state.soft_stop_breach_count END,
+                first_soft_stop_seen_at = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN NULL
+                    ELSE us_position_risk_state.first_soft_stop_seen_at END,
+                last_soft_stop_seen_at = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN NULL
+                    ELSE us_position_risk_state.last_soft_stop_seen_at END,
+                lowest_price_since_breach = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN NULL
+                    ELSE us_position_risk_state.lowest_price_since_breach END,
+                state = jsonb_set(
+                    COALESCE(us_position_risk_state.state, '{}'::jsonb),
+                    '{lifecycle}',
+                    CASE WHEN us_position_risk_state.state->'lifecycle'
+                                   ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                         THEN '{}'::jsonb
+                         ELSE COALESCE(us_position_risk_state.state->'lifecycle',
+                                       '{}'::jsonb)
+                    END
+                    || CAST(:data AS jsonb)
+                    || jsonb_build_object(
+                        'high_watermark',
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                        ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN CAST(:high AS numeric)
+                             ELSE GREATEST(
+                                CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'
+                                                  ->>'high_watermark', '') ~ '^[0-9]+([.][0-9]+)?$'
+                                     THEN (us_position_risk_state.state->'lifecycle'
+                                           ->>'high_watermark')::numeric
+                                     ELSE 0 END,
+                                CAST(:high AS numeric)
+                             ) END,
+                        'is_open',
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' IS DISTINCT FROM :life_id
+                             THEN COALESCE(CAST(:data AS jsonb)->'is_open', 'true'::jsonb)
+                             WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                                            = 'false'::jsonb
+                             THEN 'false'::jsonb
+                             ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
+                                           'true'::jsonb)
+                        END,
+                        -- Entry provenance never becomes more recent just
+                        -- because a later worker copied a stale snapshot.
+                        'opened_at',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_at'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_at'
+                        ),
+                        'opened_trade_date',
+                        COALESCE(
+                            CASE WHEN us_position_risk_state.state->'lifecycle'
+                                            ->>'lifecycle_id' = :life_id
+                                 THEN us_position_risk_state.state->'lifecycle'->'opened_trade_date'
+                                 ELSE NULL END,
+                            CAST(:data AS jsonb)->'opened_trade_date'
+                        ),
+                        'entry_policy',
+                        CASE WHEN us_position_risk_state.state->'lifecycle'
+                                          ->>'lifecycle_id' = :life_id
+                              AND COALESCE(
+                               us_position_risk_state.state->'lifecycle'->'entry_policy',
+                               '{}'::jsonb
+                             ) <> '{}'::jsonb
+                             THEN us_position_risk_state.state->'lifecycle'->'entry_policy'
+                             ELSE COALESCE(CAST(:data AS jsonb)->'entry_policy',
+                                           '{}'::jsonb)
+                        END
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE (
+                COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+                    IN ('', :life_id)
+                OR (
+                    CAST(:confirmed_reentry AS integer) = 1
+                    AND us_position_risk_state.state->'lifecycle'->'is_open' = 'false'::jsonb
+                    AND COALESCE(us_position_risk_state.state->'lifecycle'->>'closed_at', '') <> ''
+                    AND CAST(us_position_risk_state.state->'lifecycle'->>'closed_at' AS timestamptz)
+                        < CAST(:opened_at AS timestamptz)
+                )
+              )
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
+                    IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
+                    IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'env', '')
+                    IN ('', :env)
+            RETURNING state->'lifecycle' AS lifecycle
+        """), {
+            **fields, "td": trade_date, "sym": sym,
+            "data": _json_param(data), "high": high,
+            "confirmed_reentry": confirmed_reentry,
+            "opened_at": data.get("opened_at") or "1970-01-01T00:00:00+00:00",
+        }).mappings().first()
+        if not result or not isinstance(result.get("lifecycle"), dict):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        return dict(result["lifecycle"])
+
+
+
 def save_us_position_risk_state(
     symbol: str,
     trade_date: str,
@@ -2145,7 +2396,15 @@ def save_us_position_risk_state(
                         lowest_price_since_breach = EXCLUDED.lowest_price_since_breach,
                         last_price = EXCLUDED.last_price,
                         last_pnl_pct = EXCLUDED.last_pnl_pct,
-                        state = EXCLUDED.state,
+                        -- A stale soft-stop / trend snapshot cannot replace
+                        -- a newer authoritative lifecycle. Preserve its leaf.
+                        state = (COALESCE(us_position_risk_state.state, '{}'::jsonb)
+                                 || EXCLUDED.state)
+                              || CASE WHEN COALESCE(us_position_risk_state.state, '{}'::jsonb)
+                                                ? 'lifecycle'
+                                      THEN jsonb_build_object(
+                                          'lifecycle', us_position_risk_state.state->'lifecycle')
+                                      ELSE '{}'::jsonb END,
                         updated_at = NOW()
                 """),
                 {

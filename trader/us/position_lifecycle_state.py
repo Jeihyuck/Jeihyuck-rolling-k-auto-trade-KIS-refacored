@@ -174,6 +174,7 @@ def _bind_authoritative_position_identity(
     trade_date: str,
     fills: list[dict] | None,
     authoritative: bool,
+    preloaded_risk_candidates: list[dict] | None = None,
 ) -> dict[str, str]:
     """Bind missing broker identity only from active-account or exact evidence."""
     if authoritative and not identity.get("trading_epoch_id"):
@@ -194,8 +195,9 @@ def _bind_authoritative_position_identity(
     try:
         from trader.us.db.repos import load_us_position_risk_state_candidates
 
-        rows = load_us_position_risk_state_candidates(
-            _sym(pos.get("symbol")), trade_date,
+        rows = (
+            preloaded_risk_candidates if preloaded_risk_candidates is not None
+            else load_us_position_risk_state_candidates(_sym(pos.get("symbol")), trade_date)
         )
     except Exception:
         rows = []
@@ -363,12 +365,11 @@ def _confirmed_buy_fill(
 
 
 def _save_lifecycle(symbol: str, trade_date: str, lifecycle: dict, *, base: dict | None = None) -> dict:
-    risk = dict(base or load_us_position_risk_state(symbol, trade_date) or {})
-    state = dict(risk.get("state") or {})
-    state["lifecycle"] = lifecycle
-    risk["state"] = state
-    save_us_position_risk_state(symbol, trade_date, risk)
-    return lifecycle
+    # The generic risk-state writer replaces the whole state JSONB, so an
+    # older tick can otherwise erase a concurrent TP/stop or high-watermark.
+    # Persist this leaf atomically and return the exact merged DB version.
+    from trader.us.db.repos import save_us_position_lifecycle_atomic
+    return save_us_position_lifecycle_atomic(symbol, trade_date, lifecycle)
 
 
 def reconcile_us_position_lifecycles(
@@ -408,6 +409,12 @@ def reconcile_us_position_lifecycles(
     }
     out: dict[str, dict] = {}
     open_latest = load_latest_open_us_position_lifecycles(trade_date)
+    # Reuse bounded history for exact identity recovery rather than one query
+    # per position. Failure retains the legacy per-symbol read semantics.
+    from trader.us.db.repos import load_us_position_risk_state_candidates_batch
+    risk_candidates_by_symbol = load_us_position_risk_state_candidates_batch(
+        list(current), trade_date,
+    ) if current else {}
 
     for symbol, pos in current.items():
         qty = _i(pos.get("qty"))
@@ -419,6 +426,7 @@ def reconcile_us_position_lifecycles(
             trade_date=trade_date,
             fills=fills,
             authoritative=authoritative,
+            preloaded_risk_candidates=risk_candidates_by_symbol.get(symbol),
         )
         if not all(identity.get(key) for key in (
             "env", "account_id", "trading_epoch_id", "strategy_owner",
@@ -439,8 +447,20 @@ def reconcile_us_position_lifecycles(
                 identity["strategy_owner"],
             )
             continue
+        # Resolve latest lifecycle after binding authoritative identity.
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
+        # A persisted same-day lifecycle can be reused only with an exact
+        # owner/account/epoch/lifecycle match. A prior-day row must still be
+        # carried into today's row; a stale tick may never overwrite newer
+        # state, and a changed broker holding must be persisted.
+        _persisted_current_lifecycle = (
+            dict(lifecycle)
+            if str(latest.get("trade_date") or "") == str(trade_date)
+            and str(latest.get("trading_epoch_id") or "") == identity["trading_epoch_id"]
+            and _lifecycle_matches_identity(lifecycle, identity)
+            else None
+        )
         if lifecycle and not _lifecycle_matches_identity(lifecycle, identity):
             lifecycle = {}
         if not lifecycle or lifecycle.get("is_open") is False:
@@ -499,9 +519,18 @@ def reconcile_us_position_lifecycles(
                 lifecycle["holding_trade_days"] = _i(lifecycle.get("holding_trade_days"), 1) + 1
                 lifecycle["last_holding_day_counted"] = trade_date
             identity["position_lifecycle_id"] = str(lifecycle.get("lifecycle_id") or "")
-        carried_policy = dict(lifecycle.get("entry_policy") or {})
         lifecycle["identity_status"] = "IDENTIFIED"
-        _save_lifecycle(symbol, trade_date, lifecycle)
+        if _persisted_current_lifecycle is not None and lifecycle == _persisted_current_lifecycle:
+            # Exact no-op: avoiding a remote DB write does not discard a real
+            # late fill. Qty, lifecycle identity, stage or date changes still
+            # take the existing atomic writer route.
+            logger.debug(
+                "[US_POSITION][LIFECYCLE_PERSIST_NOOP] symbol=%s trade_date=%s lifecycle_id=%s",
+                symbol, trade_date, lifecycle.get("lifecycle_id"),
+            )
+        else:
+            lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
+        carried_policy = dict(lifecycle.get("entry_policy") or {})
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
             "opened_trade_date": lifecycle.get("opened_trade_date"),
@@ -530,7 +559,7 @@ def reconcile_us_position_lifecycles(
                 continue
             closed = dict(lifecycle)
             closed.update({"is_open": False, "closed_trade_date": trade_date, "closed_at": now_iso, "last_seen_qty": 0})
-            _save_lifecycle(symbol, trade_date, closed)
+            closed = _save_lifecycle(symbol, trade_date, closed)
             out[symbol] = closed
             logger.info("[US_POSITION][LIFECYCLE] symbol=%s lifecycle_id=%s is_open=0 opened_trade_date=%s holding_trade_days=%s", symbol, closed.get("lifecycle_id"), closed.get("opened_trade_date"), closed.get("holding_trade_days"))
     return out
@@ -544,9 +573,27 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
     same = lifecycle.get("lifecycle_id") == lifecycle_id
     previous = _f(lifecycle.get("high_watermark")) if same else 0.0
     new_high = max(previous, _f(current_price), _f(entry_price)) if same else max(_f(current_price), _f(entry_price))
+    # Already durable same-day high-watermark: avoid a redundant UPDATE at
+    # every tick. A prior-day row, missing provenance, or new record must
+    # still be written, and any new price high always goes through the atomic
+    # writer. This cannot discard actual broker fills or position transitions.
+    if (
+        same
+        and new_high == previous
+        and str(latest.get("trade_date") or "") == str(trade_date)
+        and lifecycle.get("high_watermark_source") == "us_position_risk_state"
+        and lifecycle.get("high_watermark_at")
+        and lifecycle.get("is_open") is True
+    ):
+        logger.info(
+            "[US_POSITION][HIGH_WATERMARK_NOOP] symbol=%s lifecycle_id=%s "
+            "saved=%.4f reason=same_cycle_same_day_non_increasing",
+            symbol, lifecycle_id, previous,
+        )
+        return lifecycle
     lifecycle.update({"lifecycle_id": lifecycle_id, "high_watermark": new_high, "high_watermark_at": now_iso if new_high != previous else lifecycle.get("high_watermark_at") or now_iso, "high_watermark_source": "us_position_risk_state"})
     if "is_open" not in lifecycle:
         lifecycle["is_open"] = True
-    _save_lifecycle(symbol, trade_date, lifecycle)
+    lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
     logger.info("[US_POSITION][HIGH_WATERMARK] symbol=%s lifecycle_id=%s previous=%.4f current=%.4f saved=%.4f source=us_position_risk_state", symbol, lifecycle_id, previous, current_price, new_high)
     return lifecycle
