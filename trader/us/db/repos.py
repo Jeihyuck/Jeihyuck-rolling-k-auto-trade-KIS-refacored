@@ -2217,7 +2217,11 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                 "last_soft_stop_seen_at": None,
                 "lowest_price_since_breach": None,
             })
-        _MEM_RISK_STATE[key] = _normalize_risk_state(sym, trade_date, old)
+        # Mirror the PostgreSQL row epoch column in the no-engine store;
+        # absent epoch is never accepted as proof for no-op persistence.
+        normalized = _normalize_risk_state(sym, trade_date, old)
+        normalized["trading_epoch_id"] = fields["epoch"]
+        _MEM_RISK_STATE[key] = normalized
         return combined
 
     with engine.begin() as conn:
