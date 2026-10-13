@@ -23,7 +23,7 @@ TICKERS = (
 
 @pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires real PostgreSQL broker-claim fixture")
 @pytest.mark.parametrize("unresolved_ticks", [(), (4, 5)])
-def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
+def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     monkeypatch, tmp_path, pg_engine, unresolved_ticks,
 ):
     from trader.us.db import repos
@@ -249,7 +249,7 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     monkeypatch.setattr(trade_tick_runner, "_get_strategy_engine", lambda **_kw: Engine())
 
     results = []
-    for tick_index in range(1, 11):
+    for tick_index in range(1, 13):
         current_tick["index"] = tick_index
         _prior_buy_count = len(broker.buy_calls)
         result = run_trade_tick(
@@ -263,7 +263,7 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
         results.append(result)
         if tick_index in unresolved_ticks:
             assert len(broker.buy_calls) == _prior_buy_count, result
-    expected_buys = 10 - len(unresolved_ticks)
+    expected_buys = 12 - len(unresolved_ticks)
     assert len(seen_eval) == expected_buys, [(x.get("entry_degraded_reason"), x.get("last_stage")) for x in results]
     assert len(broker.buy_calls) == expected_buys, [{
         "status": x.get("status"), "degraded": x.get("entry_degraded_reason"),
@@ -282,7 +282,7 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     assert len(broker.submission_sequence) == 1 + expected_buys
 
     # A second attempt with the same durable client key cannot reach KIS,
-    # even when replayed after all ten scheduled ticks have completed.
+    # even when replayed after all twelve scheduled ticks have completed.
     from trader.us.execution.order_router import route_order
     duplicate = dict(accepted_intents[0])
     prev_kis_submits = len(broker.submission_sequence)
@@ -293,8 +293,8 @@ def test_sustained_ten_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     )
     assert duplicate_result["status"] != "ACK", duplicate_result
     assert len(broker.submission_sequence) == prev_kis_submits
-    print("US_PB1_BUY_ACK_10TICK_METRICS=" + __import__("json").dumps({
-        "ticks": 10, "buy_ack": len(broker.buy_calls),
+    print("US_PB1_BUY_ACK_12TICK_METRICS=" + __import__("json").dumps({
+        "ticks": 12, "buy_ack": len(broker.buy_calls),
         "unresolved_ticks": list(unresolved_ticks),
         "blocked_buys_on_unresolved_ticks": len(unresolved_ticks),
         "protective_sell_ack": len(broker.sell_calls),
