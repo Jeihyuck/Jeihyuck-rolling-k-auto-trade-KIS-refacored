@@ -42,6 +42,22 @@ def _fixture(root, *, sha=SHA, tick_sec=48, sell_sec=8,
     (daily / "close_summary.json").write_text(json.dumps({
         "commit_sha": sha, "status": close_status,
         "open_order_pending_total": 0, "manual_reconcile_required": 0,
+        "close_integrity_status": "OK", "report_consistency": "OK",
+        "daily_report_status": "OK", "reconcile_status": "OK",
+        "ack_reconcile_status": "OK", "fills_status": "OK",
+        "position_snapshot_error": None,
+        "broker_recovery_health": {
+            "available": True,
+            "unresolved_execution_actions": 0,
+            "duplicate_semantic_submit_detection_count": 0,
+            "recovery_health_error_count": 0,
+            "unattributed_broker_fills": 0,
+            "broker_fill_rebound_failure_count": 0,
+            "broker_local_cumulative_fill_mismatch_count": 0,
+            "filled_sell_missing_cost_basis_count": 0,
+            "stale_pending_exit_stage_after_fill_count": 0,
+            "closed_lifecycle_open_state_count": 0,
+        },
         "errors": [], **(extra_close or {}),
     }))
     (daily / "ws_collector_smoke.json").write_text(json.dumps({
@@ -151,3 +167,65 @@ def test_smoke_proof_without_actual_trading_quote_hits_fails(tmp_path):
     )
     report = evaluate(tmp_path, DATE, SHA)
     assert "NO_SESSION_RUNTIME_WS_COLLECTOR_HITS" in report["reasons"]
+
+
+def test_close_integrity_must_be_explicitly_verified(tmp_path):
+    _fixture(tmp_path, extra_close={"close_integrity_status": None})
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_AUTHORITATIVE_INTEGRITY_EVIDENCE_MISSING_OR_FAILED" in report["reasons"]
+
+
+def test_close_reconcile_and_daily_report_are_independently_required(tmp_path):
+    _fixture(tmp_path, extra_close={
+        "daily_report_status": "FAILED_RECONCILE",
+        "reconcile_status": "SKIP",
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "CLOSE_AUTHORITATIVE_INTEGRITY_EVIDENCE_MISSING_OR_FAILED" in report["reasons"]
+
+
+def test_close_uncertain_claims_stay_blocked_even_when_top_level_health_zero(tmp_path):
+    _fixture(tmp_path, extra_close={
+        "broker_recovery_health": {
+            "available": True,
+            "unresolved_execution_actions": 3,
+            "duplicate_semantic_submit_detection_count": 0,
+            "recovery_health_error_count": 0,
+            "unattributed_broker_fills": 0,
+            "broker_fill_rebound_failure_count": 0,
+            "broker_local_cumulative_fill_mismatch_count": 0,
+            "filled_sell_missing_cost_basis_count": 0,
+            "stale_pending_exit_stage_after_fill_count": 0,
+            "closed_lifecycle_open_state_count": 0,
+        },
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
+
+
+def test_missing_broker_recovery_health_is_not_treated_as_zero(tmp_path):
+    _fixture(tmp_path, extra_close={"broker_recovery_health": {}})
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_UNVERIFIED" in report["reasons"]
+
+
+def test_bad_broker_recovery_count_fails_without_exception(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "close_summary.json"
+    close = json.loads(path.read_text())
+    close["broker_recovery_health"]["unresolved_execution_actions"] = "unknown"
+    path.write_text(json.dumps(close))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
+
+
+def test_ws_smoke_non_dict_symbol_cannot_use_vacuous_all(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "ws_collector_smoke.json"
+    smoke = json.loads(path.read_text())
+    smoke["symbols"] = {"MSFT": "malformed"}
+    path.write_text(json.dumps(smoke))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH" in report["reasons"]
