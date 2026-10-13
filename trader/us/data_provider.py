@@ -832,6 +832,29 @@ class USDataProvider:
                     freshness = float(os.getenv("KIS_WS_FRESH_MAX_AGE_SEC_US", "15") or 15)
                     if received <= 0 or __import__("time").time() - received > freshness:
                         ctx.price_cache.pop(cache_key, None)
+                    elif str(cached.get("source") or "") == "KIS_WEBSOCKET_COLLECTOR":
+                        # A new collector generation invalidates all inherited
+                        # tick quote snapshots even if their age is still < TTL.
+                        # Recheck the actual latest price, not just the prior age.
+                        try:
+                            from trader.marketdata.us_ws_collector import get_quote as _collector_quote
+                            _fresh_now = _collector_quote(
+                                symbol, exchange, env=self._env, max_age_sec=freshness
+                            )
+                        except Exception:
+                            _fresh_now = None
+                        if (
+                            _fresh_now is None
+                            or str(_fresh_now.get("collector_generation") or "")
+                                != str(cached.get("collector_generation") or "")
+                            or float(_fresh_now.get("last") or 0)
+                                != float(cached.get("last") or 0)
+                            or float(_fresh_now.get("received_at") or 0) != received
+                        ):
+                            ctx.price_cache.pop(cache_key, None)
+                        else:
+                            ctx.count("quote_cache_hits")
+                            return cached
                     else:
                         ctx.count("quote_cache_hits")
                         return cached
