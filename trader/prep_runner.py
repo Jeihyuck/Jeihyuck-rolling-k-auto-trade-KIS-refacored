@@ -1329,6 +1329,30 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
         allow_fallback=False,
     )
 
+    # An exact date in the DB is not sufficient provenance. Before reusing
+    # prebuilt KR PREP inputs, check the successful source and its actual date.
+    if members:
+        snapshot = repo.get_latest_successful_universe_snapshot(
+            env=env, strategy=strategy, as_of_date=as_of_s,
+        )
+        dated_source_ok = bool(
+            snapshot and str(snapshot.get("as_of") or "") == as_of_s
+            and str(snapshot.get("actual_as_of") or "") == as_of_s
+            and str(snapshot.get("provider") or "") == "krx_marketcap_asof"
+            and len(snapshot.get("members") or []) >= max(
+                100, int(os.getenv("UNIVERSE_PREP_VERIFIED_DB_MIN_MEMBERS", "100"))
+            )
+        )
+        if not dated_source_ok:
+            logger.error(
+                "[UNIVERSE][DB][REJECT_UNDATED] requested=%s cached=%d "
+                "source=%s actual_as_of=%s action=REBUILD_DATED",
+                as_of_s, len(members),
+                snapshot.get("provider") if snapshot else None,
+                snapshot.get("actual_as_of") if snapshot else None,
+            )
+            members = []
+
     # 2) build trigger
     should_build = force_always or len(members) == 0
     if should_build:
