@@ -1780,7 +1780,7 @@ class KisAPI:
                             "msg_cd=%s attempt=%s/%s",
                             status, _endpoint_name(url), rate_msg_cd, i, attempts,
                         )
-                        if is_order_endpoint(url) and str(rate_body.get("rt_cd") or "") == "1":
+                        if status != 429 and is_order_endpoint(url) and str(rate_body.get("rt_cd") or "") == "1":
                             # Broker explicitly rejected this POST; do not fake
                             # ambiguous ACK and never submit it twice.
                             logger.warning(
