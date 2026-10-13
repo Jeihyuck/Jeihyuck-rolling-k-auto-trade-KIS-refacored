@@ -8213,10 +8213,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 sticky_runtime_signature = None
                 sticky_runtime_count = 0
                 sleep_for = _sleep_until_start_aligned_tick(
-                        tick_started_monotonic=tick_started_monotonic,
-                        session_end_dt=session_end_dt,
-                        loop_interval=loop_interval,
-                    )
+                    tick_started_monotonic=tick_started_monotonic,
+                    session_end_dt=session_end_dt,
+                    loop_interval=loop_interval,
+                )
                 if sleep_for <= 0:
                     exit_reason = "session_end"
                     break
