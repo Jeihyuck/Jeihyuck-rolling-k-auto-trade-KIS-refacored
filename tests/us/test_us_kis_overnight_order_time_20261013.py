@@ -29,7 +29,9 @@ _KST = ZoneInfo("Asia/Seoul")
 def test_broker_us_session_date_and_korea_clock_map_to_exact_order_instant(
     market_date, kst_clock, submitted_utc, expected_kst_date,
 ):
-    local = resolve_kis_us_order_datetime(market_date, kst_clock)
+    local = resolve_kis_us_order_datetime(
+        market_date, kst_clock, expected_kst_date.replace("-", ""),
+    )
     assert local.date().isoformat() == expected_kst_date
     assert local.astimezone(timezone.utc).isoformat() == submitted_utc
     assert local.astimezone(_ET).date().strftime("%Y%m%d") == market_date
@@ -55,7 +57,9 @@ def test_msft_real_order_status_no_longer_claims_sunday_et_trade_date():
 
 
 def test_amd_order_fills_parser_does_not_shift_actual_event_by_one_day():
-    source = _combine_kis_date_time("20261006", "001427")
+    source = _combine_kis_date_time(
+        "20261006", "001427", domestic_order_date="20261007",
+    )
     assert source == "2026-10-07T00:14:27+09:00"
     assert datetime.fromisoformat(source).astimezone(_ET).date().isoformat() == "2026-10-06"
 
