@@ -1385,6 +1385,24 @@ def _restore_entry_meta_for_promoted_positions(
     return restored_count
 
 
+def _daily_ccld_provider_degradation(payload: dict[str, Any]) -> str | None:
+    """Identify non-authoritative daily-ccld responses, including fail-soft stubs.
+
+    A successful HTTP wrapper call is not proof of broker order/fill truth.
+    This changes only reconciliation health reporting; quantity-only holdings
+    promotion must still keep SELL price and realized PnL unresolved.
+    """
+    if payload.get("_diag_stub"):
+        return "daily_ccld_http_disabled"
+    provider_status = str(payload.get("_ccld_status") or "").strip().upper()
+    if provider_status and provider_status not in {"OK", "SUCCESS"}:
+        return "daily_ccld_provider_degraded"
+    rt_cd = payload.get("rt_cd")
+    if rt_cd is not None and str(rt_cd).strip() not in {"", "0"}:
+        return "daily_ccld_broker_error"
+    return None
+
+
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     env = ctx.env
     env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
@@ -1409,6 +1427,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
     # output2 is an aggregate summary and must never be promoted into an order.
     rows = resp.get("output1") or []
     ccld_status = str(resp.get("_ccld_status") or ("ok" if isinstance(resp, dict) else "unknown"))
+    provider_degraded = _daily_ccld_provider_degradation(resp)
+    if provider_degraded:
+        degraded_reason = degraded_reason or provider_degraded
+        logger.warning(
+            "[RECONCILE][DAILY_CCLD][NON_AUTHORITATIVE] reason=%s provider_status=%s rt_cd=%s "
+            "action=PRESERVE_ORDER_FENCES_AND_UNPRICED_PNL",
+            provider_degraded, ccld_status, str(resp.get("rt_cd") or ""),
+        )
     if isinstance(rows, dict):
         rows = [rows]
     orders_repo = OrdersRepo(engine)
