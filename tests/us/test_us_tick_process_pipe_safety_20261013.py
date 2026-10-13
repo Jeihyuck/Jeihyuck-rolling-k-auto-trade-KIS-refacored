@@ -77,3 +77,14 @@ def test_twelve_delayed_tick_results_keep_buy_to_ack_contract_without_shortcut()
         assert result["entry_evaluated"] == 1
         assert result["orders_sent"] == 1
         assert result["mock_broker"] == {"ACK": True, "qty": 1}
+
+
+def _crash_without_result(tick_cancellation_event=None):
+    os._exit(83)
+
+
+def test_child_that_exits_without_result_does_not_imply_no_broker_order():
+    result = run_tick_in_process(_crash_without_result, kwargs={}, timeout_sec=2)
+    assert result.result["status"] == "ERROR"
+    assert result.result["broker_submission_truth"] == "UNVERIFIED"
+    assert "without_result" in result.result["reason"]
