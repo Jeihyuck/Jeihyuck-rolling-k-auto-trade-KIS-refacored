@@ -37,10 +37,15 @@ def test_atomic_lifecycle_save_cannot_erase_tp_or_reduce_watermark(pg_engine, mo
         "AAPL", "2026-10-12", _lifecycle(high=125)
     )
     assert first["high_watermark"] == 125
+    stale = _lifecycle(high=102)
+    stale["opened_at"] = "2026-10-12T21:00:00+00:00"
+    stale["entry_policy"] = {"book": "WRONG", "exit_policy": "WRONG"}
     again = repos.save_us_position_lifecycle_atomic(
-        "AAPL", "2026-10-12", _lifecycle(high=102)
+        "AAPL", "2026-10-12", stale
     )
     assert float(again["high_watermark"]) == 125
+    assert again["opened_at"] == first["opened_at"]
+    assert again["entry_policy"] == first["entry_policy"]
 
     # A stale stop/risk writer must not overwrite this lifecycle, even if
     # it carries an old snapshot. All unrelated JSONB leaves must survive.
