@@ -160,3 +160,33 @@ def test_collector_survives_killed_tick_client_and_restarts_with_new_generation(
         if restarted.is_alive():
             restarted.terminate()
         restarted.join(timeout=2)
+
+
+def test_tick_cache_revalidates_collector_generation_and_latest_quote(monkeypatch):
+    from trader.us.data_provider import USDataProvider
+    from trader.us.execution.tick_context import TickExecutionContext
+
+    monkeypatch.setenv("US_WS_COLLECTOR_ENABLED", "1")
+    feed = [
+        {"last": 100.0, "received_at": time.time(), "age_sec": 0.0,
+         "collector_generation": "before-restart"},
+        {"last": 101.0, "received_at": time.time(), "age_sec": 0.0,
+         "collector_generation": "after-restart"},
+    ]
+    calls = []
+    def fake_quote(symbol, exchange, *, env, max_age_sec, **kwargs):
+        calls.append((symbol, exchange, env))
+        return dict(feed[0] if len(calls) == 1 else feed[1])
+    monkeypatch.setattr(collector, "get_quote", fake_quote)
+    provider = USDataProvider(offline=False).bind_tick_context(
+        TickExecutionContext("2026-10-12", "am", "run", 1, "tick")
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: (_ for _ in ()).throw(
+        AssertionError("do not use REST when collector quote is fresh")
+    ))
+    first = provider.get_current_price("MSFT", "NASDAQ")
+    assert first["last"] == "100.0"
+    second = provider.get_current_price("MSFT", "NASDAQ")
+    assert second["last"] == "101.0"
+    assert second["collector_generation"] == "after-restart"
+    assert len(calls) >= 3
