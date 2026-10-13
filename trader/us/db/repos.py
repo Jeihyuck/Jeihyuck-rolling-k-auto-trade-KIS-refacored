@@ -2024,6 +2024,65 @@ def load_latest_us_position_risk_states(
         return {sym: load_latest_us_position_risk_state(sym, td) for sym in symbols}
 
 
+
+def load_us_position_risk_state_candidates_batch(
+    symbols: list[str], on_or_before_trade_date: str,
+) -> dict[str, list[dict]]:
+    """Batch the *same* bounded history used by exact lifecycle resolution.
+
+    Each symbol still sees at most 2000 rows, newest first, across historical
+    epochs. The caller MUST apply its existing account/epoch/owner/lifecycle
+    identity filter; this loader does not infer that the newest row is safe.
+    A failed batch query falls back to the original per-symbol read path.
+    """
+    symbols = sorted({str(s or "").strip().upper() for s in symbols if str(s or "").strip()})
+    if not symbols:
+        return {}
+    td = str(on_or_before_trade_date)
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {sym: load_us_position_risk_state_candidates(sym, td) for sym in symbols}
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            rows = conn.execute(text("""
+                SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                       first_soft_stop_seen_at, last_soft_stop_seen_at,
+                       lowest_price_since_breach, last_price, last_pnl_pct,
+                       state, updated_at
+                FROM (
+                    SELECT trading_epoch_id, trade_date, symbol, soft_stop_breach_count,
+                           first_soft_stop_seen_at, last_soft_stop_seen_at,
+                           lowest_price_since_breach, last_price, last_pnl_pct,
+                           state, updated_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY symbol
+                               ORDER BY trade_date DESC, updated_at DESC
+                           ) AS candidate_rank
+                    FROM us_position_risk_state
+                    WHERE symbol = ANY(:symbols) AND trade_date <= :trade_date
+                ) ranked
+                WHERE candidate_rank <= 2000
+                ORDER BY symbol, candidate_rank
+            """), {"symbols": symbols, "trade_date": td}).mappings().all()
+        grouped: dict[str, list[dict]] = {sym: [] for sym in symbols}
+        for row in rows:
+            symbol = str(row["symbol"]).upper()
+            if symbol in grouped:
+                grouped[symbol].append(dict(row))
+        logger.info(
+            "[US_RISK_STATE][BATCH_CANDIDATES] symbols=%d rows=%d queries=1",
+            len(symbols), len(rows),
+        )
+        return grouped
+    except Exception as exc:
+        logger.warning(
+            "[US_RISK_STATE][BATCH_CANDIDATES_WARN] symbols=%d err=%s action=per_symbol_fallback",
+            len(symbols), exc,
+        )
+        return {sym: load_us_position_risk_state_candidates(sym, td) for sym in symbols}
+
+
 def load_us_position_risk_state_candidates(
     symbol: str, on_or_before_trade_date: str,
 ) -> list[dict]:
