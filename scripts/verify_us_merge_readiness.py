@@ -76,7 +76,8 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         and len(smoke_symbols) > 0
         and all(
             isinstance(value, dict)
-            and int(value.get("hit") or 0) >= 1
+            and type(value.get("hit")) is int
+            and value["hit"] >= 1
             for value in smoke_symbols.values()
         )
     )
@@ -204,7 +205,7 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
             "stale_pending_exit_stage_after_fill_count",
             "closed_lifecycle_open_state_count",
         ):
-            if key not in recovery or recovery[key] is None or int(recovery[key]) != 0:
+            if key not in recovery or type(recovery[key]) is not int or recovery[key] != 0:
                 reasons.append("CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN")
                 break
     if metrics["close_unresolved_actions"] or metrics["close_manual_reconcile_required"]:
