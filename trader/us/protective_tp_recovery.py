@@ -181,6 +181,44 @@ def has_unresolved_tp_claim(
 
 
 
+
+def load_crossday_unresolved_tp_lifecycles(
+    lifecycle_ids: list[str], trade_date: str, *, env: str,
+) -> set[str]:
+    """One epoch- and owner-scoped query to avoid routing known fenced exits.
+
+    Returns exact prior US_STANDARD lifecycle IDs with unresolved TP actions.
+    This does NOT resolve or release the claim and never declares a fill or
+    cancellation. A DB failure propagates: caller lets the existing broker
+    order gate remain authoritative rather than inventing an empty claim set.
+    """
+    from sqlalchemy import text
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+
+    ids = sorted({str(value or "").strip() for value in lifecycle_ids if str(value or "").strip()})
+    if not ids:
+        return set()
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("durable database required for crossday TP suppression")
+    with engine.connect() as conn:
+        epoch = _active_us_epoch(conn)
+        if not epoch:
+            raise RuntimeError("active epoch required for crossday TP suppression")
+        rows = conn.execute(text("""
+            SELECT DISTINCT lifecycle_id
+            FROM us_execution_claims
+            WHERE trading_epoch_id=:epoch AND env=:env AND market='US'
+              AND strategy_owner='US_STANDARD'
+              AND lifecycle_id = ANY(:lifecycles)
+              AND action IN ('TP1','TP2','TP3')
+              AND action_state IN ('IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED')
+              AND trade_date < CAST(:trade_date AS date)
+        """), {"epoch": epoch, "env": env, "lifecycles": ids,
+                "trade_date": str(trade_date)}).scalars().all()
+    return {str(row) for row in rows if row}
+
+
 def reserve_cancel_request(order: dict) -> bool:
     """One durable write before KIS cancel. No repeated cancel after ambiguity."""
     from sqlalchemy import text
@@ -306,6 +344,8 @@ def request_protective_tp_cancel(
                     symbol, order.get("order_no"), order.get("trade_date"),
                     trade_date, stale_classification,
                 )
+                # Audit only here. Reserved prior cancel attempts must still
+                # reconcile genuine terminal fill/cancel evidence below.
             meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
             if (
                 str(meta.get("strategy_owner") or "").upper() != "US_STANDARD"
@@ -317,6 +357,18 @@ def request_protective_tp_cancel(
                 continue
             if order.get("claim_state") not in {"IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED"}:
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "tp_claim_unverified"})
+                continue
+            if stale_classification != "SAME_DAY_TP_CLAIM" and not meta.get(
+                "protective_tp_cancel_requested_at"
+            ):
+                # Old KIS CCNL OPEN is historical, not an actionable active
+                # order. Do not burn a REST inquiry/cancel on that stale date.
+                # Leave the execution claim fenced for authoritative repair.
+                results.append({
+                    "symbol": symbol, "status": "FENCED",
+                    "reason": "historical_open_not_current_cancel_proof",
+                    "stale_classification": stale_classification,
+                })
                 continue
             evidence = provider.get_fills_by_order_no(
                 order_no=str(order["order_no"]), symbol=symbol,

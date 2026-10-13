@@ -1901,9 +1901,11 @@ def route_order(
     # KIS 주문 성공 후 DB 저장 실패는 REJECT가 아니라 ACK_DB_FAILED이다.
     order_no: str | None = None
     resp: Any = None
+    _http_boundary_mono: float | None = None
     from trader.us.execution.kis_us_client import KisUSPreSubmitError
 
     def _mark_broker_submit_boundary() -> None:
+        nonlocal _http_boundary_mono
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )
@@ -1911,6 +1913,18 @@ def route_order(
             raise KisUSPreSubmitError(
                 f"CLAIM_OBSERVATION_FAILED_BEFORE_HTTP: {observation_error}"
             )
+        _http_boundary_mono = time.monotonic()
+        # Monotonic readiness is deliberately process-local (not persisted).
+        _sell_ready = getattr(context, "_sell_signal_ready_mono", None)
+        if side == "SELL" and isinstance(_sell_ready, (int, float)):
+            _delay_ms = max(0.0, (_http_boundary_mono - _sell_ready) * 1000)
+            logger.info(
+                "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=%s attempt=%s delay_ms=%.2f",
+                symbol_upper, intent["submit_attempt_id"], _delay_ms,
+            )
+            _metrics = getattr(context, "metrics", None)
+            if isinstance(_metrics, dict):
+                _metrics["sell_signal_to_broker_boundary_ms"] = _delay_ms
 
     set_submit_boundary = getattr(kis_client, "set_before_order_http", None)
     clear_submit_boundary = getattr(kis_client, "clear_before_order_http", None)
@@ -1923,7 +1937,20 @@ def route_order(
             resp = kis_client.place_us_buy_order(symbol, exchange, qty, price)
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
+        if _http_boundary_mono is not None:
+            logger.info(
+                "[US_ORDER][BROKER_CALL_RETURNED] symbol=%s side=%s attempt=%s elapsed_ms=%.2f",
+                symbol_upper, side, intent["submit_attempt_id"],
+                (time.monotonic() - _http_boundary_mono) * 1000.0,
+            )
     except Exception as exc:
+        if _http_boundary_mono is not None:
+            logger.warning(
+                "[US_ORDER][BROKER_CALL_EXCEPTION] symbol=%s side=%s attempt=%s elapsed_ms=%.2f type=%s",
+                symbol_upper, side, intent["submit_attempt_id"],
+                (time.monotonic() - _http_boundary_mono) * 1000.0,
+                type(exc).__name__,
+            )
         if isinstance(exc, KisUSPreSubmitError):
             integrity_error = str(exc)
             try:

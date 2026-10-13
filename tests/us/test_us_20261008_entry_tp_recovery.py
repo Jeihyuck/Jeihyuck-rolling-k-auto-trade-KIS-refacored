@@ -143,7 +143,7 @@ def test_protective_tp_recovery_requires_opt_in_and_broker_proof(monkeypatch, sy
             return {"rt_cd": "0"}
     kis = KIS()
     args = {"intents": [_protective(symbol)], "provider": Provider(), "kis_client": kis,
-            "trade_date": "2026-10-07", "env": "practice",
+            "trade_date": "2026-10-06", "env": "practice",
             "find_open": lambda *a, **k: [order], "reserve": lambda x: True}
     monkeypatch.delenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", raising=False)
     assert request_protective_tp_cancel(**args) == []
@@ -511,7 +511,7 @@ def test_cancel_rejection_stays_fenced_and_does_not_release_claim(monkeypatch):
     kis = KIS()
     result = request_protective_tp_cancel(
         intents=[_protective()], provider=Provider(), kis_client=kis,
-        trade_date="2026-10-07", env="practice",
+        trade_date="2026-10-06", env="practice",
         find_open=lambda *a, **k: [_old_tp()], reserve=lambda _: True,
     )
     assert kis.count == 1

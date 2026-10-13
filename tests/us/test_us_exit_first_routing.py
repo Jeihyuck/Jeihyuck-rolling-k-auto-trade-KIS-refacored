@@ -717,3 +717,73 @@ def test_missing_effective_max_positions_preserves_existing_entry_slots(monkeypa
 
     assert captured["available_new_slots"] == 34
     assert result["available_new_slots"] == 34
+
+
+def test_protective_sell_router_precedes_buy_only_daily_notional_db(monkeypatch):
+    """SELL must not await the BUY budget DB; existing order gates remain in router."""
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+    calls = []
+    _patch_tick_basics(monkeypatch, calls)
+
+    def route(intent, **kwargs):
+        calls.append(("route_order", intent, kwargs))
+        return {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent}
+
+    def buy_budget(*args, **kwargs):
+        calls.append(("buy_notional_db", None, kwargs))
+        return 100.0
+
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", route)
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", buy_budget)
+    result = run_trade_tick(
+        session="am", env="practice", offline=False,
+        force_now="2026-06-05T10:00:00-04:00", kis_order_allowed=False,
+    )
+    sell_index = next(i for i, event in enumerate(calls) if event[0] == "route_order")
+    db_index = next(i for i, event in enumerate(calls) if event[0] == "buy_notional_db")
+    assert sell_index < db_index, calls
+    assert calls[sell_index][2]["current_daily_notional_usd"] == 0.0
+    assert result["orders"][0]["status"] == "ACK"
+
+
+def test_protective_sell_reaches_router_before_slow_buy_only_budget_lookup(monkeypatch):
+    """The real runner must not wait for BUY notional before submitting SELL.
+
+    This is a broker-free functional timing ordering test, not KIS p95 evidence.
+    """
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+    from trader.us.db import repos
+
+    calls = []
+    _patch_tick_basics(monkeypatch, calls)
+    times = {}
+
+    def slow_buy_budget(*args, **kwargs):
+        times["buy_budget_started"] = time.monotonic()
+        time.sleep(0.12)
+        return 0.0
+
+    def fake_route(intent, **kwargs):
+        if intent["side"] == "SELL":
+            times["sell_broker_boundary"] = time.monotonic()
+            assert "buy_budget_started" not in times, (
+                "BUY-only DB work delayed protective SELL submission"
+            )
+            assert kwargs["current_daily_notional_usd"] == 0.0
+        return {
+            "status": "ACK", "side": intent["side"],
+            "symbol": intent["symbol"], "intent": intent,
+        }
+
+    monkeypatch.setattr(repos, "load_today_committed_buy_notional", slow_buy_budget)
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", fake_route)
+    result = run_trade_tick(
+        session="am", env="practice", offline=False,
+        force_now="2026-06-05T10:00:00-04:00",
+        kis_order_allowed=False,
+    )
+    assert "sell_broker_boundary" in times, result
+    assert "buy_budget_started" in times, result
+    assert times["sell_broker_boundary"] < times["buy_budget_started"]
+    assert result["exit_routed_before_entry"] == 1
+    assert result["orders"][0]["status"] == "ACK"

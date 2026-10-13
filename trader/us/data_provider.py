@@ -579,9 +579,11 @@ def normalize_us_order_status_row(row: dict) -> dict:
     if not submitted_at_utc and trade_date_raw and order_time_raw:
         try:
             from zoneinfo import ZoneInfo
-            local = datetime.strptime(
-                trade_date_raw.replace("-", "") + order_time_raw, "%Y%m%d%H%M%S",
-            ).replace(tzinfo=ZoneInfo("Asia/Seoul"))
+            from trader.us.utils.kis_order_time import resolve_kis_us_order_datetime
+            local = resolve_kis_us_order_datetime(
+                trade_date_raw, order_time_raw,
+                domestic_order_date=_get_first_valid(row, ("dmst_ord_dt", "DMST_ORD_DT"), None),
+            )
             submitted_at_utc = local.astimezone(timezone.utc).isoformat()
         except Exception:
             time_error = "invalid_kis_order_datetime"
@@ -643,6 +645,11 @@ def normalize_us_order_status_row(row: dict) -> dict:
         ),
         "source_timestamp_date": trade_date_raw,
         "source_timestamp_time": order_time_raw,
+        # KIS ord_dt is the US trading session day, not necessarily the KST
+        # calendar date of ord_tmd. Keep the raw values for broker auditing.
+        "order_timestamp_date_basis": (
+            "US_TRADE_SESSION_DATE_KST_CLOCK" if trade_date_raw and order_time_raw else None
+        ),
         "exchange": str(_get_first_valid(row, ("exchange", "ovrs_excg_cd", "OVRS_EXCG_CD"), "") or ""),
         "limit_price": _safe_float(_get_first_valid(row, ("limit_price", "ft_ord_unpr3", "ord_unpr"), 0.0)),
         "submitted_at_utc": submitted_at_utc,

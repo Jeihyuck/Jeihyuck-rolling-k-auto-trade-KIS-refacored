@@ -102,13 +102,13 @@ def test_jpm_two_page_provider_pipeline_preserves_all_seven(monkeypatch):
     rows=json.loads((Path(__file__).parent.parent/"fixtures/us/jpm_7_order_rows.json").read_text())
     client=KisUSClient.__new__(KisUSClient)
     client._offline=False; client._assert_not_offline=lambda *_:None; client._build_headers=lambda *_:{}
-    client._build_us_fills_params=lambda *_:{"CTX_AREA_NK200":"","CTX_AREA_FK200":""}
+    client._build_us_fills_params=lambda *_,**__:{"CTX_AREA_NK200":"","CTX_AREA_FK200":""}
     pages=iter([{"output":rows[:5],"CTX_AREA_NK200":"NEXT","CTX_AREA_FK200":"F","_response_meta":{"tr_cont":"M"}},
                 {"output":rows[5:],"_response_meta":{"tr_cont":""}}])
     client._get=lambda *a,**k:next(pages)
     with patch("trader.us.execution.kis_us_client.get_tr_info",return_value={"tr_id":"T","path":"/x"}):
         provider=USDataProvider(offline=False); provider._get_client=lambda:client
-        normalized=provider.get_today_orders("2026-08-04")
+        normalized=provider.get_today_orders("2026-07-16")
     assert len(normalized)==7 and {row["page_index"] for row in normalized}=={1,2}
     assert sum(row["normalization_result"]=="normalized" for row in normalized)==7
     jpm=[row for row in normalized if row["symbol"]=="JPM"]

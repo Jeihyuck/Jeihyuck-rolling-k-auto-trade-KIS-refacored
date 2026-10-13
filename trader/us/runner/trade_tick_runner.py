@@ -500,8 +500,43 @@ def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_in
     return timestamp
 
 
-def _suppress_pending_sell_exit_intents(exit_intents: list[dict], trade_date: str) -> list[dict]:
-    """Do not repeatedly create SELL intents while a same-day SELL is pending."""
+def _suppress_pending_sell_exit_intents(
+    exit_intents: list[dict], trade_date: str, *, env: str = "practice",
+) -> list[dict]:
+    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP."""
+    def _standard_lifecycle(intent: dict) -> str:
+        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+        owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
+        producer = str(intent.get("strategy") or meta.get("strategy") or "").lower()
+        symbol = str(intent.get("symbol") or "").upper()
+        if symbol == "TQQQ" or owner not in {"", "US_STANDARD"}:
+            return ""
+        if owner != "US_STANDARD" and producer != "us_pb1_exit":
+            return ""
+        return str(
+            intent.get("position_lifecycle_id")
+            or meta.get("position_lifecycle_id") or ""
+        ).strip()
+
+    # One historical claim read, scoped by epoch/owner/lifecycle. No invented
+    # terminal status, no fence release and no KIS REST call on every symbol.
+    historical_fenced: set[str] = set()
+    crossday_ids = [
+        _standard_lifecycle(intent) for intent in exit_intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    ]
+    crossday_ids = [value for value in crossday_ids if value]
+    if crossday_ids:
+        try:
+            from trader.us.protective_tp_recovery import load_crossday_unresolved_tp_lifecycles
+            historical_fenced = load_crossday_unresolved_tp_lifecycles(
+                crossday_ids, trade_date, env=env,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=use_existing_order_gate",
+                exc,
+            )
     try:
         from trader.us.db.repos import has_pending_order_for_symbol_side
     except Exception:
@@ -513,6 +548,14 @@ def _suppress_pending_sell_exit_intents(exit_intents: list[dict], trade_date: st
             kept.append(intent)
             continue
         symbol = str(intent.get("symbol") or "").upper().strip()
+        lifecycle = _standard_lifecycle(intent)
+        if lifecycle and lifecycle in historical_fenced:
+            logger.warning(
+                "[US_EXIT][INTENT_SUPPRESS] symbol=%s lifecycle=%s "
+                "reason=crossday_unresolved_tp_claim action=RETAIN_FENCE_NO_NEW_ORDER",
+                symbol, lifecycle,
+            )
+            continue
         try:
             pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
         except Exception as exc:
@@ -1409,6 +1452,12 @@ def route_exit_orders_immediately(
     decisions: list[dict] = []
     for intent in sell_intents:
         try:
+            _individual_route_start = time.monotonic()
+            logger.info(
+                "[US_EXIT][ROUTER_ENTER] symbol=%s qty=%s reason=%s",
+                intent.get("symbol"), intent.get("qty"),
+                intent.get("reason") or (intent.get("meta") or {}).get("reason"),
+            )
             result = route_order(
                 intent,
                 current_daily_notional_usd=buy_daily_notional,
@@ -1423,6 +1472,12 @@ def route_exit_orders_immediately(
                 kis_client=kis_client,
             )
             orders.append(result)
+            logger.info(
+                "[US_EXIT][ROUTER_RESULT] symbol=%s elapsed_ms=%.2f status=%s",
+                intent.get("symbol"),
+                (time.monotonic() - _individual_route_start) * 1000.0,
+                result.get("status"),
+            )
             status = str(result.get("status") or "ERROR")
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
@@ -2477,6 +2532,17 @@ def run_trade_tick(
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+    # Measure protective signal readiness separately from broker routing.
+    # This never changes an intent, strategy evaluation, or order/fence state.
+    _early_sell_signal_ready_mono = (
+        time.monotonic()
+        if any(str(i.get("side") or "").upper() == "SELL" for i in exit_intents)
+        else None
+    )
+    # Process-local monotonic clock only. Never persist it in an order intent:
+    # different tick processes cannot compare monotonic timestamps.
+    if tick_context is not None:
+        setattr(tick_context, "_sell_signal_ready_mono", _early_sell_signal_ready_mono)
     logger.info("[US_EXIT_EVAL][SUMMARY] session=%s tick=%s positions_evaluated=%d sell_candidates=%d sell_orders=%d", session, tick_index, len(current_positions), len([i for i in exit_intents if str(i.get("side") or "").upper()=="SELL"]), 0)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
     tick_context.metrics["exit_engine_ms"] = (time.monotonic() - _exit_engine_started) * 1000.0
@@ -2641,9 +2707,40 @@ def run_trade_tick(
 
     # Suppress at intent generation (rather than only in the router) so all
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
-    exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)
+    exit_intents = _suppress_pending_sell_exit_intents(
+        exit_intents, trade_date, env=env,
+    )
 
-    # Route SELLs immediately before any entry watchlist or entry evaluation work.
+    # Route SELL without an unnecessary BUY-only DB budget read. The SELL
+    # branch of assert_order_allowed() never consumes the daily BUY notional.
+    # A failed budget read must still block BUY (including TQQQ), but must
+    # never delay a valid protective SELL's broker submit path.
+    if not current_position_symbols and current_positions:
+        current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
+
+    if _early_sell_signal_ready_mono is not None:
+        _pre_route_delay_ms = (time.monotonic() - _early_sell_signal_ready_mono) * 1000.0
+        tick_context.metrics["sell_intent_ready_to_route_ms"] = _pre_route_delay_ms
+        logger.warning(
+            "[US_EXIT][SIGNAL_READY_TO_ROUTE] tick=%s delay_ms=%.2f "
+            "reason=pre_route_overlay_recovery_and_claim_checks",
+            tick_index, _pre_route_delay_ms,
+        )
+    exit_route_result = route_exit_orders_immediately(
+        exit_intents,
+        buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
+        position_count=position_count,
+        effective_budget=effective_budget,
+        signal_only=signal_only,
+        kis_order_allowed=kis_order_allowed,
+        current_position_symbols=current_position_symbols,
+        context=tick_context,
+        kis_client=routing_kis_client,
+    )
+
+    # BUY-specific committed notional is loaded only after protective sells
+    # have passed the existing router, durability fences and broker boundary.
+    # Do not treat a SELL intent or ACK as new cash/buying power.
     try:
         from trader.us.db.repos import load_today_committed_buy_notional
         buy_daily_notional = load_today_committed_buy_notional(trade_date, env=env, include_pending=True)
@@ -2656,20 +2753,6 @@ def run_trade_tick(
         # SELL routing does not consume the BUY daily limit.  This sentinel is
         # used only for the already-separated SELL-first call below.
         buy_daily_notional = 0.0
-    if not current_position_symbols and current_positions:
-        current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
-
-    exit_route_result = route_exit_orders_immediately(
-        exit_intents,
-        buy_daily_notional=buy_daily_notional,
-        position_count=position_count,
-        effective_budget=effective_budget,
-        signal_only=signal_only,
-        kis_order_allowed=kis_order_allowed,
-        current_position_symbols=current_position_symbols,
-        context=tick_context,
-        kis_client=routing_kis_client,
-    )
 
     infinite_result = {"status": "OFF", "orders": []}
     _tqqq_infinite_started = time.monotonic()

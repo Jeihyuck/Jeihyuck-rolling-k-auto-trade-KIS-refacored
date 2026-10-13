@@ -1,0 +1,242 @@
+"""Evidence gate contract — no real order/DB/WS mutations."""
+from __future__ import annotations
+
+import json
+
+from scripts.verify_us_merge_readiness import evaluate, nearest_rank
+
+
+SHA = "a" * 40
+DATE = "2026-10-13"
+
+
+def _fixture(root, *, sha=SHA, tick_sec=48, sell_sec=8,
+             close_status="OK", extra_close=None, buy_defer=0):
+    daily = root / "reports" / "us_daily" / DATE
+    daily.mkdir(parents=True)
+    for session in ("am", "afternoon"):
+        (daily / f"{session}_summary.json").write_text(json.dumps({
+            "commit_sha": sha, "tick_latency": {
+                "entry_defer_count": buy_defer,
+                "kis_http_calls": {"quote_http_calls": 3},
+            },
+        }))
+        folder = root / "runtime" / "logs" / "us" / DATE / session
+        folder.mkdir(parents=True)
+        body = "".join(
+            f"[US_TICK][LATENCY] tick={i} total_ms={tick_sec * 1000} "
+            f"balance_ms=100.0" + chr(10)
+            for i in range(1, 17)
+        )
+        if session == "am":
+            body += (
+                "[US_KIS][WS_COLLECTOR_HIT] symbol=MSFT exchange=NASDAQ "
+                "generation=test-generation age_sec=0.1" + chr(10)
+            )
+        if session == "am" and sell_sec is not None:
+            body += (
+                "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
+                f"attempt=synthetic delay_ms={sell_sec * 1000}" + chr(10)
+            )
+        (folder / f"{session}.log").write_text(body)
+    (daily / "close_summary.json").write_text(json.dumps({
+        "commit_sha": sha, "status": close_status,
+        "open_order_pending_total": 0, "manual_reconcile_required": 0,
+        "close_integrity_status": "OK", "report_consistency": "OK",
+        "daily_report_status": "OK", "reconcile_status": "OK",
+        "ack_reconcile_status": "OK", "fills_status": "OK",
+        "position_snapshot_error": None,
+        "broker_recovery_health": {
+            "available": True,
+            "unresolved_execution_actions": 0,
+            "duplicate_semantic_submit_detection_count": 0,
+            "recovery_health_error_count": 0,
+            "unattributed_broker_fills": 0,
+            "broker_fill_rebound_failure_count": 0,
+            "broker_local_cumulative_fill_mismatch_count": 0,
+            "filled_sell_missing_cost_basis_count": 0,
+            "stale_pending_exit_stage_after_fill_count": 0,
+            "closed_lifecycle_open_state_count": 0,
+        },
+        "errors": [], **(extra_close or {}),
+    }))
+    (daily / "ws_collector_smoke.json").write_text(json.dumps({
+        "commit_sha": sha,
+        "evidence_at_utc": "2026-10-13T03:01:00+00:00",
+        "mode": "READ_ONLY_PRACTICE_MARKET_DATA",
+        "no_order_submit": True,
+        "verified_fresh_quote_for_all": True,
+        "collector_generation": "test-generation",
+        "symbols": {"MSFT": {"exchange": "NASDAQ", "hit": 22, "miss": 1}},
+        "ipc_failures": [],
+    }))
+
+
+def test_nearest_rank_math_for_integer_tick_count():
+    assert nearest_rank([1, 2, 3, 4, 5], .95) == 5
+    assert nearest_rank([], .95) is None
+
+
+def test_good_live_shaped_evidence_passes(tmp_path):
+    _fixture(tmp_path)
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "PASS", report
+    assert report["measured_ticks"] == 32
+    assert report["tick_p95_sec"] == 48
+    assert report["sell_signal_to_broker_boundary_p95_sec"] == 8
+    assert report["kis_quote_rest_calls"] == 6
+
+
+def test_prechange_old_sha_cannot_count_as_postmerge_evidence(tmp_path):
+    _fixture(tmp_path, sha="b" * 40)
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "EXECUTION_SHA_MISMATCH_OR_UNVERIFIED" in report["reasons"]
+
+
+def test_old_300_second_tick_latency_never_passes(tmp_path):
+    _fixture(tmp_path, tick_sec=308, sell_sec=38, buy_defer=1)
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "TICK_P95_ABOVE_60_SEC_OR_UNMEASURED" in report["reasons"]
+    assert "PROTECTIVE_SELL_LATENCY_LIMIT_FAILED" in report["reasons"]
+    assert "BUY_EVALUATION_DEFERRED_FOR_TIME" in report["reasons"]
+
+
+def test_close_pending_and_manual_reconcile_fail_closed(tmp_path):
+    _fixture(tmp_path, extra_close={
+        "open_order_pending_total": 1,
+        "manual_reconcile_required": 1,
+        "errors": ["UNRESOLVED_EXECUTION_ACTIONS:3"],
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "BROKER_OPEN_ORDERS_REQUIRE_CLOSE_TRUTH_REVIEW" in report["reasons"]
+    assert "UNRESOLVED_EXECUTION_OR_MANUAL_RECONCILIATION" in report["reasons"]
+
+
+def test_no_protective_broker_boundary_cannot_pass(tmp_path):
+    _fixture(tmp_path, sell_sec=None)
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "NO_ACTUAL_SELL_BROKER_SUBMISSION_LATENCY_EVIDENCE" in report["reasons"]
+
+
+def test_clean_label_does_not_hide_claim_conflicts_or_protective_sell_failure(tmp_path):
+    _fixture(tmp_path, close_status="OK", extra_close={
+        "close_integrity_status": "RECONCILE_REQUIRED",
+        "execution_claim_health": {
+            "unresolved_execution_actions": 3,
+            "execution_claim_conflicts": 223,
+        },
+        "runtime_liveness_failures": [
+            {"session": "am", "sell_liveness_status": "RECONCILE_REQUIRED"}
+        ],
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_BROKER_CLAIM_OR_LIVENESS_NOT_CLEAN" in report["reasons"]
+    assert report["close_claim_unresolved"] == 3
+
+
+def test_missing_collector_wsl_smoke_never_passes(tmp_path):
+    _fixture(tmp_path)
+    (tmp_path / "reports" / "us_daily" / DATE / "ws_collector_smoke.json").unlink()
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "MISSING_OR_INVALID_LIVE_WS_COLLECTOR_EVIDENCE" in report["reasons"]
+
+
+def test_collector_smoke_from_other_sha_or_without_fresh_prices_cannot_pass(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "ws_collector_smoke.json"
+    smoke = json.loads(path.read_text())
+    smoke["commit_sha"] = "b" * 40
+    smoke["verified_fresh_quote_for_all"] = False
+    path.write_text(json.dumps(smoke))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH" in report["reasons"]
+
+
+def test_smoke_proof_without_actual_trading_quote_hits_fails(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "runtime" / "logs" / "us" / DATE / "am" / "am.log"
+    path.write_text(
+        "\n".join(
+            line for line in path.read_text().splitlines()
+            if "[US_KIS][WS_COLLECTOR_HIT]" not in line
+        )
+    )
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "NO_SESSION_RUNTIME_WS_COLLECTOR_HITS" in report["reasons"]
+
+
+def test_close_integrity_must_be_explicitly_verified(tmp_path):
+    _fixture(tmp_path, extra_close={"close_integrity_status": None})
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_AUTHORITATIVE_INTEGRITY_EVIDENCE_MISSING_OR_FAILED" in report["reasons"]
+
+
+def test_close_reconcile_and_daily_report_are_independently_required(tmp_path):
+    _fixture(tmp_path, extra_close={
+        "daily_report_status": "FAILED_RECONCILE",
+        "reconcile_status": "SKIP",
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "CLOSE_AUTHORITATIVE_INTEGRITY_EVIDENCE_MISSING_OR_FAILED" in report["reasons"]
+
+
+def test_close_uncertain_claims_stay_blocked_even_when_top_level_health_zero(tmp_path):
+    _fixture(tmp_path, extra_close={
+        "broker_recovery_health": {
+            "available": True,
+            "unresolved_execution_actions": 3,
+            "duplicate_semantic_submit_detection_count": 0,
+            "recovery_health_error_count": 0,
+            "unattributed_broker_fills": 0,
+            "broker_fill_rebound_failure_count": 0,
+            "broker_local_cumulative_fill_mismatch_count": 0,
+            "filled_sell_missing_cost_basis_count": 0,
+            "stale_pending_exit_stage_after_fill_count": 0,
+            "closed_lifecycle_open_state_count": 0,
+        },
+    })
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
+
+
+def test_missing_broker_recovery_health_is_not_treated_as_zero(tmp_path):
+    _fixture(tmp_path, extra_close={"broker_recovery_health": {}})
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_UNVERIFIED" in report["reasons"]
+
+
+def test_bad_broker_recovery_count_fails_without_exception(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "close_summary.json"
+    close = json.loads(path.read_text())
+    close["broker_recovery_health"]["unresolved_execution_actions"] = "unknown"
+    path.write_text(json.dumps(close))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
+
+
+def test_ws_smoke_non_dict_symbol_cannot_use_vacuous_all(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "ws_collector_smoke.json"
+    smoke = json.loads(path.read_text())
+    smoke["symbols"] = {"MSFT": "malformed"}
+    path.write_text(json.dumps(smoke))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert "LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH" in report["reasons"]
+
+
+def test_old_duplicate_claim_conflicts_are_not_ignored_after_inflight_to_uncertain(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "close_summary.json"
+    close = json.loads(path.read_text())
+    close["broker_recovery_health"]["duplicate_semantic_submit_detection_count"] = 223
+    path.write_text(json.dumps(close))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
