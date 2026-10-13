@@ -485,6 +485,18 @@ def test_us_lifecycle_uses_confirmed_buy_fill_time_and_preserves_it_after_restar
     monkeypatch.setattr(lifecycle, "load_latest_us_position_risk_state", _latest)
     monkeypatch.setattr(lifecycle, "load_us_position_risk_state", _load)
     monkeypatch.setattr(lifecycle, "save_us_position_risk_state", _save)
+    # Production lifecycle writes are now scoped/atomic rather than whole-risk
+    # snapshots. Keep this fixture's fake DB compatible with the new writer.
+    from trader.us.db import repos
+
+    def _save_lifecycle_leaf(symbol, trade_date, new_lifecycle):
+        saved = state_by_symbol.get(str(symbol).upper(), {})
+        current_state = dict(saved.get("state") or {})
+        current_state["lifecycle"] = copy.deepcopy(new_lifecycle)
+        state_by_symbol[str(symbol).upper()] = {**saved, "state": current_state}
+        return copy.deepcopy(new_lifecycle)
+
+    monkeypatch.setattr(repos, "save_us_position_lifecycle_atomic", _save_lifecycle_leaf)
 
     contract = _contract()
     fill_time = "2026-09-18T13:35:00+00:00"
