@@ -2496,6 +2496,10 @@ def run_trade_tick(
         if any(str(i.get("side") or "").upper() == "SELL" for i in exit_intents)
         else None
     )
+    # Process-local monotonic clock only. Never persist it in an order intent:
+    # different tick processes cannot compare monotonic timestamps.
+    if tick_context is not None:
+        setattr(tick_context, "_sell_signal_ready_mono", _early_sell_signal_ready_mono)
     logger.info("[US_EXIT_EVAL][SUMMARY] session=%s tick=%s positions_evaluated=%d sell_candidates=%d sell_orders=%d", session, tick_index, len(current_positions), len([i for i in exit_intents if str(i.get("side") or "").upper()=="SELL"]), 0)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
     tick_context.metrics["exit_engine_ms"] = (time.monotonic() - _exit_engine_started) * 1000.0
