@@ -17276,6 +17276,36 @@ class PB1Engine:
             (holdings_meta or {}).get("source"),
         )
         self._exit_holdings_meta = holdings_meta
+        # Priority enrollment is nonblocking and does not change any owner
+        # decision. Keep all non-subscribed symbols eligible for governed REST
+        # fallback rather than treating WebSocket overflow as no market data.
+        try:
+            from trader.marketdata.kis_ws_price import get_kis_ws_price_service
+            _hold_codes = [
+                str(getattr(holding, "code", "") or "").zfill(6)
+                for holding in (holdings_for_exit or [])
+                if str(getattr(holding, "code", "") or "").zfill(6) != "122630"
+            ]
+            _orders = self._tick_db_cache.get("open_orders", [])
+            _order_codes = [
+                str((row or {}).get("code") or "").zfill(6)
+                for row in (_orders if isinstance(_orders, list) else [])
+                if isinstance(row, dict) and (row.get("code") or "")
+            ]
+            _final_codes = (
+                [str(code).zfill(6) for code in self.final30_df["code"].tolist()]
+                if isinstance(self.final30_df, pd.DataFrame) and "code" in self.final30_df
+                else []
+            )
+            get_kis_ws_price_service().prioritize_kr_symbols(
+                holdings=_hold_codes, unresolved_orders=_order_codes,
+                final30=_final_codes,
+            )
+        except Exception as _ws_priority_exc:
+            logger.warning(
+                "[KR_WS][OWNER_PRIORITY][FAIL_SOFT] type=%s action=KEEP_REST_FALLBACK",
+                type(_ws_priority_exc).__name__,
+            )
         positions_for_exit = [holding.to_position_dict() for holding in holdings_for_exit]
         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
         existing_positions_count = len(existing_positions)
