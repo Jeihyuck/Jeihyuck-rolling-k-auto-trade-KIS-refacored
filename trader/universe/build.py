@@ -694,6 +694,9 @@ def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict |
 
 
 def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None, *, prep_recovery: bool = False) -> list[dict]:
+    # Reject undated providers before opening DB connections or causing side effects.
+    if prep_recovery and provider_override not in (None, "krx_marketcap_asof"):
+        raise ValueError("PREP requires exact-date KRX provider; undated override rejected")
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
@@ -705,8 +708,6 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         and os.getenv("UNIVERSE_PREP_VERIFIED_DB_FALLBACK", "1") == "1"
         and os.getenv("UNIVERSE_NO_FALLBACK", "0") != "1"
     )
-    if prep_recovery and provider_override not in (None, "krx_marketcap_asof"):
-        raise ValueError("PREP requires exact-date KRX provider; undated override rejected")
     preexisting_snapshot: dict | None = None
     if prep_recovery_enabled:
         try:
