@@ -1680,17 +1680,20 @@ class KisAPI:
         last_err: Exception | None = None
         configured_timeout = kwargs.pop("timeout", (3.0, 7.0))
         for i in range(1, attempts + 1):
+            # This pre-HTTP budget gate must remain OUTSIDE the HTTP exception
+            # handler: an exhausted SELL budget is proven pre-submit, not an
+            # ambiguous broker ACK that needs an UNRESOLVED_ACK fence.
+            wait_limiter = gate.acquire(
+                environment=str(self.env or "practice"),
+                account_key=account_key,
+                endpoint_category=endpoint_category,
+                priority=endpoint_category in {"order", "balance"},
+            )
+            if wait_limiter > 0 and not _kr_sleep_with_budget(
+                wait_limiter, stage_deadline=getattr(self, "_kr_stage_deadline", None)
+            ):
+                raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER")
             try:
-                wait_limiter = gate.acquire(
-                    environment=str(self.env or "practice"),
-                    account_key=account_key,
-                    endpoint_category=endpoint_category,
-                    priority=endpoint_category in {"order", "balance"},
-                )
-                if wait_limiter > 0 and not _kr_sleep_with_budget(
-                    wait_limiter, stage_deadline=getattr(self, "_kr_stage_deadline", None)
-                ):
-                    raise KisTemporaryError("KR_TICK_DEADLINE_EXHAUSTED_DURING_GLOBAL_LIMITER")
                 stage_deadline = getattr(self, "_kr_stage_deadline", None)
                 request_timeout = _kr_bounded_timeout(
                     configured_timeout, stage_deadline=stage_deadline
