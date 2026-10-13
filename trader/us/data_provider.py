@@ -843,9 +843,12 @@ class USDataProvider:
         # Opt-in session-owned collector avoids forking an active WS thread.
         # The collector has no trading/order capability. Its socket may be
         # missing or stale; failures fall through to the existing REST path.
-        collector_enabled = not self._offline and str(
-            os.getenv("US_WS_COLLECTOR_ENABLED", "0")
-        ).strip().lower() in {"1", "true", "on", "yes"}
+        if not self._offline:
+            collector_enabled = str(
+                os.getenv("US_WS_COLLECTOR_ENABLED", "0")
+            ).strip().lower() in {"1", "true", "on", "yes"}
+        else:
+            collector_enabled = False
         if collector_enabled:
             try:
                 from trader.marketdata.us_ws_collector import get_quote
