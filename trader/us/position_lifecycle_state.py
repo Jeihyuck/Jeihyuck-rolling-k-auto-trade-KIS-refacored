@@ -174,6 +174,7 @@ def _bind_authoritative_position_identity(
     trade_date: str,
     fills: list[dict] | None,
     authoritative: bool,
+    preloaded_risk_candidates: list[dict] | None = None,
 ) -> dict[str, str]:
     """Bind missing broker identity only from active-account or exact evidence."""
     if authoritative and not identity.get("trading_epoch_id"):
@@ -194,8 +195,9 @@ def _bind_authoritative_position_identity(
     try:
         from trader.us.db.repos import load_us_position_risk_state_candidates
 
-        rows = load_us_position_risk_state_candidates(
-            _sym(pos.get("symbol")), trade_date,
+        rows = (
+            preloaded_risk_candidates if preloaded_risk_candidates is not None
+            else load_us_position_risk_state_candidates(_sym(pos.get("symbol")), trade_date)
         )
     except Exception:
         rows = []
@@ -408,6 +410,18 @@ def reconcile_us_position_lifecycles(
     }
     out: dict[str, dict] = {}
     open_latest = load_latest_open_us_position_lifecycles(trade_date)
+    # Reuse bounded history for exact identity recovery rather than one query
+    # per position. Failure retains the legacy per-symbol read semantics.
+    from trader.us.db.repos import (
+        load_latest_us_position_risk_states,
+        load_us_position_risk_state_candidates_batch,
+    )
+    risk_candidates_by_symbol = load_us_position_risk_state_candidates_batch(
+        list(current), trade_date,
+    ) if current else {}
+    latest_risk_by_symbol = load_latest_us_position_risk_states(
+        list(current), trade_date,
+    ) if current else {}
 
     for symbol, pos in current.items():
         qty = _i(pos.get("qty"))
@@ -419,6 +433,7 @@ def reconcile_us_position_lifecycles(
             trade_date=trade_date,
             fills=fills,
             authoritative=authoritative,
+            preloaded_risk_candidates=risk_candidates_by_symbol.get(symbol),
         )
         if not all(identity.get(key) for key in (
             "env", "account_id", "trading_epoch_id", "strategy_owner",
@@ -439,7 +454,7 @@ def reconcile_us_position_lifecycles(
                 identity["strategy_owner"],
             )
             continue
-        latest = load_latest_us_position_risk_state(symbol, trade_date)
+        latest = latest_risk_by_symbol.get(symbol) or {}
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
         if lifecycle and not _lifecycle_matches_identity(lifecycle, identity):
             lifecycle = {}
