@@ -249,7 +249,9 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     monkeypatch.setattr(trade_tick_runner, "_get_strategy_engine", lambda **_kw: Engine())
 
     results = []
+    tick_wall_sec = []
     for tick_index in range(1, 13):
+        tick_wall_start = time.monotonic()
         current_tick["index"] = tick_index
         _prior_buy_count = len(broker.buy_calls)
         result = run_trade_tick(
@@ -260,9 +262,15 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
             prep_cache_source="test", watchlist_cache_source="test",
             entry_can_proceed=True, exit_can_proceed=True,
         )
+        tick_wall_sec.append(time.monotonic() - tick_wall_start)
         results.append(result)
         if tick_index in unresolved_ticks:
             assert len(broker.buy_calls) == _prior_buy_count, result
+    # CI is a scaled mock-KIS/real-PostgreSQL replay, not production latency.
+    # All twelve ticks, including unresolved/blocked ticks, count toward p95.
+    sorted_wall = sorted(tick_wall_sec)
+    p95_wall = sorted_wall[int((len(sorted_wall) - 1) * .95)]
+    assert p95_wall <= 60.0, {"p95_wall_sec": p95_wall, "wall_sec": tick_wall_sec}
     expected_buys = 12 - len(unresolved_ticks)
     assert len(seen_eval) == expected_buys, [(x.get("entry_degraded_reason"), x.get("last_stage")) for x in results]
     assert len(broker.buy_calls) == expected_buys, [{
@@ -294,7 +302,9 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     assert duplicate_result["status"] != "ACK", duplicate_result
     assert len(broker.submission_sequence) == prev_kis_submits
     print("US_PB1_BUY_ACK_12TICK_METRICS=" + __import__("json").dumps({
-        "ticks": 12, "buy_ack": len(broker.buy_calls),
+        "ticks": 12, "tick_wall_p95_sec": round(p95_wall, 4),
+        "tick_wall_max_sec": round(max(tick_wall_sec), 4),
+        "buy_ack": len(broker.buy_calls),
         "unresolved_ticks": list(unresolved_ticks),
         "blocked_buys_on_unresolved_ticks": len(unresolved_ticks),
         "protective_sell_ack": len(broker.sell_calls),
