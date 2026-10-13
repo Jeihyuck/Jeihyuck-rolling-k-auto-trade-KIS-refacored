@@ -98,3 +98,40 @@ def test_exact_trade_date_bridge_is_independent_of_current_wall_clock(monkeypatc
     assert [r["odno"] for r in client.get_us_fills_today("2026-08-20")] == ["older"]
     assert seen[0]["ORD_STRT_DT"] == "20260820"
     assert seen[0]["ORD_END_DT"] == "20260821"
+
+
+def test_live_fill_parser_retains_actual_oct6_fill_from_oct7_kst(monkeypatch):
+    from trader.us.execution.fills import get_fills_today
+    client, seen = _client_with_rows(monkeypatch, [
+        {
+            **_row("AMD", "0000035281", "20261007", "001429", fill="1"),
+            "ft_ccld_unpr3": "165.55", "ovrs_excg_cd": "NASD",
+        },
+        _row("NVDA", "next-us-session", "20261007", "224500", fill="1"),
+    ])
+
+    class Provider:
+        _offline = False
+        _tick_context = None
+
+        def _get_client(self):
+            return client
+
+    result = get_fills_today(provider=Provider(), trade_date="2026-10-06")
+    assert result["status"] == "OK"
+    assert [f["order_no"] for f in result["fills"]] == ["0000035281"]
+    assert result["fills"][0]["order_timestamp_utc"].startswith(
+        "2026-10-06T15:14:29"
+    )
+    assert result["fills"][0]["meta"]["source_timestamp_date"] == "20261007"
+    assert seen[0]["ORD_END_DT"] == "20261007"
+
+
+def test_broker_date_filter_prevents_kst_day_order_cross_contamination(monkeypatch):
+    client, _ = _client_with_rows(monkeypatch, [
+        _row("AMD", "same-number-prev-us-day", "20261007", "000010"),
+        _row("AMD", "same-number-new-us-day", "20261007", "230010"),
+    ])
+    assert [r["odno"] for r in client.get_us_today_orders("2026-10-06")] == [
+        "same-number-prev-us-day",
+    ]
