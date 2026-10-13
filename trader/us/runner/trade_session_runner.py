@@ -1600,7 +1600,9 @@ def run_trade_session(
                         final_status = "FAILED"
                         final_reason = "TICK_TIMEOUT_RECONCILE_FAILED"
                     elif timeout_reconcile.get("status") == "ERROR":
-                        timeout_status = "TICK_TIMEOUT_TERMINATED_NO_ORDER"
+                        # No journal delta cannot prove non-submission to KIS.
+                        timeout_status = "TICK_TIMEOUT_TERMINATED_RECONCILE_UNVERIFIED"
+                        timeout_entry_block = True
                     elif timeout_reconcile.get("unresolved_count"):
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
                         timeout_entry_block = True
@@ -1610,7 +1612,12 @@ def run_trade_session(
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
                         timeout_entry_block = True
                     else:
-                        timeout_status = timeout_process.get("status", "TICK_TIMEOUT_TERMINATED_NO_ORDER")
+                        # A terminated worker may have sent an order before its ACK.
+                        # Keep entry fenced until a later authoritative reconcile.
+                        timeout_status = timeout_process.get(
+                            "status", "TICK_TIMEOUT_TERMINATED_SUBMIT_UNVERIFIED"
+                        )
+                        timeout_entry_block = True
                     # legacy status string retained for regression log-contract search: DEGRADED_TICK_TIMEOUT_AFTER_ACK
                     has_order_activity = timeout_status in {"TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED", "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"}
                     if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:

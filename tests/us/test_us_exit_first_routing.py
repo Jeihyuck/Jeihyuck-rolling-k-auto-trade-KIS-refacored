@@ -717,3 +717,30 @@ def test_missing_effective_max_positions_preserves_existing_entry_slots(monkeypa
 
     assert captured["available_new_slots"] == 34
     assert result["available_new_slots"] == 34
+
+
+def test_protective_sell_router_precedes_buy_only_daily_notional_db(monkeypatch):
+    """SELL must not await the BUY budget DB; existing order gates remain in router."""
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+    calls = []
+    _patch_tick_basics(monkeypatch, calls)
+
+    def route(intent, **kwargs):
+        calls.append(("route_order", intent, kwargs))
+        return {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent}
+
+    def buy_budget(*args, **kwargs):
+        calls.append(("buy_notional_db", None, kwargs))
+        return 100.0
+
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", route)
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", buy_budget)
+    result = run_trade_tick(
+        session="am", env="practice", offline=False,
+        force_now="2026-06-05T10:00:00-04:00", kis_order_allowed=False,
+    )
+    sell_index = next(i for i, event in enumerate(calls) if event[0] == "route_order")
+    db_index = next(i for i, event in enumerate(calls) if event[0] == "buy_notional_db")
+    assert sell_index < db_index, calls
+    assert calls[sell_index][2]["current_daily_notional_usd"] == 0.0
+    assert result["orders"][0]["status"] == "ACK"
