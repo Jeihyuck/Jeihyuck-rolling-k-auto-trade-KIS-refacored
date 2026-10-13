@@ -1126,6 +1126,59 @@ class KisUSClient:
     # Fills
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _broker_order_us_trade_date(row: dict) -> str | None:
+        """Return the NY trading date of a KIS inquire-ccnl order timestamp.
+
+        KIS order date/time are source-local KST, whereas the strategy trade
+        date is America/New_York. Missing source time is *unknown*, not proof
+        that an order is outside the requested US session.
+        """
+        raw_date = str(row.get("ord_dt") or row.get("ORD_DT") or "").replace("-", "").strip()
+        raw_time = str(row.get("ord_tmd") or row.get("ORD_TMD") or "").replace(":", "").strip()
+        if not raw_date or not raw_time:
+            return None
+        from zoneinfo import ZoneInfo
+        try:
+            source = datetime.strptime(raw_date + raw_time.zfill(6), "%Y%m%d%H%M%S")
+            return source.replace(tzinfo=ZoneInfo("Asia/Seoul")).astimezone(
+                ZoneInfo("America/New_York")
+            ).date().isoformat()
+        except ValueError as exc:
+            raise KisUSClientError(
+                f"KIS order date/time schema invalid: source_date={raw_date!r} source_time={raw_time!r}"
+            ) from exc
+
+    @classmethod
+    def _filter_broker_rows_for_us_trade_date(cls, rows: list[dict], trade_date: str) -> list[dict]:
+        """Prevent the two-day KST broker request from importing the next US day."""
+        matched: list[dict] = []
+        excluded = 0
+        for row in rows:
+            broker_us_date = cls._broker_order_us_trade_date(row)
+            if broker_us_date is None:
+                # Real broker evidence lacking both source date and source time
+                # cannot be safely assigned to a US trading session.
+                if any(row.get(key) not in (None, "") for key in (
+                    "pdno", "PDNO", "ft_ord_qty", "ord_qty", "ft_ccld_qty", "nccs_qty"
+                )):
+                    raise KisUSClientError(
+                        "KIS_BROKER_ORDER_DATE_UNVERIFIED: source ord_dt/ord_tmd missing"
+                    )
+                # Minimal mock/empty status rows carry no executable evidence.
+                matched.append(row)
+                continue
+            if broker_us_date == trade_date:
+                matched.append(row)
+            else:
+                excluded += 1
+        logger.info(
+            "[US_FILLS][BROKER_KST_TO_ET_DATE_FILTER] requested_us_date=%s "
+            "rows_in=%d matched=%d cross_session_excluded=%d",
+            trade_date, len(rows), len(matched), excluded,
+        )
+        return matched
+
     def get_us_fills_today(self, trade_date: str | None = None) -> list[dict]:
         """Return all same-day overseas order/fill snapshots from KIS practice.
 
@@ -1144,7 +1197,20 @@ class KisUSClient:
             from datetime import datetime as dt
             ord_dt = dt.now(tz=ZoneInfo("America/New_York")).strftime("%Y%m%d")
 
-        params = self._build_us_fills_params(ord_dt, "PRACTICE_RANGE")
+        # A US session crosses midnight in KST: e.g. 2026-10-06 11:14 ET
+        # is 2026-10-07 00:14 KST. Query BOTH broker-calendar dates, then
+        # match the returned source timestamp to the requested US trade date.
+        requested_us_date = datetime.strptime(ord_dt, "%Y%m%d").date().isoformat()
+        broker_end_date = (
+            datetime.strptime(ord_dt, "%Y%m%d") + timedelta(days=1)
+        ).strftime("%Y%m%d")
+        params = self._build_us_fills_params(
+            ord_dt, "PRACTICE_RANGE", end_dt=broker_end_date
+        )
+        logger.info(
+            "[US_FILLS][TRADE_DATE_BRIDGE] us_date=%s broker_kst_start=%s broker_kst_end=%s",
+            requested_us_date, ord_dt, broker_end_date,
+        )
         all_rows: list[dict] = []
         seen_cursors: set[tuple[str, str]] = set()
         max_pages = 10
@@ -1193,7 +1259,9 @@ class KisUSClient:
                     len(all_rows),
                     page_index + 1,
                 )
-                return all_rows
+                return self._filter_broker_rows_for_us_trade_date(
+                    all_rows, requested_us_date
+                )
 
             # M/F explicitly means continuation. If KIS omits the response
             # header but still supplies a cursor, follow the cursor rather than
@@ -1213,7 +1281,9 @@ class KisUSClient:
         """Return KIS same-day overseas order/fill rows for status normalization."""
         return self.get_us_fills_today(trade_date=trade_date)
 
-    def _build_us_fills_params(self, ord_dt: str, schema: str) -> dict:
+    def _build_us_fills_params(
+        self, ord_dt: str, schema: str, *, end_dt: str | None = None,
+    ) -> dict:
         """Build the official KIS practice inquire-ccnl parameter contract."""
         if schema not in {"PRACTICE_RANGE", "ALL_DATES", "ORD_DT", "ORD_RANGE"}:
             raise ValueError(f"unknown fills schema: {schema}")
@@ -1223,7 +1293,7 @@ class KisUSClient:
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
             "PDNO": "%" if real_mode else "",
             "ORD_STRT_DT": ord_dt,
-            "ORD_END_DT": ord_dt,
+            "ORD_END_DT": end_dt or ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "NASD" if real_mode else "",
