@@ -32,7 +32,7 @@ def test_get_us_fills_today_uses_official_practice_scope(monkeypatch):
     assert params["OVRS_EXCG_CD"] == ""
     assert params["ORD_DT"] == ""
     assert params["ORD_STRT_DT"] == "20260505"
-    assert params["ORD_END_DT"] == "20260505"
+    assert params["ORD_END_DT"] == "20260506"  # KST order date can be next day in NY session
     assert params["CCLD_NCCS_DVSN"] == "00"
     assert params["ORD_GNO_BRNO"] == ""
     assert params["ODNO"] == ""
