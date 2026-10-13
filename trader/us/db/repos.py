@@ -2210,6 +2210,13 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                 combined["is_open"] = False
         state["lifecycle"] = combined
         old["state"] = state
+        if confirmed_new_cycle:
+            old.update({
+                "soft_stop_breach_count": 0,
+                "first_soft_stop_seen_at": None,
+                "last_soft_stop_seen_at": None,
+                "lowest_price_since_breach": None,
+            })
         _MEM_RISK_STATE[key] = _normalize_risk_state(sym, trade_date, old)
         return combined
 
@@ -2224,6 +2231,22 @@ def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: d
                     jsonb_build_object('lifecycle', CAST(:data AS jsonb)), NOW())
             ON CONFLICT (trading_epoch_id, trade_date, symbol)
             DO UPDATE SET
+                soft_stop_breach_count = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN 0
+                    ELSE us_position_risk_state.soft_stop_breach_count END,
+                first_soft_stop_seen_at = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN NULL
+                    ELSE us_position_risk_state.first_soft_stop_seen_at END,
+                last_soft_stop_seen_at = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN NULL
+                    ELSE us_position_risk_state.last_soft_stop_seen_at END,
+                lowest_price_since_breach = CASE
+                    WHEN us_position_risk_state.state->'lifecycle'->>'lifecycle_id'
+                         IS DISTINCT FROM :life_id THEN NULL
+                    ELSE us_position_risk_state.lowest_price_since_breach END,
                 state = jsonb_set(
                     COALESCE(us_position_risk_state.state, '{}'::jsonb),
                     '{lifecycle}',
