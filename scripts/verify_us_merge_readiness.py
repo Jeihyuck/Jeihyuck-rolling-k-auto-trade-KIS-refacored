@@ -50,6 +50,38 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         close = {}
         reasons.append("MISSING_OR_INVALID_CLOSE_SUMMARY")
+    # The collector is opt-in. Passing mock tests or a fast tick does not
+    # demonstrate that production WSL can maintain fresh KIS websocket data.
+    # The read-only smoke tool records a separate same-revision, same-day proof.
+    smoke_path = daily / "ws_collector_smoke.json"
+    try:
+        ws_smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        ws_smoke = {}
+        reasons.append("MISSING_OR_INVALID_LIVE_WS_COLLECTOR_EVIDENCE")
+    metrics["ws_collector_smoke"] = {
+        "evidence_at_utc": ws_smoke.get("evidence_at_utc"),
+        "commit_sha": ws_smoke.get("commit_sha"),
+        "verified_fresh_quote_for_all": ws_smoke.get("verified_fresh_quote_for_all"),
+        "collector_generation": ws_smoke.get("collector_generation"),
+        "mode": ws_smoke.get("mode"),
+        "read_only": ws_smoke.get("no_order_submit"),
+    }
+    if ws_smoke and not (
+        ws_smoke.get("commit_sha") == expected_sha
+        and ws_smoke.get("mode") == "READ_ONLY_PRACTICE_MARKET_DATA"
+        and ws_smoke.get("no_order_submit") is True
+        and ws_smoke.get("verified_fresh_quote_for_all") is True
+        and bool(ws_smoke.get("collector_generation"))
+        and bool(ws_smoke.get("evidence_at_utc"))
+        and bool(ws_smoke.get("symbols"))
+        and all(
+            int(v.get("hit") or 0) >= 1
+            for v in (ws_smoke.get("symbols") or {}).values()
+            if isinstance(v, dict)
+        )
+    ):
+        reasons.append("LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH")
     if len(expected_sha) != 40 or not all(ch in "0123456789abcdef" for ch in expected_sha.lower()):
         reasons.append("EXPECTED_SHA_MUST_BE_FULL_40_HEX_DIGITS")
     all_documents = summaries + ([close] if close else [])
