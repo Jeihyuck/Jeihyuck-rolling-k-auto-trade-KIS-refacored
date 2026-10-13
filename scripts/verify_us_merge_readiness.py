@@ -22,6 +22,7 @@ _SELL_RE = re.compile(
     r"\[US_EXIT\]\[SIGNAL_TO_BROKER_BOUNDARY\].*?delay_ms=([0-9.]+)"
 )
 _FALLBACK_RE = re.compile(r"\[US_KIS\]\[WS_COLLECTOR_FALLBACK\]")
+_COLLECTOR_HIT_RE = re.compile(r"\[US_KIS\]\[WS_COLLECTOR_HIT\]")
 _ACCEPT_CLOSE = frozenset(("OK", "SUCCESS", "COMPLETED"))
 
 
@@ -93,6 +94,7 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
     tick_samples: list[float] = []
     sell_samples: list[float] = []
     fallback_count = 0
+    collector_hit_count = 0
     for session in ("am", "afternoon"):
         folder = root / "runtime" / "logs" / "us" / trade_date / session
         paths = list(folder.glob("*.log"))
@@ -106,6 +108,8 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
                     sell_samples.append(float(match.group(1)) / 1000.0)
                 if _FALLBACK_RE.search(line):
                     fallback_count += 1
+                if _COLLECTOR_HIT_RE.search(line):
+                    collector_hit_count += 1
     metrics.update({
         "measured_ticks": len(tick_samples),
         "tick_p95_sec": nearest_rank(tick_samples, 0.95),
@@ -114,6 +118,7 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         "sell_signal_to_broker_boundary_p95_sec": nearest_rank(sell_samples, 0.95),
         "sell_signal_to_broker_boundary_max_sec": max(sell_samples) if sell_samples else None,
         "ws_collector_fallback_log_count": fallback_count,
+        "ws_collector_live_hit_log_count": collector_hit_count,
         "buy_entry_deferred_count": sum(
             int((d.get("tick_latency") or {}).get("entry_defer_count") or 0)
             for d in summaries
@@ -141,6 +146,8 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         "close_open_order_pending_total": int(close.get("open_order_pending_total") or 0),
         "close_manual_reconcile_required": int(close.get("manual_reconcile_required") or 0),
     })
+    if collector_hit_count <= 0:
+        reasons.append("NO_SESSION_RUNTIME_WS_COLLECTOR_HITS")
     if len(tick_samples) < min_ticks:
         reasons.append("INSUFFICIENT_LIVE_TICK_SAMPLES")
     if not tick_samples or nearest_rank(tick_samples, 0.95) > 60.0:
