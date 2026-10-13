@@ -1432,6 +1432,19 @@ def run_trade_session(
                             # shared by the watchdog, child and all KIS I/O.
                             tick_deadline_monotonic=time_mod.monotonic() + child_budget_sec,
                         )
+                    # Collector runs in its own subprocess, not a thread in
+                    # the parent that will fork the trading tick. Each tick
+                    # checks collector liveness so a crashed instance can be
+                    # replaced without reusing its prior generation's quotes.
+                    if not offline and os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
+                        try:
+                            from trader.marketdata.us_ws_collector import ensure_started
+                            ensure_started(env=env, offline=offline)
+                        except Exception as _collector_exc:
+                            logger.warning(
+                                "[US_WS_COLLECTOR][SESSION_START_WARN] err=%s action=REST_FALLBACK",
+                                _collector_exc,
+                            )
                     # Legacy marker retained for deploy-diff scanners; hard timeout
                     # no longer uses: pool.shutdown(wait=False, cancel_futures=True)
                     target_is_injected = getattr(run_trade_tick, "__module__", "") != "trader.us.runner.trade_tick_runner"
