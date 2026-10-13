@@ -31,6 +31,11 @@ def resolve_kis_us_order_datetime(
         raise ValueError("invalid KIS US trade date / Korea order time")
     session_day = datetime.strptime(raw_date, "%Y%m%d").date()
     clock = datetime.strptime(raw_time, "%H%M%S").time()
+    if domestic_order_date in (None, ""):
+        # Legacy records and test fixtures sometimes omit DMST_ORD_DT.
+        # Without it we cannot prove that ORD_DT is a US session date;
+        # preserve the legacy literal KST date rather than invent rollover.
+        return datetime.combine(session_day, clock, tzinfo=_KST)
     candidates = []
     for shift in (-1, 0, 1, 2):
         candidate = datetime.combine(
