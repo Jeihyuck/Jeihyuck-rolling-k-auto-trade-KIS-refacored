@@ -3701,6 +3701,36 @@ def _sleep_until_next_tick_or_session_end(now: datetime, session_end_dt: datetim
         return 0.0
     return max(1.0, min(float(loop_interval), remaining))
 
+def _sleep_until_start_aligned_tick(
+    *,
+    tick_started_monotonic: float,
+    session_end_dt: datetime,
+    loop_interval: int,
+    current_monotonic: float | None = None,
+    current_kst: datetime | None = None,
+) -> float:
+    """Wait for the next *start-aligned* slot, not tick-finish + interval.
+
+    A slow tick skips missed starts rather than overlapping another tick or
+    immediately replaying old candidates. No market/risk/order gates changed.
+    """
+    period = max(1.0, float(loop_interval))
+    now_mono = time_mod.monotonic() if current_monotonic is None else current_monotonic
+    now = _get_now_kst() if current_kst is None else current_kst
+    elapsed = max(0.0, now_mono - tick_started_monotonic)
+    next_slot = (int(elapsed // period) + 1) * period
+    remaining_session = (session_end_dt - now).total_seconds()
+    if remaining_session <= 0:
+        return 0.0
+    skipped = max(0, int(elapsed // period))
+    if skipped:
+        logger.warning(
+            "[PB1][LOOP][MISSED_START_SLOT] skipped=%d elapsed_sec=%.3f interval_sec=%.1f action=SKIP_NO_CATCHUP",
+            skipped, elapsed, period,
+        )
+    return max(0.0, min(next_slot - elapsed, remaining_session))
+
+
 _WINDOW_MISMATCH_LOGGED = False
 BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
@@ -8042,6 +8072,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     now.isoformat(),
                     session_end_dt.isoformat(),
                 )
+                tick_started_monotonic = time_mod.monotonic()
                 set_kr_tick_deadline(tick_deadline_monotonic)
                 try:
                     _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
@@ -8136,7 +8167,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         )
                         exit_reason = "session_end"
                         break
-                    sleep_for = _sleep_until_next_tick_or_session_end(now_after_tick, session_end_dt, loop_interval)
+                    sleep_for = _sleep_until_start_aligned_tick(
+                        tick_started_monotonic=tick_started_monotonic,
+                        session_end_dt=session_end_dt,
+                        loop_interval=loop_interval,
+                    )
                     logger.info(
                         "[PB1][LOOP] handoff requested before session end -> defer continue sleep=%.0fs now=%s session_end=%s",
                         sleep_for,
@@ -8153,7 +8188,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     sticky_runtime_count = 0
                     continue
                 if result_status in {"NO_TRADE", "OK_NO_TRADE", "OK_NO_CANDIDATES"}:
-                    sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, loop_interval)
+                    sleep_for = _sleep_until_start_aligned_tick(
+                        tick_started_monotonic=tick_started_monotonic,
+                        session_end_dt=session_end_dt,
+                        loop_interval=loop_interval,
+                    )
                     logger.info(
                         "[PB1][LOOP] no-trade tick only -> continue result_status=%s sleep=%.0fs session_end=%s",
                         result_status,
@@ -8173,7 +8212,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 sticky_precheck_count = 0
                 sticky_runtime_signature = None
                 sticky_runtime_count = 0
-                sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, loop_interval)
+                sleep_for = _sleep_until_start_aligned_tick(
+                        tick_started_monotonic=tick_started_monotonic,
+                        session_end_dt=session_end_dt,
+                        loop_interval=loop_interval,
+                    )
                 if sleep_for <= 0:
                     exit_reason = "session_end"
                     break
