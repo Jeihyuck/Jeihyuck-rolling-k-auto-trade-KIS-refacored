@@ -229,3 +229,14 @@ def test_ws_smoke_non_dict_symbol_cannot_use_vacuous_all(tmp_path):
     path.write_text(json.dumps(smoke))
     report = evaluate(tmp_path, DATE, SHA)
     assert "LIVE_WS_COLLECTOR_EVIDENCE_FAILED_OR_SHA_MISMATCH" in report["reasons"]
+
+
+def test_old_duplicate_claim_conflicts_are_not_ignored_after_inflight_to_uncertain(tmp_path):
+    _fixture(tmp_path)
+    path = tmp_path / "reports" / "us_daily" / DATE / "close_summary.json"
+    close = json.loads(path.read_text())
+    close["broker_recovery_health"]["duplicate_semantic_submit_detection_count"] = 223
+    path.write_text(json.dumps(close))
+    report = evaluate(tmp_path, DATE, SHA)
+    assert report["result"] == "NOT_MERGE_READY"
+    assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
