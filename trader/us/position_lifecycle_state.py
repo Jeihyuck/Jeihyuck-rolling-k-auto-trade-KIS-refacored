@@ -508,9 +508,9 @@ def reconcile_us_position_lifecycles(
                 lifecycle["holding_trade_days"] = _i(lifecycle.get("holding_trade_days"), 1) + 1
                 lifecycle["last_holding_day_counted"] = trade_date
             identity["position_lifecycle_id"] = str(lifecycle.get("lifecycle_id") or "")
-        carried_policy = dict(lifecycle.get("entry_policy") or {})
         lifecycle["identity_status"] = "IDENTIFIED"
-        _save_lifecycle(symbol, trade_date, lifecycle)
+        lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
+        carried_policy = dict(lifecycle.get("entry_policy") or {})
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
             "opened_trade_date": lifecycle.get("opened_trade_date"),
@@ -539,7 +539,7 @@ def reconcile_us_position_lifecycles(
                 continue
             closed = dict(lifecycle)
             closed.update({"is_open": False, "closed_trade_date": trade_date, "closed_at": now_iso, "last_seen_qty": 0})
-            _save_lifecycle(symbol, trade_date, closed)
+            closed = _save_lifecycle(symbol, trade_date, closed)
             out[symbol] = closed
             logger.info("[US_POSITION][LIFECYCLE] symbol=%s lifecycle_id=%s is_open=0 opened_trade_date=%s holding_trade_days=%s", symbol, closed.get("lifecycle_id"), closed.get("opened_trade_date"), closed.get("holding_trade_days"))
     return out
@@ -556,6 +556,6 @@ def update_us_position_high_watermark(*, symbol: str, trade_date: str, lifecycle
     lifecycle.update({"lifecycle_id": lifecycle_id, "high_watermark": new_high, "high_watermark_at": now_iso if new_high != previous else lifecycle.get("high_watermark_at") or now_iso, "high_watermark_source": "us_position_risk_state"})
     if "is_open" not in lifecycle:
         lifecycle["is_open"] = True
-    _save_lifecycle(symbol, trade_date, lifecycle)
+    lifecycle = _save_lifecycle(symbol, trade_date, lifecycle)
     logger.info("[US_POSITION][HIGH_WATERMARK] symbol=%s lifecycle_id=%s previous=%.4f current=%.4f saved=%.4f source=us_position_risk_state", symbol, lifecycle_id, previous, current_price, new_high)
     return lifecycle
