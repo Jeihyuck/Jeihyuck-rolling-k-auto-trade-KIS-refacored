@@ -2155,6 +2155,105 @@ def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dic
         logger.warning("[US_RISK_STATE][LOAD_OPEN_LIFECYCLES_WARN] trade_date=%s err=%s", td, exc)
         return {}
 
+
+def save_us_position_lifecycle_atomic(symbol: str, trade_date: str, lifecycle: dict) -> dict:
+    """Atomic scoped lifecycle leaf update; preserve unrelated risk state.
+
+    Same lifecycle high-watermark is monotonic; a closed lifecycle cannot be
+    reopened by a stale tick. Another owner/account/lifecycle never takes over
+    an existing same-day row. A new lifecycle after confirmed re-entry is
+    allowed only in a new date row or after explicit reconciliation elsewhere.
+    """
+    sym = str(symbol or "").strip().upper()
+    data = dict(lifecycle or {})
+    fields = {
+        "life_id": str(data.get("lifecycle_id") or ""),
+        "owner": str(data.get("strategy_owner") or "").upper(),
+        "account": str(data.get("account_id") or ""),
+        "env": str(data.get("env") or "").lower(),
+        "epoch": str(data.get("trading_epoch_id") or ""),
+    }
+    if not sym or not trade_date or not all(fields.values()):
+        raise ValueError("US_LIFECYCLE_IDENTITY_REQUIRED")
+    high = float(data.get("high_watermark") or 0.0)
+    engine = _get_engine_or_none()
+    if engine is None:
+        key = _risk_state_key(sym, trade_date)
+        old = dict(_MEM_RISK_STATE.get(key) or {})
+        state = dict(old.get("state") or {})
+        prior = dict(state.get("lifecycle") or {})
+        if prior and any((
+            str(prior.get(key) or "") not in ("", fields[field])
+            for key, field in (
+                ("lifecycle_id", "life_id"), ("strategy_owner", "owner"),
+                ("account_id", "account"), ("env", "env"),
+            )
+        )):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        combined = {**prior, **data}
+        combined["high_watermark"] = max(high, float(prior.get("high_watermark") or 0))
+        if prior.get("is_open") is False:
+            combined["is_open"] = False
+        state["lifecycle"] = combined
+        old["state"] = state
+        _MEM_RISK_STATE[key] = _normalize_risk_state(sym, trade_date, old)
+        return combined
+
+    with engine.begin() as conn:
+        _ensure_us_position_risk_state_table(conn)
+        if str(_us_state_epoch_id(conn) or "") != fields["epoch"]:
+            raise RuntimeError("US_LIFECYCLE_EPOCH_MISMATCH")
+        result = conn.execute(text("""
+            INSERT INTO us_position_risk_state
+                (trading_epoch_id, trade_date, symbol, state, updated_at)
+            VALUES (:epoch, :td, :sym,
+                    jsonb_build_object('lifecycle', CAST(:data AS jsonb)), NOW())
+            ON CONFLICT (trading_epoch_id, trade_date, symbol)
+            DO UPDATE SET
+                state = jsonb_set(
+                    COALESCE(us_position_risk_state.state, '{}'::jsonb),
+                    '{lifecycle}',
+                    COALESCE(us_position_risk_state.state->'lifecycle', '{}'::jsonb)
+                    || CAST(:data AS jsonb)
+                    || jsonb_build_object(
+                        'high_watermark',
+                        GREATEST(
+                            CASE WHEN COALESCE(us_position_risk_state.state->'lifecycle'
+                                                ->>'high_watermark', '') ~ '^[0-9]+([.][0-9]+)?$'
+                                 THEN (us_position_risk_state.state->'lifecycle'
+                                       ->>'high_watermark')::numeric
+                                 ELSE 0 END,
+                            CAST(:high AS numeric)
+                        ),
+                        'is_open',
+                        CASE WHEN us_position_risk_state.state->'lifecycle'->'is_open'
+                                            = 'false'::jsonb
+                             THEN 'false'::jsonb
+                             ELSE COALESCE(CAST(:data AS jsonb)->'is_open',
+                                           'true'::jsonb)
+                        END
+                    ), true
+                ),
+                updated_at = NOW()
+            WHERE COALESCE(us_position_risk_state.state->'lifecycle'->>'lifecycle_id', '')
+                    IN ('', :life_id)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'strategy_owner', '')
+                    IN ('', :owner)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'account_id', '')
+                    IN ('', :account)
+              AND COALESCE(us_position_risk_state.state->'lifecycle'->>'env', '')
+                    IN ('', :env)
+            RETURNING state->'lifecycle' AS lifecycle
+        """), {
+            **fields, "td": trade_date, "sym": sym,
+            "data": _json_param(data), "high": high,
+        }).mappings().first()
+        if not result or not isinstance(result.get("lifecycle"), dict):
+            raise RuntimeError("US_LIFECYCLE_IDENTITY_CONFLICT")
+        return dict(result["lifecycle"])
+
+
+
 def save_us_position_risk_state(
     symbol: str,
     trade_date: str,
@@ -2205,7 +2304,15 @@ def save_us_position_risk_state(
                         lowest_price_since_breach = EXCLUDED.lowest_price_since_breach,
                         last_price = EXCLUDED.last_price,
                         last_pnl_pct = EXCLUDED.last_pnl_pct,
-                        state = EXCLUDED.state,
+                        -- A stale soft-stop / trend snapshot cannot replace
+                        -- a newer authoritative lifecycle. Preserve its leaf.
+                        state = (COALESCE(us_position_risk_state.state, '{}'::jsonb)
+                                 || EXCLUDED.state)
+                              || CASE WHEN COALESCE(us_position_risk_state.state, '{}'::jsonb)
+                                                ? 'lifecycle'
+                                      THEN jsonb_build_object(
+                                          'lifecycle', us_position_risk_state.state->'lifecycle')
+                                      ELSE '{}'::jsonb END,
                         updated_at = NOW()
                 """),
                 {
