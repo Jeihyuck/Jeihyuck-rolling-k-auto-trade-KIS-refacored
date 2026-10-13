@@ -95,3 +95,29 @@ def test_closed_lifecycle_cannot_be_reopened_or_cross_ever_written(pg_engine, mo
             "MSFT", "2026-10-12",
             {**_lifecycle(), "trading_epoch_id": "foreign-epoch"},
         )
+
+
+def test_confirmed_new_buy_reentry_same_day_is_new_lifecycle_not_prior_tp(pg_engine, monkeypatch):
+    from trader.us.db import repos
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda *_a, **_k: "atomic-epoch")
+    old = _lifecycle(high=355, life="old-life", open=True)
+    old["entry_policy"] = {"book": "OLD", "exit_policy": "OLD"}
+    repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", old)
+    closing = {**old, "is_open": False, "closed_at": "2026-10-12T18:00:00+00:00"}
+    repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", closing)
+    incoming = _lifecycle(high=103, life="new-life", open=True)
+    incoming.update({
+        "opened_at": "2026-10-12T19:00:00+00:00",
+        "opened_at_source": "confirmed_buy_fill",
+        "entry_policy": {"book": "NEW", "exit_policy": "NEW"},
+        "closed_at": None,
+        "last_seen_qty": 2,
+    })
+    saved = repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", incoming)
+    assert saved["lifecycle_id"] == "new-life"
+    assert saved["is_open"] is True
+    assert float(saved["high_watermark"]) == 103
+    assert saved["entry_policy"]["book"] == "NEW"
+    assert saved["closed_at"] is None
+    with pytest.raises(RuntimeError, match="US_LIFECYCLE_IDENTITY_CONFLICT"):
+        repos.save_us_position_lifecycle_atomic("KO", "2026-10-12", closing)
