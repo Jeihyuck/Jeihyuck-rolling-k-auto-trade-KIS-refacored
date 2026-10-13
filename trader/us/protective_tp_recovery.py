@@ -320,6 +320,18 @@ def request_protective_tp_cancel(
             if order.get("claim_state") not in {"IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED"}:
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "tp_claim_unverified"})
                 continue
+            if stale_classification != "SAME_DAY_TP_CLAIM" and not meta.get(
+                "protective_tp_cancel_requested_at"
+            ):
+                # Old KIS CCNL OPEN is historical, not an actionable active
+                # order. Do not burn a REST inquiry/cancel on that stale date.
+                # Leave the execution claim fenced for authoritative repair.
+                results.append({
+                    "symbol": symbol, "status": "FENCED",
+                    "reason": "historical_open_not_current_cancel_proof",
+                    "stale_classification": stale_classification,
+                })
+                continue
             evidence = provider.get_fills_by_order_no(
                 order_no=str(order["order_no"]), symbol=symbol,
                 trade_date=str(order["trade_date"]),
@@ -358,16 +370,6 @@ def request_protective_tp_cancel(
                                 "status": "CANCEL_TERMINAL_RECONCILED" if accepted
                                           else "CANCEL_PENDING_RECONCILE_REQUIRED"})
                 break
-            if stale_classification != "SAME_DAY_TP_CLAIM":
-                # A historical OPEN snapshot cannot prove that the broker
-                # will accept a *new* cancel today. Existing reservations
-                # above still reconcile later genuine terminal evidence.
-                results.append({
-                    "symbol": symbol, "status": "FENCED",
-                    "reason": "historical_open_not_current_cancel_proof",
-                    "stale_classification": stale_classification,
-                })
-                continue
             if not broker_proves_open_tp_order(order, evidence):
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "broker_open_proof_missing"})
                 continue
