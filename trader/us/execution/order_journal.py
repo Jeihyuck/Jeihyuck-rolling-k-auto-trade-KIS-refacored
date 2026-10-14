@@ -590,14 +590,27 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             positions_by_symbol[str(pos.get("symbol") or pos.get("pdno") or "").upper()] = pos
 
     for key, order_events in grouped.items():
-        types = {e.get("event_type") for e in order_events}
-        if "BROKER_SUBMIT_STARTED" not in types or "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types:
+        # The most recent *submitted attempt* is authoritative for a key,
+        # rather than the most recent ORDER_OPEN/REPLAY observation. A later
+        # retry may share the same durable client key with an older attempt.
+        submitted = next(
+            (event for event in reversed(order_events)
+             if event.get("event_type") == "BROKER_SUBMIT_STARTED"), None,
+        )
+        if submitted is None:
             continue
-        # Replay-generated OPEN, PARTIAL_FILL, recovery and error events may
-        # contain synthetic defaults for qty, generation and session. They
-        # describe observation state, NOT the original submission identity.
-        # Anchor every later KIS lookup/observation to this immutable intent.
-        latest = next(e for e in order_events if e.get("event_type") == "BROKER_SUBMIT_STARTED")
+        active_attempt = str(submitted.get("submit_attempt_id") or "")
+        if active_attempt:
+            order_events = [
+                event for event in order_events
+                if str(event.get("submit_attempt_id") or "") == active_attempt
+            ]
+        types = {e.get("event_type") for e in order_events}
+        if "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types:
+            continue
+        # Later ORDER_OPEN/REPLAY snapshots may have empty original session,
+        # generation=0 or qty=0. They cannot overwrite submitted identity.
+        latest = submitted
         event_trade_date = str(latest.get("trade_date") or trade_date)
         event_orders = today_orders
         event_fills = all_fills
