@@ -2,7 +2,7 @@
 
 Based on Korea Investment & Securities official open-trading-api stock master
 parsers: `stocks_info/kis_kospi_code_mst.py` and `kis_kosdaq_code_mst.py`.
-The cap is a nine-byte numeric field immediately before the final 3+1+1+1
+The cap is a nine-character numeric field immediately before the final 3+1+1+1
 bytes in both fixed-width tails. The KOSDAQ field is labelled previous-day
 market capitalisation (100M KRW). KOSPI labels its field market cap.
 
@@ -43,19 +43,23 @@ def parse_master(raw: bytes, market: str) -> list[dict]:
     seen: set[str] = set()
     if not raw or len(raw) > 80 * 1024 * 1024:
         raise RuntimeError("kis_master_invalid_uncompressed_size")
-    for line_no, line in enumerate(raw.splitlines(), start=1):
+    # KIS's reference parser opens the WHOLE file with encoding=cp949 first,
+    # then slices 228/222 characters from each decoded line. A bytewise split
+    # can sever a Korean multibyte name (observed on the live KOSPI master).
+    try:
+        decoded = raw.decode("cp949")
+    except UnicodeError as exc:
+        raise RuntimeError(f"kis_master_encoding_error market={market}") from exc
+    for line_no, line in enumerate(decoded.splitlines(), start=1):
         if not line.strip():
             continue
         if len(line) <= 21 + tail_len:
             raise RuntimeError(f"kis_master_truncated market={market} line={line_no}")
         prefix, tail = line[:-tail_len], line[-tail_len:]
-        try:
-            short = prefix[:9].decode("ascii").strip()
-            code = short[1:] if len(short) == 7 and short[0] == "A" else short
-            name_kr = prefix[21:].decode("cp949").strip()
-            cap_string = tail[-15:-6].decode("ascii").strip()
-        except UnicodeError as exc:
-            raise RuntimeError(f"kis_master_encoding_error market={market} line={line_no}") from exc
+        short = prefix[:9].strip()
+        code = short[1:] if len(short) == 7 and short[0] == "A" else short
+        name_kr = prefix[21:].strip()
+        cap_string = tail[-15:-6].strip()
         if not CODE_RE.fullmatch(code):
             continue
         if code in seen:
