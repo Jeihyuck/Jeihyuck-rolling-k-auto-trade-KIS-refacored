@@ -9,6 +9,7 @@ from datetime import date
 import pytest
 
 from trader import prep_runner
+from trader.universe.build import _kis_master_proof
 
 
 AS_OF = "2026-10-13"
@@ -28,6 +29,9 @@ def snapshot(rows, *, actual_as_of=AS_OF, provider="kis_master_marketcap"):
         "actual_as_of": actual_as_of,
         "provider": provider,
         "run_id": "committed-kis-master-universe",
+        "build_reason": _kis_master_proof(
+            AS_OF, "2026-10-14", {"KOSPI": "a" * 64, "KOSDAQ": "b" * 64}
+        ),
         "members": list(rows),
     }
 
