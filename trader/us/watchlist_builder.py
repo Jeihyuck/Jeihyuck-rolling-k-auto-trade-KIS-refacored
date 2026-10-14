@@ -709,6 +709,23 @@ def build_us_watchlist(
     fallback_meta["fallback_fill_count"] = int(fallback_meta.get("fallback_fill_count") or 0) + int(etf_refill_meta.get("fallback_fill_count") or 0)
     fallback_meta["fallback_fill_cap_safe"] = bool(fallback_meta.get("fallback_fill_cap_safe", True) and etf_refill_meta.get("fallback_fill_cap_safe", True))
 
+    if constraints.get("market_regime") != "RISK_OFF":
+        # The sector-cap stage uses target slots (30) when assembling the list.
+        # Reassess *actual* 28/29 names at PREP admission, and repair by
+        # score-ranked replacement/removal instead of blocking every BUY.
+        # Do not bypass separate crash/data-quality/session safety gates.
+        final30, actual_cap_repair = repair_final30_effective_caps(
+            final30, sorted_broader, constraints, finaln,
+            str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters,
+        )
+        regime_cap_meta["cap_violations"] = actual_cap_repair["cap_violations"]
+        regime_cap_meta["cap_repair"] = actual_cap_repair
+        regime_cap_meta["blocked_by_cluster_cap"] = list(dict.fromkeys(
+            list(regime_cap_meta.get("blocked_by_cluster_cap") or [])
+            + actual_cap_repair["dropped"]
+        ))
+        logger.info("[US_FINAL30][EFFECTIVE_CAP_REPAIR] %s", actual_cap_repair)
+
     # rank 부여 + final30_scored 구성
     final30_scored: list[dict] = []
     for rank, row in enumerate(sorted(final30, key=lambda r: -r["score_final"]), start=1):
@@ -727,6 +744,12 @@ def build_us_watchlist(
         final30_scored.append(scored)
 
     cluster_contract = validate_final30_cluster_contract(final30_scored, str(rotation_context.get("rotation_regime") or "NEUTRAL"))
+    if constraints.get("market_regime") != "RISK_OFF":
+        actual_violations = effective_final30_cap_violations(
+            final30_scored, constraints,
+            str(rotation_context.get("rotation_regime") or "NEUTRAL"),
+        )
+        regime_cap_meta["cap_violations"] = actual_violations
     if regime_cap_meta.get("cap_violations"):
         cluster_contract["cluster_contract_ok"] = False
         cluster_contract["final30_cluster_cap_clean"] = False
@@ -995,6 +1018,93 @@ def refill_under_cluster_caps(selected: list[dict], candidate_pool: list[dict], 
         drop_idx = min(ai_indexes, key=lambda idx: float(out[idx].get("score_final") or 0.0))
         out.pop(drop_idx)
     return out, {"fallback_fill_used": len(out) > len(selected), "fallback_fill_count": max(0, len(out) - len(selected)), "fallback_fill_cap_safe": bool(validate_final30_cluster_contract(out, regime).get("cluster_contract_ok")), "fallback_fill_attempted": attempted}
+
+
+def effective_final30_cap_violations(
+    rows: list[dict], constraints: dict, rotation_regime: str,
+) -> list[str]:
+    """Judge the *actual* executable list, not a hypothetical 30-name list.
+
+    The market-state cap is separate from the rotation cap.  Both must hold.
+    A missing candidate is never counted as an imaginary diversifier.
+    """
+    if not rows:
+        return ["FINAL30_EMPTY"]
+    counts = _cluster_counts(rows)
+    total = len(rows)
+    ai_count = sum(counts.get(cluster, 0) for cluster in AI_CLUSTERS)
+    violations = list(validate_final30_cluster_contract(rows, rotation_regime)["cap_violations"])
+    if ai_count / total > float(constraints.get("max_ai_tech_ratio", 1.0)) + 1e-12:
+        violations.append("AI_TECH_COMBINED")
+    if max(counts.values(), default=0) / total > float(constraints.get("max_single_cluster_ratio", 1.0)) + 1e-12:
+        violations.append("SINGLE_CLUSTER")
+    return list(dict.fromkeys(violations))
+
+
+def repair_final30_effective_caps(
+    selected: list[dict], candidate_pool: list[dict], constraints: dict,
+    finaln: int, rotation_regime: str, blocked_clusters: set[str] | None = None,
+) -> tuple[list[dict], dict]:
+    """Replace/drop lowest-scored offenders; never loosen a concentration cap.
+
+    A cap-clean 27-name Final30 is safer and more useful than a blocked 28-name
+    Final30. The existing PREP underfill tier/capital haircut still applies.
+    """
+    out = list(selected)
+    blocked_clusters = blocked_clusters or set()
+    dropped: list[str] = []
+    added: list[str] = []
+    for _ in range(len(out)):
+        violations = effective_final30_cap_violations(out, constraints, rotation_regime)
+        if not violations:
+            break
+        counts = _cluster_counts(out)
+        if "AI_TECH_COMBINED" in violations or "NON_TECH_MIN" in violations:
+            offender = lambda row: (
+                row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+            ) in AI_CLUSTERS
+        elif "AI_SEMI" in violations or "MEGA_TECH" in violations:
+            target = "AI_SEMI" if "AI_SEMI" in violations else "MEGA_TECH"
+            offender = lambda row: (
+                row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+            ) == target
+        elif "SINGLE_CLUSTER" in violations:
+            largest = max(counts, key=counts.get)
+            offender = lambda row: (
+                row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+            ) == largest
+        else:
+            # Unknown policy violation: never approve an unverified list.
+            break
+        indices = [idx for idx, row in enumerate(out) if offender(row)]
+        if not indices:
+            break
+        drop = min(indices, key=lambda idx: float(out[idx].get("score_final") or 0))
+        dropped.append(str(out[drop].get("symbol") or ""))
+        out.pop(drop)
+
+    if not effective_final30_cap_violations(out, constraints, rotation_regime):
+        seen = {str(row.get("symbol") or "") for row in out}
+        for row in sorted(candidate_pool or [], key=lambda r: float(r.get("score_final") or 0), reverse=True):
+            if len(out) >= finaln:
+                break
+            sym = str(row.get("symbol") or "")
+            cluster = row.get("theme_cluster") or theme_cluster_for(sym, row)
+            if not sym or sym in seen or cluster in blocked_clusters:
+                continue
+            if effective_final30_cap_violations(out + [row], constraints, rotation_regime):
+                continue
+            out.append(row)
+            seen.add(sym)
+            added.append(sym)
+    remaining = effective_final30_cap_violations(out, constraints, rotation_regime)
+    return out, {
+        "dropped": dropped,
+        "added": added,
+        "cap_violations": remaining,
+        "cluster_contract_ok": not remaining,
+        "actual_final30_count": len(out),
+    }
 
 
 def enforce_regime_sector_caps(selected: list[dict], candidate_pool: list[dict], constraints: dict, finaln: int) -> tuple[list[dict], dict[str, Any]]:
