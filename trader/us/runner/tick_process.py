@@ -59,7 +59,8 @@ class TickProcessResult:
 
 
 def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
-                        terminate_grace_sec: float = 10.0, mp_context=None) -> TickProcessResult:
+                        terminate_grace_sec: float = 10.0, mp_context=None,
+                        fence_account_scope: dict | None = None) -> TickProcessResult:
     """Run an isolated tick; never infer broker non-submission from worker death."""
     ctx = mp_context or mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
     receiver, sender = ctx.Pipe(duplex=False)
@@ -211,7 +212,7 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                             run_id=str(child_kwargs.get("session_run_id") or ""),
                             pid=pid, reason="child_alive_after_parent_shutdown",
                             env=str(child_kwargs.get("env") or ""),
-                            account_scope=child_kwargs.get("child_fence_account_scope"),
+                            account_scope=fence_account_scope,
                         )
                     except Exception:
                         # The session runner independently catches this typed
