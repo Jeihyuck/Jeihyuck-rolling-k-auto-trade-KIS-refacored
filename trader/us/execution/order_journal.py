@@ -5,9 +5,97 @@ import hashlib
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+
+def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: str,
+                              requested_qty: int, source_trade_date: str,
+                              journal_event: dict) -> bool:
+    """Use a memoized KIS order only when its complete available identity agrees.
+
+    Rows lacking original requested quantity are NOT suitable for fast-path
+    reconstruction; the caller falls back to an independent broker lookup.
+    A KST broker date may be one day after its US trade date.
+    """
+    from trader.us.utils.order_no import normalize_us_order_no
+
+    if not isinstance(row, dict) or requested_qty <= 0:
+        return False
+    if (normalize_us_order_no(row.get("order_no") or row.get("raw_order_no") or "")
+            != normalize_us_order_no(order_no)
+            or str(row.get("symbol") or "").upper() != symbol
+            or str(row.get("side") or "").upper() != side):
+        return False
+    if (str(row.get("normalization_result") or "").lower() == "quarantined"
+            or row.get("filled_qty_present") is False
+            or row.get("requested_qty_present") is False):
+        return False
+
+    def integral(value):
+        try:
+            number = float(value)
+            return int(number) if number.is_integer() and 0 <= number < float("inf") else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    original_qty = next((row.get(k) for k in (
+        "requested_qty", "qty_requested", "ord_qty", "ft_ord_qty"
+    ) if row.get(k) not in (None, "")), None)
+    if integral(original_qty) != requested_qty:
+        return False
+    filled = integral(row.get("filled_qty"))
+    if filled is None or filled > requested_qty:
+        return False
+    remaining_raw = next((row.get(k) for k in ("broker_open_qty", "remaining_qty")
+                          if row.get(k) not in (None, "")), None)
+    if remaining_raw is not None:
+        remaining = integral(remaining_raw)
+        if remaining is None or filled + remaining > requested_qty:
+            return False
+
+    metadata = journal_event.get("meta") if isinstance(journal_event.get("meta"), dict) else {}
+    def recorded(key):
+        return journal_event.get(key) or metadata.get(key)
+
+    # In normalized KIS rows NASD/NASDAQ refer to the same exchange. Account,
+    # market and owner fields can be provider-scoped rather than row-scoped;
+    # whenever both sides carry one, a disagreement disqualifies reuse.
+    def exchange_name(value):
+        return {"NASD": "NASDAQ", "NAS": "NASDAQ", "NYSE": "NYSE",
+                "AMEX": "AMEX", "AMS": "AMEX"}.get(str(value or "").upper(),
+                                                str(value or "").upper())
+    for field in ("exchange", "market", "session", "session_run_id",
+                  "session_generation", "account_id", "account_key", "cano",
+                  "trading_epoch_id", "strategy_owner"):
+        local = recorded(field)
+        actual = row.get(field)
+        if local in (None, "") or actual in (None, ""):
+            continue
+        if field == "exchange":
+            if exchange_name(local) != exchange_name(actual):
+                return False
+        elif str(local).upper() != str(actual).upper():
+            return False
+
+    expected_date = str(source_trade_date).replace("-", "")
+    explicit_us_date = row.get("us_trade_date") or row.get("original_us_trade_date")
+    if explicit_us_date and str(explicit_us_date).replace("-", "") != expected_date:
+        return False
+    broker_date = row.get("trade_date")
+    if broker_date:
+        date_str = str(broker_date).replace("-", "")
+        try:
+            et_date = datetime.strptime(expected_date, "%Y%m%d")
+            valid_source_dates = {
+                expected_date, (et_date + timedelta(days=1)).strftime("%Y%m%d"),
+            }
+            if date_str not in valid_source_dates:
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def journal_path(trade_date: str) -> Path:
@@ -440,13 +528,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 if isinstance(event_orders, list):
                     matches = [
                         row for row in event_orders
-                        if normalize_us_order_no(row.get("order_no") or row.get("raw_order_no") or "")
-                        == normalize_us_order_no(order_no)
-                        and str(row.get("symbol") or "").upper() == symbol
-                        and str(row.get("side") or "").upper() == side
-                        and str(row.get("normalization_result") or "").lower() != "quarantined"
-                        and row.get("filled_qty_present") is not False
-                        and row.get("filled_qty") not in (None, "")
+                        if _replay_order_row_matches(
+                            row, order_no=order_no, symbol=symbol, side=side,
+                            requested_qty=requested, source_trade_date=event_trade_date,
+                            journal_event=latest,
+                        )
                     ]
                     if matches:
                         def _fill_obs_time(row):
@@ -529,8 +615,17 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     side=side,
                     requested_qty=requested,
                     filled_qty=cumulative,
-                    remaining_qty=max(0, requested - cumulative),
-                    broker_status="FILLED" if cumulative >= requested else "PARTIALLY_FILLED",
+                    remaining_qty=(
+                        int(broker_fill["remaining_qty"])
+                        if broker_fill.get("remaining_qty") not in (None, "")
+                        else max(0, requested - cumulative)
+                    ),
+                    broker_status=(
+                        str(broker_fill.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+                        if str(broker_fill.get("status") or "").upper() in
+                        {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}
+                        else "FILLED" if cumulative >= requested else "PARTIALLY_FILLED"
+                    ),
                     evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
                     observed_at=broker_fill.get("observed_at"),
                     raw_row={**broker_fill, "requested_qty": requested, "avg_price": fill_price},
@@ -560,7 +655,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                                   "execution_timestamp": broker_fill.get("execution_timestamp") or broker_fill.get("observed_at"),
                                   "broker_execution_id": broker_fill.get("broker_execution_id"), "fees": broker_fill.get("fees")})
             else:
-                broker_order = next((o for o in (event_orders or []) if normalize_us_order_no(o.get("order_no") or o.get("odno"))==normalize_us_order_no(order_no) and str(o.get("symbol") or o.get("pdno") or symbol).upper()==symbol and str(o.get("side") or side).upper()==side),None)
+                broker_order = next((o for o in (event_orders or []) if _replay_order_row_matches(
+                    o, order_no=order_no, symbol=symbol, side=side,
+                    requested_qty=requested, source_trade_date=event_trade_date,
+                    journal_event=latest,
+                )), None)
                 if broker_order:
                     broker_symbol=str(broker_order.get("symbol") or broker_order.get("pdno") or symbol).upper()
                     broker_side=str(broker_order.get("side") or side).upper()
