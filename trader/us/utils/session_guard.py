@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import socket
@@ -82,37 +83,77 @@ def _unverified_child_fence_path(trade_date: str, session: str) -> Path:
     return _GUARD_BASE / trade_date / f"{session}.child_unverified.fence"
 
 
-def read_us_session_child_unverified_fence(trade_date: str, session: str) -> dict:
-    """Durable no-restart fence. Only explicit broker-truth recovery can clear it."""
-    path = _unverified_child_fence_path(trade_date, session)
-    if not path.exists():
-        return {}
-    payload = _read_json(path)
-    return payload or {"state": "CHILD_UNVERIFIED", "reason": "unreadable_fence"}
+def _child_fence_scope(env: str | None = None) -> dict:
+    """Account+environment fence key; never persist raw CANO or product id."""
+    from trader.account_state import get_account_key, resolve_env_name
+    name = resolve_env_name(env)
+    account_key = get_account_key(env=name)
+    return {"env": name, "account_digest": hashlib.sha256(account_key.encode("utf-8")).hexdigest()}
+
+
+def _child_scope_fence_path(scope: dict) -> Path:
+    return _GUARD_BASE / ".child_scope" / f"{scope['env']}.{scope['account_digest']}.fence"
+
+
+def read_us_session_child_unverified_fence(trade_date: str, session: str, *,
+                                           env: str | None = None) -> dict:
+    """Check account-wide US child uncertainty BEFORE any session/date lock.
+
+    A child from yesterday's AM remains order capable in today's afternoon
+    unless it is explicitly reaped and the broker's submit truth reconciled.
+    Another verified account/env uses a different scope and is not blocked.
+    """
+    scope = _child_fence_scope(env)
+    scoped = _child_scope_fence_path(scope)
+    if scoped.exists():
+        payload = _read_json(scoped)
+        return payload or {"state": "CHILD_UNVERIFIED", "reason": "unreadable_scope_fence"}
+    # Legacy per-session files are retained as supplementary evidence; only
+    # a matching account scope may block a different, explicitly known account.
+    local = _unverified_child_fence_path(trade_date, session)
+    if local.exists():
+        payload = _read_json(local)
+        if not payload:
+            return {"state": "CHILD_UNVERIFIED", "reason": "unreadable_local_fence"}
+        if (not payload.get("account_digest")
+                or (payload.get("env") == scope["env"]
+                    and payload.get("account_digest") == scope["account_digest"])):
+            return payload
+    return {}
 
 
 def mark_us_session_child_unverified_fence(trade_date: str, session: str, *,
-                                            run_id: str, pid: int, reason: str) -> Path:
-    """Fence all new ticks even after parent PID dies or running lock gets stale."""
-    path = _unverified_child_fence_path(trade_date, session)
-    path.parent.mkdir(parents=True, exist_ok=True)
+                                            run_id: str, pid: int, reason: str,
+                                            env: str | None = None) -> Path:
+    """Persist both account-wide and historical-session child uncertainty.
+
+    Do not auto-clear on timeout, date rollover or process PID disappearance.
+    Explicit broker-truth and child-exit recovery must clear both records.
+    """
+    scope = _child_fence_scope(env)
+    global_path = _child_scope_fence_path(scope)
+    local_path = _unverified_child_fence_path(trade_date, session)
     payload = {"state": "CHILD_UNVERIFIED", "market": "US", "trade_date": trade_date,
                "session": session, "run_id": run_id, "pid": pid,
                "broker_submission_truth": "UNVERIFIED", "reason": reason,
+               "env": scope["env"], "account_digest": scope["account_digest"],
                "created_at_et": now_et_iso()}
-    # Existing fence must never be overwritten by a later run.
-    try:
-        _atomic_write_new(path, payload)
-    except FileExistsError:
-        pass
-    logger.critical("[US_SESSION_GUARD][CHILD_UNVERIFIED_FENCE] path=%s pid=%s", path, pid)
-    return path
+    # The GLOBAL durable fence is written before local session evidence.
+    # No later run or atexit code is allowed to overwrite it.
+    for path in (global_path, local_path):
+        try:
+            _atomic_write_new(path, payload)
+        except FileExistsError:
+            pass
+    logger.critical("[US_SESSION_GUARD][CHILD_UNVERIFIED_FENCE] scope=%s pid=%s",
+                    str(global_path), pid)
+    return local_path
 
 
-def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, stale_minutes: int | None = None) -> dict:
+def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, stale_minutes: int | None = None, *, env: str | None = None) -> dict:
     # Persistent fail-closed state is checked BEFORE stale-lock reclamation
     # and even before the test bypass. A dead parent PID is not broker truth.
-    unverified = read_us_session_child_unverified_fence(trade_date, session)
+    unverified = read_us_session_child_unverified_fence(trade_date, session, env=env)
     if unverified:
         return {"acquired": False, "reason": "CHILD_UNVERIFIED_FENCE",
                 "path": str(_unverified_child_fence_path(trade_date, session)),
@@ -147,9 +188,9 @@ def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, 
                 return {"acquired": False, "reason": f"RUNNING_LOCK_REPLACE_FAILED:{exc}", "path": str(path), "payload": old}
 
 
-def release_us_session_running_lock(trade_date: str, session: str, run_id: str | None = None) -> dict:
+def release_us_session_running_lock(trade_date: str, session: str, run_id: str | None = None, *, env: str | None = None) -> dict:
     # Also protects atexit hooks that otherwise release locks unconditionally.
-    if read_us_session_child_unverified_fence(trade_date, session):
+    if read_us_session_child_unverified_fence(trade_date, session, env=env):
         logger.critical("[US_SESSION_GUARD][LOCK_RELEASE_DENIED] trade_date=%s session=%s reason=CHILD_UNVERIFIED", trade_date, session)
         return {"released": False, "reason": "CHILD_UNVERIFIED_FENCE",
                 "path": str(_running_path(trade_date, session))}
