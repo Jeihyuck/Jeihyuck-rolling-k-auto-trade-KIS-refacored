@@ -350,7 +350,23 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     # Query authoritative snapshots once per timeout, not once per journal row.
     balance = None
     today_orders = None
+    # The 2026-10-13 incident made >600 KIS CCNL requests in 35 ticks.
+    # Historical active claims often share an original trade date; do not
+    # fetch that broker order book repeatedly within one reconciliation.
+    # This memo never survives a replay/tick, so genuine later broker fills
+    # are rediscovered on the next fresh invocation.
+    orders_by_trade_date: dict[str, list[dict] | None] = {}
     fills_by_trade_date: dict[str, list[dict] | None] = {}
+
+    def orders_for_trade_date(source_trade_date: str) -> list[dict] | None:
+        if source_trade_date not in orders_by_trade_date:
+            try:
+                method = getattr(provider, "get_today_orders", None)
+                rows = method(trade_date=source_trade_date) if callable(method) else None
+                orders_by_trade_date[source_trade_date] = rows if isinstance(rows, list) else None
+            except Exception:
+                orders_by_trade_date[source_trade_date] = None
+        return orders_by_trade_date[source_trade_date]
 
     def fills_for_trade_date(source_trade_date: str) -> list[dict] | None:
         if source_trade_date not in fills_by_trade_date:
@@ -369,10 +385,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         try: balance = provider.get_balance(force_refresh=True)
         except TypeError: balance = provider.get_balance()
         except Exception: balance = None
-        try:
-            method = getattr(provider, "get_today_orders", None)
-            today_orders = method(trade_date=trade_date) if callable(method) else None
-        except Exception: today_orders = None
+        today_orders = orders_for_trade_date(trade_date)
         all_fills = fills_for_trade_date(trade_date)
     positions_by_symbol = {}
     if isinstance(balance, dict):
@@ -386,11 +399,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         event_orders = today_orders
         event_fills = all_fills
         if provider is not None and event_trade_date != trade_date:
-            try:
-                method = getattr(provider, "get_today_orders", None)
-                event_orders = method(trade_date=event_trade_date) if callable(method) else None
-            except Exception:
-                event_orders = None
+            event_orders = orders_for_trade_date(event_trade_date)
             event_fills = fills_for_trade_date(event_trade_date)
         append_order_event("JOURNAL_REPLAY_STARTED", latest)
         ack = next((e for e in reversed(order_events) if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}), None)
