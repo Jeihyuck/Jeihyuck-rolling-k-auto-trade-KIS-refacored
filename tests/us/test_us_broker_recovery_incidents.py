@@ -421,7 +421,7 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
         def get_order_lookup_provenance(self, trade_date):
             return {"verified": True, "source": "kis_authenticated_order_book",
                     "query_trade_date": trade_date, "market": "US",
-                    "account_id": "mock-account", "session": "am"}
+                    "account_id": "active-replay-account", "session": "am"}
 
         def get_today_orders(self, trade_date):
             self.order_calls += 1
@@ -461,7 +461,8 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
         active_claims_only=True,
     )
 
-    assert first["broker_unfilled_ack_count"] == second["broker_unfilled_ack_count"] == 1
+    assert first["broker_unfilled_ack_count"] == 1, first
+    assert second["broker_unfilled_ack_count"] == 1, second
     # The exact OPEN row is already in each fresh same-invocation KIS
     # order book; do not repeat an entire CCNL REST request through the
     # per-order helper. Each replay still refetches broker truth.
