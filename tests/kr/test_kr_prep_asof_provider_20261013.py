@@ -1,7 +1,7 @@
 """KIS official daily master-file regression for KR PREP 150+150.
 
 No KRX HTTP, brokerage orders or production DB writes. Generated synthetic
-CP949 records follow the official KIS 228/222-byte tail layout.
+CP949 records follow the official KIS 228/222-character tail layout.
 """
 from __future__ import annotations
 
@@ -26,10 +26,14 @@ def sample_mst(market="KOSPI", *, count=180, duplicate=False):
             code = f"{100000:06d}"
         prefix = (f"A{code}".ljust(9) + f"KR{i:010d}"[:12].ljust(12)).encode("ascii")
         name = f"가상기업{i}".encode("cp949")
-        tail = bytearray(b" " * tail_len)
+        tail = list(" " * tail_len)
+        # A non-ASCII tail character makes byte offsets differ from KIS's
+        # reference *decoded character* widths. Reproduces live row 154.
+        if i == 153:
+            tail[40] = "가"
         cap = 100000000 - i * 100
-        tail[-15:-6] = f"{cap:09d}".encode("ascii")
-        records.append(prefix + name + bytes(tail) + b"\n")
+        tail[-15:-6] = list(f"{cap:09d}")
+        records.append(prefix + name + "".join(tail).encode("cp949") + b"\n")
     return file_name, b"".join(records)
 
 
