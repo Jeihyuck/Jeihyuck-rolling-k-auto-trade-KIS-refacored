@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 
+class TickChildUnverifiedError(RuntimeError):
+    """An order-capable child may still be alive; session must stay fenced."""
+
+
 class TickProcessTimeout(TimeoutError):
     def __init__(self, result: dict):
         super().__init__(result.get("status", "tick process timeout"))
@@ -194,7 +198,22 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                         process.kill()
                 process.join(5.0)
             if process.is_alive():
-                raise RuntimeError(
+                state_path = child_kwargs.get("active_session_state_path")
+                if state_path:
+                    from trader.us.utils.session_guard import mark_us_session_child_unverified_fence
+                    try:
+                        mark_us_session_child_unverified_fence(
+                            Path(state_path).parent.name,
+                            str(child_kwargs.get("session") or ""),
+                            run_id=str(child_kwargs.get("session_run_id") or ""),
+                            pid=pid, reason="child_alive_after_parent_shutdown",
+                        )
+                    except Exception:
+                        # The session runner independently catches this typed
+                        # error and withholds CLOSED/lock release even if the
+                        # filesystem rejected the first durable fence write.
+                        logger.exception("[US_TICK_PROCESS][FENCE_WRITE_FAILED]")
+                raise TickChildUnverifiedError(
                     f"tick_child_process_stuck_after_parent_exit pid={pid} "
                     "broker_submission_truth=UNVERIFIED"
                 )
