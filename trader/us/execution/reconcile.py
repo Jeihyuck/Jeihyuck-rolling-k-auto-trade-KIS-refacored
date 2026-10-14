@@ -1382,7 +1382,15 @@ def classify_ack_orders_with_final_balance(
             final_status = "broker_fill_confirmed"
         elif fill_qty > 0 or raw_status in {"PARTIALLY_FILLED"}:
             final_status = "ack_open_order_pending" if broker_remaining is None else "ack_unresolved_error"
-        elif order.get("active_claim") and not broker_present:
+        elif (
+            order.get("active_claim") and not broker_present
+            and not order.get("qty_recovered_from_unique_close_balance_delta")
+        ):
+            # Unknown claim stays unresolved.  The one narrow exception is a
+            # uniquely attributable SELL with an authoritative whole-share
+            # decrease; allow the balance-delta classification below.  This
+            # does NOT release the durable execution claim or label the KIS
+            # physical fill as confirmed.
             final_status = "ack_unresolved_error"
         elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
             final_status = "balance_delta_confirmed"
