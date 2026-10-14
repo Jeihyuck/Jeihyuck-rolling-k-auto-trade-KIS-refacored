@@ -88,3 +88,37 @@ def test_pool_iteration_order_cannot_force_unnecessary_deletion():
         assert len(result) == 25, (seed, audit)
         assert audit["cap_violations"] == [], (seed, audit)
         assert audit["replacement_search"]["forced_deletions"] == 0, (seed, audit)
+
+
+def test_twenty_eight_ai_six_two_safe_additions_fill_thirty_without_swap():
+    """The 6/28 -> 6/30 denominator bridge must not delete an AI candidate."""
+    rows = [
+        {"symbol": f"AI_{i}", "theme_cluster": ("AI_SEMI" if i < 3 else "AI_SOFTWARE"),
+         "score_final": 0.99 - i * 0.01}
+        for i in range(6)
+    ]
+    clusters = ["HEALTHCARE", "FINANCIAL", "INDUSTRIAL", "OTHER", "ENERGY_MATERIALS", "CONSUMER_STAPLES"]
+    rows += [
+        {"symbol": f"OTHER_{i}", "theme_cluster": clusters[i % len(clusters)],
+         "score_final": 0.8 - i * 0.002}
+        for i in range(22)
+    ]
+    assert len(rows) == 28
+    replacements = [
+        {"symbol": "NON_AI_B", "theme_cluster": "FINANCIAL", "score_final": 0.25},
+        {"symbol": "NON_AI_A", "theme_cluster": "OTHER", "score_final": 0.26},
+    ]
+    caps = {"max_ai_tech_ratio": 0.20, "max_single_cluster_ratio": 0.20}
+    assert "AI_TECH_COMBINED" in effective_final30_cap_violations(rows, caps, "NEUTRAL")
+    for seed in range(20):
+        import random
+        pool = rows + replacements
+        random.Random(seed).shuffle(pool)
+        new_rows, audit = repair_final30_effective_caps(rows, pool, caps, 30, "NEUTRAL")
+        assert len(new_rows) == 30, (seed, audit)
+        assert {r["symbol"] for r in rows} <= {r["symbol"] for r in new_rows}
+        assert {r["symbol"] for r in replacements} <= {r["symbol"] for r in new_rows}
+        assert audit["replacement_search"]["forced_deletions"] == 0
+        assert audit["cap_violations"] == []
+        assert audit["repair_failure_reason"] == ""
+        assert audit["replacement_search"]["joint_refill_count"] >= 1
