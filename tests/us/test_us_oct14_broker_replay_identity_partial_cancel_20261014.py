@@ -94,6 +94,11 @@ def test_submit_cancel_and_late_fill_require_fresh_replay_snapshot(monkeypatch):
         reads = 0
         def get_balance(self, force_refresh=False):
             return {"positions": []}
+        def get_order_lookup_provenance(self, trade_date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": trade_date, "market": "US",
+                    "account_id": "verified-practice-account", "session": "am"}
+
         def get_today_orders(self, *, trade_date):
             self.reads += 1
             return [{
@@ -118,3 +123,28 @@ def test_submit_cancel_and_late_fill_require_fresh_replay_snapshot(monkeypatch):
     assert observations[-1]["filled_qty"] == 1
     assert observations[-1]["remaining_qty"] == 0
     assert observations[-1]["broker_status"] == "CANCELLED"
+
+
+def test_absent_kis_row_account_session_and_date_require_proven_scope(proof):
+    journal, row = proof
+    # A row containing order number/symbol/quantity but no context is NOT a
+    # verified account/session/date match for reusing a KIS snapshot.
+    for name in ("account_id", "session", "trade_date", "us_trade_date"):
+        row.pop(name, None)
+    assert not _matches(journal, row)
+    proven = {"verified": True, "source": "kis_authenticated_order_book",
+              "query_trade_date": "2026-10-13", "market": "US",
+              "account_id": "account-1", "session": "am",
+              "session_run_id": "session-1", "session_generation": 1}
+    assert _replay_order_row_matches(
+        row, order_no="0000043251", symbol="MCK", side="SELL",
+        requested_qty=2, source_trade_date="2026-10-13",
+        journal_event=journal, lookup_context=proven)
+    for field, value in (("account_id", "wrong-account"),
+                         ("session", "afternoon"),
+                         ("query_trade_date", "2026-10-12")):
+        wrong = dict(proven, **{field: value})
+        assert not _replay_order_row_matches(
+            row, order_no="0000043251", symbol="MCK", side="SELL",
+            requested_qty=2, source_trade_date="2026-10-13",
+            journal_event=journal, lookup_context=wrong)
