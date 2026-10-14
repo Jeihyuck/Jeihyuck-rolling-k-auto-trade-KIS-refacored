@@ -462,7 +462,10 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
     )
 
     assert first["broker_unfilled_ack_count"] == 1, first
-    assert second["broker_unfilled_ack_count"] == 1, second
+    assert second["broker_unfilled_ack_count"] == 1, {
+        "second": second, "first": first, "provider_order_calls": provider.order_calls,
+        "provider_fill_calls": provider.fill_calls,
+    }
     # The exact OPEN row is already in each fresh same-invocation KIS
     # order book; do not repeat an entire CCNL REST request through the
     # per-order helper. Each replay still refetches broker truth.
