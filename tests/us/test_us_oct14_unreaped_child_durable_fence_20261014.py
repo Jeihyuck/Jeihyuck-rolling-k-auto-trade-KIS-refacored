@@ -129,9 +129,11 @@ def test_unreaped_child_blocks_all_us_sessions_and_later_trade_dates_for_same_ac
         "2026-10-14", "am", "real-other-account", env="practice",
     )["acquired"] is True
     monkeypatch.setattr(us_cfg, "KIS_ENV", "prod")
+    monkeypatch.setenv("KIS_ENV", "prod")
     assert guard.acquire_us_session_running_lock(
         "2026-10-14", "am", "real-other-env", env="prod",
     )["acquired"] is True
+    monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setattr(us_cfg, "KIS_ENV", "practice")
     monkeypatch.setattr(us_cfg, "CANO", "12345678")
     monkeypatch.setenv("CANO", "12345678")
