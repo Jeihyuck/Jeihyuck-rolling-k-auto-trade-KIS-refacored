@@ -59,6 +59,9 @@ def test_prep_prior_success_is_not_reset_by_force_rebuild(monkeypatch):
                 "run_id": "previous-success", "as_of": as_of,
                 "actual_as_of": as_of, "provider": "kis_master_marketcap",
                 "status": "SUCCESS", "members": saved,
+                "build_reason": build._kis_master_proof(
+                    as_of, "2026-10-13", {"KOSPI": "a" * 64, "KOSDAQ": "b" * 64}
+                ),
             }
         def start_universe_run(self, **_kw):
             raise AssertionError("must not change SUCCESS to RUNNING")
