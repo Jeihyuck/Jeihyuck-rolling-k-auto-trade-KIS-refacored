@@ -1060,16 +1060,31 @@ def repair_final30_effective_caps(
     blocked_clusters = blocked_clusters or set()
     dropped: list[str] = []
     added: list[str] = []
+    original_count = len(out)
+    original_violations = effective_final30_cap_violations(out, constraints, rotation_regime)
+    replacement_rejections: dict[str, int] = {}
+    search_diagnostics = {"evaluated_swaps": 0, "non_improving_swaps": 0,
+                          "accepted_swaps": 0, "forced_deletions": 0}
+
+    def reject(reason: str) -> bool:
+        replacement_rejections[reason] = replacement_rejections.get(reason, 0) + 1
+        return False
 
     def cluster(row):
         return row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
 
     def eligible(row):
+        symbol = str(row.get("symbol") or "").strip()
         score = _safe_float(row.get("score_final"))
-        return bool(str(row.get("symbol") or "").strip() and math.isfinite(score)
-                    and score > 0 and cluster(row) not in blocked_clusters
-                    and not row.get("blocked_by_cluster_cap")
-                    and (not _is_etf_row(row) or str(row.get("symbol") or "").upper() in _CORE_ETFS))
+        if not symbol:
+            return reject("missing_symbol")
+        if not math.isfinite(score) or score <= 0:
+            return reject("invalid_or_nonpositive_score")
+        if cluster(row) in blocked_clusters or row.get("blocked_by_cluster_cap"):
+            return reject("blocked_cluster")
+        if _is_etf_row(row) and symbol.upper() not in _CORE_ETFS:
+            return reject("not_permitted_core_etf")
+        return True
 
     pool = sorted((r for r in candidate_pool or [] if eligible(r)),
                   key=lambda r: -float(r["score_final"]))
@@ -1107,8 +1122,10 @@ def repair_final30_effective_caps(
                     if str(row["symbol"]).upper() in used:
                         continue
                     trial = out[:idx] + [row] + out[idx + 1:]
+                    search_diagnostics["evaluated_swaps"] += 1
                     after = excess(trial)
                     if after >= before:
+                        search_diagnostics["non_improving_swaps"] += 1
                         continue
                     key = (after, float(out[idx].get("score_final") or 0), -float(row["score_final"]))
                     if best is None or key < best[0]:
@@ -1119,6 +1136,7 @@ def repair_final30_effective_caps(
             dropped.append(str(out[idx].get("symbol") or ""))
             added.append(str(row["symbol"]))
             out[idx] = row
+            search_diagnostics["accepted_swaps"] += 1
 
     for _ in range(len(out)):
         replace_before_drop()
@@ -1149,6 +1167,7 @@ def repair_final30_effective_caps(
         drop = min(indices, key=lambda idx: float(out[idx].get("score_final") or 0))
         dropped.append(str(out[drop].get("symbol") or ""))
         out.pop(drop)
+        search_diagnostics["forced_deletions"] += 1
 
     if not effective_final30_cap_violations(out, constraints, rotation_regime):
         seen = {str(row.get("symbol") or "") for row in out}
@@ -1167,7 +1186,28 @@ def repair_final30_effective_caps(
             seen.add(sym)
             added.append(sym)
     remaining = effective_final30_cap_violations(out, constraints, rotation_regime)
+    # All filtered-out alternatives are accounted for in the PREP artifact.
+    # A missing replacement must not silently turn a >=25-member normal tier
+    # into a degraded underfill tier without explicit operator evidence.
+    if len(out) < original_count:
+        used = {str(row.get("symbol") or "").upper() for row in out}
+        for row in pool:
+            if str(row.get("symbol") or "").upper() in used:
+                continue
+            trial = out + [row]
+            if effective_final30_cap_violations(trial, constraints, rotation_regime):
+                reject("would_violate_effective_caps")
+            elif sum(_is_etf_row(item) for item in trial) > _MAX_ETF_IN_FINAL30:
+                reject("would_exceed_etf_cap")
+            else:
+                reject("not_selected_after_repair")
     return out, {
+        "original_count": original_count,
+        "original_cap_violations": original_violations,
+        "replacement_pool_count": len(candidate_pool or []),
+        "eligible_replacement_pool_count": len(pool),
+        "replacement_rejection_reasons": replacement_rejections,
+        "replacement_search": search_diagnostics,
         "dropped": dropped,
         "added": added,
         "cap_violations": remaining,
