@@ -1378,6 +1378,33 @@ class USDataProvider:
         return 0.0
     
 
+    def get_order_lookup_provenance(self, trade_date: str) -> dict:
+        """Authenticated KIS lookup scope; NEVER infer missing identity from a row.
+
+        get_today_orders uses client._build_us_fills_params() scoped by CANO /
+        ACNT_PRDT_CD and filters its KST date bridge back to the requested US
+        date. Session identity is only available from an explicitly bound tick.
+        Historical claims of another session must take the slower safe path.
+        """
+        if self._offline:
+            return {}
+        client = self._get_client()
+        cano = str(getattr(client, "_cano", "") or "").strip()
+        product = str(getattr(client, "_acnt_prdt_cd", "") or "").strip()
+        client_env = str(getattr(client, "_env", "") or "").lower()
+        if not cano or not product or client_env != self._env:
+            return {}
+        ctx = self._tick_context
+        return {
+            "verified": True, "source": "kis_authenticated_order_book",
+            "query_trade_date": str(trade_date), "market": "US",
+            "account_id": cano, "account_product_code": product,
+            "env": client_env,
+            "session": getattr(ctx, "session", "") if ctx is not None else "",
+            "session_run_id": getattr(ctx, "session_run_id", "") if ctx is not None else "",
+            "session_generation": getattr(ctx, "session_generation", None) if ctx is not None else None,
+        }
+
     def get_today_orders(self, trade_date: str) -> list[dict]:
         """Return normalized same-day US broker order status rows."""
         if self._offline:
