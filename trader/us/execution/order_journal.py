@@ -73,29 +73,17 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
         return {"NASD": "NASDAQ", "NAS": "NASDAQ", "NYSE": "NYSE",
                 "AMEX": "AMEX", "AMS": "AMEX"}.get(str(value or "").upper(),
                                                 str(value or "").upper())
-    for field in ("exchange", "market", "session", "session_run_id",
-                  "session_generation", "account_id", "account_key", "cano",
-                  "trading_epoch_id", "strategy_owner"):
+    # KIS proves account + market + source day via the authenticated query.
+    # It does NOT know the original local session/generation/epoch/owner.
+    # Those identities belong to the immutable submit/ACK journal, NEVER
+    # to the current tick's lookup context or a synthesized ORDER_OPEN row.
+    for field in ("exchange", "market", "account_id", "account_key", "cano"):
         local = recorded(field)
         actual = row.get(field)
-        if actual in (None, "") and field in {
-                "market", "session", "session_run_id", "session_generation",
-                "account_id", "account_key", "cano", "trading_epoch_id"}:
-            if local in (None, "") and field not in {"account_id", "market", "session"}:
-                # Optional extended IDs are not required when neither source
-                # claims that field. Do not fabricate an epoch or generation.
-                continue
-            # A KIS row cannot claim a session or account implicitly. The
-            # authenticated account+date lookup and a bound session can fill
-            # the gap, but never a guessed context or unrelated tick.
+        if actual in (None, "") and field in {"market", "account_id", "account_key", "cano"}:
             if not scoped:
                 return False
-            aliases = {"account_key": "account_id", "cano": "account_id"}
-            actual = ctx.get(aliases.get(field, field))
-            if actual in (None, ""):
-                if local not in (None, ""):
-                    return False
-                continue
+            actual = ctx.get("account_id" if field in {"account_id", "account_key", "cano"} else field)
         if actual in (None, ""):
             continue
         if local not in (None, ""):
@@ -104,10 +92,22 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
                     return False
             elif str(local).upper() != str(actual).upper():
                 return False
+        # An explicitly specified row account must also match the signed
+        # provider scope even when the journal lacks the account field.
+        if field in {"account_id", "account_key", "cano"} and scoped:
+            if str(actual).upper() != str(ctx["account_id"]).upper():
+                return False
+
+    for field in ("session", "session_run_id", "session_generation",
+                  "trading_epoch_id", "strategy_owner"):
+        explicit_broker_value = row.get(field)
+        immutable = recorded(field)
+        if explicit_broker_value not in (None, ""):
+            if immutable in (None, "") or str(immutable).upper() != str(explicit_broker_value).upper():
+                return False
+        # Missing KIS-internal metadata does not imply the CURRENT lookup
+        # tick had the same session or epoch as the ORIGINAL submission.
     if row.get("trade_date") in (None, "") and not scoped:
-        return False
-    if (row.get("session") in (None, "") and row.get("session_run_id") in (None, "")
-            and (not scoped or not recorded("session") or not ctx.get("session"))):
         return False
     if (row.get("account_id") in (None, "") and row.get("cano") in (None, "")
             and not scoped):
@@ -579,8 +579,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             positions_by_symbol[str(pos.get("symbol") or pos.get("pdno") or "").upper()] = pos
 
     for key, order_events in grouped.items():
-        latest = order_events[-1]; types = {e.get("event_type") for e in order_events}
-        if "BROKER_SUBMIT_STARTED" not in types or "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types: continue
+        types = {e.get("event_type") for e in order_events}
+        if "BROKER_SUBMIT_STARTED" not in types or "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types:
+            continue
+        # Replay-generated OPEN, PARTIAL_FILL, recovery and error events may
+        # contain synthetic defaults for qty, generation and session. They
+        # describe observation state, NOT the original submission identity.
+        # Anchor every later KIS lookup/observation to this immutable intent.
+        latest = next(e for e in order_events if e.get("event_type") == "BROKER_SUBMIT_STARTED")
         event_trade_date = str(latest.get("trade_date") or trade_date)
         event_orders = today_orders
         event_fills = all_fills
