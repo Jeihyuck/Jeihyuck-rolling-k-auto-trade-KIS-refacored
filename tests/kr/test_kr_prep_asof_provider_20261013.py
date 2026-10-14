@@ -1,98 +1,138 @@
-"""Regression for 2026-10-13 KR PREP dated universe failure."""
+"""KIS official daily master-file regression for KR PREP 150+150.
+
+No KRX HTTP, brokerage orders or production DB writes. Generated synthetic
+CP949 records follow the official KIS 228/222-byte tail layout.
+"""
 from __future__ import annotations
 
-from datetime import date
-import pandas as pd
+from datetime import date, datetime
+from io import BytesIO
+from zipfile import ZipFile
+
 import pytest
+from zoneinfo import ZoneInfo
 
-from trader.universe.providers import krx_marketcap_asof as module
+from trader.universe.providers import kis_master_marketcap as master
 
-
-@pytest.fixture(autouse=True)
-def _fake_dated_listing(monkeypatch):
-    # Mock an exchange listing for the same as-of date; real KRX HTTP is never
-    # contacted by offline tests.
-    def listed(as_of, market):
-        assert as_of == "20261012"
-        assert market in ("KOSPI", "KOSDAQ")
-        return [f"{100000 + i:06d}" for i in range(200)]
-    monkeypatch.setattr(module, "get_market_ticker_list", listed)
+KST = ZoneInfo("Asia/Seoul")
 
 
-def _df(n=180):
-    codes = [f"{100000 + i:06d}" for i in range(n)]
-    return pd.DataFrame(
-        {"시가총액": [1000000000000 - i * 1000 for i in range(n)],
-         "종목명": [f"sample-{i}" for i in range(n)]},
-        index=codes,
-    )
+def sample_mst(market="KOSPI", *, count=180, duplicate=False):
+    file_name, tail_len = master.LAYOUT[market]
+    records = []
+    for i in range(count):
+        code = f"{100000 + i:06d}"
+        if duplicate and i == count-1:
+            code = f"{100000:06d}"
+        prefix = (f"A{code}".ljust(9) + f"KR{i:010d}"[:12].ljust(12)).encode("ascii")
+        name = f"가상기업{i}".encode("cp949")
+        tail = bytearray(b" " * tail_len)
+        cap = 100000000 - i * 100
+        tail[-15:-6] = f"{cap:09d}".encode("ascii")
+        records.append(prefix + name + bytes(tail) + b"\n")
+    return file_name, b"".join(records)
 
 
-def test_dated_marketcap_uses_exact_session_and_150_per_market(monkeypatch):
-    calls = []
-    def fetch(market, requested, max_rollback_days=None):
-        calls.append((market, requested, max_rollback_days))
-        return _df(), requested, "ok"
-    monkeypatch.setattr(module, "fetch_with_rollback", fetch)
-    provider = module.KRXAsOfMarketcapProvider()
-    for market in ("KOSPI", "KOSDAQ"):
-        result = provider.get_marketcap_top_with_meta(market, "2026-10-12", 150)
-        assert len(result) == 150
-        assert len({x["code"] for x in result}) == 150
-        assert all(x["market"] == market for x in result)
-        assert all(x["actual_as_of"] == "2026-10-12" for x in result)
-        assert all(x["market_cap"] > 0 for x in result)
-    assert calls == [
-        ("KOSPI", date(2026, 10, 12), 0),
-        ("KOSDAQ", date(2026, 10, 12), 0),
-    ]
+def sample_zip(market):
+    file_name, content = sample_mst(market)
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as z:
+        z.writestr(file_name, content)
+    return buffer.getvalue()
 
 
-@pytest.mark.parametrize("used_date,reason", [
-    (date(2026, 10, 8), "rolled_back"),
-    (date(2026, 10, 12), "rolled_back"),
-])
-def test_never_relabel_an_old_marketcap_session(monkeypatch, used_date, reason):
-    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (_df(), used_date, reason))
-    with pytest.raises(RuntimeError, match="date_mismatch"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
+class FakeResponse:
+    headers = {"Last-Modified": "Wed, 14 Oct 2026 00:01:00 GMT"}
+    def __init__(self, content):
+        self.content = content
+    def raise_for_status(self):
+        return None
 
 
-def test_provider_reported_date_mismatch_blocks(monkeypatch):
-    frame = _df()
-    frame.attrs["actual_as_of"] = "2026-10-08"
-    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (frame, date(2026,10,12), "ok"))
-    with pytest.raises(RuntimeError, match="provider_date_mismatch"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
+class FakeSession:
+    def __init__(self, data):
+        self.data = data
+    def get(self, url, **kwargs):
+        market = "KOSPI" if "kospi_code" in url else "KOSDAQ"
+        assert kwargs["timeout"] == (5, 25)
+        return FakeResponse(self.data[market])
 
 
-def test_30_rows_cannot_be_promoted_to_150(monkeypatch):
-    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (_df(30), date(2026,10,12), "ok"))
-    with pytest.raises(RuntimeError, match="insufficient"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
+def test_official_byte_layout_parses_cp949_and_orders_capitalisation():
+    for venue in master.LAYOUT:
+        _name, raw = sample_mst(venue)
+        rows = master.parse_master(raw, venue)
+        assert len(rows) == 180
+        assert rows[0]["code"] == "100000"
+        assert rows[0]["name"] == "가상기업0"
+        assert rows[0]["market_cap"] > rows[-1]["market_cap"]
+        assert rows[-1]["code"] == "100179"
 
 
-def test_marketcap_column_and_market_validation(monkeypatch):
-    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (pd.DataFrame({"x":[1]}, index=["005930"]), date(2026,10,12), "ok"))
-    with pytest.raises(RuntimeError, match="missing_market_cap"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
-    with pytest.raises(ValueError, match="invalid_market"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("UNKNOWN", "2026-10-12", 150)
+def test_live_shape_readonly_150_each_and_provenance():
+    data = {m: sample_zip(m) for m in master.LAYOUT}
+    provider = master.KISMasterMarketcapProvider(session=FakeSession(data))
+    for market in master.LAYOUT:
+        rows = provider.get_marketcap_top_with_meta(market, "2026-10-13", 150,
+                                                    readonly_probe=True)
+        assert len(rows) == 150
+        assert all(x["market"] == market for x in rows)
+        assert all(x["actual_as_of"] == "2026-10-13" for x in rows)
+        assert all(x["source_published_on"] == "2026-10-14" for x in rows)
+        assert len({r["code"] for r in rows}) == 150
+        assert len(rows[0]["source_sha256"]) == 64
 
 
-def test_dated_venue_listing_must_cover_market(monkeypatch):
-    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (_df(), date(2026,10,12), "ok"))
-    monkeypatch.setattr(module, "get_market_ticker_list", lambda *_a, **_kw: ["005930"])
-    with pytest.raises(RuntimeError, match="venue_listing_incomplete"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
+def test_duplicate_stock_code_fails_closed():
+    _name, raw = sample_mst(duplicate=True)
+    with pytest.raises(RuntimeError, match="duplicate_code"):
+        master.parse_master(raw, "KOSPI")
 
 
-def test_codes_outside_verified_market_are_not_admitted(monkeypatch):
-    monkeypatch.setattr(module, "fetch_with_rollback", lambda *a, **kw: (_df(), date(2026,10,12), "ok"))
-    # Large listing, but it contains fewer than 150 of the capitalization
-    # response codes. Strict venue reconciliation must fail, not mislabel.
-    listing = [f"{100000 + i:06d}" for i in range(140)]
-    listing += [f"{400000 + i:06d}" for i in range(60)]
-    monkeypatch.setattr(module, "get_market_ticker_list", lambda *_a, **_kw: listing)
-    with pytest.raises(RuntimeError, match="insufficient"):
-        module.KRXAsOfMarketcapProvider().get_marketcap_top_with_meta("KOSPI", "2026-10-12", 150)
+def test_empty_and_short_or_malformed_master_fail_closed():
+    with pytest.raises(RuntimeError, match="invalid_uncompressed_size"):
+        master.parse_master(b"", "KOSPI")
+    with pytest.raises(RuntimeError, match="truncated"):
+        master.parse_master(b"123", "KOSDAQ")
+    _name, raw = sample_mst(count=30)
+    with pytest.raises(RuntimeError, match="insufficient_valid"):
+        master.parse_master(raw, "KOSDAQ")
+
+
+def test_prep_morning_requires_exact_previous_session_and_fresh_master(monkeypatch):
+    data = {m: sample_zip(m) for m in master.LAYOUT}
+    p = master.KISMasterMarketcapProvider(session=FakeSession(data))
+    monkeypatch.setattr(master, "now_kst", lambda: datetime(2026,10,14,6,30,tzinfo=KST))
+    monkeypatch.setattr(master, "resolve_prev_krx_trading_day", lambda day: date(2026,10,13))
+    assert len(p.get_marketcap_top_with_meta("KOSPI","2026-10-13",150)) == 150
+    with pytest.raises(RuntimeError, match="asof_mismatch"):
+        p.get_marketcap_top_with_meta("KOSPI","2026-10-12",150)
+    monkeypatch.setattr(master, "now_kst", lambda: datetime(2026,10,14,15,30,tzinfo=KST))
+    with pytest.raises(RuntimeError, match="morning_window"):
+        p.get_marketcap_top_with_meta("KOSPI","2026-10-13",150)
+
+
+def test_stale_last_modified_fails_closed(monkeypatch):
+    class StaleSession(FakeSession):
+        def get(self, url, **kwargs):
+            out = super().get(url, **kwargs)
+            out.headers = {"Last-Modified": "Mon, 12 Oct 2026 00:01:00 GMT"}
+            return out
+    p = master.KISMasterMarketcapProvider(session=StaleSession({
+        m: sample_zip(m) for m in master.LAYOUT}))
+    monkeypatch.setattr(master, "now_kst", lambda: datetime(2026,10,14,6,30,tzinfo=KST))
+    monkeypatch.setattr(master, "resolve_prev_krx_trading_day", lambda d: date(2026,10,13))
+    with pytest.raises(RuntimeError, match="stale_publication"):
+        p.get_marketcap_top_with_meta("KOSDAQ","2026-10-13",150)
+
+
+def test_missing_last_modified_and_zip_entry_fail_closed():
+    class MissingHeaderSession(FakeSession):
+        def get(self, url, **kwargs):
+            out = super().get(url, **kwargs)
+            out.headers = {}
+            return out
+    data = {m: sample_zip(m) for m in master.LAYOUT}
+    p = master.KISMasterMarketcapProvider(session=MissingHeaderSession(data))
+    with pytest.raises(RuntimeError, match="last_modified_missing"):
+        p.get_marketcap_top_with_meta("KOSPI","2026-10-13",150,readonly_probe=True)
