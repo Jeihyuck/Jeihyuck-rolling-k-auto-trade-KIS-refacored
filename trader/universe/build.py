@@ -61,6 +61,45 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
 
 logger = logging.getLogger(__name__)
 
+# Run-level, durable proof of the *two* KIS master ZIPs that produced PREP.
+# universe_members only has market/name/rank/cap; its meta_json is not stored.
+# Encode compact source evidence in the existing universe_runs.build_reason.
+KIS_MASTER_PROOF_RE = re.compile(
+    r"^kis_master_v1\\|published=(\\d{4}-\\d{2}-\\d{2})"
+    r"\\|KOSPI=([0-9a-f]{64})\\|KOSDAQ=([0-9a-f]{64})$"
+)
+
+
+def _kis_master_proof(as_of_date: str, published: str, hashes: dict[str, str]) -> str:
+    """Build a strictly dated immutable DB audit token (no credentials)."""
+    from trader.time_utils import resolve_prev_krx_trading_day
+    published_day = date.fromisoformat(str(published))
+    requested_day = date.fromisoformat(str(as_of_date))
+    if resolve_prev_krx_trading_day(published_day) != requested_day:
+        raise ValueError("kis_master_proof_previous_session_mismatch")
+    ordered = {}
+    for market in ("KOSPI", "KOSDAQ"):
+        digest = str(hashes.get(market) or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"kis_master_proof_invalid_sha256:{market}")
+        ordered[market] = digest
+    return (f"kis_master_v1|published={published_day.isoformat()}"
+            f"|KOSPI={ordered['KOSPI']}|KOSDAQ={ordered['KOSDAQ']}")
+
+
+def _kis_master_proof_matches(snapshot: dict, as_of_date: str) -> bool:
+    stored = str(snapshot.get("build_reason") or "")
+    match = KIS_MASTER_PROOF_RE.fullmatch(stored)
+    if match is None:
+        return False
+    published, kospi_hash, kosdaq_hash = match.groups()
+    try:
+        return _kis_master_proof(
+            as_of_date, published, {"KOSPI": kospi_hash, "KOSDAQ": kosdaq_hash}
+        ) == stored
+    except (ValueError, RuntimeError):
+        return False
+
 
 def _resolve_seed_dir() -> Path:
     default_dir = runtime_root() / "diagnostics" / "universe_seed"
@@ -208,6 +247,16 @@ def _load_fallback_universe_from_db(
         logger.error(
             "[UNIVERSE][FALLBACK][DB][UNVERIFIED_DATE] requested=%s actual=%s action=FAIL_CLOSED",
             as_of_date, snapshot.get("actual_as_of"),
+        )
+        return []
+
+    # The actual file checksums must survive DB persistence/restart. A mere
+    # provider string + claimed as_of never proves which KIS master was used.
+    if require_exact_as_of and not _kis_master_proof_matches(snapshot, as_of_date):
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][SOURCE_PROOF_MISSING_OR_INVALID] "
+            "as_of=%s action=FAIL_CLOSED",
+            as_of_date,
         )
         return []
 
@@ -959,7 +1008,11 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             reason=last_reason,
             requested_as_of=as_of_date,
             actual_as_of=str(params.get("actual_as_of") or as_of_date),
-            build_reason=last_reason,
+            build_reason=_kis_master_proof(
+                as_of_date,
+                str(params["source_published_on"]),
+                dict(params["source_sha256_by_market"]),
+            ) if prep_recovery else last_reason,
             universe_name=strategy,
         )
     except Exception as exc:
