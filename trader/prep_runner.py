@@ -1335,14 +1335,16 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
         snapshot = repo.get_latest_successful_universe_snapshot(
             env=env, strategy=strategy, as_of_date=as_of_s,
         )
-        dated_source_ok = bool(
-            snapshot and str(snapshot.get("as_of") or "") == as_of_s
-            and str(snapshot.get("actual_as_of") or "") == as_of_s
-            and str(snapshot.get("provider") or "") == "krx_marketcap_asof"
-            and len(snapshot.get("members") or []) >= max(
-                100, int(os.getenv("UNIVERSE_PREP_VERIFIED_DB_MIN_MEMBERS", "100"))
-            )
-        )
+        # Validate the *members*, not only the source/date/row count.
+        # Reuse the same strict six-digit, venue and deduplication contract
+        # enforced by the universe builder on exact-as-of recovery.
+        from trader.universe.build import _load_fallback_universe_from_db
+        validated = _load_fallback_universe_from_db(
+            repo=repo, env=env, strategy=strategy, as_of_date=as_of_s,
+            snapshot=snapshot, require_exact_as_of=True,
+            enforce_fallback_switch=False,
+        ) if snapshot else []
+        dated_source_ok = bool(validated and len(validated) == len(members))
         if not dated_source_ok:
             logger.error(
                 "[UNIVERSE][DB][REJECT_UNDATED] requested=%s cached=%d "
@@ -1392,6 +1394,23 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
             as_of_date=as_of_s,
             allow_fallback=False,
         )
+        # A successful write is not sufficient: verify the committed DB
+        # snapshot and every member before PREP continues to Final30.
+        committed = repo.get_latest_successful_universe_snapshot(
+            env=env, strategy=strategy, as_of_date=as_of_s,
+        )
+        verified_members = _load_fallback_universe_from_db(
+            repo=repo, env=env, strategy=strategy, as_of_date=as_of_s,
+            snapshot=committed, require_exact_as_of=True,
+            enforce_fallback_switch=False,
+        )
+        if not verified_members or len(verified_members) != len(members):
+            logger.error(
+                "[UNIVERSE][PREP][POST_BUILD_PROVENANCE_FAIL] as_of=%s db_rows=%d verified_rows=%d",
+                as_of_s, len(members), len(verified_members),
+            )
+            raise RuntimeError("KR_PREP_UNIVERSE_PROVENANCE_INVALID")
+        members = verified_members
 
     # 4) hard fail if exact as_of still empty
     if len(members) == 0:
