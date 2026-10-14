@@ -661,12 +661,26 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             # Store observed broker evidence per attempt, keep fencing, and
             # allow the independent fill-ingestion path to attribute it.
             broker_nos = sorted(by_client_key.get(key) or ())
-            rows = orders_for_trade_date(str(latest.get("trade_date") or trade_date)) if provider else None
+            attempt_ack = next(
+                (event for event in reversed(order_events)
+                 if event.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}
+                 and event.get("broker_order_no")), None,
+            )
+            original_no = str((attempt_ack or {}).get("broker_order_no") or "")
+            source_day = str(latest.get("trade_date") or trade_date)
+            rows = orders_for_trade_date(source_day) if provider else None
             for row in (rows or []):
-                if normalize_us_order_no(row.get("order_no") or row.get("raw_order_no")) in broker_nos:
+                if (original_no and _replay_order_row_matches(
+                        row, order_no=original_no,
+                        symbol=str(latest.get("symbol") or "").upper(),
+                        side=str(latest.get("side") or "").upper(),
+                        requested_qty=int(latest.get("qty") or 0),
+                        source_trade_date=source_day, journal_event=latest,
+                        lookup_context=source_scope_by_trade_date.get(source_day),
+                    )):
                     append_order_event(
                         "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE", latest,
-                        broker_order_no=str(row.get("raw_order_no") or row.get("order_no") or ""),
+                        broker_order_no=original_no,
                         broker_status=str(row.get("status") or "UNKNOWN"),
                         raw_response=row,
                     )
