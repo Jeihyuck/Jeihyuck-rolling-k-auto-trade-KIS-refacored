@@ -153,6 +153,51 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
             return TickProcessResult(value, pid, time.monotonic() - started)
         return TickProcessResult(value, pid, time.monotonic() - started)
     finally:
+        # SIGINT/SIGTERM from the parent session raises SystemExit while
+        # receiver.poll() is running. The old finally only closed the pipe,
+        # leaving the independently session-grouped, order-capable child alive
+        # AFTER the parent released its session lock. Unconditionally stop an
+        # active child before returning control to session finalization.
+        if process.is_alive():
+            cancellation.set()
+            state_path = child_kwargs.get("active_session_state_path")
+            if state_path:
+                try:
+                    state_path_obj = Path(state_path)
+                    state = json.loads(state_path_obj.read_text(encoding="utf-8"))
+                    state["state"] = "CANCELLING"
+                    state["broker_submission_truth"] = "UNVERIFIED"
+                    tmp = state_path_obj.with_suffix(state_path_obj.suffix + ".parent_signal.tmp")
+                    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+                    os.replace(tmp, state_path_obj)
+                except Exception:
+                    pass
+            try:
+                if hasattr(os, "killpg") and pid > 0:
+                    os.killpg(pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                # The child may not yet have called setsid(); a missing
+                # process group does not prove the process is gone.
+                if process.is_alive():
+                    process.terminate()
+            process.join(max(0.0, terminate_grace_sec))
+            if process.is_alive():
+                try:
+                    if hasattr(os, "killpg") and pid > 0:
+                        os.killpg(pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    if process.is_alive():
+                        process.kill()
+                process.join(5.0)
+            if process.is_alive():
+                raise RuntimeError(
+                    f"tick_child_process_stuck_after_parent_exit pid={pid} "
+                    "broker_submission_truth=UNVERIFIED"
+                )
         receiver.close()
 
 
