@@ -122,3 +122,20 @@ def test_twenty_eight_ai_six_two_safe_additions_fill_thirty_without_swap():
         assert audit["cap_violations"] == []
         assert audit["repair_failure_reason"] == ""
         assert audit["replacement_search"]["joint_refill_count"] >= 1
+
+
+def test_target_underfill_is_reported_even_when_count_increased():
+    rows = [
+        {"symbol": f"SAFE_{i}", "theme_cluster": "OTHER" if i % 2 else "FINANCIAL",
+         "score_final": 0.7}
+        for i in range(4)
+    ]
+    pool = rows + [{"symbol": "SAFE_NEW", "theme_cluster": "HEALTHCARE", "score_final": 0.6}]
+    repaired, audit = repair_final30_effective_caps(
+        rows, pool, {"max_ai_tech_ratio": 0.2, "max_single_cluster_ratio": 0.6},
+        6, "NEUTRAL",
+    )
+    assert len(repaired) == 5
+    assert audit["cap_violations"] == []
+    assert audit["repair_failure_reason"] == "qualified_replacement_pool_exhausted"
+    assert audit["actual_final30_count"] == 5
