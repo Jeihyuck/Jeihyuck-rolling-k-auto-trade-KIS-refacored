@@ -227,14 +227,14 @@ def test_broker_raw_cano_and_hashed_claim_identity_agree_in_both_paths():
         assert conflict(invalid), invalid
 
 
-def test_old_attempt_late_actual_fill_survives_new_attempt_with_same_client_key(monkeypatch):
+def test_old_attempt_late_actual_fill_survives_new_independent_intent(monkeypatch):
     import trader.us.execution.order_journal as journal
     import trader.us.execution.fills as fills
     import trader.us.db.repos as repos
     td = "2026-10-13"
     events = []
     for attempt, num in (("older", "0000001001"), ("newer", "0000001002")):
-        base = {"trade_date": td, "client_order_key": "one-logical-key",
+        base = {"trade_date": td, "client_order_key": "key-" + attempt,
                 "submit_attempt_id": attempt, "symbol": "AMD", "side": "SELL",
                 "session": "am", "exchange": "NASDAQ", "qty": 1,
                 "limit_price": 25.0}
@@ -282,3 +282,55 @@ def test_old_attempt_late_actual_fill_survives_new_attempt_with_same_client_key(
     assert {(x["raw_order_no"], x["filled_qty"]) for x in recorded} == {
         ("0000001001", 1), ("0000001002", 0),
     }
+
+
+def test_same_client_key_two_real_broker_orders_preserves_proof_and_fences(monkeypatch):
+    """Never corrupt one-key us_orders by writing two different KIS order numbers."""
+    import trader.us.execution.order_journal as journal
+    import trader.us.execution.fills as fills
+    import trader.us.db.repos as repos
+    td = "2026-10-13"
+    events = []
+    for attempt, order_no in (("old", "0000010201"), ("new", "0000010202")):
+        base = {"trade_date": td, "client_order_key": "same-key",
+                "submit_attempt_id": attempt, "symbol": "AMD", "side": "SELL",
+                "qty": 1, "session": "am", "exchange": "NASDAQ"}
+        events += [dict(base, event_id=attempt+"-start",
+                        event_type="BROKER_SUBMIT_STARTED"),
+                   dict(base, event_id=attempt+"-ack",
+                        event_type="BROKER_ACK_RECEIVED", broker_order_no=order_no)]
+    monkeypatch.setattr(journal, "load_order_events", lambda *_a, **_kw: events)
+    recorded_events = []
+    monkeypatch.setattr(journal, "append_order_event",
+                        lambda kind, intent, **kwargs:
+                        (recorded_events.append((kind, kwargs)) or {}))
+    writes = []
+    monkeypatch.setattr(repos, "save_order_ack",
+                        lambda *a, **k: (writes.append(("ACK", a, k)) or True))
+    monkeypatch.setattr(repos, "apply_broker_order_observation",
+                        lambda **kw: (writes.append(("OBS", kw)) or {"status": "OK"}))
+    monkeypatch.setattr(fills, "get_fills_today",
+                        lambda provider, trade_date: {"status": "OK", "fills": []})
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {"positions": []}
+        def get_today_orders(self, trade_date):
+            return [
+                {"order_no": "0000010201", "status": "FILLED", "symbol": "AMD",
+                 "side": "SELL", "requested_qty": 1, "filled_qty": 1,
+                 "remaining_qty": 0, "trade_date": "20261014"},
+                {"order_no": "0000010202", "status": "OPEN", "symbol": "AMD",
+                 "side": "SELL", "requested_qty": 1, "filled_qty": 0,
+                 "remaining_qty": 1, "trade_date": "20261014"},
+            ]
+    result = journal.replay_order_journal(td, provider=Provider())
+    assert not writes, "same client key cannot represent distinct broker orders in us_orders"
+    assert result["broker_unknown_count"] == 2, result
+    assert result["status"] == "UNRESOLVED", result
+    evidence = [details for kind, details in recorded_events
+                if kind == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"]
+    assert evidence and any(
+        "0000010201" in str(row["broker_order_no"]) and
+        row["raw_response"]["filled_qty"] == 1 for row in evidence
+    )
+    assert any(kind == "JOURNAL_REPLAY_UNRESOLVED" for kind, _ in recorded_events)
