@@ -1316,6 +1316,12 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
     """
     from trader.universe.build import _load_fallback_universe_from_db
 
+    def _member_identity(rows: list[dict]) -> set[tuple[str, str]]:
+        return {
+            (str(row.get("code") or ""), str(row.get("market") or "").upper())
+            for row in rows
+        }
+
     repo = UniverseRepo(engine)
     as_of_s = as_of.isoformat()
 
@@ -1345,7 +1351,10 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
             snapshot=snapshot, require_exact_as_of=True,
             enforce_fallback_switch=False,
         ) if snapshot else []
-        dated_source_ok = bool(validated and len(validated) == len(members))
+        dated_source_ok = bool(
+            validated and len(validated) == len(members)
+            and _member_identity(validated) == _member_identity(members)
+        )
         if not dated_source_ok:
             logger.error(
                 "[UNIVERSE][DB][REJECT_UNDATED] requested=%s cached=%d "
@@ -1405,7 +1414,8 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
             snapshot=committed, require_exact_as_of=True,
             enforce_fallback_switch=False,
         )
-        if not verified_members or len(verified_members) != len(members):
+        if (not verified_members or len(verified_members) != len(members)
+                or _member_identity(verified_members) != _member_identity(members)):
             logger.error(
                 "[UNIVERSE][PREP][POST_BUILD_PROVENANCE_FAIL] as_of=%s db_rows=%d verified_rows=%d",
                 as_of_s, len(members), len(verified_members),
