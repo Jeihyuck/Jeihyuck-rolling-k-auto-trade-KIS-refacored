@@ -22,7 +22,7 @@ from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
-from trader.universe.providers.krx_marketcap_asof import KRXAsOfMarketcapProvider
+from trader.universe.providers.kis_master_marketcap import KISMasterMarketcapProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
 from trader.universe.mode import is_db_only_mode, resolve_strategy_mode
@@ -197,7 +197,7 @@ def _load_fallback_universe_from_db(
         )
         return []
 
-    if require_exact_as_of and str(snapshot.get("provider") or "") != "krx_marketcap_asof":
+    if require_exact_as_of and str(snapshot.get("provider") or "") != "kis_master_marketcap":
         logger.error(
             "[UNIVERSE][FALLBACK][DB][UNVERIFIED_PROVIDER] provider=%s action=FAIL_CLOSED",
             snapshot.get("provider"),
@@ -591,28 +591,33 @@ def _load_emergency_seed() -> dict | None:
 
 
 
-def _build_from_krx_asof(
-    provider: KRXAsOfMarketcapProvider, as_of_date: str,
+def _build_from_kis_master(
+    provider: KISMasterMarketcapProvider, as_of_date: str,
 ) -> tuple[dict | None, str]:
-    """Build exact-asof 150+150 from dated KRX data, never from current KIS top30."""
+    """Build 150+150 from fresh, date-checked official KIS morning master files."""
     try:
         rows_by_market = {
             market: provider.get_marketcap_top_with_meta(market, as_of_date, TARGETS[market])
             for market in ("KOSPI", "KOSDAQ")
         }
     except Exception as exc:
-        logger.warning("[UNIVERSE][KRX_ASOF][FAIL] requested=%s reason=%s", as_of_date, exc)
-        return None, f"krx_asof_failed:{exc}"
+        logger.warning("[UNIVERSE][KIS_MASTER][FAIL] requested=%s reason=%s", as_of_date, exc)
+        return None, f"kis_master_failed:{exc}"
 
     combined = rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]
     if len(combined) != sum(TARGETS.values()):
-        return None, f"krx_asof_insufficient total={len(combined)}"
+        return None, f"kis_master_insufficient total={len(combined)}"
+    publications = {item.get("source_published_on") for item in combined}
+    if len(publications) != 1 or None in publications:
+        return None, "kis_master_publication_dates_inconsistent"
+    if any(not item.get("source_sha256") for item in combined):
+        return None, "kis_master_file_checksum_missing"
     codes = [item["code"] for item in combined]
     if len(set(codes)) != len(codes):
-        return None, "krx_asof_cross_market_duplicate"
+        return None, "kis_master_cross_market_duplicate"
     for market, rows in rows_by_market.items():
         if any(row.get("market") != market or row.get("actual_as_of") != as_of_date for row in rows):
-            return None, f"krx_asof_metadata_mismatch market={market}"
+            return None, f"kis_master_metadata_mismatch market={market}"
 
     selected_by_market = {
         market: [
@@ -622,6 +627,8 @@ def _build_from_krx_asof(
                 "name": item.get("name"),
                 "market_cap": item["market_cap"],
                 "actual_as_of": item["actual_as_of"],
+                "source_published_on": item["source_published_on"],
+                "source_sha256": item["source_sha256"],
             }
             for rank, item in enumerate(rows, 1)
         ]
@@ -631,14 +638,16 @@ def _build_from_krx_asof(
     payload = _normalize_payload({
         "selected": codes, "selected_by_market": selected_by_market,
     })
-    logger.info("[UNIVERSE][KRX_ASOF][COMPLETE] as_of=%s kospi=%d kosdaq=%d",
+    logger.info("[UNIVERSE][KIS_MASTER][COMPLETE] as_of=%s kospi=%d kosdaq=%d",
                 as_of_date, len(rows_by_market["KOSPI"]), len(rows_by_market["KOSDAQ"]))
     return {
-        "payload": payload, "members": members, "source": "krx_marketcap_asof",
+        "payload": payload, "members": members, "source": "kis_master_marketcap",
         "params": {
             "actual_as_of": as_of_date,
+            "source_published_on": next(iter(publications)),
+            "source_sha256_by_market": {m: rows[0]["source_sha256"] for m, rows in rows_by_market.items()},
             "requested_as_of": as_of_date,
-            "provider_contract": "dated_krx_no_rollback",
+            "provider_contract": "kis_daily_morning_master",
             "targets": dict(TARGETS),
         },
     }, "krx_marketcap_asof"
@@ -696,8 +705,8 @@ def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict |
 
 def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None, *, prep_recovery: bool = False) -> list[dict]:
     # Reject undated providers before opening DB connections or causing side effects.
-    if prep_recovery and provider_override not in (None, "krx_marketcap_asof"):
-        raise ValueError("PREP requires exact-date KRX provider; undated override rejected")
+    if prep_recovery and provider_override not in (None, "kis_master_marketcap"):
+        raise ValueError("PREP requires verified KIS morning master provider; undated override rejected")
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
@@ -733,7 +742,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     payload: dict | None = None
     members: list[dict] = []
-    source = "krx_marketcap_asof" if prep_recovery else (provider_override or DEFAULT_PROVIDER)
+    source = "kis_master_marketcap" if prep_recovery else (provider_override or DEFAULT_PROVIDER)
     params: dict = {"as_of": as_of_date}
     last_reason: str | None = None
 
@@ -756,7 +765,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     # PREP must not backdate KIS's undated 30-row current ranking or unversioned
     # static seeds. Preserve the existing KIS chain for non-PREP consumers.
-    allowed_chain = ["krx_marketcap_asof"] if prep_recovery else providers_for_env(env)
+    allowed_chain = ["kis_master_marketcap"] if prep_recovery else providers_for_env(env)
     if provider_override:
         if provider_override not in allowed_chain:
             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
@@ -794,8 +803,8 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             provider_name,
         )
 
-        if provider_name == "krx_marketcap_asof":
-            result, reason = _build_from_krx_asof(KRXAsOfMarketcapProvider(), as_of_date)
+        if provider_name == "kis_master_marketcap":
+            result, reason = _build_from_kis_master(KISMasterMarketcapProvider(), as_of_date)
         elif provider_name == "kis_marketcap_top":
             if not kis_provider:
                 reason = last_reason or "kis_provider_unavailable"
@@ -888,10 +897,10 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
 
     if prep_recovery and members and len(members) < max(100, int(os.getenv("UNIVERSE_PREP_VERIFIED_DB_MIN_MEMBERS", "100"))):
         logger.error(
-            "[UNIVERSE][KRX_ASOF][QUALITY_FAIL] after_sanitize=%d min=100 action=FAIL_CLOSED",
+            "[UNIVERSE][KIS_MASTER][QUALITY_FAIL] after_sanitize=%d min=100 action=FAIL_CLOSED",
             len(members),
         )
-        last_reason = "krx_asof_insufficient_after_sanitize"
+        last_reason = "kis_master_insufficient_after_sanitize"
         members = []
 
     if not members:
