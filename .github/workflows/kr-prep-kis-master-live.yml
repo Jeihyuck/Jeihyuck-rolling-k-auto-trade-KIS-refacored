@@ -1,0 +1,43 @@
+name: KR PREP KIS Master Live Readonly Acceptance
+
+on:
+  pull_request:
+    branches:
+      - dual-agent
+    paths:
+      - 'trader/universe/providers/kis_master_marketcap.py'
+      - 'trader/universe/build.py'
+      - 'trader/prep_runner.py'
+      - 'tests/kr/test_kr_prep_asof_provider_20261013.py'
+      - 'scripts/wsl/verify-kis-master-readonly.sh'
+      - '.github/workflows/kr-prep-kis-master-live.yml'
+
+jobs:
+  kis-master-150-plus-150:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      DRY_RUN: '1'
+      ALLOW_REAL_ORDER: '0'
+      KIS_ORDER_ALLOWED: '0'
+      PB1_KIS_ORDER_ALLOWED: '0'
+      US_KIS_ORDER_ALLOWED: '0'
+      KIS_HTTP_BLOCK: '1'
+      PYTHONPATH: '.'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install KIS master parser dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify shell and KIS provider module
+        run: |
+          bash -n scripts/wsl/verify-kis-master-readonly.sh
+          python -m py_compile trader/universe/providers/kis_master_marketcap.py
+      - name: Run KIS provider isolated regressions
+        run: python -m pytest -q tests/kr/test_kr_prep_asof_provider_20261013.py
+      - name: Fetch real KIS KOSPI and KOSDAQ masters (read only)
+        run: bash scripts/wsl/verify-kis-master-readonly.sh
