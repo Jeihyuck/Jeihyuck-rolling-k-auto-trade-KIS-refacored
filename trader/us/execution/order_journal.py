@@ -80,10 +80,15 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
     for field in ("exchange", "market", "account_id", "account_key", "cano"):
         local = recorded(field)
         actual = row.get(field)
-        if actual in (None, "") and field in {"market", "account_id", "account_key", "cano"}:
+        if actual in (None, "") and field == "market":
             if not scoped:
                 return False
-            actual = ctx.get("account_id" if field in {"account_id", "account_key", "cano"} else field)
+            actual = ctx["market"]
+        elif actual in (None, "") and field == "account_id" and scoped:
+            actual = ctx["account_id"]
+        # Optional alias fields are NOT an independent requirement for a
+        # scoped lookup when KIS explicitly supplied another account field.
+        # The mandatory account proof is checked once below.
         if actual in (None, ""):
             continue
         if local not in (None, ""):
