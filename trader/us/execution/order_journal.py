@@ -12,7 +12,7 @@ from typing import Any
 
 def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: str,
                               requested_qty: int, source_trade_date: str,
-                              journal_event: dict) -> bool:
+                              journal_event: dict, lookup_context: dict | None = None) -> bool:
     """Use a memoized KIS order only when its complete available identity agrees.
 
     Rows lacking original requested quantity are NOT suitable for fast-path
@@ -56,6 +56,13 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
             return False
 
     metadata = journal_event.get("meta") if isinstance(journal_event.get("meta"), dict) else {}
+    ctx = lookup_context or {}
+    scoped = (ctx.get("verified") is True
+              and ctx.get("source") == "kis_authenticated_order_book"
+              and str(ctx.get("query_trade_date") or "").replace("-", "")
+                  == str(source_trade_date).replace("-", "")
+              and str(ctx.get("market") or "").upper() == "US"
+              and bool(ctx.get("account_id")))
     def recorded(key):
         return journal_event.get(key) or metadata.get(key)
 
@@ -71,13 +78,30 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
                   "trading_epoch_id", "strategy_owner"):
         local = recorded(field)
         actual = row.get(field)
-        if local in (None, "") or actual in (None, ""):
-            continue
-        if field == "exchange":
-            if exchange_name(local) != exchange_name(actual):
+        if actual in (None, "") and field in {
+                "market", "session", "session_run_id", "session_generation",
+                "account_id", "account_key", "cano", "trading_epoch_id"}:
+            # A KIS row cannot claim a session or account implicitly. The
+            # authenticated account+date lookup and a bound session can fill
+            # the gap, but never a guessed context or unrelated tick.
+            if not scoped:
                 return False
-        elif str(local).upper() != str(actual).upper():
-            return False
+            aliases = {"account_key": "account_id", "cano": "account_id"}
+            actual = ctx.get(aliases.get(field, field))
+            if actual in (None, ""):
+                if local not in (None, ""):
+                    return False
+                continue
+        if actual in (None, ""):
+            continue
+        if local not in (None, ""):
+            if field == "exchange":
+                if exchange_name(local) != exchange_name(actual):
+                    return False
+            elif str(local).upper() != str(actual).upper():
+                return False
+    if row.get("trade_date") in (None, "") and not scoped:
+        return False
 
     expected_date = str(source_trade_date).replace("-", "")
     explicit_us_date = row.get("us_trade_date") or row.get("original_us_trade_date")
@@ -444,6 +468,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     # This memo never survives a replay/tick, so genuine later broker fills
     # are rediscovered on the next fresh invocation.
     orders_by_trade_date: dict[str, list[dict] | None] = {}
+    source_scope_by_trade_date: dict[str, dict] = {}
     fills_by_trade_date: dict[str, list[dict] | None] = {}
 
     def orders_for_trade_date(source_trade_date: str) -> list[dict] | None:
@@ -452,6 +477,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 method = getattr(provider, "get_today_orders", None)
                 rows = method(trade_date=source_trade_date) if callable(method) else None
                 orders_by_trade_date[source_trade_date] = rows if isinstance(rows, list) else None
+                provenance = getattr(provider, "get_order_lookup_provenance", None)
+                scope = provenance(source_trade_date) if callable(provenance) else {}
+                source_scope_by_trade_date[source_trade_date] = scope if isinstance(scope, dict) else {}
             except Exception:
                 orders_by_trade_date[source_trade_date] = None
         return orders_by_trade_date[source_trade_date]
@@ -532,6 +560,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                             row, order_no=order_no, symbol=symbol, side=side,
                             requested_qty=requested, source_trade_date=event_trade_date,
                             journal_event=latest,
+                            lookup_context=source_scope_by_trade_date.get(event_trade_date),
                         )
                     ]
                     if matches:
@@ -565,6 +594,26 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                             unresolved_symbol_sides.append([symbol, side])
                             append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
                             continue
+                # Direct per-order broker lookup is allowed only if no returned
+                # explicit identity contradicts the durable submitted action.
+                # Missing fields remain the KIS API call's scoped contract;
+                # conflicting fields are NEVER silently accepted as a fallback.
+                if isinstance(broker_fill, dict):
+                    from trader.us.utils.order_no import normalize_us_order_no
+                    detail_no = broker_fill.get("order_no") or broker_fill.get("raw_order_no")
+                    detail_qty = next((broker_fill.get(k) for k in
+                                       ("requested_qty", "qty_requested", "ord_qty")
+                                       if broker_fill.get(k) not in (None, "")), None)
+                    try:
+                        qty_conflict = detail_qty is not None and float(detail_qty) != requested
+                    except (TypeError, ValueError):
+                        qty_conflict = True
+                    if (qty_conflict
+                        or (detail_no and normalize_us_order_no(detail_no) != normalize_us_order_no(order_no))
+                        or (broker_fill.get("symbol") and str(broker_fill["symbol"]).upper() != symbol)
+                        or (broker_fill.get("side") and str(broker_fill["side"]).upper() != side)):
+                        broker_fill = {"status": "EVIDENCE_IDENTITY_CONFLICT",
+                                       "symbol": symbol, "side": side}
                 if not broker_fill and isinstance(event_fills, list):
                     matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
                     if matched:
@@ -585,6 +634,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             ).upper()
             if broker_fill_status in {
                 "EVIDENCE_QUANTITY_REGRESSION",
+                "EVIDENCE_IDENTITY_CONFLICT",
                 "EVIDENCE_QUANTITY_CONFLICT",
                 "EVIDENCE_QUANTITY_OVERFLOW",
                 "FILL_ACCOUNTING_INVARIANT_FAILED",
@@ -659,6 +709,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     o, order_no=order_no, symbol=symbol, side=side,
                     requested_qty=requested, source_trade_date=event_trade_date,
                     journal_event=latest,
+                    lookup_context=source_scope_by_trade_date.get(event_trade_date),
                 )), None)
                 if broker_order:
                     broker_symbol=str(broker_order.get("symbol") or broker_order.get("pdno") or symbol).upper()
