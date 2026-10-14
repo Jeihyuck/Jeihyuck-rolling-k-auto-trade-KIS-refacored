@@ -21,13 +21,13 @@ def members(count=150):
     ]
 
 
-def snapshot(rows, *, actual_as_of=AS_OF, provider="krx_marketcap_asof"):
+def snapshot(rows, *, actual_as_of=AS_OF, provider="kis_master_marketcap"):
     return {
         "status": "SUCCESS",
         "as_of": AS_OF,
         "actual_as_of": actual_as_of,
         "provider": provider,
-        "run_id": "committed-krx-universe",
+        "run_id": "committed-kis-master-universe",
         "members": list(rows),
     }
 
@@ -100,7 +100,7 @@ def test_duplicate_in_existing_same_day_snapshot_forces_verified_rebuild(monkeyp
 
 
 @pytest.mark.parametrize("actual_as_of,provider", [
-    ("2026-10-12", "krx_marketcap_asof"),
+    ("2026-10-12", "kis_master_marketcap"),
     ("2026-10-13", "kis_marketcap_top"),
 ])
 def test_post_build_invalid_committed_provenance_fails_closed(monkeypatch, actual_as_of, provider):
