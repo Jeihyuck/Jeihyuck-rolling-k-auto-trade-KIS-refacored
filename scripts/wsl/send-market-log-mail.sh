@@ -277,6 +277,58 @@ else
   evidence_groups=("reports/us_daily/$TRADE_DATE" "reports/us_prep/$TRADE_DATE" "runtime/us/session_state/$TRADE_DATE" "runtime/us/watchlist/$TRADE_DATE" "reports/us_schedule_health/$TRADE_DATE.json")
 fi
 
+# Mail completeness must reflect the *current trade-date* PREP contract, not
+# merely the existence of a historical Final30 file. This is report-only:
+# missing/failed PREP never grants BUY permission and never blocks log delivery.
+if [[ "$MARKET" == kr ]]; then
+  kr_contract="runtime/kr/watchlist/$TRADE_DATE/prep_contract.json"
+  if [[ ! -f "$kr_contract" ]]; then
+    record_missing KR_PREP_CONTRACT_MISSING "$kr_contract"
+  else
+    kr_contract_result="$(python3 - "$kr_contract" "$TRADE_DATE" <<'PY_KR_CONTRACT'
+import json, re, sys
+from pathlib import Path
+path, trade_date = Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('not_object')
+    if str(data.get('trade_date') or '')[:10] != trade_date:
+        result = 'TRADE_DATE_MISMATCH'
+    elif data.get('contract_ok') is not True or data.get('trade_can_proceed') is not True:
+        result = 'CONTRACT_NOT_READY'
+    elif int(data.get('final30_rows') or data.get('final30_scored_rows') or 0) != 30:
+        result = 'FINAL30_ROWS_INVALID'
+    else:
+        result = 'OK'
+except Exception:
+    result = 'UNREADABLE'
+print(result)
+PY_KR_CONTRACT
+)" || kr_contract_result="UNREADABLE"
+    if [[ "$kr_contract_result" != OK ]]; then
+      record_missing "KR_PREP_${kr_contract_result}" "$kr_contract"
+    fi
+  fi
+  kr_prep_summary="reports/kr_prep/$TRADE_DATE/kr_prep_summary.json"
+  if [[ -f "$kr_prep_summary" ]]; then
+    kr_summary_status="$(python3 - "$kr_prep_summary" <<'PY_KR_SUMMARY'
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    status = str(data.get('status') or '').strip().upper()
+    print('OK' if status == 'OK' else 'NOT_OK')
+except Exception:
+    print('UNREADABLE')
+PY_KR_SUMMARY
+)" || kr_summary_status="UNREADABLE"
+    if [[ "$kr_summary_status" != OK ]]; then
+      record_missing "KR_PREP_SUMMARY_${kr_summary_status}" "$kr_prep_summary"
+    fi
+  fi
+fi
+
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
