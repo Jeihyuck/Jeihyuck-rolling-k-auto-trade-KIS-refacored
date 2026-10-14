@@ -543,6 +543,23 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         attempt = str(event.get("submit_attempt_id") or "").strip()
         if key:
             grouped.setdefault((key, attempt), []).append(event)
+    # us_orders is one row per client_order_key. If a broken retry
+    # produced two distinct real KIS order numbers under one key, attempting
+    # save_order_ack for both would overwrite broker identity. Preserve each
+    # proof in the immutable journal and retain the claim fence instead.
+    by_client_key: dict[str, set[str]] = {}
+    for (client_key, _attempt), attempt_events in grouped.items():
+        from trader.us.utils.order_no import normalize_us_order_no
+        broker_numbers = {
+            normalize_us_order_no(e.get("broker_order_no"))
+            for e in attempt_events
+            if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}
+            and e.get("broker_order_no")
+        }
+        by_client_key.setdefault(client_key, set()).update(broker_numbers)
+    conflicting_client_keys = {
+        key for key, order_nos in by_client_key.items() if len(order_nos) > 1
+    }
     counts = {"db_ack_restored_count": 0, "broker_full_fill_count": 0,
               "broker_partial_fill_count": 0, "broker_unfilled_ack_count": 0,
               "broker_rejected_count": 0, "broker_unknown_count": 0,
@@ -631,6 +648,31 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         # Later ORDER_OPEN/REPLAY snapshots may have empty original session,
         # generation=0 or qty=0. They cannot overwrite submitted identity.
         latest = submitted
+        if key in conflicting_client_keys:
+            # The broker may have filled an older attempt after the newer
+            # submit. Never rewrite the one-key DB row with either order no.
+            # Store observed broker evidence per attempt, keep fencing, and
+            # allow the independent fill-ingestion path to attribute it.
+            broker_nos = sorted(by_client_key.get(key) or ())
+            rows = orders_for_trade_date(str(latest.get("trade_date") or trade_date)) if provider else None
+            for row in (rows or []):
+                if normalize_us_order_no(row.get("order_no") or row.get("raw_order_no")) in broker_nos:
+                    append_order_event(
+                        "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE", latest,
+                        broker_order_no=str(row.get("raw_order_no") or row.get("order_no") or ""),
+                        broker_status=str(row.get("status") or "UNKNOWN"),
+                        raw_response=row,
+                    )
+            counts["broker_unknown_count"] += 1
+            unresolved_symbol_sides.append([str(latest.get("symbol") or "").upper(),
+                                            str(latest.get("side") or "").upper()])
+            append_order_event(
+                "JOURNAL_REPLAY_UNRESOLVED", latest,
+                broker_status="MULTIPLE_BROKER_ORDERS_SAME_CLIENT_KEY",
+                raw_response={"broker_order_numbers": broker_nos,
+                              "reason": "us_orders_one_key_identity_collision"},
+            )
+            continue
         event_trade_date = str(latest.get("trade_date") or trade_date)
         event_orders = today_orders
         event_fills = all_fills
