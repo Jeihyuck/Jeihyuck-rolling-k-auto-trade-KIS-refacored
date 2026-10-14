@@ -72,6 +72,11 @@ def test_verified_db_fallback_rejects_stale_unverified_and_small(monkeypatch):
         _snapshot(provider="emergency_seed"),
         _snapshot(provider="kis_marketcap_top"),
         _snapshot(actual_as_of="2026-10-07"),
+        _snapshot(build_reason=None),  # old success has no durable file evidence
+        _snapshot(build_reason="kis_master_v1|published=2026-10-12|KOSPI=bad|KOSDAQ=bad"),
+        _snapshot(build_reason=_snapshot()["build_reason"].replace(
+            "published=2026-10-12", "published=2026-10-13"
+        )),  # mismatched publication/previous trading session
         _snapshot(members=_members(20)),
         _snapshot(members=[*(_members(194)), {"code": "999999", "market": ""}]),
         _snapshot(members=[*(_members(194)), _members()[0]]),
