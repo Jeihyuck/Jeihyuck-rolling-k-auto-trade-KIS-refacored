@@ -211,6 +211,7 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                             run_id=str(child_kwargs.get("session_run_id") or ""),
                             pid=pid, reason="child_alive_after_parent_shutdown",
                             env=str(child_kwargs.get("env") or ""),
+                            account_scope=child_kwargs.get("child_fence_account_scope"),
                         )
                     except Exception:
                         # The session runner independently catches this typed
