@@ -1265,6 +1265,13 @@ def repair_final30_effective_caps(
         out.pop(drop)
         search_diagnostics["forced_deletions"] += 1
 
+    # Repair may have deleted offenders AFTER the first joint-search (which
+    # could have had zero free slots). Search the NEW roster with the actual
+    # remaining capacity before diagnosing underfill; this also permits a
+    # jointly cap-clean refill that cannot be reached one candidate at a time.
+    if len(out) < finaln:
+        fill_before_swap_or_drop()
+
     if not effective_final30_cap_violations(out, constraints, rotation_regime):
         seen = {str(row.get("symbol") or "") for row in out}
         # Revisit every previously blocked candidate after ANY successful
@@ -1304,11 +1311,14 @@ def repair_final30_effective_caps(
                 reject("would_exceed_etf_cap")
             else:
                 reject("not_selected_after_repair")
+    present_symbols = {str(row.get("symbol") or "").upper() for row in out}
     unique_remaining = {
         str(row.get("symbol") or "").upper() for row in pool
-        if str(row.get("symbol") or "").upper() not in
-           {str(current.get("symbol") or "").upper() for current in out}
+        if str(row.get("symbol") or "").upper() not in present_symbols
     }
+    # A zero-candidate joint search is still an exhausted supply, not an
+    # unexplored possible combination. No search result is inferred from the
+    # original roster's cardinality after a forced deletion.
     needed = max(0, finaln - len(out))
     if remaining:
         failure_reason = "no_cap_safe_roster"
