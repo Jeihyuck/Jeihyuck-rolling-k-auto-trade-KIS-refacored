@@ -114,6 +114,52 @@ def test_kr_mail_accepts_runtime_watchlist_final30_without_ledger(tmp_path):
     assert "[LOG_MAIL][DRY_RUN]" in result.stdout
 
 
+def test_standalone_redactor_masks_krx_credentials(tmp_path):
+    """Real archive redactor must not leak KRX data-source login details."""
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "krx.log").write_text(
+        "KRX_ID=id-sensitive-123 KRX_PW=pw-sensitive-456 "
+        "KRX_API_KEY=key-sensitive-789\\n", encoding="utf-8")
+    (stage / "evidence.json").write_text(json.dumps({
+        "KRX_ID": "id-sensitive-123", "KRX_PW": "pw-sensitive-456",
+        "KRX_API_KEY": "key-sensitive-789"}), encoding="utf-8")
+    result = subprocess.run(
+        [os.sys.executable, str(ROOT / "scripts/wsl/redact-log-archive.py"), str(stage)],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "id-sensitive-123" not in (stage / "krx.log").read_text()
+    assert "pw-sensitive-456" not in (stage / "krx.log").read_text()
+    assert "key-sensitive-789" not in (stage / "krx.log").read_text()
+    payload = json.loads((stage / "evidence.json").read_text())
+    assert payload == {
+        "KRX_ID": "[REDACTED]", "KRX_PW": "[REDACTED]",
+        "KRX_API_KEY": "[REDACTED]",
+    }
+
+
+def test_kr_mail_embedded_redactor_masks_krx_credentials(tmp_path):
+    """Packaged email fallback redactor must apply the same secret controls."""
+    root = fixture_repo(tmp_path, "kr")
+    evidence = root / f"runtime/logs/kr/{DATE}/prep/attempt-1.log"
+    evidence.write_text(
+        "KRX_ID=credential-id-one KRX_PW=credential-pass-two "
+        "KRX_API_KEY=credential-key-three\\n", encoding="utf-8")
+    result, archive = run_mail(root, "kr")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        logs = b"".join(
+            tf.extractfile(name).read()
+            for name in tf.getnames()
+            if name.endswith(".log")
+        )
+        assert b"credential-id-one" not in logs
+        assert b"credential-pass-two" not in logs
+        assert b"credential-key-three" not in logs
+        assert b"KRX_ID=[REDACTED]" in logs
+
+
 def test_kr_mail_complete_prep_integer_gate_is_not_degraded(tmp_path):
     """Real PREP producer writes trade_can_proceed=1, not the bool True."""
     root = fixture_repo(tmp_path, "kr", smtp_mode="success")
