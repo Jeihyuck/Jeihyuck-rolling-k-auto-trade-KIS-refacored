@@ -132,6 +132,66 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
     return True
 
 
+
+def _replay_detail_identity_conflicts(row: dict, *, order_no: str, symbol: str,
+                                      side: str, requested_qty: int,
+                                      source_trade_date: str, journal_event: dict,
+                                      lookup_context: dict | None) -> bool:
+    """Reject any explicit broker detail contradicting journal or scoped lookup."""
+    from trader.us.utils.order_no import normalize_us_order_no
+    if not isinstance(row, dict):
+        return True
+    metadata = journal_event.get("meta") if isinstance(journal_event.get("meta"), dict) else {}
+    context = lookup_context or {}
+    for key, target in (("order_no", normalize_us_order_no(order_no)),
+                        ("raw_order_no", normalize_us_order_no(order_no))):
+        value = row.get(key)
+        if value and normalize_us_order_no(value) != target:
+            return True
+    if (row.get("symbol") and str(row["symbol"]).upper() != symbol
+            or row.get("side") and str(row["side"]).upper() != side):
+        return True
+    for key in ("requested_qty", "qty_requested", "ord_qty", "ft_ord_qty"):
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                if float(value) != requested_qty:
+                    return True
+            except (TypeError, ValueError):
+                return True
+            break
+    for key in ("account_id", "account_key", "cano", "market", "session",
+                "session_run_id", "session_generation", "trading_epoch_id",
+                "strategy_owner", "exchange"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        expected = journal_event.get(key) or metadata.get(key)
+        if expected in (None, ""):
+            expected = context.get("account_id" if key in {"account_id", "account_key", "cano"} else key)
+        if expected not in (None, ""):
+            lhs, rhs = str(value).upper(), str(expected).upper()
+            if key == "exchange":
+                aliases = {"NASD": "NASDAQ", "NAS": "NASDAQ", "AMS": "AMEX"}
+                lhs, rhs = aliases.get(lhs, lhs), aliases.get(rhs, rhs)
+            if lhs != rhs:
+                return True
+    us_date = row.get("us_trade_date") or row.get("original_us_trade_date")
+    if us_date and str(us_date).replace("-", "") != str(source_trade_date).replace("-", ""):
+        return True
+    broker_date = row.get("trade_date")
+    if broker_date:
+        try:
+            base = datetime.strptime(str(source_trade_date).replace("-", ""), "%Y%m%d")
+            valid_dates = {base.strftime("%Y%m%d"),
+                           (base + timedelta(days=1)).strftime("%Y%m%d")}
+            if str(broker_date).replace("-", "") not in valid_dates:
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 def journal_path(trade_date: str) -> Path:
     root = Path(os.getenv("US_ORDER_JOURNAL_DIR", "runtime/us/order_journal"))
     return root / f"{trade_date}.jsonl"
@@ -608,24 +668,23 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 # explicit identity contradicts the durable submitted action.
                 # Missing fields remain the KIS API call's scoped contract;
                 # conflicting fields are NEVER silently accepted as a fallback.
-                if isinstance(broker_fill, dict):
-                    from trader.us.utils.order_no import normalize_us_order_no
-                    detail_no = broker_fill.get("order_no") or broker_fill.get("raw_order_no")
-                    detail_qty = next((broker_fill.get(k) for k in
-                                       ("requested_qty", "qty_requested", "ord_qty")
-                                       if broker_fill.get(k) not in (None, "")), None)
-                    try:
-                        qty_conflict = detail_qty is not None and float(detail_qty) != requested
-                    except (TypeError, ValueError):
-                        qty_conflict = True
-                    if (qty_conflict
-                        or (detail_no and normalize_us_order_no(detail_no) != normalize_us_order_no(order_no))
-                        or (broker_fill.get("symbol") and str(broker_fill["symbol"]).upper() != symbol)
-                        or (broker_fill.get("side") and str(broker_fill["side"]).upper() != side)):
-                        broker_fill = {"status": "EVIDENCE_IDENTITY_CONFLICT",
-                                       "symbol": symbol, "side": side}
+                if (isinstance(broker_fill, dict)
+                        and _replay_detail_identity_conflicts(
+                            broker_fill, order_no=order_no, symbol=symbol,
+                            side=side, requested_qty=requested,
+                            source_trade_date=event_trade_date,
+                            journal_event=latest,
+                            lookup_context=source_scope_by_trade_date.get(event_trade_date),
+                        )):
+                    broker_fill = {"status": "EVIDENCE_IDENTITY_CONFLICT",
+                                   "symbol": symbol, "side": side}
                 if not broker_fill and isinstance(event_fills, list):
-                    matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
+                    matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side and not _replay_detail_identity_conflicts(
+                        f, order_no=order_no, symbol=symbol, side=side,
+                        requested_qty=requested, source_trade_date=event_trade_date,
+                        journal_event=latest,
+                        lookup_context=source_scope_by_trade_date.get(event_trade_date),
+                    )]
                     if matched:
                         def _cum(row):
                             return int(row.get("cumulative_filled_qty") or row.get("filled_qty") or row.get("qty") or 0)
