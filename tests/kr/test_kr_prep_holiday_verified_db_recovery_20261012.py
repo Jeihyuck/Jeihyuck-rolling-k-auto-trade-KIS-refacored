@@ -31,7 +31,7 @@ def _snapshot(**changes) -> dict:
     result = {
         "status": "SUCCESS",
         "as_of": AS_OF,
-        "provider": "krx_marketcap_asof",
+        "provider": "kis_master_marketcap",
         "actual_as_of": AS_OF,
         "run_id": "previous-verified-run",
         "members": _members(),
