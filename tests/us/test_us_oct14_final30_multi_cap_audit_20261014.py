@@ -70,3 +70,21 @@ def test_invalid_replacements_report_exact_rejection_reasons_and_underfill():
     assert audit["replacement_rejection_reasons"]["not_permitted_core_etf"] == 1
     assert audit["replacement_search"]["forced_deletions"] > 0
     assert effective_final30_cap_violations(result, caps, "NEUTRAL") == []
+
+
+def test_pool_iteration_order_cannot_force_unnecessary_deletion():
+    import random
+
+    rows = _rows()
+    caps = {"max_ai_tech_ratio": 0.20, "max_single_cluster_ratio": 0.20}
+    replacement = [
+        {"symbol": "SAFE_STAPLE", "theme_cluster": "CONSUMER_STAPLES", "score_final": 0.5},
+        {"symbol": "SAFE_OTHER", "theme_cluster": "OTHER", "score_final": 0.4},
+    ]
+    for seed in range(20):
+        pool = rows + replacement
+        random.Random(seed).shuffle(pool)
+        result, audit = repair_final30_effective_caps(rows, pool, caps, 25, "NEUTRAL")
+        assert len(result) == 25, (seed, audit)
+        assert audit["cap_violations"] == [], (seed, audit)
+        assert audit["replacement_search"]["forced_deletions"] == 0, (seed, audit)
