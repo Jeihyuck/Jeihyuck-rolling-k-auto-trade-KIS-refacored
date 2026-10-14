@@ -2308,6 +2308,7 @@ class UniverseRepo:
                 self._schema.universe_runs.c.provider,
                 self._schema.universe_runs.c.status,
                 self._schema.universe_runs.c.actual_as_of,
+                self._schema.universe_runs.c.build_reason,
             )
             .where(
                 self._schema.universe_runs.c.strategy == strategy_key,
@@ -2332,6 +2333,7 @@ class UniverseRepo:
                     "provider": row["provider"],
                     "status": row["status"],
                     "actual_as_of": str(row["actual_as_of"]) if row["actual_as_of"] else None,
+                    "build_reason": row["build_reason"],
                     "members_count": len(members),
                     "members": members,
                 }
