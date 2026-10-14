@@ -21,11 +21,18 @@ def _meta():
 def _intent():
     return {"trade_date":"2026-08-04","client_order_key":"K1","submit_attempt_id":"A1",
             "symbol":"JPM","exchange":"NYSE","side":"SELL","qty":2,"limit_price":106,
+            "session":"am","session_run_id":"session-jpm","account_id":"practice-account",
             "position_lifecycle_id":"L1","submitted_at_utc":"2026-08-04T13:31:00+00:00",
             "meta":_meta()}
 
 
 class Provider:
+    def get_order_lookup_provenance(self, trade_date):
+        return {"verified": True, "source": "kis_authenticated_order_book",
+                "query_trade_date": trade_date, "market": "US",
+                "account_id": "practice-account", "session": "am",
+                "session_run_id": "session-jpm"}
+
     def __init__(self, rows, fill=None): self.rows=rows; self.fill=fill
     def get_balance(self, **kwargs): return {"positions":[]}
     def get_today_orders(self, trade_date): return self.rows

@@ -29,7 +29,15 @@ def test_timeout_replay_full_fill(tmp_path,monkeypatch):
 def test_timeout_replay_partial_fill(tmp_path,monkeypatch):
     import trader.us.db.repos as repos; repos.reset_memory_stores(); journal(tmp_path,monkeypatch); r=replay_order_journal('2026-07-16',tick_id='t',provider=Provider({'filled_qty':3,'avg_price':10,'symbol':'AMD','side':'SELL'})); assert r['broker_partial_fill_count']==1 and repos._MEM_ORDERS[0]['status']=='PARTIALLY_FILLED'
 def test_timeout_replay_unfilled_ack(tmp_path,monkeypatch):
-    journal(tmp_path,monkeypatch); p=Provider(orders=[{'order_no':'O1','symbol':'AMD','side':'SELL','status':'ACK'}]); r=replay_order_journal('2026-07-16',tick_id='t',provider=p); assert r['broker_unfilled_ack_count']==1 and r['status']=='OK'
+    # An ACK row with no original requested quantity is insufficient to
+    # confirm an order's identity or clear the reconciliation safety fence.
+    journal(tmp_path,monkeypatch)
+    p = Provider(orders=[{'order_no':'O1','symbol':'AMD','side':'SELL','status':'ACK'}])
+    r = replay_order_journal('2026-07-16',tick_id='t',provider=p)
+    assert r['broker_unfilled_ack_count'] == 0
+    assert r['broker_unknown_count'] == 1
+    assert r['status'] == 'UNRESOLVED'
+    assert ['AMD', 'SELL'] in r['unresolved_symbol_sides']
 def test_timeout_replay_submit_without_ack(tmp_path,monkeypatch):
     journal(tmp_path,monkeypatch,False); r=replay_order_journal('2026-07-16',tick_id='t',provider=Provider()); assert r['broker_unknown_count']==1
 def test_timeout_replay_identity_mismatch(tmp_path,monkeypatch):
