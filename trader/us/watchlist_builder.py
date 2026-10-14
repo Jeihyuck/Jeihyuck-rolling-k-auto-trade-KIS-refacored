@@ -11,6 +11,7 @@ Agent B: Strategy Entry Score
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -704,7 +705,10 @@ def build_us_watchlist(
             "risk_off_cap_warning": "entry_blocked_but_final30_preserved",
         }
     else:
-        final30, regime_cap_meta = enforce_regime_sector_caps(final30, sorted_broader, constraints, finaln)
+        # Keep the roster intact until replacement-first repair below. The
+        # legacy target-slot pass deletes candidates before trying a swap.
+        regime_cap_meta = {"sector_cap_enforced": True, "cap_violations": [],
+                           "blocked_by_cluster_cap": [], "sector_cap_replacements": []}
     fallback_meta["fallback_fill_used"] = bool(fallback_meta.get("fallback_fill_used") or etf_refill_meta.get("fallback_fill_used"))
     fallback_meta["fallback_fill_count"] = int(fallback_meta.get("fallback_fill_count") or 0) + int(etf_refill_meta.get("fallback_fill_count") or 0)
     fallback_meta["fallback_fill_cap_safe"] = bool(fallback_meta.get("fallback_fill_cap_safe", True) and etf_refill_meta.get("fallback_fill_cap_safe", True))
@@ -720,6 +724,7 @@ def build_us_watchlist(
         )
         regime_cap_meta["cap_violations"] = actual_cap_repair["cap_violations"]
         regime_cap_meta["cap_repair"] = actual_cap_repair
+        regime_cap_meta["sector_cap_replacements"] = actual_cap_repair["added"]
         regime_cap_meta["blocked_by_cluster_cap"] = list(dict.fromkeys(
             list(regime_cap_meta.get("blocked_by_cluster_cap") or [])
             + actual_cap_repair["dropped"]
@@ -1045,16 +1050,78 @@ def repair_final30_effective_caps(
     selected: list[dict], candidate_pool: list[dict], constraints: dict,
     finaln: int, rotation_regime: str, blocked_clusters: set[str] | None = None,
 ) -> tuple[list[dict], dict]:
-    """Replace/drop lowest-scored offenders; never loosen a concentration cap.
+    """Repair fixed-size rosters before removing a candidate or relaxing nothing.
 
-    A cap-clean 27-name Final30 is safer and more useful than a blocked 28-name
-    Final30. The existing PREP underfill tier/capital haircut still applies.
+    Pool rows have already passed the strategy admission stage. Never invent
+    scores or promote a blocked/zero-score/non-core ETF row to fill capacity.
+    Each swap strictly reduces integer cap excess, so repair cannot cycle.
     """
     out = list(selected)
     blocked_clusters = blocked_clusters or set()
     dropped: list[str] = []
     added: list[str] = []
+
+    def cluster(row):
+        return row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+
+    def eligible(row):
+        score = _safe_float(row.get("score_final"))
+        return bool(str(row.get("symbol") or "").strip() and math.isfinite(score)
+                    and score > 0 and cluster(row) not in blocked_clusters
+                    and not row.get("blocked_by_cluster_cap")
+                    and (not _is_etf_row(row) or str(row.get("symbol") or "").upper() in _CORE_ETFS))
+
+    pool = sorted((r for r in candidate_pool or [] if eligible(r)),
+                  key=lambda r: -float(r["score_final"]))
+
+    def excess(rows):
+        total = len(rows)
+        if not total:
+            return 1
+        counts = _cluster_counts(rows)
+        caps = cluster_caps_for_regime(rotation_regime)
+        ai_cap = min(float(constraints.get("max_ai_tech_ratio", 1)),
+                     float(caps.get("AI_TECH_COMBINED", caps.get("AI_COMBINED", 1))))
+        if rotation_regime == "AI_OFF_ROTATION":
+            ai_cap = min(ai_cap, 0.50)
+        single_cap = min(float(constraints.get("max_single_cluster_ratio", 1)),
+                         float(caps.get("SINGLE_CLUSTER", 1)))
+        capacity = math.floor(single_cap * total + 1e-9)
+        value = sum(max(0, n - capacity) for n in counts.values())
+        value += max(0, sum(counts.get(c, 0) for c in AI_CLUSTERS)
+                     - math.floor(ai_cap * total + 1e-9))
+        if rotation_regime == "AI_OFF_ROTATION":
+            value += max(0, counts.get("AI_SEMI", 0) - 3)
+            value += max(0, counts.get("MEGA_TECH", 0) - 2)
+        value += max(0, sum(_is_etf_row(r) for r in rows) - _MAX_ETF_IN_FINAL30)
+        return value
+
+    def replace_before_drop():
+        while effective_final30_cap_violations(out, constraints, rotation_regime):
+            before = excess(out)
+            used = {str(r.get("symbol") or "").upper() for r in out}
+            best = None
+            # Lowest-score removal first; replacements keep pool score order.
+            for idx in sorted(range(len(out)), key=lambda i: float(out[i].get("score_final") or 0)):
+                for row in pool:
+                    if str(row["symbol"]).upper() in used:
+                        continue
+                    trial = out[:idx] + [row] + out[idx + 1:]
+                    after = excess(trial)
+                    if after >= before:
+                        continue
+                    key = (after, float(out[idx].get("score_final") or 0), -float(row["score_final"]))
+                    if best is None or key < best[0]:
+                        best = (key, idx, row)
+            if best is None:
+                break
+            _, idx, row = best
+            dropped.append(str(out[idx].get("symbol") or ""))
+            added.append(str(row["symbol"]))
+            out[idx] = row
+
     for _ in range(len(out)):
+        replace_before_drop()
         violations = effective_final30_cap_violations(out, constraints, rotation_regime)
         if not violations:
             break
@@ -1085,7 +1152,7 @@ def repair_final30_effective_caps(
 
     if not effective_final30_cap_violations(out, constraints, rotation_regime):
         seen = {str(row.get("symbol") or "") for row in out}
-        for row in sorted(candidate_pool or [], key=lambda r: float(r.get("score_final") or 0), reverse=True):
+        for row in pool:
             if len(out) >= finaln:
                 break
             sym = str(row.get("symbol") or "")
@@ -1093,6 +1160,8 @@ def repair_final30_effective_caps(
             if not sym or sym in seen or cluster in blocked_clusters:
                 continue
             if effective_final30_cap_violations(out + [row], constraints, rotation_regime):
+                continue
+            if sum(_is_etf_row(r) for r in out + [row]) > _MAX_ETF_IN_FINAL30:
                 continue
             out.append(row)
             seen.add(sym)
@@ -1104,6 +1173,8 @@ def repair_final30_effective_caps(
         "cap_violations": remaining,
         "cluster_contract_ok": not remaining,
         "actual_final30_count": len(out),
+        "repair_failure_reason": ("no_cap_safe_roster" if remaining else
+                                  "qualified_replacement_pool_exhausted" if len(out) < len(selected) else ""),
     }
 
 
