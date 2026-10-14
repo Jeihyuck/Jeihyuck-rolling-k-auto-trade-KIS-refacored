@@ -186,3 +186,99 @@ def test_historical_order_is_not_falsely_rejected_by_current_session(proof):
         requested_qty=2, source_trade_date="2026-10-13",
         journal_event=immutable, lookup_context=context,
     )
+
+
+def test_broker_raw_cano_and_hashed_claim_identity_agree_in_both_paths():
+    """Same account => memo + detail agree; other account/env/product => deny."""
+    import hashlib
+    from trader.account_state import get_account_key
+    from trader.us.execution.order_journal import _replay_detail_identity_conflicts
+    cano, product = "12345678", "01"
+    def scope(env="practice", c=cano, p=product):
+        digest = hashlib.sha256(get_account_key(env=env, cano=c, product_code=p).encode()).hexdigest()
+        return {"verified": True, "source": "kis_authenticated_order_book",
+                "query_trade_date": "2026-10-13", "market": "US",
+                "broker_account_no": c, "account_id": digest,
+                "account_product_code": p, "env": env}
+    valid = scope()
+    journal = {"symbol": "MCK", "side": "SELL", "exchange": "NASDAQ",
+               "account_id": valid["account_id"], "market": "US",
+               "session": "am", "submit_attempt_id": "attempt-1",
+               "trade_date": "2026-10-13", "qty": 2}
+    row = {"order_no": "0000043251", "symbol": "MCK", "side": "SELL",
+           "exchange": "NASD", "account_id": cano, "requested_qty": 2,
+           "filled_qty": 1, "remaining_qty": 0, "status": "CANCELLED",
+           "trade_date": "20261014"}
+    def memo(ctx):
+        return _replay_order_row_matches(
+            row, order_no="0000043251", symbol="MCK", side="SELL",
+            requested_qty=2, source_trade_date="2026-10-13",
+            journal_event=journal, lookup_context=ctx,
+        )
+    def conflict(ctx):
+        return _replay_detail_identity_conflicts(
+            row, order_no="0000043251", symbol="MCK", side="SELL",
+            requested_qty=2, source_trade_date="2026-10-13",
+            journal_event=journal, lookup_context=ctx,
+        )
+    assert memo(valid) and not conflict(valid)
+    for invalid in (scope(c="87654321"), scope(env="prod"), scope(p="02")):
+        assert not memo(invalid), invalid
+        assert conflict(invalid), invalid
+
+
+def test_old_attempt_late_actual_fill_survives_new_attempt_with_same_client_key(monkeypatch):
+    import trader.us.execution.order_journal as journal
+    import trader.us.execution.fills as fills
+    import trader.us.db.repos as repos
+    td = "2026-10-13"
+    events = []
+    for attempt, num in (("older", "0000001001"), ("newer", "0000001002")):
+        base = {"trade_date": td, "client_order_key": "one-logical-key",
+                "submit_attempt_id": attempt, "symbol": "AMD", "side": "SELL",
+                "session": "am", "exchange": "NASDAQ", "qty": 1,
+                "limit_price": 25.0}
+        events.append(dict(base, event_type="BROKER_SUBMIT_STARTED", event_id=attempt + "-start"))
+        events.append(dict(base, event_type="BROKER_ACK_RECEIVED",
+                           event_id=attempt + "-ack", broker_order_no=num))
+    monkeypatch.setattr(journal, "load_order_events", lambda day, session_run_id=None: events)
+    monkeypatch.setattr(journal, "append_order_event", lambda *args, **kw: {})
+    monkeypatch.setattr(repos, "save_order_ack", lambda *args, **kw: True)
+    monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
+    monkeypatch.setattr(fills, "get_fills_today",
+                        lambda provider, trade_date: {"status": "OK", "fills": []})
+    recorded = []
+    monkeypatch.setattr(repos, "apply_broker_order_observation",
+                        lambda **kwargs: (recorded.append(kwargs) or {"status": "OK"}))
+    class Provider:
+        stage = 0
+        reads = 0
+        def get_balance(self, force_refresh=False):
+            return {"positions": []}
+        def get_order_lookup_provenance(self, date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": date, "market": "US", "account_id": "acct"}
+        def get_today_orders(self, trade_date):
+            self.reads += 1
+            return [{"order_no": number, "symbol": "AMD", "side": "SELL",
+                     "exchange": "NASD", "requested_qty": 1,
+                     "filled_qty": (1 if attempt == "older" and self.stage else 0),
+                     "remaining_qty": (0 if attempt == "older" and self.stage else 1),
+                     "status": ("FILLED" if attempt == "older" and self.stage else "OPEN"),
+                     "trade_date": "20261014", "avg_price": 25.0}
+                    for attempt, number in (("older", "0000001001"),
+                                             ("newer", "0000001002"))]
+        def get_fills_by_order_no(self, **kwargs):
+            pytest.fail("two exact broker order rows must be reused without extra REST")
+    provider = Provider()
+    first = journal.replay_order_journal(td, provider=provider)
+    assert first["broker_unfilled_ack_count"] == 2, first
+    provider.stage = 1
+    recorded.clear()
+    second = journal.replay_order_journal(td, provider=provider)
+    assert provider.reads == 2
+    assert second["broker_full_fill_count"] == 1, second
+    assert second["broker_unfilled_ack_count"] == 1, second
+    assert {(x["raw_order_no"], x["filled_qty"]) for x in recorded} == {
+        ("0000001001", 1), ("0000001002", 0),
+    }
