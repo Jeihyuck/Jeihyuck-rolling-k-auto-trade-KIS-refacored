@@ -457,7 +457,10 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
     )
 
     assert first["broker_unfilled_ack_count"] == second["broker_unfilled_ack_count"] == 1
-    assert provider.fill_calls == ["broker-unresolved-attempt"] * 2
+    # The exact OPEN row is already in each fresh same-invocation KIS
+    # order book; do not repeat an entire CCNL REST request through the
+    # per-order helper. Each replay still refetches broker truth.
+    assert provider.fill_calls == []
     assert provider.order_calls == provider.balance_calls == 2
     assert claim_repo.get(active_identity).active_attempt_id == "unresolved-attempt"
     claim_repo.record_observation(
@@ -470,7 +473,7 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
     )
     assert completed_replay["events_scanned"] == 0
     assert completed_replay["balance_fetched"] is False
-    assert provider.fill_calls == ["broker-unresolved-attempt"] * 2
+    assert provider.fill_calls == []
     engine.dispose()
 
 
