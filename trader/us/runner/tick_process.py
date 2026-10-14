@@ -8,9 +8,16 @@ import signal
 import time
 import traceback
 import json
+import logging
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+
+class TickChildUnverifiedError(RuntimeError):
+    """An order-capable child may still be alive; session must stay fenced."""
 
 
 class TickProcessTimeout(TimeoutError):
@@ -52,7 +59,8 @@ class TickProcessResult:
 
 
 def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
-                        terminate_grace_sec: float = 10.0, mp_context=None) -> TickProcessResult:
+                        terminate_grace_sec: float = 10.0, mp_context=None,
+                        fence_account_scope: dict | None = None) -> TickProcessResult:
     """Run an isolated tick; never infer broker non-submission from worker death."""
     ctx = mp_context or mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
     receiver, sender = ctx.Pipe(duplex=False)
@@ -153,6 +161,68 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
             return TickProcessResult(value, pid, time.monotonic() - started)
         return TickProcessResult(value, pid, time.monotonic() - started)
     finally:
+        # SIGINT/SIGTERM from the parent session raises SystemExit while
+        # receiver.poll() is running. The old finally only closed the pipe,
+        # leaving the independently session-grouped, order-capable child alive
+        # AFTER the parent released its session lock. Unconditionally stop an
+        # active child before returning control to session finalization.
+        if process.is_alive():
+            cancellation.set()
+            state_path = child_kwargs.get("active_session_state_path")
+            if state_path:
+                try:
+                    state_path_obj = Path(state_path)
+                    state = json.loads(state_path_obj.read_text(encoding="utf-8"))
+                    state["state"] = "CANCELLING"
+                    state["broker_submission_truth"] = "UNVERIFIED"
+                    tmp = state_path_obj.with_suffix(state_path_obj.suffix + ".parent_signal.tmp")
+                    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+                    os.replace(tmp, state_path_obj)
+                except Exception:
+                    pass
+            try:
+                if hasattr(os, "killpg") and pid > 0:
+                    os.killpg(pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                # The child may not yet have called setsid(); a missing
+                # process group does not prove the process is gone.
+                if process.is_alive():
+                    process.terminate()
+            process.join(max(0.0, terminate_grace_sec))
+            if process.is_alive():
+                try:
+                    if hasattr(os, "killpg") and pid > 0:
+                        os.killpg(pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    if process.is_alive():
+                        process.kill()
+                process.join(5.0)
+            if process.is_alive():
+                state_path = child_kwargs.get("active_session_state_path")
+                if state_path:
+                    from trader.us.utils.session_guard import mark_us_session_child_unverified_fence
+                    try:
+                        mark_us_session_child_unverified_fence(
+                            Path(state_path).parent.name,
+                            str(child_kwargs.get("session") or ""),
+                            run_id=str(child_kwargs.get("session_run_id") or ""),
+                            pid=pid, reason="child_alive_after_parent_shutdown",
+                            env=str(child_kwargs.get("env") or ""),
+                            account_scope=fence_account_scope,
+                        )
+                    except Exception:
+                        # The session runner independently catches this typed
+                        # error and withholds CLOSED/lock release even if the
+                        # filesystem rejected the first durable fence write.
+                        logger.exception("[US_TICK_PROCESS][FENCE_WRITE_FAILED]")
+                raise TickChildUnverifiedError(
+                    f"tick_child_process_stuck_after_parent_exit pid={pid} "
+                    "broker_submission_truth=UNVERIFIED"
+                )
         receiver.close()
 
 
