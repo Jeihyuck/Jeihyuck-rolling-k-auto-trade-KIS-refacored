@@ -1314,6 +1314,8 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
     - If missing (or force always), build and persist for exact as_of.
     - Reload exact as_of and fail hard when still empty.
     """
+    from trader.universe.build import _load_fallback_universe_from_db
+
     repo = UniverseRepo(engine)
     as_of_s = as_of.isoformat()
 
@@ -1338,7 +1340,6 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
         # Validate the *members*, not only the source/date/row count.
         # Reuse the same strict six-digit, venue and deduplication contract
         # enforced by the universe builder on exact-as-of recovery.
-        from trader.universe.build import _load_fallback_universe_from_db
         validated = _load_fallback_universe_from_db(
             repo=repo, env=env, strategy=strategy, as_of_date=as_of_s,
             snapshot=snapshot, require_exact_as_of=True,
