@@ -924,6 +924,14 @@ def run_trade_session(
             active_tick_id="", run_source=run_source,
         )
     if not running_lock.get("acquired"):
+        denial = str(running_lock.get("reason") or "")
+        if denial.startswith("BROKER_"):
+            logger.critical(
+                "[US_SESSION][BROKER_ACCOUNT_IDENTITY_FAILED] session=%s trade_date=%s reason=%s",
+                session, trade_date, denial,
+            )
+            return {"status": "FAILED", "reason": denial, "session": session,
+                    "trade_date": trade_date, "tick_count": 0}
         logger.warning(
             "[US_SESSION][SKIP_DUPLICATE_RUNNING] session=%s trade_date=%s reason=%s",
             session, trade_date, running_lock.get("reason"),
