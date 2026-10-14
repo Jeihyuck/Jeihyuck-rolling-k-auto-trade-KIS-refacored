@@ -910,9 +910,9 @@ def run_trade_session(
     )
     session_started_at_et = now_et_iso()
 
-    running_lock = acquire_us_session_running_lock(trade_date, session, run_id)
+    running_lock = acquire_us_session_running_lock(trade_date, session, run_id, env=env)
     if running_lock.get("acquired"):
-        atexit.register(release_us_session_running_lock, trade_date, session, run_id)
+        atexit.register(release_us_session_running_lock, trade_date, session, run_id, env=env)
         # Do not publish a phantom ACTIVE session when durable child
         # uncertainty has already denied acquiring the execution lock.
         _write_active_session_state(
@@ -1469,7 +1469,7 @@ def run_trade_session(
                             try:
                                 mark_us_session_child_unverified_fence(
                                     trade_date, session, run_id=session_run_id, pid=0,
-                                    reason=str(exc),
+                                    reason=str(exc), env=env,
                                 )
                             except Exception:
                                 logger.exception("[US_SESSION][CHILD_FENCE_PERSIST_FAILED]")
@@ -2497,7 +2497,7 @@ def run_trade_session(
     finally:
         from trader.us.utils.session_guard import read_us_session_child_unverified_fence
         _child_fenced = _unreaped_child_seen or bool(
-            read_us_session_child_unverified_fence(trade_date, session)
+            read_us_session_child_unverified_fence(trade_date, session, env=env)
         )
         if _child_fenced:
             final_status = "FAILED_CHILD_UNVERIFIED"
@@ -2521,7 +2521,7 @@ def run_trade_session(
         except Exception:
             pass
         if not _child_fenced:
-            release_us_session_running_lock(trade_date, session, run_id=run_id)
+            release_us_session_running_lock(trade_date, session, run_id=run_id, env=env)
             try:
                 write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="LOCK_RELEASED", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
             except Exception:
