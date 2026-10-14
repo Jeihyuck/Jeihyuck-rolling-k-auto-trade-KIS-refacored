@@ -86,8 +86,16 @@ def _unverified_child_fence_path(trade_date: str, session: str) -> Path:
 def _child_fence_scope(env: str | None = None) -> dict:
     """Account+environment fence key; never persist raw CANO or product id."""
     from trader.account_state import get_account_key, resolve_env_name
+    from trader.us import config as us_cfg
     name = resolve_env_name(env)
-    account_key = get_account_key(env=name)
+    # The actual US KIS client uses us_cfg, which can be loaded from .env
+    # independently of shell variables. Match the broker account identity,
+    # not merely environment values that might still be unset.
+    account_key = get_account_key(
+        env=name,
+        cano=str(os.getenv("CANO") or us_cfg.CANO or ""),
+        product_code=str(os.getenv("ACNT_PRDT_CD") or us_cfg.ACNT_PRDT_CD or ""),
+    )
     return {"env": name, "account_digest": hashlib.sha256(account_key.encode("utf-8")).hexdigest()}
 
 
