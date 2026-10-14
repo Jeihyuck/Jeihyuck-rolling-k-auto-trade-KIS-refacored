@@ -548,7 +548,12 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     # save_order_ack for both would overwrite broker identity. Preserve each
     # proof in the immutable journal and retain the claim fence instead.
     by_client_key: dict[str, set[str]] = {}
-    for (client_key, _attempt), attempt_events in grouped.items():
+    possible_attempts_by_client_key: dict[str, set[str]] = {}
+    for (client_key, attempt), attempt_events in grouped.items():
+        types = {event.get("event_type") for event in attempt_events}
+        if ("BROKER_SUBMIT_STARTED" in types
+                and "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" not in types):
+            possible_attempts_by_client_key.setdefault(client_key, set()).add(attempt)
         from trader.us.utils.order_no import normalize_us_order_no
         broker_numbers = {
             normalize_us_order_no(e.get("broker_order_no"))
@@ -558,7 +563,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         }
         by_client_key.setdefault(client_key, set()).update(broker_numbers)
     conflicting_client_keys = {
-        key for key, order_nos in by_client_key.items() if len(order_nos) > 1
+        key for key, order_nos in by_client_key.items()
+        if len(order_nos) > 1
+        or len(possible_attempts_by_client_key.get(key, ())) > 1
     }
     counts = {"db_ack_restored_count": 0, "broker_full_fill_count": 0,
               "broker_partial_fill_count": 0, "broker_unfilled_ack_count": 0,
