@@ -1287,6 +1287,34 @@ def classify_ack_orders_with_final_balance(
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
         broker = order.get("_broker_observation") if isinstance(order.get("_broker_observation"), dict) else {}
+        # 2026-10-13 MCK: the journal+claim preserved a unique KIS ACK
+        # identity and pre-order balance (2), but neither source carried qty.
+        # KIS practice returned the fill under the *prior* session date.
+        # Only infer quantity from an authoritative close balance when exactly
+        # one identified SELL attempt exists for this symbol/session and no
+        # BUY could have altered the same balance.  Never turn an ambiguous
+        # multi-attempt or unknown-broker order into a confirmed fill.
+        if (
+            side == "SELL" and qty <= 0 and pre_qty is not None
+            and 0 <= final_qty < pre_qty
+            and str(order.get("order_no") or "").strip()
+            and str(order.get("client_order_key") or "").strip()
+            and str(order.get("submit_attempt_id") or "").strip()
+            and {"journal", "claim"}.issubset(set(order.get("_sources") or []))
+            and sum(
+                1 for attempt in orders
+                if str(attempt.get("symbol") or "").upper() == symbol
+                and str(attempt.get("side") or "").upper() in {"BUY", "SELL"}
+            ) == 1
+            and not broker
+        ):
+            qty = pre_qty - final_qty
+            order["qty_recovered_from_unique_close_balance_delta"] = True
+            logger.warning(
+                "[US_CLOSE][ZERO_QTY_ACK_RECOVERY] symbol=%s order_no=%s "
+                "qty=%d evidence=journal_claim_unique_identity_authoritative_balance",
+                symbol, order.get("order_no"), qty,
+            )
         broker_status = str(broker.get("status") or "").strip().upper()
         broker_present = bool(broker)
         broker_normalized = str(broker.get("normalization_result") or "").lower() != "quarantined"
@@ -1354,7 +1382,15 @@ def classify_ack_orders_with_final_balance(
             final_status = "broker_fill_confirmed"
         elif fill_qty > 0 or raw_status in {"PARTIALLY_FILLED"}:
             final_status = "ack_open_order_pending" if broker_remaining is None else "ack_unresolved_error"
-        elif order.get("active_claim") and not broker_present:
+        elif (
+            order.get("active_claim") and not broker_present
+            and not order.get("qty_recovered_from_unique_close_balance_delta")
+        ):
+            # Unknown claim stays unresolved.  The one narrow exception is a
+            # uniquely attributable SELL with an authoritative whole-share
+            # decrease; allow the balance-delta classification below.  This
+            # does NOT release the durable execution claim or label the KIS
+            # physical fill as confirmed.
             final_status = "ack_unresolved_error"
         elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
             final_status = "balance_delta_confirmed"
@@ -1411,6 +1447,7 @@ def classify_ack_orders_with_final_balance(
             "broker_filled_qty": broker_fill,
             "broker_remaining_qty": broker_remaining,
             "broker_local_fill_qty_conflict": bool(order.get("broker_local_fill_qty_conflict")),
+            "qty_recovered_from_unique_close_balance_delta": bool(order.get("qty_recovered_from_unique_close_balance_delta")),
             "evidence_sources": list(order.get("_sources") or []),
             "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
             "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else ("position_absent_confirmed_sell" if final_status == "position_absent_confirmed_sell" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),
