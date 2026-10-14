@@ -175,3 +175,23 @@ def test_child_account_scope_is_pinned_to_broker_identity_not_shell(tmp_path, mo
     assert guard.acquire_us_session_running_lock(
         "2026-10-15", "close", "blocked", env="practice",
     )["reason"] == "CHILD_UNVERIFIED_FENCE"
+
+
+def test_session_runner_rejects_broker_vs_shell_account_conflict_before_any_tick(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("CANO", "99998888")
+    monkeypatch.setenv("ACNT_PRDT_CD", "01")
+    from trader.us import config as us_cfg
+    monkeypatch.setattr(us_cfg, "KIS_ENV", "practice")
+    monkeypatch.setattr(us_cfg, "CANO", "11112222")
+    monkeypatch.setattr(us_cfg, "ACNT_PRDT_CD", "01")
+    from trader.us.runner import trade_session_runner as runner
+    result = runner.run_trade_session(
+        session="am", env="practice", offline=True,
+        force_now="2026-10-13T09:35:00-04:00", max_ticks=1,
+    )
+    assert result["status"] == "FAILED", result
+    assert result["reason"] == "BROKER_ACCOUNT_CONFIG_MISMATCH"
+    assert result["tick_count"] == 0
+    assert not list((tmp_path / "runtime/us/session_state/2026-10-13").glob("*.json"))
