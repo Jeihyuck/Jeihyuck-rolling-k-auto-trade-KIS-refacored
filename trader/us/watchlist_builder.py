@@ -1138,6 +1138,57 @@ def repair_final30_effective_caps(
             out[idx] = row
             search_diagnostics["accepted_swaps"] += 1
 
+    def fill_before_swap_or_drop() -> None:
+        """Admit a *jointly* cap-clean expansion before deleting an offender.
+
+        A 28-name roster with 6 AI names can be dirty at both 28 and 29,
+        but cap-clean with two non-AI additions at 30 (6/30 == 20%).
+        Intermediate hypothetical rows do NOT become a live Final30.
+        A bounded three-slot lookahead covers the near-full actual roster;
+        the ordinary safe refill below handles later opportunities.
+        """
+        if len(out) >= finaln or not pool:
+            return
+        used = {str(item.get("symbol") or "").upper() for item in out}
+        options = [r for r in pool if str(r.get("symbol") or "").upper() not in used]
+        slots = min(3, finaln - len(out), len(options))
+        if not slots:
+            return
+        # Each partial state is a proposal only, not an approved roster.
+        # Keep diverse cap-excess states so a temporarily offending prefix is
+        # allowed when its complete expansion ultimately satisfies every cap.
+        states = [([], -1)]
+        for _depth in range(1, slots + 1):
+            next_states = []
+            winner = None
+            for indices, last in states:
+                for index in range(last + 1, len(options)):
+                    selected_rows = [options[i] for i in (*indices, index)]
+                    trial = out + selected_rows
+                    search_diagnostics["evaluated_swaps"] += 1
+                    if (not effective_final30_cap_violations(trial, constraints, rotation_regime)
+                            and sum(_is_etf_row(item) for item in trial) <= _MAX_ETF_IN_FINAL30):
+                        score = sum(float(item.get("score_final") or 0) for item in selected_rows)
+                        if winner is None or score > winner[0]:
+                            winner = (score, selected_rows)
+                    if _depth < slots:
+                        next_states.append((excess(trial), -sum(float(item.get("score_final") or 0) for item in selected_rows),
+                                            indices + [index], index))
+            if winner is not None:
+                for item in winner[1]:
+                    out.append(item)
+                    added.append(str(item["symbol"]))
+                search_diagnostics["joint_refill_count"] = search_diagnostics.get("joint_refill_count", 0) + 1
+                return
+            # Bounded beam: retain multiple plausible prefixes, rather than
+            # rejecting a candidate solely because the first append is dirty.
+            next_states.sort(key=lambda item: (item[0], item[1]))
+            states = [(indices, index) for _bad, _score, indices, index in next_states[:128]]
+            if not states:
+                return
+
+    fill_before_swap_or_drop()
+
     for _ in range(len(out)):
         replace_before_drop()
         violations = effective_final30_cap_violations(out, constraints, rotation_regime)
@@ -1171,20 +1222,27 @@ def repair_final30_effective_caps(
 
     if not effective_final30_cap_violations(out, constraints, rotation_regime):
         seen = {str(row.get("symbol") or "") for row in out}
-        for row in pool:
-            if len(out) >= finaln:
+        # Revisit every previously blocked candidate after ANY successful
+        # addition changes the true denominator or another cap's slack.
+        while len(out) < finaln:
+            changed = False
+            for row in pool:
+                if len(out) >= finaln:
+                    break
+                sym = str(row.get("symbol") or "")
+                cluster = row.get("theme_cluster") or theme_cluster_for(sym, row)
+                if not sym or sym in seen or cluster in blocked_clusters:
+                    continue
+                if effective_final30_cap_violations(out + [row], constraints, rotation_regime):
+                    continue
+                if sum(_is_etf_row(r) for r in out + [row]) > _MAX_ETF_IN_FINAL30:
+                    continue
+                out.append(row)
+                seen.add(sym)
+                added.append(sym)
+                changed = True
+            if not changed:
                 break
-            sym = str(row.get("symbol") or "")
-            cluster = row.get("theme_cluster") or theme_cluster_for(sym, row)
-            if not sym or sym in seen or cluster in blocked_clusters:
-                continue
-            if effective_final30_cap_violations(out + [row], constraints, rotation_regime):
-                continue
-            if sum(_is_etf_row(r) for r in out + [row]) > _MAX_ETF_IN_FINAL30:
-                continue
-            out.append(row)
-            seen.add(sym)
-            added.append(sym)
     remaining = effective_final30_cap_violations(out, constraints, rotation_regime)
     # All filtered-out alternatives are accounted for in the PREP artifact.
     # A missing replacement must not silently turn a >=25-member normal tier
