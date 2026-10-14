@@ -148,3 +148,18 @@ def test_absent_kis_row_account_session_and_date_require_proven_scope(proof):
             row, order_no="0000043251", symbol="MCK", side="SELL",
             requested_qty=2, source_trade_date="2026-10-13",
             journal_event=journal, lookup_context=wrong)
+
+
+def test_broker_detail_fallback_rejects_cross_account_and_source_date(proof):
+    from trader.us.execution.order_journal import _replay_detail_identity_conflicts
+    journal, row = proof
+    for key, value in (("account_id", "different-account"),
+                       ("market", "KR"), ("session", "afternoon"),
+                       ("trade_date", "20261016"),
+                       ("requested_qty", 3)):
+        conflicting = dict(row, **{key: value})
+        assert _replay_detail_identity_conflicts(
+            conflicting, order_no="0000043251", symbol="MCK", side="SELL",
+            requested_qty=2, source_trade_date="2026-10-13",
+            journal_event=journal, lookup_context={},
+        ), key
