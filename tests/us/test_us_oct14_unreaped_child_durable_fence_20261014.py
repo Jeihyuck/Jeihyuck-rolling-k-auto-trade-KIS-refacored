@@ -85,3 +85,44 @@ def test_runner_integrates_unreaped_child_into_session_finally(tmp_path, monkeyp
     assert (tmp_path / "runtime/session_guard/us/2026-06-05/am.running").exists()
     assert (tmp_path / "runtime/session_guard/us/2026-06-05/am.child_unverified.fence").exists()
     assert guard.acquire_us_session_running_lock("2026-06-05", "am", "replacement")["acquired"] is False
+
+
+def test_unreaped_child_blocks_all_us_sessions_and_later_trade_dates_for_same_account(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CANO", "12345678")
+    monkeypatch.setenv("ACNT_PRDT_CD", "01")
+    import trader.us.utils.session_guard as guard
+    source_date = "2026-10-13"
+    assert guard.acquire_us_session_running_lock(source_date, "am", "source", env="practice")["acquired"]
+    guard.mark_us_session_child_unverified_fence(
+        source_date, "am", run_id="source", pid=54321,
+        reason="simulated_orphan", env="practice",
+    )
+    monkeypatch.setenv("US_BYPASS_RUNNING_LOCK_FOR_TEST", "1")
+    for trade_date, session in ((source_date, "am"), (source_date, "afternoon"),
+                                ("2026-10-14", "am"), ("2026-10-15", "close"),
+                                ("2026-10-20", "trader")):
+        denied = guard.acquire_us_session_running_lock(
+            trade_date, session, "new-run", env="practice",
+        )
+        assert denied["acquired"] is False, (trade_date, session, denied)
+        assert denied["reason"] == "CHILD_UNVERIFIED_FENCE"
+    assert guard.release_us_session_running_lock(source_date, "am", "source", env="practice")["released"] is False
+
+    # The precise account+environment is the fence scope, not all US accounts.
+    assert guard.acquire_us_session_running_lock(
+        "2026-10-14", "am", "other-environment", env="prod",
+    )["acquired"] is True
+    monkeypatch.setenv("CANO", "87654321")
+    assert guard.acquire_us_session_running_lock(
+        "2026-10-14", "am", "other-account", env="practice",
+    )["acquired"] is True
+    monkeypatch.setenv("CANO", "12345678")
+    assert guard.acquire_us_session_running_lock(
+        "2026-10-14", "am", "same-again", env="practice",
+    )["acquired"] is False
+
+    scope_files = list((tmp_path / "runtime/session_guard/us/.child_scope").glob("*.fence"))
+    assert len(scope_files) == 1
+    assert "12345678" not in str(scope_files[0])
+    assert "12345678" not in scope_files[0].read_text()
