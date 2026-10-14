@@ -55,6 +55,27 @@ def _install(monkeypatch, repo, build):
     monkeypatch.setenv("UNIVERSE_NO_FALLBACK", "1")
 
 
+def test_same_count_but_different_members_does_not_reuse_stale_snapshot(monkeypatch):
+    correct = members()
+    wrong = [*correct[:-1], {"code": "987654", "market": "KOSDAQ", "rank": 150}]
+    repo = FakeRepo(wrong, snapshot(correct))
+    rebuild_called = []
+
+    def rebuild(**kwargs):
+        rebuild_called.append(kwargs)
+        repo.rows = list(correct)
+        repo.committed = snapshot(correct)
+        return list(correct)
+
+    _install(monkeypatch, repo, rebuild)
+    result = prep_runner._ensure_universe(
+        engine=object(), env="practice", strategy="best_k_meta",
+        as_of=date(2026, 10, 13),
+    )
+    assert len(result) == 150
+    assert len(rebuild_called) == 1
+
+
 def test_duplicate_in_existing_same_day_snapshot_forces_verified_rebuild(monkeypatch):
     good = members()
     corrupt = [*good[:-1], good[0]]
