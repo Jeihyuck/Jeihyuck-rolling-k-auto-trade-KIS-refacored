@@ -1384,7 +1384,7 @@ class USDataProvider:
         get_today_orders uses client._build_us_fills_params() scoped by CANO /
         ACNT_PRDT_CD and filters its KST date bridge back to the requested US
         date. Session identity is only available from an explicitly bound tick.
-        Historical claims of another session must take the slower safe path.
+        Original submission session belongs to the local journal, NOT this query.
         """
         if self._offline:
             return {}
@@ -1394,11 +1394,17 @@ class USDataProvider:
         client_env = str(getattr(client, "_env", "") or "").lower()
         if not cano or not product or client_env != self._env:
             return {}
+        from trader.account_state import get_account_key
+        import hashlib
         ctx = self._tick_context
+        account_fingerprint = hashlib.sha256(
+            get_account_key(env=client_env, cano=cano, product_code=product).encode("utf-8")
+        ).hexdigest()
         return {
             "verified": True, "source": "kis_authenticated_order_book",
             "query_trade_date": str(trade_date), "market": "US",
-            "account_id": cano, "account_product_code": product,
+            "account_id": account_fingerprint, "broker_account_no": cano,
+            "account_product_code": product,
             "env": client_env,
             "session": getattr(ctx, "session", "") if ctx is not None else "",
             "session_run_id": getattr(ctx, "session_run_id", "") if ctx is not None else "",
