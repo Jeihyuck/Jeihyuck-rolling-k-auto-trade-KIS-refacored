@@ -334,7 +334,7 @@ def test_same_client_key_two_real_broker_orders_preserves_proof_and_fences(monke
                 if kind == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"]
     assert evidence and any(
         "0000010201" in str(row["broker_order_no"]) and
-        row["raw_response"]["filled_qty"] == 1 for row in evidence
+        row["raw_response"]["cumulative_filled_qty"] == 1 for row in evidence
     )
     assert any(kind == "JOURNAL_REPLAY_UNRESOLVED" for kind, _ in recorded_events)
 
