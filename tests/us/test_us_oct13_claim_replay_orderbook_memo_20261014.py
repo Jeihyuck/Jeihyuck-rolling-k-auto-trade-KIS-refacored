@@ -19,11 +19,13 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
             {"event_type": "BROKER_SUBMIT_STARTED",
              "event_id": f"submit-{sym}", "trade_date": source_date,
              "client_order_key": key, "submit_attempt_id": attempt,
-             "symbol": sym, "exchange": "NASDAQ", "side": "SELL", "qty": 1},
+             "symbol": sym, "exchange": "NASDAQ", "side": "SELL", "qty": 1,
+             "session": "am", "session_run_id": "historical-session"},
             {"event_type": "BROKER_ACK_RECEIVED",
              "event_id": f"ack-{sym}", "trade_date": source_date,
              "client_order_key": key, "submit_attempt_id": attempt,
              "symbol": sym, "exchange": "NASDAQ", "side": "SELL", "qty": 1,
+             "session": "am", "session_run_id": "historical-session",
              "broker_order_no": no},
         ])
 
@@ -43,6 +45,12 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
 
         def get_balance(self, force_refresh=False):
             return {"positions": []}
+
+        def get_order_lookup_provenance(self, trade_date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": trade_date, "market": "US",
+                    "account_id": "mock-account", "session": "am",
+                    "session_run_id": "historical-session"}
 
         def get_today_orders(self, *, trade_date):
             self.reads.append(trade_date)
