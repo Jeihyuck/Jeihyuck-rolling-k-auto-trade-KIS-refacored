@@ -894,6 +894,7 @@ def run_trade_session(
         session_state_path, state="ACTIVE", session=session, session_run_id=session_run_id,
         session_generation=session_generation, active_tick_id="", run_source=run_source,
     )
+    _unreaped_child_seen = False
     final_status = "OK"
     final_reason = "session_end"
     last_stage = "session_start"
@@ -1453,11 +1454,25 @@ def run_trade_session(
                         # in-process mocks; production/practice always uses isolation.
                         tick_result = run_trade_tick(**tick_kwargs)
                     else:
-                        from trader.us.runner.tick_process import run_tick_in_process
-                        process_result = run_tick_in_process(
-                            run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
-                            terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
-                        )
+                        from trader.us.runner.tick_process import run_tick_in_process, TickChildUnverifiedError
+                        try:
+                            process_result = run_tick_in_process(
+                                run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
+                                terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
+                            )
+                        except TickChildUnverifiedError as exc:
+                            _unreaped_child_seen = True
+                            from trader.us.utils.session_guard import mark_us_session_child_unverified_fence
+                            try:
+                                mark_us_session_child_unverified_fence(
+                                    trade_date, session, run_id=session_run_id, pid=0,
+                                    reason=str(exc),
+                                )
+                            except Exception:
+                                logger.exception("[US_SESSION][CHILD_FENCE_PERSIST_FAILED]")
+                            final_status = "FAILED_CHILD_UNVERIFIED"
+                            final_reason = "tick_child_unreaped"
+                            raise
                         tick_result = process_result.result
                         tick_result.setdefault("child_pid", process_result.child_pid)
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
@@ -2476,23 +2491,37 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        from trader.us.utils.session_guard import read_us_session_child_unverified_fence
+        _child_fenced = _unreaped_child_seen or bool(
+            read_us_session_child_unverified_fence(trade_date, session)
+        )
+        if _child_fenced:
+            final_status = "FAILED_CHILD_UNVERIFIED"
+            final_reason = "tick_child_unreaped_broker_truth_unverified"
+            logger.critical(
+                "[US_SESSION][CHILD_UNVERIFIED][LOCK_HELD] session=%s run=%s action=BLOCK_NEW_TICKS",
+                session, session_run_id,
+            )
         try:
             _write_active_session_state(
-                session_state_path, state="CLOSED", session=session,
-                session_run_id=session_run_id, session_generation=session_generation,
-                active_tick_id="", run_source=run_source,
+                session_state_path, state="CHILD_UNVERIFIED" if _child_fenced else "CLOSED",
+                session=session, session_run_id=session_run_id,
+                session_generation=session_generation, active_tick_id="",
+                broker_submission_truth="UNVERIFIED" if _child_fenced else "RECONCILED",
+                run_source=run_source,
             )
         except Exception:
             logger.exception("[US_SESSION][STATE_CLOSE_FAILED]")
         try:
-            write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="SESSION_FINALLY", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
+            write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="CHILD_UNVERIFIED" if _child_fenced else "SESSION_FINALLY", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
         except Exception:
             pass
-        release_us_session_running_lock(trade_date, session, run_id=run_id)
-        try:
-            write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="LOCK_RELEASED", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
-        except Exception:
-            pass
+        if not _child_fenced:
+            release_us_session_running_lock(trade_date, session, run_id=run_id)
+            try:
+                write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="LOCK_RELEASED", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
+            except Exception:
+                pass
 def main() -> None:
     from trader.us.utils.logging_utils import setup_us_logging
     setup_us_logging()
