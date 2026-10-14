@@ -1397,9 +1397,16 @@ class USDataProvider:
         from trader.account_state import get_account_key
         import hashlib
         ctx = self._tick_context
-        account_fingerprint = hashlib.sha256(
-            get_account_key(env=client_env, cano=cano, product_code=product).encode("utf-8")
-        ).hexdigest()
+        broker_account_key = get_account_key(
+            env=client_env, cano=cano, product_code=product
+        )
+        # Match the same local account identity namespace used by the
+        # durable execution-claim repository. Disagreement is NOT a hint to
+        # weaken the identity check: disable memo reuse and use exact lookup.
+        if broker_account_key != get_account_key(env=client_env):
+            logger.warning("[US_JOURNAL][SCOPE_MISMATCH] action=NO_ORDER_BOOK_MEMO")
+            return {}
+        account_fingerprint = hashlib.sha256(broker_account_key.encode("utf-8")).hexdigest()
         return {
             "verified": True, "source": "kis_authenticated_order_book",
             "query_trade_date": str(trade_date), "market": "US",
