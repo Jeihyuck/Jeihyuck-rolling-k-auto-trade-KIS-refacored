@@ -77,7 +77,7 @@ def test_live_shape_readonly_150_each_and_provenance():
                                                     readonly_probe=True)
         assert len(rows) == 150
         assert all(x["market"] == market for x in rows)
-        assert all(x["actual_as_of"] == "2026-10-13" for x in rows)
+        assert all(x["actual_as_of"] is None for x in rows)
         assert all(x["source_published_on"] == "2026-10-14" for x in rows)
         assert len({r["code"] for r in rows}) == 150
         assert len(rows[0]["source_sha256"]) == 64
