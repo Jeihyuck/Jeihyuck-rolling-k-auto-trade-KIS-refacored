@@ -1139,53 +1139,98 @@ def repair_final30_effective_caps(
             search_diagnostics["accepted_swaps"] += 1
 
     def fill_before_swap_or_drop() -> None:
-        """Admit a *jointly* cap-clean expansion before deleting an offender.
+        """Exact feasible expansion over ALL remaining Final30 slots.
 
-        A 28-name roster with 6 AI names can be dirty at both 28 and 29,
-        but cap-clean with two non-AI additions at 30 (6/30 == 20%).
-        Intermediate hypothetical rows do NOT become a live Final30.
-        A bounded three-slot lookahead covers the near-full actual roster;
-        the ordinary safe refill below handles later opportunities.
+        Single append may be cap-dirty while a full expansion is cap-clean.
+        Dynamic programming groups interchangeable candidates by cluster and
+        ETF status; it searches possible cardinalities from largest to smallest
+        without a 3-name horizon or a truncated beam. The best-scored prefix
+        of each group is sufficient for each count because all cap constraints
+        depend on group counts, not symbol identity.
         """
-        if len(out) >= finaln or not pool:
-            return
-        used = {str(item.get("symbol") or "").upper() for item in out}
-        options = [r for r in pool if str(r.get("symbol") or "").upper() not in used]
-        slots = min(3, finaln - len(out), len(options))
+        slots = min(max(0, finaln - len(out)), len(pool))
         if not slots:
             return
-        # Each partial state is a proposal only, not an approved roster.
-        # Keep diverse cap-excess states so a temporarily offending prefix is
-        # allowed when its complete expansion ultimately satisfies every cap.
-        states = [([], -1)]
-        for _depth in range(1, slots + 1):
-            next_states = []
-            winner = None
-            for indices, last in states:
-                for index in range(last + 1, len(options)):
-                    selected_rows = [options[i] for i in (*indices, index)]
-                    trial = out + selected_rows
-                    search_diagnostics["evaluated_swaps"] += 1
-                    if (not effective_final30_cap_violations(trial, constraints, rotation_regime)
-                            and sum(_is_etf_row(item) for item in trial) <= _MAX_ETF_IN_FINAL30):
-                        score = sum(float(item.get("score_final") or 0) for item in selected_rows)
-                        if winner is None or score > winner[0]:
-                            winner = (score, selected_rows)
-                    if _depth < slots:
-                        next_states.append((excess(trial), -sum(float(item.get("score_final") or 0) for item in selected_rows),
-                                            indices + [index], index))
-            if winner is not None:
-                for item in winner[1]:
-                    out.append(item)
-                    added.append(str(item["symbol"]))
-                search_diagnostics["joint_refill_count"] = search_diagnostics.get("joint_refill_count", 0) + 1
-                return
-            # Bounded beam: retain multiple plausible prefixes, rather than
-            # rejecting a candidate solely because the first append is dirty.
-            next_states.sort(key=lambda item: (item[0], item[1]))
-            states = [(indices, index) for _bad, _score, indices, index in next_states[:128]]
-            if not states:
-                return
+        selected_symbols = {str(r.get("symbol") or "").upper() for r in out}
+        candidates = {}
+        for row in pool:
+            symbol = str(row.get("symbol") or "").upper()
+            if symbol in selected_symbols or symbol in candidates:
+                continue
+            candidates[symbol] = row
+        by_cluster: dict[str, dict[bool, list[dict]]] = {}
+        for row in candidates.values():
+            group = by_cluster.setdefault(cluster(row), {False: [], True: []})
+            group[bool(_is_etf_row(row))].append(row)
+        for groups in by_cluster.values():
+            for rows in groups.values():
+                rows.sort(key=lambda r: (-float(r["score_final"]), str(r["symbol"])))
+        initial_counts = _cluster_counts(out)
+        initial_ai = sum(initial_counts.get(name, 0) for name in AI_CLUSTERS)
+        initial_etf = sum(_is_etf_row(r) for r in out)
+        rotation_caps = cluster_caps_for_regime(rotation_regime)
+        ai_ratio = min(float(constraints.get("max_ai_tech_ratio", 1.0)),
+                       float(rotation_caps.get("AI_TECH_COMBINED",
+                                               rotation_caps.get("AI_COMBINED", 1.0))))
+        single_ratio = min(float(constraints.get("max_single_cluster_ratio", 1.0)),
+                           float(rotation_caps.get("SINGLE_CLUSTER", 1.0)))
+        if rotation_regime == "AI_OFF_ROTATION":
+            ai_ratio = min(ai_ratio, 0.50)
+
+        # No arbitrary search cap: the state space is bounded by finaln, AI
+        # capacity and the existing ETF limit, NOT combinations of symbols.
+        search_diagnostics["joint_search_method"] = "exact_cluster_dp"
+        search_diagnostics["joint_search_complete"] = True
+        for target in range(min(finaln, len(out) + len(candidates)), len(out), -1):
+            need = target - len(out)
+            per_cluster_limit = math.floor(single_ratio * target + 1e-9)
+            ai_limit = math.floor(ai_ratio * target + 1e-9)
+            if (initial_ai > ai_limit or initial_etf > _MAX_ETF_IN_FINAL30
+                    or any(count > per_cluster_limit for count in initial_counts.values())):
+                continue
+            # dp[(filled, ai_added, etf_added)] -> (score, selected_rows)
+            dp = {(0, 0, 0): (0.0, ())}
+            for name, groups in sorted(by_cluster.items()):
+                non_etf, etfs = groups[False], groups[True]
+                capacity = max(0, per_cluster_limit - initial_counts.get(name, 0))
+                if rotation_regime == "AI_OFF_ROTATION":
+                    if name == "AI_SEMI":
+                        capacity = min(capacity, 3 - initial_counts.get(name, 0))
+                    if name == "MEGA_TECH":
+                        capacity = min(capacity, 2 - initial_counts.get(name, 0))
+                nxt = {}
+                for (filled, ai_added, etf_added), (score, selected_rows) in dp.items():
+                    left = min(capacity, need - filled)
+                    for normal_n in range(min(left, len(non_etf)) + 1):
+                        for etf_n in range(min(left - normal_n, len(etfs)) + 1):
+                            new_filled = filled + normal_n + etf_n
+                            new_ai = ai_added + (normal_n + etf_n if name in AI_CLUSTERS else 0)
+                            new_etf = etf_added + etf_n
+                            if initial_ai + new_ai > ai_limit or initial_etf + new_etf > _MAX_ETF_IN_FINAL30:
+                                continue
+                            choice = (*non_etf[:normal_n], *etfs[:etf_n])
+                            new_score = score + sum(float(r["score_final"]) for r in choice)
+                            key = (new_filled, new_ai, new_etf)
+                            previous = nxt.get(key)
+                            search_diagnostics["evaluated_swaps"] += 1
+                            if previous is None or new_score > previous[0]:
+                                nxt[key] = (new_score, selected_rows + choice)
+                dp = nxt
+                if not dp:
+                    break
+            choices = [(score, rows) for (filled, _ai, _etf), (score, rows)
+                       in dp.items() if filled == need]
+            if not choices:
+                continue
+            for _score, chosen in sorted(choices, key=lambda item: -item[0]):
+                trial = out + list(chosen)
+                if not effective_final30_cap_violations(trial, constraints, rotation_regime):
+                    out.extend(chosen)
+                    added.extend(str(r["symbol"]) for r in chosen)
+                    search_diagnostics["joint_refill_count"] = search_diagnostics.get("joint_refill_count", 0) + 1
+                    search_diagnostics["joint_refill_slots"] = len(chosen)
+                    return
+        search_diagnostics["joint_refill_slots"] = 0
 
     fill_before_swap_or_drop()
 
