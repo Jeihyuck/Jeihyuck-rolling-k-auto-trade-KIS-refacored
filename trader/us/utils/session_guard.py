@@ -78,7 +78,45 @@ def _atomic_write_new(path: Path, payload: dict) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
+def _unverified_child_fence_path(trade_date: str, session: str) -> Path:
+    return _GUARD_BASE / trade_date / f"{session}.child_unverified.fence"
+
+
+def read_us_session_child_unverified_fence(trade_date: str, session: str) -> dict:
+    """Durable no-restart fence. Only explicit broker-truth recovery can clear it."""
+    path = _unverified_child_fence_path(trade_date, session)
+    if not path.exists():
+        return {}
+    payload = _read_json(path)
+    return payload or {"state": "CHILD_UNVERIFIED", "reason": "unreadable_fence"}
+
+
+def mark_us_session_child_unverified_fence(trade_date: str, session: str, *,
+                                            run_id: str, pid: int, reason: str) -> Path:
+    """Fence all new ticks even after parent PID dies or running lock gets stale."""
+    path = _unverified_child_fence_path(trade_date, session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"state": "CHILD_UNVERIFIED", "market": "US", "trade_date": trade_date,
+               "session": session, "run_id": run_id, "pid": pid,
+               "broker_submission_truth": "UNVERIFIED", "reason": reason,
+               "created_at_et": now_et_iso()}
+    # Existing fence must never be overwritten by a later run.
+    try:
+        _atomic_write_new(path, payload)
+    except FileExistsError:
+        pass
+    logger.critical("[US_SESSION_GUARD][CHILD_UNVERIFIED_FENCE] path=%s pid=%s", path, pid)
+    return path
+
+
 def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, stale_minutes: int | None = None) -> dict:
+    # Persistent fail-closed state is checked BEFORE stale-lock reclamation
+    # and even before the test bypass. A dead parent PID is not broker truth.
+    unverified = read_us_session_child_unverified_fence(trade_date, session)
+    if unverified:
+        return {"acquired": False, "reason": "CHILD_UNVERIFIED_FENCE",
+                "path": str(_unverified_child_fence_path(trade_date, session)),
+                "payload": unverified}
     if os.getenv("US_BYPASS_RUNNING_LOCK_FOR_TEST") == "1":
         return {"acquired": True, "reason": "BYPASS_FOR_TEST", "path": str(_running_path(trade_date, session))}
     stale_minutes = int(stale_minutes or _STALE_DEFAULTS.get(session, 240))
@@ -110,6 +148,11 @@ def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, 
 
 
 def release_us_session_running_lock(trade_date: str, session: str, run_id: str | None = None) -> dict:
+    # Also protects atexit hooks that otherwise release locks unconditionally.
+    if read_us_session_child_unverified_fence(trade_date, session):
+        logger.critical("[US_SESSION_GUARD][LOCK_RELEASE_DENIED] trade_date=%s session=%s reason=CHILD_UNVERIFIED", trade_date, session)
+        return {"released": False, "reason": "CHILD_UNVERIFIED_FENCE",
+                "path": str(_running_path(trade_date, session))}
     path = _running_path(trade_date, session)
     payload = _read_json(path)
     if run_id and payload and str(payload.get("run_id")) != str(run_id):
