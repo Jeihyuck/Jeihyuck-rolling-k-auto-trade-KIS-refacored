@@ -95,6 +95,9 @@ def _child_fence_scope(env: str | None = None) -> dict:
     # its unreaped child under a different account's fence.
     if str(us_cfg.KIS_ENV or "").strip().lower() != name:
         raise ValueError("BROKER_ENV_CONFIG_MISMATCH")
+    shell_env = str(os.getenv("KIS_ENV") or "").strip().lower()
+    if shell_env and shell_env != name:
+        raise ValueError("BROKER_ENV_CONFIG_MISMATCH")
     for field, configured in (("CANO_US", cano), ("CANO", cano),
                               ("ACNT_PRDT_CD_US", product),
                               ("ACNT_PRDT_CD", product)):
