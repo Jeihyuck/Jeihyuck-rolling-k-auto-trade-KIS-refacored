@@ -10,6 +10,25 @@ from pathlib import Path
 from typing import Any
 
 
+def _replay_account_identity(value: object, lookup_context: dict | None) -> str:
+    """One canonical comparison for KIS raw CANO and durable account hash.
+
+    Only an authenticated, account-and-product-scoped KIS query may bind
+    CANO to an internal hash. Unproven raw IDs are never guessed into hashes.
+    """
+    ctx = lookup_context or {}
+    raw = str(value or "").strip().upper()
+    cano = str(ctx.get("broker_account_no") or "").strip().upper()
+    digest = str(ctx.get("account_id") or "").strip().upper()
+    if (raw and cano and digest and raw == cano
+            and ctx.get("verified") is True
+            and ctx.get("source") == "kis_authenticated_order_book"
+            and ctx.get("account_product_code")
+            and ctx.get("env")):
+        return digest
+    return raw
+
+
 def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: str,
                               requested_qty: int, source_trade_date: str,
                               journal_event: dict, lookup_context: dict | None = None) -> bool:
@@ -78,12 +97,7 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
     # Those identities belong to the immutable submit/ACK journal, NEVER
     # to the current tick's lookup context or a synthesized ORDER_OPEN row.
     def canonical_account(value):
-        raw = str(value or "").strip().upper()
-        # KIS identifies CANO while the durable execution claim stores a
-        # SHA256 account fingerprint (env/CANO/product), not raw CANO.
-        if scoped and raw == str(ctx.get("broker_account_no") or "").upper() and raw:
-            return str(ctx["account_id"]).upper()
-        return raw
+        return _replay_account_identity(value, ctx if scoped else None)
 
     for field in ("exchange", "market", "account_id", "account_key", "cano"):
         local = recorded(field)
@@ -182,6 +196,13 @@ def _replay_detail_identity_conflicts(row: dict, *, order_no: str, symbol: str,
             expected = context.get("account_id" if key in {"account_id", "account_key", "cano"} else key)
         if expected not in (None, ""):
             lhs, rhs = str(value).upper(), str(expected).upper()
+            if key in {"account_id", "account_key", "cano"}:
+                lhs = _replay_account_identity(value, context)
+                rhs = _replay_account_identity(expected, context)
+                if context.get("verified") is True and context.get("account_id"):
+                    scope_account = _replay_account_identity(context["account_id"], context)
+                    if lhs != scope_account:
+                        return True
             if key == "exchange":
                 aliases = {"NASD": "NASDAQ", "NAS": "NASDAQ", "AMS": "AMEX"}
                 lhs, rhs = aliases.get(lhs, lhs), aliases.get(rhs, rhs)
