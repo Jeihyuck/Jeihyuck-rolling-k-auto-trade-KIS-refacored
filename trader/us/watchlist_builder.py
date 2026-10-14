@@ -1304,7 +1304,27 @@ def repair_final30_effective_caps(
                 reject("would_exceed_etf_cap")
             else:
                 reject("not_selected_after_repair")
+    unique_remaining = {
+        str(row.get("symbol") or "").upper() for row in pool
+        if str(row.get("symbol") or "").upper() not in
+           {str(current.get("symbol") or "").upper() for current in out}
+    }
+    needed = max(0, finaln - len(out))
+    if remaining:
+        failure_reason = "no_cap_safe_roster"
+    elif needed == 0:
+        failure_reason = ""
+    elif len(unique_remaining) < needed:
+        failure_reason = "qualified_replacement_pool_exhausted"
+    elif search_diagnostics.get("joint_search_complete"):
+        # Feasible cardinalities have been checked exactly by cluster DP.
+        # Eligible candidates exist, but no cap-clean joint completion does.
+        failure_reason = "cap_constrained_no_feasible_expansion"
+    else:
+        failure_reason = "replacement_search_incomplete"
     return out, {
+        "missing_target_slots": needed,
+        "remaining_eligible_replacements": len(unique_remaining),
         "original_count": original_count,
         "original_cap_violations": original_violations,
         "replacement_pool_count": len(candidate_pool or []),
@@ -1316,8 +1336,7 @@ def repair_final30_effective_caps(
         "cap_violations": remaining,
         "cluster_contract_ok": not remaining,
         "actual_final30_count": len(out),
-        "repair_failure_reason": ("no_cap_safe_roster" if remaining else
-                                  "qualified_replacement_pool_exhausted" if len(out) < finaln else ""),
+        "repair_failure_reason": failure_reason,
     }
 
 
