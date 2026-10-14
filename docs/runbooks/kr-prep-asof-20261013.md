@@ -6,8 +6,8 @@
   `https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip`
   and `.../kosdaq_code.mst.zip`.
 - The source contracts are the official KIS sample parsers
-  `open-trading-api/stocks_info/kis_kospi_code_mst.py` (228-character tail)
-  and `kis_kosdaq_code_mst.py` (222-character tail).
+  `open-trading-api/stocks_info/kis_kospi_code_mst.py` (227-character record tail after LF removal)
+  and `kis_kosdaq_code_mst.py` (221-character record tail after LF removal).
 - Decode each file as CP949 *before* splitting the official character-width columns; byte-width splitting corrupts multibyte fields. The capitalisation
   field is nine characters before the final group (3), credit (1), mortgage (1),
   and stock lending (1) bytes. Filter invalid, duplicate or zero-cap codes.
@@ -57,3 +57,7 @@ PREP required 150+150. Original attempt fell through to an absent emergency
 seed and persisted a FAILED universe with zero members. The KIS master
 solution avoids the [091] 30-row pagination contract instead of relaxing
 the existing 300-name design policy.
+
+### 2026-10-14 official-KIS layout correction
+- Live KIS files first proved 150+150 retrieval, but the initial mock failed to catch a one-character cap offset. Official KIS scripts slice 228 (KOSPI) and 222 (KOSDAQ) **including** a terminal newline, while field specifications total 227 and 221. After whole-file CP949 decoding and splitlines(), the parser must use **227/221**.
+- New regression checks the exact nine-character capitalisation value and the official field-width totals, not only the number of tickers. Fresh real-source CI must pass after this fix.
