@@ -2447,7 +2447,8 @@ def run_trade_session(
         )
 
         # ── 파일 기반 done 마커 기록 (성공/경고 종료 시만) ────────────────────────
-        if final_status not in ("FAILED", "SKIP"):
+        if (not final_status.startswith("FAILED") and final_status != "SKIP"
+                and not _unreaped_child_seen):
             write_us_session_done_file(
                 trade_date=trade_date,
                 session=session,
@@ -2507,7 +2508,7 @@ def run_trade_session(
                 session_state_path, state="CHILD_UNVERIFIED" if _child_fenced else "CLOSED",
                 session=session, session_run_id=session_run_id,
                 session_generation=session_generation, active_tick_id="",
-                broker_submission_truth="UNVERIFIED" if _child_fenced else "RECONCILED",
+                broker_submission_truth="UNVERIFIED" if _child_fenced else "NOT_ASSERTED",
                 run_source=run_source,
             )
         except Exception:
@@ -2522,6 +2523,10 @@ def run_trade_session(
                 write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="LOCK_RELEASED", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
             except Exception:
                 pass
+        elif sys.exc_info()[0] is None:
+            # Even if an inner tick-error handler swallowed the child failure,
+            # no session can return OK while order authority remains alive.
+            raise RuntimeError("US_SESSION_CHILD_UNVERIFIED_LOCK_HELD")
 def main() -> None:
     from trader.us.utils.logging_utils import setup_us_logging
     setup_us_logging()
