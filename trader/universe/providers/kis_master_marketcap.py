@@ -141,7 +141,7 @@ class KISMasterMarketcapProvider:
         # The official daily KIS master has no explicit as-of date per record.
         # The prior-session association is a morning-publication rule,
         # NOT a claim that a historical KIS endpoint was queried.
-        return [{**row, "actual_as_of": requested.isoformat(),
+        return [{**row, "actual_as_of": (None if readonly_probe else requested.isoformat()),
                  "source_published_on": published_on.isoformat(),
                  "source_sha256": digest}
                 for row in rows[:int(n)]]
