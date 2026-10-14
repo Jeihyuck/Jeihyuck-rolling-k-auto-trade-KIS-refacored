@@ -534,10 +534,15 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             identity = event_id or repr(sorted(event.items()))
             unique_events[identity] = event
         events = list(unique_events.values())
-    grouped: dict[str, list[dict]] = {}
+    # A durable order key may have multiple attempts across restarts. Split
+    # broker-possible attempts rather than discarding an earlier real fill
+    # when a later attempt has been submitted under the same client key.
+    grouped: dict[tuple[str, str], list[dict]] = {}
     for event in events:
         key = str(event.get("client_order_key") or "").strip()
-        if key: grouped.setdefault(key, []).append(event)
+        attempt = str(event.get("submit_attempt_id") or "").strip()
+        if key:
+            grouped.setdefault((key, attempt), []).append(event)
     counts = {"db_ack_restored_count": 0, "broker_full_fill_count": 0,
               "broker_partial_fill_count": 0, "broker_unfilled_ack_count": 0,
               "broker_rejected_count": 0, "broker_unknown_count": 0,
@@ -610,22 +615,16 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         for pos in balance.get("positions") or []:
             positions_by_symbol[str(pos.get("symbol") or pos.get("pdno") or "").upper()] = pos
 
-    for key, order_events in grouped.items():
-        # The most recent *submitted attempt* is authoritative for a key,
-        # rather than the most recent ORDER_OPEN/REPLAY observation. A later
-        # retry may share the same durable client key with an older attempt.
+    for (key, active_attempt), order_events in grouped.items():
+        # Each submit attempt retains its own immutable owner, order number
+        # and broker outcome. Processing all broker-possible attempts is
+        # essential when an earlier fill arrives AFTER a newer ACK.
         submitted = next(
             (event for event in reversed(order_events)
              if event.get("event_type") == "BROKER_SUBMIT_STARTED"), None,
         )
         if submitted is None:
             continue
-        active_attempt = str(submitted.get("submit_attempt_id") or "")
-        if active_attempt:
-            order_events = [
-                event for event in order_events
-                if str(event.get("submit_attempt_id") or "") == active_attempt
-            ]
         types = {e.get("event_type") for e in order_events}
         if "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types:
             continue
