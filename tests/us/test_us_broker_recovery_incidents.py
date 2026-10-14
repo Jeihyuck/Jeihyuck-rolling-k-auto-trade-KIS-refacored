@@ -376,7 +376,7 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
             "symbol": "REPLAY_TEST",
             "exchange": "NASDAQ",
             "side": "SELL",
-            "qty": 1,
+            "qty": 1, "session": "am",
             "limit_price": 10,
             "submitted_at_utc": "2026-10-01T14:00:00+00:00",
             "strategy_owner": "US_STANDARD",
@@ -417,6 +417,11 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
         def get_balance(self, **_kwargs):
             self.balance_calls += 1
             return {"positions": []}
+
+        def get_order_lookup_provenance(self, trade_date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": trade_date, "market": "US",
+                    "account_id": "mock-account", "session": "am"}
 
         def get_today_orders(self, trade_date):
             self.order_calls += 1
