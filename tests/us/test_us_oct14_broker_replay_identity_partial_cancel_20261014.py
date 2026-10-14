@@ -141,7 +141,6 @@ def test_absent_kis_row_account_session_and_date_require_proven_scope(proof):
         requested_qty=2, source_trade_date="2026-10-13",
         journal_event=journal, lookup_context=proven)
     for field, value in (("account_id", "wrong-account"),
-                         ("session", "afternoon"),
                          ("query_trade_date", "2026-10-12")):
         wrong = dict(proven, **{field: value})
         assert not _replay_order_row_matches(
@@ -163,3 +162,27 @@ def test_broker_detail_fallback_rejects_cross_account_and_source_date(proof):
             requested_qty=2, source_trade_date="2026-10-13",
             journal_event=journal, lookup_context={},
         ), key
+
+
+def test_historical_order_is_not_falsely_rejected_by_current_session(proof):
+    """A new tick in afternoon may reconcile yesterday's original AM order."""
+    immutable, order = proof
+    for name in ("session", "session_run_id", "session_generation",
+                 "trading_epoch_id", "trade_date", "account_id"):
+        order.pop(name, None)
+    context = {"verified": True, "source": "kis_authenticated_order_book",
+               "query_trade_date": "2026-10-13", "market": "US",
+               "account_id": "account-1",
+               "session": "afternoon", "session_run_id": "current-run",
+               "session_generation": 8}
+    assert _replay_order_row_matches(
+        order, order_no="0000043251", symbol="MCK", side="SELL",
+        requested_qty=2, source_trade_date="2026-10-13",
+        journal_event=immutable, lookup_context=context,
+    )
+    order["session_run_id"] = "wrong-original-run"
+    assert not _replay_order_row_matches(
+        order, order_no="0000043251", symbol="MCK", side="SELL",
+        requested_qty=2, source_trade_date="2026-10-13",
+        journal_event=immutable, lookup_context=context,
+    )
