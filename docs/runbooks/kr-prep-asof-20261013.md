@@ -61,3 +61,9 @@ the existing 300-name design policy.
 ### 2026-10-14 official-KIS layout correction
 - Live KIS files first proved 150+150 retrieval, but the initial mock failed to catch a one-character cap offset. Official KIS scripts slice 228 (KOSPI) and 222 (KOSDAQ) **including** a terminal newline, while field specifications total 227 and 221. After whole-file CP949 decoding and splitlines(), the parser must use **227/221**.
 - New regression checks the exact nine-character capitalisation value and the official field-width totals, not only the number of tickers. Fresh real-source CI must pass after this fix.
+
+### Durable DB source evidence (pre-merge safety review)
+- `universe_runs.build_reason` now preserves both KIS ZIP SHA-256 digests and the publication date in a compact versioned `kis_master_v1` token. `UniverseRepo.get_latest_successful_universe_snapshot` reads it back.
+- Reused SUCCESS snapshots are rejected if the token is missing, malformed, fails previous-session/date validation, or has invalid checksums. The stored record still is not a cryptographic signature of KIS's source; it makes the exact input ZIP files auditable and rejects undated legacy runs.
+- This uses the existing DB column; no schema or Windows scheduler changes. Existing prior SUCCESS rows that lack the token are intentionally **not** re-admitted for new BUY without fresh proof.
+- Added an end-to-end mocked universe build regression asserting 300 persisted members and both ZIP hashes are supplied to the DB store call.
