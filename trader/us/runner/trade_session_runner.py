@@ -1432,7 +1432,6 @@ def run_trade_session(
                             prep_run_id=str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),
                             tick_id=tick_id,
                             active_session_state_path=str(session_state_path),
-                            child_fence_account_scope=session_account_scope,
                             blocked_symbol_sides=[list(x) for x in sorted(timeout_blocked_symbol_sides)],
                             session_balance_temp_error_count=temp_error_count,
                             balance_consecutive_failed_ticks=consecutive_balance_failed_ticks,
@@ -1466,6 +1465,7 @@ def run_trade_session(
                             process_result = run_tick_in_process(
                                 run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
                                 terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
+                                fence_account_scope=session_account_scope,
                             )
                         except TickChildUnverifiedError as exc:
                             _unreaped_child_seen = True
