@@ -904,6 +904,7 @@ def run_trade_session(
     from trader.us.utils.session_guard import (
         acquire_us_session_running_lock,
         release_us_session_running_lock,
+        _child_fence_scope,
         check_us_session_file_guard,
         now_et_iso,
         write_us_session_done_file,
@@ -912,7 +913,9 @@ def run_trade_session(
 
     running_lock = acquire_us_session_running_lock(trade_date, session, run_id, env=env)
     if running_lock.get("acquired"):
-        atexit.register(release_us_session_running_lock, trade_date, session, run_id, env=env)
+        session_account_scope = _child_fence_scope(env)
+        atexit.register(release_us_session_running_lock, trade_date, session, run_id,
+                        env=env, account_scope=session_account_scope)
         # Do not publish a phantom ACTIVE session when durable child
         # uncertainty has already denied acquiring the execution lock.
         _write_active_session_state(
@@ -1429,6 +1432,7 @@ def run_trade_session(
                             prep_run_id=str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),
                             tick_id=tick_id,
                             active_session_state_path=str(session_state_path),
+                            child_fence_account_scope=session_account_scope,
                             blocked_symbol_sides=[list(x) for x in sorted(timeout_blocked_symbol_sides)],
                             session_balance_temp_error_count=temp_error_count,
                             balance_consecutive_failed_ticks=consecutive_balance_failed_ticks,
@@ -1470,6 +1474,7 @@ def run_trade_session(
                                 mark_us_session_child_unverified_fence(
                                     trade_date, session, run_id=session_run_id, pid=0,
                                     reason=str(exc), env=env,
+                                    account_scope=session_account_scope,
                                 )
                             except Exception:
                                 logger.exception("[US_SESSION][CHILD_FENCE_PERSIST_FAILED]")
@@ -2496,9 +2501,15 @@ def run_trade_session(
 
     finally:
         from trader.us.utils.session_guard import read_us_session_child_unverified_fence
-        _child_fenced = _unreaped_child_seen or bool(
-            read_us_session_child_unverified_fence(trade_date, session, env=env)
-        )
+        try:
+            _fence_record = read_us_session_child_unverified_fence(
+                trade_date, session, env=env, account_scope=session_account_scope,
+            )
+        except ValueError as exc:
+            # Never release the authority lock after a broker scope mutation.
+            logger.critical("[US_SESSION][BROKER_SCOPE_CHANGED][LOCK_HELD] reason=%s", exc)
+            _fence_record = {"reason": str(exc)}
+        _child_fenced = _unreaped_child_seen or bool(_fence_record)
         if _child_fenced:
             final_status = "FAILED_CHILD_UNVERIFIED"
             final_reason = "tick_child_unreaped_broker_truth_unverified"
@@ -2521,7 +2532,8 @@ def run_trade_session(
         except Exception:
             pass
         if not _child_fenced:
-            release_us_session_running_lock(trade_date, session, run_id=run_id, env=env)
+            release_us_session_running_lock(trade_date, session, run_id=run_id,
+                                            env=env, account_scope=session_account_scope)
             try:
                 write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="LOCK_RELEASED", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
             except Exception:
