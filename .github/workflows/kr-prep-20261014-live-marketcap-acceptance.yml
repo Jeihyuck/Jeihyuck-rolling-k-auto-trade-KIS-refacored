@@ -1,0 +1,58 @@
+name: KR PREP Live Marketcap Readonly Acceptance
+
+# PR-only read from the same dated source used by canonical PREP.
+# No broker, no DB writes, no scheduler, no secrets.
+on:
+  pull_request:
+    branches:
+      - dual-agent
+    paths:
+      - '.github/workflows/kr-prep-20261014-live-marketcap-acceptance.yml'
+      - 'trader/universe/providers/krx_marketcap_asof.py'
+      - 'trader/universe/providers/krx_provider.py'
+      - 'trader/universe/build.py'
+      - 'trader/prep_runner.py'
+      - 'tests/kr/test_kr_prep_asof_commit_provenance_20261014.py'
+
+jobs:
+  dated-source-150-plus-150:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      DRY_RUN: '1'
+      ALLOW_REAL_ORDER: '0'
+      KIS_ORDER_ALLOWED: '0'
+      PB1_KIS_ORDER_ALLOWED: '0'
+      US_KIS_ORDER_ALLOWED: '0'
+      KIS_HTTP_BLOCK: '1'
+      PYTHONPATH: '.'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dated source dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Validate 2026-10-13 live KRX market-cap source, read only
+        run: |
+          timeout --signal=TERM --kill-after=10s 210s python - <<'PY'
+          import json
+          from trader.universe.providers.krx_marketcap_asof import KRXAsOfMarketcapProvider
+          provider = KRXAsOfMarketcapProvider()
+          codes = set()
+          output = {}
+          for market in ('KOSPI', 'KOSDAQ'):
+              rows = provider.get_marketcap_top_with_meta(market, '2026-10-13', 150)
+              assert len(rows) == 150, (market, len(rows))
+              for item in rows:
+                  assert item['market'] == market
+                  assert item['actual_as_of'] == '2026-10-13'
+                  assert float(item['market_cap']) > 0
+                  assert item['code'] not in codes
+                  codes.add(item['code'])
+              output[market] = {'rows': len(rows), 'sample_codes': [r['code'] for r in rows[:4]]}
+          assert len(codes) == 300
+          print('[KR_PREP_LIVE_SOURCE][PASS] ' + json.dumps(output, sort_keys=True))
+          PY
