@@ -91,6 +91,10 @@ def test_unreaped_child_blocks_all_us_sessions_and_later_trade_dates_for_same_ac
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CANO", "12345678")
     monkeypatch.setenv("ACNT_PRDT_CD", "01")
+    from trader.us import config as us_cfg
+    monkeypatch.setattr(us_cfg, "CANO", "12345678")
+    monkeypatch.setattr(us_cfg, "ACNT_PRDT_CD", "01")
+    monkeypatch.setattr(us_cfg, "KIS_ENV", "practice")
     import trader.us.utils.session_guard as guard
     source_date = "2026-10-13"
     assert guard.acquire_us_session_running_lock(source_date, "am", "source", env="practice")["acquired"]
@@ -110,13 +114,26 @@ def test_unreaped_child_blocks_all_us_sessions_and_later_trade_dates_for_same_ac
     assert guard.release_us_session_running_lock(source_date, "am", "source", env="practice")["released"] is False
 
     # The precise account+environment is the fence scope, not all US accounts.
-    assert guard.acquire_us_session_running_lock(
-        "2026-10-14", "am", "other-environment", env="prod",
-    )["acquired"] is True
+    # Merely changing the shell cannot impersonate another KIS account:
+    # it is a configuration mismatch and must fail before lock admission.
+    monkeypatch.setenv("CANO", "87654321")
+    mismatch = guard.acquire_us_session_running_lock(
+        "2026-10-14", "am", "shell-conflict", env="practice",
+    )
+    assert mismatch["acquired"] is False
+    assert mismatch["reason"] == "BROKER_ACCOUNT_CONFIG_MISMATCH"
+    monkeypatch.setenv("CANO", "12345678")
+    monkeypatch.setattr(us_cfg, "CANO", "87654321")
     monkeypatch.setenv("CANO", "87654321")
     assert guard.acquire_us_session_running_lock(
-        "2026-10-14", "am", "other-account", env="practice",
+        "2026-10-14", "am", "real-other-account", env="practice",
     )["acquired"] is True
+    monkeypatch.setattr(us_cfg, "KIS_ENV", "prod")
+    assert guard.acquire_us_session_running_lock(
+        "2026-10-14", "am", "real-other-env", env="prod",
+    )["acquired"] is True
+    monkeypatch.setattr(us_cfg, "KIS_ENV", "practice")
+    monkeypatch.setattr(us_cfg, "CANO", "12345678")
     monkeypatch.setenv("CANO", "12345678")
     assert guard.acquire_us_session_running_lock(
         "2026-10-14", "am", "same-again", env="practice",
@@ -126,3 +143,35 @@ def test_unreaped_child_blocks_all_us_sessions_and_later_trade_dates_for_same_ac
     assert len(scope_files) == 1
     assert "12345678" not in str(scope_files[0])
     assert "12345678" not in scope_files[0].read_text()
+
+
+def test_child_account_scope_is_pinned_to_broker_identity_not_shell(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from trader.us import config as us_cfg
+    import trader.us.utils.session_guard as guard
+    monkeypatch.setattr(us_cfg, "KIS_ENV", "practice")
+    monkeypatch.setattr(us_cfg, "CANO", "11223344")
+    monkeypatch.setattr(us_cfg, "ACNT_PRDT_CD", "01")
+    monkeypatch.setenv("CANO", "11223344")
+    monkeypatch.setenv("ACNT_PRDT_CD", "01")
+    pinned = guard._child_fence_scope("practice")
+    assert guard.acquire_us_session_running_lock(
+        "2026-10-13", "am", "initial", env="practice", account_scope=pinned,
+    )["acquired"]
+    monkeypatch.setenv("CANO", "99887766")
+    denied = guard.acquire_us_session_running_lock(
+        "2026-10-14", "afternoon", "should-not-run",
+        env="practice", account_scope=pinned,
+    )
+    assert denied["acquired"] is False
+    assert denied["reason"] == "BROKER_ACCOUNT_CONFIG_MISMATCH"
+    # A later child that did not exit writes to the original pinned scope,
+    # regardless of what the shell environment has become.
+    guard.mark_us_session_child_unverified_fence(
+        "2026-10-13", "am", run_id="initial", pid=9876,
+        reason="simulated_child_alive", env="practice", account_scope=pinned,
+    )
+    monkeypatch.setenv("CANO", "11223344")
+    assert guard.acquire_us_session_running_lock(
+        "2026-10-15", "close", "blocked", env="practice",
+    )["reason"] == "CHILD_UNVERIFIED_FENCE"
