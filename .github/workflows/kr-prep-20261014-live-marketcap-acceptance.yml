@@ -38,6 +38,8 @@ jobs:
           python-version: '3.11'
       - name: Install dated source dependencies
         run: python -m pip install -r requirements.txt
+      - name: Verify read-only probe shell syntax
+        run: bash -n scripts/wsl/verify-krx-asof-readonly.sh
       - name: Check KRX login configuration (no secret values logged)
         run: |
           if [[ -z "${KRX_ID:-}" || -z "${KRX_PW:-}" ]]; then
