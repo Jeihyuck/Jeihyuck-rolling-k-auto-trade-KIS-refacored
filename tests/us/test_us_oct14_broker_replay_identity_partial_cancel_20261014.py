@@ -393,6 +393,7 @@ def test_multi_order_collision_actual_ledger_and_replay_survives_restarts(
         )
     class Provider:
         reads = 0
+        source_reads = 0
         def get_balance(self, force_refresh=False):
             return {"positions": []}
         def get_order_lookup_provenance(self, trade_date):
@@ -404,11 +405,16 @@ def test_multi_order_collision_actual_ledger_and_replay_survives_restarts(
             self.reads += 1
             if trade_date != original_date:
                 return []
+            self.source_reads += 1
+            # A later observation timestamp with UNCHANGED cumulative qty
+            # is the same broker truth, not a second fill.
+            old_seen_at = ("2026-10-14T01:31:00Z" if self.source_reads == 1
+                           else "2026-10-14T01:35:00Z")
             return [
                 {"order_no": "0000010201", "status": "FILLED",
                  "symbol": "AMD", "side": "SELL", "requested_qty": 1,
                  "filled_qty": 1, "remaining_qty": 0,
-                 "avg_price": 23.75, "observed_at": "2026-10-14T01:31:00Z",
+                 "avg_price": 23.75, "observed_at": old_seen_at,
                  "trade_date": "20261014"},
                 {"order_no": "0000010202", "status": "OPEN",
                  "symbol": "AMD", "side": "SELL", "requested_qty": 1,
