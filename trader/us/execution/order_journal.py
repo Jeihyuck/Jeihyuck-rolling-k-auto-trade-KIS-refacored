@@ -410,8 +410,21 @@ def load_order_events(trade_date: str, *, session_run_id: str | None = None) -> 
     path = journal_path(trade_date)
     if not path.exists():
         return []
-    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return [e for e in events if not session_run_id or e.get("session_run_id") == session_run_id]
+    # Offline JSONL may contain repeated deliveries of the same cumulative
+    # observation (the DB ledger already uses UNIQUE idempotency_key).
+    # Retain the earliest durable event, never add the same broker fill twice.
+    unique: dict[str, dict] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if session_run_id and event.get("session_run_id") != session_run_id:
+            continue
+        identity = str(event.get("idempotency_key") or event.get("event_id") or "")
+        if not identity:
+            raise ValueError("order_journal_event_missing_identity")
+        unique.setdefault(identity, event)
+    return list(unique.values())
 
 
 def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None) -> dict:
