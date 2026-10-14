@@ -69,8 +69,17 @@ def test_official_byte_layout_parses_cp949_and_orders_capitalisation():
         assert len(rows) == 180
         assert rows[0]["code"] == "100000"
         assert rows[0]["name"] == "가상기업0"
+        assert rows[0]["market_cap"] == 100000000
+        assert rows[-1]["market_cap"] == 100000000 - 179 * 100
         assert rows[0]["market_cap"] > rows[-1]["market_cap"]
         assert rows[-1]["code"] == "100179"
+
+
+def test_official_kis_tail_width_excludes_newline():
+    # KIS sample slices row[-228:] (KOSPI) / row[-222:] (KOSDAQ)
+    # including LF; its official fixed-width field specs total 227/221.
+    assert master.LAYOUT["KOSPI"] == ("kospi_code.mst", 227)
+    assert master.LAYOUT["KOSDAQ"] == ("kosdaq_code.mst", 221)
 
 
 def test_live_shape_readonly_150_each_and_provenance():
