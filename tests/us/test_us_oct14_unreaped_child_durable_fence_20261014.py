@@ -23,6 +23,15 @@ def test_durable_fence_outlives_dead_parent_and_refuses_atexit_release(tmp_path,
     next_run = guard.acquire_us_session_running_lock(td, session, "second-run", stale_minutes=1)
     assert next_run["acquired"] is False
     assert next_run["reason"] == "CHILD_UNVERIFIED_FENCE"
+    # The full runner must refuse starting even its ACTIVE state file.
+    import trader.us.runner.trade_session_runner as runner
+    result = runner.run_trade_session(
+        session=session, env="practice", offline=True,
+        force_now="2026-10-13T09:35:00-04:00", max_ticks=1,
+    )
+    assert result["status"] == "SKIP"
+    assert result["reason"] == "duplicate_session_running"
+    assert not list((tmp_path / "runtime/us/session_state" / td).glob("*.json"))
 
 
 def test_runner_integrates_unreaped_child_into_session_finally(tmp_path, monkeypatch):
