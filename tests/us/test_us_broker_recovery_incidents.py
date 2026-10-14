@@ -454,22 +454,6 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
         include_active_claims=True,
         active_claims_only=True,
     )
-    from trader.us.execution.order_journal import load_order_events, _replay_order_row_matches
-    previous = load_order_events(TRADE_DATE)
-    last_proof = previous[-1]
-    lookup = provider.get_order_lookup_provenance(TRADE_DATE)
-    print("SECOND_REPLAY_DEBUG", {
-        "last_events": [(e.get("event_type"), e.get("qty"), e.get("session"),
-                         e.get("session_run_id"), e.get("trade_date"), e.get("exchange"),
-                         e.get("broker_order_no"), e.get("meta")) for e in previous[-3:]],
-        "scope": lookup,
-        "fastpath_match": _replay_order_row_matches(
-            provider.get_today_orders(TRADE_DATE)[0],
-            order_no="broker-unresolved-attempt", symbol="REPLAY_TEST", side="SELL",
-            requested_qty=1, source_trade_date=TRADE_DATE,
-            journal_event=last_proof, lookup_context=lookup,
-        ),
-    })
     second = replay_order_journal(
         TRADE_DATE,
         provider=provider,
@@ -478,10 +462,7 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
     )
 
     assert first["broker_unfilled_ack_count"] == 1, first
-    assert second["broker_unfilled_ack_count"] == 1, {
-        "second": second, "first": first, "provider_order_calls": provider.order_calls,
-        "provider_fill_calls": provider.fill_calls,
-    }
+    assert second["broker_unfilled_ack_count"] == 1, second
     # The exact OPEN row is already in each fresh same-invocation KIS
     # order book; do not repeat an entire CCNL REST request through the
     # per-order helper. Each replay still refetches broker truth.
