@@ -650,7 +650,7 @@ def _build_from_kis_master(
             "provider_contract": "kis_daily_morning_master",
             "targets": dict(TARGETS),
         },
-    }, "krx_marketcap_asof"
+    }, "kis_master_marketcap"
 
 
 def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
