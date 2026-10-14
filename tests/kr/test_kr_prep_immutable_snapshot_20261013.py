@@ -25,8 +25,8 @@ def test_prep_krx_150_plus_150_preserves_candidate_policy():
             assert n == 150
             return _rows(market)
     result, reason = build._build_from_krx_asof(Provider(), "2026-10-12")
-    assert reason == "krx_marketcap_asof"
-    assert result["source"] == "krx_marketcap_asof"
+    assert reason == "kis_master_marketcap"
+    assert result["source"] == "kis_master_marketcap"
     assert result["params"]["actual_as_of"] == "2026-10-12"
     assert len(result["members"]) == 300
     assert len({x["code"] for x in result["members"]}) == 300
@@ -55,7 +55,7 @@ def test_prep_prior_success_is_not_reset_by_force_rebuild(monkeypatch):
         def get_latest_successful_universe_snapshot(self, **_kwargs):
             return {
                 "run_id": "previous-success", "as_of": as_of,
-                "actual_as_of": as_of, "provider": "krx_marketcap_asof",
+                "actual_as_of": as_of, "provider": "kis_master_marketcap",
                 "status": "SUCCESS", "members": saved,
             }
         def start_universe_run(self, **_kw):
