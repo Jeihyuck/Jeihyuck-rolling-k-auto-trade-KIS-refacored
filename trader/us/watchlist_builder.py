@@ -1312,9 +1312,15 @@ def repair_final30_effective_caps(
             else:
                 reject("not_selected_after_repair")
     present_symbols = {str(row.get("symbol") or "").upper() for row in out}
+    initially_selected = {str(row.get("symbol") or "").upper() for row in selected}
+    # A previously selected offender is not a newly available QUALIFIED
+    # replacement merely because the cap repair had to remove it. The full
+    # joint search above already tried adding it back if genuinely feasible.
+    # Count only additional admitted candidates when diagnosing supply.
     unique_remaining = {
         str(row.get("symbol") or "").upper() for row in pool
         if str(row.get("symbol") or "").upper() not in present_symbols
+        and str(row.get("symbol") or "").upper() not in initially_selected
     }
     # A zero-candidate joint search is still an exhausted supply, not an
     # unexplored possible combination. No search result is inferred from the
