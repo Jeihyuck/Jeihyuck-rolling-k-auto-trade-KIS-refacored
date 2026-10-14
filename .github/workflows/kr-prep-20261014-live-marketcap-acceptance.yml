@@ -46,22 +46,5 @@ jobs:
           fi
       - name: Validate 2026-10-13 live KRX market-cap source, read only
         run: |
-          timeout --signal=TERM --kill-after=10s 210s python - <<'PY'
-          import json
-          from trader.universe.providers.krx_marketcap_asof import KRXAsOfMarketcapProvider
-          provider = KRXAsOfMarketcapProvider()
-          codes = set()
-          output = {}
-          for market in ('KOSPI', 'KOSDAQ'):
-              rows = provider.get_marketcap_top_with_meta(market, '2026-10-13', 150)
-              assert len(rows) == 150, (market, len(rows))
-              for item in rows:
-                  assert item['market'] == market
-                  assert item['actual_as_of'] == '2026-10-13'
-                  assert float(item['market_cap']) > 0
-                  assert item['code'] not in codes
-                  codes.add(item['code'])
-              output[market] = {'rows': len(rows), 'sample_codes': [r['code'] for r in rows[:4]]}
-          assert len(codes) == 300
-          print('[KR_PREP_LIVE_SOURCE][PASS] ' + json.dumps(output, sort_keys=True))
-          PY
+          bash -n scripts/wsl/verify-krx-asof-readonly.sh
+          bash scripts/wsl/verify-krx-asof-readonly.sh 2026-10-13
