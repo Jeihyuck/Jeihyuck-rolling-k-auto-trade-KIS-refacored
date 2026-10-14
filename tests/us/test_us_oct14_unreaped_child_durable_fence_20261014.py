@@ -63,14 +63,12 @@ def test_runner_integrates_unreaped_child_into_session_finally(tmp_path, monkeyp
         raise ticks.TickChildUnverifiedError("mock unreaped child pid=2147483")
 
     monkeypatch.setattr(ticks, "run_tick_in_process", _unreaped)
-    try:
+    with pytest.raises((ticks.TickChildUnverifiedError, RuntimeError)):
         runner.run_trade_session(
             session="am", env="practice", offline=False,
             max_minutes=1, interval_sec=1, max_ticks=1,
             force_now="2026-06-05T09:35:00-04:00",
         )
-    except ticks.TickChildUnverifiedError:
-        pass
     state_files = list((tmp_path / "runtime/us/session_state/2026-06-05").glob("*.json"))
     assert state_files, "real session runner must write active session state"
     assert all(json.loads(path.read_text())["state"] == "CHILD_UNVERIFIED"
