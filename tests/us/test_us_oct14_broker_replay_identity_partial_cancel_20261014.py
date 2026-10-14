@@ -337,3 +337,127 @@ def test_same_client_key_two_real_broker_orders_preserves_proof_and_fences(monke
         row["raw_response"]["filled_qty"] == 1 for row in evidence
     )
     assert any(kind == "JOURNAL_REPLAY_UNRESOLVED" for kind, _ in recorded_events)
+
+
+@pytest.mark.parametrize("active_only", [False, True])
+def test_multi_order_collision_actual_ledger_and_replay_survives_restarts(
+        tmp_path, monkeypatch, active_only):
+    """Use REAL journal writer, JSONL and persisted DB JSONB payload contract."""
+    import json
+    import trader.us.execution.order_journal as journal
+    import trader.us.execution.fills as fills
+    import trader.us.db.repos as repos
+
+    original_date, current_date = "2026-10-13", "2026-10-14"
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("US_OFFLINE", "1")
+    store = {}
+    def save_event(row):
+        key = row["idempotency_key"]
+        store.setdefault(key, dict(row))
+        return True
+    def read_events(day, session_run_id=None):
+        result = []
+        for row in store.values():
+            if row["trade_date"] != day:
+                continue
+            item = {**row, **row["payload"]}
+            if not session_run_id or item.get("session_run_id") == session_run_id:
+                result.append(item)
+        return result
+    monkeypatch.setattr(repos, "append_us_order_event", save_event)
+    monkeypatch.setattr(repos, "load_us_order_events", read_events)
+    monkeypatch.setattr(
+        repos, "load_active_execution_claim_attempts",
+        lambda: [{"trade_date": original_date,
+                  "client_order_key": "one-claim",
+                  "active_attempt_id": "new"}],
+    )
+    def never_mutate(*args, **kwargs):
+        pytest.fail("conflicting KIS orders must not mutate us_orders or clear a claim")
+    monkeypatch.setattr(repos, "save_order_ack", never_mutate)
+    monkeypatch.setattr(repos, "apply_broker_order_observation", never_mutate)
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", never_mutate)
+    monkeypatch.setattr(
+        fills, "get_fills_today",
+        lambda provider, trade_date: {"status": "OK", "fills": []},
+    )
+    for attempt, order_no in (("old", "0000010201"), ("new", "0000010202")):
+        intent = {"trade_date": original_date, "client_order_key": "one-claim",
+                  "submit_attempt_id": attempt, "symbol": "AMD", "side": "SELL",
+                  "qty": 1, "session": "am", "exchange": "NASDAQ"}
+        journal.append_order_event("BROKER_SUBMIT_STARTED", intent)
+        journal.append_order_event(
+            "BROKER_ACK_RECEIVED", intent, broker_order_no=order_no,
+            broker_status="ACK",
+        )
+    class Provider:
+        reads = 0
+        def get_balance(self, force_refresh=False):
+            return {"positions": []}
+        def get_order_lookup_provenance(self, trade_date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": trade_date, "market": "US",
+                    "account_id": "verified-account-sha",
+                    "account_product_code": "01", "env": "practice"}
+        def get_today_orders(self, trade_date):
+            self.reads += 1
+            if trade_date != original_date:
+                return []
+            return [
+                {"order_no": "0000010201", "status": "FILLED",
+                 "symbol": "AMD", "side": "SELL", "requested_qty": 1,
+                 "filled_qty": 1, "remaining_qty": 0,
+                 "avg_price": 23.75, "observed_at": "2026-10-14T01:31:00Z",
+                 "trade_date": "20261014"},
+                {"order_no": "0000010202", "status": "OPEN",
+                 "symbol": "AMD", "side": "SELL", "requested_qty": 1,
+                 "filled_qty": 0, "remaining_qty": 1,
+                 "avg_price": 24.0, "observed_at": "2026-10-14T01:32:00Z",
+                 "trade_date": "20261014"},
+            ]
+    provider = Provider()
+    for _ in range(2):
+        result = journal.replay_order_journal(
+            current_date if active_only else original_date,
+            provider=provider, include_active_claims=active_only,
+            active_claims_only=active_only,
+        )
+        assert result["status"] == "UNRESOLVED", result
+        assert result["db_ack_restored_count"] == 0
+        assert result["broker_full_fill_count"] == 0
+        assert result["unresolved_symbol_sides"]
+    proof_type = "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
+    db_proofs = [v["payload"] for v in store.values() if v["event_type"] == proof_type]
+    assert len(db_proofs) == 2, db_proofs
+    assert {e["submit_attempt_id"] for e in db_proofs} == {"old", "new"}
+    assert {e["broker_order_no"] for e in db_proofs} == {
+        "0000010201", "0000010202",
+    }
+    filled = next(e for e in db_proofs if e["submit_attempt_id"] == "old")
+    opened = next(e for e in db_proofs if e["submit_attempt_id"] == "new")
+    assert filled["broker_evidence"]["cumulative_filled_qty"] == 1
+    assert filled["broker_evidence"]["remaining_qty"] == 0
+    assert filled["broker_evidence"]["avg_price"] == 23.75
+    assert filled["broker_evidence"]["observed_at"] == "2026-10-14T01:31:00Z"
+    assert filled["broker_evidence"]["lookup_scope"]["account_id"] == "verified-account-sha"
+    assert opened["broker_evidence"]["cumulative_filled_qty"] == 0
+    assert opened["broker_evidence"]["remaining_qty"] == 1
+    assert opened["broker_evidence"]["avg_price"] == 24.0
+    assert all(e["raw_response_hash"] and e["idempotency_key"] for e in db_proofs)
+    assert all("broker_account_no" not in json.dumps(e) for e in db_proofs)
+
+    # DB ledger and JSONL both carry the proof. Duplicate deliveries cannot
+    # be counted as new fills, even with a new per-event UUID/timestamp.
+    raw_jsonl = (tmp_path / "journal" / f"{original_date}.jsonl").read_text()
+    jsonl_proofs = [
+        json.loads(line) for line in raw_jsonl.splitlines()
+        if json.loads(line)["event_type"] == proof_type
+    ]
+    assert len(jsonl_proofs) >= 2
+    assert {x["idempotency_key"] for x in jsonl_proofs} == {
+        x["idempotency_key"] for x in db_proofs
+    }
+    monkeypatch.setattr(repos, "load_us_order_events", lambda *a, **kw: None)
+    deduped = journal.load_order_events(original_date)
+    assert sum(e["event_type"] == proof_type for e in deduped) == 2
