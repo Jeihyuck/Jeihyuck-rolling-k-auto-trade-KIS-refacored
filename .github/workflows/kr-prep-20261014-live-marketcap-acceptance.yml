@@ -28,6 +28,9 @@ jobs:
       US_KIS_ORDER_ALLOWED: '0'
       KIS_HTTP_BLOCK: '1'
       PYTHONPATH: '.'
+      # Only named GitHub Actions secrets are ever supplied; never log values.
+      KRX_ID: ${{ secrets.KRX_ID }}
+      KRX_PW: ${{ secrets.KRX_PW }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,6 +38,12 @@ jobs:
           python-version: '3.11'
       - name: Install dated source dependencies
         run: python -m pip install -r requirements.txt
+      - name: Check KRX login configuration (no secret values logged)
+        run: |
+          if [[ -z "${KRX_ID:-}" || -z "${KRX_PW:-}" ]]; then
+            echo "::error title=KRX_SOURCE_AUTH_NOT_CONFIGURED::KRX_ID/KRX_PW Actions secrets missing. Configure source authorization before treating PREP as merge ready."
+            exit 1
+          fi
       - name: Validate 2026-10-13 live KRX market-cap source, read only
         run: |
           timeout --signal=TERM --kill-after=10s 210s python - <<'PY'
