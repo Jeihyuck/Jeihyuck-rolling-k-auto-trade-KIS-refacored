@@ -58,4 +58,6 @@ def test_no_replacement_keeps_failure_reason_and_existing_underfill_policy():
     result, audit = repair_final30_effective_caps(rows, rows, {"max_ai_tech_ratio": 0.20}, 25, "NEUTRAL")
     assert len(result) == 23
     assert audit["repair_failure_reason"] == "qualified_replacement_pool_exhausted"
+    assert audit["remaining_eligible_replacements"] == 0
+    assert audit["missing_target_slots"] == 2
     assert audit["cap_violations"] == []
