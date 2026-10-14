@@ -175,3 +175,26 @@ def test_five_clusters_five_each_require_all_five_joint_additions():
         assert audit["replacement_search"]["forced_deletions"] == 0
         assert audit["cap_violations"] == []
         assert audit["repair_failure_reason"] == ""
+
+
+def test_cap_infeasibility_is_not_mislabeled_as_candidate_exhaustion():
+    clusters = ["HEALTHCARE", "FINANCIAL", "INDUSTRIAL", "OTHER", "CONSUMER_STAPLES"]
+    base = [
+        {"symbol": f"{name}_{i}", "theme_cluster": name, "score_final": 0.90}
+        for name in clusters for i in range(5)
+    ]
+    # Five legitimate scored candidates, but all in one already capped sector.
+    options = [
+        {"symbol": f"HEALTH_NEW_{i}", "theme_cluster": "HEALTHCARE", "score_final": 0.60}
+        for i in range(5)
+    ]
+    repaired, audit = repair_final30_effective_caps(
+        base, base + options,
+        {"max_single_cluster_ratio": 0.20, "max_ai_tech_ratio": 0.20},
+        30, "NEUTRAL",
+    )
+    assert len(repaired) == 25, audit
+    assert audit["remaining_eligible_replacements"] == 5
+    assert audit["missing_target_slots"] == 5
+    assert audit["repair_failure_reason"] == "cap_constrained_no_feasible_expansion"
+    assert audit["replacement_search"]["joint_search_complete"] is True
