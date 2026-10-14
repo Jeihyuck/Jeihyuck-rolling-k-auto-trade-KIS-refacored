@@ -134,7 +134,7 @@ def test_target_underfill_is_reported_even_when_count_increased():
          "score_final": 0.7}
         for i in range(23)
     ] + [
-        {"symbol": f"AI_{i}", "theme_cluster": "AI_SOFTWARE", "score_final": 0.75}
+        {"symbol": f"AI_{i}", "theme_cluster": ["AI_SOFTWARE", "MEGA_TECH", "AI_SEMI", "AI_SOFTWARE", "MEGA_TECH"][i], "score_final": 0.75}
         for i in range(5)
     ]
     pool = rows + [{"symbol": "SAFE_NEW", "theme_cluster": "INDUSTRIAL",
