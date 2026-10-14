@@ -260,6 +260,54 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
             "expected_realized_pnl",
         )
     }
+    # Persist a small, typed proof envelope in JSONL and in DB JSONB.
+    # A SHA of the raw broker response by itself is NOT reconciliation proof.
+    # Never store the raw CANO, KIS tokens or the unsanitized broker row.
+    is_multi_broker_proof = event_type == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
+    observation = raw_response if isinstance(raw_response, dict) else {}
+    proof_scope = observation.get("broker_lookup_scope")
+    proof_scope = proof_scope if isinstance(proof_scope, dict) else {}
+    broker_proof = None
+    if is_multi_broker_proof:
+        if not (proof_scope.get("verified") is True
+                and proof_scope.get("provider_source") == "kis_authenticated_order_book"
+                and proof_scope.get("market") == "US"
+                and proof_scope.get("account_id")
+                and proof_scope.get("source_trade_date")):
+            raise ValueError("MULTI_BROKER_EVIDENCE_SCOPE_UNVERIFIED")
+        broker_proof = {
+            "requested_qty": observation.get("broker_requested_qty"),
+            "cumulative_filled_qty": observation.get("cumulative_filled_qty"),
+            "remaining_qty": observation.get("broker_remaining_qty"),
+            "avg_price": observation.get("broker_avg_price"),
+            "observed_at": observation.get("broker_observed_at") or datetime.now(timezone.utc).isoformat(),
+            "lookup_scope": {
+                key: proof_scope.get(key) for key in (
+                    "source_trade_date", "market", "provider_source",
+                    "verified", "account_id", "account_product_code", "env"
+                )
+            },
+        }
+        for field in ("requested_qty", "cumulative_filled_qty", "remaining_qty"):
+            value = broker_proof[field]
+            if value is not None:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"MULTI_BROKER_EVIDENCE_INVALID_{field}")
+                if not numeric.is_integer() or not 0 <= numeric < float("inf"):
+                    raise ValueError(f"MULTI_BROKER_EVIDENCE_INVALID_{field}")
+                broker_proof[field] = int(numeric)
+        price = broker_proof["avg_price"]
+        if price not in (None, ""):
+            try:
+                price = float(price)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("MULTI_BROKER_EVIDENCE_INVALID_PRICE")
+            if not 0 <= price < float("inf"):
+                raise ValueError("MULTI_BROKER_EVIDENCE_INVALID_PRICE")
+            broker_proof["avg_price"] = price
+
     event = {
         "event_id": str(uuid.uuid4()), "event_type": event_type, "trade_date": td,
         "session": intent.get("session") or getattr(context, "session", ""),
@@ -293,10 +341,31 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "fees": (raw_response or {}).get("fees") if isinstance(raw_response, dict) else None,
         "timestamp": datetime.now(timezone.utc).isoformat(), "raw_response_hash": hashlib.sha256(raw.encode()).hexdigest(),
     }
+    if broker_proof is not None:
+        event["broker_evidence"] = broker_proof
+        event["cumulative_filled_qty"] = broker_proof["cumulative_filled_qty"]
+        event["broker_remaining_qty"] = broker_proof["remaining_qty"]
+        event["broker_avg_price"] = broker_proof["avg_price"]
+        event["broker_observed_at"] = broker_proof["observed_at"]
     idem_material = "|".join(str(v or "") for v in (
         td, event.get("submit_attempt_id"), canonical_no, event_type,
         event.get("cumulative_filled_qty"), event.get("broker_execution_id"),
         event.get("raw_response_hash")))
+    if broker_proof is not None:
+        # Observations at different retrieval times with identical cumulative
+        # truth must not create new DB fill events or bypass the claim fence.
+        stable_proof = {
+            "trade_date": td, "attempt": event["submit_attempt_id"],
+            "client_order_key": event["client_order_key"],
+            "order_no": canonical_no, "event_type": event_type,
+            "status": str(broker_status or "").upper(),
+            "requested_qty": broker_proof["requested_qty"],
+            "filled_qty": broker_proof["cumulative_filled_qty"],
+            "remaining_qty": broker_proof["remaining_qty"],
+            "avg_price": broker_proof["avg_price"],
+            "lookup_scope": broker_proof["lookup_scope"],
+        }
+        idem_material = json.dumps(stable_proof, sort_keys=True, default=str)
     event["idempotency_key"] = hashlib.sha256(idem_material.encode()).hexdigest()
     event["raw_broker_order_no"] = broker_order_no
     event["canonical_broker_order_no"] = canonical_no
