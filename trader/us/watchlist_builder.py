@@ -1272,7 +1272,7 @@ def repair_final30_effective_caps(
         "cluster_contract_ok": not remaining,
         "actual_final30_count": len(out),
         "repair_failure_reason": ("no_cap_safe_roster" if remaining else
-                                  "qualified_replacement_pool_exhausted" if len(out) < len(selected) else ""),
+                                  "qualified_replacement_pool_exhausted" if len(out) < finaln else ""),
     }
 
 
