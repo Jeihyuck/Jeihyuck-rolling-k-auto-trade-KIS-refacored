@@ -50,3 +50,41 @@ When no trustworthy exact-asof source or snapshot exists, fail CLOSED for
 new BUY and log the primary KRX failure. Never rewrite an older snapshot as
 the new date. Never remove/reclassify broker fills, unresolved orders or
 positions in response to a PREP failure.
+
+
+## 2026-10-14 live-source acceptance result and authentication
+
+A dedicated **read-only** GitHub Actions test on 2026-10-14 returned
+`KRX fetch failed ... EmptyDataFrame` for `2026-10-13 KOSPI`.
+The upstream pykrx call reported `KRX 로그인 실패:
+KRX_ID 또는 KRX_PW 환경 변수가 설정되지 않았습니다.`.
+Therefore the pre-existing mocked provider suite passing is NOT proof that
+the current provider can build a 300-name universe in production.
+
+Before declaring MERGE READY, verify KRX login exists on the actual WSL
+host without printing credential values:
+
+```bash
+cd ~/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
+set -a
+source .env
+set +a
+for key in KRX_ID KRX_PW; do
+  if [[ -n "${!key:-}" ]]; then echo "$key=SET"; else echo "$key=MISSING"; fi
+done
+```
+
+If either is missing, configure authentication **outside Git and CI logs**.
+Do not place credentials in PR content, issue comments, job output or artifacts.
+
+A separate PR-only `KR PREP Live Marketcap Readonly Acceptance` checks for
+`KRX_ID`/`KRX_PW` GitHub Actions secrets. It fetches the real dated source
+and requires exactly 150 KOSPI + 150 KOSDAQ unique positive-cap symbols.
+Absence of secrets or an upstream provider failure is a HARD acceptance failure.
+A GitHub runner failing because it has no secrets does not prove the WSL host
+has the same problem; WSL must be checked independently.
+
+The prebuild is data-only, but once the credentials work the acceptance still
+requires provider source-date validation, the subsequent 300→Final30 chain and
+a fresh KIS practice session test. Until then the PREP repair remains DRAFT and
+no earlier or undated data may be promoted for BUY.
