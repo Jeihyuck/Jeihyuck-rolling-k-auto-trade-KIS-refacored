@@ -125,17 +125,26 @@ def test_twenty_eight_ai_six_two_safe_additions_fill_thirty_without_swap():
 
 
 def test_target_underfill_is_reported_even_when_count_increased():
+    # Use a genuine >=25 candidate normal-tier roster; the tiny 4-name
+    # synthetic roster is subject to unrelated Final30 per-cluster minima.
+    clusters = ["HEALTHCARE", "FINANCIAL", "INDUSTRIAL",
+                "OTHER", "ENERGY_MATERIALS", "CONSUMER_STAPLES"]
     rows = [
-        {"symbol": f"SAFE_{i}", "theme_cluster": "OTHER" if i % 2 else "FINANCIAL",
+        {"symbol": f"SAFE_{i}", "theme_cluster": clusters[i % len(clusters)],
          "score_final": 0.7}
-        for i in range(4)
+        for i in range(23)
+    ] + [
+        {"symbol": f"AI_{i}", "theme_cluster": "AI_SOFTWARE", "score_final": 0.75}
+        for i in range(5)
     ]
-    pool = rows + [{"symbol": "SAFE_NEW", "theme_cluster": "HEALTHCARE", "score_final": 0.6}]
+    pool = rows + [{"symbol": "SAFE_NEW", "theme_cluster": "INDUSTRIAL",
+                    "score_final": 0.6}]
+    caps = {"max_ai_tech_ratio": 0.2, "max_single_cluster_ratio": 0.2}
+    assert effective_final30_cap_violations(rows, caps, "NEUTRAL") == []
     repaired, audit = repair_final30_effective_caps(
-        rows, pool, {"max_ai_tech_ratio": 0.2, "max_single_cluster_ratio": 0.6},
-        6, "NEUTRAL",
+        rows, pool, caps, 30, "NEUTRAL",
     )
-    assert len(repaired) == 5
+    assert len(repaired) == 29
     assert audit["cap_violations"] == []
     assert audit["repair_failure_reason"] == "qualified_replacement_pool_exhausted"
-    assert audit["actual_final30_count"] == 5
+    assert audit["actual_final30_count"] == 29
