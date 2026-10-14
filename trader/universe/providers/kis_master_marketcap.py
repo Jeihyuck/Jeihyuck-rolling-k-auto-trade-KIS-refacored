@@ -30,8 +30,10 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 MASTER_BASE = "https://new.real.download.dws.co.kr/common/master"
 LAYOUT = {
-    "KOSPI": ("kospi_code.mst", 228),
-    "KOSDAQ": ("kosdaq_code.mst", 222),
+    # Official widths 228/222 INCLUDE trailing LF; splitlines removes LF.
+    # Actual fixed-width field specs total 227/221 characters respectively.
+    "KOSPI": ("kospi_code.mst", 227),
+    "KOSDAQ": ("kosdaq_code.mst", 221),
 }
 CODE_RE = re.compile(r"^[0-9]{6}$")
 
