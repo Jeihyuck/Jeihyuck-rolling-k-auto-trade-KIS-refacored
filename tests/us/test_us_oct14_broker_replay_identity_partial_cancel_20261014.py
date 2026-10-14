@@ -314,6 +314,9 @@ def test_same_client_key_two_real_broker_orders_preserves_proof_and_fences(monke
     class Provider:
         def get_balance(self, force_refresh=False):
             return {"positions": []}
+        def get_order_lookup_provenance(self, trade_date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": trade_date, "market": "US", "account_id": "acct"}
         def get_today_orders(self, trade_date):
             return [
                 {"order_no": "0000010201", "status": "FILLED", "symbol": "AMD",
