@@ -486,6 +486,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     events = load_order_events(trade_date, session_run_id=session_run_id)
     if tick_id:
         events = [e for e in events if e.get("tick_id") == tick_id]
+    # Full submit/ACK history is used ONLY for conflicting-order detection.
+    # The operational replay may subsequently select only the active attempt.
+    collision_evidence_events = list(events)
     active_claim_errors = []
     active_attempt_keys: set[tuple[str, str]] = set()
     if include_active_claims:
@@ -505,6 +508,13 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 if source_date == trade_date and not active_claims_only:
                     continue
                 source_events = load_order_events(source_date)
+                # Retain every submit attempt for this active claim key BEFORE
+                # applying the active-only filter. An older KIS ACK/fill cannot
+                # be made invisible merely because the claim points at a retry.
+                collision_evidence_events.extend(
+                    event for event in source_events
+                    if str(event.get("client_order_key") or "") == key
+                )
                 attempt_events = [
                     event for event in source_events
                     if str(event.get("client_order_key") or "") == key
@@ -543,13 +553,19 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         attempt = str(event.get("submit_attempt_id") or "").strip()
         if key:
             grouped.setdefault((key, attempt), []).append(event)
-    # us_orders is one row per client_order_key. If a broken retry
-    # produced two distinct real KIS order numbers under one key, attempting
-    # save_order_ack for both would overwrite broker identity. Preserve each
-    # proof in the immutable journal and retain the claim fence instead.
+    # Use UNSLICED submit history for collisions, never the filtered active
+    # replay set. This is critical when active_claims_only=True in production.
+    evidence_grouped: dict[tuple[str, str], list[dict]] = {}
+    for evidence_event in collision_evidence_events:
+        evidence_key = str(evidence_event.get("client_order_key") or "").strip()
+        evidence_attempt = str(evidence_event.get("submit_attempt_id") or "").strip()
+        if evidence_key:
+            evidence_grouped.setdefault((evidence_key, evidence_attempt), []).append(evidence_event)
+    # us_orders is one row per client_order_key. Never overwrite it with a
+    # second real KIS order number created by a conflicting retry.
     by_client_key: dict[str, set[str]] = {}
     possible_attempts_by_client_key: dict[str, set[str]] = {}
-    for (client_key, attempt), attempt_events in grouped.items():
+    for (client_key, attempt), attempt_events in evidence_grouped.items():
         types = {event.get("event_type") for event in attempt_events}
         if ("BROKER_SUBMIT_STARTED" in types
                 and "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" not in types):
@@ -669,20 +685,53 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             original_no = str((attempt_ack or {}).get("broker_order_no") or "")
             source_day = str(latest.get("trade_date") or trade_date)
             rows = orders_for_trade_date(source_day) if provider else None
+            lookup_scope = source_scope_by_trade_date.get(source_day) or {}
+            scope_verified = (
+                lookup_scope.get("verified") is True
+                and lookup_scope.get("source") == "kis_authenticated_order_book"
+                and str(lookup_scope.get("query_trade_date") or "").replace("-", "")
+                    == source_day.replace("-", "")
+                and str(lookup_scope.get("market") or "").upper() == "US"
+                and bool(lookup_scope.get("account_id"))
+            )
             for row in (rows or []):
-                if (original_no and _replay_order_row_matches(
+                if (original_no and scope_verified and _replay_order_row_matches(
                         row, order_no=original_no,
                         symbol=str(latest.get("symbol") or "").upper(),
                         side=str(latest.get("side") or "").upper(),
                         requested_qty=int(latest.get("qty") or 0),
                         source_trade_date=source_day, journal_event=latest,
-                        lookup_context=source_scope_by_trade_date.get(source_day),
+                        lookup_context=lookup_scope,
+                    ) and not _replay_detail_identity_conflicts(
+                        row, order_no=original_no,
+                        symbol=str(latest.get("symbol") or "").upper(),
+                        side=str(latest.get("side") or "").upper(),
+                        requested_qty=int(latest.get("qty") or 0),
+                        source_trade_date=source_day, journal_event=latest,
+                        lookup_context=lookup_scope,
                     )):
+                    evidence_scope = {
+                        "source_trade_date": source_day,
+                        "market": "US",
+                        "provider_source": "kis_authenticated_order_book",
+                        "verified": True,
+                        "account_id": str(lookup_scope["account_id"]),
+                        "account_product_code": str(lookup_scope.get("account_product_code") or ""),
+                        "env": str(lookup_scope.get("env") or ""),
+                    }
                     append_order_event(
                         "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE", latest,
                         broker_order_no=original_no,
                         broker_status=str(row.get("status") or "UNKNOWN"),
-                        raw_response=row,
+                        raw_response={
+                            "cumulative_filled_qty": row.get("filled_qty"),
+                            "broker_remaining_qty": row.get("remaining_qty", row.get("broker_open_qty")),
+                            "broker_avg_price": row.get("avg_price", row.get("avg_price_usd")),
+                            "broker_observed_at": (row.get("observed_at") or row.get("updated_at")
+                                                   or row.get("order_timestamp") or row.get("order_time")),
+                            "broker_requested_qty": row.get("requested_qty"),
+                            "broker_lookup_scope": evidence_scope,
+                        },
                     )
             counts["broker_unknown_count"] += 1
             unresolved_symbol_sides.append([str(latest.get("symbol") or "").upper(),
