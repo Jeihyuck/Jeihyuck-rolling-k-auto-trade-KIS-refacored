@@ -9,7 +9,7 @@ from pathlib import Path
 
 from trader import time_utils
 from trader.kr.calendar import resolve_kr_expected_as_of
-from trader.universe.build import _load_fallback_universe_from_db
+from trader.universe.build import _load_fallback_universe_from_db, _kis_master_proof
 from scripts import check_prep_duplicate_guard as duplicate_guard
 
 
@@ -34,6 +34,9 @@ def _snapshot(**changes) -> dict:
         "provider": "kis_master_marketcap",
         "actual_as_of": AS_OF,
         "run_id": "previous-verified-run",
+        "build_reason": _kis_master_proof(
+            AS_OF, "2026-10-12", {"KOSPI": "a" * 64, "KOSDAQ": "b" * 64}
+        ),
         "members": _members(),
     }
     result.update(changes)
