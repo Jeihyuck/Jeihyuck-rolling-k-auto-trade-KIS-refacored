@@ -431,15 +431,54 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 append_order_event("JOURNAL_REPLAY_DB_ACK_RESTORED", ack, broker_order_no=order_no, broker_status="JOURNAL_ACK_DB_RESTORED")
             broker_fill = None
             if provider is not None:
-                detail = getattr(provider, "get_fills_by_order_no", None)
-                if callable(detail):
-                    try:
-                        broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=event_trade_date)
-                    except TypeError as exc:
-                        counts["failed_count"] += 1
-                        unresolved_symbol_sides.append([symbol, side])
-                        append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
-                        continue
+                # A fresh account-scoped order book was already fetched for
+                # this source trade date in THIS invocation. Match the exact
+                # broker order/symbol/side here instead of causing another
+                # full KIS CCNL REST request per unresolved action. Reject
+                # quarantined/quantity-regressing observations; do not cache
+                # across ticks or generations.
+                if isinstance(event_orders, list):
+                    matches = [
+                        row for row in event_orders
+                        if normalize_us_order_no(row.get("order_no") or row.get("raw_order_no") or "")
+                        == normalize_us_order_no(order_no)
+                        and str(row.get("symbol") or "").upper() == symbol
+                        and str(row.get("side") or "").upper() == side
+                        and str(row.get("normalization_result") or "").lower() != "quarantined"
+                        and row.get("filled_qty_present") is not False
+                        and row.get("filled_qty") not in (None, "")
+                    ]
+                    if matches:
+                        def _fill_obs_time(row):
+                            return str(
+                                row.get("observed_at") or row.get("updated_at")
+                                or row.get("order_timestamp") or row.get("order_time") or ""
+                            )
+                        best = max(
+                            matches,
+                            key=lambda row: (int(row.get("filled_qty") or 0), _fill_obs_time(row)),
+                        )
+                        conflict = any(
+                            _fill_obs_time(row) > _fill_obs_time(best)
+                            and int(row.get("filled_qty") or 0) < int(best.get("filled_qty") or 0)
+                            for row in matches
+                        )
+                        broker_fill = dict(best)
+                        broker_fill["filled_qty"] = int(best.get("filled_qty") or 0)
+                        broker_fill["status"] = (
+                            "EVIDENCE_QUANTITY_REGRESSION" if conflict
+                            else str(best.get("status") or "OK")
+                        )
+                if broker_fill is None:
+                    detail = getattr(provider, "get_fills_by_order_no", None)
+                    if callable(detail):
+                        try:
+                            broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=event_trade_date)
+                        except TypeError as exc:
+                            counts["failed_count"] += 1
+                            unresolved_symbol_sides.append([symbol, side])
+                            append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
+                            continue
                 if not broker_fill and isinstance(event_fills, list):
                     matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
                     if matched:
