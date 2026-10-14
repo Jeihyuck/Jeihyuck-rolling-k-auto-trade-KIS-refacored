@@ -295,7 +295,7 @@ try:
         raise ValueError('not_object')
     if str(data.get('trade_date') or '')[:10] != trade_date:
         result = 'TRADE_DATE_MISMATCH'
-    elif data.get('contract_ok') is not True or data.get('trade_can_proceed') is not True:
+    elif data.get('contract_ok') not in (True, 1) or data.get('trade_can_proceed') not in (True, 1):
         result = 'CONTRACT_NOT_READY'
     elif int(data.get('final30_rows') or data.get('final30_scored_rows') or 0) != 30:
         result = 'FINAL30_ROWS_INVALID'
