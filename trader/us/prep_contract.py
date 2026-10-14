@@ -946,6 +946,20 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
         "close_can_proceed": bool(contract.get("close_can_proceed", trade_can_proceed)),
     }
 
+    # The runtime PREP artifact is authoritative but historically lacked a
+    # run_id.  This made the TQQQ owner-specific PB1 policy override
+    # impossible even with an intact, version-matched, scored PREP artifact.
+    # Fingerprint ONLY the validated dated artifact: not a DB cache or a
+    # fabricated successful run. Revision mismatch still denies the override.
+    artifact_hash = str(contract.get("final30_hash") or "").strip()
+    artifact_revision = str(contract.get("run_revision") or contract.get("git_commit_sha") or "").strip()
+    if artifact_hash and artifact_revision and contract.get("contract_version") == "us_sector_rotation_v3":
+        base_payload["prep_run_id"] = (
+            str(contract.get("run_id") or "").strip()
+            or f"artifact:{trade_date}:{artifact_revision}:{artifact_hash}"
+        )
+        base_payload["prep_artifact_identity_verified"] = True
+
     has_split_permissions = any(k in contract for k in ("entry_can_proceed", "exit_can_proceed", "close_can_proceed"))
     entry_can_proceed = int(contract.get("entry_can_proceed", trade_can_proceed) or 0)
     exit_can_proceed = int(contract.get("exit_can_proceed", trade_can_proceed) or 0)
