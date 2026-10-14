@@ -42,6 +42,13 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
         p=root/item; p.mkdir(parents=True); (p/"evidence.json").write_text('{"ok":true}')
     if market == "kr":
         (root/f"bot_state/trader_ledger/final30/practice/{trade_date}/final30_scored.json").write_text('{"rows": []}')
+        (root/f"runtime/kr/watchlist/{trade_date}/prep_contract.json").write_text(
+            json.dumps({"trade_date": trade_date, "contract_ok": True,
+                        "trade_can_proceed": True, "final30_rows": 30})
+        )
+        (root/f"reports/kr_prep/{trade_date}/kr_prep_summary.json").write_text(
+            json.dumps({"status": "OK", "reason": "KR_PREP_DONE", "final30_rows": 30})
+        )
     counter=root/"smtp-count"
     if smtp_mode != "dry":
         wrapper=root/"scripts/wsl/with-venv.sh"
@@ -125,6 +132,45 @@ def test_kr_mail_missing_final30_sends_degraded_with_exact_missing_path(tmp_path
         assert evidence["status"] == "DEGRADED"
         assert expected in json.dumps(evidence)
 
+
+
+def test_kr_mail_failed_prep_is_degraded_even_with_final30_present(tmp_path):
+    """A stale Final30 file cannot make an unsuccessful current PREP look healthy."""
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    contract = root / f"runtime/kr/watchlist/{DATE}/prep_contract.json"
+    contract.write_text(json.dumps({
+        "trade_date": DATE, "contract_ok": False,
+        "trade_can_proceed": False, "final30_rows": 30,
+        "reason": "provider_empty:emergency_seed_missing",
+    }))
+    summary = root / f"reports/kr_prep/{DATE}/kr_prep_summary.json"
+    summary.write_text(json.dumps({
+        "status": "FAIL", "reason": "PREP_RUNNER_FAILED", "final30_rows": 0,
+    }))
+    result, archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "DEGRADED" and marker["mail_sent"] is True
+    assert marker["mail_complete"] is False
+    missing_codes = {row["code"] for row in marker["missing_evidence"]}
+    assert "KR_PREP_CONTRACT_NOT_READY" in missing_codes
+    assert "KR_PREP_SUMMARY_NOT_OK" in missing_codes
+    with tarfile.open(archive, "r:gz") as tar:
+        manifest = json.load(tar.extractfile("./mail_evidence_report.json"))
+        assert manifest["status"] == "DEGRADED"
+        assert manifest["required_missing_count"] >= 2
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+
+def test_kr_mail_missing_prep_contract_still_sends_degraded(tmp_path):
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    (root / f"runtime/kr/watchlist/{DATE}/prep_contract.json").unlink()
+    result, _ = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "DEGRADED"
+    assert "KR_PREP_CONTRACT_MISSING" in {r["code"] for r in marker["missing_evidence"]}
+    assert (root / "smtp-count").read_text().strip() == "1"
 
 
 def test_kr_mail_previous_final30_skips_krx_holiday(tmp_path):
