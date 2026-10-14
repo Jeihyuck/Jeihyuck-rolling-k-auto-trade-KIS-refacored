@@ -6,10 +6,10 @@
   `https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip`
   and `.../kosdaq_code.mst.zip`.
 - The source contracts are the official KIS sample parsers
-  `open-trading-api/stocks_info/kis_kospi_code_mst.py` (228-byte tail)
-  and `kis_kosdaq_code_mst.py` (222-byte tail).
-- Read the CP949 bytes without lossy width conversion. The capitalisation
-  field is nine bytes before the final group (3), credit (1), mortgage (1),
+  `open-trading-api/stocks_info/kis_kospi_code_mst.py` (228-character tail)
+  and `kis_kosdaq_code_mst.py` (222-character tail).
+- Decode each file as CP949 *before* splitting the official character-width columns; byte-width splitting corrupts multibyte fields. The capitalisation
+  field is nine characters before the final group (3), credit (1), mortgage (1),
   and stock lending (1) bytes. Filter invalid, duplicate or zero-cap codes.
   Rank each market independently and require **150 KOSPI + 150 KOSDAQ**.
 - The daily master is **not a historical as-of API**. No proof of past
