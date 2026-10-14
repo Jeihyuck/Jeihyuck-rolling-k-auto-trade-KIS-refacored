@@ -81,6 +81,10 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
         if actual in (None, "") and field in {
                 "market", "session", "session_run_id", "session_generation",
                 "account_id", "account_key", "cano", "trading_epoch_id"}:
+            if local in (None, "") and field not in {"account_id", "market", "session"}:
+                # Optional extended IDs are not required when neither source
+                # claims that field. Do not fabricate an epoch or generation.
+                continue
             # A KIS row cannot claim a session or account implicitly. The
             # authenticated account+date lookup and a bound session can fill
             # the gap, but never a guessed context or unrelated tick.
@@ -101,6 +105,12 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
             elif str(local).upper() != str(actual).upper():
                 return False
     if row.get("trade_date") in (None, "") and not scoped:
+        return False
+    if (row.get("session") in (None, "") and row.get("session_run_id") in (None, "")
+            and (not scoped or not recorded("session") or not ctx.get("session"))):
+        return False
+    if (row.get("account_id") in (None, "") and row.get("cano") in (None, "")
+            and not scoped):
         return False
 
     expected_date = str(source_trade_date).replace("-", "")
