@@ -44,7 +44,7 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
         (root/f"bot_state/trader_ledger/final30/practice/{trade_date}/final30_scored.json").write_text('{"rows": []}')
         (root/f"runtime/kr/watchlist/{trade_date}/prep_contract.json").write_text(
             json.dumps({"trade_date": trade_date, "contract_ok": True,
-                        "trade_can_proceed": True, "final30_rows": 30})
+                        "trade_can_proceed": 1, "final30_rows": 30})
         )
         (root/f"reports/kr_prep/{trade_date}/kr_prep_summary.json").write_text(
             json.dumps({"status": "OK", "reason": "KR_PREP_DONE", "final30_rows": 30})
@@ -112,6 +112,22 @@ def test_kr_mail_accepts_runtime_watchlist_final30_without_ledger(tmp_path):
     result,_=run_mail(root,"kr")
     assert result.returncode == 0, result.stderr+result.stdout
     assert "[LOG_MAIL][DRY_RUN]" in result.stdout
+
+
+def test_kr_mail_complete_prep_integer_gate_is_not_degraded(tmp_path):
+    """Real PREP producer writes trade_can_proceed=1, not the bool True."""
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    contract_path = root / f"runtime/kr/watchlist/{DATE}/prep_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["trade_can_proceed"] == 1
+    result, _archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "OK"
+    assert marker["mail_complete"] is True
+    assert not any(str(item.get("code", "")).startswith("KR_PREP_")
+                   for item in marker.get("missing_evidence", []))
+    assert (root / "smtp-count").read_text().strip() == "1"
 
 
 def test_kr_mail_missing_final30_sends_degraded_with_exact_missing_path(tmp_path):
