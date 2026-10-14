@@ -65,8 +65,8 @@ logger = logging.getLogger(__name__)
 # universe_members only has market/name/rank/cap; its meta_json is not stored.
 # Encode compact source evidence in the existing universe_runs.build_reason.
 KIS_MASTER_PROOF_RE = re.compile(
-    r"^kis_master_v1\\|published=(\\d{4}-\\d{2}-\\d{2})"
-    r"\\|KOSPI=([0-9a-f]{64})\\|KOSDAQ=([0-9a-f]{64})$"
+    r"^kis_master_v1\|published=(\d{4}-\d{2}-\d{2})"
+    r"\|KOSPI=([0-9a-f]{64})\|KOSDAQ=([0-9a-f]{64})$"
 )
 
 
@@ -122,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--provider", default=None, help="Universe provider name")
-    parser.add_argument("--prep-recovery", action="store_true", help="Require exact-date KRX universe and PREP safety gates")
+    parser.add_argument("--prep-recovery", action="store_true", help="Require dated KIS official master universe and PREP safety gates")
     return parser.parse_args()
 
 
