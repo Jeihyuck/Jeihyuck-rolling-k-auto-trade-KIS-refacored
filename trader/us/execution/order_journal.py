@@ -77,6 +77,14 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
     # It does NOT know the original local session/generation/epoch/owner.
     # Those identities belong to the immutable submit/ACK journal, NEVER
     # to the current tick's lookup context or a synthesized ORDER_OPEN row.
+    def canonical_account(value):
+        raw = str(value or "").strip().upper()
+        # KIS identifies CANO while the durable execution claim stores a
+        # SHA256 account fingerprint (env/CANO/product), not raw CANO.
+        if scoped and raw == str(ctx.get("broker_account_no") or "").upper() and raw:
+            return str(ctx["account_id"]).upper()
+        return raw
+
     for field in ("exchange", "market", "account_id", "account_key", "cano"):
         local = recorded(field)
         actual = row.get(field)
@@ -86,21 +94,19 @@ def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: st
             actual = ctx["market"]
         elif actual in (None, "") and field == "account_id" and scoped:
             actual = ctx["account_id"]
-        # Optional alias fields are NOT an independent requirement for a
-        # scoped lookup when KIS explicitly supplied another account field.
-        # The mandatory account proof is checked once below.
         if actual in (None, ""):
             continue
         if local not in (None, ""):
             if field == "exchange":
                 if exchange_name(local) != exchange_name(actual):
                     return False
+            elif field in {"account_id", "account_key", "cano"}:
+                if canonical_account(local) != canonical_account(actual):
+                    return False
             elif str(local).upper() != str(actual).upper():
                 return False
-        # An explicitly specified row account must also match the signed
-        # provider scope even when the journal lacks the account field.
         if field in {"account_id", "account_key", "cano"} and scoped:
-            if str(actual).upper() != str(ctx["account_id"]).upper():
+            if canonical_account(actual) != canonical_account(ctx["account_id"]):
                 return False
 
     for field in ("session", "session_run_id", "session_generation",
