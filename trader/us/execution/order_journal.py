@@ -642,6 +642,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 or (broker_fill or {}).get("status")
                 or "OK"
             ).upper()
+            if broker_fill_status == "EVIDENCE_IDENTITY_CONFLICT":
+                counts["identity_mismatch_count"] += 1
+                unresolved_symbol_sides.append([symbol, side])
+                append_order_event("JOURNAL_REPLAY_FAILED", ack,
+                                   broker_order_no=order_no,
+                                   broker_status=broker_fill_status,
+                                   raw_response=broker_fill)
+                continue
             if broker_fill_status in {
                 "EVIDENCE_QUANTITY_REGRESSION",
                 "EVIDENCE_IDENTITY_CONFLICT",
