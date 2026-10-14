@@ -890,10 +890,6 @@ def run_trade_session(
     session_generation = int(os.getenv("US_SESSION_GENERATION", "1") or 1)
     run_source = os.getenv("US_RUN_SOURCE", "OPERATOR_MANUAL")
     session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
-    _write_active_session_state(
-        session_state_path, state="ACTIVE", session=session, session_run_id=session_run_id,
-        session_generation=session_generation, active_tick_id="", run_source=run_source,
-    )
     _unreaped_child_seen = False
     final_status = "OK"
     final_reason = "session_end"
@@ -917,6 +913,13 @@ def run_trade_session(
     running_lock = acquire_us_session_running_lock(trade_date, session, run_id)
     if running_lock.get("acquired"):
         atexit.register(release_us_session_running_lock, trade_date, session, run_id)
+        # Do not publish a phantom ACTIVE session when durable child
+        # uncertainty has already denied acquiring the execution lock.
+        _write_active_session_state(
+            session_state_path, state="ACTIVE", session=session,
+            session_run_id=session_run_id, session_generation=session_generation,
+            active_tick_id="", run_source=run_source,
+        )
     if not running_lock.get("acquired"):
         logger.warning(
             "[US_SESSION][SKIP_DUPLICATE_RUNNING] session=%s trade_date=%s reason=%s",
