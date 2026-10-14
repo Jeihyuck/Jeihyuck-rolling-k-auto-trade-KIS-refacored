@@ -148,3 +148,30 @@ def test_target_underfill_is_reported_even_when_count_increased():
     assert audit["cap_violations"] == []
     assert audit["repair_failure_reason"] == "qualified_replacement_pool_exhausted"
     assert audit["actual_final30_count"] == 29
+
+
+def test_five_clusters_five_each_require_all_five_joint_additions():
+    """25->30: every individual/intermediate append breaches a 20% sector cap."""
+    clusters = ["HEALTHCARE", "FINANCIAL", "INDUSTRIAL", "OTHER", "CONSUMER_STAPLES"]
+    base = [
+        {"symbol": f"{name}_{i}", "theme_cluster": name, "score_final": 0.95 - i * 0.01}
+        for name in clusters for i in range(5)
+    ]
+    increments = [
+        {"symbol": f"EXTRA_{name}", "theme_cluster": name, "score_final": 0.45}
+        for name in clusters
+    ]
+    caps = {"max_single_cluster_ratio": 0.20, "max_ai_tech_ratio": 0.20}
+    assert effective_final30_cap_violations(base, caps, "NEUTRAL") == []
+    import random
+    for seed in range(20):
+        candidates = base + increments
+        random.Random(seed).shuffle(candidates)
+        repaired, audit = repair_final30_effective_caps(base, candidates, caps, 30, "NEUTRAL")
+        assert len(repaired) == 30, (seed, audit)
+        assert {r["symbol"] for r in repaired} == {r["symbol"] for r in candidates}
+        assert audit["replacement_search"]["joint_refill_slots"] == 5
+        assert audit["replacement_search"]["joint_search_complete"] is True
+        assert audit["replacement_search"]["forced_deletions"] == 0
+        assert audit["cap_violations"] == []
+        assert audit["repair_failure_reason"] == ""
