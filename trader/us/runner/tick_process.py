@@ -210,6 +210,7 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
                             str(child_kwargs.get("session") or ""),
                             run_id=str(child_kwargs.get("session_run_id") or ""),
                             pid=pid, reason="child_alive_after_parent_shutdown",
+                            env=str(child_kwargs.get("env") or ""),
                         )
                     except Exception:
                         # The session runner independently catches this typed
