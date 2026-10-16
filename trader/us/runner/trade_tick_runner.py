@@ -2459,6 +2459,10 @@ def run_trade_tick(
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
 
+    # Process-local earliest readiness; observation only, never persisted.
+    _sell_signal_ready_by_symbol: dict[str, float] = {}
+    if tick_context is not None:
+        setattr(tick_context, "_sell_signal_ready_by_symbol", _sell_signal_ready_by_symbol)
     # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
@@ -2498,6 +2502,9 @@ def run_trade_tick(
                 # intent is available, before unrelated symbols' trend work.
                 # Never mutate risk state or order intent for telemetry.
                 _safety_ready_mono = time.monotonic()
+                for _ready_intent in safety_exit_intents or []:
+                    if str(_ready_intent.get("side") or "").upper() == "SELL":
+                        _sell_signal_ready_by_symbol.setdefault(str(_ready_intent.get("symbol") or "").upper(), _safety_ready_mono)
                 for _signal_index, _signal in enumerate(safety_exit_intents or []):
                     if str(_signal.get("side") or "").upper() == "SELL":
                         logger.info(
@@ -2527,6 +2534,9 @@ def run_trade_tick(
                 try:
                     trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
                     _trend_ready_mono = time.monotonic()
+                    for _ready_intent in trend_exit_intents or []:
+                        if str(_ready_intent.get("side") or "").upper() == "SELL":
+                            _sell_signal_ready_by_symbol.setdefault(str(_ready_intent.get("symbol") or "").upper(), _trend_ready_mono)
                     for _signal_index, _signal in enumerate(trend_exit_intents or []):
                         if str(_signal.get("side") or "").upper() == "SELL":
                             logger.info(
