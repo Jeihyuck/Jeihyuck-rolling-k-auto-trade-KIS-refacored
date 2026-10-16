@@ -2585,6 +2585,10 @@ def run_trade_tick(
                 and str(recon.get("status") or "").upper() == "OK"
                 and str(ack_recon.get("status") or "").upper() == "OK"
                 and int(ack_recon.get("unresolved_count") or 0) == 0
+                and isinstance(active_claim_recovery_result, dict)
+                and str(active_claim_recovery_result.get("status") or "").upper()
+                    in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
+                and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
                 and _exit_observer_supported
             )
             _pilot_safety_intents: list[dict] = []
