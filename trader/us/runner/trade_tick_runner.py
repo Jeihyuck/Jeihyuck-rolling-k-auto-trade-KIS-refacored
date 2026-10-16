@@ -4537,9 +4537,19 @@ def run_trade_tick(
     _by_attempt = tick_context.metrics.get("sell_signal_to_broker_boundary_by_attempt_ms", {})
     _by_attempt = _by_attempt if isinstance(_by_attempt, dict) else {}
     _per_attempt_observations = dict(list(_by_attempt.items())[:128])
+    _first_by_attempt = tick_context.metrics.get(
+        "sell_first_candidate_to_broker_by_attempt_ms", {}
+    )
+    _first_by_attempt = _first_by_attempt if isinstance(_first_by_attempt, dict) else {}
+    _first_candidate_observations = dict(list(_first_by_attempt.items())[:128])
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
         "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
+        "sell_first_candidate_to_broker_by_attempt_ms": _first_candidate_observations,
+        "sell_first_candidate_truncated_count": (
+            max(0, len(_first_by_attempt) - len(_first_candidate_observations))
+            + int(tick_context.metrics.get("sell_first_candidate_dropped_count", 0))
+        ),
         "sell_signal_to_broker_boundary_truncated_count": (
             max(0, len(_by_attempt) - len(_per_attempt_observations))
             + int(tick_context.metrics.get("sell_signal_to_broker_boundary_dropped_count", 0))
