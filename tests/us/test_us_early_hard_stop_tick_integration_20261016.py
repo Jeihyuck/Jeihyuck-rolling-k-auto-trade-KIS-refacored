@@ -26,6 +26,16 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0")
     monkeypatch.setenv("US_ENTRY_ENABLED", "0")
     monkeypatch.setenv("KIS_ENV", "practice")
+    # This fixture explicitly models clean, available durable-order evidence.
+    # Strict early routing must refuse to submit if either lookup fails.
+    monkeypatch.setattr(
+        "trader.us.protective_tp_recovery.load_crossday_unresolved_tp_lifecycles",
+        lambda *args, **kwargs: set(),
+    )
+    monkeypatch.setattr(
+        "trader.us.db.repos.has_pending_order_for_symbol_side",
+        lambda **kwargs: False,
+    )
     positions = [
         {"symbol": "AAA", "strategy_owner": "US_STANDARD",
          "exchange": "NASDAQ", "qty": 2, "orderable_qty": 2,
