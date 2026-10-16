@@ -1305,7 +1305,7 @@ def _exit_family(intent: dict) -> str:
     return fallback or "OTHER_EXIT"
 
 
-def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
+def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) -> list[dict]:
     """Select one deterministic SELL per symbol while retaining absorbed reasons."""
     priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TIME_STOP": 3,
                 "TREND_TRIM": 3, "TAKE_PROFIT": 4}
@@ -1320,6 +1320,11 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     for symbol, rows in grouped.items():
         rows.sort(key=lambda row: (priority.get(_exit_family(row[1]), 99), row[0]))
         selected = dict(rows[0][1])
+        if on_selected is not None:
+            try:
+                on_selected(rows[0][1], selected)
+            except Exception:
+                logger.warning("[US_EXIT][SELECTED_TRACE_FAILED] symbol=%s", symbol)
         selected_meta = dict(selected.get("meta") or {})
         selected_reason = str(selected.get("reason") or selected_meta.get("reason") or _exit_family(selected))
         absorbed = [str(row.get("reason") or (row.get("meta") or {}).get("reason") or _exit_family(row))
@@ -1446,7 +1451,25 @@ def route_exit_orders_immediately(
     """
     from trader.us.execution.order_router import route_order
 
-    sell_intents = [i for i in merge_exit_intents_by_symbol(exit_intents) if str(i.get("side") or "").upper() == "SELL"]
+    def _track_actual_selection(original: dict, selected: dict) -> None:
+        # Explicitly resolve attribution *after* all overlay/cluster/defense
+        # candidates have entered the same legacy priority merge.
+        selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
+        by_identity = getattr(context, "_sell_selected_ready_by_identity", None)
+        if not isinstance(selected_ready, dict):
+            return
+        symbol = str(original.get("symbol") or "").upper()
+        value = by_identity.get(id(original)) if isinstance(by_identity, dict) else None
+        if isinstance(value, (int, float)):
+            selected_ready[symbol] = value
+        else:
+            selected_ready.pop(symbol, None)
+
+    sell_intents = [
+        i for i in merge_exit_intents_by_symbol(
+            exit_intents, on_selected=_track_actual_selection,
+        ) if str(i.get("side") or "").upper() == "SELL"
+    ]
     logger.info("[US_EXIT][ROUTE_IMMEDIATE][START] exit_intents=%d", len(sell_intents))
     orders: list[dict] = []
     decisions: list[dict] = []
