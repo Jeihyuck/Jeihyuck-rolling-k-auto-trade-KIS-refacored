@@ -502,8 +502,13 @@ def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_in
 
 def _suppress_pending_sell_exit_intents(
     exit_intents: list[dict], trade_date: str, *, env: str = "practice",
+    strict: bool = False,
 ) -> list[dict]:
-    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP."""
+    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP.
+
+    strict is for the *opt-in early pilot only*: stale/unavailable DB evidence
+    cannot authorize a submission. The existing late route stays unchanged.
+    """
     def _standard_lifecycle(intent: dict) -> str:
         meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
         owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
@@ -534,13 +539,15 @@ def _suppress_pending_sell_exit_intents(
             )
         except Exception as exc:
             logger.warning(
-                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=use_existing_order_gate",
-                exc,
+                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=%s",
+                exc, "FAIL_CLOSED_EARLY_PILOT" if strict else "use_existing_order_gate",
             )
+            if strict:
+                return []
     try:
         from trader.us.db.repos import has_pending_order_for_symbol_side
     except Exception:
-        return exit_intents
+        return [] if strict else exit_intents
     statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
     kept: list[dict] = []
     for intent in exit_intents:
@@ -560,6 +567,8 @@ def _suppress_pending_sell_exit_intents(
             pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
         except Exception as exc:
             logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
+            if strict:
+                return []
             pending = False
         if pending:
             logger.info("[US_EXIT][INTENT_SUPPRESS] symbol=%s reason=pending_sell_order_exists", symbol)
@@ -2651,7 +2660,7 @@ def run_trade_tick(
                 # Preserve historical TP fences and same-symbol pending-order
                 # suppression before any possible broker submission.
                 _eligible = _suppress_pending_sell_exit_intents(
-                    _eligible, trade_date, env=env,
+                    _eligible, trade_date, env=env, strict=True,
                 )
                 if len(_eligible) != 1:
                     return
