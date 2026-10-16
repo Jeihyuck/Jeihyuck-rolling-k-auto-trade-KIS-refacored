@@ -2494,6 +2494,19 @@ def run_trade_tick(
                 exit_snapshots = []
             try:
                 safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
+                # Observation only: record the first point at which each safety
+                # intent is available, before unrelated symbols' trend work.
+                # Never mutate risk state or order intent for telemetry.
+                _safety_ready_mono = time.monotonic()
+                for _signal_index, _signal in enumerate(safety_exit_intents or []):
+                    if str(_signal.get("side") or "").upper() == "SELL":
+                        logger.info(
+                            "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=safety index=%d symbol=%s "
+                            "family=%s ready_mono_ns=%d observed_at_utc=%s",
+                            tick_index, _signal_index, str(_signal.get("symbol") or "").upper(),
+                            _exit_family(_signal), int(_safety_ready_mono * 1_000_000_000),
+                            datetime.now(timezone.utc).isoformat(),
+                        )
             except Exception as _safety_eval_exc:
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
                 safety_exit_intents = []
@@ -2513,6 +2526,16 @@ def run_trade_tick(
             if trend_targets:
                 try:
                     trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
+                    _trend_ready_mono = time.monotonic()
+                    for _signal_index, _signal in enumerate(trend_exit_intents or []):
+                        if str(_signal.get("side") or "").upper() == "SELL":
+                            logger.info(
+                                "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=trend index=%d symbol=%s "
+                                "family=%s ready_mono_ns=%d observed_at_utc=%s",
+                                tick_index, _signal_index, str(_signal.get("symbol") or "").upper(),
+                                _exit_family(_signal), int(_trend_ready_mono * 1_000_000_000),
+                                datetime.now(timezone.utc).isoformat(),
+                            )
                 except Exception as _trend_eval_exc:
                     logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
                     trend_exit_intents = []
