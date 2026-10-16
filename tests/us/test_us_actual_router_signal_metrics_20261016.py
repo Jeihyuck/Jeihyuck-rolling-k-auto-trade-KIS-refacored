@@ -4,14 +4,25 @@ Neither fake broker call performs HTTP. This verifies that diagnostics do
 not change route outcomes and selected vs first-candidate metrics stay split.
 """
 import time
+from dataclasses import replace
 
+from trader.us.execution import order_router
 from trader.us.execution.order_router import route_order
 from trader.us.execution.tick_context import TickExecutionContext
-from tests.us.test_us_route_order_claim_boundary import _intent, _route_fixture
+from tests.us.test_us_route_order_claim_boundary import _intent, _route_fixture, _identity
 
 
 def test_exact_selected_and_symbol_first_remain_separate_across_two_attempts(monkeypatch):
     _engine, _claims, broker = _route_fixture(monkeypatch)
+    # The durable semantic fence is lifecycle-scoped, never order-key-scoped.
+    # Two symbols with independent lifecycles must not share a test identity.
+    monkeypatch.setattr(
+        order_router, "_semantic_action_identity",
+        lambda intent, *, account_env: replace(
+            _identity(str(intent["trade_date"]), "EXIT"),
+            lifecycle_id="lifecycle-" + str(intent["symbol"]),
+        ),
+    )
     context = TickExecutionContext(
         "2026-10-02", "am", "trace-run", 1, "trace-tick",
         deadline=time.monotonic() + 30,
