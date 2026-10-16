@@ -1007,7 +1007,23 @@ def prepare_exit_position_snapshots(
     snapshots: list[dict] = []
     for original_pos in positions:
         _snapshot_start_mono = time.monotonic()
+        _quote_elapsed_ms = 0.0
+        _state_elapsed_ms = 0.0
         pos = dict(original_pos or {})
+
+        def _observe_snapshot_outcome(outcome: str, reason: str = "") -> None:
+            # Pure observation. Failure must not affect the exit/risk path.
+            try:
+                logger.info(
+                    "[US_EXIT][SNAPSHOT_OUTCOME] symbol=%s owner=%s lifecycle=%s "
+                    "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f",
+                    symbol, pos.get("strategy_owner") or pos.get("owner") or "",
+                    pos.get("position_lifecycle_id") or "",
+                    outcome, reason, (time.monotonic() - _snapshot_start_mono) * 1000.0,
+                    _quote_elapsed_ms, _state_elapsed_ms,
+                )
+            except Exception:
+                pass
         symbol = pos.get("symbol", "")
         raw_exchange = pos.get("exchange", "NASDAQ")
         try:
@@ -1018,6 +1034,7 @@ def prepare_exit_position_snapshots(
                 symbol, raw_exchange, exc
             )
             exchange = "NASDAQ"
+        _quote_started_mono = time.monotonic()
         try:
             if hasattr(provider, "get_current_price"):
                 price_data = provider.get_current_price(symbol, exchange)
@@ -1035,6 +1052,8 @@ def prepare_exit_position_snapshots(
                             symbol, exchange, price_data.get("source") or "unknown",
                             quote_quality or "unknown", price_data.get("asof") or price_data.get("_stale_date") or price_data.get("asof_epoch"),
                         )
+                        _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+                        _observe_snapshot_outcome("SKIP", "quote_stale")
                         continue
                     current_price = float(price_data.get("last") or price_data.get("price") or 0)
                 else:
@@ -1045,10 +1064,15 @@ def prepare_exit_position_snapshots(
                 current_price = float(pos.get("current_price") or pos.get("current_price_usd") or pos.get("last_price") or 0)
         except Exception as exc:
             logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
+            _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+            _observe_snapshot_outcome("SKIP", "quote_exception")
             continue
+        _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
         if current_price <= 0:
             logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
+            _observe_snapshot_outcome("SKIP", "price_nonpositive")
             continue
+        _state_started_mono = time.monotonic()
         entry_price_for_state = _resolve_position_entry_price(pos)
         if entry_price_for_state > 0 and current_price > 0:
             try:
@@ -1136,6 +1160,8 @@ def prepare_exit_position_snapshots(
                 "current_price_usd": current_price,
                 "current_price": current_price,
             })
+        _state_elapsed_ms = (time.monotonic() - _state_started_mono) * 1000.0
+        _observe_snapshot_outcome("READY")
         # This observation happens after the existing per-symbol quote and
         # risk-state work. It does not perform another evaluation or mutation.
         logger.info(
