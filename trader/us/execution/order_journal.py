@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _replay_account_identity(value: object, lookup_context: dict | None) -> str:
