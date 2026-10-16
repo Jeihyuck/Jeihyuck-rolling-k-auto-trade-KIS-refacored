@@ -1936,9 +1936,20 @@ def route_order(
             _metrics = getattr(context, "metrics", None)
             if isinstance(_metrics, dict):
                 _metrics["sell_signal_to_broker_boundary_ms"] = _delay_ms
-                _metrics.setdefault("sell_signal_to_broker_boundary_by_attempt_ms", {})[
-                    str(intent["submit_attempt_id"])
-                ] = _delay_ms
+                _samples = _metrics.setdefault(
+                    "sell_signal_to_broker_boundary_by_attempt_ms", {},
+                )
+                # Bound telemetry independently of the durable order journal.
+                # Every attempt still has a structured log even after overflow.
+                if isinstance(_samples, dict) and (
+                    len(_samples) < 128
+                    or str(intent["submit_attempt_id"]) in _samples
+                ):
+                    _samples[str(intent["submit_attempt_id"])] = _delay_ms
+                else:
+                    _metrics["sell_signal_to_broker_boundary_dropped_count"] = (
+                        int(_metrics.get("sell_signal_to_broker_boundary_dropped_count", 0)) + 1
+                    )
 
     set_submit_boundary = getattr(kis_client, "set_before_order_http", None)
     clear_submit_boundary = getattr(kis_client, "clear_before_order_http", None)
