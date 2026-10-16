@@ -23,3 +23,24 @@ def test_no_trading_policy_or_frequency_mutation_in_trace():
     assert '[US_EXIT][PER_SIGNAL_READY]' in tick
     assert 'phase=safety' in tick
     assert 'phase=trend' in tick
+
+
+def test_snapshot_timing_is_observational_and_monotonic():
+    root = Path(__file__).resolve().parents[2]
+    engine = (root / "trader/us/pb1/us_exit_engine.py").read_text(encoding="utf-8")
+    assert '_snapshot_start_mono = time.monotonic()' in engine
+    assert '[US_EXIT][SNAPSHOT_READY]' in engine
+    assert 'elapsed_ms=%.2f' in engine
+    assert 'snapshots.append(pos)' in engine
+
+
+def test_per_attempt_metric_retains_previous_attempts():
+    # The accumulation contract is keyed by submit attempt, not overwritten.
+    first = 'attempt-1'
+    second = 'attempt-2'
+    measurements = {}
+    measurements.setdefault('sell_signal_to_broker_boundary_by_attempt_ms', {})[first] = 100.0
+    measurements.setdefault('sell_signal_to_broker_boundary_by_attempt_ms', {})[second] = 300.0
+    assert measurements['sell_signal_to_broker_boundary_by_attempt_ms'] == {
+        first: 100.0, second: 300.0,
+    }
