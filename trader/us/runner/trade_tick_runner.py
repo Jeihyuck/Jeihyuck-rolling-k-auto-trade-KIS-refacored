@@ -4495,7 +4495,10 @@ def run_trade_tick(
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
         "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
-        "sell_signal_to_broker_boundary_truncated_count": max(0, len(_by_attempt) - len(_per_attempt_observations)),
+        "sell_signal_to_broker_boundary_truncated_count": (
+            max(0, len(_by_attempt) - len(_per_attempt_observations))
+            + int(tick_context.metrics.get("sell_signal_to_broker_boundary_dropped_count", 0))
+        ),
         "balance_snapshot_ms": float(tick_context.metrics.get("balance_snapshot_ms", 0)),
         "balance_snapshot_logical_calls": int(tick_context.counters.get("balance_logical_calls", 0)),
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
