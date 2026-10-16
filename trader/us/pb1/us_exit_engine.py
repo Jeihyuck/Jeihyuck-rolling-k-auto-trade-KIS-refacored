@@ -1002,6 +1002,8 @@ def prepare_exit_position_snapshots(
     positions: list[dict],
     provider: Any,
     now: datetime | None = None,
+    *,
+    on_snapshot_ready=None,
 ) -> list[dict]:
     from trader.us.symbols import normalize_us_exchange
     snapshots: list[dict] = []
@@ -1170,6 +1172,11 @@ def prepare_exit_position_snapshots(
             datetime.now(timezone.utc).isoformat(),
         )
         snapshots.append(pos)
+        if on_snapshot_ready is not None:
+            # Callback exceptions propagate to the caller, which must fail
+            # closed: it can no longer assume every snapshot was evaluated.
+            # Risk state has already been persisted once for this position.
+            on_snapshot_ready(pos)
     return snapshots
 
 
