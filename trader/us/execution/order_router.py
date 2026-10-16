@@ -1921,6 +1921,37 @@ def route_order(
             if side == "SELL" and isinstance(_selected_ready, dict)
             else None
         )
+        # Distinguish symbol-first candidate wait from selected-intent wait.
+        # The first candidate's time must NEVER be used as selected truth.
+        _first_by_symbol = getattr(context, "_sell_signal_ready_by_symbol", None)
+        _first_ready = (
+            _first_by_symbol.get(symbol_upper)
+            if side == "SELL" and isinstance(_first_by_symbol, dict)
+            else None
+        )
+        _metrics = getattr(context, "metrics", None)
+        if side == "SELL" and isinstance(_first_ready, (int, float)):
+            _first_wait_ms = max(
+                0.0, (_http_boundary_mono - _first_ready) * 1000.0
+            )
+            logger.info(
+                "[US_EXIT][FIRST_CANDIDATE_TO_BROKER_BOUNDARY] "
+                "symbol=%s attempt=%s source=first_observed_candidate delay_ms=%.2f",
+                symbol_upper, intent["submit_attempt_id"], _first_wait_ms,
+            )
+            if isinstance(_metrics, dict):
+                _first_samples = _metrics.setdefault(
+                    "sell_first_candidate_to_broker_by_attempt_ms", {},
+                )
+                if isinstance(_first_samples, dict) and (
+                    len(_first_samples) < 128
+                    or str(intent["submit_attempt_id"]) in _first_samples
+                ):
+                    _first_samples[str(intent["submit_attempt_id"])] = _first_wait_ms
+                else:
+                    _metrics["sell_first_candidate_dropped_count"] = (
+                        int(_metrics.get("sell_first_candidate_dropped_count", 0)) + 1
+                    )
         # Never attach a different SELL candidate's timestamp as if it
         # belonged to this selected order. Unknown means missing, not zero.
         if side == "SELL" and isinstance(_sell_ready, (int, float)):
