@@ -1346,6 +1346,16 @@ def generate_exit_intents(
         return _evaluate_exit_intents_from_snapshots(
             snapshots, now=now, include_trend_time=include_trend_time,
         )
+    import inspect as _inspect
+    if "on_sell_ready" not in _inspect.signature(
+        _evaluate_exit_intents_from_snapshots
+    ).parameters:
+        # A supplied legacy evaluator cannot be instrumented. Do not turn
+        # diagnostic compatibility into a failed trading evaluation.
+        logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] evaluator=legacy")
+        return _evaluate_exit_intents_from_snapshots(
+            snapshots, now=now, include_trend_time=include_trend_time,
+        )
     return _evaluate_exit_intents_from_snapshots(
         snapshots, now=now, include_trend_time=include_trend_time,
         on_sell_ready=on_sell_ready,
