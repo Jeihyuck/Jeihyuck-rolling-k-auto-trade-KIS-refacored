@@ -1340,4 +1340,13 @@ def generate_exit_intents(
         return []
     logger.info("[US_EXIT][EVAL][START] positions=%d", len(prepared_snapshots or positions or []))
     snapshots = prepared_snapshots if prepared_snapshots is not None else prepare_exit_position_snapshots(positions, provider, now)
-    return _evaluate_exit_intents_from_snapshots(snapshots, now=now, include_trend_time=include_trend_time, on_sell_ready=on_sell_ready)
+    if on_sell_ready is None:
+        # Backwards compatible with strategy adapters/tests that provide
+        # the pre-telemetry evaluation function contract.
+        return _evaluate_exit_intents_from_snapshots(
+            snapshots, now=now, include_trend_time=include_trend_time,
+        )
+    return _evaluate_exit_intents_from_snapshots(
+        snapshots, now=now, include_trend_time=include_trend_time,
+        on_sell_ready=on_sell_ready,
+    )
