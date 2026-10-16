@@ -502,8 +502,13 @@ def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_in
 
 def _suppress_pending_sell_exit_intents(
     exit_intents: list[dict], trade_date: str, *, env: str = "practice",
+    strict: bool = False,
 ) -> list[dict]:
-    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP."""
+    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP.
+
+    strict is for the *opt-in early pilot only*: stale/unavailable DB evidence
+    cannot authorize a submission. The existing late route stays unchanged.
+    """
     def _standard_lifecycle(intent: dict) -> str:
         meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
         owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
@@ -534,13 +539,15 @@ def _suppress_pending_sell_exit_intents(
             )
         except Exception as exc:
             logger.warning(
-                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=use_existing_order_gate",
-                exc,
+                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=%s",
+                exc, "FAIL_CLOSED_EARLY_PILOT" if strict else "use_existing_order_gate",
             )
+            if strict:
+                return []
     try:
         from trader.us.db.repos import has_pending_order_for_symbol_side
     except Exception:
-        return exit_intents
+        return [] if strict else exit_intents
     statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
     kept: list[dict] = []
     for intent in exit_intents:
@@ -560,6 +567,8 @@ def _suppress_pending_sell_exit_intents(
             pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
         except Exception as exc:
             logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
+            if strict:
+                return []
             pending = False
         if pending:
             logger.info("[US_EXIT][INTENT_SUPPRESS] symbol=%s reason=pending_sell_order_exists", symbol)
@@ -2539,6 +2548,13 @@ def run_trade_tick(
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
+    # Explicitly disabled unless a practice-only pilot is approved. A pilot
+    # routes at most one PB1 standard hard-stop via the existing durable router.
+    _early_pilot_attempted_symbols: set[str] = set()
+    _early_pilot_stream_incomplete = False
+    _early_pilot_intents: list[dict] = []
+    _early_pilot_results: list[dict] = []
+    _early_pilot_enabled = False
     try:
         if not exit_can_proceed:
             logger.error("[US_EXIT_EVAL][SKIP] session=%s tick=%s reason=exit_can_proceed_false", session, tick_index)
@@ -2577,16 +2593,149 @@ def run_trade_tick(
                     logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] phase=%s", phase)
                 return _gen_exit_from_snapshots([], provider=None, now=now, **kwargs)
 
+            _pb1_positions = exclude_non_standard(current_positions)
+            _pb1_symbol_counts: dict[str, int] = {}
+            for _pos in _pb1_positions:
+                _key = str(_pos.get("symbol") or "").upper()
+                _pb1_symbol_counts[_key] = _pb1_symbol_counts.get(_key, 0) + 1
+
+            _early_pilot_enabled = (
+                os.getenv("US_EARLY_HARD_STOP_PILOT_ENABLED", "0") == "1"
+                and str(env).lower() == "practice"
+                # Never route a practice pilot to a real KIS client if the
+                # runner argument and actual client environment disagree.
+                and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
+                and not offline
+                and kis_order_allowed and not signal_only and exit_can_proceed
+                and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"
+                and not fills_contract_error and not fills_temp_error
+                and bool(recon.get("authoritative_positions"))
+                and str(recon.get("status") or "").upper() == "OK"
+                and str(ack_recon.get("status") or "").upper() == "OK"
+                and int(ack_recon.get("unresolved_count") or 0) == 0
+                and isinstance(active_claim_recovery_result, dict)
+                and str(active_claim_recovery_result.get("status") or "").upper()
+                    in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
+                and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
+                and _exit_observer_supported
+            )
+            _pilot_safety_intents: list[dict] = []
+            if _early_pilot_enabled:
+                # Required for the *actual* winner-to-HTTP trace in the
+                # common router; still no trading fields added to the intent.
+                setattr(tick_context, "_sell_selected_ready_by_symbol", {})
+                setattr(tick_context, "_sell_selected_trace_id_by_symbol", {})
+
+            def _on_snapshot_ready_for_pilot(snapshot: dict) -> None:
+                _new_intents = _gen_pb1_observed(
+                    [snapshot], include_trend_time=False, phase="safety",
+                )
+                _earlier_sells = any(
+                    str(i.get("side") or "").upper() == "SELL"
+                    for i in _pilot_safety_intents
+                )
+                _pilot_safety_intents.extend(_new_intents)
+                if _early_pilot_attempted_symbols or _earlier_sells:
+                    return
+                if str(snapshot.get("strategy_owner") or "").upper() != "US_STANDARD":
+                    return
+                _sym = str(snapshot.get("symbol") or "").upper()
+                if _sym == "TQQQ" or _pb1_symbol_counts.get(_sym) != 1:
+                    return
+                _eligible = [
+                    i for i in _new_intents
+                    if str(i.get("side") or "").upper() == "SELL"
+                    # SWING routing canonicalizes hard_stop_loss to hard_stop.
+                    # Require BOTH the canonical exit reason and exit family
+                    # to avoid admitting unrelated high-priority exits.
+                    and str(i.get("exit_type") or "").lower()
+                        in {"hard_stop", "hard_stop_loss"}
+                    and str(i.get("exit_reason") or "").lower()
+                        == "hard_stop_full_exit"
+                    and _exit_family(i) == "HARD_STOP"
+                    and str(i.get("symbol") or "").upper() == _sym
+                ]
+                if len(_eligible) != 1:
+                    return
+                # Preserve historical TP fences and same-symbol pending-order
+                # suppression before any possible broker submission.
+                _eligible = _suppress_pending_sell_exit_intents(
+                    _eligible, trade_date, env=env, strict=True,
+                )
+                if len(_eligible) != 1:
+                    return
+                _early_pilot_attempted_symbols.add(_sym)
+                _early_pilot_intents.append(_eligible[0])
+                # This pilot has a unique, hard-stop-only final choice for
+                # this symbol; attribute its real HTTP boundary to THIS intent,
+                # not an unrelated first-by-symbol candidate.
+                _chosen_mono = _sell_selected_ready_by_identity.get(id(_eligible[0]))
+                _chosen_trace_id = _sell_signal_id_by_identity.get(id(_eligible[0]))
+                if isinstance(_chosen_mono, (int, float)):
+                    tick_context._sell_selected_ready_by_symbol[_sym] = _chosen_mono
+                    if _chosen_trace_id:
+                        tick_context._sell_selected_trace_id_by_symbol[_sym] = _chosen_trace_id
+                logger.warning(
+                    "[US_EXIT][EARLY_HARD_STOP_PILOT] tick=%s symbol=%s "
+                    "action=route_via_canonical_router_before_unrelated_snapshots",
+                    tick_index, _sym,
+                )
+                try:
+                    _pilot_result = route_exit_orders_immediately(
+                        _eligible, buy_daily_notional=0.0,
+                        position_count=position_count,
+                        effective_budget=effective_budget,
+                        signal_only=signal_only,
+                        kis_order_allowed=kis_order_allowed,
+                        current_position_symbols=(
+                            current_position_symbols or {
+                                str(p.get("symbol") or "").upper()
+                                for p in current_positions if p.get("symbol")
+                            }
+                        ),
+                        context=tick_context, kis_client=routing_kis_client,
+                    )
+                    _early_pilot_results.append(_pilot_result)
+                except Exception as _pilot_error:
+                    # A router exception may occur after KIS submission.
+                    # Never re-submit in the late path; leave the broker fence
+                    # to durable reconciliation.
+                    logger.exception(
+                        "[US_EXIT][EARLY_HARD_STOP_PILOT][UNCERTAIN] symbol=%s err=%s",
+                        _sym, _pilot_error,
+                    )
+                    _early_pilot_results.append({
+                        "orders": [{"status": "BROKER_SUBMIT_RESULT_UNKNOWN",
+                                    "requires_reconcile": True, "intent": _eligible[0]}],
+                        "decisions": [],
+                    })
+
             try:
                 exit_snapshots = prepare_exit_position_snapshots(
-                    exclude_non_standard(current_positions), provider, now
+                    _pb1_positions, provider, now,
+                    **({"on_snapshot_ready": _on_snapshot_ready_for_pilot}
+                       if _early_pilot_enabled else {}),
                 )
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
+                if _early_pilot_enabled:
+                    _early_pilot_stream_incomplete = True
+                    # A partial stream may already have submitted a SELL.
+                    # Never proceed to BUY on incomplete exit-state evidence.
+                    entry_can_proceed = False
+                    entry_block_reason = "early_exit_snapshot_stream_incomplete"
+                    logger.error(
+                        "[US_EXIT][EARLY_HARD_STOP_PILOT][FAIL_CLOSED] "
+                        "reason=snapshot_stream_incomplete action=block_buy_retain_claims"
+                    )
                 exit_snapshots = []
             try:
-                safety_exit_intents = _gen_pb1_observed(
-                    exit_snapshots, include_trend_time=False, phase="safety",
+                safety_exit_intents = (
+                    list(_pilot_safety_intents)
+                    if _early_pilot_enabled
+                    else _gen_pb1_observed(
+                        exit_snapshots, include_trend_time=False, phase="safety",
+                    )
                 )
             except Exception as _safety_eval_exc:
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
@@ -2724,6 +2873,13 @@ def run_trade_tick(
         logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
     finally:
         tick_context.metrics["market_state_ms"] = (time.monotonic() - _market_state_started) * 1000.0
+    # A CRASH_REBOUND overlay must not override an exit-stream failure.
+    # Without complete per-position evaluation, no new BUY is authorized.
+    if _early_pilot_stream_incomplete:
+        entry_can_proceed = False
+        allow_new_symbols = False
+        allow_add_to_existing = False
+        entry_block_reason = "early_exit_snapshot_stream_incomplete"
     effective_budget_before_overlay = effective_budget
     exposure_multiplier = float(market_state_overlay.get(
         "effective_capital_scale",
@@ -2831,6 +2987,17 @@ def run_trade_tick(
     exit_intents = _suppress_pending_sell_exit_intents(
         exit_intents, trade_date, env=env,
     )
+    # An early pilot ACK may now appear as pending. Preserve its original
+    # selected intent for tick audit/status, but exclude it from the late
+    # route below. Otherwise a genuine exit would be reported as NO_TRADE.
+    for _early_intent in _early_pilot_intents:
+        if not any(
+            str(i.get("symbol") or "").upper()
+                == str(_early_intent.get("symbol") or "").upper()
+            and str(i.get("side") or "").upper() == "SELL"
+            for i in exit_intents
+        ):
+            exit_intents.append(_early_intent)
 
     # Route SELL without an unnecessary BUY-only DB budget read. The SELL
     # branch of assert_order_allowed() never consumes the daily BUY notional.
@@ -2847,8 +3014,12 @@ def run_trade_tick(
             "reason=pre_route_overlay_recovery_and_claim_checks",
             tick_index, _pre_route_delay_ms,
         )
+    _late_exit_intents = [
+        i for i in exit_intents
+        if str(i.get("symbol") or "").upper() not in _early_pilot_attempted_symbols
+    ]
     exit_route_result = route_exit_orders_immediately(
-        exit_intents,
+        _late_exit_intents,
         buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
         position_count=position_count,
         effective_budget=effective_budget,
@@ -2858,6 +3029,27 @@ def run_trade_tick(
         context=tick_context,
         kis_client=routing_kis_client,
     )
+
+    if _early_pilot_results:
+        _all_exit_orders = [
+            o for batch in _early_pilot_results for o in batch.get("orders", [])
+        ] + list(exit_route_result.get("orders", []))
+        _all_exit_decisions = [
+            d for batch in _early_pilot_results for d in batch.get("decisions", [])
+        ] + list(exit_route_result.get("decisions", []))
+        _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(_all_exit_orders)
+        exit_route_result = {
+            "orders": _all_exit_orders, "decisions": _all_exit_decisions,
+            "sent": _sent, "ack": _ack, "rejected": _rejected,
+            "blocked": _blocked,
+            "sell_notional_routed": _routed_sell_notional(_all_exit_orders),
+            "exit_notional_routed": _routed_sell_notional(_all_exit_orders),
+        }
+        logger.warning(
+            "[US_EXIT][EARLY_HARD_STOP_PILOT][MERGED_RESULTS] "
+            "attempted=%d orders=%d",
+            len(_early_pilot_attempted_symbols), len(_all_exit_orders),
+        )
 
     # BUY-specific committed notional is loaded only after protective sells
     # have passed the existing router, durability fences and broker boundary.
