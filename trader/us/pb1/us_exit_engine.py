@@ -1005,6 +1005,7 @@ def prepare_exit_position_snapshots(
     from trader.us.symbols import normalize_us_exchange
     snapshots: list[dict] = []
     for original_pos in positions:
+        _snapshot_start_mono = time.monotonic()
         pos = dict(original_pos or {})
         symbol = pos.get("symbol", "")
         raw_exchange = pos.get("exchange", "NASDAQ")
@@ -1134,6 +1135,13 @@ def prepare_exit_position_snapshots(
                 "current_price_usd": current_price,
                 "current_price": current_price,
             })
+        # This observation happens after the existing per-symbol quote and
+        # risk-state work. It does not perform another evaluation or mutation.
+        logger.info(
+            "[US_EXIT][SNAPSHOT_READY] symbol=%s elapsed_ms=%.2f observed_at_utc=%s",
+            symbol, (time.monotonic() - _snapshot_start_mono) * 1000.0,
+            datetime.now(timezone.utc).isoformat(),
+        )
         snapshots.append(pos)
     return snapshots
 
