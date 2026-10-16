@@ -1925,9 +1925,13 @@ def route_order(
         # belonged to this selected order. Unknown means missing, not zero.
         if side == "SELL" and isinstance(_sell_ready, (int, float)):
             _delay_ms = max(0.0, (_http_boundary_mono - _sell_ready) * 1000)
+            _trace_ids = getattr(context, "_sell_selected_trace_id_by_symbol", None)
+            _signal_id = _trace_ids.get(symbol_upper) if isinstance(_trace_ids, dict) else None
             logger.info(
-                "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=%s attempt=%s delay_ms=%.2f",
-                symbol_upper, intent["submit_attempt_id"], _delay_ms,
+                "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=%s attempt=%s "
+                "signal_id=%s source=selected_intent_exact delay_ms=%.2f",
+                symbol_upper, intent["submit_attempt_id"], _signal_id or "UNOBSERVED",
+                _delay_ms,
             )
             _metrics = getattr(context, "metrics", None)
             if isinstance(_metrics, dict):
