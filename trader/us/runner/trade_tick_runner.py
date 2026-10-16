@@ -1455,6 +1455,8 @@ def route_exit_orders_immediately(
         # Explicitly resolve attribution *after* all overlay/cluster/defense
         # candidates have entered the same legacy priority merge.
         selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
+        selected_trace_ids = getattr(context, "_sell_selected_trace_id_by_symbol", None)
+        by_trace_id = getattr(context, "_sell_signal_id_by_identity", None)
         by_identity = getattr(context, "_sell_selected_ready_by_identity", None)
         if not isinstance(selected_ready, dict):
             return
@@ -1462,8 +1464,12 @@ def route_exit_orders_immediately(
         value = by_identity.get(id(original)) if isinstance(by_identity, dict) else None
         if isinstance(value, (int, float)):
             selected_ready[symbol] = value
+            if isinstance(selected_trace_ids, dict) and isinstance(by_trace_id, dict):
+                selected_trace_ids[symbol] = by_trace_id.get(id(original))
         else:
             selected_ready.pop(symbol, None)
+            if isinstance(selected_trace_ids, dict):
+                selected_trace_ids.pop(symbol, None)
 
     sell_intents = [
         i for i in merge_exit_intents_by_symbol(
@@ -2487,8 +2493,10 @@ def run_trade_tick(
     if tick_context is not None:
         setattr(tick_context, "_sell_signal_ready_by_symbol", _sell_signal_ready_by_symbol)
     _sell_selected_ready_by_identity: dict[int, float] = {}
+    _sell_signal_id_by_identity: dict[int, str] = {}
     if tick_context is not None:
         setattr(tick_context, "_sell_selected_ready_by_identity", _sell_selected_ready_by_identity)
+        setattr(tick_context, "_sell_signal_id_by_identity", _sell_signal_id_by_identity)
     def _observe_pb1_sell(intent: dict, observed_mono: float, phase: str) -> None:
         # Selected and earliest candidate are separate measurement dimensions.
         # Intent-local observation is deliberately process-local, never sent
@@ -2496,6 +2504,17 @@ def run_trade_tick(
         symbol = str(intent.get("symbol") or "").upper()
         _sell_signal_ready_by_symbol.setdefault(symbol, observed_mono)
         _sell_selected_ready_by_identity[id(intent)] = observed_mono
+        import uuid as _trace_uuid
+        _signal_id = _trace_uuid.uuid4().hex
+        _sell_signal_id_by_identity[id(intent)] = _signal_id
+        logger.info(
+            "[US_EXIT][SIGNAL_TRACE_ID] signal_id=%s tick=%s phase=%s symbol=%s "
+            "owner=%s lifecycle=%s trade_date=%s epoch=%s",
+            _signal_id, tick_index, phase, symbol,
+            str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or ""),
+            str(intent.get("position_lifecycle_id") or (intent.get("meta") or {}).get("position_lifecycle_id") or ""),
+            trade_date, str(session_generation),
+        )
         logger.info(
             "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=%s symbol=%s "
             "family=%s observed_mono_ns=%d",
@@ -2618,6 +2637,8 @@ def run_trade_tick(
     }
     if tick_context is not None:
         setattr(tick_context, "_sell_selected_ready_by_symbol", _sell_selected_ready_by_symbol)
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_trace_id_by_symbol", {})
     # Measure protective signal readiness separately from broker routing.
     # This never changes an intent, strategy evaluation, or order/fence state.
     _early_sell_signal_ready_mono = (
