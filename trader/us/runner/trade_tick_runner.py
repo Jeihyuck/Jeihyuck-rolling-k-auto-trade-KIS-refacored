@@ -2579,7 +2579,11 @@ def run_trade_tick(
                 and str(env).lower() == "practice"
                 and kis_order_allowed and not signal_only and exit_can_proceed
                 and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"
-                and not fills_contract_error
+                and not fills_contract_error and not fills_temp_error
+                and bool(recon.get("authoritative_positions"))
+                and str(recon.get("status") or "").upper() == "OK"
+                and str(ack_recon.get("status") or "").upper() == "OK"
+                and int(ack_recon.get("unresolved_count") or 0) == 0
                 and _exit_observer_supported
             )
             _pilot_safety_intents: list[dict] = []
@@ -2634,7 +2638,12 @@ def run_trade_tick(
                         effective_budget=effective_budget,
                         signal_only=signal_only,
                         kis_order_allowed=kis_order_allowed,
-                        current_position_symbols=current_position_symbols,
+                        current_position_symbols=(
+                            current_position_symbols or {
+                                str(p.get("symbol") or "").upper()
+                                for p in current_positions if p.get("symbol")
+                            }
+                        ),
                         context=tick_context, kis_client=routing_kis_client,
                     )
                     _early_pilot_results.append(_pilot_result)
