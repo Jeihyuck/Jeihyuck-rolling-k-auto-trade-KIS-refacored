@@ -2715,6 +2715,15 @@ def run_trade_tick(
                 )
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
+                if _early_pilot_enabled:
+                    # A partial stream may already have submitted a SELL.
+                    # Never proceed to BUY on incomplete exit-state evidence.
+                    entry_can_proceed = False
+                    entry_block_reason = "early_exit_snapshot_stream_incomplete"
+                    logger.error(
+                        "[US_EXIT][EARLY_HARD_STOP_PILOT][FAIL_CLOSED] "
+                        "reason=snapshot_stream_incomplete action=block_buy_retain_claims"
+                    )
                 exit_snapshots = []
             try:
                 safety_exit_intents = (
