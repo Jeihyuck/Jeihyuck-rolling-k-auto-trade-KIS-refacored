@@ -2163,6 +2163,7 @@ def run_trade_tick(
     # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
     if not offline:
         _order_reconcile_started = time.monotonic()
+        _active_claim_replay_started = time.monotonic()
         try:
             from trader.us.execution.order_journal import replay_order_journal
             active_claim_recovery_result = replay_order_journal(
@@ -2181,6 +2182,13 @@ def run_trade_tick(
             }
             ack_recon["active_claim_recovery"] = active_claim_recovery_result
             logger.error("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY_ERROR] %s", exc)
+        finally:
+            tick_context.metrics["active_claim_replay_ms"] = (
+                time.monotonic() - _active_claim_replay_started
+            ) * 1000.0
+            logger.info("[US_RECONCILE][ACTIVE_CLAIM_LATENCY] tick=%s duration_ms=%.2f",
+                        tick_index, tick_context.metrics["active_claim_replay_ms"])
+        _ack_reconcile_started = time.monotonic()
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon = reconcile_ack_orders_with_balance(
@@ -2209,7 +2217,15 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
         finally:
+            tick_context.metrics["ack_reconcile_ms"] = (
+                time.monotonic() - _ack_reconcile_started
+            ) * 1000.0
             tick_context.metrics["order_reconcile_ms"] = (time.monotonic() - _order_reconcile_started) * 1000.0
+            logger.info(
+                "[US_RECONCILE][ACK_LATENCY] tick=%s duration_ms=%.2f total_ms=%.2f",
+                tick_index, tick_context.metrics["ack_reconcile_ms"],
+                tick_context.metrics["order_reconcile_ms"],
+            )
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
@@ -4556,6 +4572,8 @@ def run_trade_tick(
         "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
         "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
         "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "active_claim_replay_ms": float(tick_context.metrics.get("active_claim_replay_ms", 0)),
+        "ack_reconcile_ms": float(tick_context.metrics.get("ack_reconcile_ms", 0)),
         "post_route_reconcile_ms": float(tick_context.metrics.get("post_route_reconcile_ms", 0)),
         "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
         "fill_rows_received": len(fills_today),
