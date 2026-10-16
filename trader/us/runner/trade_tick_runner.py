@@ -2528,6 +2528,7 @@ def run_trade_tick(
     # Explicitly disabled unless a practice-only pilot is approved. A pilot
     # routes at most one PB1 standard hard-stop via the existing durable router.
     _early_pilot_attempted_symbols: set[str] = set()
+    _early_pilot_intents: list[dict] = []
     _early_pilot_results: list[dict] = []
     _early_pilot_enabled = False
     try:
@@ -2626,6 +2627,7 @@ def run_trade_tick(
                 if len(_eligible) != 1:
                     return
                 _early_pilot_attempted_symbols.add(_sym)
+                _early_pilot_intents.append(_eligible[0])
                 logger.warning(
                     "[US_EXIT][EARLY_HARD_STOP_PILOT] tick=%s symbol=%s "
                     "action=route_via_canonical_router_before_unrelated_snapshots",
@@ -2921,6 +2923,17 @@ def run_trade_tick(
     exit_intents = _suppress_pending_sell_exit_intents(
         exit_intents, trade_date, env=env,
     )
+    # An early pilot ACK may now appear as pending. Preserve its original
+    # selected intent for tick audit/status, but exclude it from the late
+    # route below. Otherwise a genuine exit would be reported as NO_TRADE.
+    for _early_intent in _early_pilot_intents:
+        if not any(
+            str(i.get("symbol") or "").upper()
+                == str(_early_intent.get("symbol") or "").upper()
+            and str(i.get("side") or "").upper() == "SELL"
+            for i in exit_intents
+        ):
+            exit_intents.append(_early_intent)
 
     # Route SELL without an unnecessary BUY-only DB budget read. The SELL
     # branch of assert_order_allowed() never consumes the daily BUY notional.
