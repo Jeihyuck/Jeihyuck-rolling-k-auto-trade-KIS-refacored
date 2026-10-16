@@ -2528,6 +2528,22 @@ def run_trade_tick(
             exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
         else:
             from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
+            import inspect as _exit_inspect
+            _exit_observer_supported = (
+                "on_sell_ready" in _exit_inspect.signature(_gen_exit_from_snapshots).parameters
+            )
+            def _gen_pb1_observed(snapshots, *, include_trend_time, phase):
+                kwargs = dict(
+                    prepared_snapshots=snapshots, include_trend_time=include_trend_time,
+                )
+                if _exit_observer_supported:
+                    kwargs["on_sell_ready"] = (
+                        lambda intent, observed: _observe_pb1_sell(intent, observed, phase)
+                    )
+                else:
+                    logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] phase=%s", phase)
+                return _gen_exit_from_snapshots([], provider=None, now=now, **kwargs)
+
             try:
                 exit_snapshots = prepare_exit_position_snapshots(
                     exclude_non_standard(current_positions), provider, now
@@ -2536,10 +2552,8 @@ def run_trade_tick(
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 exit_snapshots = []
             try:
-                safety_exit_intents = _gen_exit_from_snapshots(
-                    [], provider=None, now=now, prepared_snapshots=exit_snapshots,
-                    include_trend_time=False,
-                    on_sell_ready=lambda intent, t: _observe_pb1_sell(intent, t, "safety"),
+                safety_exit_intents = _gen_pb1_observed(
+                    exit_snapshots, include_trend_time=False, phase="safety",
                 )
             except Exception as _safety_eval_exc:
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
@@ -2559,10 +2573,8 @@ def run_trade_tick(
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
             if trend_targets:
                 try:
-                    trend_exit_intents = _gen_exit_from_snapshots(
-                        [], provider=None, now=now, prepared_snapshots=trend_targets,
-                        include_trend_time=True,
-                        on_sell_ready=lambda intent, t: _observe_pb1_sell(intent, t, "trend"),
+                    trend_exit_intents = _gen_pb1_observed(
+                        trend_targets, include_trend_time=True, phase="trend",
                     )
                 except Exception as _trend_eval_exc:
                     logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
