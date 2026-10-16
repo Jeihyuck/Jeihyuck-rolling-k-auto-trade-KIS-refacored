@@ -1915,14 +1915,14 @@ def route_order(
             )
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
-        _per_symbol_ready = getattr(context, "_sell_signal_ready_by_symbol", None)
+        _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
         _sell_ready = (
-            _per_symbol_ready.get(symbol_upper)
-            if side == "SELL" and isinstance(_per_symbol_ready, dict)
+            _selected_ready.get(symbol_upper)
+            if side == "SELL" and isinstance(_selected_ready, dict)
             else None
         )
-        if _sell_ready is None:
-            _sell_ready = getattr(context, "_sell_signal_ready_mono", None)
+        # Never attach a different SELL candidate's timestamp as if it
+        # belonged to this selected order. Unknown means missing, not zero.
         if side == "SELL" and isinstance(_sell_ready, (int, float)):
             _delay_ms = max(0.0, (_http_boundary_mono - _sell_ready) * 1000)
             logger.info(
