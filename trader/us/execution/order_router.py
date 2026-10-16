@@ -1915,7 +1915,14 @@ def route_order(
             )
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
-        _sell_ready = getattr(context, "_sell_signal_ready_mono", None)
+        _per_symbol_ready = getattr(context, "_sell_signal_ready_by_symbol", None)
+        _sell_ready = (
+            _per_symbol_ready.get(symbol_upper)
+            if side == "SELL" and isinstance(_per_symbol_ready, dict)
+            else None
+        )
+        if _sell_ready is None:
+            _sell_ready = getattr(context, "_sell_signal_ready_mono", None)
         if side == "SELL" and isinstance(_sell_ready, (int, float)):
             _delay_ms = max(0.0, (_http_boundary_mono - _sell_ready) * 1000)
             logger.info(
@@ -1925,6 +1932,9 @@ def route_order(
             _metrics = getattr(context, "metrics", None)
             if isinstance(_metrics, dict):
                 _metrics["sell_signal_to_broker_boundary_ms"] = _delay_ms
+                _metrics.setdefault("sell_signal_to_broker_boundary_by_attempt_ms", {})[
+                    str(intent["submit_attempt_id"])
+                ] = _delay_ms
 
     set_submit_boundary = getattr(kis_client, "set_before_order_http", None)
     clear_submit_boundary = getattr(kis_client, "clear_before_order_http", None)
