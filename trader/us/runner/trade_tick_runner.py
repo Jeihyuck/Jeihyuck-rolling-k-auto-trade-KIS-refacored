@@ -2542,6 +2542,7 @@ def run_trade_tick(
     # Explicitly disabled unless a practice-only pilot is approved. A pilot
     # routes at most one PB1 standard hard-stop via the existing durable router.
     _early_pilot_attempted_symbols: set[str] = set()
+    _early_pilot_stream_incomplete = False
     _early_pilot_intents: list[dict] = []
     _early_pilot_results: list[dict] = []
     _early_pilot_enabled = False
@@ -2696,6 +2697,7 @@ def run_trade_tick(
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 if _early_pilot_enabled:
+                    _early_pilot_stream_incomplete = True
                     # A partial stream may already have submitted a SELL.
                     # Never proceed to BUY on incomplete exit-state evidence.
                     entry_can_proceed = False
@@ -2849,6 +2851,13 @@ def run_trade_tick(
         logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
     finally:
         tick_context.metrics["market_state_ms"] = (time.monotonic() - _market_state_started) * 1000.0
+    # A CRASH_REBOUND overlay must not override an exit-stream failure.
+    # Without complete per-position evaluation, no new BUY is authorized.
+    if _early_pilot_stream_incomplete:
+        entry_can_proceed = False
+        allow_new_symbols = False
+        allow_add_to_existing = False
+        entry_block_reason = "early_exit_snapshot_stream_incomplete"
     effective_budget_before_overlay = effective_budget
     exposure_multiplier = float(market_state_overlay.get(
         "effective_capital_scale",
