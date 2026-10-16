@@ -37,8 +37,10 @@ def test_hard_stop_route_precedes_next_symbols_slow_quote(monkeypatch):
         "quality_summary": "synthetic", "quality_warning": False,
     })
 
+    submission_times: list[float] = []
     def fake_route_order(intent, **kwargs):
         events.append("submit:" + intent["symbol"])
+        submission_times.append(time.monotonic())
         return {"status": "ACK", "side": "SELL",
                 "symbol": intent["symbol"], "intent": intent}
 
@@ -62,13 +64,17 @@ def test_hard_stop_route_precedes_next_symbols_slow_quote(monkeypatch):
                 current_position_symbols={"AAA", "BBB"},
             )
 
+    early_started = time.monotonic()
     us_exit_engine.prepare_exit_position_snapshots(
         [dict(x) for x in positions], QuoteProvider(),
         on_snapshot_ready=submit_from_snapshot,
     )
+    early_submit_ms = (submission_times[0] - early_started) * 1000.0
     assert events.index("submit:AAA") < events.index("quote:BBB")
 
     events.clear()
+    submission_times.clear()
+    baseline_started = time.monotonic()
     snapshots = us_exit_engine.prepare_exit_position_snapshots(
         [dict(x) for x in positions], QuoteProvider(),
     )
@@ -81,5 +87,9 @@ def test_hard_stop_route_precedes_next_symbols_slow_quote(monkeypatch):
         signal_only=False, kis_order_allowed=False,
         current_position_symbols={"AAA", "BBB"},
     )
+    baseline_submit_ms = (submission_times[0] - baseline_started) * 1000.0
     assert events.index("quote:BBB") < events.index("submit:AAA")
     assert events.count("submit:AAA") == 1
+    # Synthetic delay injection proves causal isolation of B's 60-ms wait.
+    # This is NOT a claim about real WSL/KIS execution.
+    assert baseline_submit_ms - early_submit_ms >= 40.0
