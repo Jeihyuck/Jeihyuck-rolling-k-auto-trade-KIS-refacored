@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1005,7 +1006,24 @@ def prepare_exit_position_snapshots(
     from trader.us.symbols import normalize_us_exchange
     snapshots: list[dict] = []
     for original_pos in positions:
+        _snapshot_start_mono = time.monotonic()
+        _quote_elapsed_ms = 0.0
+        _state_elapsed_ms = 0.0
         pos = dict(original_pos or {})
+
+        def _observe_snapshot_outcome(outcome: str, reason: str = "") -> None:
+            # Pure observation. Failure must not affect the exit/risk path.
+            try:
+                logger.info(
+                    "[US_EXIT][SNAPSHOT_OUTCOME] symbol=%s owner=%s lifecycle=%s "
+                    "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f",
+                    symbol, pos.get("strategy_owner") or pos.get("owner") or "",
+                    pos.get("position_lifecycle_id") or "",
+                    outcome, reason, (time.monotonic() - _snapshot_start_mono) * 1000.0,
+                    _quote_elapsed_ms, _state_elapsed_ms,
+                )
+            except Exception:
+                pass
         symbol = pos.get("symbol", "")
         raw_exchange = pos.get("exchange", "NASDAQ")
         try:
@@ -1016,6 +1034,7 @@ def prepare_exit_position_snapshots(
                 symbol, raw_exchange, exc
             )
             exchange = "NASDAQ"
+        _quote_started_mono = time.monotonic()
         try:
             if hasattr(provider, "get_current_price"):
                 price_data = provider.get_current_price(symbol, exchange)
@@ -1033,6 +1052,8 @@ def prepare_exit_position_snapshots(
                             symbol, exchange, price_data.get("source") or "unknown",
                             quote_quality or "unknown", price_data.get("asof") or price_data.get("_stale_date") or price_data.get("asof_epoch"),
                         )
+                        _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+                        _observe_snapshot_outcome("SKIP", "quote_stale")
                         continue
                     current_price = float(price_data.get("last") or price_data.get("price") or 0)
                 else:
@@ -1043,10 +1064,15 @@ def prepare_exit_position_snapshots(
                 current_price = float(pos.get("current_price") or pos.get("current_price_usd") or pos.get("last_price") or 0)
         except Exception as exc:
             logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
+            _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+            _observe_snapshot_outcome("SKIP", "quote_exception")
             continue
+        _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
         if current_price <= 0:
             logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
+            _observe_snapshot_outcome("SKIP", "price_nonpositive")
             continue
+        _state_started_mono = time.monotonic()
         entry_price_for_state = _resolve_position_entry_price(pos)
         if entry_price_for_state > 0 and current_price > 0:
             try:
@@ -1134,6 +1160,15 @@ def prepare_exit_position_snapshots(
                 "current_price_usd": current_price,
                 "current_price": current_price,
             })
+        _state_elapsed_ms = (time.monotonic() - _state_started_mono) * 1000.0
+        _observe_snapshot_outcome("READY")
+        # This observation happens after the existing per-symbol quote and
+        # risk-state work. It does not perform another evaluation or mutation.
+        logger.info(
+            "[US_EXIT][SNAPSHOT_READY] symbol=%s elapsed_ms=%.2f observed_at_utc=%s",
+            symbol, (time.monotonic() - _snapshot_start_mono) * 1000.0,
+            datetime.now(timezone.utc).isoformat(),
+        )
         snapshots.append(pos)
     return snapshots
 
@@ -1143,6 +1178,7 @@ def _evaluate_exit_intents_from_snapshots(
     *,
     now: datetime | None = None,
     include_trend_time: bool = True,
+    on_sell_ready=None,
 ) -> list[dict]:
     intents: list[dict] = []
     sell_explanations: list[dict] = []
@@ -1213,6 +1249,14 @@ def _evaluate_exit_intents_from_snapshots(
             except Exception as exc:
                 logger.warning("[US_EXIT][ENTRY_CONTRACT][AUDIT_WARN] symbol=%s err=%s", symbol, exc)
 
+            # True per-position signal time: called inside the evaluation loop
+            # only after the selected intent is fully populated. Observer failure
+            # cannot prevent order evaluation or change risk-state mutations.
+            if on_sell_ready is not None:
+                try:
+                    on_sell_ready(intent, time.monotonic())
+                except Exception:
+                    logger.warning("[US_EXIT][OBSERVATION_FAILED] symbol=%s", symbol)
             intents.append(intent)
         elif intent is not None and intent.get("side") == "HOLD":
             hold_explanation = build_us_exit_explanation(
@@ -1289,6 +1333,7 @@ def generate_exit_intents(
     *,
     prepared_snapshots: list[dict] | None = None,
     include_trend_time: bool = True,
+    on_sell_ready=None,
 ) -> list[dict]:
     """보유 포지션 전체에 대해 청산 조건 평가."""
     if not positions and not prepared_snapshots:
@@ -1296,4 +1341,23 @@ def generate_exit_intents(
         return []
     logger.info("[US_EXIT][EVAL][START] positions=%d", len(prepared_snapshots or positions or []))
     snapshots = prepared_snapshots if prepared_snapshots is not None else prepare_exit_position_snapshots(positions, provider, now)
-    return _evaluate_exit_intents_from_snapshots(snapshots, now=now, include_trend_time=include_trend_time)
+    if on_sell_ready is None:
+        # Backwards compatible with strategy adapters/tests that provide
+        # the pre-telemetry evaluation function contract.
+        return _evaluate_exit_intents_from_snapshots(
+            snapshots, now=now, include_trend_time=include_trend_time,
+        )
+    import inspect as _inspect
+    if "on_sell_ready" not in _inspect.signature(
+        _evaluate_exit_intents_from_snapshots
+    ).parameters:
+        # A supplied legacy evaluator cannot be instrumented. Do not turn
+        # diagnostic compatibility into a failed trading evaluation.
+        logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] evaluator=legacy")
+        return _evaluate_exit_intents_from_snapshots(
+            snapshots, now=now, include_trend_time=include_trend_time,
+        )
+    return _evaluate_exit_intents_from_snapshots(
+        snapshots, now=now, include_trend_time=include_trend_time,
+        on_sell_ready=on_sell_ready,
+    )

@@ -1305,7 +1305,7 @@ def _exit_family(intent: dict) -> str:
     return fallback or "OTHER_EXIT"
 
 
-def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
+def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) -> list[dict]:
     """Select one deterministic SELL per symbol while retaining absorbed reasons."""
     priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TIME_STOP": 3,
                 "TREND_TRIM": 3, "TAKE_PROFIT": 4}
@@ -1320,6 +1320,11 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     for symbol, rows in grouped.items():
         rows.sort(key=lambda row: (priority.get(_exit_family(row[1]), 99), row[0]))
         selected = dict(rows[0][1])
+        if on_selected is not None:
+            try:
+                on_selected(rows[0][1], selected)
+            except Exception:
+                logger.warning("[US_EXIT][SELECTED_TRACE_FAILED] symbol=%s", symbol)
         selected_meta = dict(selected.get("meta") or {})
         selected_reason = str(selected.get("reason") or selected_meta.get("reason") or _exit_family(selected))
         absorbed = [str(row.get("reason") or (row.get("meta") or {}).get("reason") or _exit_family(row))
@@ -1446,7 +1451,31 @@ def route_exit_orders_immediately(
     """
     from trader.us.execution.order_router import route_order
 
-    sell_intents = [i for i in merge_exit_intents_by_symbol(exit_intents) if str(i.get("side") or "").upper() == "SELL"]
+    def _track_actual_selection(original: dict, selected: dict) -> None:
+        # Explicitly resolve attribution *after* all overlay/cluster/defense
+        # candidates have entered the same legacy priority merge.
+        selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
+        selected_trace_ids = getattr(context, "_sell_selected_trace_id_by_symbol", None)
+        by_trace_id = getattr(context, "_sell_signal_id_by_identity", None)
+        by_identity = getattr(context, "_sell_selected_ready_by_identity", None)
+        if not isinstance(selected_ready, dict):
+            return
+        symbol = str(original.get("symbol") or "").upper()
+        value = by_identity.get(id(original)) if isinstance(by_identity, dict) else None
+        if isinstance(value, (int, float)):
+            selected_ready[symbol] = value
+            if isinstance(selected_trace_ids, dict) and isinstance(by_trace_id, dict):
+                selected_trace_ids[symbol] = by_trace_id.get(id(original))
+        else:
+            selected_ready.pop(symbol, None)
+            if isinstance(selected_trace_ids, dict):
+                selected_trace_ids.pop(symbol, None)
+
+    sell_intents = [
+        i for i in merge_exit_intents_by_symbol(
+            exit_intents, on_selected=_track_actual_selection,
+        ) if str(i.get("side") or "").upper() == "SELL"
+    ]
     logger.info("[US_EXIT][ROUTE_IMMEDIATE][START] exit_intents=%d", len(sell_intents))
     orders: list[dict] = []
     decisions: list[dict] = []
@@ -2459,6 +2488,53 @@ def run_trade_tick(
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
 
+    # Process-local earliest readiness; observation only, never persisted.
+    _sell_signal_ready_by_symbol: dict[str, float] = {}
+    if tick_context is not None:
+        setattr(tick_context, "_sell_signal_ready_by_symbol", _sell_signal_ready_by_symbol)
+    _sell_selected_ready_by_identity: dict[int, float] = {}
+    _sell_signal_id_by_identity: dict[int, str] = {}
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_ready_by_identity", _sell_selected_ready_by_identity)
+        setattr(tick_context, "_sell_signal_id_by_identity", _sell_signal_id_by_identity)
+    def _observe_pb1_sell(intent: dict, observed_mono: float, phase: str) -> None:
+        # Selected and earliest candidate are separate measurement dimensions.
+        # Intent-local observation is deliberately process-local, never sent
+        # to the broker as a field or persisted as a monotonic timestamp.
+        symbol = str(intent.get("symbol") or "").upper()
+        _sell_signal_ready_by_symbol.setdefault(symbol, observed_mono)
+        _sell_selected_ready_by_identity[id(intent)] = observed_mono
+        import uuid as _trace_uuid
+        _signal_id = _trace_uuid.uuid4().hex
+        _sell_signal_id_by_identity[id(intent)] = _signal_id
+        _trace_position = next(
+            (p for p in current_positions
+             if str(p.get("symbol") or "").upper() == symbol),
+            {},
+        )
+        logger.info(
+            "[US_EXIT][SIGNAL_TRACE_ID] signal_id=%s tick=%s tick_id=%s "
+            "session_run_id=%s session_generation=%s phase=%s symbol=%s "
+            "owner=%s lifecycle=%s trade_date=%s trading_epoch=%s",
+            _signal_id, tick_index, tick_id, session_run_id,
+            session_generation, phase, symbol,
+            str(intent.get("strategy_owner")
+                or (intent.get("meta") or {}).get("strategy_owner")
+                or _trace_position.get("strategy_owner") or ""),
+            str(intent.get("position_lifecycle_id")
+                or (intent.get("meta") or {}).get("position_lifecycle_id")
+                or _trace_position.get("position_lifecycle_id") or ""),
+            trade_date,
+            str(intent.get("trading_epoch_id")
+                or (intent.get("meta") or {}).get("trading_epoch_id")
+                or _trace_position.get("trading_epoch_id") or "UNKNOWN"),
+        )
+        logger.info(
+            "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=%s symbol=%s "
+            "family=%s observed_mono_ns=%d",
+            tick_index, phase, symbol, _exit_family(intent),
+            int(observed_mono * 1_000_000_000),
+        )
     # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
@@ -2485,6 +2561,22 @@ def run_trade_tick(
             exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
         else:
             from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
+            import inspect as _exit_inspect
+            _exit_observer_supported = (
+                "on_sell_ready" in _exit_inspect.signature(_gen_exit_from_snapshots).parameters
+            )
+            def _gen_pb1_observed(snapshots, *, include_trend_time, phase):
+                kwargs = dict(
+                    prepared_snapshots=snapshots, include_trend_time=include_trend_time,
+                )
+                if _exit_observer_supported:
+                    kwargs["on_sell_ready"] = (
+                        lambda intent, observed: _observe_pb1_sell(intent, observed, phase)
+                    )
+                else:
+                    logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] phase=%s", phase)
+                return _gen_exit_from_snapshots([], provider=None, now=now, **kwargs)
+
             try:
                 exit_snapshots = prepare_exit_position_snapshots(
                     exclude_non_standard(current_positions), provider, now
@@ -2493,7 +2585,9 @@ def run_trade_tick(
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 exit_snapshots = []
             try:
-                safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
+                safety_exit_intents = _gen_pb1_observed(
+                    exit_snapshots, include_trend_time=False, phase="safety",
+                )
             except Exception as _safety_eval_exc:
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
                 safety_exit_intents = []
@@ -2512,7 +2606,9 @@ def run_trade_tick(
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
             if trend_targets:
                 try:
-                    trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
+                    trend_exit_intents = _gen_pb1_observed(
+                        trend_targets, include_trend_time=True, phase="trend",
+                    )
                 except Exception as _trend_eval_exc:
                     logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
                     trend_exit_intents = []
@@ -2532,6 +2628,31 @@ def run_trade_tick(
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+    # Identity is currently preserved for PB1 safety and trend intents, but
+    # the downstream merge copies its chosen row. Preserve provenance only
+    # when the selected row's symbol has a single evaluated SELL candidate.
+    # Ambiguous sources must remain unmeasured, not be mislabeled.
+    _sell_selected_ready_by_symbol: dict[str, float] = {}
+    _sell_candidate_count_by_symbol: dict[str, int] = {}
+    for _selected_intent in exit_intents:
+        if str(_selected_intent.get("side") or "").upper() != "SELL":
+            continue
+        _symbol = str(_selected_intent.get("symbol") or "").upper()
+        _sell_candidate_count_by_symbol[_symbol] = _sell_candidate_count_by_symbol.get(_symbol, 0) + 1
+        _selected_mono = _sell_selected_ready_by_identity.get(id(_selected_intent))
+        if _selected_mono is not None and _symbol not in _sell_selected_ready_by_symbol:
+            _sell_selected_ready_by_symbol[_symbol] = _selected_mono
+        elif _selected_mono is None:
+            _sell_selected_ready_by_symbol.pop(_symbol, None)
+    _sell_selected_ready_by_symbol = {
+        _symbol: _observed
+        for _symbol, _observed in _sell_selected_ready_by_symbol.items()
+        if _sell_candidate_count_by_symbol.get(_symbol) == 1
+    }
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_ready_by_symbol", _sell_selected_ready_by_symbol)
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_trace_id_by_symbol", {})
     # Measure protective signal readiness separately from broker routing.
     # This never changes an intent, strategy evaluation, or order/fence state.
     _early_sell_signal_ready_mono = (
@@ -4186,8 +4307,28 @@ def run_trade_tick(
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
     tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
+    # Per-order data is bounded, explicit, and labeled separately from
+    # summary statistics. No telemetry I/O is performed on the order path.
+    _by_attempt = tick_context.metrics.get("sell_signal_to_broker_boundary_by_attempt_ms", {})
+    _by_attempt = _by_attempt if isinstance(_by_attempt, dict) else {}
+    _per_attempt_observations = dict(list(_by_attempt.items())[:128])
+    _first_by_attempt = tick_context.metrics.get(
+        "sell_first_candidate_to_broker_by_attempt_ms", {}
+    )
+    _first_by_attempt = _first_by_attempt if isinstance(_first_by_attempt, dict) else {}
+    _first_candidate_observations = dict(list(_first_by_attempt.items())[:128])
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
+        "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
+        "sell_first_candidate_to_broker_by_attempt_ms": _first_candidate_observations,
+        "sell_first_candidate_truncated_count": (
+            max(0, len(_first_by_attempt) - len(_first_candidate_observations))
+            + int(tick_context.metrics.get("sell_first_candidate_dropped_count", 0))
+        ),
+        "sell_signal_to_broker_boundary_truncated_count": (
+            max(0, len(_by_attempt) - len(_per_attempt_observations))
+            + int(tick_context.metrics.get("sell_signal_to_broker_boundary_dropped_count", 0))
+        ),
         "balance_snapshot_ms": float(tick_context.metrics.get("balance_snapshot_ms", 0)),
         "balance_snapshot_logical_calls": int(tick_context.counters.get("balance_logical_calls", 0)),
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
