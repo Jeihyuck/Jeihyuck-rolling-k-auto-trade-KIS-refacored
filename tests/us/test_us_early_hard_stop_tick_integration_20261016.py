@@ -88,16 +88,22 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
             "sources": {}, "missing_symbols": [],
         }),
     )
+    state_updates = {"risk": [], "hwm": []}
+    def update_risk(**kwargs):
+        state_updates["risk"].append(kwargs["symbol"])
+        return {"soft_stop_breach_count": 0}
+    def update_hwm(**kwargs):
+        state_updates["hwm"].append(kwargs["symbol"])
+        return {
+            "high_watermark": kwargs["current_price"],
+            "lifecycle_id": kwargs["lifecycle_id"],
+        }
     monkeypatch.setattr(
-        "trader.us.db.repos.update_us_soft_stop_risk_state",
-        lambda **kwargs: {"soft_stop_breach_count": 0},
+        "trader.us.db.repos.update_us_soft_stop_risk_state", update_risk,
     )
     monkeypatch.setattr(
         "trader.us.position_lifecycle_state.update_us_position_high_watermark",
-        lambda **kwargs: {
-            "high_watermark": kwargs["current_price"],
-            "lifecycle_id": kwargs["lifecycle_id"],
-        },
+        update_hwm,
     )
     monkeypatch.setattr(trade_tick_runner, "_get_strategy_engine",
                         lambda env, offline: USPb1Engine(env=env, offline=offline))
@@ -148,3 +154,8 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
         assert events.index("quote_BBB") < events.index("submit_AAA"), events
     assert result["exit_intents"] == 1
     assert result["orders"][0]["status"] == route_status
+    # Safety-pass streaming may not repeat soft-stop ticks or high-watermarks.
+    assert state_updates["risk"].count("AAA") == 1
+    assert state_updates["risk"].count("BBB") == 1
+    assert state_updates["hwm"].count("AAA") == 1
+    assert state_updates["hwm"].count("BBB") == 1
