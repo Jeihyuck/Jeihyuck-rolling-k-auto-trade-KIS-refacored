@@ -2929,14 +2929,23 @@ class PB1Engine:
             raise
         finally:
             elapsed = time.perf_counter() - started
-            # [2026-04-30] tick 잔여 시간 업데이트 (non-critical DB skip 판단용)
+            # The stage budget is NOT the shared tick budget. Do not extend
+            # KIS I/O availability when a short stage finishes quickly after
+            # most of the outer tick's monotonic deadline has already elapsed.
             if max_sec > 0:
-                remaining = max(0.0, max_sec - elapsed)
+                stage_remaining = max(0.0, max_sec - elapsed)
+                from trader.kis_wrapper import kr_tick_remaining_sec
+                shared_remaining = kr_tick_remaining_sec()
+                remaining = (
+                    min(stage_remaining, max(0.0, shared_remaining))
+                    if math.isfinite(shared_remaining)
+                    else stage_remaining
+                )
                 self._tick_remaining_sec = remaining
                 if remaining < int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5")):
                     logger.info(
-                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f action=skip_noncritical_update",
-                        stage_name, remaining,
+                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f shared_remaining_sec=%s action=skip_noncritical_update",
+                        stage_name, remaining, shared_remaining,
                     )
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
             if error is None and max_sec > 0 and elapsed > max_sec:
@@ -13384,9 +13393,15 @@ class PB1Engine:
                 display_code, eval_reason, holding_minutes, min_hold_minutes,
             )
         # [2026-04-30] last_exit_eval_json은 non-critical: 남은 tick budget이 부족하면 skip
-        _noncritical_timeout = int(os.getenv("PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC", "2"))
         _skip_threshold = int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"))
+        from trader.kis_wrapper import kr_tick_remaining_sec
         _tick_remaining = getattr(self, "_tick_remaining_sec", None)
+        _live_remaining = kr_tick_remaining_sec()
+        if math.isfinite(_live_remaining):
+            _tick_remaining = (
+                max(0.0, _live_remaining) if _tick_remaining is None
+                else min(float(_tick_remaining), max(0.0, _live_remaining))
+            )
         _should_skip_noncritical = (
             _tick_remaining is not None and float(_tick_remaining) < _skip_threshold
         )
@@ -13397,22 +13412,20 @@ class PB1Engine:
             )
         else:
             try:
-                import signal as _signal
-                def _timeout_handler(signum, frame):
-                    raise TimeoutError("noncritical_db_update_timeout")
-                _signal.signal(_signal.SIGALRM, _timeout_handler)
-                _signal.alarm(_noncritical_timeout)
-                try:
-                    self.positions_repo.update_position_fields(
-                        env=self.env,
-                        strategy=self.STRATEGY_NAME,
-                        sid=sid,
-                        mode=mode,
-                        code=code,
-                        fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
-                    )
-                finally:
-                    _signal.alarm(0)
+                # SIGALRM is owned by pb1_runner's shared tick watchdog.
+                # Never install/cancel a nested alarm: that could silently
+                # disarm the actual trading tick timeout. This DB write is
+                # noncritical; broker submission and durable claim come first.
+                # The existing whole-tick watchdog/DB driver timeout apply.
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=sid,
+                    mode=mode,
+                    code=code,
+                    fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
+                )
+
             except Exception as _upd_exc:
                 logger.warning(
                     "[POSITIONS][UPDATE][FAIL_SOFT] code=%s field=last_exit_eval_json err=%s",
@@ -17263,6 +17276,36 @@ class PB1Engine:
             (holdings_meta or {}).get("source"),
         )
         self._exit_holdings_meta = holdings_meta
+        # Priority enrollment is nonblocking and does not change any owner
+        # decision. Keep all non-subscribed symbols eligible for governed REST
+        # fallback rather than treating WebSocket overflow as no market data.
+        try:
+            from trader.marketdata.kis_ws_price import get_kis_ws_price_service
+            _hold_codes = [
+                str(getattr(holding, "code", "") or "").zfill(6)
+                for holding in (holdings_for_exit or [])
+                if str(getattr(holding, "code", "") or "").zfill(6) != "122630"
+            ]
+            _orders = self._tick_db_cache.get("open_orders", [])
+            _order_codes = [
+                str((row or {}).get("code") or "").zfill(6)
+                for row in (_orders if isinstance(_orders, list) else [])
+                if isinstance(row, dict) and (row.get("code") or "")
+            ]
+            _final_codes = (
+                [str(code).zfill(6) for code in self.final30_df["code"].tolist()]
+                if isinstance(self.final30_df, pd.DataFrame) and "code" in self.final30_df
+                else []
+            )
+            get_kis_ws_price_service().prioritize_kr_symbols(
+                holdings=_hold_codes, unresolved_orders=_order_codes,
+                final30=_final_codes,
+            )
+        except Exception as _ws_priority_exc:
+            logger.warning(
+                "[KR_WS][OWNER_PRIORITY][FAIL_SOFT] type=%s action=KEEP_REST_FALLBACK",
+                type(_ws_priority_exc).__name__,
+            )
         positions_for_exit = [holding.to_position_dict() for holding in holdings_for_exit]
         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
         existing_positions_count = len(existing_positions)
@@ -17349,7 +17392,17 @@ class PB1Engine:
         exit_pass_fail_open = self._exit_pass_timeout_fail_open_enabled()
         exit_pass_started = time.perf_counter()
         # exit prewarm: exit_pass 직전에 OHLCV/현재가 캐시를 미리 채운다
-        self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
+        # Full-universe prewarm is a head-of-line blocker: one slow historical
+        # candle or quote delays *every* protective SELL. The existing
+        # _run_exit_always path still loads each owner's required OHLCV before
+        # its own decision. Keep legacy eager prewarm opt-in for diagnostics.
+        if os.getenv("KR_EXIT_BLOCKING_PREWARM", "0") == "1":
+            self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
+        else:
+            logger.info(
+                "[KR_EXIT][PREWARM_DEFERRED] holdings=%s action=EVALUATE_PER_HOLDING_FIRST",
+                len(holdings_for_exit or []),
+            )
         logger.info(
             "[PASS][EXIT][START] phase=%s existing_positions=%s holdings_source=%s",
             self.phase,

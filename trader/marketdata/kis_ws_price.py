@@ -161,6 +161,43 @@ class KisWebSocketPriceService:
             self._desired[("KR", symbol)] = (self.KR_TR_ID, symbol)
         self._ensure_started()
 
+    def prioritize_kr_symbols(
+        self,
+        *,
+        holdings: list[str],
+        unresolved_orders: list[str],
+        final30: list[str],
+    ) -> dict[str, int]:
+        """Reserve scarce WS slots for KR owner-held and open-order symbols.
+
+        Does not change strategy signals or REST fallback. Excess symbols
+        continue through the ordinary freshness-checked REST quote path.
+        """
+        if not self.network_allowed("KR"):
+            return {"priority": 0, "desired": 0, "overflow": 0}
+        ordered: list[str] = []
+        for group in (holdings, unresolved_orders, final30):
+            for raw in group or []:
+                normalized = self._normalize_symbol("KR", raw)
+                if normalized and normalized not in ordered:
+                    ordered.append(normalized)
+        with self._lock:
+            old = dict(self._desired)
+            arranged: dict[tuple[str, str], tuple[str, str]] = {
+                ("KR", sym): (self.KR_TR_ID, sym) for sym in ordered
+            }
+            arranged.update({key: value for key, value in old.items() if key not in arranged})
+            self._desired = arranged
+            max_count = max(1, int(float(os.getenv("KIS_WS_MAX_SUBSCRIPTIONS", "40") or 40)))
+            total = len(arranged)
+        self._ensure_started()
+        logger.info(
+            "[KR_WS][OWNER_PRIORITY] holdings=%s unresolved=%s final30=%s priority=%s desired=%s slots=%s overflow=%s",
+            len(holdings or []), len(unresolved_orders or []), len(final30 or []),
+            len(ordered), total, max_count, max(0, total - max_count),
+        )
+        return {"priority": len(ordered), "desired": total, "overflow": max(0, total - max_count)}
+
     def subscribe_us(self, symbol: str, exchange: str) -> None:
         if not self.network_allowed("US"):
             return
@@ -425,6 +462,34 @@ class KisWebSocketPriceService:
                                 "[KIS_WS][SUBSCRIPTION_LIMIT] desired=%d max=%d action=REST_FALLBACK_FOR_EXCESS",
                                 len(desired), max_subscriptions,
                             )
+
+                        # Rebalance already-sent KR subscriptions when owner
+                        # priorities change after the connection started. An
+                        # unsent/out-of-cap symbol must not occupy a slot at the
+                        # expense of an active held position. KIS unsubscribe is
+                        # tr_type=2; never increase the configured slot limit.
+                        target_keys = set(list(desired)[:max_subscriptions])
+                        stale_kr = [
+                            key for key in sent
+                            if key[0] == "KR" and key not in target_keys
+                        ]
+                        if stale_kr:
+                            old_key = stale_kr[0]
+                            tr_id, tr_key = desired.get(old_key, (self.KR_TR_ID, old_key[1]))
+                            await ws.send(json.dumps({
+                                "header": {
+                                    "approval_key": approval, "custtype": "P",
+                                    "tr_type": "2", "content-type": "utf-8",
+                                },
+                                "body": {"input": {"tr_id": tr_id, "tr_key": tr_key}},
+                            }, ensure_ascii=False))
+                            sent.discard(old_key)
+                            with self._lock:
+                                self._quotes.pop(old_key, None)
+                            last_subscribe_at = time.monotonic()
+                            logger.info("[KR_WS][REBALANCE_UNSUBSCRIBE] symbol=%s action=MAKE_ROOM_FOR_HOLDINGS", tr_key)
+                            await asyncio.sleep(_env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5))
+                            continue
 
                         # Interleave subscribe and receive work. A rejected
                         # symbol is held behind its own retry deadline so it
