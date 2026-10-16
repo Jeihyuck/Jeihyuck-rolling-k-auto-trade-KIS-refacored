@@ -2547,13 +2547,27 @@ def run_trade_tick(
         import uuid as _trace_uuid
         _signal_id = _trace_uuid.uuid4().hex
         _sell_signal_id_by_identity[id(intent)] = _signal_id
+        _trace_position = next(
+            (p for p in current_positions
+             if str(p.get("symbol") or "").upper() == symbol),
+            {},
+        )
         logger.info(
-            "[US_EXIT][SIGNAL_TRACE_ID] signal_id=%s tick=%s phase=%s symbol=%s "
-            "owner=%s lifecycle=%s trade_date=%s epoch=%s",
-            _signal_id, tick_index, phase, symbol,
-            str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or ""),
-            str(intent.get("position_lifecycle_id") or (intent.get("meta") or {}).get("position_lifecycle_id") or ""),
-            trade_date, str(session_generation),
+            "[US_EXIT][SIGNAL_TRACE_ID] signal_id=%s tick=%s tick_id=%s "
+            "session_run_id=%s session_generation=%s phase=%s symbol=%s "
+            "owner=%s lifecycle=%s trade_date=%s trading_epoch=%s",
+            _signal_id, tick_index, tick_id, session_run_id,
+            session_generation, phase, symbol,
+            str(intent.get("strategy_owner")
+                or (intent.get("meta") or {}).get("strategy_owner")
+                or _trace_position.get("strategy_owner") or ""),
+            str(intent.get("position_lifecycle_id")
+                or (intent.get("meta") or {}).get("position_lifecycle_id")
+                or _trace_position.get("position_lifecycle_id") or ""),
+            trade_date,
+            str(intent.get("trading_epoch_id")
+                or (intent.get("meta") or {}).get("trading_epoch_id")
+                or _trace_position.get("trading_epoch_id") or "UNKNOWN"),
         )
         logger.info(
             "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=%s symbol=%s "
