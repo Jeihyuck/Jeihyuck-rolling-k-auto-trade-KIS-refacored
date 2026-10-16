@@ -95,11 +95,70 @@ def get_quote(symbol: str, exchange: str, *, env: str, max_age_sec: float = 15,
         return None
 
 
+def subscribe_many(pairs: list[tuple[str, str]], *, env: str,
+                   timeout_sec: float = 0.5) -> bool:
+    """Best-effort READ-ONLY subscription warmup, never a quote/order truth.
+
+    Does not return prices. A failed, late or stale collector is handled by
+    the unchanged fresh-quote and REST fallback in USDataProvider.
+    """
+    if not enabled() or not pairs:
+        return False
+    normalized = []
+    seen = set()
+    for symbol, exchange in pairs:
+        pair = (str(symbol).strip().upper(), str(exchange).strip().upper())
+        if not pair[0] or not pair[1] or len(pair[0]) > 16 or pair in seen:
+            continue
+        seen.add(pair)
+        normalized.append({"symbol": pair[0], "exchange": pair[1]})
+        if len(normalized) >= 16:
+            break
+    if not normalized:
+        return False
+    try:
+        result = _send_request(
+            env, {"cmd": "SUBSCRIBE_MANY", "pairs": normalized},
+            timeout_sec=min(0.8, max(0.05, timeout_sec)),
+        )
+        ok = bool(
+            result and result.get("status") == "OK"
+            and int(result.get("subscribed") or 0) == len(normalized)
+            and result.get("generation")
+        )
+        if not ok:
+            logger.info(
+                "[US_WS_COLLECTOR][SUBSCRIBE_MANY_MISS] requested=%d response=%s",
+                len(normalized), str((result or {}).get("status") or "NO_REPLY"),
+            )
+        return ok
+    except (OSError, ValueError, RuntimeError, TypeError) as exc:
+        logger.info("[US_WS_COLLECTOR][SUBSCRIBE_MANY_FALLBACK] reason=%s", type(exc).__name__)
+        return False
+
+
 def _reply(request: dict, *, env: str, generation: str, service) -> dict:
     if request.get("identity") != _account_identity(env) or request.get("env") != env:
         return {"status": "DENIED"}
     if str(request.get("cmd") or "") == "HEALTH":
         return {"status": "OK", "generation": generation, "collector": "READ_ONLY"}
+    if request.get("cmd") == "SUBSCRIBE_MANY":
+        pairs = request.get("pairs")
+        if not isinstance(pairs, list) or not 1 <= len(pairs) <= 16:
+            return {"status": "BAD_REQUEST"}
+        valid = []
+        for item in pairs:
+            if not isinstance(item, dict):
+                return {"status": "BAD_REQUEST"}
+            symbol = str(item.get("symbol") or "").strip().upper()
+            exchange = str(item.get("exchange") or "").strip().upper()
+            if not symbol or not exchange or len(symbol) > 16 or len(exchange) > 12:
+                return {"status": "BAD_REQUEST"}
+            valid.append((symbol, exchange))
+        for symbol, exchange in valid:
+            service.subscribe_us(symbol, exchange)
+        return {"status": "OK", "generation": generation,
+                "subscribed": len(valid), "collector": "READ_ONLY"}
     if request.get("cmd") != "QUOTE":
         return {"status": "BAD_REQUEST"}
     symbol = str(request.get("symbol") or "").strip().upper()
