@@ -1178,6 +1178,7 @@ def _evaluate_exit_intents_from_snapshots(
     *,
     now: datetime | None = None,
     include_trend_time: bool = True,
+    on_sell_ready=None,
 ) -> list[dict]:
     intents: list[dict] = []
     sell_explanations: list[dict] = []
