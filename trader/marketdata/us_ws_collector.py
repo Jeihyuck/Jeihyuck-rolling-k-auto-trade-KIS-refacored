@@ -22,6 +22,7 @@ import uuid
 logger = logging.getLogger(__name__)
 _MAX_MESSAGE_BYTES = 4096
 _MAX_REPLY_BYTES = 8192
+_LAST_START_REQUEST: subprocess.Popen | None = None
 
 
 def enabled() -> bool:
@@ -238,18 +239,35 @@ def serve(*, env: str, parent_pid: int, service=None, max_seconds: float | None 
 
 def ensure_started(*, env: str, offline: bool = False) -> subprocess.Popen | None:
     """Start collector from the session parent; do not fork its WS threads."""
+    global _LAST_START_REQUEST
     if offline or not enabled():
         return None
     try:
         health = _send_request(env, {"cmd": "HEALTH"}, timeout_sec=0.15)
         if health and health.get("status") == "OK":
             return None
+        if _LAST_START_REQUEST is not None:
+            _previous_exit = _LAST_START_REQUEST.poll()
+            if _previous_exit is None:
+                logger.warning(
+                    "[US_WS_COLLECTOR][HEALTH_UNAVAILABLE_CHILD_ALIVE] pid=%d "
+                    "action=REST_FALLBACK_NO_DUPLICATE_SPAWN",
+                    _LAST_START_REQUEST.pid,
+                )
+                return None
+            logger.warning(
+                "[US_WS_COLLECTOR][EARLY_EXIT] pid=%d exit_code=%s "
+                "action=RESTART_WITH_NEW_GENERATION",
+                _LAST_START_REQUEST.pid, _previous_exit,
+            )
+            _LAST_START_REQUEST = None
         process = subprocess.Popen(
             [sys.executable, "-m", "trader.marketdata.us_ws_collector",
              "--env", env, "--parent-pid", str(os.getpid())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
         )
+        _LAST_START_REQUEST = process
         logger.info("[US_WS_COLLECTOR][START_REQUEST] pid=%d", process.pid)
         return process
     except (OSError, RuntimeError) as exc:
