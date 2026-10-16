@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _replay_account_identity(value: object, lookup_context: dict | None) -> str:
@@ -577,6 +580,12 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         try:
             from trader.us.db.repos import load_active_execution_claim_attempts
             active_claims = load_active_execution_claim_attempts()
+            # A single broker/journal replay must see one consistent journal
+            # snapshot per source date. Re-reading identical historical dates
+            # for each active claim adds redundant DB I/O and cannot discover
+            # later fills until the next broker evidence reconciliation anyway.
+            source_events_by_date: dict[str, list[dict]] = {}
+            reused_source_dates = 0
             for claim in active_claims:
                 source_date = str(claim.get("trade_date") or "")
                 key = str(claim.get("client_order_key") or "")
@@ -589,7 +598,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 active_attempt_keys.add((key, attempt_id))
                 if source_date == trade_date and not active_claims_only:
                     continue
-                source_events = load_order_events(source_date)
+                if source_date not in source_events_by_date:
+                    source_events_by_date[source_date] = load_order_events(source_date)
+                else:
+                    reused_source_dates += 1
+                source_events = source_events_by_date[source_date]
                 # Retain every submit attempt for this active claim key BEFORE
                 # applying the active-only filter. An older KIS ACK/fill cannot
                 # be made invisible merely because the claim points at a retry.
@@ -608,6 +621,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     })
                     continue
                 events.extend(attempt_events)
+            logger.info(
+                "[US_ORDER_JOURNAL][ACTIVE_CLAIM_SOURCE_MEMO] "
+                "claims=%d unique_dates=%d duplicate_reads_eliminated=%d",
+                len(active_claims), len(source_events_by_date), reused_source_dates,
+            )
         except Exception as exc:
             active_claim_errors.append({
                 "symbol": "", "side": "", "reason": f"active_claim_lookup_failed:{type(exc).__name__}",

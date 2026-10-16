@@ -1972,6 +1972,46 @@ def run_trade_tick(
     # Extract position_symbols from reconcile result
     current_position_symbols: set[str] = set(recon.get("position_symbols", []))
 
+    # PR-C: subscribe to held STANDARD symbols while slow fill/order recovery
+    # has yet to run. No quote or cash truth is accepted here. Freshness and
+    # generation checks still run at the original data-provider boundary.
+    # Opt-in only; the collector process has no order APIs.
+    if (
+        not offline and os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1"
+        and os.getenv("US_WS_EXIT_OWNER_PREWARM_ENABLED", "0") == "1"
+        and str(recon.get("status") or "").upper() == "OK"
+        and isinstance(recon.get("positions"), list)
+    ):
+        try:
+            from trader.us.strategy_ownership import exclude_non_standard as _standard_for_ws
+            from trader.us.symbols import normalize_us_exchange as _normalize_ws_exchange
+            from trader.marketdata.us_ws_collector import subscribe_many as _ws_subscribe_many
+            _pairs = []
+            for _pos in _standard_for_ws(recon["positions"]):
+                _symbol = str(_pos.get("symbol") or "").strip().upper()
+                if not _symbol or _symbol == "TQQQ":
+                    continue
+                try:
+                    _exchange = _normalize_ws_exchange(_pos.get("exchange") or "NASDAQ")
+                except ValueError:
+                    continue
+                _pairs.append((_symbol, _exchange))
+            _seen_pairs = list(dict.fromkeys(_pairs))
+            _subscribed_batches = 0
+            for _index in range(0, min(len(_seen_pairs), 48), 16):
+                _subscribed_batches += int(_ws_subscribe_many(
+                    _seen_pairs[_index:_index + 16], env=env, timeout_sec=0.3,
+                ))
+            logger.info(
+                "[US_WS_COLLECTOR][EXIT_OWNER_PREWARM] symbols=%d batches_ok=%d",
+                min(len(_seen_pairs), 48), _subscribed_batches,
+            )
+        except Exception as _ws_prewarm_error:
+            logger.warning(
+                "[US_WS_COLLECTOR][EXIT_OWNER_PREWARM_SKIP] reason=%s",
+                type(_ws_prewarm_error).__name__,
+            )
+
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
     
@@ -2132,6 +2172,7 @@ def run_trade_tick(
     # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
     if not offline:
         _order_reconcile_started = time.monotonic()
+        _active_claim_replay_started = time.monotonic()
         try:
             from trader.us.execution.order_journal import replay_order_journal
             active_claim_recovery_result = replay_order_journal(
@@ -2150,6 +2191,13 @@ def run_trade_tick(
             }
             ack_recon["active_claim_recovery"] = active_claim_recovery_result
             logger.error("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY_ERROR] %s", exc)
+        finally:
+            tick_context.metrics["active_claim_replay_ms"] = (
+                time.monotonic() - _active_claim_replay_started
+            ) * 1000.0
+            logger.info("[US_RECONCILE][ACTIVE_CLAIM_LATENCY] tick=%s duration_ms=%.2f",
+                        tick_index, tick_context.metrics["active_claim_replay_ms"])
+        _ack_reconcile_started = time.monotonic()
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon = reconcile_ack_orders_with_balance(
@@ -2178,7 +2226,15 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
         finally:
+            tick_context.metrics["ack_reconcile_ms"] = (
+                time.monotonic() - _ack_reconcile_started
+            ) * 1000.0
             tick_context.metrics["order_reconcile_ms"] = (time.monotonic() - _order_reconcile_started) * 1000.0
+            logger.info(
+                "[US_RECONCILE][ACK_LATENCY] tick=%s duration_ms=%.2f total_ms=%.2f",
+                tick_index, tick_context.metrics["ack_reconcile_ms"],
+                tick_context.metrics["order_reconcile_ms"],
+            )
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
@@ -2987,9 +3043,8 @@ def run_trade_tick(
     exit_intents = _suppress_pending_sell_exit_intents(
         exit_intents, trade_date, env=env,
     )
-    # An early pilot ACK may now appear as pending. Preserve its original
-    # selected intent for tick audit/status, but exclude it from the late
-    # route below. Otherwise a genuine exit would be reported as NO_TRADE.
+    # Restore audit of the already-attempted early SELL without permitting
+    # any late submission of this symbol.
     for _early_intent in _early_pilot_intents:
         if not any(
             str(i.get("symbol") or "").upper()
@@ -4549,6 +4604,8 @@ def run_trade_tick(
         "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
         "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
         "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "active_claim_replay_ms": float(tick_context.metrics.get("active_claim_replay_ms", 0)),
+        "ack_reconcile_ms": float(tick_context.metrics.get("ack_reconcile_ms", 0)),
         "post_route_reconcile_ms": float(tick_context.metrics.get("post_route_reconcile_ms", 0)),
         "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
         "fill_rows_received": len(fills_today),
