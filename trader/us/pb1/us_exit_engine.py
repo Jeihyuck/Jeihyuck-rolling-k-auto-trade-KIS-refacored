@@ -1222,6 +1222,14 @@ def _evaluate_exit_intents_from_snapshots(
             except Exception as exc:
                 logger.warning("[US_EXIT][ENTRY_CONTRACT][AUDIT_WARN] symbol=%s err=%s", symbol, exc)
 
+            # True per-position signal time: called inside the evaluation loop
+            # only after the selected intent is fully populated. Observer failure
+            # cannot prevent order evaluation or change risk-state mutations.
+            if on_sell_ready is not None:
+                try:
+                    on_sell_ready(intent, time.monotonic())
+                except Exception:
+                    logger.warning("[US_EXIT][OBSERVATION_FAILED] symbol=%s", symbol)
             intents.append(intent)
         elif intent is not None and intent.get("side") == "HOLD":
             hold_explanation = build_us_exit_explanation(
@@ -1298,6 +1306,7 @@ def generate_exit_intents(
     *,
     prepared_snapshots: list[dict] | None = None,
     include_trend_time: bool = True,
+    on_sell_ready=None,
 ) -> list[dict]:
     """보유 포지션 전체에 대해 청산 조건 평가."""
     if not positions and not prepared_snapshots:
@@ -1305,4 +1314,4 @@ def generate_exit_intents(
         return []
     logger.info("[US_EXIT][EVAL][START] positions=%d", len(prepared_snapshots or positions or []))
     snapshots = prepared_snapshots if prepared_snapshots is not None else prepare_exit_position_snapshots(positions, provider, now)
-    return _evaluate_exit_intents_from_snapshots(snapshots, now=now, include_trend_time=include_trend_time)
+    return _evaluate_exit_intents_from_snapshots(snapshots, now=now, include_trend_time=include_trend_time, on_sell_ready=on_sell_ready)
