@@ -2560,13 +2560,27 @@ def run_trade_tick(
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
-    # Derive selected-intent attribution only from *actual* identity. An
-    # unrelated candidate's first-by-symbol timestamp is not a valid proxy.
+    # Identity is currently preserved for PB1 safety and trend intents, but
+    # the downstream merge copies its chosen row. Preserve provenance only
+    # when the selected row's symbol has a single evaluated SELL candidate.
+    # Ambiguous sources must remain unmeasured, not be mislabeled.
     _sell_selected_ready_by_symbol: dict[str, float] = {}
+    _sell_candidate_count_by_symbol: dict[str, int] = {}
     for _selected_intent in exit_intents:
+        if str(_selected_intent.get("side") or "").upper() != "SELL":
+            continue
+        _symbol = str(_selected_intent.get("symbol") or "").upper()
+        _sell_candidate_count_by_symbol[_symbol] = _sell_candidate_count_by_symbol.get(_symbol, 0) + 1
         _selected_mono = _sell_selected_ready_by_identity.get(id(_selected_intent))
-        if _selected_mono is not None:
-            _sell_selected_ready_by_symbol[str(_selected_intent.get("symbol") or "").upper()] = _selected_mono
+        if _selected_mono is not None and _symbol not in _sell_selected_ready_by_symbol:
+            _sell_selected_ready_by_symbol[_symbol] = _selected_mono
+        elif _selected_mono is None:
+            _sell_selected_ready_by_symbol.pop(_symbol, None)
+    _sell_selected_ready_by_symbol = {
+        _symbol: _observed
+        for _symbol, _observed in _sell_selected_ready_by_symbol.items()
+        if _sell_candidate_count_by_symbol.get(_symbol) == 1
+    }
     if tick_context is not None:
         setattr(tick_context, "_sell_selected_ready_by_symbol", _sell_selected_ready_by_symbol)
     # Measure protective signal readiness separately from broker routing.
