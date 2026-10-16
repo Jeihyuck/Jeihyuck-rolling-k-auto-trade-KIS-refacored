@@ -2560,6 +2560,15 @@ def run_trade_tick(
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+    # Derive selected-intent attribution only from *actual* identity. An
+    # unrelated candidate's first-by-symbol timestamp is not a valid proxy.
+    _sell_selected_ready_by_symbol: dict[str, float] = {}
+    for _selected_intent in exit_intents:
+        _selected_mono = _sell_selected_ready_by_identity.get(id(_selected_intent))
+        if _selected_mono is not None:
+            _sell_selected_ready_by_symbol[str(_selected_intent.get("symbol") or "").upper()] = _selected_mono
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_ready_by_symbol", _sell_selected_ready_by_symbol)
     # Measure protective signal readiness separately from broker routing.
     # This never changes an intent, strategy evaluation, or order/fence state.
     _early_sell_signal_ready_mono = (
@@ -4214,8 +4223,15 @@ def run_trade_tick(
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
     tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
+    # Per-order data is bounded, explicit, and labeled separately from
+    # summary statistics. No telemetry I/O is performed on the order path.
+    _by_attempt = tick_context.metrics.get("sell_signal_to_broker_boundary_by_attempt_ms", {})
+    _by_attempt = _by_attempt if isinstance(_by_attempt, dict) else {}
+    _per_attempt_observations = dict(list(_by_attempt.items())[:128])
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
+        "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
+        "sell_signal_to_broker_boundary_truncated_count": max(0, len(_by_attempt) - len(_per_attempt_observations)),
         "balance_snapshot_ms": float(tick_context.metrics.get("balance_snapshot_ms", 0)),
         "balance_snapshot_logical_calls": int(tick_context.counters.get("balance_logical_calls", 0)),
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
