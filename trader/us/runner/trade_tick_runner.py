@@ -2649,6 +2649,10 @@ def run_trade_tick(
             _early_pilot_enabled = (
                 os.getenv("US_EARLY_HARD_STOP_PILOT_ENABLED", "0") == "1"
                 and str(env).lower() == "practice"
+                # Never route a practice pilot to a real KIS client if the
+                # runner argument and actual client environment disagree.
+                and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
+                and not offline
                 and kis_order_allowed and not signal_only and exit_can_proceed
                 and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"
                 and not fills_contract_error and not fills_temp_error
@@ -2709,6 +2713,15 @@ def run_trade_tick(
                     return
                 _early_pilot_attempted_symbols.add(_sym)
                 _early_pilot_intents.append(_eligible[0])
+                # This pilot has a unique, hard-stop-only final choice for
+                # this symbol; attribute its real HTTP boundary to THIS intent,
+                # not an unrelated first-by-symbol candidate.
+                _chosen_mono = _sell_selected_ready_by_identity.get(id(_eligible[0]))
+                _chosen_trace_id = _sell_signal_id_by_identity.get(id(_eligible[0]))
+                if isinstance(_chosen_mono, (int, float)):
+                    tick_context._sell_selected_ready_by_symbol[_sym] = _chosen_mono
+                    if _chosen_trace_id:
+                        tick_context._sell_selected_trace_id_by_symbol[_sym] = _chosen_trace_id
                 logger.warning(
                     "[US_EXIT][EARLY_HARD_STOP_PILOT] tick=%s symbol=%s "
                     "action=route_via_canonical_router_before_unrelated_snapshots",
