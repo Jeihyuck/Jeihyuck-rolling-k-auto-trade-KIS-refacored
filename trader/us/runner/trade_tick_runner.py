@@ -2657,7 +2657,13 @@ def run_trade_tick(
                 _eligible = [
                     i for i in _new_intents
                     if str(i.get("side") or "").upper() == "SELL"
-                    and str(i.get("exit_type") or "").lower() == "hard_stop_loss"
+                    # SWING routing canonicalizes hard_stop_loss to hard_stop.
+                    # Require BOTH the canonical exit reason and exit family
+                    # to avoid admitting unrelated high-priority exits.
+                    and str(i.get("exit_type") or "").lower()
+                        in {"hard_stop", "hard_stop_loss"}
+                    and str(i.get("exit_reason") or "").lower()
+                        == "hard_stop_full_exit"
                     and _exit_family(i) == "HARD_STOP"
                     and str(i.get("symbol") or "").upper() == _sym
                 ]
