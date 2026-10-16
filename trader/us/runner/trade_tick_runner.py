@@ -2463,6 +2463,22 @@ def run_trade_tick(
     _sell_signal_ready_by_symbol: dict[str, float] = {}
     if tick_context is not None:
         setattr(tick_context, "_sell_signal_ready_by_symbol", _sell_signal_ready_by_symbol)
+    _sell_selected_ready_by_identity: dict[int, float] = {}
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_ready_by_identity", _sell_selected_ready_by_identity)
+    def _observe_pb1_sell(intent: dict, observed_mono: float, phase: str) -> None:
+        # Selected and earliest candidate are separate measurement dimensions.
+        # Intent-local observation is deliberately process-local, never sent
+        # to the broker as a field or persisted as a monotonic timestamp.
+        symbol = str(intent.get("symbol") or "").upper()
+        _sell_signal_ready_by_symbol.setdefault(symbol, observed_mono)
+        _sell_selected_ready_by_identity[id(intent)] = observed_mono
+        logger.info(
+            "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=%s symbol=%s "
+            "family=%s observed_mono_ns=%d",
+            tick_index, phase, symbol, _exit_family(intent),
+            int(observed_mono * 1_000_000_000),
+        )
     # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
@@ -2497,23 +2513,11 @@ def run_trade_tick(
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
                 exit_snapshots = []
             try:
-                safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
-                # Observation only: record the first point at which each safety
-                # intent is available, before unrelated symbols' trend work.
-                # Never mutate risk state or order intent for telemetry.
-                _safety_ready_mono = time.monotonic()
-                for _ready_intent in safety_exit_intents or []:
-                    if str(_ready_intent.get("side") or "").upper() == "SELL":
-                        _sell_signal_ready_by_symbol.setdefault(str(_ready_intent.get("symbol") or "").upper(), _safety_ready_mono)
-                for _signal_index, _signal in enumerate(safety_exit_intents or []):
-                    if str(_signal.get("side") or "").upper() == "SELL":
-                        logger.info(
-                            "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=safety index=%d symbol=%s "
-                            "family=%s ready_mono_ns=%d observed_at_utc=%s",
-                            tick_index, _signal_index, str(_signal.get("symbol") or "").upper(),
-                            _exit_family(_signal), int(_safety_ready_mono * 1_000_000_000),
-                            datetime.now(timezone.utc).isoformat(),
-                        )
+                safety_exit_intents = _gen_exit_from_snapshots(
+                    [], provider=None, now=now, prepared_snapshots=exit_snapshots,
+                    include_trend_time=False,
+                    on_sell_ready=lambda intent, t: _observe_pb1_sell(intent, t, "safety"),
+                )
             except Exception as _safety_eval_exc:
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
                 safety_exit_intents = []
@@ -2532,20 +2536,11 @@ def run_trade_tick(
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
             if trend_targets:
                 try:
-                    trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
-                    _trend_ready_mono = time.monotonic()
-                    for _ready_intent in trend_exit_intents or []:
-                        if str(_ready_intent.get("side") or "").upper() == "SELL":
-                            _sell_signal_ready_by_symbol.setdefault(str(_ready_intent.get("symbol") or "").upper(), _trend_ready_mono)
-                    for _signal_index, _signal in enumerate(trend_exit_intents or []):
-                        if str(_signal.get("side") or "").upper() == "SELL":
-                            logger.info(
-                                "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=trend index=%d symbol=%s "
-                                "family=%s ready_mono_ns=%d observed_at_utc=%s",
-                                tick_index, _signal_index, str(_signal.get("symbol") or "").upper(),
-                                _exit_family(_signal), int(_trend_ready_mono * 1_000_000_000),
-                                datetime.now(timezone.utc).isoformat(),
-                            )
+                    trend_exit_intents = _gen_exit_from_snapshots(
+                        [], provider=None, now=now, prepared_snapshots=trend_targets,
+                        include_trend_time=True,
+                        on_sell_ready=lambda intent, t: _observe_pb1_sell(intent, t, "trend"),
+                    )
                 except Exception as _trend_eval_exc:
                     logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
                     trend_exit_intents = []
