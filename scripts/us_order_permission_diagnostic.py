@@ -27,7 +27,7 @@ def diagnose(session: str, environ: dict[str, str], env_text: str = "") -> dict:
     mode = environ.get("RUN_MODE") or environ.get("STRATEGY_MODE") or "TRADE"
     p = resolve_us_order_permissions(session, strategy_env, mode, environ)
     declared = set(re.findall(
-        r"(?m)^\\s*(?:export\\s+)?([A-Z][A-Z0-9_]*)\\s*=",
+        r"(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=",
         env_text,
     ))
     # Restricted to safe enum and boolean keys; secrets/account/token impossible.
@@ -42,7 +42,11 @@ def diagnose(session: str, environ: dict[str, str], env_text: str = "") -> dict:
         "permission_reasons": p.reasons,
         "effective_safe_flags": flags,
         "effective_safe_modes": {
-            key: str(environ.get(key, "UNSET"))[:48]
+            key: (str(environ.get(key, "UNSET")).upper()
+                  if str(environ.get(key, "UNSET")).upper() in {
+                      "UNSET", "PRACTICE", "PAPER", "LIVE", "TRADE",
+                      "SIGNAL_ONLY", "PREP", "DRY_RUN",
+                  } else "OTHER_OR_INVALID")
             for key in _SAFE_ENUMS
         },
         "env_file_declares_flags": sorted(k for k in _FLAG_KEYS if k in declared),
