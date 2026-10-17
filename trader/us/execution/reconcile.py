@@ -550,6 +550,7 @@ def reconcile_ack_orders_with_balance(
     from trader.us.db.repos import (load_pending_ack_orders, mark_order_filled_by_reconcile,
                                     apply_broker_order_observation, _get_engine_or_none)
     from trader.us.utils.order_no import normalize_us_order_no
+    from trader.us.execution.evidence_policy import require_broker_proof_for_balance_estimate
 
     settlement_shadow_engine = None
     try:
@@ -876,6 +877,18 @@ def reconcile_ack_orders_with_balance(
             continue
 
         if delta_confirmation["status"] in {"BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL"}:
+            if require_broker_proof_for_balance_estimate(order):
+                # Position change alone cannot establish which ACK order filled,
+                # its price, or its TP stage. Keep the original order/claim
+                # unsettled and fenced until the scoped broker execution arrives.
+                unresolved_count += 1
+                symbols_by_status["unresolved"].append(symbol)
+                logger.warning(
+                    "[US_RECONCILE][BALANCE_ESTIMATE_PENDING_BROKER] symbol=%s side=%s "
+                    "source_trade_date=%s action=KEEP_ORDER_CLAIM_PENDING",
+                    symbol, side, trade_date,
+                )
+                continue
             if atomic_scope_active or atomic_scope_unknown:
                 unresolved_count += 1
                 symbols_by_status["unresolved"].append(symbol)
@@ -974,6 +987,15 @@ def reconcile_ack_orders_with_balance(
                     fill_price_candidate,
                     buy_reason,
                 )
+                if require_broker_proof_for_balance_estimate(order):
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
+                    logger.warning(
+                        "[US_RECONCILE][BUY_BALANCE_ESTIMATE_PENDING_BROKER] "
+                        "symbol=%s source_trade_date=%s action=KEEP_ORDER_CLAIM_PENDING",
+                        symbol, trade_date,
+                    )
+                    continue
                 try:
                     mark_result = mark_order_filled_by_reconcile(
                         order_no=order_no,
