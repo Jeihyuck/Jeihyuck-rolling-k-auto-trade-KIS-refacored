@@ -19,13 +19,16 @@ _FLAG_KEYS = (
     "LIVE_TRADING_ENABLED", "US_LIVE_TRADING_ENABLED", "US_ORDER_ARMED",
     "SIGNAL_ONLY", "US_AGENT_ENABLED", "US_PAPER_TRADING_ENABLED",
 )
-_SAFE_ENUMS = ("KIS_ENV", "STRATEGY_ENV", "RUN_MODE", "STRATEGY_MODE")
+_SAFE_ENUMS = ("KIS_ENV", "STRATEGY_ENV", "RUN_MODE", "STRATEGY_MODE", "US_RUN_MODE")
 
 
 def diagnose(session: str, environ: dict[str, str], env_text: str = "") -> dict:
     strategy_env = str(environ.get("STRATEGY_ENV", "practice")).lower()
-    mode = environ.get("RUN_MODE") or environ.get("STRATEGY_MODE") or "TRADE"
-    p = resolve_us_order_permissions(session, strategy_env, mode, environ)
+    mode = environ.get("US_RUN_MODE") or environ.get("RUN_MODE") or environ.get("STRATEGY_MODE") or "TRADE"
+    effective_env = dict(environ)
+    if str(environ.get("US_SIGNAL_ONLY", "")).strip() == "1":
+        effective_env["SIGNAL_ONLY"] = "1"
+    p = resolve_us_order_permissions(session, strategy_env, mode, effective_env)
     declared = set(re.findall(
         r"(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=",
         env_text,
