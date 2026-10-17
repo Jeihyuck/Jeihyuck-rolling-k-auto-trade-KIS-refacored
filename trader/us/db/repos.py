@@ -5580,6 +5580,66 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
         raise RuntimeError(f"US prep status load DB error: {exc}") from exc
 
 
+
+def load_us_prep_completion_for_run(
+    trade_date: str, run_id: str, timeout_sec: int = 20,
+) -> dict:
+    """Read an exact completed same-day PREP run; do not use latest-attempt state.
+
+    A newer STARTED/ERROR must not mask the canonical artifact's completed run.
+    The caller must still validate the artifact, locked rows and provenance.
+    Duplicate identities, missing finish timestamps and DB errors fail closed.
+    This function never writes or changes an existing revision pin.
+    """
+    from trader.us.prep_effective import is_effective_prep_status
+
+    date_key = str(trade_date or "").strip()
+    run_key = str(run_id or "").strip()
+    if not date_key or not run_key:
+        return {}
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {}
+    try:
+        with engine.begin() as conn:
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 5000))
+            _set_statement_timeout(conn, timeout_ms)
+            # LIMIT 2 makes even duplicate run IDs fail closed.
+            rows = conn.execute(text("""
+                SELECT run_id, status, trade_date, result, started_at, finished_at
+                  FROM us_agent_runs
+                 WHERE trade_date = :trade_date
+                   AND run_id = :run_id
+                   AND agent_name IN ('us_prep', 'us_prep_dual_agent')
+                   AND mode = 'prep'
+                   AND finished_at IS NOT NULL
+                 ORDER BY finished_at DESC
+                 LIMIT 2
+            """), {"trade_date": date_key, "run_id": run_key}).mappings().all()
+        if len(rows) != 1:
+            logger.warning(
+                "[US_PREP_STATUS][RUN_LOOKUP] trade_date=%s unique=%s candidate_count=%d",
+                date_key, False, len(rows),
+            )
+            return {}
+        row = dict(rows[0])
+        if str(row.get("run_id") or "") != run_key:
+            return {}
+        if str(row.get("trade_date") or "") != date_key:
+            return {}
+        if not is_effective_prep_status(row.get("status")):
+            return {}
+        logger.info(
+            "[US_PREP_STATUS][RUN_LOOKUP] trade_date=%s status=%s completion_confirmed=1",
+            date_key, row.get("status"),
+        )
+        return row
+    except Exception as exc:
+        logger.error("[US_PREP_STATUS][RUN_LOOKUP][ERROR] trade_date=%s err_type=%s",
+                     date_key, type(exc).__name__)
+        raise RuntimeError("US PREP completion lookup failed") from exc
+
+
 def load_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
     """Backward-compatible alias for daily report prep status loading."""
     return load_latest_us_prep_status(trade_date=trade_date, timeout_sec=timeout_sec)

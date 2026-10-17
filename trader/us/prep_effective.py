@@ -11,10 +11,23 @@ from collections.abc import Sequence
 from typing import Any
 
 
+# These are completed PREP states, not permission to open new BUYs.  Do not
+# accept arbitrary *_BLOCKED states: a system or provider failure must remain
+# ineligible for reuse even if its label contains ENTRY_BLOCKED.
+_EXIT_ONLY_COMPLETE_STATUSES = frozenset({
+    "RISK_OFF_ENTRY_BLOCKED",
+    "DEFENSE_CRASH_ENTRY_BLOCKED",
+})
+
+
 def is_effective_prep_status(status: object) -> bool:
-    """Return True only for completed non-fatal PREP status families."""
+    """Recognize completion independently of the new-entry policy."""
     text = str(status or "").strip().upper()
-    return text == "OK" or text == "OK_WITH_WARNINGS" or text.startswith("OK_WITH_WARNINGS_")
+    return (
+        text in {"OK", "OK_WITH_WARNINGS"}
+        or text.startswith("OK_WITH_WARNINGS_")
+        or text in _EXIT_ONLY_COMPLETE_STATUSES
+    )
 
 
 def locked_rows_match_prep_run(
