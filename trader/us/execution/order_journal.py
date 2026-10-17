@@ -709,7 +709,6 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     from trader.us.utils.order_no import normalize_us_order_no
     # Query authoritative snapshots once per timeout, not once per journal row.
     balance = None
-    today_orders = None
     # The 2026-10-13 incident made >600 KIS CCNL requests in 35 ticks.
     # Historical active claims often share an original trade date; do not
     # fetch that broker order book repeatedly within one reconciliation.
@@ -744,13 +743,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 fills_by_trade_date[source_trade_date] = None
         return fills_by_trade_date[source_trade_date]
 
-    all_fills = None
+    # A replay of *historical* active claims must not query today's broker
+    # order/fill books. Every source day is resolved only when an attempt
+    # actually needs it. This is a per-invocation cache, never shared with a
+    # later tick or generation.
     if provider is not None:
         try: balance = provider.get_balance(force_refresh=True)
         except TypeError: balance = provider.get_balance()
         except Exception: balance = None
-        today_orders = orders_for_trade_date(trade_date)
-        all_fills = fills_for_trade_date(trade_date)
     positions_by_symbol = {}
     if isinstance(balance, dict):
         for pos in balance.get("positions") or []:
@@ -866,11 +866,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             )
             continue
         event_trade_date = str(latest.get("trade_date") or trade_date)
-        event_orders = today_orders
-        event_fills = all_fills
-        if provider is not None and event_trade_date != trade_date:
-            event_orders = orders_for_trade_date(event_trade_date)
-            event_fills = fills_for_trade_date(event_trade_date)
+        event_orders = orders_for_trade_date(event_trade_date) if provider is not None else None
         append_order_event("JOURNAL_REPLAY_STARTED", latest)
         ack = next((e for e in reversed(order_events) if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}), None)
         symbol, side, requested = str(latest.get("symbol") or "").upper(), str(latest.get("side") or "").upper(), int(latest.get("qty") or 0)
@@ -962,6 +958,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         )):
                     broker_fill = {"status": "EVIDENCE_IDENTITY_CONFLICT",
                                    "symbol": symbol, "side": side}
+                # The fresh, identity-checked order row/detail is already the
+                # broker observation. Fetch a source-day fill list only if
+                # neither source supplied an observation. Never skip this
+                # fallback merely because the order book was reachable.
+                if not broker_fill:
+                    event_fills = fills_for_trade_date(event_trade_date)
+                else:
+                    event_fills = None
                 if not broker_fill and isinstance(event_fills, list):
                     matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side and not _replay_detail_identity_conflicts(
                         f, order_no=order_no, symbol=symbol, side=side,
