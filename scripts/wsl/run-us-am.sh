@@ -186,8 +186,24 @@ if [[ "${US_OFFLINE:-0}" == "1" ]]; then
   cmd+=(--offline)
 fi
 
-# Sanitize permission diagnostics; never emit .env contents, account IDs, or tokens.
-# This has no order authority and cannot override any explicit stop flag.
-"${PYTHON_BIN}" scripts/us_order_permission_diagnostic.py --session am --env-file .env >> "$LOG_FILE" 2>&1 || true
+# Preserve explicit order stops. Diagnostics disclose only allowlisted flags.
+# A real TRADE session must not spend minutes evaluating/rerouting orders if
+# the shared broker permission resolver already denies *all* submissions.
+# Intentional dry-run, signal-only, offline and non-trade sessions continue.
+if "${PYTHON_BIN}" scripts/us_order_permission_diagnostic.py --session am --env-file .env --check-trade-start >> "$LOG_FILE" 2>&1; then
+  :
+else
+  startup_gate_rc=$?
+  if [[ "$startup_gate_rc" == "42" ]]; then
+    export NULLIM_SESSION_FINAL_STATUS=FAILED_ORDER_PERMISSION
+    export NULLIM_SESSION_FINAL_REASON=TRADE_START_PERMISSION_DENIED
+    echo "[US_ORDER_PERMISSION][STARTUP_BLOCKED] session=am reason=TRADE_START_PERMISSION_DENIED no_broker_submit=1" >> "$LOG_FILE"
+  else
+    export NULLIM_SESSION_FINAL_STATUS=FAILED_ORDER_PERMISSION_DIAGNOSTIC
+    export NULLIM_SESSION_FINAL_REASON=ORDER_PERMISSION_DIAGNOSTIC_FAILED
+    echo "[US_ORDER_PERMISSION][STARTUP_ERROR] session=am rc=$startup_gate_rc no_broker_submit=1" >> "$LOG_FILE"
+  fi
+  exit "$startup_gate_rc"
+fi
 
 "${cmd[@]}" >> "$LOG_FILE" 2>&1
