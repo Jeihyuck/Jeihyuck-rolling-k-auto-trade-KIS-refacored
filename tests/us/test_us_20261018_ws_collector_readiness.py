@@ -19,7 +19,7 @@ def _ws_env(monkeypatch):
     monkeypatch.delenv("DIAG_KIS_CALLS_ENABLED", raising=False)
     monkeypatch.delenv("KIS_WS_PRICE_FORCE_ENABLE", raising=False)
     monkeypatch.delenv("FORCE_HTTP", raising=False)
-    monkeypatch.setenv("KIS_WS_COLLECTOR_ROLE", "READ_ONLY")
+    monkeypatch.setenv("US_WS_COLLECTOR_ROLE", "READ_ONLY")
 
 
 def test_readonly_collector_can_subscribe_in_auto_even_without_live_strategy(monkeypatch):
