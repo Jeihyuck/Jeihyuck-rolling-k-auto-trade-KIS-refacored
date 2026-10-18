@@ -17449,6 +17449,12 @@ class PB1Engine:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
         
+        # Price-subscription prewarm for a separate strategy must not block
+        # PB1 exits or consume the time available to submit protective SELLs.
+        _after_exit = getattr(self, "_kr_after_protective_exit", None)
+        if callable(_after_exit):
+            _after_exit()
+
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")
             self._log_tick_price_cache_summary()
@@ -17547,6 +17553,12 @@ class PB1Engine:
             )
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status="OK_NO_TRADE", notes="PORTFOLIO_FULL")
+
+        # The scanner may feed KR rescue/relax bridge decisions: preserve
+        # its results and original failure handling, but run ONLY after SELL.
+        _deferred_entry_scan = getattr(self, "_kr_deferred_entry_scan", None)
+        if callable(_deferred_entry_scan) and self.phase == "entry":
+            _deferred_entry_scan()
 
         entry_pass_ok = True
         entry_pass_buys = 0
