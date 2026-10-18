@@ -7090,7 +7090,7 @@ def run_once(
 
         def _kr_entry_scan_after_exit():
             nonlocal entry_signals_result, entry_scan_compat_failed
-            scan_started = time.monotonic()
+            scan_started = time_mod.monotonic()
             logger.info("[ENTRY_SCAN][AFTER_EXIT][START] phase=%s", getattr(engine_runner, "phase", None))
             if (run_ctx.get("phase_name") or phase_override_arg) == "entry" and not close_cancel_only:
                 try:
@@ -7209,7 +7209,7 @@ def run_once(
                         exc_info=True,
                     )
             
-            logger.info("[ENTRY_SCAN][AFTER_EXIT][END] elapsed_sec=%.3f", time.monotonic() - scan_started)
+            logger.info("[ENTRY_SCAN][AFTER_EXIT][END] elapsed_sec=%.3f", time_mod.monotonic() - scan_started)
 
         # Runner-side diagnostics are not allowed to sit ahead of protected
         # exits. The engine invokes these hooks on the SAME tick/deadline.
