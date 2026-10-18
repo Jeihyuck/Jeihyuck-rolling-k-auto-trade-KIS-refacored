@@ -36,8 +36,11 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
     monkeypatch.setattr(repos, "save_order_ack", lambda *a, **kw: False)
     monkeypatch.setattr(repos, "apply_broker_order_observation",
                         lambda **kw: {"status": "OK"})
+    fill_reads = []
     monkeypatch.setattr(fills, "get_fills_today",
-                        lambda provider, trade_date: {"status": "OK", "fills": []})
+                        lambda provider, trade_date: (
+                            fill_reads.append(trade_date) or {"status": "OK", "fills": []}
+                        ))
 
     class Provider:
         def __init__(self):
@@ -72,7 +75,8 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
         current_date, provider=provider,
         include_active_claims=True, active_claims_only=True,
     )
-    assert provider.reads == [current_date, source_date]
+    assert provider.reads == [source_date]
+    assert fill_reads == []  # Broker orderbook already contained exact proof.
     assert result["failed_count"] == 0
     assert result["broker_unfilled_ack_count"] == 2
     assert result["broker_full_fill_count"] == 0
@@ -81,4 +85,5 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
         current_date, provider=provider,
         include_active_claims=True, active_claims_only=True,
     )
-    assert provider.reads == [current_date, source_date, current_date, source_date]
+    assert provider.reads == [source_date, source_date]
+    assert fill_reads == []

@@ -51,6 +51,20 @@ def classify(row: dict) -> dict:
     order_filled = str(row.get("order_status") or "").upper() == "FILLED"
     claim = str(row.get("action_state") or "").upper()
     requires_review = bool(synth and not broker and order_filled)
+    attempt_state = str(row.get("attempt_state") or "").upper()
+    if requires_review:
+        plan = "VERIFY_ORIGINAL_ORDER_WITH_ACCOUNT_SCOPED_KIS_EVIDENCE"
+        defer_reason = "BALANCE_DELTA_IS_NOT_BROKER_EXECUTION_PROOF"
+    elif broker and (claim in {"IN_FLIGHT", "UNCERTAIN"} or attempt_state not in {"FILLED"}):
+        plan = "VALIDATE_ORDER_ATTEMPT_IDENTITY_BEFORE_IDEMPOTENT_RECONCILIATION"
+        defer_reason = "FILL_ROW_COUNT_ALONE_DOES_NOT_VERIFY_ATTEMPT_IDENTITY"
+    elif broker:
+        plan, defer_reason = "NO_STATE_MUTATION_NEEDED", "NONE"
+    elif claim in {"IN_FLIGHT", "UNCERTAIN"} or str(row.get("order_status") or "").upper() in {"OPEN", "ACK", "PARTIALLY_FILLED"}:
+        plan = "REQUERY_BROKER_ORIGINAL_TRADE_DATE_KEEP_CLAIM_FENCED"
+        defer_reason = "BROKER_QUERY_ABSENCE_IS_NOT_TERMINAL_PROOF"
+    else:
+        plan, defer_reason = "MANUAL_REVIEW_NO_AUTOMATIC_REPAIR", "EVIDENCE_INCOMPLETE"
     return {
         "trade_date": str(row.get("trade_date") or ""),
         "symbol": str(row.get("symbol") or ""),
@@ -66,7 +80,11 @@ def classify(row: dict) -> dict:
         "finding": "SYNTHETIC_ONLY_FILLED_ORDER" if requires_review else
                    "BROKER_EVIDENCE_PRESENT" if broker else
                    "AWAIT_BROKER_ORDER_PROOF" if claim in {"IN_FLIGHT","UNCERTAIN"} else "NO_ACTION",
+        # Describe a potential future repair only; do not change DB state,
+        # claims, PnL or the order's execution provenance in a dry-run.
         "proposed_change": "NONE_DRY_RUN",
+        "proposed_change_plan": plan,
+        "defer_reason": defer_reason,
         "release_fence": False,
         "verification_required": bool(requires_review),
     }
