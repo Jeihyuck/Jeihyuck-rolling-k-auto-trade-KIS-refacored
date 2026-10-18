@@ -597,6 +597,54 @@ def reconcile_ack_orders_with_balance(
         len(pending_orders), trade_date,
     )
 
+    # USDataProvider.get_fills_by_order_no is backed by a *whole-day* KIS
+    # CCNL query. Calling it for each ACK multiplies the same REST roundtrip.
+    # Reuse one immutable normalized snapshot for this invocation only, after
+    # checking the actual broker client's account/env/date provenance. A
+    # missing or unverifiable scope falls back to original per-order lookups.
+    # A missing order row NEVER means cancelled, expired or safe to resubmit.
+    broker_book_snapshot = None
+    if (
+        len(pending_orders) > 1
+        and callable(getattr(provider, "get_today_orders", None))
+        and callable(getattr(provider, "get_order_lookup_provenance", None))
+        and _accepts_keyword(getattr(provider, "get_fills_by_order_no", None),
+                             "order_book_snapshot")
+    ):
+        try:
+            lookup_scope = provider.get_order_lookup_provenance(trade_date)
+            scope_ok = (
+                isinstance(lookup_scope, dict)
+                and lookup_scope.get("verified") is True
+                and lookup_scope.get("source") == "kis_authenticated_order_book"
+                and str(lookup_scope.get("query_trade_date") or "").replace("-", "")
+                    == str(trade_date).replace("-", "")
+                and str(lookup_scope.get("market") or "").upper() == "US"
+                and str(lookup_scope.get("env") or "").lower() == str(env).lower()
+                and bool(lookup_scope.get("account_id"))
+                and bool(lookup_scope.get("account_product_code"))
+            )
+            if scope_ok:
+                rows = provider.get_today_orders(trade_date=trade_date)
+                if isinstance(rows, list):
+                    broker_book_snapshot = rows
+                    logger.info(
+                        "[US_RECONCILE][ACK_BOOK_BATCH] status=VERIFIED "
+                        "orders=%d pending=%d source_trade_date=%s",
+                        len(rows), len(pending_orders), trade_date,
+                    )
+            else:
+                logger.warning(
+                    "[US_RECONCILE][ACK_BOOK_BATCH] status=SCOPE_UNVERIFIED "
+                    "action=PER_ORDER_REQUERY"
+                )
+        except Exception as exc:
+            logger.warning(
+                "[US_RECONCILE][ACK_BOOK_BATCH] status=UNAVAILABLE "
+                "reason=%s action=PER_ORDER_REQUERY",
+                type(exc).__name__,
+            )
+
     kis_position_by_symbol: dict[str, dict] = {}
     try:
         balance = _get_balance_force_refresh(provider)
@@ -685,7 +733,12 @@ def reconcile_ack_orders_with_balance(
         fills_resp: dict = {}
         fills_lookup_error: str | None = None
         try:
-            fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
+            order_lookup_kwargs = {
+                "order_no": order_no, "symbol": symbol, "trade_date": trade_date,
+            }
+            if broker_book_snapshot is not None:
+                order_lookup_kwargs["order_book_snapshot"] = broker_book_snapshot
+            fills_resp = provider.get_fills_by_order_no(**order_lookup_kwargs)
             if fills_resp and isinstance(fills_resp, dict):
                 terminal_status = str(fills_resp.get("status") or "").upper()
                 if terminal_status in {"EXPIRED", "LAPSED", "DAY_ORDER_LAPSED", "만료"}:
