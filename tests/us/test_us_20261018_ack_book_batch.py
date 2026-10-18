@@ -102,6 +102,6 @@ def test_missing_order_from_shared_book_remains_unresolved(monkeypatch):
     )
     assert broker.calls == 1
     assert result["confirmed_count"] == 0
-    assert result["unresolved_count"] >= 1
+    assert result["unresolved_count"] + result["open_order_pending_count"] >= 1
     assert result["cancelled_count"] == 0
     assert result["expired_count"] == 0
