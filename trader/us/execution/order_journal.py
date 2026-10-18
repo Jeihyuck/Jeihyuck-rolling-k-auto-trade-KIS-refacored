@@ -705,6 +705,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             "balance_fetched": False,
         }
     from trader.us.db.repos import save_order_ack, mark_order_filled_by_reconcile, apply_broker_order_observation
+    from trader.us.execution.evidence_policy import require_broker_proof_for_balance_estimate
     from trader.us.utils.order_no import normalize_us_order_no
     # Query authoritative snapshots once per timeout, not once per journal row.
     balance = None
@@ -1115,6 +1116,19 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         except Exception:
                             delta = 0
                         if delta > 0:
+                            if require_broker_proof_for_balance_estimate(latest):
+                                # Never infer a KIS fill from a holdings delta.
+                                # Historical claim remains in-flight, preventing
+                                # a replacement order while evidence is missing.
+                                counts["broker_unknown_count"] += 1
+                                unresolved_symbol_sides.append([symbol, side])
+                                logger.warning(
+                                    "[US_JOURNAL][BALANCE_ESTIMATE_PENDING_BROKER] "
+                                    "symbol=%s side=%s source_trade_date=%s "
+                                    "action=KEEP_ORIGINAL_ATTEMPT_FENCED",
+                                    symbol, side, event_trade_date,
+                                )
+                                continue
                             cumulative = min(delta, requested)
                             result=mark_order_filled_by_reconcile(order_no=order_no,client_order_key=key,symbol=symbol,side=side,
                                 filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,
