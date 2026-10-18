@@ -148,13 +148,18 @@ def _reply(request: dict, *, env: str, generation: str, service) -> dict:
         return {
             "status": "OK", "generation": generation, "collector": "READ_ONLY",
             "process": "STARTED",
+            "approval_obtained": bool(stats.get("approval_obtained")),
             "ws_connected": bool(stats.get("connected")),
             "requested_subscriptions": int(stats.get("subscriptions") or 0),
+            "broker_subscription_acks": int(stats.get("broker_subscription_acks") or 0),
             "received_symbols": int(stats.get("quotes") or 0),
             "last_received_age_sec": stats.get("last_received_age_sec"),
             "stage": (
                 "PRICE_RECEIVED" if stats.get("quotes_received")
-                else "CONNECTED_AWAITING_QUOTE" if stats.get("connected")
+                else "SUBSCRIPTION_ACKED_AWAITING_PRICE"
+                    if int(stats.get("broker_subscription_acks") or 0) > 0
+                else "CONNECTED_AWAITING_SUBSCRIPTION_ACK" if stats.get("connected")
+                else "APPROVAL_OBTAINED_CONNECTING" if stats.get("approval_obtained")
                 else "PROCESS_READY_WS_CONNECTING"
             ),
         }
