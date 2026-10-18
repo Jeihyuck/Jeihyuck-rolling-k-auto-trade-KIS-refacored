@@ -29,6 +29,9 @@ def test_real_loop_aligns_all_completion_and_timeout_paths(monkeypatch, tmp_path
     monkeypatch.setattr(runner, 'runtime_root', lambda:tmp_path)
     monkeypatch.setattr(runner, 'decide_window', lambda **k:object())
     monkeypatch.setattr(runner, '_run_nontrading_smoke_if_needed', lambda **k:False)
+    # The session registers process handlers; this virtual-clock test must not
+    # replace pytest's SIGINT/SIGTERM handlers for subsequent test modules.
+    monkeypatch.setattr(runner.signal, 'signal', lambda *a, **k: None)
     for name in ('_touch_session_guard','_ensure_bootstrap_migrations','_write_change_flag',
                  '_finish_session_guard','release_advisory_xact_lock','dispose_engine_safely',
                  '_record_session_execution_marker','_write_session_result_file'):
