@@ -11,6 +11,7 @@ Agent B: Strategy Entry Score
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any
 
@@ -704,10 +705,31 @@ def build_us_watchlist(
             "risk_off_cap_warning": "entry_blocked_but_final30_preserved",
         }
     else:
-        final30, regime_cap_meta = enforce_regime_sector_caps(final30, sorted_broader, constraints, finaln)
+        # Keep the roster intact until replacement-first repair below. The
+        # legacy target-slot pass deletes candidates before trying a swap.
+        regime_cap_meta = {"sector_cap_enforced": True, "cap_violations": [],
+                           "blocked_by_cluster_cap": [], "sector_cap_replacements": []}
     fallback_meta["fallback_fill_used"] = bool(fallback_meta.get("fallback_fill_used") or etf_refill_meta.get("fallback_fill_used"))
     fallback_meta["fallback_fill_count"] = int(fallback_meta.get("fallback_fill_count") or 0) + int(etf_refill_meta.get("fallback_fill_count") or 0)
     fallback_meta["fallback_fill_cap_safe"] = bool(fallback_meta.get("fallback_fill_cap_safe", True) and etf_refill_meta.get("fallback_fill_cap_safe", True))
+
+    if constraints.get("market_regime") != "RISK_OFF":
+        # The sector-cap stage uses target slots (30) when assembling the list.
+        # Reassess *actual* 28/29 names at PREP admission, and repair by
+        # score-ranked replacement/removal instead of blocking every BUY.
+        # Do not bypass separate crash/data-quality/session safety gates.
+        final30, actual_cap_repair = repair_final30_effective_caps(
+            final30, sorted_broader, constraints, finaln,
+            str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters,
+        )
+        regime_cap_meta["cap_violations"] = actual_cap_repair["cap_violations"]
+        regime_cap_meta["cap_repair"] = actual_cap_repair
+        regime_cap_meta["sector_cap_replacements"] = actual_cap_repair["added"]
+        regime_cap_meta["blocked_by_cluster_cap"] = list(dict.fromkeys(
+            list(regime_cap_meta.get("blocked_by_cluster_cap") or [])
+            + actual_cap_repair["dropped"]
+        ))
+        logger.info("[US_FINAL30][EFFECTIVE_CAP_REPAIR] %s", actual_cap_repair)
 
     # rank 부여 + final30_scored 구성
     final30_scored: list[dict] = []
@@ -727,6 +749,12 @@ def build_us_watchlist(
         final30_scored.append(scored)
 
     cluster_contract = validate_final30_cluster_contract(final30_scored, str(rotation_context.get("rotation_regime") or "NEUTRAL"))
+    if constraints.get("market_regime") != "RISK_OFF":
+        actual_violations = effective_final30_cap_violations(
+            final30_scored, constraints,
+            str(rotation_context.get("rotation_regime") or "NEUTRAL"),
+        )
+        regime_cap_meta["cap_violations"] = actual_violations
     if regime_cap_meta.get("cap_violations"):
         cluster_contract["cluster_contract_ok"] = False
         cluster_contract["final30_cluster_cap_clean"] = False
@@ -995,6 +1023,337 @@ def refill_under_cluster_caps(selected: list[dict], candidate_pool: list[dict], 
         drop_idx = min(ai_indexes, key=lambda idx: float(out[idx].get("score_final") or 0.0))
         out.pop(drop_idx)
     return out, {"fallback_fill_used": len(out) > len(selected), "fallback_fill_count": max(0, len(out) - len(selected)), "fallback_fill_cap_safe": bool(validate_final30_cluster_contract(out, regime).get("cluster_contract_ok")), "fallback_fill_attempted": attempted}
+
+
+def effective_final30_cap_violations(
+    rows: list[dict], constraints: dict, rotation_regime: str,
+) -> list[str]:
+    """Judge the *actual* executable list, not a hypothetical 30-name list.
+
+    The market-state cap is separate from the rotation cap.  Both must hold.
+    A missing candidate is never counted as an imaginary diversifier.
+    """
+    if not rows:
+        return ["FINAL30_EMPTY"]
+    counts = _cluster_counts(rows)
+    total = len(rows)
+    ai_count = sum(counts.get(cluster, 0) for cluster in AI_CLUSTERS)
+    violations = list(validate_final30_cluster_contract(rows, rotation_regime)["cap_violations"])
+    if ai_count / total > float(constraints.get("max_ai_tech_ratio", 1.0)) + 1e-12:
+        violations.append("AI_TECH_COMBINED")
+    if max(counts.values(), default=0) / total > float(constraints.get("max_single_cluster_ratio", 1.0)) + 1e-12:
+        violations.append("SINGLE_CLUSTER")
+    return list(dict.fromkeys(violations))
+
+
+def repair_final30_effective_caps(
+    selected: list[dict], candidate_pool: list[dict], constraints: dict,
+    finaln: int, rotation_regime: str, blocked_clusters: set[str] | None = None,
+) -> tuple[list[dict], dict]:
+    """Repair fixed-size rosters before removing a candidate or relaxing nothing.
+
+    Pool rows have already passed the strategy admission stage. Never invent
+    scores or promote a blocked/zero-score/non-core ETF row to fill capacity.
+    Each swap strictly reduces integer cap excess, so repair cannot cycle.
+    """
+    out = list(selected)
+    blocked_clusters = blocked_clusters or set()
+    dropped: list[str] = []
+    added: list[str] = []
+    original_count = len(out)
+    original_violations = effective_final30_cap_violations(out, constraints, rotation_regime)
+    replacement_rejections: dict[str, int] = {}
+    search_diagnostics = {"evaluated_swaps": 0, "non_improving_swaps": 0,
+                          "accepted_swaps": 0, "forced_deletions": 0}
+
+    def reject(reason: str) -> bool:
+        replacement_rejections[reason] = replacement_rejections.get(reason, 0) + 1
+        return False
+
+    def cluster(row):
+        return row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+
+    def eligible(row):
+        symbol = str(row.get("symbol") or "").strip()
+        score = _safe_float(row.get("score_final"))
+        if not symbol:
+            return reject("missing_symbol")
+        if not math.isfinite(score) or score <= 0:
+            return reject("invalid_or_nonpositive_score")
+        if cluster(row) in blocked_clusters or row.get("blocked_by_cluster_cap"):
+            return reject("blocked_cluster")
+        if _is_etf_row(row) and symbol.upper() not in _CORE_ETFS:
+            return reject("not_permitted_core_etf")
+        return True
+
+    pool = sorted((r for r in candidate_pool or [] if eligible(r)),
+                  key=lambda r: -float(r["score_final"]))
+
+    def excess(rows):
+        total = len(rows)
+        if not total:
+            return 1
+        counts = _cluster_counts(rows)
+        caps = cluster_caps_for_regime(rotation_regime)
+        ai_cap = min(float(constraints.get("max_ai_tech_ratio", 1)),
+                     float(caps.get("AI_TECH_COMBINED", caps.get("AI_COMBINED", 1))))
+        if rotation_regime == "AI_OFF_ROTATION":
+            ai_cap = min(ai_cap, 0.50)
+        single_cap = min(float(constraints.get("max_single_cluster_ratio", 1)),
+                         float(caps.get("SINGLE_CLUSTER", 1)))
+        capacity = math.floor(single_cap * total + 1e-9)
+        value = sum(max(0, n - capacity) for n in counts.values())
+        value += max(0, sum(counts.get(c, 0) for c in AI_CLUSTERS)
+                     - math.floor(ai_cap * total + 1e-9))
+        if rotation_regime == "AI_OFF_ROTATION":
+            value += max(0, counts.get("AI_SEMI", 0) - 3)
+            value += max(0, counts.get("MEGA_TECH", 0) - 2)
+        value += max(0, sum(_is_etf_row(r) for r in rows) - _MAX_ETF_IN_FINAL30)
+        return value
+
+    def replace_before_drop():
+        while effective_final30_cap_violations(out, constraints, rotation_regime):
+            before = excess(out)
+            used = {str(r.get("symbol") or "").upper() for r in out}
+            best = None
+            # Lowest-score removal first; replacements keep pool score order.
+            for idx in sorted(range(len(out)), key=lambda i: float(out[i].get("score_final") or 0)):
+                for row in pool:
+                    if str(row["symbol"]).upper() in used:
+                        continue
+                    trial = out[:idx] + [row] + out[idx + 1:]
+                    search_diagnostics["evaluated_swaps"] += 1
+                    after = excess(trial)
+                    if after >= before:
+                        search_diagnostics["non_improving_swaps"] += 1
+                        continue
+                    key = (after, float(out[idx].get("score_final") or 0), -float(row["score_final"]))
+                    if best is None or key < best[0]:
+                        best = (key, idx, row)
+            if best is None:
+                break
+            _, idx, row = best
+            dropped.append(str(out[idx].get("symbol") or ""))
+            added.append(str(row["symbol"]))
+            out[idx] = row
+            search_diagnostics["accepted_swaps"] += 1
+
+    def fill_before_swap_or_drop() -> None:
+        """Exact feasible expansion over ALL remaining Final30 slots.
+
+        Single append may be cap-dirty while a full expansion is cap-clean.
+        Dynamic programming groups interchangeable candidates by cluster and
+        ETF status; it searches possible cardinalities from largest to smallest
+        without a 3-name horizon or a truncated beam. The best-scored prefix
+        of each group is sufficient for each count because all cap constraints
+        depend on group counts, not symbol identity.
+        """
+        slots = min(max(0, finaln - len(out)), len(pool))
+        if not slots:
+            return
+        selected_symbols = {str(r.get("symbol") or "").upper() for r in out}
+        candidates = {}
+        for row in pool:
+            symbol = str(row.get("symbol") or "").upper()
+            if symbol in selected_symbols or symbol in candidates:
+                continue
+            candidates[symbol] = row
+        by_cluster: dict[str, dict[bool, list[dict]]] = {}
+        for row in candidates.values():
+            group = by_cluster.setdefault(cluster(row), {False: [], True: []})
+            group[bool(_is_etf_row(row))].append(row)
+        for groups in by_cluster.values():
+            for rows in groups.values():
+                rows.sort(key=lambda r: (-float(r["score_final"]), str(r["symbol"])))
+        initial_counts = _cluster_counts(out)
+        initial_ai = sum(initial_counts.get(name, 0) for name in AI_CLUSTERS)
+        initial_etf = sum(_is_etf_row(r) for r in out)
+        rotation_caps = cluster_caps_for_regime(rotation_regime)
+        ai_ratio = min(float(constraints.get("max_ai_tech_ratio", 1.0)),
+                       float(rotation_caps.get("AI_TECH_COMBINED",
+                                               rotation_caps.get("AI_COMBINED", 1.0))))
+        single_ratio = min(float(constraints.get("max_single_cluster_ratio", 1.0)),
+                           float(rotation_caps.get("SINGLE_CLUSTER", 1.0)))
+        if rotation_regime == "AI_OFF_ROTATION":
+            ai_ratio = min(ai_ratio, 0.50)
+
+        # No arbitrary search cap: the state space is bounded by finaln, AI
+        # capacity and the existing ETF limit, NOT combinations of symbols.
+        search_diagnostics["joint_search_method"] = "exact_cluster_dp"
+        search_diagnostics["joint_search_complete"] = True
+        for target in range(min(finaln, len(out) + len(candidates)), len(out), -1):
+            need = target - len(out)
+            per_cluster_limit = math.floor(single_ratio * target + 1e-9)
+            ai_limit = math.floor(ai_ratio * target + 1e-9)
+            if (initial_ai > ai_limit or initial_etf > _MAX_ETF_IN_FINAL30
+                    or any(count > per_cluster_limit for count in initial_counts.values())):
+                continue
+            # dp[(filled, ai_added, etf_added)] -> (score, selected_rows)
+            dp = {(0, 0, 0): (0.0, ())}
+            for name, groups in sorted(by_cluster.items()):
+                non_etf, etfs = groups[False], groups[True]
+                capacity = max(0, per_cluster_limit - initial_counts.get(name, 0))
+                if rotation_regime == "AI_OFF_ROTATION":
+                    if name == "AI_SEMI":
+                        capacity = min(capacity, 3 - initial_counts.get(name, 0))
+                    if name == "MEGA_TECH":
+                        capacity = min(capacity, 2 - initial_counts.get(name, 0))
+                nxt = {}
+                for (filled, ai_added, etf_added), (score, selected_rows) in dp.items():
+                    left = min(capacity, need - filled)
+                    for normal_n in range(min(left, len(non_etf)) + 1):
+                        for etf_n in range(min(left - normal_n, len(etfs)) + 1):
+                            new_filled = filled + normal_n + etf_n
+                            new_ai = ai_added + (normal_n + etf_n if name in AI_CLUSTERS else 0)
+                            new_etf = etf_added + etf_n
+                            if initial_ai + new_ai > ai_limit or initial_etf + new_etf > _MAX_ETF_IN_FINAL30:
+                                continue
+                            choice = (*non_etf[:normal_n], *etfs[:etf_n])
+                            new_score = score + sum(float(r["score_final"]) for r in choice)
+                            key = (new_filled, new_ai, new_etf)
+                            previous = nxt.get(key)
+                            search_diagnostics["evaluated_swaps"] += 1
+                            if previous is None or new_score > previous[0]:
+                                nxt[key] = (new_score, selected_rows + choice)
+                dp = nxt
+                if not dp:
+                    break
+            choices = [(score, rows) for (filled, _ai, _etf), (score, rows)
+                       in dp.items() if filled == need]
+            if not choices:
+                continue
+            for _score, chosen in sorted(choices, key=lambda item: -item[0]):
+                trial = out + list(chosen)
+                if not effective_final30_cap_violations(trial, constraints, rotation_regime):
+                    out.extend(chosen)
+                    added.extend(str(r["symbol"]) for r in chosen)
+                    search_diagnostics["joint_refill_count"] = search_diagnostics.get("joint_refill_count", 0) + 1
+                    search_diagnostics["joint_refill_slots"] = len(chosen)
+                    return
+        search_diagnostics["joint_refill_slots"] = 0
+
+    fill_before_swap_or_drop()
+
+    for _ in range(len(out)):
+        replace_before_drop()
+        violations = effective_final30_cap_violations(out, constraints, rotation_regime)
+        if not violations:
+            break
+        counts = _cluster_counts(out)
+        if "AI_TECH_COMBINED" in violations or "NON_TECH_MIN" in violations:
+            offender = lambda row: (
+                row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+            ) in AI_CLUSTERS
+        elif "AI_SEMI" in violations or "MEGA_TECH" in violations:
+            target = "AI_SEMI" if "AI_SEMI" in violations else "MEGA_TECH"
+            offender = lambda row: (
+                row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+            ) == target
+        elif "SINGLE_CLUSTER" in violations:
+            largest = max(counts, key=counts.get)
+            offender = lambda row: (
+                row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+            ) == largest
+        else:
+            # Unknown policy violation: never approve an unverified list.
+            break
+        indices = [idx for idx, row in enumerate(out) if offender(row)]
+        if not indices:
+            break
+        drop = min(indices, key=lambda idx: float(out[idx].get("score_final") or 0))
+        dropped.append(str(out[drop].get("symbol") or ""))
+        out.pop(drop)
+        search_diagnostics["forced_deletions"] += 1
+
+    # Repair may have deleted offenders AFTER the first joint-search (which
+    # could have had zero free slots). Search the NEW roster with the actual
+    # remaining capacity before diagnosing underfill; this also permits a
+    # jointly cap-clean refill that cannot be reached one candidate at a time.
+    if len(out) < finaln:
+        fill_before_swap_or_drop()
+
+    if not effective_final30_cap_violations(out, constraints, rotation_regime):
+        seen = {str(row.get("symbol") or "") for row in out}
+        # Revisit every previously blocked candidate after ANY successful
+        # addition changes the true denominator or another cap's slack.
+        while len(out) < finaln:
+            changed = False
+            for row in pool:
+                if len(out) >= finaln:
+                    break
+                sym = str(row.get("symbol") or "")
+                cluster = row.get("theme_cluster") or theme_cluster_for(sym, row)
+                if not sym or sym in seen or cluster in blocked_clusters:
+                    continue
+                if effective_final30_cap_violations(out + [row], constraints, rotation_regime):
+                    continue
+                if sum(_is_etf_row(r) for r in out + [row]) > _MAX_ETF_IN_FINAL30:
+                    continue
+                out.append(row)
+                seen.add(sym)
+                added.append(sym)
+                changed = True
+            if not changed:
+                break
+    remaining = effective_final30_cap_violations(out, constraints, rotation_regime)
+    # All filtered-out alternatives are accounted for in the PREP artifact.
+    # A missing replacement must not silently turn a >=25-member normal tier
+    # into a degraded underfill tier without explicit operator evidence.
+    if len(out) < original_count:
+        used = {str(row.get("symbol") or "").upper() for row in out}
+        for row in pool:
+            if str(row.get("symbol") or "").upper() in used:
+                continue
+            trial = out + [row]
+            if effective_final30_cap_violations(trial, constraints, rotation_regime):
+                reject("would_violate_effective_caps")
+            elif sum(_is_etf_row(item) for item in trial) > _MAX_ETF_IN_FINAL30:
+                reject("would_exceed_etf_cap")
+            else:
+                reject("not_selected_after_repair")
+    present_symbols = {str(row.get("symbol") or "").upper() for row in out}
+    initially_selected = {str(row.get("symbol") or "").upper() for row in selected}
+    # A previously selected offender is not a newly available QUALIFIED
+    # replacement merely because the cap repair had to remove it. The full
+    # joint search above already tried adding it back if genuinely feasible.
+    # Count only additional admitted candidates when diagnosing supply.
+    unique_remaining = {
+        str(row.get("symbol") or "").upper() for row in pool
+        if str(row.get("symbol") or "").upper() not in present_symbols
+        and str(row.get("symbol") or "").upper() not in initially_selected
+    }
+    # A zero-candidate joint search is still an exhausted supply, not an
+    # unexplored possible combination. No search result is inferred from the
+    # original roster's cardinality after a forced deletion.
+    needed = max(0, finaln - len(out))
+    if remaining:
+        failure_reason = "no_cap_safe_roster"
+    elif needed == 0:
+        failure_reason = ""
+    elif len(unique_remaining) < needed:
+        failure_reason = "qualified_replacement_pool_exhausted"
+    elif search_diagnostics.get("joint_search_complete"):
+        # Feasible cardinalities have been checked exactly by cluster DP.
+        # Eligible candidates exist, but no cap-clean joint completion does.
+        failure_reason = "cap_constrained_no_feasible_expansion"
+    else:
+        failure_reason = "replacement_search_incomplete"
+    return out, {
+        "missing_target_slots": needed,
+        "remaining_eligible_replacements": len(unique_remaining),
+        "original_count": original_count,
+        "original_cap_violations": original_violations,
+        "replacement_pool_count": len(candidate_pool or []),
+        "eligible_replacement_pool_count": len(pool),
+        "replacement_rejection_reasons": replacement_rejections,
+        "replacement_search": search_diagnostics,
+        "dropped": dropped,
+        "added": added,
+        "cap_violations": remaining,
+        "cluster_contract_ok": not remaining,
+        "actual_final30_count": len(out),
+        "repair_failure_reason": failure_reason,
+    }
 
 
 def enforce_regime_sector_caps(selected: list[dict], candidate_pool: list[dict], constraints: dict, finaln: int) -> tuple[list[dict], dict[str, Any]]:

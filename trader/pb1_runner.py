@@ -8257,10 +8257,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     logger.info("[PB1][LOOP] after timeout recovery, session_end reached -> exit")
                     exit_reason = "session_end"
                     break
-                sleep_for = _sleep_until_next_tick_or_session_end(
-                    now_after_timeout,
-                    session_end_dt,
-                    min(loop_interval, 5),
+                sleep_for = _sleep_until_start_aligned_tick(
+                    tick_started_monotonic=tick_started_monotonic,
+                    session_end_dt=session_end_dt,
+                    loop_interval=loop_interval,
                 )
                 if sleep_for <= 0:
                     exit_reason = "session_end"
@@ -8291,8 +8291,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     if now_after_timeout >= session_end_dt:
                         exit_reason = "session_end"
                         break
-                    sleep_for = _sleep_until_next_tick_or_session_end(
-                        now_after_timeout, session_end_dt, min(loop_interval, 5)
+                    sleep_for = _sleep_until_start_aligned_tick(
+                        tick_started_monotonic=tick_started_monotonic,
+                        session_end_dt=session_end_dt,
+                        loop_interval=loop_interval,
                     )
                     if sleep_for <= 0:
                         exit_reason = "session_end"
@@ -8369,7 +8371,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     traceback.format_exc(),
                 )
                 ticks_fatal += 1
-                sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, min(loop_interval, 3))
+                sleep_for = _sleep_until_start_aligned_tick(
+                    tick_started_monotonic=tick_started_monotonic,
+                    session_end_dt=session_end_dt,
+                    loop_interval=loop_interval,
+                )
                 if sleep_for <= 0:
                     exit_reason = "session_end"
                     break

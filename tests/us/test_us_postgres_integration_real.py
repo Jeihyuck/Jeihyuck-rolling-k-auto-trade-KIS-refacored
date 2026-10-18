@@ -1447,3 +1447,78 @@ def test_same_cumulative_kis_price_correction_is_not_skipped(pg_engine):
     assert order["qty_filled"] == 3
     assert float(order["avg_price_usd"]) == 107.25
     assert order["status"] == "PARTIALLY_FILLED"
+
+
+def test_real_postgres_multi_broker_observation_persists_verified_evidence_and_is_idempotent(
+        pg_engine, monkeypatch, tmp_path):
+    """The real us_order_events JSONB and UNIQUE idem preserve broker truth."""
+    from trader.us.execution.order_journal import append_order_event, load_order_events
+    from trader.us.db import repos
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "verified-orders"))
+    trade_date = "2026-10-13"
+    intent = {
+        "trade_date": trade_date, "client_order_key": "collision-pg-proof",
+        "submit_attempt_id": "old-attempt-pg", "symbol": "AMD",
+        "side": "SELL", "exchange": "NASDAQ", "qty": 2, "session": "am",
+        "session_run_id": "historical-session",
+    }
+    base_proof = {
+        "broker_requested_qty": 2,
+        "cumulative_filled_qty": 1,
+        "broker_remaining_qty": 1,
+        "broker_avg_price": 23.75,
+        "broker_observed_at": "2026-10-14T01:31:00Z",
+        "broker_lookup_scope": {
+            "source_trade_date": trade_date,
+            "market": "US", "verified": True,
+            "provider_source": "kis_authenticated_order_book",
+            "account_id": "sha256-account-id",
+            "account_product_code": "01", "env": "practice",
+        },
+    }
+    first = append_order_event(
+        "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE",
+        intent, broker_order_no="0000010201",
+        broker_status="PARTIALLY_FILLED", raw_response=base_proof,
+    )
+    second = append_order_event(
+        "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE",
+        intent, broker_order_no="0000010201",
+        broker_status="PARTIALLY_FILLED",
+        raw_response={**base_proof, "broker_observed_at": "2026-10-14T01:35:00Z"},
+    )
+    assert first["event_id"] != second["event_id"]
+    assert first["idempotency_key"] == second["idempotency_key"]
+    rows = [
+        r for r in repos.load_us_order_events(trade_date)
+        if r["event_type"] == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
+        and r["client_order_key"] == intent["client_order_key"]
+    ]
+    assert len(rows) == 1, rows
+    saved = rows[0]
+    assert saved["submit_attempt_id"] == "old-attempt-pg"
+    assert saved["broker_order_no"] == "0000010201"
+    assert saved["cumulative_filled_qty"] == 1
+    assert saved["broker_evidence"]["requested_qty"] == 2
+    assert saved["broker_evidence"]["remaining_qty"] == 1
+    assert saved["broker_evidence"]["avg_price"] == 23.75
+    assert saved["broker_evidence"]["observed_at"] == "2026-10-14T01:31:00Z"
+    assert saved["broker_evidence"]["lookup_scope"]["source_trade_date"] == trade_date
+    assert saved["broker_evidence"]["lookup_scope"]["account_id"] == "sha256-account-id"
+    assert saved["raw_response_hash"]
+    assert "broker_account_no" not in str(saved)
+    # These are evidence-only, never a second filled us_orders row.
+    from sqlalchemy import text
+    with pg_engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM us_orders WHERE client_order_key = :key"
+        ), {"key": intent["client_order_key"]}).scalar_one() == 0
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM us_fills WHERE client_order_key = :key"
+        ), {"key": intent["client_order_key"]}).scalar_one() == 0
+    assert len([
+        r for r in load_order_events(trade_date)
+        if r["event_type"] == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
+        and r["client_order_key"] == intent["client_order_key"]
+    ]) == 1

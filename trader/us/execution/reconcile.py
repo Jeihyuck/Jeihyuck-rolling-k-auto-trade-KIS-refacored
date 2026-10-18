@@ -550,6 +550,7 @@ def reconcile_ack_orders_with_balance(
     from trader.us.db.repos import (load_pending_ack_orders, mark_order_filled_by_reconcile,
                                     apply_broker_order_observation, _get_engine_or_none)
     from trader.us.utils.order_no import normalize_us_order_no
+    from trader.us.execution.evidence_policy import require_broker_proof_for_balance_estimate
 
     settlement_shadow_engine = None
     try:
@@ -595,6 +596,54 @@ def reconcile_ack_orders_with_balance(
         "[US_RECONCILE][ACK_RECONCILE][START] pending_count=%d trade_date=%s",
         len(pending_orders), trade_date,
     )
+
+    # USDataProvider.get_fills_by_order_no is backed by a *whole-day* KIS
+    # CCNL query. Calling it for each ACK multiplies the same REST roundtrip.
+    # Reuse one immutable normalized snapshot for this invocation only, after
+    # checking the actual broker client's account/env/date provenance. A
+    # missing or unverifiable scope falls back to original per-order lookups.
+    # A missing order row NEVER means cancelled, expired or safe to resubmit.
+    broker_book_snapshot = None
+    if (
+        len(pending_orders) > 1
+        and callable(getattr(provider, "get_today_orders", None))
+        and callable(getattr(provider, "get_order_lookup_provenance", None))
+        and _accepts_keyword(getattr(provider, "get_fills_by_order_no", None),
+                             "order_book_snapshot")
+    ):
+        try:
+            lookup_scope = provider.get_order_lookup_provenance(trade_date)
+            scope_ok = (
+                isinstance(lookup_scope, dict)
+                and lookup_scope.get("verified") is True
+                and lookup_scope.get("source") == "kis_authenticated_order_book"
+                and str(lookup_scope.get("query_trade_date") or "").replace("-", "")
+                    == str(trade_date).replace("-", "")
+                and str(lookup_scope.get("market") or "").upper() == "US"
+                and str(lookup_scope.get("env") or "").lower() == str(env).lower()
+                and bool(lookup_scope.get("account_id"))
+                and bool(lookup_scope.get("account_product_code"))
+            )
+            if scope_ok:
+                rows = provider.get_today_orders(trade_date=trade_date)
+                if isinstance(rows, list):
+                    broker_book_snapshot = rows
+                    logger.info(
+                        "[US_RECONCILE][ACK_BOOK_BATCH] status=VERIFIED "
+                        "orders=%d pending=%d source_trade_date=%s",
+                        len(rows), len(pending_orders), trade_date,
+                    )
+            else:
+                logger.warning(
+                    "[US_RECONCILE][ACK_BOOK_BATCH] status=SCOPE_UNVERIFIED "
+                    "action=PER_ORDER_REQUERY"
+                )
+        except Exception as exc:
+            logger.warning(
+                "[US_RECONCILE][ACK_BOOK_BATCH] status=UNAVAILABLE "
+                "reason=%s action=PER_ORDER_REQUERY",
+                type(exc).__name__,
+            )
 
     kis_position_by_symbol: dict[str, dict] = {}
     try:
@@ -684,7 +733,12 @@ def reconcile_ack_orders_with_balance(
         fills_resp: dict = {}
         fills_lookup_error: str | None = None
         try:
-            fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
+            order_lookup_kwargs = {
+                "order_no": order_no, "symbol": symbol, "trade_date": trade_date,
+            }
+            if broker_book_snapshot is not None:
+                order_lookup_kwargs["order_book_snapshot"] = broker_book_snapshot
+            fills_resp = provider.get_fills_by_order_no(**order_lookup_kwargs)
             if fills_resp and isinstance(fills_resp, dict):
                 terminal_status = str(fills_resp.get("status") or "").upper()
                 if terminal_status in {"EXPIRED", "LAPSED", "DAY_ORDER_LAPSED", "만료"}:
@@ -876,6 +930,18 @@ def reconcile_ack_orders_with_balance(
             continue
 
         if delta_confirmation["status"] in {"BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL"}:
+            if require_broker_proof_for_balance_estimate(order):
+                # Position change alone cannot establish which ACK order filled,
+                # its price, or its TP stage. Keep the original order/claim
+                # unsettled and fenced until the scoped broker execution arrives.
+                unresolved_count += 1
+                symbols_by_status["unresolved"].append(symbol)
+                logger.warning(
+                    "[US_RECONCILE][BALANCE_ESTIMATE_PENDING_BROKER] symbol=%s side=%s "
+                    "source_trade_date=%s action=KEEP_ORDER_CLAIM_PENDING",
+                    symbol, side, trade_date,
+                )
+                continue
             if atomic_scope_active or atomic_scope_unknown:
                 unresolved_count += 1
                 symbols_by_status["unresolved"].append(symbol)
@@ -974,6 +1040,15 @@ def reconcile_ack_orders_with_balance(
                     fill_price_candidate,
                     buy_reason,
                 )
+                if require_broker_proof_for_balance_estimate(order):
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
+                    logger.warning(
+                        "[US_RECONCILE][BUY_BALANCE_ESTIMATE_PENDING_BROKER] "
+                        "symbol=%s source_trade_date=%s action=KEEP_ORDER_CLAIM_PENDING",
+                        symbol, trade_date,
+                    )
+                    continue
                 try:
                     mark_result = mark_order_filled_by_reconcile(
                         order_no=order_no,
@@ -1287,6 +1362,34 @@ def classify_ack_orders_with_final_balance(
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
         broker = order.get("_broker_observation") if isinstance(order.get("_broker_observation"), dict) else {}
+        # 2026-10-13 MCK: the journal+claim preserved a unique KIS ACK
+        # identity and pre-order balance (2), but neither source carried qty.
+        # KIS practice returned the fill under the *prior* session date.
+        # Only infer quantity from an authoritative close balance when exactly
+        # one identified SELL attempt exists for this symbol/session and no
+        # BUY could have altered the same balance.  Never turn an ambiguous
+        # multi-attempt or unknown-broker order into a confirmed fill.
+        if (
+            side == "SELL" and qty <= 0 and pre_qty is not None
+            and 0 <= final_qty < pre_qty
+            and str(order.get("order_no") or "").strip()
+            and str(order.get("client_order_key") or "").strip()
+            and str(order.get("submit_attempt_id") or "").strip()
+            and {"journal", "claim"}.issubset(set(order.get("_sources") or []))
+            and sum(
+                1 for attempt in orders
+                if str(attempt.get("symbol") or "").upper() == symbol
+                and str(attempt.get("side") or "").upper() in {"BUY", "SELL"}
+            ) == 1
+            and not broker
+        ):
+            qty = pre_qty - final_qty
+            order["qty_recovered_from_unique_close_balance_delta"] = True
+            logger.warning(
+                "[US_CLOSE][ZERO_QTY_ACK_RECOVERY] symbol=%s order_no=%s "
+                "qty=%d evidence=journal_claim_unique_identity_authoritative_balance",
+                symbol, order.get("order_no"), qty,
+            )
         broker_status = str(broker.get("status") or "").strip().upper()
         broker_present = bool(broker)
         broker_normalized = str(broker.get("normalization_result") or "").lower() != "quarantined"
@@ -1354,7 +1457,15 @@ def classify_ack_orders_with_final_balance(
             final_status = "broker_fill_confirmed"
         elif fill_qty > 0 or raw_status in {"PARTIALLY_FILLED"}:
             final_status = "ack_open_order_pending" if broker_remaining is None else "ack_unresolved_error"
-        elif order.get("active_claim") and not broker_present:
+        elif (
+            order.get("active_claim") and not broker_present
+            and not order.get("qty_recovered_from_unique_close_balance_delta")
+        ):
+            # Unknown claim stays unresolved.  The one narrow exception is a
+            # uniquely attributable SELL with an authoritative whole-share
+            # decrease; allow the balance-delta classification below.  This
+            # does NOT release the durable execution claim or label the KIS
+            # physical fill as confirmed.
             final_status = "ack_unresolved_error"
         elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
             final_status = "balance_delta_confirmed"
@@ -1411,6 +1522,7 @@ def classify_ack_orders_with_final_balance(
             "broker_filled_qty": broker_fill,
             "broker_remaining_qty": broker_remaining,
             "broker_local_fill_qty_conflict": bool(order.get("broker_local_fill_qty_conflict")),
+            "qty_recovered_from_unique_close_balance_delta": bool(order.get("qty_recovered_from_unique_close_balance_delta")),
             "evidence_sources": list(order.get("_sources") or []),
             "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
             "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else ("position_absent_confirmed_sell" if final_status == "position_absent_confirmed_sell" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),

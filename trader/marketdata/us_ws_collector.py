@@ -22,6 +22,7 @@ import uuid
 logger = logging.getLogger(__name__)
 _MAX_MESSAGE_BYTES = 4096
 _MAX_REPLY_BYTES = 8192
+_LAST_START_REQUEST: subprocess.Popen | None = None
 
 
 def enabled() -> bool:
@@ -95,11 +96,93 @@ def get_quote(symbol: str, exchange: str, *, env: str, max_age_sec: float = 15,
         return None
 
 
+def subscribe_many(pairs: list[tuple[str, str]], *, env: str,
+                   timeout_sec: float = 0.5) -> bool:
+    """Best-effort READ-ONLY subscription warmup, never a quote/order truth.
+
+    Does not return prices. A failed, late or stale collector is handled by
+    the unchanged fresh-quote and REST fallback in USDataProvider.
+    """
+    if not enabled() or not pairs:
+        return False
+    normalized = []
+    seen = set()
+    for symbol, exchange in pairs:
+        pair = (str(symbol).strip().upper(), str(exchange).strip().upper())
+        if not pair[0] or not pair[1] or len(pair[0]) > 16 or pair in seen:
+            continue
+        seen.add(pair)
+        normalized.append({"symbol": pair[0], "exchange": pair[1]})
+        if len(normalized) >= 16:
+            break
+    if not normalized:
+        return False
+    try:
+        result = _send_request(
+            env, {"cmd": "SUBSCRIBE_MANY", "pairs": normalized},
+            timeout_sec=min(0.8, max(0.05, timeout_sec)),
+        )
+        ok = bool(
+            result and result.get("status") == "OK"
+            and int(result.get("subscribed") or 0) == len(normalized)
+            and result.get("generation")
+        )
+        if not ok:
+            logger.info(
+                "[US_WS_COLLECTOR][SUBSCRIBE_MANY_MISS] requested=%d response=%s",
+                len(normalized), str((result or {}).get("status") or "NO_REPLY"),
+            )
+        return ok
+    except (OSError, ValueError, RuntimeError, TypeError) as exc:
+        logger.info("[US_WS_COLLECTOR][SUBSCRIBE_MANY_FALLBACK] reason=%s", type(exc).__name__)
+        return False
+
+
 def _reply(request: dict, *, env: str, generation: str, service) -> dict:
     if request.get("identity") != _account_identity(env) or request.get("env") != env:
         return {"status": "DENIED"}
     if str(request.get("cmd") or "") == "HEALTH":
-        return {"status": "OK", "generation": generation, "collector": "READ_ONLY"}
+        stats = service.stats() if callable(getattr(service, "stats", None)) else {}
+        # Only safe readiness indicators; neither credentials nor raw WS
+        # errors nor any account identifier are sent over the IPC endpoint.
+        return {
+            "status": "OK", "generation": generation, "collector": "READ_ONLY",
+            "process": "STARTED",
+            "approval_obtained": bool(stats.get("approval_obtained")),
+            "ws_connected": bool(stats.get("connected")),
+            "requested_subscriptions": int(stats.get("subscriptions") or 0),
+            "broker_subscription_acks": int(stats.get("broker_subscription_acks") or 0),
+            "received_symbols": int(stats.get("quotes") or 0),
+            "last_received_age_sec": stats.get("last_received_age_sec"),
+            "stage": (
+                "PRICE_RECEIVED" if stats.get("quotes_received")
+                else "SUBSCRIPTION_ACKED_AWAITING_PRICE"
+                    if int(stats.get("broker_subscription_acks") or 0) > 0
+                else "CONNECTED_AWAITING_SUBSCRIPTION_ACK" if stats.get("connected")
+                else "APPROVAL_OBTAINED_CONNECTING" if stats.get("approval_obtained")
+                else "PROCESS_READY_WS_CONNECTING"
+            ),
+        }
+    if request.get("cmd") == "SUBSCRIBE_MANY":
+        pairs = request.get("pairs")
+        if not isinstance(pairs, list) or not 1 <= len(pairs) <= 16:
+            return {"status": "BAD_REQUEST"}
+        valid = []
+        for item in pairs:
+            if not isinstance(item, dict):
+                return {"status": "BAD_REQUEST"}
+            symbol = str(item.get("symbol") or "").strip().upper()
+            exchange = str(item.get("exchange") or "").strip().upper()
+            if not symbol or not exchange or len(symbol) > 16 or len(exchange) > 12:
+                return {"status": "BAD_REQUEST"}
+            valid.append((symbol, exchange))
+        accepted = 0
+        for symbol, exchange in valid:
+            if service.subscribe_us(symbol, exchange) is not False:
+                accepted += 1
+        return {"status": "OK" if accepted == len(valid) else "SUBSCRIPTION_DISABLED",
+                "generation": generation, "subscribed": accepted,
+                "collector": "READ_ONLY"}
     if request.get("cmd") != "QUOTE":
         return {"status": "BAD_REQUEST"}
     symbol = str(request.get("symbol") or "").strip().upper()
@@ -107,11 +190,21 @@ def _reply(request: dict, *, env: str, generation: str, service) -> dict:
     if not symbol or not exchange or len(symbol) > 32:
         return {"status": "BAD_REQUEST"}
     # Subscription happens only in this independent process, never in the tick.
-    service.subscribe_us(symbol, exchange)
+    subscription_allowed = service.subscribe_us(symbol, exchange)
+    if subscription_allowed is False:
+        return {"status": "MISS", "generation": generation, "quote": None,
+                "reason": "SUBSCRIPTION_DISABLED"}
     max_age = max(0.05, min(float(request.get("max_age_sec") or 15), 30))
     quote = service.get_fresh_quote("US", symbol, max_age_sec=max_age)
+    stats = service.stats() if callable(getattr(service, "stats", None)) else {}
+    reason = ""
+    if not quote:
+        reason = (
+            "WS_NOT_CONNECTED" if stats.get("connected") is False
+            else "NO_FRESH_QUOTE"
+        )
     return {"status": "OK" if quote else "MISS", "generation": generation,
-            "quote": quote, "reason": "" if quote else "NOT_RECEIVED_OR_STALE"}
+            "quote": quote, "reason": reason}
 
 
 def _handle(conn: socket.socket, *, env: str, generation: str, service) -> None:
@@ -179,18 +272,40 @@ def serve(*, env: str, parent_pid: int, service=None, max_seconds: float | None 
 
 def ensure_started(*, env: str, offline: bool = False) -> subprocess.Popen | None:
     """Start collector from the session parent; do not fork its WS threads."""
+    global _LAST_START_REQUEST
     if offline or not enabled():
         return None
     try:
         health = _send_request(env, {"cmd": "HEALTH"}, timeout_sec=0.15)
         if health and health.get("status") == "OK":
             return None
+        if _LAST_START_REQUEST is not None:
+            _previous_exit = _LAST_START_REQUEST.poll()
+            if _previous_exit is None:
+                logger.warning(
+                    "[US_WS_COLLECTOR][HEALTH_UNAVAILABLE_CHILD_ALIVE] pid=%d "
+                    "action=REST_FALLBACK_NO_DUPLICATE_SPAWN",
+                    _LAST_START_REQUEST.pid,
+                )
+                return None
+            logger.warning(
+                "[US_WS_COLLECTOR][EARLY_EXIT] pid=%d exit_code=%s "
+                "action=RESTART_WITH_NEW_GENERATION",
+                _LAST_START_REQUEST.pid, _previous_exit,
+            )
+            _LAST_START_REQUEST = None
+        # The child is explicitly an isolated no-orders WS price reader.
+        # Do not edit the parent trading flags, nor override explicit offline
+        # or KIS HTTP shutdown flags.
+        child_env = {**os.environ, "US_WS_COLLECTOR_ROLE": "READ_ONLY"}
         process = subprocess.Popen(
             [sys.executable, "-m", "trader.marketdata.us_ws_collector",
              "--env", env, "--parent-pid", str(os.getpid())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            env=child_env,
         )
+        _LAST_START_REQUEST = process
         logger.info("[US_WS_COLLECTOR][START_REQUEST] pid=%d", process.pid)
         return process
     except (OSError, RuntimeError) as exc:

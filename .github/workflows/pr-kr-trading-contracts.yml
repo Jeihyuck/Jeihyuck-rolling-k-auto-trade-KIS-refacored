@@ -6,6 +6,8 @@ on:
       - dual-agent
       - main
       - master
+      - fix/kr-20261013-pr-a-protective-sell-deadline
+      - perf/kr-20261013-pr-b-ws-owner-first
       - stabilize/02-us-broker-recovery-20261004
       - stabilize/03-kr-broker-recovery-20261004
       - stabilize/04-lifecycle-contract-recovery-20261004
@@ -78,12 +80,17 @@ jobs:
           pytest tests/test_kr_final30_contract.py -q
           pytest tests/test_kis_ws_price.py -q
 
+      - name: KR Oct-13 and Oct-18 offline execution regressions
+        run: pytest tests/kr/test_kr_20261013_*.py tests/kr/test_kr_20261018_*.py -q
+
       - name: Migration 0050 legacy schema hotfix tests
         run: |
           pytest tests/test_migration_0050_legacy_schema.py -q
           pytest tests/test_pm_completed_marker_retryable.py -q
           pytest tests/test_prep_core_marker.py -q
           pytest tests/test_prep_aux_timeout.py -q
+          bash -n scripts/wsl/send-market-log-mail.sh
+          pytest tests/test_market_log_mail_e2e.py -q
           pytest tests/test_kr_session_result_file.py -q
           pytest tests/test_live_gate_refresh_order.py -q
           pytest tests/test_pb1_volume_config_unified.py -q
