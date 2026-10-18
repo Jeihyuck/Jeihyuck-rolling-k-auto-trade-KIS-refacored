@@ -62,8 +62,10 @@ def precheck_prep_revision(trade_date: str, revision: str,
     """
     flags = os.environ if environ is None else environ
     path = manifest_path(trade_date)
-    if not path.exists() or not revision or revision == "unknown":
-        return {"ok": True, "reason": "no_comparable_revision"}
+    if not path.exists():
+        return {"ok": True, "reason": "no_pinned_revision"}
+    if not revision or revision == "unknown":
+        return {"ok": False, "reason": "current_revision_unavailable"}
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict):

@@ -65,3 +65,12 @@ def test_same_revision_does_not_block(tmp_path, monkeypatch):
     assert run_manifest.precheck_prep_revision(
         "2026-10-14", "new", {"status": "OK", "entry_can_proceed": 1}
     )["ok"]
+
+
+
+def test_unknown_runtime_sha_refuses_existing_pin_before_rebuild(tmp_path, monkeypatch):
+    path = _pinned(tmp_path, monkeypatch)
+    previous = path.read_bytes()
+    result = run_manifest.precheck_prep_revision("2026-10-14", "unknown")
+    assert result == {"ok": False, "reason": "current_revision_unavailable"}
+    assert path.read_bytes() == previous
