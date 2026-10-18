@@ -287,6 +287,10 @@ class KisBalanceUnavailable(KisTemporaryError):
     """잔고 조회 실패."""
 
 
+class KisOrderPreSubmitBlocked(KisTemporaryError):
+    """The broker order endpoint was provably not called."""
+
+
 class NetTemporaryError(KisTemporaryError):
     """네트워크/SSL 등 일시적 오류를 의미 (제외 금지, 루프 스킵)."""
 
@@ -298,6 +302,8 @@ def is_kr_order_submit_outcome_ambiguous(exc: BaseException) -> bool:
     Every other temporary order error is fenced for broker reconciliation so
     the caller never blindly submits the same economic order again.
     """
+    if isinstance(exc, KisOrderPreSubmitBlocked):
+        return False
     if not isinstance(exc, KisTemporaryError):
         return False
     message = str(exc or "").upper()
@@ -4771,7 +4777,14 @@ class KisAPI:
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         requested_qty = int(qty or 0)
         # --- 강화된 사전점검: 보유수량 우선 ---
-        pos = self.get_positions() or []
+        # This is strictly BEFORE the broker order HTTP boundary. Do not
+        # classify a balance-budget failure here as an uncertain broker ACK.
+        try:
+            pos = self.get_positions() or []
+        except KisBalanceUnavailable as exc:
+            raise KisOrderPreSubmitBlocked(
+                "KR_SELL_PRECHECK_PROVEN_BEFORE_ORDER_HTTP: " + str(exc)
+            ) from exc
         hldg = 0
         ord_psbl = 0
         for r in pos:

@@ -2929,14 +2929,23 @@ class PB1Engine:
             raise
         finally:
             elapsed = time.perf_counter() - started
-            # [2026-04-30] tick 잔여 시간 업데이트 (non-critical DB skip 판단용)
+            # The stage budget is NOT the shared tick budget. Do not extend
+            # KIS I/O availability when a short stage finishes quickly after
+            # most of the outer tick's monotonic deadline has already elapsed.
             if max_sec > 0:
-                remaining = max(0.0, max_sec - elapsed)
+                stage_remaining = max(0.0, max_sec - elapsed)
+                from trader.kis_wrapper import kr_tick_remaining_sec
+                shared_remaining = kr_tick_remaining_sec()
+                remaining = (
+                    min(stage_remaining, max(0.0, shared_remaining))
+                    if math.isfinite(shared_remaining)
+                    else stage_remaining
+                )
                 self._tick_remaining_sec = remaining
                 if remaining < int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5")):
                     logger.info(
-                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f action=skip_noncritical_update",
-                        stage_name, remaining,
+                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f shared_remaining_sec=%s action=skip_noncritical_update",
+                        stage_name, remaining, shared_remaining,
                     )
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
             if error is None and max_sec > 0 and elapsed > max_sec:
@@ -2976,6 +2985,7 @@ class PB1Engine:
     def _reset_tick_warning_counts(self) -> None:
         self._tick_warning_counts = Counter()
         self._tick_db_cache = {}
+        self._pending_exit_audit_updates = []
         logger.info("[PB1][TICK][CACHE_RESET] tick_id=%s", getattr(self, "_last_stage", "unknown"))
 
     def _emit_tick_warning_summary(self, *, code: str | None = None) -> None:
@@ -3006,7 +3016,40 @@ class PB1Engine:
             return "SESSION_END_OK_WITH_WARNINGS"
         return "SESSION_END_OK"
 
+    def _queue_exit_audit_update(self, **update: Any) -> None:
+        pending = getattr(self, "_pending_exit_audit_updates", None)
+        if pending is None:
+            pending = self._pending_exit_audit_updates = []
+        pending.append(update)
+
+    def _flush_exit_audit_updates(self) -> None:
+        """Best-effort diagnostics after order work, under the outer watchdog.
+
+        These snapshots never release a claim or establish broker execution.
+        Discard unwritten diagnostics at tick end; never replay stale snapshots
+        into a subsequent tick or reset/extend its shared deadline.
+        """
+        from trader.kis_wrapper import kr_tick_remaining_sec
+        pending = getattr(self, "_pending_exit_audit_updates", [])
+        self._pending_exit_audit_updates = []
+        threshold = max(0.0, float(os.getenv(
+            "PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"
+        )))
+        for update in pending:
+            if kr_tick_remaining_sec() < threshold:
+                logger.info("[POSITIONS][UPDATE][SKIP_NONCRITICAL] reason=low_tick_budget")
+                break
+            try:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, **update,
+                )
+            except Exception as exc:
+                # The installed hard watchdog raises BaseException, which must
+                # unwind through this handler without any diagnostic retry.
+                logger.warning("[POSITIONS][UPDATE][FAIL_SOFT] code=%s err=%r", update["code"], exc)
+
     def _finalize_run_result(self, *, status: str, notes: str | None) -> RunResult:
+        self._flush_exit_audit_updates()
         self._emit_tick_warning_summary()
         warning_counts = self._warning_counts_dict()
         logger.info(
@@ -13383,41 +13426,14 @@ class PB1Engine:
                 "min_hold=%s action=skip_soft_exit hard_exit_allowed=1",
                 display_code, eval_reason, holding_minutes, min_hold_minutes,
             )
-        # [2026-04-30] last_exit_eval_json은 non-critical: 남은 tick budget이 부족하면 skip
-        _noncritical_timeout = int(os.getenv("PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC", "2"))
-        _skip_threshold = int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"))
-        _tick_remaining = getattr(self, "_tick_remaining_sec", None)
-        _should_skip_noncritical = (
-            _tick_remaining is not None and float(_tick_remaining) < _skip_threshold
+        # Diagnostic snapshots must not precede this or another owner's SELL.
+        # Risk fields, durable intent/claim, submit observations and fill writes
+        # below remain synchronous. Keep the payload reference so finalization
+        # persists the actual result rather than the initial SIGNAL_ONLY state.
+        self._queue_exit_audit_update(
+            sid=sid, mode=mode, code=code,
+            fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
         )
-        if _should_skip_noncritical:
-            logger.info(
-                "[POSITIONS][UPDATE][SKIP_NONCRITICAL] code=%s field=last_exit_eval_json reason=low_tick_budget remaining_sec=%.1f",
-                code, float(_tick_remaining or 0),
-            )
-        else:
-            try:
-                import signal as _signal
-                def _timeout_handler(signum, frame):
-                    raise TimeoutError("noncritical_db_update_timeout")
-                _signal.signal(_signal.SIGALRM, _timeout_handler)
-                _signal.alarm(_noncritical_timeout)
-                try:
-                    self.positions_repo.update_position_fields(
-                        env=self.env,
-                        strategy=self.STRATEGY_NAME,
-                        sid=sid,
-                        mode=mode,
-                        code=code,
-                        fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
-                    )
-                finally:
-                    _signal.alarm(0)
-            except Exception as _upd_exc:
-                logger.warning(
-                    "[POSITIONS][UPDATE][FAIL_SOFT] code=%s field=last_exit_eval_json err=%s",
-                    code, repr(_upd_exc),
-                )
 
         logger.info(
             "[EXIT][EVAL] code=%s qty=%s avg=%s last=%s pnl_pct=%.2f stop_loss_hit=%s take_profit_hit=%s trailing_stop_hit=%s close_below_ma20=%s close_below_ma50=%s time_stop_hit=%s signal_hit=%s orderable=%s reason=%s",
@@ -17349,7 +17365,17 @@ class PB1Engine:
         exit_pass_fail_open = self._exit_pass_timeout_fail_open_enabled()
         exit_pass_started = time.perf_counter()
         # exit prewarm: exit_pass 직전에 OHLCV/현재가 캐시를 미리 채운다
-        self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
+        # Full-universe prewarm is a head-of-line blocker: one slow historical
+        # candle or quote delays *every* protective SELL. The existing
+        # _run_exit_always path still loads each owner's required OHLCV before
+        # its own decision. Keep legacy eager prewarm opt-in for diagnostics.
+        if os.getenv("KR_EXIT_BLOCKING_PREWARM", "0") == "1":
+            self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
+        else:
+            logger.info(
+                "[KR_EXIT][PREWARM_DEFERRED] holdings=%s action=EVALUATE_PER_HOLDING_FIRST",
+                len(holdings_for_exit or []),
+            )
         logger.info(
             "[PASS][EXIT][START] phase=%s existing_positions=%s holdings_source=%s",
             self.phase,
@@ -17423,6 +17449,12 @@ class PB1Engine:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
         
+        # Price-subscription prewarm for a separate strategy must not block
+        # PB1 exits or consume the time available to submit protective SELLs.
+        _after_exit = getattr(self, "_kr_after_protective_exit", None)
+        if callable(_after_exit):
+            _after_exit()
+
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")
             self._log_tick_price_cache_summary()
@@ -17521,6 +17553,12 @@ class PB1Engine:
             )
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status="OK_NO_TRADE", notes="PORTFOLIO_FULL")
+
+        # The scanner may feed KR rescue/relax bridge decisions: preserve
+        # its results and original failure handling, but run ONLY after SELL.
+        _deferred_entry_scan = getattr(self, "_kr_deferred_entry_scan", None)
+        if callable(_deferred_entry_scan) and self.phase == "entry":
+            _deferred_entry_scan()
 
         entry_pass_ok = True
         entry_pass_buys = 0
