@@ -25,6 +25,8 @@ def test_pr159_required_workflows_target_exact_stabilization_base():
             "dual-agent",
             "main",
             "master",
+            "fix/kr-20261013-pr-a-protective-sell-deadline",
+            "perf/kr-20261013-pr-b-ws-owner-first",
             "stabilize/02-us-broker-recovery-20261004",
             "stabilize/03-kr-broker-recovery-20261004",
             BASE_BRANCH,
