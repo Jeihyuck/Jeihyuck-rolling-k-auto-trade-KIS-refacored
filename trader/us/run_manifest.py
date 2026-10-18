@@ -91,7 +91,7 @@ def precheck_prep_revision(trade_date: str, revision: str,
     # candidate/score contract. Do not preempt the already approved recovery
     # path: its later broker-order-progress fence remains mandatory.
     recoverable = (old_status in {"DEFENSE_CRASH_ENTRY_BLOCKED", "ERROR", "DEGRADED"}
-                   or old_status.startswith("DEGRADED"))
+                   or old_status.startswith(("DEGRADED", "OK_WITH_WARNINGS")))
     if recoverable and not old_entry:
         return {"ok": True, "reason": "defer_to_existing_recovery_upgrade_gate"}
     return {"ok": False, "reason": "trade_day_revision_already_pinned"}
