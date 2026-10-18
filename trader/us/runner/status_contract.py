@@ -49,6 +49,30 @@ _POLICY_ENTRY_BLOCK_REASONS = {
 }
 
 
+_ORDER_PERMISSION_SELL_BLOCK_REASONS = frozenset({
+    "us_live_trading_disabled", "live_trading_flag_disabled",
+    "disable_live_trading_enabled", "disable_real_trading_enabled",
+    "us_order_not_armed", "us_agent_not_enabled",
+})
+
+
+def is_permission_blocked_sell_route(orders: list[dict] | None) -> bool:
+    """A denied real-trade SELL intent must not be reported as healthy.
+
+    Broker-boundary blocks are distinct from intentional SIGNAL_ONLY/dry-run
+    and from safe duplicate-order fences. Do not infer a failed fill here.
+    """
+    for order in orders or ():
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("status") or "").upper() not in {"BLOCKED", "REJECT", "ERROR"}:
+            continue
+        reason = str(order.get("reason") or order.get("error") or "").lower()
+        if any(code in reason for code in _ORDER_PERMISSION_SELL_BLOCK_REASONS):
+            return True
+    return False
+
+
 def classify_runtime_integrity(tick_result: dict | None) -> str:
     """Separate policy entry blocks from execution, reconciliation, and liveness failures."""
     if not isinstance(tick_result, dict):

@@ -186,4 +186,8 @@ if [[ "${US_OFFLINE:-0}" == "1" ]]; then
   cmd+=(--offline)
 fi
 
+# Sanitize permission diagnostics; never emit .env contents, account IDs, or tokens.
+# This has no order authority and cannot override any explicit stop flag.
+"${PYTHON_BIN}" scripts/us_order_permission_diagnostic.py --session am --env-file .env >> "$LOG_FILE" 2>&1 || true
+
 "${cmd[@]}" >> "$LOG_FILE" 2>&1
