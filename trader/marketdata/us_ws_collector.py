@@ -142,7 +142,22 @@ def _reply(request: dict, *, env: str, generation: str, service) -> dict:
     if request.get("identity") != _account_identity(env) or request.get("env") != env:
         return {"status": "DENIED"}
     if str(request.get("cmd") or "") == "HEALTH":
-        return {"status": "OK", "generation": generation, "collector": "READ_ONLY"}
+        stats = service.stats() if callable(getattr(service, "stats", None)) else {}
+        # Only safe readiness indicators; neither credentials nor raw WS
+        # errors nor any account identifier are sent over the IPC endpoint.
+        return {
+            "status": "OK", "generation": generation, "collector": "READ_ONLY",
+            "process": "STARTED",
+            "ws_connected": bool(stats.get("connected")),
+            "requested_subscriptions": int(stats.get("subscriptions") or 0),
+            "received_symbols": int(stats.get("quotes") or 0),
+            "last_received_age_sec": stats.get("last_received_age_sec"),
+            "stage": (
+                "PRICE_RECEIVED" if stats.get("quotes_received")
+                else "CONNECTED_AWAITING_QUOTE" if stats.get("connected")
+                else "PROCESS_READY_WS_CONNECTING"
+            ),
+        }
     if request.get("cmd") == "SUBSCRIBE_MANY":
         pairs = request.get("pairs")
         if not isinstance(pairs, list) or not 1 <= len(pairs) <= 16:
@@ -156,10 +171,13 @@ def _reply(request: dict, *, env: str, generation: str, service) -> dict:
             if not symbol or not exchange or len(symbol) > 16 or len(exchange) > 12:
                 return {"status": "BAD_REQUEST"}
             valid.append((symbol, exchange))
+        accepted = 0
         for symbol, exchange in valid:
-            service.subscribe_us(symbol, exchange)
-        return {"status": "OK", "generation": generation,
-                "subscribed": len(valid), "collector": "READ_ONLY"}
+            if service.subscribe_us(symbol, exchange) is not False:
+                accepted += 1
+        return {"status": "OK" if accepted == len(valid) else "SUBSCRIPTION_DISABLED",
+                "generation": generation, "subscribed": accepted,
+                "collector": "READ_ONLY"}
     if request.get("cmd") != "QUOTE":
         return {"status": "BAD_REQUEST"}
     symbol = str(request.get("symbol") or "").strip().upper()
@@ -167,11 +185,21 @@ def _reply(request: dict, *, env: str, generation: str, service) -> dict:
     if not symbol or not exchange or len(symbol) > 32:
         return {"status": "BAD_REQUEST"}
     # Subscription happens only in this independent process, never in the tick.
-    service.subscribe_us(symbol, exchange)
+    subscription_allowed = service.subscribe_us(symbol, exchange)
+    if subscription_allowed is False:
+        return {"status": "MISS", "generation": generation, "quote": None,
+                "reason": "SUBSCRIPTION_DISABLED"}
     max_age = max(0.05, min(float(request.get("max_age_sec") or 15), 30))
     quote = service.get_fresh_quote("US", symbol, max_age_sec=max_age)
+    stats = service.stats() if callable(getattr(service, "stats", None)) else {}
+    reason = ""
+    if not quote:
+        reason = (
+            "WS_NOT_CONNECTED" if stats.get("connected") is False
+            else "NO_FRESH_QUOTE"
+        )
     return {"status": "OK" if quote else "MISS", "generation": generation,
-            "quote": quote, "reason": "" if quote else "NOT_RECEIVED_OR_STALE"}
+            "quote": quote, "reason": reason}
 
 
 def _handle(conn: socket.socket, *, env: str, generation: str, service) -> None:
@@ -261,11 +289,16 @@ def ensure_started(*, env: str, offline: bool = False) -> subprocess.Popen | Non
                 _LAST_START_REQUEST.pid, _previous_exit,
             )
             _LAST_START_REQUEST = None
+        # The child is explicitly an isolated no-orders WS price reader.
+        # Do not edit the parent trading flags, nor override explicit offline
+        # or KIS HTTP shutdown flags.
+        child_env = {**os.environ, "US_WS_COLLECTOR_ROLE": "READ_ONLY"}
         process = subprocess.Popen(
             [sys.executable, "-m", "trader.marketdata.us_ws_collector",
              "--env", env, "--parent-pid", str(os.getpid())],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+            env=child_env,
         )
         _LAST_START_REQUEST = process
         logger.info("[US_WS_COLLECTOR][START_REQUEST] pid=%d", process.pid)
