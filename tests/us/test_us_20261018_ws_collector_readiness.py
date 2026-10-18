@@ -58,6 +58,8 @@ def test_role_not_in_parent_does_not_enable_strategy_network(monkeypatch):
 class Fake:
     def __init__(self, *, allowed=True, connected=False, quote=None):
         self.allowed, self.connected, self.quote = allowed, connected, quote
+        self.approval_obtained = False
+        self.broker_subscription_acks = 0
         self.pairs = []
 
     def subscribe_us(self, symbol, exchange):
@@ -75,6 +77,8 @@ class Fake:
     def stats(self):
         return {
             "connected": self.connected, "subscriptions": len(self.pairs),
+            "approval_obtained": self.approval_obtained,
+            "broker_subscription_acks": self.broker_subscription_acks,
             "quotes": 1 if self.quote else 0,
             "quotes_received": self.quote is not None,
             "last_received_age_sec": (
@@ -93,9 +97,15 @@ def test_health_stages_do_not_claim_ws_price_on_process_start(monkeypatch):
     process = collector._reply(_req("HEALTH"), env="practice", generation="g", service=fake)
     assert process["status"] == "OK"
     assert process["stage"] == "PROCESS_READY_WS_CONNECTING"
+    fake.approval_obtained = True
+    approved = collector._reply(_req("HEALTH"), env="practice", generation="g", service=fake)
+    assert approved["stage"] == "APPROVAL_OBTAINED_CONNECTING"
     fake.connected = True
     connected = collector._reply(_req("HEALTH"), env="practice", generation="g", service=fake)
-    assert connected["stage"] == "CONNECTED_AWAITING_QUOTE"
+    assert connected["stage"] == "CONNECTED_AWAITING_SUBSCRIPTION_ACK"
+    fake.broker_subscription_acks = 1
+    acked = collector._reply(_req("HEALTH"), env="practice", generation="g", service=fake)
+    assert acked["stage"] == "SUBSCRIPTION_ACKED_AWAITING_PRICE"
     fake.quote = {"last": 101.0, "received_at": time.time()}
     receiving = collector._reply(_req("HEALTH"), env="practice", generation="g", service=fake)
     assert receiving["stage"] == "PRICE_RECEIVED"
@@ -146,3 +156,29 @@ def test_launcher_sets_read_only_role_in_child_not_parent(monkeypatch):
     collector.ensure_started(env="practice")
     assert calls[0]["env"]["US_WS_COLLECTOR_ROLE"] == "READ_ONLY"
     assert os.getenv("US_WS_COLLECTOR_ROLE") == parent_role
+
+
+
+def test_subscription_ack_not_confused_with_subscription_request(monkeypatch):
+    import asyncio
+    import json
+
+    _ws_env(monkeypatch)
+    service = KisWebSocketPriceService()
+    assert service.stats()["broker_subscription_acks"] == 0
+
+    class WS:
+        pass
+
+    good = json.dumps({
+        "header": {"tr_id": service.US_TR_ID, "tr_key": "DNASMETA"},
+        "body": {"rt_cd": "0"},
+    })
+    asyncio.run(service._handle_message(WS(), good))
+    assert service.stats()["broker_subscription_acks"] == 1
+    rejected = json.dumps({
+        "header": {"tr_id": service.US_TR_ID, "tr_key": "DNASMETA"},
+        "body": {"rt_cd": "1", "msg1": "SUBSCRIPTION_REJECTED"},
+    })
+    asyncio.run(service._handle_message(WS(), rejected))
+    assert service.stats()["broker_subscription_acks"] == 0
