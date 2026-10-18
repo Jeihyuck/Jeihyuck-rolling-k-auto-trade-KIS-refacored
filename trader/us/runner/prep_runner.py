@@ -235,6 +235,41 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "force_now" if force_now else "now_ny",
     )
 
+    # Reject an incompatible pinned revision *before* the 20+ minute
+    # universe/daily-bar PREP. A recoverable bad contract may still enter the
+    # existing broker-progress-checked upgrade path at save time; this check
+    # never replaces or deletes a manifest or a completed PREP artifact.
+    try:
+        from trader.us.run_manifest import precheck_prep_revision
+        from trader.us.prep_contract import _current_git_commit_sha
+        from trader.us.path_contract import load_us_prep_contract
+        revision_check = precheck_prep_revision(
+            trade_date, _current_git_commit_sha(),
+            load_us_prep_contract(trade_date) or {},
+        )
+    except Exception as exc:
+        logger.exception("[US_PREP][REVISION_PREFLIGHT_ERROR] trade_date=%s", trade_date)
+        return {
+            "status": "ERROR", "stage": "revision_preflight",
+            "reason": "revision_preflight_unavailable",
+            "error": type(exc).__name__,
+        }
+    if not revision_check["ok"]:
+        logger.error(
+            "[US_PREP][REVISION_PREFLIGHT_BLOCKED] trade_date=%s reason=%s "
+            "action=preserve_existing_contract",
+            trade_date, revision_check["reason"],
+        )
+        return {
+            "status": "ERROR", "stage": "revision_preflight",
+            "reason": revision_check["reason"], "trade_date": trade_date,
+            "existing_contract_preserved": True,
+        }
+    logger.info(
+        "[US_PREP][REVISION_PREFLIGHT] trade_date=%s reason=%s",
+        trade_date, revision_check["reason"],
+    )
+
     # ── already_prepared guard bypass 체크 ───────────────────────────────
     if force_rebuild_prep:
         logger.warning(
