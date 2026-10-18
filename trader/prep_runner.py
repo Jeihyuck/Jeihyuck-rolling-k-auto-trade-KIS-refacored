@@ -1314,6 +1314,14 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
     - If missing (or force always), build and persist for exact as_of.
     - Reload exact as_of and fail hard when still empty.
     """
+    from trader.universe.build import _load_fallback_universe_from_db
+
+    def _member_identity(rows: list[dict]) -> set[tuple[str, str]]:
+        return {
+            (str(row.get("code") or ""), str(row.get("market") or "").upper())
+            for row in rows
+        }
+
     repo = UniverseRepo(engine)
     as_of_s = as_of.isoformat()
 
@@ -1328,6 +1336,34 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
         as_of_date=as_of_s,
         allow_fallback=False,
     )
+
+    # An exact date in the DB is not sufficient provenance. Before reusing
+    # prebuilt KR PREP inputs, check the successful source and its actual date.
+    if members:
+        snapshot = repo.get_latest_successful_universe_snapshot(
+            env=env, strategy=strategy, as_of_date=as_of_s,
+        )
+        # Validate the *members*, not only the source/date/row count.
+        # Reuse the same strict six-digit, venue and deduplication contract
+        # enforced by the universe builder on exact-as-of recovery.
+        validated = _load_fallback_universe_from_db(
+            repo=repo, env=env, strategy=strategy, as_of_date=as_of_s,
+            snapshot=snapshot, require_exact_as_of=True,
+            enforce_fallback_switch=False,
+        ) if snapshot else []
+        dated_source_ok = bool(
+            validated and len(validated) == len(members)
+            and _member_identity(validated) == _member_identity(members)
+        )
+        if not dated_source_ok:
+            logger.error(
+                "[UNIVERSE][DB][REJECT_UNDATED] requested=%s cached=%d "
+                "source=%s actual_as_of=%s action=REBUILD_DATED",
+                as_of_s, len(members),
+                snapshot.get("provider") if snapshot else None,
+                snapshot.get("actual_as_of") if snapshot else None,
+            )
+            members = []
 
     # 2) build trigger
     should_build = force_always or len(members) == 0
@@ -1368,6 +1404,24 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
             as_of_date=as_of_s,
             allow_fallback=False,
         )
+        # A successful write is not sufficient: verify the committed DB
+        # snapshot and every member before PREP continues to Final30.
+        committed = repo.get_latest_successful_universe_snapshot(
+            env=env, strategy=strategy, as_of_date=as_of_s,
+        )
+        verified_members = _load_fallback_universe_from_db(
+            repo=repo, env=env, strategy=strategy, as_of_date=as_of_s,
+            snapshot=committed, require_exact_as_of=True,
+            enforce_fallback_switch=False,
+        )
+        if (not verified_members or len(verified_members) != len(members)
+                or _member_identity(verified_members) != _member_identity(members)):
+            logger.error(
+                "[UNIVERSE][PREP][POST_BUILD_PROVENANCE_FAIL] as_of=%s db_rows=%d verified_rows=%d",
+                as_of_s, len(members), len(verified_members),
+            )
+            raise RuntimeError("KR_PREP_UNIVERSE_PROVENANCE_INVALID")
+        members = verified_members
 
     # 4) hard fail if exact as_of still empty
     if len(members) == 0:

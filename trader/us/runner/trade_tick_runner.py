@@ -502,8 +502,13 @@ def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_in
 
 def _suppress_pending_sell_exit_intents(
     exit_intents: list[dict], trade_date: str, *, env: str = "practice",
+    strict: bool = False,
 ) -> list[dict]:
-    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP."""
+    """Suppress repeat routing for exact pending / crossday-fenced STANDARD TP.
+
+    strict is for the *opt-in early pilot only*: stale/unavailable DB evidence
+    cannot authorize a submission. The existing late route stays unchanged.
+    """
     def _standard_lifecycle(intent: dict) -> str:
         meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
         owner = str(intent.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
@@ -534,13 +539,15 @@ def _suppress_pending_sell_exit_intents(
             )
         except Exception as exc:
             logger.warning(
-                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=use_existing_order_gate",
-                exc,
+                "[US_EXIT][HISTORICAL_TP_CLAIM_READ_WARN] err=%s action=%s",
+                exc, "FAIL_CLOSED_EARLY_PILOT" if strict else "use_existing_order_gate",
             )
+            if strict:
+                return []
     try:
         from trader.us.db.repos import has_pending_order_for_symbol_side
     except Exception:
-        return exit_intents
+        return [] if strict else exit_intents
     statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
     kept: list[dict] = []
     for intent in exit_intents:
@@ -560,6 +567,8 @@ def _suppress_pending_sell_exit_intents(
             pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
         except Exception as exc:
             logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
+            if strict:
+                return []
             pending = False
         if pending:
             logger.info("[US_EXIT][INTENT_SUPPRESS] symbol=%s reason=pending_sell_order_exists", symbol)
@@ -1305,7 +1314,7 @@ def _exit_family(intent: dict) -> str:
     return fallback or "OTHER_EXIT"
 
 
-def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
+def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) -> list[dict]:
     """Select one deterministic SELL per symbol while retaining absorbed reasons."""
     priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TIME_STOP": 3,
                 "TREND_TRIM": 3, "TAKE_PROFIT": 4}
@@ -1320,6 +1329,11 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     for symbol, rows in grouped.items():
         rows.sort(key=lambda row: (priority.get(_exit_family(row[1]), 99), row[0]))
         selected = dict(rows[0][1])
+        if on_selected is not None:
+            try:
+                on_selected(rows[0][1], selected)
+            except Exception:
+                logger.warning("[US_EXIT][SELECTED_TRACE_FAILED] symbol=%s", symbol)
         selected_meta = dict(selected.get("meta") or {})
         selected_reason = str(selected.get("reason") or selected_meta.get("reason") or _exit_family(selected))
         absorbed = [str(row.get("reason") or (row.get("meta") or {}).get("reason") or _exit_family(row))
@@ -1446,7 +1460,31 @@ def route_exit_orders_immediately(
     """
     from trader.us.execution.order_router import route_order
 
-    sell_intents = [i for i in merge_exit_intents_by_symbol(exit_intents) if str(i.get("side") or "").upper() == "SELL"]
+    def _track_actual_selection(original: dict, selected: dict) -> None:
+        # Explicitly resolve attribution *after* all overlay/cluster/defense
+        # candidates have entered the same legacy priority merge.
+        selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
+        selected_trace_ids = getattr(context, "_sell_selected_trace_id_by_symbol", None)
+        by_trace_id = getattr(context, "_sell_signal_id_by_identity", None)
+        by_identity = getattr(context, "_sell_selected_ready_by_identity", None)
+        if not isinstance(selected_ready, dict):
+            return
+        symbol = str(original.get("symbol") or "").upper()
+        value = by_identity.get(id(original)) if isinstance(by_identity, dict) else None
+        if isinstance(value, (int, float)):
+            selected_ready[symbol] = value
+            if isinstance(selected_trace_ids, dict) and isinstance(by_trace_id, dict):
+                selected_trace_ids[symbol] = by_trace_id.get(id(original))
+        else:
+            selected_ready.pop(symbol, None)
+            if isinstance(selected_trace_ids, dict):
+                selected_trace_ids.pop(symbol, None)
+
+    sell_intents = [
+        i for i in merge_exit_intents_by_symbol(
+            exit_intents, on_selected=_track_actual_selection,
+        ) if str(i.get("side") or "").upper() == "SELL"
+    ]
     logger.info("[US_EXIT][ROUTE_IMMEDIATE][START] exit_intents=%d", len(sell_intents))
     orders: list[dict] = []
     decisions: list[dict] = []
@@ -1934,6 +1972,46 @@ def run_trade_tick(
     # Extract position_symbols from reconcile result
     current_position_symbols: set[str] = set(recon.get("position_symbols", []))
 
+    # PR-C: subscribe to held STANDARD symbols while slow fill/order recovery
+    # has yet to run. No quote or cash truth is accepted here. Freshness and
+    # generation checks still run at the original data-provider boundary.
+    # Opt-in only; the collector process has no order APIs.
+    if (
+        not offline and os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1"
+        and os.getenv("US_WS_EXIT_OWNER_PREWARM_ENABLED", "0") == "1"
+        and str(recon.get("status") or "").upper() == "OK"
+        and isinstance(recon.get("positions"), list)
+    ):
+        try:
+            from trader.us.strategy_ownership import exclude_non_standard as _standard_for_ws
+            from trader.us.symbols import normalize_us_exchange as _normalize_ws_exchange
+            from trader.marketdata.us_ws_collector import subscribe_many as _ws_subscribe_many
+            _pairs = []
+            for _pos in _standard_for_ws(recon["positions"]):
+                _symbol = str(_pos.get("symbol") or "").strip().upper()
+                if not _symbol or _symbol == "TQQQ":
+                    continue
+                try:
+                    _exchange = _normalize_ws_exchange(_pos.get("exchange") or "NASDAQ")
+                except ValueError:
+                    continue
+                _pairs.append((_symbol, _exchange))
+            _seen_pairs = list(dict.fromkeys(_pairs))
+            _subscribed_batches = 0
+            for _index in range(0, min(len(_seen_pairs), 48), 16):
+                _subscribed_batches += int(_ws_subscribe_many(
+                    _seen_pairs[_index:_index + 16], env=env, timeout_sec=0.3,
+                ))
+            logger.info(
+                "[US_WS_COLLECTOR][EXIT_OWNER_PREWARM] symbols=%d batches_ok=%d",
+                min(len(_seen_pairs), 48), _subscribed_batches,
+            )
+        except Exception as _ws_prewarm_error:
+            logger.warning(
+                "[US_WS_COLLECTOR][EXIT_OWNER_PREWARM_SKIP] reason=%s",
+                type(_ws_prewarm_error).__name__,
+            )
+
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
     
@@ -2094,6 +2172,7 @@ def run_trade_tick(
     # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
     if not offline:
         _order_reconcile_started = time.monotonic()
+        _active_claim_replay_started = time.monotonic()
         try:
             from trader.us.execution.order_journal import replay_order_journal
             active_claim_recovery_result = replay_order_journal(
@@ -2112,6 +2191,13 @@ def run_trade_tick(
             }
             ack_recon["active_claim_recovery"] = active_claim_recovery_result
             logger.error("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY_ERROR] %s", exc)
+        finally:
+            tick_context.metrics["active_claim_replay_ms"] = (
+                time.monotonic() - _active_claim_replay_started
+            ) * 1000.0
+            logger.info("[US_RECONCILE][ACTIVE_CLAIM_LATENCY] tick=%s duration_ms=%.2f",
+                        tick_index, tick_context.metrics["active_claim_replay_ms"])
+        _ack_reconcile_started = time.monotonic()
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon = reconcile_ack_orders_with_balance(
@@ -2140,7 +2226,15 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
         finally:
+            tick_context.metrics["ack_reconcile_ms"] = (
+                time.monotonic() - _ack_reconcile_started
+            ) * 1000.0
             tick_context.metrics["order_reconcile_ms"] = (time.monotonic() - _order_reconcile_started) * 1000.0
+            logger.info(
+                "[US_RECONCILE][ACK_LATENCY] tick=%s duration_ms=%.2f total_ms=%.2f",
+                tick_index, tick_context.metrics["ack_reconcile_ms"],
+                tick_context.metrics["order_reconcile_ms"],
+            )
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
@@ -2459,10 +2553,64 @@ def run_trade_tick(
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
 
+    # Process-local earliest readiness; observation only, never persisted.
+    _sell_signal_ready_by_symbol: dict[str, float] = {}
+    if tick_context is not None:
+        setattr(tick_context, "_sell_signal_ready_by_symbol", _sell_signal_ready_by_symbol)
+    _sell_selected_ready_by_identity: dict[int, float] = {}
+    _sell_signal_id_by_identity: dict[int, str] = {}
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_ready_by_identity", _sell_selected_ready_by_identity)
+        setattr(tick_context, "_sell_signal_id_by_identity", _sell_signal_id_by_identity)
+    def _observe_pb1_sell(intent: dict, observed_mono: float, phase: str) -> None:
+        # Selected and earliest candidate are separate measurement dimensions.
+        # Intent-local observation is deliberately process-local, never sent
+        # to the broker as a field or persisted as a monotonic timestamp.
+        symbol = str(intent.get("symbol") or "").upper()
+        _sell_signal_ready_by_symbol.setdefault(symbol, observed_mono)
+        _sell_selected_ready_by_identity[id(intent)] = observed_mono
+        import uuid as _trace_uuid
+        _signal_id = _trace_uuid.uuid4().hex
+        _sell_signal_id_by_identity[id(intent)] = _signal_id
+        _trace_position = next(
+            (p for p in current_positions
+             if str(p.get("symbol") or "").upper() == symbol),
+            {},
+        )
+        logger.info(
+            "[US_EXIT][SIGNAL_TRACE_ID] signal_id=%s tick=%s tick_id=%s "
+            "session_run_id=%s session_generation=%s phase=%s symbol=%s "
+            "owner=%s lifecycle=%s trade_date=%s trading_epoch=%s",
+            _signal_id, tick_index, tick_id, session_run_id,
+            session_generation, phase, symbol,
+            str(intent.get("strategy_owner")
+                or (intent.get("meta") or {}).get("strategy_owner")
+                or _trace_position.get("strategy_owner") or ""),
+            str(intent.get("position_lifecycle_id")
+                or (intent.get("meta") or {}).get("position_lifecycle_id")
+                or _trace_position.get("position_lifecycle_id") or ""),
+            trade_date,
+            str(intent.get("trading_epoch_id")
+                or (intent.get("meta") or {}).get("trading_epoch_id")
+                or _trace_position.get("trading_epoch_id") or "UNKNOWN"),
+        )
+        logger.info(
+            "[US_EXIT][PER_SIGNAL_READY] tick=%s phase=%s symbol=%s "
+            "family=%s observed_mono_ns=%d",
+            tick_index, phase, symbol, _exit_family(intent),
+            int(observed_mono * 1_000_000_000),
+        )
     # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
+    # Explicitly disabled unless a practice-only pilot is approved. A pilot
+    # routes at most one PB1 standard hard-stop via the existing durable router.
+    _early_pilot_attempted_symbols: set[str] = set()
+    _early_pilot_stream_incomplete = False
+    _early_pilot_intents: list[dict] = []
+    _early_pilot_results: list[dict] = []
+    _early_pilot_enabled = False
     try:
         if not exit_can_proceed:
             logger.error("[US_EXIT_EVAL][SKIP] session=%s tick=%s reason=exit_can_proceed_false", session, tick_index)
@@ -2485,15 +2633,166 @@ def run_trade_tick(
             exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
         else:
             from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
+            import inspect as _exit_inspect
+            _exit_observer_supported = (
+                "on_sell_ready" in _exit_inspect.signature(_gen_exit_from_snapshots).parameters
+            )
+            def _gen_pb1_observed(snapshots, *, include_trend_time, phase):
+                kwargs = dict(
+                    prepared_snapshots=snapshots, include_trend_time=include_trend_time,
+                )
+                if _exit_observer_supported:
+                    kwargs["on_sell_ready"] = (
+                        lambda intent, observed: _observe_pb1_sell(intent, observed, phase)
+                    )
+                else:
+                    logger.info("[US_EXIT][OBSERVATION_UNSUPPORTED] phase=%s", phase)
+                return _gen_exit_from_snapshots([], provider=None, now=now, **kwargs)
+
+            _pb1_positions = exclude_non_standard(current_positions)
+            _pb1_symbol_counts: dict[str, int] = {}
+            for _pos in _pb1_positions:
+                _key = str(_pos.get("symbol") or "").upper()
+                _pb1_symbol_counts[_key] = _pb1_symbol_counts.get(_key, 0) + 1
+
+            _early_pilot_enabled = (
+                os.getenv("US_EARLY_HARD_STOP_PILOT_ENABLED", "0") == "1"
+                and str(env).lower() == "practice"
+                # Never route a practice pilot to a real KIS client if the
+                # runner argument and actual client environment disagree.
+                and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
+                and not offline
+                and kis_order_allowed and not signal_only and exit_can_proceed
+                and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"
+                and not fills_contract_error and not fills_temp_error
+                and bool(recon.get("authoritative_positions"))
+                and str(recon.get("status") or "").upper() == "OK"
+                and str(ack_recon.get("status") or "").upper() == "OK"
+                and int(ack_recon.get("unresolved_count") or 0) == 0
+                and isinstance(active_claim_recovery_result, dict)
+                and str(active_claim_recovery_result.get("status") or "").upper()
+                    in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
+                and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
+                and _exit_observer_supported
+            )
+            _pilot_safety_intents: list[dict] = []
+            if _early_pilot_enabled:
+                # Required for the *actual* winner-to-HTTP trace in the
+                # common router; still no trading fields added to the intent.
+                setattr(tick_context, "_sell_selected_ready_by_symbol", {})
+                setattr(tick_context, "_sell_selected_trace_id_by_symbol", {})
+
+            def _on_snapshot_ready_for_pilot(snapshot: dict) -> None:
+                _new_intents = _gen_pb1_observed(
+                    [snapshot], include_trend_time=False, phase="safety",
+                )
+                _earlier_sells = any(
+                    str(i.get("side") or "").upper() == "SELL"
+                    for i in _pilot_safety_intents
+                )
+                _pilot_safety_intents.extend(_new_intents)
+                if _early_pilot_attempted_symbols or _earlier_sells:
+                    return
+                if str(snapshot.get("strategy_owner") or "").upper() != "US_STANDARD":
+                    return
+                _sym = str(snapshot.get("symbol") or "").upper()
+                if _sym == "TQQQ" or _pb1_symbol_counts.get(_sym) != 1:
+                    return
+                _eligible = [
+                    i for i in _new_intents
+                    if str(i.get("side") or "").upper() == "SELL"
+                    # SWING routing canonicalizes hard_stop_loss to hard_stop.
+                    # Require BOTH the canonical exit reason and exit family
+                    # to avoid admitting unrelated high-priority exits.
+                    and str(i.get("exit_type") or "").lower()
+                        in {"hard_stop", "hard_stop_loss"}
+                    and str(i.get("exit_reason") or "").lower()
+                        == "hard_stop_full_exit"
+                    and _exit_family(i) == "HARD_STOP"
+                    and str(i.get("symbol") or "").upper() == _sym
+                ]
+                if len(_eligible) != 1:
+                    return
+                # Preserve historical TP fences and same-symbol pending-order
+                # suppression before any possible broker submission.
+                _eligible = _suppress_pending_sell_exit_intents(
+                    _eligible, trade_date, env=env, strict=True,
+                )
+                if len(_eligible) != 1:
+                    return
+                _early_pilot_attempted_symbols.add(_sym)
+                _early_pilot_intents.append(_eligible[0])
+                # This pilot has a unique, hard-stop-only final choice for
+                # this symbol; attribute its real HTTP boundary to THIS intent,
+                # not an unrelated first-by-symbol candidate.
+                _chosen_mono = _sell_selected_ready_by_identity.get(id(_eligible[0]))
+                _chosen_trace_id = _sell_signal_id_by_identity.get(id(_eligible[0]))
+                if isinstance(_chosen_mono, (int, float)):
+                    tick_context._sell_selected_ready_by_symbol[_sym] = _chosen_mono
+                    if _chosen_trace_id:
+                        tick_context._sell_selected_trace_id_by_symbol[_sym] = _chosen_trace_id
+                logger.warning(
+                    "[US_EXIT][EARLY_HARD_STOP_PILOT] tick=%s symbol=%s "
+                    "action=route_via_canonical_router_before_unrelated_snapshots",
+                    tick_index, _sym,
+                )
+                try:
+                    _pilot_result = route_exit_orders_immediately(
+                        _eligible, buy_daily_notional=0.0,
+                        position_count=position_count,
+                        effective_budget=effective_budget,
+                        signal_only=signal_only,
+                        kis_order_allowed=kis_order_allowed,
+                        current_position_symbols=(
+                            current_position_symbols or {
+                                str(p.get("symbol") or "").upper()
+                                for p in current_positions if p.get("symbol")
+                            }
+                        ),
+                        context=tick_context, kis_client=routing_kis_client,
+                    )
+                    _early_pilot_results.append(_pilot_result)
+                except Exception as _pilot_error:
+                    # A router exception may occur after KIS submission.
+                    # Never re-submit in the late path; leave the broker fence
+                    # to durable reconciliation.
+                    logger.exception(
+                        "[US_EXIT][EARLY_HARD_STOP_PILOT][UNCERTAIN] symbol=%s err=%s",
+                        _sym, _pilot_error,
+                    )
+                    _early_pilot_results.append({
+                        "orders": [{"status": "BROKER_SUBMIT_RESULT_UNKNOWN",
+                                    "requires_reconcile": True, "intent": _eligible[0]}],
+                        "decisions": [],
+                    })
+
             try:
                 exit_snapshots = prepare_exit_position_snapshots(
-                    exclude_non_standard(current_positions), provider, now
+                    _pb1_positions, provider, now,
+                    **({"on_snapshot_ready": _on_snapshot_ready_for_pilot}
+                       if _early_pilot_enabled else {}),
                 )
             except Exception as _snapshot_exc:
                 logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
+                if _early_pilot_enabled:
+                    _early_pilot_stream_incomplete = True
+                    # A partial stream may already have submitted a SELL.
+                    # Never proceed to BUY on incomplete exit-state evidence.
+                    entry_can_proceed = False
+                    entry_block_reason = "early_exit_snapshot_stream_incomplete"
+                    logger.error(
+                        "[US_EXIT][EARLY_HARD_STOP_PILOT][FAIL_CLOSED] "
+                        "reason=snapshot_stream_incomplete action=block_buy_retain_claims"
+                    )
                 exit_snapshots = []
             try:
-                safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
+                safety_exit_intents = (
+                    list(_pilot_safety_intents)
+                    if _early_pilot_enabled
+                    else _gen_pb1_observed(
+                        exit_snapshots, include_trend_time=False, phase="safety",
+                    )
+                )
             except Exception as _safety_eval_exc:
                 logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
                 safety_exit_intents = []
@@ -2512,7 +2811,9 @@ def run_trade_tick(
                 logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
             if trend_targets:
                 try:
-                    trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
+                    trend_exit_intents = _gen_pb1_observed(
+                        trend_targets, include_trend_time=True, phase="trend",
+                    )
                 except Exception as _trend_eval_exc:
                     logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
                     trend_exit_intents = []
@@ -2532,6 +2833,31 @@ def run_trade_tick(
             logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
         else:
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+    # Identity is currently preserved for PB1 safety and trend intents, but
+    # the downstream merge copies its chosen row. Preserve provenance only
+    # when the selected row's symbol has a single evaluated SELL candidate.
+    # Ambiguous sources must remain unmeasured, not be mislabeled.
+    _sell_selected_ready_by_symbol: dict[str, float] = {}
+    _sell_candidate_count_by_symbol: dict[str, int] = {}
+    for _selected_intent in exit_intents:
+        if str(_selected_intent.get("side") or "").upper() != "SELL":
+            continue
+        _symbol = str(_selected_intent.get("symbol") or "").upper()
+        _sell_candidate_count_by_symbol[_symbol] = _sell_candidate_count_by_symbol.get(_symbol, 0) + 1
+        _selected_mono = _sell_selected_ready_by_identity.get(id(_selected_intent))
+        if _selected_mono is not None and _symbol not in _sell_selected_ready_by_symbol:
+            _sell_selected_ready_by_symbol[_symbol] = _selected_mono
+        elif _selected_mono is None:
+            _sell_selected_ready_by_symbol.pop(_symbol, None)
+    _sell_selected_ready_by_symbol = {
+        _symbol: _observed
+        for _symbol, _observed in _sell_selected_ready_by_symbol.items()
+        if _sell_candidate_count_by_symbol.get(_symbol) == 1
+    }
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_ready_by_symbol", _sell_selected_ready_by_symbol)
+    if tick_context is not None:
+        setattr(tick_context, "_sell_selected_trace_id_by_symbol", {})
     # Measure protective signal readiness separately from broker routing.
     # This never changes an intent, strategy evaluation, or order/fence state.
     _early_sell_signal_ready_mono = (
@@ -2603,6 +2929,13 @@ def run_trade_tick(
         logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
     finally:
         tick_context.metrics["market_state_ms"] = (time.monotonic() - _market_state_started) * 1000.0
+    # A CRASH_REBOUND overlay must not override an exit-stream failure.
+    # Without complete per-position evaluation, no new BUY is authorized.
+    if _early_pilot_stream_incomplete:
+        entry_can_proceed = False
+        allow_new_symbols = False
+        allow_add_to_existing = False
+        entry_block_reason = "early_exit_snapshot_stream_incomplete"
     effective_budget_before_overlay = effective_budget
     exposure_multiplier = float(market_state_overlay.get(
         "effective_capital_scale",
@@ -2710,6 +3043,16 @@ def run_trade_tick(
     exit_intents = _suppress_pending_sell_exit_intents(
         exit_intents, trade_date, env=env,
     )
+    # Restore audit of the already-attempted early SELL without permitting
+    # any late submission of this symbol.
+    for _early_intent in _early_pilot_intents:
+        if not any(
+            str(i.get("symbol") or "").upper()
+                == str(_early_intent.get("symbol") or "").upper()
+            and str(i.get("side") or "").upper() == "SELL"
+            for i in exit_intents
+        ):
+            exit_intents.append(_early_intent)
 
     # Route SELL without an unnecessary BUY-only DB budget read. The SELL
     # branch of assert_order_allowed() never consumes the daily BUY notional.
@@ -2726,8 +3069,12 @@ def run_trade_tick(
             "reason=pre_route_overlay_recovery_and_claim_checks",
             tick_index, _pre_route_delay_ms,
         )
+    _late_exit_intents = [
+        i for i in exit_intents
+        if str(i.get("symbol") or "").upper() not in _early_pilot_attempted_symbols
+    ]
     exit_route_result = route_exit_orders_immediately(
-        exit_intents,
+        _late_exit_intents,
         buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
         position_count=position_count,
         effective_budget=effective_budget,
@@ -2737,6 +3084,27 @@ def run_trade_tick(
         context=tick_context,
         kis_client=routing_kis_client,
     )
+
+    if _early_pilot_results:
+        _all_exit_orders = [
+            o for batch in _early_pilot_results for o in batch.get("orders", [])
+        ] + list(exit_route_result.get("orders", []))
+        _all_exit_decisions = [
+            d for batch in _early_pilot_results for d in batch.get("decisions", [])
+        ] + list(exit_route_result.get("decisions", []))
+        _sent, _ack, _rejected, _blocked = _routed_order_truth_counts(_all_exit_orders)
+        exit_route_result = {
+            "orders": _all_exit_orders, "decisions": _all_exit_decisions,
+            "sent": _sent, "ack": _ack, "rejected": _rejected,
+            "blocked": _blocked,
+            "sell_notional_routed": _routed_sell_notional(_all_exit_orders),
+            "exit_notional_routed": _routed_sell_notional(_all_exit_orders),
+        }
+        logger.warning(
+            "[US_EXIT][EARLY_HARD_STOP_PILOT][MERGED_RESULTS] "
+            "attempted=%d orders=%d",
+            len(_early_pilot_attempted_symbols), len(_all_exit_orders),
+        )
 
     # BUY-specific committed notional is loaded only after protective sells
     # have passed the existing router, durability fences and broker boundary.
@@ -4186,8 +4554,28 @@ def run_trade_tick(
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
     tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
+    # Per-order data is bounded, explicit, and labeled separately from
+    # summary statistics. No telemetry I/O is performed on the order path.
+    _by_attempt = tick_context.metrics.get("sell_signal_to_broker_boundary_by_attempt_ms", {})
+    _by_attempt = _by_attempt if isinstance(_by_attempt, dict) else {}
+    _per_attempt_observations = dict(list(_by_attempt.items())[:128])
+    _first_by_attempt = tick_context.metrics.get(
+        "sell_first_candidate_to_broker_by_attempt_ms", {}
+    )
+    _first_by_attempt = _first_by_attempt if isinstance(_first_by_attempt, dict) else {}
+    _first_candidate_observations = dict(list(_first_by_attempt.items())[:128])
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
+        "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
+        "sell_first_candidate_to_broker_by_attempt_ms": _first_candidate_observations,
+        "sell_first_candidate_truncated_count": (
+            max(0, len(_first_by_attempt) - len(_first_candidate_observations))
+            + int(tick_context.metrics.get("sell_first_candidate_dropped_count", 0))
+        ),
+        "sell_signal_to_broker_boundary_truncated_count": (
+            max(0, len(_by_attempt) - len(_per_attempt_observations))
+            + int(tick_context.metrics.get("sell_signal_to_broker_boundary_dropped_count", 0))
+        ),
         "balance_snapshot_ms": float(tick_context.metrics.get("balance_snapshot_ms", 0)),
         "balance_snapshot_logical_calls": int(tick_context.counters.get("balance_logical_calls", 0)),
         "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
@@ -4216,6 +4604,8 @@ def run_trade_tick(
         "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
         "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
         "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "active_claim_replay_ms": float(tick_context.metrics.get("active_claim_replay_ms", 0)),
+        "ack_reconcile_ms": float(tick_context.metrics.get("ack_reconcile_ms", 0)),
         "post_route_reconcile_ms": float(tick_context.metrics.get("post_route_reconcile_ms", 0)),
         "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
         "fill_rows_received": len(fills_today),
@@ -4265,7 +4655,7 @@ def run_trade_tick(
         )
     logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
                 tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
-    from trader.us.runner.status_contract import classify_runtime_integrity
+    from trader.us.runner.status_contract import classify_runtime_integrity, is_permission_blocked_sell_route
     exit_route_orders = exit_route_result.get("orders", [])
     exit_route_statuses = {str(order.get("status") or "").upper() for order in exit_route_orders}
     exit_route_reconcile_required = any(
@@ -4282,6 +4672,7 @@ def run_trade_tick(
         and not signal_only
         and (
             exit_route_reconcile_required
+            or is_permission_blocked_sell_route(exit_route_orders)
             or any(
                 status in {"ERROR", "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "ORDER_ROUTE_BUDGET_EXHAUSTED"}
                 for status in exit_route_statuses

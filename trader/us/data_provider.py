@@ -1378,6 +1378,46 @@ class USDataProvider:
         return 0.0
     
 
+    def get_order_lookup_provenance(self, trade_date: str) -> dict:
+        """Authenticated KIS lookup scope; NEVER infer missing identity from a row.
+
+        get_today_orders uses client._build_us_fills_params() scoped by CANO /
+        ACNT_PRDT_CD and filters its KST date bridge back to the requested US
+        date. Session identity is only available from an explicitly bound tick.
+        Original submission session belongs to the local journal, NOT this query.
+        """
+        if self._offline:
+            return {}
+        client = self._get_client()
+        cano = str(getattr(client, "_cano", "") or "").strip()
+        product = str(getattr(client, "_acnt_prdt_cd", "") or "").strip()
+        client_env = str(getattr(client, "_env", "") or "").lower()
+        if not cano or not product or client_env != self._env:
+            return {}
+        from trader.account_state import get_account_key
+        import hashlib
+        ctx = self._tick_context
+        broker_account_key = get_account_key(
+            env=client_env, cano=cano, product_code=product
+        )
+        # Match the same local account identity namespace used by the
+        # durable execution-claim repository. Disagreement is NOT a hint to
+        # weaken the identity check: disable memo reuse and use exact lookup.
+        if broker_account_key != get_account_key(env=client_env):
+            logger.warning("[US_JOURNAL][SCOPE_MISMATCH] action=NO_ORDER_BOOK_MEMO")
+            return {}
+        account_fingerprint = hashlib.sha256(broker_account_key.encode("utf-8")).hexdigest()
+        return {
+            "verified": True, "source": "kis_authenticated_order_book",
+            "query_trade_date": str(trade_date), "market": "US",
+            "account_id": account_fingerprint, "broker_account_no": cano,
+            "account_product_code": product,
+            "env": client_env,
+            "session": getattr(ctx, "session", "") if ctx is not None else "",
+            "session_run_id": getattr(ctx, "session_run_id", "") if ctx is not None else "",
+            "session_generation": getattr(ctx, "session_generation", None) if ctx is not None else None,
+        }
+
     def get_today_orders(self, trade_date: str) -> list[dict]:
         """Return normalized same-day US broker order status rows."""
         if self._offline:
@@ -1398,11 +1438,20 @@ class USDataProvider:
                         row.get("raw_row_id"), row.get("page_index"), row.get("raw_order_no"), row.get("canonical_order_no"), row.get("symbol"), row.get("side"), row.get("requested_qty"), row.get("filled_qty"), row.get("remaining_qty"), row.get("normalization_result"), row.get("filter_reason"))
         return normalized
 
-    def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict | None:
-        """Return normalized cumulative fill/order detail for a single broker order."""
+    def get_fills_by_order_no(
+        self, order_no: str, symbol: str, trade_date: str,
+        *, order_book_snapshot: list[dict] | None = None,
+    ) -> dict | None:
+        """Normalized broker observation from a fresh, caller-scoped order book.
+
+        The caller may supply a single account/date-verified snapshot shared
+        between pending orders in ONE reconciliation. There is no persistent
+        cache and callers outside that batch still query the broker directly.
+        """
         if self._offline:
             return None
-        rows = self.get_today_orders(trade_date)
+        rows = (order_book_snapshot if order_book_snapshot is not None
+                else self.get_today_orders(trade_date))
         wanted = normalize_us_order_no(order_no)
         matches = [r for r in rows if normalize_us_order_no(r.get("order_no")) == wanted and str(r.get("symbol") or "").upper() == str(symbol).upper()]
         if not matches:

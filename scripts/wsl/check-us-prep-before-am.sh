@@ -45,6 +45,7 @@ import sys
 trade_date=sys.argv[1]
 from trader.us.prep_effective import is_effective_prep_contract, is_effective_prep_status
 artifact_ok=False
+contract={}
 try:
     # Canonical artifact remains runtime/us/watchlist/<trade_date>/final30_scored.json.
     # Entry-blocked OK_WITH_WARNINGS_* states are still completed PREP contracts;
@@ -63,15 +64,23 @@ except Exception as exc:
 
 db_ok=False
 try:
-    from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+    from trader.us.db.repos import load_us_prep_completion_for_run, load_locked_us_watchlist
+    from trader.us.prep_effective import locked_rows_match_prep_run
     from trader.us.score_columns import validate_us_entry_provenance_contract
-    prep=load_latest_us_prep_status(trade_date) or {}
+    prep=load_us_prep_completion_for_run(trade_date, str(contract.get('run_id') or '')) if artifact_ok else {}
     rows=load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
     provenance=validate_us_entry_provenance_contract(rows)
+    # An unrelated STARTED/completed run must not validate an old locked
+    # watchlist.  The artifact, DB completion and rows must refer to one run.
+    artifact_run_id = str(contract.get('run_id') or '').strip() if artifact_ok else ''
+    db_run_id = str(prep.get('run_id') or '').strip()
     db_ok = (
         is_effective_prep_status(prep.get('status'))
         and len(rows) >= 10
         and provenance.get('ok') is True
+        and locked_rows_match_prep_run(prep, rows)
+        and bool(artifact_run_id)
+        and artifact_run_id == db_run_id
     )
     if db_ok:
         print(

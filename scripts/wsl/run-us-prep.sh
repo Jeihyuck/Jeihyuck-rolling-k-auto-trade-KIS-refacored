@@ -148,13 +148,13 @@ from trader.us.prep_effective import (
     is_effective_prep_status,
     locked_rows_match_prep_run,
 )
-from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+from trader.us.db.repos import load_us_prep_completion_for_run, load_locked_us_watchlist
 from trader.us.score_columns import validate_us_entry_provenance_contract
 contract = load_us_prep_contract(trade_date) or {}
 artifact_rows = load_us_final30_scored(trade_date) or []
 if not is_effective_prep_contract(contract, artifact_rows, trade_date=trade_date, min_rows=10):
     raise SystemExit(1)
-prep = load_latest_us_prep_status(trade_date) or {}
+prep = load_us_prep_completion_for_run(trade_date, str(contract.get('run_id') or '')) or {}
 locked_rows = load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
 provenance = validate_us_entry_provenance_contract(locked_rows)
 prep_run_id = str(prep.get("run_id") or "").strip()

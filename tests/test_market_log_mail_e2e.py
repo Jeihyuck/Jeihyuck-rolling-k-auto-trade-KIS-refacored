@@ -42,6 +42,13 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
         p=root/item; p.mkdir(parents=True); (p/"evidence.json").write_text('{"ok":true}')
     if market == "kr":
         (root/f"bot_state/trader_ledger/final30/practice/{trade_date}/final30_scored.json").write_text('{"rows": []}')
+        (root/f"runtime/kr/watchlist/{trade_date}/prep_contract.json").write_text(
+            json.dumps({"trade_date": trade_date, "contract_ok": True,
+                        "trade_can_proceed": 1, "final30_rows": 30})
+        )
+        (root/f"reports/kr_prep/{trade_date}/kr_prep_summary.json").write_text(
+            json.dumps({"status": "OK", "reason": "KR_PREP_DONE", "final30_rows": 30})
+        )
     counter=root/"smtp-count"
     if smtp_mode != "dry":
         wrapper=root/"scripts/wsl/with-venv.sh"
@@ -107,16 +114,125 @@ def test_kr_mail_accepts_runtime_watchlist_final30_without_ledger(tmp_path):
     assert "[LOG_MAIL][DRY_RUN]" in result.stdout
 
 
-def test_kr_mail_failure_marker_records_full_missing_evidence_path(tmp_path):
-    root=fixture_repo(tmp_path,"kr")
-    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
-    result,_=run_mail(root,"kr")
-    assert result.returncode != 0
-    expected=f"bot_state/trader_ledger/final30/practice/{DATE}/final30_scored.json"
-    assert expected in result.stderr
-    marker=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
-    assert marker["failure_reason"] == "REQUIRED_EVIDENCE_MISSING"
-    assert marker["missing_path"] == expected
+def test_standalone_redactor_masks_krx_credentials(tmp_path):
+    """Real archive redactor must not leak KRX data-source login details."""
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "krx.log").write_text(
+        "KRX_ID=id-sensitive-123 KRX_PW=pw-sensitive-456 "
+        "KRX_API_KEY=key-sensitive-789\\n", encoding="utf-8")
+    (stage / "evidence.json").write_text(json.dumps({
+        "KRX_ID": "id-sensitive-123", "KRX_PW": "pw-sensitive-456",
+        "KRX_API_KEY": "key-sensitive-789"}), encoding="utf-8")
+    result = subprocess.run(
+        [os.sys.executable, str(ROOT / "scripts/wsl/redact-log-archive.py"), str(stage)],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "id-sensitive-123" not in (stage / "krx.log").read_text()
+    assert "pw-sensitive-456" not in (stage / "krx.log").read_text()
+    assert "key-sensitive-789" not in (stage / "krx.log").read_text()
+    payload = json.loads((stage / "evidence.json").read_text())
+    assert payload == {
+        "KRX_ID": "[REDACTED]", "KRX_PW": "[REDACTED]",
+        "KRX_API_KEY": "[REDACTED]",
+    }
+
+
+def test_kr_mail_embedded_redactor_masks_krx_credentials(tmp_path):
+    """Packaged email fallback redactor must apply the same secret controls."""
+    root = fixture_repo(tmp_path, "kr")
+    evidence = root / f"runtime/logs/kr/{DATE}/prep/attempt-1.log"
+    evidence.write_text(
+        "KRX_ID=credential-id-one KRX_PW=credential-pass-two "
+        "KRX_API_KEY=credential-key-three\\n", encoding="utf-8")
+    result, archive = run_mail(root, "kr")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        logs = b"".join(
+            tf.extractfile(name).read()
+            for name in tf.getnames()
+            if name.endswith(".log")
+        )
+        assert b"credential-id-one" not in logs
+        assert b"credential-pass-two" not in logs
+        assert b"credential-key-three" not in logs
+        assert b"KRX_ID=[REDACTED]" in logs
+
+
+def test_kr_mail_complete_prep_integer_gate_is_not_degraded(tmp_path):
+    """Real PREP producer writes trade_can_proceed=1, not the bool True."""
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    contract_path = root / f"runtime/kr/watchlist/{DATE}/prep_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["trade_can_proceed"] == 1
+    result, _archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "OK"
+    assert marker["mail_complete"] is True
+    assert not any(str(item.get("code", "")).startswith("KR_PREP_")
+                   for item in marker.get("missing_evidence", []))
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+
+def test_kr_mail_missing_final30_sends_degraded_with_exact_missing_path(tmp_path):
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    shutil.rmtree(root / f"bot_state/trader_ledger/final30/practice/{DATE}")
+    result, archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[LOG_MAIL][OK]" in result.stdout
+    expected = f"bot_state/trader_ledger/final30/practice/{DATE}/final30_scored.json"
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "DEGRADED"
+    assert marker["mail_sent"] is True
+    assert marker["mail_complete"] is False
+    assert {"code": "REQUIRED_EVIDENCE_MISSING", "path": expected} in marker["missing_evidence"]
+    assert (root / "smtp-count").read_text().strip() == "1"
+    with tarfile.open(archive, "r:gz") as tar:
+        evidence = json.load(tar.extractfile("./mail_evidence_report.json"))
+        assert evidence["status"] == "DEGRADED"
+        assert expected in json.dumps(evidence)
+
+
+
+def test_kr_mail_failed_prep_is_degraded_even_with_final30_present(tmp_path):
+    """A stale Final30 file cannot make an unsuccessful current PREP look healthy."""
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    contract = root / f"runtime/kr/watchlist/{DATE}/prep_contract.json"
+    contract.write_text(json.dumps({
+        "trade_date": DATE, "contract_ok": False,
+        "trade_can_proceed": False, "final30_rows": 30,
+        "reason": "provider_empty:emergency_seed_missing",
+    }))
+    summary = root / f"reports/kr_prep/{DATE}/kr_prep_summary.json"
+    summary.write_text(json.dumps({
+        "status": "FAIL", "reason": "PREP_RUNNER_FAILED", "final30_rows": 0,
+    }))
+    result, archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "DEGRADED" and marker["mail_sent"] is True
+    assert marker["mail_complete"] is False
+    missing_codes = {row["code"] for row in marker["missing_evidence"]}
+    assert "KR_PREP_CONTRACT_NOT_READY" in missing_codes
+    assert "KR_PREP_SUMMARY_NOT_OK" in missing_codes
+    with tarfile.open(archive, "r:gz") as tar:
+        manifest = json.load(tar.extractfile("./mail_evidence_report.json"))
+        assert manifest["status"] == "DEGRADED"
+        assert manifest["required_missing_count"] >= 2
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+
+def test_kr_mail_missing_prep_contract_still_sends_degraded(tmp_path):
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    (root / f"runtime/kr/watchlist/{DATE}/prep_contract.json").unlink()
+    result, _ = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["status"] == "DEGRADED"
+    assert "KR_PREP_CONTRACT_MISSING" in {r["code"] for r in marker["missing_evidence"]}
+    assert (root / "smtp-count").read_text().strip() == "1"
 
 
 def test_kr_mail_previous_final30_skips_krx_holiday(tmp_path):
@@ -153,22 +269,28 @@ def test_kr_mail_rejects_source_path_outside_repo(tmp_path):
     contract.write_text(json.dumps({"source_paths":{"final30":str(outside)}}),encoding="utf-8")
 
     result,archive=run_mail(root,"kr")
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr + result.stdout
     assert "REQUIRED_EVIDENCE_MISSING" in result.stderr
-    assert not archive.exists()
+    assert archive.exists()
+    with tarfile.open(archive, "r:gz") as tf:
+        assert not any(str(outside) in name for name in tf.getnames())
 
 
-def test_kr_mail_failure_reports_searched_paths(tmp_path):
-    root=fixture_repo(tmp_path,"kr")
-    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
-    result,_=run_mail(root,"kr")
-    assert result.returncode != 0
-    marker=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
-    searched=marker["searched_paths"]
-    assert f"bot_state/trader_ledger/final30/practice/{DATE}" in searched
-    assert f"runtime/kr/watchlist/{DATE}/final30_scored.json" in searched
-    assert "bot_state/trader_ledger/final30/practice/2099-01-01" in searched
-    assert "searched_paths=" in result.stderr
+def test_kr_mail_missing_final30_still_reports_missing_evidence(tmp_path):
+    root = fixture_repo(tmp_path, "kr")
+    shutil.rmtree(root / f"bot_state/trader_ledger/final30/practice/{DATE}")
+    result, archive = run_mail(root, "kr")
+    assert result.returncode == 0, result.stderr + result.stdout
+    marker = json.loads((root / f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
+    assert marker["status"] == "DRY_RUN"
+    assert marker["evidence_status"] == "DEGRADED"
+    assert marker["required_missing_count"] >= 1
+    expected = f"bot_state/trader_ledger/final30/practice/{DATE}/final30_scored.json"
+    assert any(item["path"] == expected for item in marker["missing_evidence"])
+    assert "REQUIRED_EVIDENCE_MISSING" in result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        assert "DEGRADED" in tf.extractfile("./mail_evidence_report.json").read().decode()
+
 
 
 def test_us_cross_midnight_partition_collects_every_purpose(tmp_path):

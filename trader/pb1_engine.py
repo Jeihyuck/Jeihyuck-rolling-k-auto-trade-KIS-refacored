@@ -2985,6 +2985,7 @@ class PB1Engine:
     def _reset_tick_warning_counts(self) -> None:
         self._tick_warning_counts = Counter()
         self._tick_db_cache = {}
+        self._pending_exit_audit_updates = []
         logger.info("[PB1][TICK][CACHE_RESET] tick_id=%s", getattr(self, "_last_stage", "unknown"))
 
     def _emit_tick_warning_summary(self, *, code: str | None = None) -> None:
@@ -3015,7 +3016,40 @@ class PB1Engine:
             return "SESSION_END_OK_WITH_WARNINGS"
         return "SESSION_END_OK"
 
+    def _queue_exit_audit_update(self, **update: Any) -> None:
+        pending = getattr(self, "_pending_exit_audit_updates", None)
+        if pending is None:
+            pending = self._pending_exit_audit_updates = []
+        pending.append(update)
+
+    def _flush_exit_audit_updates(self) -> None:
+        """Best-effort diagnostics after order work, under the outer watchdog.
+
+        These snapshots never release a claim or establish broker execution.
+        Discard unwritten diagnostics at tick end; never replay stale snapshots
+        into a subsequent tick or reset/extend its shared deadline.
+        """
+        from trader.kis_wrapper import kr_tick_remaining_sec
+        pending = getattr(self, "_pending_exit_audit_updates", [])
+        self._pending_exit_audit_updates = []
+        threshold = max(0.0, float(os.getenv(
+            "PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"
+        )))
+        for update in pending:
+            if kr_tick_remaining_sec() < threshold:
+                logger.info("[POSITIONS][UPDATE][SKIP_NONCRITICAL] reason=low_tick_budget")
+                break
+            try:
+                self.positions_repo.update_position_fields(
+                    env=self.env, strategy=self.STRATEGY_NAME, **update,
+                )
+            except Exception as exc:
+                # The installed hard watchdog raises BaseException, which must
+                # unwind through this handler without any diagnostic retry.
+                logger.warning("[POSITIONS][UPDATE][FAIL_SOFT] code=%s err=%r", update["code"], exc)
+
     def _finalize_run_result(self, *, status: str, notes: str | None) -> RunResult:
+        self._flush_exit_audit_updates()
         self._emit_tick_warning_summary()
         warning_counts = self._warning_counts_dict()
         logger.info(
@@ -13392,45 +13426,14 @@ class PB1Engine:
                 "min_hold=%s action=skip_soft_exit hard_exit_allowed=1",
                 display_code, eval_reason, holding_minutes, min_hold_minutes,
             )
-        # [2026-04-30] last_exit_eval_json은 non-critical: 남은 tick budget이 부족하면 skip
-        _skip_threshold = int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"))
-        from trader.kis_wrapper import kr_tick_remaining_sec
-        _tick_remaining = getattr(self, "_tick_remaining_sec", None)
-        _live_remaining = kr_tick_remaining_sec()
-        if math.isfinite(_live_remaining):
-            _tick_remaining = (
-                max(0.0, _live_remaining) if _tick_remaining is None
-                else min(float(_tick_remaining), max(0.0, _live_remaining))
-            )
-        _should_skip_noncritical = (
-            _tick_remaining is not None and float(_tick_remaining) < _skip_threshold
+        # Diagnostic snapshots must not precede this or another owner's SELL.
+        # Risk fields, durable intent/claim, submit observations and fill writes
+        # below remain synchronous. Keep the payload reference so finalization
+        # persists the actual result rather than the initial SIGNAL_ONLY state.
+        self._queue_exit_audit_update(
+            sid=sid, mode=mode, code=code,
+            fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
         )
-        if _should_skip_noncritical:
-            logger.info(
-                "[POSITIONS][UPDATE][SKIP_NONCRITICAL] code=%s field=last_exit_eval_json reason=low_tick_budget remaining_sec=%.1f",
-                code, float(_tick_remaining or 0),
-            )
-        else:
-            try:
-                # SIGALRM is owned by pb1_runner's shared tick watchdog.
-                # Never install/cancel a nested alarm: that could silently
-                # disarm the actual trading tick timeout. This DB write is
-                # noncritical; broker submission and durable claim come first.
-                # The existing whole-tick watchdog/DB driver timeout apply.
-                self.positions_repo.update_position_fields(
-                    env=self.env,
-                    strategy=self.STRATEGY_NAME,
-                    sid=sid,
-                    mode=mode,
-                    code=code,
-                    fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
-                )
-
-            except Exception as _upd_exc:
-                logger.warning(
-                    "[POSITIONS][UPDATE][FAIL_SOFT] code=%s field=last_exit_eval_json err=%s",
-                    code, repr(_upd_exc),
-                )
 
         logger.info(
             "[EXIT][EVAL] code=%s qty=%s avg=%s last=%s pnl_pct=%.2f stop_loss_hit=%s take_profit_hit=%s trailing_stop_hit=%s close_below_ma20=%s close_below_ma50=%s time_stop_hit=%s signal_hit=%s orderable=%s reason=%s",
