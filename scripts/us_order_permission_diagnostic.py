@@ -59,20 +59,55 @@ def diagnose(session: str, environ: dict[str, str], env_text: str = "") -> dict:
     }
 
 
+def classify_trade_start(environ: dict[str, str], permission: dict) -> dict:
+    """Fail an order-intended TRADE startup *before* a costly tick.
+
+    Dry-run, offline, signal-only and non-trade modes are diagnostics, not
+    unintended trade sessions. This does not grant order permission; every
+    actual broker request still uses the same order_permissions resolver.
+    """
+    mode = str(
+        environ.get("US_RUN_MODE") or environ.get("RUN_MODE")
+        or environ.get("STRATEGY_MODE") or "TRADE"
+    ).strip().upper()
+    def enabled(key: str) -> bool:
+        return str(environ.get(key, "0")).strip().lower() in {"1", "true", "yes", "on"}
+    if (mode not in {"TRADE", "LIVE"} or enabled("DRY_RUN")
+            or enabled("US_SIGNAL_ONLY") or enabled("SIGNAL_ONLY")
+            or enabled("US_OFFLINE")):
+        return {"decision": "OBSERVATION_MODE", "reason": "no_broker_order_expected"}
+    if not permission.get("permission_allowed"):
+        return {
+            "decision": "TRADE_START_BLOCKED",
+            "reason": "order_permission_denied",
+            "permission_reasons": permission.get("permission_reasons") or [],
+        }
+    if str(environ.get("US_KIS_ORDER_ALLOWED", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return {"decision": "TRADE_START_BLOCKED", "reason": "us_kis_order_allowed_disabled"}
+    return {"decision": "TRADE_START_ALLOWED", "reason": "permission_resolver_allowed"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--session", required=True, choices=("am", "afternoon"))
     parser.add_argument("--env-file", default=".env")
+    parser.add_argument("--check-trade-start", action="store_true",
+                        help="exit 42 if a TRADE session cannot submit broker orders")
     args = parser.parse_args()
     path = Path(args.env_file)
     try:
         content = path.read_text(encoding="utf-8") if path.is_file() else ""
     except OSError:
         content = ""
-    print("[US_ORDER_PERMISSION][STARTUP] " + json.dumps(
-        diagnose(args.session, dict(os.environ), content), sort_keys=True,
-    ))
-    return 0
+    env = dict(os.environ)
+    permission = diagnose(args.session, env, content)
+    if args.check_trade_start:
+        permission["startup"] = classify_trade_start(env, permission)
+    print("[US_ORDER_PERMISSION][STARTUP] " + json.dumps(permission, sort_keys=True))
+    return 42 if (
+        args.check_trade_start
+        and permission["startup"]["decision"] == "TRADE_START_BLOCKED"
+    ) else 0
 
 
 if __name__ == "__main__":
