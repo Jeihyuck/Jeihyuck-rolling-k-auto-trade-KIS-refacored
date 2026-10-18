@@ -7082,137 +7082,153 @@ def run_once(
             except Exception as exc:
                 logger.warning("[PREP][MANIFEST][LOAD_FAIL] path=%s err=%s", prep_manifest_path, exc)
         
-        # ✅ ENTRY SCAN: 진입 시그널 스캔 (Phase=entry일 때만)
+        # ENTRY scan uses scanner_context in the KR rescue policy, but it must
+        # never delay a protective SELL for unrelated candidates. Defer the
+        # identical scan until after the exit pass and portfolio-full guard.
         entry_signals_result = {}
         entry_scan_compat_failed = False
-        if (run_ctx.get("phase_name") or phase_override_arg) == "entry" and not close_cancel_only:
-            try:
-                locked_watchlist_members = []
-                if precomputed_final30_df is not None and not precomputed_final30_df.empty:
-                    locked_watchlist_members = [dict(x or {}) for x in precomputed_final30_df.to_dict(orient="records")]
-                elif universe_ctx:
-                    locked_watchlist_members = list(universe_ctx.members or [])
-                watchlist_members = locked_watchlist_members
-                
-                if watchlist_members:
-                    logger.info("[ENTRY_SCAN] start scanning %s symbols", len(watchlist_members))
-                    
-                    # OHLCV Provider 설정
-                    trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
-                    trade_precomputed_only = bool(
-                        (run_ctx.get("phase_name") or phase_override_arg) == "entry"
-                        and trade_use_precomputed_features
-                        and not precomputed_final30_df.empty
-                        and (run_ctx.get("window_name") or window_label or "").strip().lower() in {"day", "intraday", "after"}
-                        and trade_input == "final30"
-                    )
 
-                    def ohlcv_provider_for_entry(
-                        code: str,
-                        days: int,
-                        *,
-                        usage_context: str | None = None,
-                        allow_long_fetch: bool = True,
-                        purpose: str | None = None,
-                    ):
-                        """Entry scan용 OHLCV provider"""
-                        try:
-                            from trader.data.ohlcv_provider import KISOHLCVProvider
-                            provider = KISOHLCVProvider(kis)
-                            result = provider.get_ohlcv(
-                                code,
-                                days,
-                                usage_context=usage_context,
-                                allow_long_fetch=allow_long_fetch,
-                                purpose=purpose,
-                            )
-                            return result.df
-                        except Exception as exc:
-                            logger.debug("[ENTRY_SCAN][OHLCV] code=%s days=%s err=%s", code, days, exc)
-                            return None
+        def _kr_entry_scan_after_exit():
+            nonlocal entry_signals_result, entry_scan_compat_failed
+            scan_started = time.monotonic()
+            logger.info("[ENTRY_SCAN][AFTER_EXIT][START] phase=%s", getattr(engine_runner, "phase", None))
+            if (run_ctx.get("phase_name") or phase_override_arg) == "entry" and not close_cancel_only:
+                try:
+                    locked_watchlist_members = []
+                    if precomputed_final30_df is not None and not precomputed_final30_df.empty:
+                        locked_watchlist_members = [dict(x or {}) for x in precomputed_final30_df.to_dict(orient="records")]
+                    elif universe_ctx:
+                        locked_watchlist_members = list(universe_ctx.members or [])
+                    watchlist_members = locked_watchlist_members
                     
-                    # Entry Scan 실행
-                    entry_signals_result = scan_all_strategies(
-                        watchlist=watchlist_members,
-                        ohlcv_provider=ohlcv_provider_for_entry,
-                        precomputed_final30_df=precomputed_final30_df,
-                        trade_precomputed_only=trade_precomputed_only,
-                        data_metrics=(engine_runner._data_metrics if engine_runner else None),
-                    )
-                    if engine_runner is not None:
-                        setattr(engine_runner, "_scanner_summary", dict(entry_signals_result.get("summary") or {}))
-                        setattr(engine_runner, "_scanner_evaluations", list(entry_signals_result.get("evaluations") or []))
-                    
-                    logger.info(
-                        "[ENTRY_SCAN] completed - breakout=%s pullback=%s momentum=%s unique=%s",
-                        len(entry_signals_result.get("breakout", [])),
-                        len(entry_signals_result.get("pullback", [])),
-                        len(entry_signals_result.get("momentum", [])),
-                        len(entry_signals_result.get("all", [])),
-                    )
-                    
-                    # 시그널 요약 로그
-                    for signal in entry_signals_result.get("all", [])[:5]:  # 상위 5개만 로그
-                        logger.info(
-                            "[ENTRY_SIGNAL] %s %s: strategy=%s strength=%.3f close=%.0f",
-                            signal.code,
-                            signal.name,
-                            signal.strategy,
-                            signal.signal_strength,
-                            signal.close,
+                    if watchlist_members:
+                        logger.info("[ENTRY_SCAN] start scanning %s symbols", len(watchlist_members))
+                        
+                        # OHLCV Provider 설정
+                        trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
+                        trade_precomputed_only = bool(
+                            (run_ctx.get("phase_name") or phase_override_arg) == "entry"
+                            and trade_use_precomputed_features
+                            and not precomputed_final30_df.empty
+                            and (run_ctx.get("window_name") or window_label or "").strip().lower() in {"day", "intraday", "after"}
+                            and trade_input == "final30"
                         )
 
-                    # [2026-05-18] KR rescue: entry scan 결과로 scanner_context 업데이트
-                    # engine 생성 시점에는 precomputed_final30_df 기반 codes만 있었으나
-                    # 실제 entry scan 후에는 전략별 passed_codes / 집계를 반영한다.
-                    if engine_runner is not None:
-                        _all_scan_codes = list({
-                            str(s.code)
-                            for s in entry_signals_result.get("all", [])
-                            if getattr(s, "code", None)
-                        })
-                        _existing_ctx = getattr(engine_runner, "scanner_context", {}) or {}
-                        engine_runner.scanner_context = {
-                            **_existing_ctx,
-                            "scanner_passed_codes": _all_scan_codes or _existing_ctx.get("scanner_passed_codes", []),
-                            "raw_signal_setup_ok": len(entry_signals_result.get("all", [])),
-                            "scanner_passed": len(entry_signals_result.get("all", [])),
-                            "pullback_pass": len(entry_signals_result.get("pullback", [])),
-                            "breakout_pass": len(entry_signals_result.get("breakout", [])),
-                            "momentum_pass": len(entry_signals_result.get("momentum", [])),
-                        }
+                        def ohlcv_provider_for_entry(
+                            code: str,
+                            days: int,
+                            *,
+                            usage_context: str | None = None,
+                            allow_long_fetch: bool = True,
+                            purpose: str | None = None,
+                        ):
+                            """Entry scan용 OHLCV provider"""
+                            try:
+                                from trader.data.ohlcv_provider import KISOHLCVProvider
+                                provider = KISOHLCVProvider(kis)
+                                result = provider.get_ohlcv(
+                                    code,
+                                    days,
+                                    usage_context=usage_context,
+                                    allow_long_fetch=allow_long_fetch,
+                                    purpose=purpose,
+                                )
+                                return result.df
+                            except Exception as exc:
+                                logger.debug("[ENTRY_SCAN][OHLCV] code=%s days=%s err=%s", code, days, exc)
+                                return None
+                        
+                        # Entry Scan 실행
+                        entry_signals_result = scan_all_strategies(
+                            watchlist=watchlist_members,
+                            ohlcv_provider=ohlcv_provider_for_entry,
+                            precomputed_final30_df=precomputed_final30_df,
+                            trade_precomputed_only=trade_precomputed_only,
+                            data_metrics=(engine_runner._data_metrics if engine_runner else None),
+                        )
+                        if engine_runner is not None:
+                            setattr(engine_runner, "_scanner_summary", dict(entry_signals_result.get("summary") or {}))
+                            setattr(engine_runner, "_scanner_evaluations", list(entry_signals_result.get("evaluations") or []))
+                        
                         logger.info(
-                            "[ENTRY_SCAN][DIAGNOSTIC_ONLY] authoritative=0 scanner_passed=%s pullback=%s breakout=%s momentum=%s",
-                            len(_all_scan_codes),
-                            len(entry_signals_result.get("pullback", [])),
+                            "[ENTRY_SCAN] completed - breakout=%s pullback=%s momentum=%s unique=%s",
                             len(entry_signals_result.get("breakout", [])),
+                            len(entry_signals_result.get("pullback", [])),
                             len(entry_signals_result.get("momentum", [])),
+                            len(entry_signals_result.get("all", [])),
                         )
-                else:
-                    logger.error(
-                        "[ENTRY_SCAN][LOCK_MISSING] final30_locked=%s derived_as_of=%s",
-                        int(bool(run_ctx.get("final30_locked"))),
-                        str(run_ctx.get("derived_as_of") or as_of),
+                        
+                        # 시그널 요약 로그
+                        for signal in entry_signals_result.get("all", [])[:5]:  # 상위 5개만 로그
+                            logger.info(
+                                "[ENTRY_SIGNAL] %s %s: strategy=%s strength=%.3f close=%.0f",
+                                signal.code,
+                                signal.name,
+                                signal.strategy,
+                                signal.signal_strength,
+                                signal.close,
+                            )
+
+                        # [2026-05-18] KR rescue: entry scan 결과로 scanner_context 업데이트
+                        # engine 생성 시점에는 precomputed_final30_df 기반 codes만 있었으나
+                        # 실제 entry scan 후에는 전략별 passed_codes / 집계를 반영한다.
+                        if engine_runner is not None:
+                            _all_scan_codes = list({
+                                str(s.code)
+                                for s in entry_signals_result.get("all", [])
+                                if getattr(s, "code", None)
+                            })
+                            _existing_ctx = getattr(engine_runner, "scanner_context", {}) or {}
+                            engine_runner.scanner_context = {
+                                **_existing_ctx,
+                                "scanner_passed_codes": _all_scan_codes or _existing_ctx.get("scanner_passed_codes", []),
+                                "raw_signal_setup_ok": len(entry_signals_result.get("all", [])),
+                                "scanner_passed": len(entry_signals_result.get("all", [])),
+                                "pullback_pass": len(entry_signals_result.get("pullback", [])),
+                                "breakout_pass": len(entry_signals_result.get("breakout", [])),
+                                "momentum_pass": len(entry_signals_result.get("momentum", [])),
+                            }
+                            logger.info(
+                                "[ENTRY_SCAN][DIAGNOSTIC_ONLY] authoritative=0 scanner_passed=%s pullback=%s breakout=%s momentum=%s",
+                                len(_all_scan_codes),
+                                len(entry_signals_result.get("pullback", [])),
+                                len(entry_signals_result.get("breakout", [])),
+                                len(entry_signals_result.get("momentum", [])),
+                            )
+                    else:
+                        logger.error(
+                            "[ENTRY_SCAN][LOCK_MISSING] final30_locked=%s derived_as_of=%s",
+                            int(bool(run_ctx.get("final30_locked"))),
+                            str(run_ctx.get("derived_as_of") or as_of),
+                        )
+                except Exception as exc:
+                    entry_scan_compat_failed = True
+                    logger.warning(
+                        "[ENTRY_SCAN][COMPAT_FAIL] reason=%s fallback=pb1_engine_internal_scan severity=non_fatal",
+                        exc,
+                        exc_info=True,
                     )
-            except Exception as exc:
-                entry_scan_compat_failed = True
-                logger.warning(
-                    "[ENTRY_SCAN][COMPAT_FAIL] reason=%s fallback=pb1_engine_internal_scan severity=non_fatal",
-                    exc,
-                    exc_info=True,
-                )
-        
-        if close_cancel_only:
-            result = engine_runner.run_close_cancel()
-        else:
-            # KR_INFINITE owns 122630 but shares this process/tick budget.
-            # Subscribe before PB1's heavy evaluation so the sleeve reads a hot
-            # WebSocket cache instead of starting REST at the tail of the tick.
+            
+            logger.info("[ENTRY_SCAN][AFTER_EXIT][END] elapsed_sec=%.3f", time.monotonic() - scan_started)
+
+        # Runner-side diagnostics are not allowed to sit ahead of protected
+        # exits. The engine invokes these hooks on the SAME tick/deadline.
+        engine_runner._kr_deferred_entry_scan = _kr_entry_scan_after_exit
+
+        def _kr_after_protective_exit():
+            # KR_INFINITE owns this sleeve. Only schedule price subscription;
+            # do not change strategy owner, signal, sizing or risk policy.
             try:
                 from trader.kr.infinite.runner import prewarm_kr_infinite_price
                 prewarm_kr_infinite_price("122630")
-            except Exception as _inf_prewarm_exc:
-                logger.warning("[KR_INF][PRICE_PREWARM][FAIL_SOFT] err=%s", _inf_prewarm_exc)
+            except Exception as inf_prewarm_exc:
+                logger.warning("[KR_INF][PRICE_PREWARM][FAIL_SOFT] err=%s", inf_prewarm_exc)
+
+        engine_runner._kr_after_protective_exit = _kr_after_protective_exit
+
+        if close_cancel_only:
+            result = engine_runner.run_close_cancel()
+        else:
             engine_started = True
             try:
                 result = engine_runner.run()
