@@ -100,6 +100,7 @@ class KisWebSocketPriceService:
         self._retry_subscriptions: set[tuple[str, str]] = set()
         self._subscription_retry_after: dict[tuple[str, str], float] = {}
         self._subscription_retry_attempts: dict[tuple[str, str], int] = {}
+        self._pending_unsubscribes: set[tuple[str, str]] = set()
 
     def enabled(self) -> bool:
         if os.getenv("PYTEST_CURRENT_TEST") and not _env_flag("KIS_WS_PRICE_TEST_ENABLE", False):
@@ -169,6 +170,43 @@ class KisWebSocketPriceService:
         with self._lock:
             self._desired[("KR", symbol)] = (self.KR_TR_ID, symbol)
         self._ensure_started()
+
+    def prioritize_kr_symbols(
+        self,
+        *,
+        holdings: list[str],
+        unresolved_orders: list[str],
+        final30: list[str],
+    ) -> dict[str, int]:
+        """Reserve scarce WS slots for KR owner-held and open-order symbols.
+
+        Does not change strategy signals or REST fallback. Excess symbols
+        continue through the ordinary freshness-checked REST quote path.
+        """
+        if not self.network_allowed("KR"):
+            return {"priority": 0, "desired": 0, "overflow": 0}
+        ordered: list[str] = []
+        for group in (holdings, unresolved_orders, final30):
+            for raw in group or []:
+                normalized = self._normalize_symbol("KR", raw)
+                if normalized.isdigit() and len(normalized) == 6 and normalized != "000000" and normalized not in ordered:
+                    ordered.append(normalized)
+        with self._lock:
+            old = dict(self._desired)
+            arranged: dict[tuple[str, str], tuple[str, str]] = {
+                ("KR", sym): (self.KR_TR_ID, sym) for sym in ordered
+            }
+            arranged.update({key: value for key, value in old.items() if key not in arranged})
+            self._desired = arranged
+            max_count = max(1, int(float(os.getenv("KIS_WS_MAX_SUBSCRIPTIONS", "40") or 40)))
+            total = len(arranged)
+        self._ensure_started()
+        logger.info(
+            "[KR_WS][OWNER_PRIORITY] holdings=%s unresolved=%s final30=%s priority=%s desired=%s slots=%s overflow=%s",
+            len(holdings or []), len(unresolved_orders or []), len(final30 or []),
+            len(ordered), total, max_count, max(0, total - max_count),
+        )
+        return {"priority": len(ordered), "desired": total, "overflow": max(0, total - max_count)}
 
     def subscribe_us(self, symbol: str, exchange: str) -> bool:
         if not self.network_allowed("US"):
@@ -432,6 +470,8 @@ class KisWebSocketPriceService:
                     sent: set[tuple[str, str]] = set()
                     backoff = 1.0
                     last_subscribe_at = 0.0
+                    pending_unsubscribe = None
+                    unsubscribe_started = 0.0
                     while not self._stop.is_set():
                         with self._lock:
                             desired = dict(self._desired)
@@ -452,18 +492,64 @@ class KisWebSocketPriceService:
                                 len(desired), max_subscriptions,
                             )
 
+                        # Rebalance already-sent KR subscriptions when owner
+                        # priorities change after the connection started. An
+                        # unsent/out-of-cap symbol must not occupy a slot at the
+                        # expense of an active held position. KIS unsubscribe is
+                        # tr_type=2; never increase the configured slot limit.
+                        # Already active US slots remain owned by US. KR may
+                        # rebalance only the remaining capacity on this socket.
+                        other_sent = [key for key in sent if key[0] != "KR"]
+                        target_keys = set(other_sent + [
+                            key for key in desired if key not in other_sent
+                        ][:max(0, max_subscriptions - len(other_sent))])
+                        if pending_unsubscribe is not None:
+                            old_key, subscription = pending_unsubscribe
+                            with self._lock:
+                                waiting = subscription in self._pending_unsubscribes
+                            if not waiting:
+                                sent.discard(old_key)
+                                pending_unsubscribe = None
+                            elif time.monotonic() - unsubscribe_started >= _env_float("KIS_WS_UNSUBSCRIBE_ACK_TIMEOUT_SEC", 3.0):
+                                # A send is not a broker ACK. Reconnect to drop
+                                # the old socket's slots before any replacement.
+                                raise RuntimeError("KR_WS_UNSUBSCRIBE_ACK_TIMEOUT")
+                        stale_kr = [
+                            key for key in sent
+                            if key[0] == "KR" and key not in target_keys
+                        ]
+                        if stale_kr and pending_unsubscribe is None and (time.monotonic() - last_subscribe_at >= _env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5)):
+                            old_key = stale_kr[0]
+                            tr_id, tr_key = desired.get(old_key, (self.KR_TR_ID, old_key[1]))
+                            subscription = (tr_id, tr_key)
+                            with self._lock:
+                                if subscription not in self._broker_subscriptions_acked:
+                                    raise RuntimeError("KR_WS_REBALANCE_UNACKED_SUBSCRIPTION")
+                                self._pending_unsubscribes.add(subscription)
+                            pending_unsubscribe = (old_key, subscription)
+                            unsubscribe_started = time.monotonic()
+                            await ws.send(json.dumps({
+                                "header": {
+                                    "approval_key": approval, "custtype": "P",
+                                    "tr_type": "2", "content-type": "utf-8",
+                                },
+                                "body": {"input": {"tr_id": tr_id, "tr_key": tr_key}},
+                            }, ensure_ascii=False))
+                            last_subscribe_at = time.monotonic()
+                            logger.info("[KR_WS][REBALANCE_UNSUBSCRIBE] symbol=%s action=WAIT_BROKER_ACK", tr_key)
+
                         # Interleave subscribe and receive work. A rejected
                         # symbol is held behind its own retry deadline so it
                         # cannot starve later Final30/US subscriptions.
                         subscribe_interval = _env_float("KIS_WS_SUBSCRIBE_INTERVAL_SEC", 0.5)
                         now_mono = time.monotonic()
                         pending_item = self._next_pending_subscription(
-                            desired,
+                            {key: value for key, value in desired.items() if key in target_keys},
                             sent,
                             max_subscriptions=max_subscriptions,
                             now_mono=now_mono,
                         )
-                        if pending_item and (now_mono - last_subscribe_at >= subscribe_interval):
+                        if pending_item and pending_unsubscribe is None and len(sent) < max_subscriptions and (now_mono - last_subscribe_at >= subscribe_interval):
                             logical_key, subscription = pending_item
                             tr_id, tr_key = subscription
                             payload = {
@@ -498,6 +584,7 @@ class KisWebSocketPriceService:
                 with self._lock:
                     self._quotes.clear()
                     self._broker_subscriptions_acked.clear()
+                    self._pending_unsubscribes.clear()
                     self._approval_obtained = False
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning("[KIS_WS][DISCONNECTED] err=%s retry_sec=%.1f", self._last_error, backoff)
@@ -516,6 +603,19 @@ class KisWebSocketPriceService:
             except Exception:
                 return
             tr_id = str((payload.get("header") or {}).get("tr_id") or "")
+            tr_key = str((payload.get("header") or {}).get("tr_key") or "")
+            subscription = (tr_id, tr_key)
+            with self._lock:
+                unsubscribe_pending = subscription in self._pending_unsubscribes
+            if unsubscribe_pending:
+                if str((payload.get("body") or {}).get("rt_cd")) != "0":
+                    raise RuntimeError("KR_WS_UNSUBSCRIBE_REJECTED")
+                with self._lock:
+                    self._pending_unsubscribes.discard(subscription)
+                    self._broker_subscriptions_acked.discard(subscription)
+                    self._quotes.pop(("KR", self._normalize_symbol("KR", tr_key)), None)
+                self._clear_subscription_retry(subscription)
+                return
             if tr_id == "PINGPONG":
                 try:
                     await ws.pong(text.encode("utf-8"))

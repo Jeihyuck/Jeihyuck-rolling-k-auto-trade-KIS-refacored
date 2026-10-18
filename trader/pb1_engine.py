@@ -17279,6 +17279,36 @@ class PB1Engine:
             (holdings_meta or {}).get("source"),
         )
         self._exit_holdings_meta = holdings_meta
+        # Priority enrollment is nonblocking and does not change any owner
+        # decision. Keep all non-subscribed symbols eligible for governed REST
+        # fallback rather than treating WebSocket overflow as no market data.
+        try:
+            from trader.marketdata.kis_ws_price import get_kis_ws_price_service
+            _hold_codes = [
+                str(getattr(holding, "code", "") or "").zfill(6)
+                for holding in (holdings_for_exit or [])
+                if str(getattr(holding, "code", "") or "").zfill(6) != "122630"
+            ]
+            _orders = self._tick_db_cache.get("open_orders", [])
+            _order_codes = [
+                str((row or {}).get("code") or "").zfill(6)
+                for row in (_orders if isinstance(_orders, list) else [])
+                if isinstance(row, dict) and (row.get("code") or "")
+            ]
+            _final_codes = (
+                [str(code).zfill(6) for code in self.final30_df["code"].tolist()]
+                if isinstance(self.final30_df, pd.DataFrame) and "code" in self.final30_df
+                else []
+            )
+            get_kis_ws_price_service().prioritize_kr_symbols(
+                holdings=_hold_codes, unresolved_orders=_order_codes,
+                final30=_final_codes,
+            )
+        except Exception as _ws_priority_exc:
+            logger.warning(
+                "[KR_WS][OWNER_PRIORITY][FAIL_SOFT] type=%s action=KEEP_REST_FALLBACK",
+                type(_ws_priority_exc).__name__,
+            )
         positions_for_exit = [holding.to_position_dict() for holding in holdings_for_exit]
         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
         existing_positions_count = len(existing_positions)
@@ -17449,8 +17479,7 @@ class PB1Engine:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
         
-        # Price-subscription prewarm for a separate strategy must not block
-        # PB1 exits or consume the time available to submit protective SELLs.
+        # KR_INFINITE subscription belongs after PB1's protective exit work.
         _after_exit = getattr(self, "_kr_after_protective_exit", None)
         if callable(_after_exit):
             _after_exit()
@@ -17554,8 +17583,7 @@ class PB1Engine:
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status="OK_NO_TRADE", notes="PORTFOLIO_FULL")
 
-        # The scanner may feed KR rescue/relax bridge decisions: preserve
-        # its results and original failure handling, but run ONLY after SELL.
+        # Scanner/rescue data is needed only for entry, never before SELL.
         _deferred_entry_scan = getattr(self, "_kr_deferred_entry_scan", None)
         if callable(_deferred_entry_scan) and self.phase == "entry":
             _deferred_entry_scan()
