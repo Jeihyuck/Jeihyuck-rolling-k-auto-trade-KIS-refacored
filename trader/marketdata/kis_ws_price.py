@@ -129,9 +129,16 @@ class KisWebSocketPriceService:
         if http_policy == "AUTO":
             strategy_mode = str(os.getenv("STRATEGY_MODE") or "").strip().upper()
             if market_u == "US":
-                # US INTENT_ONLY workflows still use live market data while
-                # keeping broker order submission disabled by separate guards.
-                return strategy_mode in {"LIVE", "INTENT_ONLY"} or force_http
+                # The independently spawned collector is a *read-only* market
+                # data worker, not a trading strategy. It has no order client
+                # and must not require STRATEGY_MODE=LIVE to subscribe under
+                # HTTP=AUTO. Explicit offline/HTTP=OFF/diagnostic-stop policy
+                # above still denies all network access.
+                collector_read_only = (
+                    str(os.getenv("US_WS_COLLECTOR_ROLE") or "") == "READ_ONLY"
+                    and _env_flag("US_WS_COLLECTOR_ENABLED", False)
+                )
+                return collector_read_only or strategy_mode in {"LIVE", "INTENT_ONLY"} or force_http
             return strategy_mode == "LIVE" or force_http
         return True
 
@@ -161,16 +168,17 @@ class KisWebSocketPriceService:
             self._desired[("KR", symbol)] = (self.KR_TR_ID, symbol)
         self._ensure_started()
 
-    def subscribe_us(self, symbol: str, exchange: str) -> None:
+    def subscribe_us(self, symbol: str, exchange: str) -> bool:
         if not self.network_allowed("US"):
-            return
+            return False
         symbol = self._normalize_symbol("US", symbol)
         if not symbol:
-            return
+            return False
         key = self.us_subscription_key(symbol, exchange)
         with self._lock:
             self._desired[("US", symbol)] = (self.US_TR_ID, key)
         self._ensure_started()
+        return True
 
     def get_fresh_quote(self, market: str, symbol: str, *, max_age_sec: float) -> dict[str, Any] | None:
         if not self.network_allowed(market):
@@ -236,11 +244,20 @@ class KisWebSocketPriceService:
         with self._lock:
             desired = len(self._desired)
             quotes = len(self._quotes)
+            latest_received_at = max(
+                (float(q.received_at) for q in self._quotes.values()), default=0.0
+            )
+        connected = self._connected.is_set()
         return {
             "enabled": self.enabled(),
-            "connected": self._connected.is_set(),
-            "subscriptions": desired,
+            "connected": connected,
+            "subscriptions": desired,  # requested, not broker-ACKed subscriptions
             "quotes": quotes,
+            "quotes_received": quotes > 0,
+            "last_received_age_sec": (
+                max(0.0, time.time() - latest_received_at)
+                if latest_received_at > 0 else None
+            ),
             "connections": self._connection_count,
             "reconnects": self._reconnect_count,
             "last_error": self._last_error,
@@ -467,6 +484,10 @@ class KisWebSocketPriceService:
                         await self._handle_message(ws, message)
             except Exception as exc:
                 self._connected.clear()
+                # Quotes from a dead WS generation are not trusted after
+                # disconnect/reconnect, even if still inside the age TTL.
+                with self._lock:
+                    self._quotes.clear()
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning("[KIS_WS][DISCONNECTED] err=%s retry_sec=%.1f", self._last_error, backoff)
                 await asyncio.sleep(backoff)
