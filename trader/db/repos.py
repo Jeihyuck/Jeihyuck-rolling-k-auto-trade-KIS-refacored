@@ -2307,6 +2307,8 @@ class UniverseRepo:
                 self._schema.universe_runs.c.as_of,
                 self._schema.universe_runs.c.provider,
                 self._schema.universe_runs.c.status,
+                self._schema.universe_runs.c.actual_as_of,
+                self._schema.universe_runs.c.build_reason,
             )
             .where(
                 self._schema.universe_runs.c.strategy == strategy_key,
@@ -2330,6 +2332,8 @@ class UniverseRepo:
                     "as_of": row["as_of"],
                     "provider": row["provider"],
                     "status": row["status"],
+                    "actual_as_of": str(row["actual_as_of"]) if row["actual_as_of"] else None,
+                    "build_reason": row["build_reason"],
                     "members_count": len(members),
                     "members": members,
                 }
@@ -2412,7 +2416,7 @@ class UniverseRepo:
         Get universe members for given (env, strategy, as_of_date).
         
         CRITICAL: env is account_env (practice/paper/real), NOT exec_mode.
-        Uses (strategy_key, as_of) tuple only - NO run_id filtering.
+        Only committed SUCCESS runs qualify for exact-asof and fallback reads.
         """
         strategy_key = self._strategy_key(env, strategy)
         as_of_d = _as_date(as_of_date)
@@ -2422,6 +2426,7 @@ class UniverseRepo:
                 and_(
                     self._schema.universe_runs.c.strategy == strategy_key,
                     self._schema.universe_runs.c.as_of == as_of_d,
+                    self._schema.universe_runs.c.status == "SUCCESS",
                 )
             )
             .order_by(self._schema.universe_runs.c.created_ts.desc())
@@ -2445,6 +2450,7 @@ class UniverseRepo:
             fallback_stmt = (
                 select(self._schema.universe_runs.c.as_of, self._schema.universe_runs.c.run_id)
                 .where(self._schema.universe_runs.c.strategy == strategy_key)
+                .where(self._schema.universe_runs.c.status == "SUCCESS")
                 .order_by(self._schema.universe_runs.c.as_of.desc())
             )
             with self.engine.begin() as conn:
@@ -2485,6 +2491,7 @@ class UniverseRepo:
                     and_(
                         self._schema.universe_runs.c.strategy == strategy_key,
                         self._schema.universe_runs.c.as_of < as_of_d,
+                        self._schema.universe_runs.c.status == "SUCCESS",
                     )
                 )
                 .order_by(self._schema.universe_runs.c.as_of.desc())

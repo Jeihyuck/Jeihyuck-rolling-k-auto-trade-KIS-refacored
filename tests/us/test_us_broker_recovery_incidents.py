@@ -376,7 +376,7 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
             "symbol": "REPLAY_TEST",
             "exchange": "NASDAQ",
             "side": "SELL",
-            "qty": 1,
+            "qty": 1, "session": "am",
             "limit_price": 10,
             "submitted_at_utc": "2026-10-01T14:00:00+00:00",
             "strategy_owner": "US_STANDARD",
@@ -418,6 +418,11 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
             self.balance_calls += 1
             return {"positions": []}
 
+        def get_order_lookup_provenance(self, trade_date):
+            return {"verified": True, "source": "kis_authenticated_order_book",
+                    "query_trade_date": trade_date, "market": "US",
+                    "account_id": "active-replay-account", "session": "am"}
+
         def get_today_orders(self, trade_date):
             self.order_calls += 1
             return [{
@@ -456,8 +461,12 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
         active_claims_only=True,
     )
 
-    assert first["broker_unfilled_ack_count"] == second["broker_unfilled_ack_count"] == 1
-    assert provider.fill_calls == ["broker-unresolved-attempt"] * 2
+    assert first["broker_unfilled_ack_count"] == 1, first
+    assert second["broker_unfilled_ack_count"] == 1, second
+    # The exact OPEN row is already in each fresh same-invocation KIS
+    # order book; do not repeat an entire CCNL REST request through the
+    # per-order helper. Each replay still refetches broker truth.
+    assert provider.fill_calls == []
     assert provider.order_calls == provider.balance_calls == 2
     assert claim_repo.get(active_identity).active_attempt_id == "unresolved-attempt"
     claim_repo.record_observation(
@@ -470,7 +479,7 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
     )
     assert completed_replay["events_scanned"] == 0
     assert completed_replay["balance_fetched"] is False
-    assert provider.fill_calls == ["broker-unresolved-attempt"] * 2
+    assert provider.fill_calls == []
     engine.dispose()
 
 

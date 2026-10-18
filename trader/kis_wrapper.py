@@ -940,7 +940,11 @@ class _PriceCache:
                 ev.set()
 
     def wait_inflight(self, key: Tuple[str, str], ev: threading.Event, timeout: float = 5.0) -> dict:
-        ok = ev.wait(timeout=timeout)
+        remaining = kr_tick_remaining_sec()
+        wait_budget = min(float(timeout), max(0.0, remaining - 0.05))
+        if wait_budget <= 0:
+            return {}
+        ok = ev.wait(timeout=wait_budget)
         with self.lock:
             return self.inflight_result.pop(key, {}) if ok else {}
 
@@ -3317,9 +3321,11 @@ class KisAPI:
             if sleep_s > 0:
                 _price_cache.record_retry_wait()
                 logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
-                time.sleep(sleep_s)
+                if not _kr_sleep_with_budget(sleep_s):
+                    return {}
             if _PRICE_JITTER_MAX_SEC > 0:
-                time.sleep(random.uniform(0.0, _PRICE_JITTER_MAX_SEC))
+                if not _kr_sleep_with_budget(random.uniform(0.0, _PRICE_JITTER_MAX_SEC)):
+                    return {}
 
             # 5) 기존 get_price_quote 호출
             data = self.get_price_quote(code, diag_mode=False, attempts=2)

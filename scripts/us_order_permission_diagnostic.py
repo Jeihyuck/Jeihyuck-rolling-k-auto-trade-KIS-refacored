@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Read-only, sanitized US order-permission diagnosis.
+
+No KIS/DB I/O. A matching .env assignment is only a *candidate* source:
+the process could inherit the same value. Never print arbitrary env values.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from pathlib import Path
+
+from trader.us.execution.order_permissions import resolve_us_order_permissions
+
+_FLAG_KEYS = (
+    "DRY_RUN", "DISABLE_LIVE_TRADING", "DISABLE_REAL_TRADING",
+    "LIVE_TRADING_ENABLED", "US_LIVE_TRADING_ENABLED", "US_ORDER_ARMED",
+    "SIGNAL_ONLY", "US_AGENT_ENABLED", "US_PAPER_TRADING_ENABLED",
+)
+_SAFE_ENUMS = ("KIS_ENV", "STRATEGY_ENV", "RUN_MODE", "STRATEGY_MODE", "US_RUN_MODE")
+
+
+def diagnose(session: str, environ: dict[str, str], env_text: str = "") -> dict:
+    strategy_env = str(environ.get("STRATEGY_ENV", "practice")).lower()
+    mode = environ.get("US_RUN_MODE") or environ.get("RUN_MODE") or environ.get("STRATEGY_MODE") or "TRADE"
+    effective_env = dict(environ)
+    if str(environ.get("US_SIGNAL_ONLY", "")).strip() == "1":
+        effective_env["SIGNAL_ONLY"] = "1"
+    p = resolve_us_order_permissions(session, strategy_env, mode, effective_env)
+    declared = set(re.findall(
+        r"(?m)^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=",
+        env_text,
+    ))
+    # Restricted to safe enum and boolean keys; secrets/account/token impossible.
+    flags = {key: ("UNSET" if key not in environ
+                   else "1" if str(environ[key]).strip().lower() in {"1", "true", "yes", "on"}
+                   else "0" if str(environ[key]).strip().lower() in {"0", "false", "no", "off", ""}
+                   else "INVALID_BOOLEAN")
+             for key in _FLAG_KEYS}
+    return {
+        "session": session,
+        "permission_allowed": p.allowed,
+        "permission_reasons": p.reasons,
+        "effective_safe_flags": flags,
+        "effective_safe_modes": {
+            key: (str(environ.get(key, "UNSET")).upper()
+                  if str(environ.get(key, "UNSET")).upper() in {
+                      "UNSET", "PRACTICE", "PAPER", "LIVE", "TRADE",
+                      "SIGNAL_ONLY", "PREP", "DRY_RUN",
+                  } else "OTHER_OR_INVALID")
+            for key in _SAFE_ENUMS
+        },
+        "env_file_declares_flags": sorted(k for k in _FLAG_KEYS if k in declared),
+        "origin_verified": False,
+        "origin_caveat": "effective values may originate from parent, deployment preflight, .env, or wrapper defaults",
+        "no_secrets_logged": True,
+    }
+
+
+def classify_trade_start(environ: dict[str, str], permission: dict) -> dict:
+    """Fail an order-intended TRADE startup *before* a costly tick.
+
+    Dry-run, offline, signal-only and non-trade modes are diagnostics, not
+    unintended trade sessions. This does not grant order permission; every
+    actual broker request still uses the same order_permissions resolver.
+    """
+    mode = str(
+        environ.get("US_RUN_MODE") or environ.get("RUN_MODE")
+        or environ.get("STRATEGY_MODE") or "TRADE"
+    ).strip().upper()
+    def enabled(key: str) -> bool:
+        return str(environ.get(key, "0")).strip().lower() in {"1", "true", "yes", "on"}
+    if (mode not in {"TRADE", "LIVE"} or enabled("DRY_RUN")
+            or enabled("US_SIGNAL_ONLY") or enabled("SIGNAL_ONLY")
+            or enabled("US_OFFLINE")):
+        return {"decision": "OBSERVATION_MODE", "reason": "no_broker_order_expected"}
+    if not permission.get("permission_allowed"):
+        return {
+            "decision": "TRADE_START_BLOCKED",
+            "reason": "order_permission_denied",
+            "permission_reasons": permission.get("permission_reasons") or [],
+        }
+    if str(environ.get("US_KIS_ORDER_ALLOWED", "1")).strip().lower() in {"0", "false", "no", "off"}:
+        return {"decision": "TRADE_START_BLOCKED", "reason": "us_kis_order_allowed_disabled"}
+    return {"decision": "TRADE_START_ALLOWED", "reason": "permission_resolver_allowed"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--session", required=True, choices=("am", "afternoon"))
+    parser.add_argument("--env-file", default=".env")
+    parser.add_argument("--check-trade-start", action="store_true",
+                        help="exit 42 if a TRADE session cannot submit broker orders")
+    args = parser.parse_args()
+    path = Path(args.env_file)
+    try:
+        content = path.read_text(encoding="utf-8") if path.is_file() else ""
+    except OSError:
+        content = ""
+    env = dict(os.environ)
+    permission = diagnose(args.session, env, content)
+    if args.check_trade_start:
+        permission["startup"] = classify_trade_start(env, permission)
+    print("[US_ORDER_PERMISSION][STARTUP] " + json.dumps(permission, sort_keys=True))
+    return 42 if (
+        args.check_trade_start
+        and permission["startup"]["decision"] == "TRADE_START_BLOCKED"
+    ) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

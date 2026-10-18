@@ -3,11 +3,228 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def _replay_account_identity(value: object, lookup_context: dict | None) -> str:
+    """One canonical comparison for KIS raw CANO and durable account hash.
+
+    Only an authenticated, account-and-product-scoped KIS query may bind
+    CANO to an internal hash. Unproven raw IDs are never guessed into hashes.
+    """
+    ctx = lookup_context or {}
+    raw = str(value or "").strip().upper()
+    cano = str(ctx.get("broker_account_no") or "").strip().upper()
+    digest = str(ctx.get("account_id") or "").strip().upper()
+    if (raw and cano and digest and raw == cano
+            and ctx.get("verified") is True
+            and ctx.get("source") == "kis_authenticated_order_book"
+            and ctx.get("account_product_code")
+            and ctx.get("env")):
+        return digest
+    return raw
+
+
+def _replay_order_row_matches(row: dict, *, order_no: str, symbol: str, side: str,
+                              requested_qty: int, source_trade_date: str,
+                              journal_event: dict, lookup_context: dict | None = None) -> bool:
+    """Use a memoized KIS order only when its complete available identity agrees.
+
+    Rows lacking original requested quantity are NOT suitable for fast-path
+    reconstruction; the caller falls back to an independent broker lookup.
+    A KST broker date may be one day after its US trade date.
+    """
+    from trader.us.utils.order_no import normalize_us_order_no
+
+    if not isinstance(row, dict) or requested_qty <= 0:
+        return False
+    if (normalize_us_order_no(row.get("order_no") or row.get("raw_order_no") or "")
+            != normalize_us_order_no(order_no)
+            or str(row.get("symbol") or "").upper() != symbol
+            or str(row.get("side") or "").upper() != side):
+        return False
+    if (str(row.get("normalization_result") or "").lower() == "quarantined"
+            or row.get("filled_qty_present") is False
+            or row.get("requested_qty_present") is False):
+        return False
+
+    def integral(value):
+        try:
+            number = float(value)
+            return int(number) if number.is_integer() and 0 <= number < float("inf") else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    original_qty = next((row.get(k) for k in (
+        "requested_qty", "qty_requested", "ord_qty", "ft_ord_qty"
+    ) if row.get(k) not in (None, "")), None)
+    if integral(original_qty) != requested_qty:
+        return False
+    filled = integral(row.get("filled_qty"))
+    if filled is None or filled > requested_qty:
+        return False
+    remaining_raw = next((row.get(k) for k in ("broker_open_qty", "remaining_qty")
+                          if row.get(k) not in (None, "")), None)
+    if remaining_raw is not None:
+        remaining = integral(remaining_raw)
+        if remaining is None or filled + remaining > requested_qty:
+            return False
+
+    metadata = journal_event.get("meta") if isinstance(journal_event.get("meta"), dict) else {}
+    ctx = lookup_context or {}
+    scoped = (ctx.get("verified") is True
+              and ctx.get("source") == "kis_authenticated_order_book"
+              and str(ctx.get("query_trade_date") or "").replace("-", "")
+                  == str(source_trade_date).replace("-", "")
+              and str(ctx.get("market") or "").upper() == "US"
+              and bool(ctx.get("account_id")))
+    def recorded(key):
+        return journal_event.get(key) or metadata.get(key)
+
+    # In normalized KIS rows NASD/NASDAQ refer to the same exchange. Account,
+    # market and owner fields can be provider-scoped rather than row-scoped;
+    # whenever both sides carry one, a disagreement disqualifies reuse.
+    def exchange_name(value):
+        return {"NASD": "NASDAQ", "NAS": "NASDAQ", "NYSE": "NYSE",
+                "AMEX": "AMEX", "AMS": "AMEX"}.get(str(value or "").upper(),
+                                                str(value or "").upper())
+    # KIS proves account + market + source day via the authenticated query.
+    # It does NOT know the original local session/generation/epoch/owner.
+    # Those identities belong to the immutable submit/ACK journal, NEVER
+    # to the current tick's lookup context or a synthesized ORDER_OPEN row.
+    def canonical_account(value):
+        return _replay_account_identity(value, ctx if scoped else None)
+
+    for field in ("exchange", "market", "account_id", "account_key", "cano"):
+        local = recorded(field)
+        actual = row.get(field)
+        if actual in (None, "") and field == "market":
+            if not scoped:
+                return False
+            actual = ctx["market"]
+        elif actual in (None, "") and field == "account_id" and scoped:
+            actual = ctx["account_id"]
+        if actual in (None, ""):
+            continue
+        if local not in (None, ""):
+            if field == "exchange":
+                if exchange_name(local) != exchange_name(actual):
+                    return False
+            elif field in {"account_id", "account_key", "cano"}:
+                if canonical_account(local) != canonical_account(actual):
+                    return False
+            elif str(local).upper() != str(actual).upper():
+                return False
+        if field in {"account_id", "account_key", "cano"} and scoped:
+            if canonical_account(actual) != canonical_account(ctx["account_id"]):
+                return False
+
+    for field in ("session", "session_run_id", "session_generation",
+                  "trading_epoch_id", "strategy_owner"):
+        explicit_broker_value = row.get(field)
+        immutable = recorded(field)
+        if explicit_broker_value not in (None, ""):
+            if immutable in (None, "") or str(immutable).upper() != str(explicit_broker_value).upper():
+                return False
+        # Missing KIS-internal metadata does not imply the CURRENT lookup
+        # tick had the same session or epoch as the ORIGINAL submission.
+    if row.get("trade_date") in (None, "") and not scoped:
+        return False
+    if (row.get("account_id") in (None, "") and row.get("cano") in (None, "")
+            and not scoped):
+        return False
+
+    expected_date = str(source_trade_date).replace("-", "")
+    explicit_us_date = row.get("us_trade_date") or row.get("original_us_trade_date")
+    if explicit_us_date and str(explicit_us_date).replace("-", "") != expected_date:
+        return False
+    broker_date = row.get("trade_date")
+    if broker_date:
+        date_str = str(broker_date).replace("-", "")
+        try:
+            et_date = datetime.strptime(expected_date, "%Y%m%d")
+            valid_source_dates = {
+                expected_date, (et_date + timedelta(days=1)).strftime("%Y%m%d"),
+            }
+            if date_str not in valid_source_dates:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+
+def _replay_detail_identity_conflicts(row: dict, *, order_no: str, symbol: str,
+                                      side: str, requested_qty: int,
+                                      source_trade_date: str, journal_event: dict,
+                                      lookup_context: dict | None) -> bool:
+    """Reject any explicit broker detail contradicting journal or scoped lookup."""
+    from trader.us.utils.order_no import normalize_us_order_no
+    if not isinstance(row, dict):
+        return True
+    metadata = journal_event.get("meta") if isinstance(journal_event.get("meta"), dict) else {}
+    context = lookup_context or {}
+    for key, target in (("order_no", normalize_us_order_no(order_no)),
+                        ("raw_order_no", normalize_us_order_no(order_no))):
+        value = row.get(key)
+        if value and normalize_us_order_no(value) != target:
+            return True
+    if (row.get("symbol") and str(row["symbol"]).upper() != symbol
+            or row.get("side") and str(row["side"]).upper() != side):
+        return True
+    for key in ("requested_qty", "qty_requested", "ord_qty", "ft_ord_qty"):
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                if float(value) != requested_qty:
+                    return True
+            except (TypeError, ValueError):
+                return True
+            break
+    for key in ("account_id", "account_key", "cano", "market", "session",
+                "session_run_id", "session_generation", "trading_epoch_id",
+                "strategy_owner", "exchange"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        expected = journal_event.get(key) or metadata.get(key)
+        if expected in (None, ""):
+            expected = context.get("account_id" if key in {"account_id", "account_key", "cano"} else key)
+        if expected not in (None, ""):
+            lhs, rhs = str(value).upper(), str(expected).upper()
+            if key in {"account_id", "account_key", "cano"}:
+                lhs = _replay_account_identity(value, context)
+                rhs = _replay_account_identity(expected, context)
+                if context.get("verified") is True and context.get("account_id"):
+                    scope_account = _replay_account_identity(context["account_id"], context)
+                    if lhs != scope_account:
+                        return True
+            if key == "exchange":
+                aliases = {"NASD": "NASDAQ", "NAS": "NASDAQ", "AMS": "AMEX"}
+                lhs, rhs = aliases.get(lhs, lhs), aliases.get(rhs, rhs)
+            if lhs != rhs:
+                return True
+    us_date = row.get("us_trade_date") or row.get("original_us_trade_date")
+    if us_date and str(us_date).replace("-", "") != str(source_trade_date).replace("-", ""):
+        return True
+    broker_date = row.get("trade_date")
+    if broker_date:
+        try:
+            base = datetime.strptime(str(source_trade_date).replace("-", ""), "%Y%m%d")
+            valid_dates = {base.strftime("%Y%m%d"),
+                           (base + timedelta(days=1)).strftime("%Y%m%d")}
+            if str(broker_date).replace("-", "") not in valid_dates:
+                return True
+        except ValueError:
+            return True
+    return False
 
 
 def journal_path(trade_date: str) -> Path:
@@ -46,6 +263,54 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
             "expected_realized_pnl",
         )
     }
+    # Persist a small, typed proof envelope in JSONL and in DB JSONB.
+    # A SHA of the raw broker response by itself is NOT reconciliation proof.
+    # Never store the raw CANO, KIS tokens or the unsanitized broker row.
+    is_multi_broker_proof = event_type == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
+    observation = raw_response if isinstance(raw_response, dict) else {}
+    proof_scope = observation.get("broker_lookup_scope")
+    proof_scope = proof_scope if isinstance(proof_scope, dict) else {}
+    broker_proof = None
+    if is_multi_broker_proof:
+        if not (proof_scope.get("verified") is True
+                and proof_scope.get("provider_source") == "kis_authenticated_order_book"
+                and proof_scope.get("market") == "US"
+                and proof_scope.get("account_id")
+                and proof_scope.get("source_trade_date")):
+            raise ValueError("MULTI_BROKER_EVIDENCE_SCOPE_UNVERIFIED")
+        broker_proof = {
+            "requested_qty": observation.get("broker_requested_qty"),
+            "cumulative_filled_qty": observation.get("cumulative_filled_qty"),
+            "remaining_qty": observation.get("broker_remaining_qty"),
+            "avg_price": observation.get("broker_avg_price"),
+            "observed_at": observation.get("broker_observed_at") or datetime.now(timezone.utc).isoformat(),
+            "lookup_scope": {
+                key: proof_scope.get(key) for key in (
+                    "source_trade_date", "market", "provider_source",
+                    "verified", "account_id", "account_product_code", "env"
+                )
+            },
+        }
+        for field in ("requested_qty", "cumulative_filled_qty", "remaining_qty"):
+            value = broker_proof[field]
+            if value is not None:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"MULTI_BROKER_EVIDENCE_INVALID_{field}")
+                if not numeric.is_integer() or not 0 <= numeric < float("inf"):
+                    raise ValueError(f"MULTI_BROKER_EVIDENCE_INVALID_{field}")
+                broker_proof[field] = int(numeric)
+        price = broker_proof["avg_price"]
+        if price not in (None, ""):
+            try:
+                price = float(price)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("MULTI_BROKER_EVIDENCE_INVALID_PRICE")
+            if not 0 <= price < float("inf"):
+                raise ValueError("MULTI_BROKER_EVIDENCE_INVALID_PRICE")
+            broker_proof["avg_price"] = price
+
     event = {
         "event_id": str(uuid.uuid4()), "event_type": event_type, "trade_date": td,
         "session": intent.get("session") or getattr(context, "session", ""),
@@ -79,10 +344,31 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "fees": (raw_response or {}).get("fees") if isinstance(raw_response, dict) else None,
         "timestamp": datetime.now(timezone.utc).isoformat(), "raw_response_hash": hashlib.sha256(raw.encode()).hexdigest(),
     }
+    if broker_proof is not None:
+        event["broker_evidence"] = broker_proof
+        event["cumulative_filled_qty"] = broker_proof["cumulative_filled_qty"]
+        event["broker_remaining_qty"] = broker_proof["remaining_qty"]
+        event["broker_avg_price"] = broker_proof["avg_price"]
+        event["broker_observed_at"] = broker_proof["observed_at"]
     idem_material = "|".join(str(v or "") for v in (
         td, event.get("submit_attempt_id"), canonical_no, event_type,
         event.get("cumulative_filled_qty"), event.get("broker_execution_id"),
         event.get("raw_response_hash")))
+    if broker_proof is not None:
+        # Observations at different retrieval times with identical cumulative
+        # truth must not create new DB fill events or bypass the claim fence.
+        stable_proof = {
+            "trade_date": td, "attempt": event["submit_attempt_id"],
+            "client_order_key": event["client_order_key"],
+            "order_no": canonical_no, "event_type": event_type,
+            "status": str(broker_status or "").upper(),
+            "requested_qty": broker_proof["requested_qty"],
+            "filled_qty": broker_proof["cumulative_filled_qty"],
+            "remaining_qty": broker_proof["remaining_qty"],
+            "avg_price": broker_proof["avg_price"],
+            "lookup_scope": broker_proof["lookup_scope"],
+        }
+        idem_material = json.dumps(stable_proof, sort_keys=True, default=str)
     event["idempotency_key"] = hashlib.sha256(idem_material.encode()).hexdigest()
     event["raw_broker_order_no"] = broker_order_no
     event["canonical_broker_order_no"] = canonical_no
@@ -127,8 +413,21 @@ def load_order_events(trade_date: str, *, session_run_id: str | None = None) -> 
     path = journal_path(trade_date)
     if not path.exists():
         return []
-    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    return [e for e in events if not session_run_id or e.get("session_run_id") == session_run_id]
+    # Offline JSONL may contain repeated deliveries of the same cumulative
+    # observation (the DB ledger already uses UNIQUE idempotency_key).
+    # Retain the earliest durable event, never add the same broker fill twice.
+    unique: dict[str, dict] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if session_run_id and event.get("session_run_id") != session_run_id:
+            continue
+        identity = str(event.get("idempotency_key") or event.get("event_id") or "")
+        if not identity:
+            raise ValueError("order_journal_event_missing_identity")
+        unique.setdefault(identity, event)
+    return list(unique.values())
 
 
 def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None) -> dict:
@@ -272,12 +571,21 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     events = load_order_events(trade_date, session_run_id=session_run_id)
     if tick_id:
         events = [e for e in events if e.get("tick_id") == tick_id]
+    # Full submit/ACK history is used ONLY for conflicting-order detection.
+    # The operational replay may subsequently select only the active attempt.
+    collision_evidence_events = list(events)
     active_claim_errors = []
     active_attempt_keys: set[tuple[str, str]] = set()
     if include_active_claims:
         try:
             from trader.us.db.repos import load_active_execution_claim_attempts
             active_claims = load_active_execution_claim_attempts()
+            # A single broker/journal replay must see one consistent journal
+            # snapshot per source date. Re-reading identical historical dates
+            # for each active claim adds redundant DB I/O and cannot discover
+            # later fills until the next broker evidence reconciliation anyway.
+            source_events_by_date: dict[str, list[dict]] = {}
+            reused_source_dates = 0
             for claim in active_claims:
                 source_date = str(claim.get("trade_date") or "")
                 key = str(claim.get("client_order_key") or "")
@@ -290,7 +598,18 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 active_attempt_keys.add((key, attempt_id))
                 if source_date == trade_date and not active_claims_only:
                     continue
-                source_events = load_order_events(source_date)
+                if source_date not in source_events_by_date:
+                    source_events_by_date[source_date] = load_order_events(source_date)
+                else:
+                    reused_source_dates += 1
+                source_events = source_events_by_date[source_date]
+                # Retain every submit attempt for this active claim key BEFORE
+                # applying the active-only filter. An older KIS ACK/fill cannot
+                # be made invisible merely because the claim points at a retry.
+                collision_evidence_events.extend(
+                    event for event in source_events
+                    if str(event.get("client_order_key") or "") == key
+                )
                 attempt_events = [
                     event for event in source_events
                     if str(event.get("client_order_key") or "") == key
@@ -302,6 +621,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     })
                     continue
                 events.extend(attempt_events)
+            logger.info(
+                "[US_ORDER_JOURNAL][ACTIVE_CLAIM_SOURCE_MEMO] "
+                "claims=%d unique_dates=%d duplicate_reads_eliminated=%d",
+                len(active_claims), len(source_events_by_date), reused_source_dates,
+            )
         except Exception as exc:
             active_claim_errors.append({
                 "symbol": "", "side": "", "reason": f"active_claim_lookup_failed:{type(exc).__name__}",
@@ -320,10 +644,45 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             identity = event_id or repr(sorted(event.items()))
             unique_events[identity] = event
         events = list(unique_events.values())
-    grouped: dict[str, list[dict]] = {}
+    # A durable order key may have multiple attempts across restarts. Split
+    # broker-possible attempts rather than discarding an earlier real fill
+    # when a later attempt has been submitted under the same client key.
+    grouped: dict[tuple[str, str], list[dict]] = {}
     for event in events:
         key = str(event.get("client_order_key") or "").strip()
-        if key: grouped.setdefault(key, []).append(event)
+        attempt = str(event.get("submit_attempt_id") or "").strip()
+        if key:
+            grouped.setdefault((key, attempt), []).append(event)
+    # Use UNSLICED submit history for collisions, never the filtered active
+    # replay set. This is critical when active_claims_only=True in production.
+    evidence_grouped: dict[tuple[str, str], list[dict]] = {}
+    for evidence_event in collision_evidence_events:
+        evidence_key = str(evidence_event.get("client_order_key") or "").strip()
+        evidence_attempt = str(evidence_event.get("submit_attempt_id") or "").strip()
+        if evidence_key:
+            evidence_grouped.setdefault((evidence_key, evidence_attempt), []).append(evidence_event)
+    # us_orders is one row per client_order_key. Never overwrite it with a
+    # second real KIS order number created by a conflicting retry.
+    by_client_key: dict[str, set[str]] = {}
+    possible_attempts_by_client_key: dict[str, set[str]] = {}
+    for (client_key, attempt), attempt_events in evidence_grouped.items():
+        types = {event.get("event_type") for event in attempt_events}
+        if ("BROKER_SUBMIT_STARTED" in types
+                and "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" not in types):
+            possible_attempts_by_client_key.setdefault(client_key, set()).add(attempt)
+        from trader.us.utils.order_no import normalize_us_order_no
+        broker_numbers = {
+            normalize_us_order_no(e.get("broker_order_no"))
+            for e in attempt_events
+            if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}
+            and e.get("broker_order_no")
+        }
+        by_client_key.setdefault(client_key, set()).update(broker_numbers)
+    conflicting_client_keys = {
+        key for key, order_nos in by_client_key.items()
+        if len(order_nos) > 1
+        or len(possible_attempts_by_client_key.get(key, ())) > 1
+    }
     counts = {"db_ack_restored_count": 0, "broker_full_fill_count": 0,
               "broker_partial_fill_count": 0, "broker_unfilled_ack_count": 0,
               "broker_rejected_count": 0, "broker_unknown_count": 0,
@@ -346,11 +705,31 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             "balance_fetched": False,
         }
     from trader.us.db.repos import save_order_ack, mark_order_filled_by_reconcile, apply_broker_order_observation
+    from trader.us.execution.evidence_policy import require_broker_proof_for_balance_estimate
     from trader.us.utils.order_no import normalize_us_order_no
     # Query authoritative snapshots once per timeout, not once per journal row.
     balance = None
-    today_orders = None
+    # The 2026-10-13 incident made >600 KIS CCNL requests in 35 ticks.
+    # Historical active claims often share an original trade date; do not
+    # fetch that broker order book repeatedly within one reconciliation.
+    # This memo never survives a replay/tick, so genuine later broker fills
+    # are rediscovered on the next fresh invocation.
+    orders_by_trade_date: dict[str, list[dict] | None] = {}
+    source_scope_by_trade_date: dict[str, dict] = {}
     fills_by_trade_date: dict[str, list[dict] | None] = {}
+
+    def orders_for_trade_date(source_trade_date: str) -> list[dict] | None:
+        if source_trade_date not in orders_by_trade_date:
+            try:
+                method = getattr(provider, "get_today_orders", None)
+                rows = method(trade_date=source_trade_date) if callable(method) else None
+                orders_by_trade_date[source_trade_date] = rows if isinstance(rows, list) else None
+                provenance = getattr(provider, "get_order_lookup_provenance", None)
+                scope = provenance(source_trade_date) if callable(provenance) else {}
+                source_scope_by_trade_date[source_trade_date] = scope if isinstance(scope, dict) else {}
+            except Exception:
+                orders_by_trade_date[source_trade_date] = None
+        return orders_by_trade_date[source_trade_date]
 
     def fills_for_trade_date(source_trade_date: str) -> list[dict] | None:
         if source_trade_date not in fills_by_trade_date:
@@ -364,34 +743,130 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 fills_by_trade_date[source_trade_date] = None
         return fills_by_trade_date[source_trade_date]
 
-    all_fills = None
+    # A replay of *historical* active claims must not query today's broker
+    # order/fill books. Every source day is resolved only when an attempt
+    # actually needs it. This is a per-invocation cache, never shared with a
+    # later tick or generation.
     if provider is not None:
         try: balance = provider.get_balance(force_refresh=True)
         except TypeError: balance = provider.get_balance()
         except Exception: balance = None
-        try:
-            method = getattr(provider, "get_today_orders", None)
-            today_orders = method(trade_date=trade_date) if callable(method) else None
-        except Exception: today_orders = None
-        all_fills = fills_for_trade_date(trade_date)
     positions_by_symbol = {}
     if isinstance(balance, dict):
         for pos in balance.get("positions") or []:
             positions_by_symbol[str(pos.get("symbol") or pos.get("pdno") or "").upper()] = pos
 
-    for key, order_events in grouped.items():
-        latest = order_events[-1]; types = {e.get("event_type") for e in order_events}
-        if "BROKER_SUBMIT_STARTED" not in types or "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types: continue
+    collision_keys_recorded: set[str] = set()
+    for (key, active_attempt), order_events in grouped.items():
+        # Each submit attempt retains its own immutable owner, order number
+        # and broker outcome. Processing all broker-possible attempts is
+        # essential when an earlier fill arrives AFTER a newer ACK.
+        submitted = next(
+            (event for event in reversed(order_events)
+             if event.get("event_type") == "BROKER_SUBMIT_STARTED"), None,
+        )
+        if submitted is None:
+            continue
+        types = {e.get("event_type") for e in order_events}
+        if "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types:
+            continue
+        # Later ORDER_OPEN/REPLAY snapshots may have empty original session,
+        # generation=0 or qty=0. They cannot overwrite submitted identity.
+        latest = submitted
+        if key in conflicting_client_keys:
+            # The broker may have filled an older attempt after the newer
+            # submit. Never rewrite the one-key DB row with either order no.
+            # Store observed broker evidence per attempt, keep fencing, and
+            # allow the independent fill-ingestion path to attribute it.
+            broker_nos = sorted(by_client_key.get(key) or ())
+            if key not in collision_keys_recorded:
+                collision_keys_recorded.add(key)
+                # The ACTIVE attempt is only one member of the collision.
+                # Persist *every* known historical attempt's independent
+                # broker order evidence, even when production replays active
+                # claims only. None of this writes us_orders or clears claims.
+                for (history_key, history_attempt), historical in evidence_grouped.items():
+                    if history_key != key:
+                        continue
+                    historical_submit = next(
+                        (event for event in reversed(historical)
+                         if event.get("event_type") == "BROKER_SUBMIT_STARTED"), None)
+                    if historical_submit is None:
+                        continue
+                    historical_ack = next(
+                        (event for event in reversed(historical)
+                         if event.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}
+                         and event.get("broker_order_no")), None)
+                    original_no = str((historical_ack or {}).get("broker_order_no") or "")
+                    if not original_no:
+                        continue
+                    source_day = str(historical_submit.get("trade_date") or trade_date)
+                    rows = orders_for_trade_date(source_day) if provider else None
+                    lookup_scope = source_scope_by_trade_date.get(source_day) or {}
+                    scope_verified = (
+                        lookup_scope.get("verified") is True
+                        and lookup_scope.get("source") == "kis_authenticated_order_book"
+                        and str(lookup_scope.get("query_trade_date") or "").replace("-", "")
+                            == source_day.replace("-", "")
+                        and str(lookup_scope.get("market") or "").upper() == "US"
+                        and bool(lookup_scope.get("account_id"))
+                    )
+                    if not scope_verified:
+                        continue
+                    for row in (rows or []):
+                        symbol = str(historical_submit.get("symbol") or "").upper()
+                        side = str(historical_submit.get("side") or "").upper()
+                        requested = int(historical_submit.get("qty") or 0)
+                        if not (_replay_order_row_matches(
+                                row, order_no=original_no,
+                                symbol=symbol, side=side, requested_qty=requested,
+                                source_trade_date=source_day,
+                                journal_event=historical_submit,
+                                lookup_context=lookup_scope,
+                            ) and not _replay_detail_identity_conflicts(
+                                row, order_no=original_no,
+                                symbol=symbol, side=side, requested_qty=requested,
+                                source_trade_date=source_day,
+                                journal_event=historical_submit,
+                                lookup_context=lookup_scope,
+                            )):
+                            continue
+                        evidence_scope = {
+                            "source_trade_date": source_day,
+                            "market": "US",
+                            "provider_source": "kis_authenticated_order_book",
+                            "verified": True,
+                            "account_id": str(lookup_scope["account_id"]),
+                            "account_product_code": str(lookup_scope.get("account_product_code") or ""),
+                            "env": str(lookup_scope.get("env") or ""),
+                        }
+                        append_order_event(
+                            "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE",
+                            historical_submit,
+                            broker_order_no=original_no,
+                            broker_status=str(row.get("status") or "UNKNOWN"),
+                            raw_response={
+                                "cumulative_filled_qty": row.get("filled_qty"),
+                                "broker_remaining_qty": row.get("remaining_qty", row.get("broker_open_qty")),
+                                "broker_avg_price": row.get("avg_price", row.get("avg_price_usd")),
+                                "broker_observed_at": (row.get("observed_at") or row.get("updated_at")
+                                                       or row.get("order_timestamp") or row.get("order_time")),
+                                "broker_requested_qty": row.get("requested_qty"),
+                                "broker_lookup_scope": evidence_scope,
+                            },
+                        )
+            counts["broker_unknown_count"] += 1
+            unresolved_symbol_sides.append([str(latest.get("symbol") or "").upper(),
+                                            str(latest.get("side") or "").upper()])
+            append_order_event(
+                "JOURNAL_REPLAY_UNRESOLVED", latest,
+                broker_status="MULTIPLE_BROKER_ORDERS_SAME_CLIENT_KEY",
+                raw_response={"broker_order_numbers": broker_nos,
+                              "reason": "us_orders_one_key_identity_collision"},
+            )
+            continue
         event_trade_date = str(latest.get("trade_date") or trade_date)
-        event_orders = today_orders
-        event_fills = all_fills
-        if provider is not None and event_trade_date != trade_date:
-            try:
-                method = getattr(provider, "get_today_orders", None)
-                event_orders = method(trade_date=event_trade_date) if callable(method) else None
-            except Exception:
-                event_orders = None
-            event_fills = fills_for_trade_date(event_trade_date)
+        event_orders = orders_for_trade_date(event_trade_date) if provider is not None else None
         append_order_event("JOURNAL_REPLAY_STARTED", latest)
         ack = next((e for e in reversed(order_events) if e.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}), None)
         symbol, side, requested = str(latest.get("symbol") or "").upper(), str(latest.get("side") or "").upper(), int(latest.get("qty") or 0)
@@ -422,17 +897,82 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 append_order_event("JOURNAL_REPLAY_DB_ACK_RESTORED", ack, broker_order_no=order_no, broker_status="JOURNAL_ACK_DB_RESTORED")
             broker_fill = None
             if provider is not None:
-                detail = getattr(provider, "get_fills_by_order_no", None)
-                if callable(detail):
-                    try:
-                        broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=event_trade_date)
-                    except TypeError as exc:
-                        counts["failed_count"] += 1
-                        unresolved_symbol_sides.append([symbol, side])
-                        append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
-                        continue
+                # A fresh account-scoped order book was already fetched for
+                # this source trade date in THIS invocation. Match the exact
+                # broker order/symbol/side here instead of causing another
+                # full KIS CCNL REST request per unresolved action. Reject
+                # quarantined/quantity-regressing observations; do not cache
+                # across ticks or generations.
+                if isinstance(event_orders, list):
+                    matches = [
+                        row for row in event_orders
+                        if _replay_order_row_matches(
+                            row, order_no=order_no, symbol=symbol, side=side,
+                            requested_qty=requested, source_trade_date=event_trade_date,
+                            journal_event=latest,
+                            lookup_context=source_scope_by_trade_date.get(event_trade_date),
+                        )
+                    ]
+                    if matches:
+                        def _fill_obs_time(row):
+                            return str(
+                                row.get("observed_at") or row.get("updated_at")
+                                or row.get("order_timestamp") or row.get("order_time") or ""
+                            )
+                        best = max(
+                            matches,
+                            key=lambda row: (int(row.get("filled_qty") or 0), _fill_obs_time(row)),
+                        )
+                        conflict = any(
+                            _fill_obs_time(row) > _fill_obs_time(best)
+                            and int(row.get("filled_qty") or 0) < int(best.get("filled_qty") or 0)
+                            for row in matches
+                        )
+                        broker_fill = dict(best)
+                        broker_fill["filled_qty"] = int(best.get("filled_qty") or 0)
+                        broker_fill["status"] = (
+                            "EVIDENCE_QUANTITY_REGRESSION" if conflict
+                            else str(best.get("status") or "OK")
+                        )
+                if broker_fill is None:
+                    detail = getattr(provider, "get_fills_by_order_no", None)
+                    if callable(detail):
+                        try:
+                            broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=event_trade_date)
+                        except TypeError as exc:
+                            counts["failed_count"] += 1
+                            unresolved_symbol_sides.append([symbol, side])
+                            append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
+                            continue
+                # Direct per-order broker lookup is allowed only if no returned
+                # explicit identity contradicts the durable submitted action.
+                # Missing fields remain the KIS API call's scoped contract;
+                # conflicting fields are NEVER silently accepted as a fallback.
+                if (isinstance(broker_fill, dict)
+                        and _replay_detail_identity_conflicts(
+                            broker_fill, order_no=order_no, symbol=symbol,
+                            side=side, requested_qty=requested,
+                            source_trade_date=event_trade_date,
+                            journal_event=latest,
+                            lookup_context=source_scope_by_trade_date.get(event_trade_date),
+                        )):
+                    broker_fill = {"status": "EVIDENCE_IDENTITY_CONFLICT",
+                                   "symbol": symbol, "side": side}
+                # The fresh, identity-checked order row/detail is already the
+                # broker observation. Fetch a source-day fill list only if
+                # neither source supplied an observation. Never skip this
+                # fallback merely because the order book was reachable.
+                if not broker_fill:
+                    event_fills = fills_for_trade_date(event_trade_date)
+                else:
+                    event_fills = None
                 if not broker_fill and isinstance(event_fills, list):
-                    matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
+                    matched = [f for f in event_fills if normalize_us_order_no(f.get("order_no")) == normalize_us_order_no(order_no) and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side and not _replay_detail_identity_conflicts(
+                        f, order_no=order_no, symbol=symbol, side=side,
+                        requested_qty=requested, source_trade_date=event_trade_date,
+                        journal_event=latest,
+                        lookup_context=source_scope_by_trade_date.get(event_trade_date),
+                    )]
                     if matched:
                         def _cum(row):
                             return int(row.get("cumulative_filled_qty") or row.get("filled_qty") or row.get("qty") or 0)
@@ -449,8 +989,17 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 or (broker_fill or {}).get("status")
                 or "OK"
             ).upper()
+            if broker_fill_status == "EVIDENCE_IDENTITY_CONFLICT":
+                counts["identity_mismatch_count"] += 1
+                unresolved_symbol_sides.append([symbol, side])
+                append_order_event("JOURNAL_REPLAY_FAILED", ack,
+                                   broker_order_no=order_no,
+                                   broker_status=broker_fill_status,
+                                   raw_response=broker_fill)
+                continue
             if broker_fill_status in {
                 "EVIDENCE_QUANTITY_REGRESSION",
+                "EVIDENCE_IDENTITY_CONFLICT",
                 "EVIDENCE_QUANTITY_CONFLICT",
                 "EVIDENCE_QUANTITY_OVERFLOW",
                 "FILL_ACCOUNTING_INVARIANT_FAILED",
@@ -481,8 +1030,17 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     side=side,
                     requested_qty=requested,
                     filled_qty=cumulative,
-                    remaining_qty=max(0, requested - cumulative),
-                    broker_status="FILLED" if cumulative >= requested else "PARTIALLY_FILLED",
+                    remaining_qty=(
+                        int(broker_fill["remaining_qty"])
+                        if broker_fill.get("remaining_qty") not in (None, "")
+                        else max(0, requested - cumulative)
+                    ),
+                    broker_status=(
+                        str(broker_fill.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+                        if str(broker_fill.get("status") or "").upper() in
+                        {"CANCELLED", "CANCELED", "EXPIRED", "REJECTED"}
+                        else "FILLED" if cumulative >= requested else "PARTIALLY_FILLED"
+                    ),
                     evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
                     observed_at=broker_fill.get("observed_at"),
                     raw_row={**broker_fill, "requested_qty": requested, "avg_price": fill_price},
@@ -512,7 +1070,12 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                                   "execution_timestamp": broker_fill.get("execution_timestamp") or broker_fill.get("observed_at"),
                                   "broker_execution_id": broker_fill.get("broker_execution_id"), "fees": broker_fill.get("fees")})
             else:
-                broker_order = next((o for o in (event_orders or []) if normalize_us_order_no(o.get("order_no") or o.get("odno"))==normalize_us_order_no(order_no) and str(o.get("symbol") or o.get("pdno") or symbol).upper()==symbol and str(o.get("side") or side).upper()==side),None)
+                broker_order = next((o for o in (event_orders or []) if _replay_order_row_matches(
+                    o, order_no=order_no, symbol=symbol, side=side,
+                    requested_qty=requested, source_trade_date=event_trade_date,
+                    journal_event=latest,
+                    lookup_context=source_scope_by_trade_date.get(event_trade_date),
+                )), None)
                 if broker_order:
                     broker_symbol=str(broker_order.get("symbol") or broker_order.get("pdno") or symbol).upper()
                     broker_side=str(broker_order.get("side") or side).upper()
@@ -557,6 +1120,19 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         except Exception:
                             delta = 0
                         if delta > 0:
+                            if require_broker_proof_for_balance_estimate(latest):
+                                # Never infer a KIS fill from a holdings delta.
+                                # Historical claim remains in-flight, preventing
+                                # a replacement order while evidence is missing.
+                                counts["broker_unknown_count"] += 1
+                                unresolved_symbol_sides.append([symbol, side])
+                                logger.warning(
+                                    "[US_JOURNAL][BALANCE_ESTIMATE_PENDING_BROKER] "
+                                    "symbol=%s side=%s source_trade_date=%s "
+                                    "action=KEEP_ORIGINAL_ATTEMPT_FENCED",
+                                    symbol, side, event_trade_date,
+                                )
+                                continue
                             cumulative = min(delta, requested)
                             result=mark_order_filled_by_reconcile(order_no=order_no,client_order_key=key,symbol=symbol,side=side,
                                 filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,

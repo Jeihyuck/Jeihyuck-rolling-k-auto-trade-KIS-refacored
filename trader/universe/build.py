@@ -22,6 +22,7 @@ from trader.kis_wrapper import KisAPI
 from trader.time_utils import now_kst
 from trader.universe.capabilities import providers_for_env
 from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+from trader.universe.providers.kis_master_marketcap import KISMasterMarketcapProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
 from trader.universe.mode import is_db_only_mode, resolve_strategy_mode
@@ -60,6 +61,45 @@ def _prefer_provider_order(chain: list[str]) -> list[str]:
 
 logger = logging.getLogger(__name__)
 
+# Run-level, durable proof of the *two* KIS master ZIPs that produced PREP.
+# universe_members only has market/name/rank/cap; its meta_json is not stored.
+# Encode compact source evidence in the existing universe_runs.build_reason.
+KIS_MASTER_PROOF_RE = re.compile(
+    r"^kis_master_v1\|published=(\d{4}-\d{2}-\d{2})"
+    r"\|KOSPI=([0-9a-f]{64})\|KOSDAQ=([0-9a-f]{64})$"
+)
+
+
+def _kis_master_proof(as_of_date: str, published: str, hashes: dict[str, str]) -> str:
+    """Build a strictly dated immutable DB audit token (no credentials)."""
+    from trader.time_utils import resolve_prev_krx_trading_day
+    published_day = date.fromisoformat(str(published))
+    requested_day = date.fromisoformat(str(as_of_date))
+    if resolve_prev_krx_trading_day(published_day) != requested_day:
+        raise ValueError("kis_master_proof_previous_session_mismatch")
+    ordered = {}
+    for market in ("KOSPI", "KOSDAQ"):
+        digest = str(hashes.get(market) or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"kis_master_proof_invalid_sha256:{market}")
+        ordered[market] = digest
+    return (f"kis_master_v1|published={published_day.isoformat()}"
+            f"|KOSPI={ordered['KOSPI']}|KOSDAQ={ordered['KOSDAQ']}")
+
+
+def _kis_master_proof_matches(snapshot: dict, as_of_date: str) -> bool:
+    stored = str(snapshot.get("build_reason") or "")
+    match = KIS_MASTER_PROOF_RE.fullmatch(stored)
+    if match is None:
+        return False
+    published, kospi_hash, kosdaq_hash = match.groups()
+    try:
+        return _kis_master_proof(
+            as_of_date, published, {"KOSPI": kospi_hash, "KOSDAQ": kosdaq_hash}
+        ) == stored
+    except (ValueError, RuntimeError):
+        return False
+
 
 def _resolve_seed_dir() -> Path:
     default_dir = runtime_root() / "diagnostics" / "universe_seed"
@@ -81,7 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", required=True, help="Environment (practice/real)")
     parser.add_argument("--strategy", required=True, help="Strategy name to store universe for")
     parser.add_argument("--date", help="As-of date (YYYY-MM-DD). Defaults to today.")
-    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="Universe provider name")
+    parser.add_argument("--provider", default=None, help="Universe provider name")
+    parser.add_argument("--prep-recovery", action="store_true", help="Require dated KIS official master universe and PREP safety gates")
     return parser.parse_args()
 
 
@@ -169,6 +210,7 @@ def _load_fallback_universe_from_db(
     as_of_date: str,
     snapshot: dict | None = None,
     require_exact_as_of: bool = False,
+    enforce_fallback_switch: bool = True,
 ) -> list[dict]:
     """Use only a committed, venue-verified DB snapshot; never guess KRX venues.
 
@@ -176,7 +218,7 @@ def _load_fallback_universe_from_db(
     distinct symbols.  Historical snapshots from a different session are not
     silently relabeled as today's inputs.
     """
-    if os.getenv("UNIVERSE_NO_FALLBACK", "0") == "1":
+    if enforce_fallback_switch and os.getenv("UNIVERSE_NO_FALLBACK", "0") == "1":
         logger.error("[UNIVERSE][NO_FALLBACK] fallback disabled by env")
         return []
 
@@ -194,12 +236,27 @@ def _load_fallback_universe_from_db(
         )
         return []
 
-    if require_exact_as_of and str(snapshot.get("provider") or "") not in {
-        "kis_marketcap_top", "seed_static",
-    }:
+    if require_exact_as_of and str(snapshot.get("provider") or "") != "kis_master_marketcap":
         logger.error(
             "[UNIVERSE][FALLBACK][DB][UNVERIFIED_PROVIDER] provider=%s action=FAIL_CLOSED",
             snapshot.get("provider"),
+        )
+        return []
+
+    if require_exact_as_of and str(snapshot.get("actual_as_of") or "") != as_of_date:
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][UNVERIFIED_DATE] requested=%s actual=%s action=FAIL_CLOSED",
+            as_of_date, snapshot.get("actual_as_of"),
+        )
+        return []
+
+    # The actual file checksums must survive DB persistence/restart. A mere
+    # provider string + claimed as_of never proves which KIS master was used.
+    if require_exact_as_of and not _kis_master_proof_matches(snapshot, as_of_date):
+        logger.error(
+            "[UNIVERSE][FALLBACK][DB][SOURCE_PROOF_MISSING_OR_INVALID] "
+            "as_of=%s action=FAIL_CLOSED",
+            as_of_date,
         )
         return []
 
@@ -582,6 +639,69 @@ def _load_emergency_seed() -> dict | None:
     }
 
 
+
+def _build_from_kis_master(
+    provider: KISMasterMarketcapProvider, as_of_date: str,
+) -> tuple[dict | None, str]:
+    """Build 150+150 from fresh, date-checked official KIS morning master files."""
+    try:
+        rows_by_market = {
+            market: provider.get_marketcap_top_with_meta(market, as_of_date, TARGETS[market])
+            for market in ("KOSPI", "KOSDAQ")
+        }
+    except Exception as exc:
+        logger.warning("[UNIVERSE][KIS_MASTER][FAIL] requested=%s reason=%s", as_of_date, exc)
+        return None, f"kis_master_failed:{exc}"
+
+    combined = rows_by_market["KOSPI"] + rows_by_market["KOSDAQ"]
+    if len(combined) != sum(TARGETS.values()):
+        return None, f"kis_master_insufficient total={len(combined)}"
+    publications = {item.get("source_published_on") for item in combined}
+    if len(publications) != 1 or None in publications:
+        return None, "kis_master_publication_dates_inconsistent"
+    if any(not item.get("source_sha256") for item in combined):
+        return None, "kis_master_file_checksum_missing"
+    codes = [item["code"] for item in combined]
+    if len(set(codes)) != len(codes):
+        return None, "kis_master_cross_market_duplicate"
+    for market, rows in rows_by_market.items():
+        if any(row.get("market") != market or row.get("actual_as_of") != as_of_date for row in rows):
+            return None, f"kis_master_metadata_mismatch market={market}"
+
+    selected_by_market = {
+        market: [
+            {
+                "code": item["code"],
+                "rank": rank,
+                "name": item.get("name"),
+                "market_cap": item["market_cap"],
+                "actual_as_of": item["actual_as_of"],
+                "source_published_on": item["source_published_on"],
+                "source_sha256": item["source_sha256"],
+            }
+            for rank, item in enumerate(rows, 1)
+        ]
+        for market, rows in rows_by_market.items()
+    }
+    members = _build_members_from_payload(selected_by_market)
+    payload = _normalize_payload({
+        "selected": codes, "selected_by_market": selected_by_market,
+    })
+    logger.info("[UNIVERSE][KIS_MASTER][COMPLETE] as_of=%s kospi=%d kosdaq=%d",
+                as_of_date, len(rows_by_market["KOSPI"]), len(rows_by_market["KOSDAQ"]))
+    return {
+        "payload": payload, "members": members, "source": "kis_master_marketcap",
+        "params": {
+            "actual_as_of": as_of_date,
+            "source_published_on": next(iter(publications)),
+            "source_sha256_by_market": {m: rows[0]["source_sha256"] for m, rows in rows_by_market.items()},
+            "requested_as_of": as_of_date,
+            "provider_contract": "kis_daily_morning_master",
+            "targets": dict(TARGETS),
+        },
+    }, "kis_master_marketcap"
+
+
 def _build_from_kis(provider: KISMarketcapTopProvider, as_of_date: str) -> tuple[dict | None, str]:
     try:
         kospi_rows = provider.get_marketcap_top_with_meta("KOSPI", TARGETS["KOSPI"])
@@ -633,6 +753,9 @@ def _build_from_fdr_kospi100(as_of_date: str, target: int = 100) -> tuple[dict |
 
 
 def build_universe(as_of_date: str, env: str, strategy: str, provider_override: str | None = None, *, prep_recovery: bool = False) -> list[dict]:
+    # Reject undated providers before opening DB connections or causing side effects.
+    if prep_recovery and provider_override not in (None, "kis_master_marketcap"):
+        raise ValueError("PREP requires verified KIS morning master provider; undated override rejected")
     engine = make_engine()
     run_migrations(engine)
     repo = UniverseRepo(engine)
@@ -645,7 +768,7 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         and os.getenv("UNIVERSE_NO_FALLBACK", "0") != "1"
     )
     preexisting_snapshot: dict | None = None
-    if prep_recovery_enabled:
+    if prep_recovery:
         try:
             preexisting_snapshot = repo.get_latest_successful_universe_snapshot(
                 env=env, strategy=strategy, as_of_date=as_of_date,
@@ -653,9 +776,22 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         except Exception as exc:
             logger.warning("[UNIVERSE][FALLBACK][DB][PREFETCH_FAIL] err=%s", exc)
 
+    # Previous successful dated snapshots are immutable. In particular, force
+    # rebuild or provider failure must never downgrade SUCCESS to RUNNING/FAILED.
+    if prep_recovery and preexisting_snapshot:
+        verified_existing = _load_fallback_universe_from_db(
+            repo=repo, env=env, strategy=strategy, as_of_date=as_of_date,
+            snapshot=preexisting_snapshot, require_exact_as_of=True,
+            enforce_fallback_switch=False,
+        )
+        if verified_existing:
+            logger.info("[UNIVERSE][PREP][REUSE_IMMUTABLE] as_of=%s members=%d run_id=%s",
+                        as_of_date, len(verified_existing), preexisting_snapshot.get("run_id"))
+            return verified_existing
+
     payload: dict | None = None
     members: list[dict] = []
-    source = provider_override or DEFAULT_PROVIDER
+    source = "kis_master_marketcap" if prep_recovery else (provider_override or DEFAULT_PROVIDER)
     params: dict = {"as_of": as_of_date}
     last_reason: str | None = None
 
@@ -676,7 +812,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
         logger.warning("[UNIVERSE][RUN][START_FAIL] err=%s", exc)
         # Continue anyway - operations below will fail gracefully if run_id is None
 
-    allowed_chain = providers_for_env(env)
+    # PREP must not backdate KIS's undated 30-row current ranking or unversioned
+    # static seeds. Preserve the existing KIS chain for non-PREP consumers.
+    allowed_chain = ["kis_master_marketcap"] if prep_recovery else providers_for_env(env)
     if provider_override:
         if provider_override not in allowed_chain:
             logger.info("[UNIVERSE][CHAIN][OVERRIDE] env=%s provider=%s", env, provider_override)
@@ -714,7 +852,9 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             provider_name,
         )
 
-        if provider_name == "kis_marketcap_top":
+        if provider_name == "kis_master_marketcap":
+            result, reason = _build_from_kis_master(KISMasterMarketcapProvider(), as_of_date)
+        elif provider_name == "kis_marketcap_top":
             if not kis_provider:
                 reason = last_reason or "kis_provider_unavailable"
             else:
@@ -804,6 +944,14 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
                 dropped_tradeable[: min(5, len(dropped_tradeable))],
             )
 
+    if prep_recovery and members and len(members) < max(100, int(os.getenv("UNIVERSE_PREP_VERIFIED_DB_MIN_MEMBERS", "100"))):
+        logger.error(
+            "[UNIVERSE][KIS_MASTER][QUALITY_FAIL] after_sanitize=%d min=100 action=FAIL_CLOSED",
+            len(members),
+        )
+        last_reason = "kis_master_insufficient_after_sanitize"
+        members = []
+
     if not members:
         logger.error("[UNIVERSE][EMPTY] as_of=%s env=%s strategy=%s source=%s", as_of_date, env, strategy, source)
         error_reason = f"provider_empty:{last_reason or source}"
@@ -859,8 +1007,12 @@ def build_universe(as_of_date: str, env: str, strategy: str, provider_override: 
             members=members,
             reason=last_reason,
             requested_as_of=as_of_date,
-            actual_as_of=as_of_date,
-            build_reason=last_reason,
+            actual_as_of=str(params.get("actual_as_of") or as_of_date),
+            build_reason=_kis_master_proof(
+                as_of_date,
+                str(params["source_published_on"]),
+                dict(params["source_sha256_by_market"]),
+            ) if prep_recovery else last_reason,
             universe_name=strategy,
         )
     except Exception as exc:
@@ -909,7 +1061,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     args = parse_args()
     as_of = args.date or now_kst().date().isoformat()
-    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy, provider_override=args.provider)
+    build_universe(as_of_date=as_of, env=args.env, strategy=args.strategy,
+                   provider_override=args.provider, prep_recovery=args.prep_recovery)
 
 
 if __name__ == "__main__":

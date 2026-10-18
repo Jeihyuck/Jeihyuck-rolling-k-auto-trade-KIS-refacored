@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import socket
@@ -78,7 +79,123 @@ def _atomic_write_new(path: Path, payload: dict) -> None:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
 
-def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, stale_minutes: int | None = None) -> dict:
+def _unverified_child_fence_path(trade_date: str, session: str) -> Path:
+    return _GUARD_BASE / trade_date / f"{session}.child_unverified.fence"
+
+
+def _child_fence_scope(env: str | None = None) -> dict:
+    """Resolve from the exact settings used by KisUSClient, not shell fallback."""
+    from trader.account_state import get_account_key, resolve_env_name
+    from trader.us import config as us_cfg
+    name = resolve_env_name(env)
+    cano = str(us_cfg.CANO or "").strip()
+    product = str(us_cfg.ACNT_PRDT_CD or "").strip()
+    # A split configuration is unsafe even when the unmatched value was
+    # intended for another runtime: block US execution instead of placing
+    # its unreaped child under a different account's fence.
+    if str(us_cfg.KIS_ENV or "").strip().lower() != name:
+        raise ValueError("BROKER_ENV_CONFIG_MISMATCH")
+    shell_env = str(os.getenv("KIS_ENV") or "").strip().lower()
+    if shell_env and shell_env != name:
+        raise ValueError("BROKER_ENV_CONFIG_MISMATCH")
+    for field, configured in (("CANO_US", cano), ("CANO", cano),
+                              ("ACNT_PRDT_CD_US", product),
+                              ("ACNT_PRDT_CD", product)):
+        supplied = str(os.getenv(field) or "").strip()
+        if supplied and supplied != configured:
+            raise ValueError("BROKER_ACCOUNT_CONFIG_MISMATCH")
+    key = get_account_key(env=name, cano=cano, product_code=product)
+    return {"env": name, "account_digest": hashlib.sha256(key.encode("utf-8")).hexdigest()}
+
+
+def _verified_child_scope(env: str | None = None, account_scope: dict | None = None) -> dict:
+    """Pin account identity at session admission; reject live config drift."""
+    actual = _child_fence_scope(env)
+    if account_scope is not None and actual != account_scope:
+        raise ValueError("BROKER_ACCOUNT_SCOPE_CHANGED")
+    return actual
+
+
+def _child_scope_fence_path(scope: dict) -> Path:
+    return _GUARD_BASE / ".child_scope" / f"{scope['env']}.{scope['account_digest']}.fence"
+
+
+def read_us_session_child_unverified_fence(trade_date: str, session: str, *,
+                                           env: str | None = None,
+                                           account_scope: dict | None = None) -> dict:
+    """Check account-wide US child uncertainty BEFORE any session/date lock.
+
+    A child from yesterday's AM remains order capable in today's afternoon
+    unless it is explicitly reaped and the broker's submit truth reconciled.
+    Another verified account/env uses a different scope and is not blocked.
+    """
+    scope = _verified_child_scope(env, account_scope)
+    scoped = _child_scope_fence_path(scope)
+    if scoped.exists():
+        payload = _read_json(scoped)
+        return payload or {"state": "CHILD_UNVERIFIED", "reason": "unreadable_scope_fence"}
+    # Legacy per-session files are retained as supplementary evidence; only
+    # a matching account scope may block a different, explicitly known account.
+    local = _unverified_child_fence_path(trade_date, session)
+    if local.exists():
+        payload = _read_json(local)
+        if not payload:
+            return {"state": "CHILD_UNVERIFIED", "reason": "unreadable_local_fence"}
+        if (not payload.get("account_digest")
+                or (payload.get("env") == scope["env"]
+                    and payload.get("account_digest") == scope["account_digest"])):
+            return payload
+    return {}
+
+
+def mark_us_session_child_unverified_fence(trade_date: str, session: str, *,
+                                            run_id: str, pid: int, reason: str,
+                                            env: str | None = None,
+                                            account_scope: dict | None = None) -> Path:
+    """Persist both account-wide and historical-session child uncertainty.
+
+    Do not auto-clear on timeout, date rollover or process PID disappearance.
+    Explicit broker-truth and child-exit recovery must clear both records.
+    """
+    # The child may have outlived a config reload. Always fence the pinned
+    # session account first; a mismatch must never divert the marker to a
+    # new account or silently release the old session lock.
+    scope = account_scope if account_scope is not None else _child_fence_scope(env)
+    if (not isinstance(scope, dict) or not scope.get("env")
+            or not scope.get("account_digest")):
+        raise ValueError("BROKER_ACCOUNT_SCOPE_UNAVAILABLE")
+    global_path = _child_scope_fence_path(scope)
+    local_path = _unverified_child_fence_path(trade_date, session)
+    payload = {"state": "CHILD_UNVERIFIED", "market": "US", "trade_date": trade_date,
+               "session": session, "run_id": run_id, "pid": pid,
+               "broker_submission_truth": "UNVERIFIED", "reason": reason,
+               "env": scope["env"], "account_digest": scope["account_digest"],
+               "created_at_et": now_et_iso()}
+    # The GLOBAL durable fence is written before local session evidence.
+    # No later run or atexit code is allowed to overwrite it.
+    for path in (global_path, local_path):
+        try:
+            _atomic_write_new(path, payload)
+        except FileExistsError:
+            pass
+    logger.critical("[US_SESSION_GUARD][CHILD_UNVERIFIED_FENCE] scope=%s pid=%s",
+                    str(global_path), pid)
+    return local_path
+
+
+def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, stale_minutes: int | None = None, *, env: str | None = None, account_scope: dict | None = None) -> dict:
+    # Persistent fail-closed state is checked BEFORE stale-lock reclamation
+    # and even before the test bypass. A dead parent PID is not broker truth.
+    try:
+        unverified = read_us_session_child_unverified_fence(
+            trade_date, session, env=env, account_scope=account_scope,
+        )
+    except ValueError as exc:
+        return {"acquired": False, "reason": str(exc), "path": "", "payload": {}}
+    if unverified:
+        return {"acquired": False, "reason": "CHILD_UNVERIFIED_FENCE",
+                "path": str(_unverified_child_fence_path(trade_date, session)),
+                "payload": unverified}
     if os.getenv("US_BYPASS_RUNNING_LOCK_FOR_TEST") == "1":
         return {"acquired": True, "reason": "BYPASS_FOR_TEST", "path": str(_running_path(trade_date, session))}
     stale_minutes = int(stale_minutes or _STALE_DEFAULTS.get(session, 240))
@@ -109,7 +226,18 @@ def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, 
                 return {"acquired": False, "reason": f"RUNNING_LOCK_REPLACE_FAILED:{exc}", "path": str(path), "payload": old}
 
 
-def release_us_session_running_lock(trade_date: str, session: str, run_id: str | None = None) -> dict:
+def release_us_session_running_lock(trade_date: str, session: str, run_id: str | None = None, *, env: str | None = None, account_scope: dict | None = None) -> dict:
+    # Also protects atexit hooks that otherwise release locks unconditionally.
+    try:
+        fenced = read_us_session_child_unverified_fence(
+            trade_date, session, env=env, account_scope=account_scope,
+        )
+    except ValueError:
+        fenced = {"reason": "BROKER_ACCOUNT_SCOPE_UNVERIFIED"}
+    if fenced:
+        logger.critical("[US_SESSION_GUARD][LOCK_RELEASE_DENIED] trade_date=%s session=%s reason=CHILD_UNVERIFIED", trade_date, session)
+        return {"released": False, "reason": "CHILD_UNVERIFIED_FENCE",
+                "path": str(_running_path(trade_date, session))}
     path = _running_path(trade_date, session)
     payload = _read_json(path)
     if run_id and payload and str(payload.get("run_id")) != str(run_id):
