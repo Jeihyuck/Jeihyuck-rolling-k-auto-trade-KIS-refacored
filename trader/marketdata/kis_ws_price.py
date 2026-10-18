@@ -95,6 +95,8 @@ class KisWebSocketPriceService:
         self._last_error: str | None = None
         self._connection_count = 0
         self._reconnect_count = 0
+        self._approval_obtained = False
+        self._broker_subscriptions_acked: set[tuple[str, str]] = set()
         self._retry_subscriptions: set[tuple[str, str]] = set()
         self._subscription_retry_after: dict[tuple[str, str], float] = {}
         self._subscription_retry_attempts: dict[tuple[str, str], int] = {}
@@ -247,11 +249,15 @@ class KisWebSocketPriceService:
             latest_received_at = max(
                 (float(q.received_at) for q in self._quotes.values()), default=0.0
             )
+            acked_subscriptions = len(self._broker_subscriptions_acked)
+            approval_obtained = self._approval_obtained
         connected = self._connected.is_set()
         return {
             "enabled": self.enabled(),
             "connected": connected,
             "subscriptions": desired,  # requested, not broker-ACKed subscriptions
+            "broker_subscription_acks": acked_subscriptions,
+            "approval_obtained": approval_obtained,
             "quotes": quotes,
             "quotes_received": quotes > 0,
             "last_received_age_sec": (
@@ -368,6 +374,7 @@ class KisWebSocketPriceService:
             delay = min(max_delay, base * (2 ** max(0, attempt - 1)))
             self._subscription_retry_after[subscription] = now_value + delay
             self._retry_subscriptions.add(subscription)
+            self._broker_subscriptions_acked.discard(subscription)
         return delay
 
     def _clear_subscription_retry(self, subscription: tuple[str, str]) -> None:
@@ -407,6 +414,8 @@ class KisWebSocketPriceService:
         while not self._stop.is_set():
             try:
                 approval = await asyncio.to_thread(self._approval_key)
+                with self._lock:
+                    self._approval_obtained = bool(approval)
                 async with websockets.connect(
                     self._ws_url(),
                     ping_interval=None,
@@ -488,6 +497,8 @@ class KisWebSocketPriceService:
                 # disconnect/reconnect, even if still inside the age TTL.
                 with self._lock:
                     self._quotes.clear()
+                    self._broker_subscriptions_acked.clear()
+                    self._approval_obtained = False
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning("[KIS_WS][DISCONNECTED] err=%s retry_sec=%.1f", self._last_error, backoff)
                 await asyncio.sleep(backoff)
@@ -530,6 +541,8 @@ class KisWebSocketPriceService:
                 tr_key = str((payload.get("header") or {}).get("tr_key") or "")
                 if tr_id and tr_key:
                     self._clear_subscription_retry((tr_id, tr_key))
+                    with self._lock:
+                        self._broker_subscriptions_acked.add((tr_id, tr_key))
             return
 
         parts = text.split("|", 3)
