@@ -10,6 +10,8 @@ from trader.marketdata.kis_ws_price import KisWebSocketPriceService
 
 def _ws_env(monkeypatch):
     monkeypatch.setenv("KIS_WS_PRICE_TEST_ENABLE", "1")
+    monkeypatch.setenv("KIS_WS_PRICE_ENABLED", "1")
+    monkeypatch.setenv("MINERVINI_ONLY", "0")
     monkeypatch.setenv("US_WS_COLLECTOR_ENABLED", "1")
     monkeypatch.setenv("US_KIS_HTTP_ENABLED", "AUTO")
     monkeypatch.delenv("STRATEGY_MODE", raising=False)
@@ -48,7 +50,7 @@ def test_explicit_network_stops_remain_fail_closed(monkeypatch, stop):
 
 def test_role_not_in_parent_does_not_enable_strategy_network(monkeypatch):
     _ws_env(monkeypatch)
-    monkeypatch.delenv("US_WS_COLLECTOR_ROLE")
+    monkeypatch.delenv("US_WS_COLLECTOR_ROLE", raising=False)
     service = KisWebSocketPriceService()
     assert not service.network_allowed("US")
 
@@ -125,7 +127,7 @@ def test_no_fresh_quote_after_disconnect(monkeypatch):
 
 def test_launcher_sets_read_only_role_in_child_not_parent(monkeypatch):
     _ws_env(monkeypatch)
-    monkeypatch.delenv("US_WS_COLLECTOR_ROLE")
+    monkeypatch.delenv("US_WS_COLLECTOR_ROLE", raising=False)
     monkeypatch.setattr(collector, "_send_request", lambda *a, **k: None)
     monkeypatch.setattr(collector, "_LAST_START_REQUEST", None)
     parent_role = os.getenv("US_WS_COLLECTOR_ROLE")
