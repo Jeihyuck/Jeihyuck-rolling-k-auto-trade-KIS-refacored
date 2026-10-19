@@ -176,3 +176,55 @@ def test_broker_uncertainty_expired_and_other_owner_are_not_released():
     for identity, _ in identities:
         assert repo._execution_claim_repo.get(identity).action_state == "IN_FLIGHT"
     engine.dispose()
+
+
+
+def test_reconcile_tick_releases_only_proven_before_kis_attempt(monkeypatch):
+    """The real KR reconcile entrypoint must invoke scoped repair before health."""
+    from trader import reconcile_kis as reconcile
+    from trader.run_context import RunContext
+
+    engine, schema, repo, epoch = _setup()
+    releasable, _ = _claim(engine, schema, repo, epoch, code="251970")
+    ambiguous, _ = _claim(
+        engine, schema, repo, epoch, code="192820", order_status="EXPIRED"
+    )
+
+    class FakeKis:
+        def inquire_daily_ccld(self, **_kwargs):
+            return {"output1": [], "_ccld_status": "ok"}
+
+    class NoopRepo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __getattr__(self, _name):
+            return lambda **_kwargs: None
+
+    monkeypatch.setattr(reconcile, "OrdersRepo", lambda _engine: repo)
+    monkeypatch.setattr(reconcile, "FillsRepo", NoopRepo)
+    monkeypatch.setattr(reconcile, "PositionsRepo", NoopRepo)
+    monkeypatch.setattr(reconcile, "LedgerEventsRepo", NoopRepo)
+    monkeypatch.setattr(reconcile, "ReconcileLogRepo", NoopRepo)
+    monkeypatch.setattr(reconcile, "_resolve_reconcile_run_id", lambda *_args: "test-run")
+    monkeypatch.setattr(
+        reconcile, "now_kst", lambda: datetime(2026, 10, 19, 14, 30)
+    )
+    result = reconcile.reconcile_today(
+        engine=engine,
+        kis=FakeKis(),
+        ctx=RunContext(
+            run_id="test-run",
+            env="practice",
+            strategy="pb1_pullback_close",
+            started_at=datetime(2026, 10, 19, 14, 30),
+            dry_run=True,
+        ),
+    )
+    assert result["orders"] == 0
+    assert result["fills"] == 0
+    assert result["degraded"] == "unresolved_execution_actions"
+    assert result["execution_claim_health"]["unresolved_execution_actions"] == 1
+    assert repo._execution_claim_repo.get(releasable).action_state == "OPEN"
+    assert repo._execution_claim_repo.get(ambiguous).action_state == "IN_FLIGHT"
+    engine.dispose()
