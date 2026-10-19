@@ -307,6 +307,22 @@ class PB1StageTimeout(RuntimeError):
     pass
 
 
+def _kr_pb1_can_create_buy_intent(*, remaining_sec: float, required_sec: float = 45.0) -> bool:
+    """Avoid durable CREATED orders when KR's shared tick has too little runway.
+
+    This is a pre-broker gate, not evidence that any existing CREATED row is safe
+    to expire. Existing uncertain rows remain subject to broker reconciliation.
+    """
+    try:
+        remaining = float(remaining_sec)
+        minimum = max(25.0, float(required_sec))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (math.isinf(remaining) and remaining > 0) or (
+        math.isfinite(remaining) and remaining >= minimum
+    )
+
+
 def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
     try:
         flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
@@ -10931,6 +10947,32 @@ class PB1Engine:
         }
         logger.info("[ORDER][BASELINE] code=%s side=BUY snapshot_id=%s pre_qty=%s requested_qty=%s",
                     cf.code, request_payload.get("balance_snapshot_id"), pre_order_holding_qty, qty)
+        # An intent becomes a blocking CREATED row before KIS is contacted.
+        # Reserve room for fresh quote and 20s broker-submit checks before
+        # persisting it; last-second attempts on Oct 19 stranded CREATED rows.
+        # This PB1-only condition does not apply to the KR_INFINITE owner.
+        if self._is_kr_equity_context() and str(cf.code).lstrip("A").zfill(6) != str(os.getenv("KR_INFINITE_SYMBOL", "122630")).lstrip("A").zfill(6):
+            from trader.kis_wrapper import kr_tick_remaining_sec
+            remaining_before_intent = kr_tick_remaining_sec()
+            min_before_intent = os.getenv("KR_PB1_BUY_PREINTENT_MIN_REMAINING_SEC", "45")
+            if not _kr_pb1_can_create_buy_intent(
+                remaining_sec=remaining_before_intent,
+                required_sec=min_before_intent,
+            ):
+                logger.warning(
+                    "[ORDER][PRE_INTENT][LOW_TICK_BUDGET] code=%s remaining_sec=%.2f min_required_sec=%s action=DEFER_WITHOUT_CREATED_ROW",
+                    display_code, remaining_before_intent, min_before_intent,
+                )
+                self._log_final_skip(
+                    cf=cf, reason_code="LOW_PREINTENT_TICK_BUDGET",
+                    reason_detail="Insufficient shared tick time before durable BUY intent",
+                    stage=stage, price=record_price,
+                )
+                status["skipped"] = 1
+                status["skipped_reason"] = "LOW_PREINTENT_TICK_BUDGET"
+                status["submit_terminal_status"] = "SKIPPED_RETRYABLE_PRE_BROKER"
+                status["terminal_event"] = "FINAL_SKIP"
+                return status
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()
@@ -10943,6 +10985,7 @@ class PB1Engine:
                 effective_client_order_key,
                 existing_status,
             )
+        os.environ["PB1_LAST_STAGE"] = "buy.intent.persist"
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -11087,6 +11130,7 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        os.environ["PB1_LAST_STAGE"] = "buy.pretrade_quote"
         if not self._pretrade_check(
             code=cf.code,
             market=cf.market,
@@ -11131,6 +11175,7 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        os.environ["PB1_LAST_STAGE"] = "buy.execution_claim"
         try:
             claim_identity, claim = self._claim_pb1_submit_action(
                 client_order_key=effective_client_order_key or "",
