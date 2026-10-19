@@ -3208,6 +3208,10 @@ class OrdersRepo:
             return 0
         today = trade_date or now_kst().date()
         account_key = get_account_key(env=env)
+        # SemanticActionIdentity.account_id is the SHA-256 digest of the
+        # canonical account key (see claim_execution_action).  Comparing the
+        # unhashed key silently matched no rows during the 2026-10-19 incident.
+        account_identity = hashlib.sha256(account_key.encode("utf-8")).hexdigest()
         actions = self._execution_claim_repo.actions
         attempts = self._execution_claim_repo.attempts
         orders = self._schema.orders
@@ -3235,7 +3239,7 @@ class OrdersRepo:
                     orders.c.kis_odno, orders.c.broker_order_id,
                 ).select_from(join).where(
                     actions.c.env == env,
-                    actions.c.account_id == account_key,
+                    actions.c.account_id == account_identity,
                     actions.c.market == "KR",
                     actions.c.strategy_owner == "PB1",
                     actions.c.trading_epoch_id == active_epoch,
