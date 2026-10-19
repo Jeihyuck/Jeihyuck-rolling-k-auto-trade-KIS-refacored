@@ -15461,6 +15461,23 @@ class PB1Engine:
                     "precomputed_usable_row": bool(usable_precomputed_row),
                     "precomputed_usable_reasons": list(usable_reasons),
                 }
+                # The four-family gate consumes completed-daily proof fields.
+                # Those fields exist in Final30 but were dropped when features
+                # were manually rebuilt, falsely rejecting October 19's scored
+                # candidates with completed_daily_proof_date_mismatch.
+                # Only copy the original scored Final30 row; never manufacture
+                # proof from runtime scores or fill a missing date with today.
+                from trader.kr.final30_proof import copy_final30_completed_daily_proof
+                source_final30 = self._precomputed_final30_map.get(code)
+                features = copy_final30_completed_daily_proof(
+                    features, source_final30, expected_code=code,
+                )
+                logger.info(
+                    "[KR][FINAL30][PROOF_TRANSFER] code=%s source_row=%s as_of=%s proof_as_of=%s screen_keys=%s",
+                    code, int(isinstance(source_final30, dict)),
+                    features.get("as_of"), features.get("candidate_family_proof_as_of"),
+                    sorted((features.get("candidate_family_screens") or {}).keys()),
+                )
                 features["market"] = market
                 filter_thresholds = getattr(self, "filter_thresholds", None)
                 features["_pb1_vol_max"] = float(getattr(filter_thresholds, "vol_contraction_max", PB1_VOL_MAX))
