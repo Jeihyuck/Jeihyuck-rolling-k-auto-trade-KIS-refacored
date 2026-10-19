@@ -41,3 +41,23 @@ Required before merge:
 - Run focused KR test suite, run existing safety tests, and verify GitHub CI.
 - Record change in end-to-end simulated tick with candidate -> valid quote -> protected KIS submit stub. Test invalid quote, broker ambiguous ACK, close handoff, orphan CREATED, and zero-fill reconciliation.
 - Real KIS/practice brokerage verification requires explicit separate approval.
+
+## Oct-19 afternoon follow-up and final mitigation scope
+
+- As checked during the afternoon, the current KR runtime was still on the original pinned SHA `28ceff3c79ac67de870d0b8dbf4b1051164283dc`. Recent afternoon PB1 rows continued to show `TICK_TIMEOUT_KRX`; this PR was not running live at that point.
+- One 096530 pre-broker `CREATED` row subsequently transitioned to `EXPIRED` in Supabase; no assumption is made that KIS was never contacted solely from status and missing timestamps. **Do not perform mass expiry or disable duplicate guards.**
+- The new PB1 BUY pre-intent budget gate (`KR_PB1_BUY_PREINTENT_MIN_REMAINING_SEC`, default 45s, floor 25s) avoids writing a blocking `CREATED` row when time is already insufficient for quote and broker submit reserve.
+- If ledger intent recording fails after a durable row was written, or no KIS client exists on a known pre-broker path, the row is best-effort marked retryable `ERROR` with `broker_submit:false`. A failed DB cleanup is logged and remains blocked for reconciliation; any path that may have crossed KIS submit is excluded.
+- Canonical PB1 pretrade quote probes only the normalized six-digit KR symbol and KIS domestic `J` market for its at-most-two REST retry rounds. The generic quote API retains its original market/code variant fallback and `KIS_RETRY_MAX` behavior.
+- The offline acceptance suite includes a 240s candidate simulation under the 360s shared tick deadline with no overlapping ticks and no KIS network calls, as well as prebroker cleanup, quote retry and source freshness tests.
+
+### Expected run-level evidence after deployment
+
+```text
+[KR_P1][BUDGET_CONTRACT] ... tick_hard_timeout_sec=360 min_tick_budget_sec=380 ...
+[KR_TICK][DEADLINE] ... budget_sec=360.000 timeout_sec=360 ...
+[KIS][QUOTE][BOUNDED_PRETRADE_RETRY] ... max_attempts=2 ... canonical_kr=1
+[ORDER][PRE_INTENT][LOW_TICK_BUDGET] ... action=DEFER_WITHOUT_CREATED_ROW  # only if remaining time is insufficient
+```
+
+**Do not infer a successful KIS order from those budget logs.** Prove `ORDER_INTENT -> attempt -> KIS submit -> broker ACK -> reconciliation -> fill` independently and retain broker-ambiguous protections.
