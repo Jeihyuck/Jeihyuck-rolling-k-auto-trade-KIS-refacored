@@ -32,7 +32,9 @@ def test_kr_infinite_uses_existing_owner_shared_snapshot_and_entry_guard():
         "engine_runner._kr_after_protective_exit"
     )]
     assert "balance_snapshot=balance_snapshot_raw or {}" in snippet
-    assert "allow_entry=bool(order_allowed and calc_allowed)" in snippet
+    assert "order_allowed and calc_allowed" in snippet
+    assert 'getattr(engine_runner, "_kr_exit_pass_ok", False)' in snippet
+    assert "self._kr_exit_pass_ok = bool(exit_pass_ok)" in inspect.getsource(PB1Engine.run)
     assert "kr_inf_run_result = run_kr_infinite_sleeve_tick" in snippet
     assert "shared_balance=1" in snippet
     assert "[KR_INF][NOT_RUN]" in runner
