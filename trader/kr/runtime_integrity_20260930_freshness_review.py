@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import Any
 
@@ -267,7 +268,18 @@ def _strict_rest_quote(kis: Any, code: Any, *, max_age_sec: float) -> tuple[dict
     _evict_ws_cache_if_not_fresh(normalized, max_age_sec=max_age_sec)
 
     try:
-        quote = kis.get_price_quote(normalized, diag_mode=False, attempts=2)
+        # Only the PB1 pretrade KIS adapter uses a bounded outer quote retry.
+        # Other strategies, SELL routes, and test/legacy adapters retain their
+        # original get_price_quote contract. Missing/stale quotes still fail closed.
+        if isinstance(kis, kis_wrapper_module.KisAPI):
+            retry_cap = max(1, int(os.getenv("KR_PB1_PRETRADE_QUOTE_RETRY_CAP", "2")))
+            logger.info(
+                "[KR_P1][PRETRADE_REST_RETRY] code=%s max_attempts=%s",
+                normalized, retry_cap,
+            )
+            quote = kis.get_price_quote(normalized, diag_mode=False, attempts=2, retry_cap=retry_cap)
+        else:
+            quote = kis.get_price_quote(normalized, diag_mode=False, attempts=2)
     except Exception as exc:
         return None, f"rest_quote_fail:{exc}"
     if not isinstance(quote, dict) or not quote:
