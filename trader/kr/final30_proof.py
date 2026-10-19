@@ -3,6 +3,7 @@
 The only trusted source for the four-family entry proof is the immutable,
 validated Final30 scored PREP row for that exact code. Do NOT reconstruct
 missing proof from runtime scores, current price or the trading date.
+Do not transfer stale exit policy from PREP: final arbitration selects its owner.
 """
 from __future__ import annotations
 
@@ -21,7 +22,6 @@ PROOF_KEYS = (
     "vcp_pass",
     "minervini_pass",
     "vcp_evidence_as_of",
-    "exit_policy_family",
 )
 
 
@@ -35,6 +35,11 @@ def copy_final30_completed_daily_proof(
 
     Missing and mismatched proof stays missing: downstream four-family gates
     remain fail-closed. Never coerce a missing screen/proof into True.
+
+    Do not import entry/exit policy fields (such as exit_policy_family):
+    four-family arbitration may have changed the chosen entry style after
+    the PREP row acquired those policy fields. build_entry_exit_plan must
+    derive the position's exit contract from the final winning style.
     """
     result = dict(runtime_features)
     source = scored_final30_row if isinstance(scored_final30_row, dict) else {}
