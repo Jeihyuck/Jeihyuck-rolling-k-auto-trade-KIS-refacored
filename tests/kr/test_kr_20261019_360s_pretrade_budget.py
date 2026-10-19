@@ -93,3 +93,82 @@ def test_wsl_am_and_pm_defaults_use_360_and_380_budgets():
         source = (root / "scripts" / "wsl" / script).read_text(encoding="utf-8")
         assert 'PB1_TICK_HARD_TIMEOUT_SEC="${PB1_TICK_HARD_TIMEOUT_SEC:-360}"' in source
         assert 'PB1_MIN_TICK_BUDGET_SEC="${PB1_MIN_TICK_BUDGET_SEC:-380}"' in source
+
+
+def test_preintent_budget_defer_protects_durable_created_row():
+    from trader.pb1_engine import _kr_pb1_can_create_buy_intent
+
+    assert _kr_pb1_can_create_buy_intent(remaining_sec=float("inf"))
+    assert _kr_pb1_can_create_buy_intent(remaining_sec=360)
+    assert _kr_pb1_can_create_buy_intent(remaining_sec=45)
+    assert not _kr_pb1_can_create_buy_intent(remaining_sec=44.99)
+    assert not _kr_pb1_can_create_buy_intent(remaining_sec=20)
+    assert not _kr_pb1_can_create_buy_intent(remaining_sec=float("nan"))
+    assert not _kr_pb1_can_create_buy_intent(remaining_sec=-float("inf"))
+    assert not _kr_pb1_can_create_buy_intent(remaining_sec="unknown")
+
+
+def test_canonical_pretrade_http_does_not_probe_u_market_or_a_variant(monkeypatch):
+    """Exercise the real KIS quote retry loop with stubbed I/O, never a broker."""
+    import threading
+
+    class NoWs:
+        def subscribe_kr(self, code):
+            pass
+
+        def get_fresh_quote(self, market, code, *, max_age_sec):
+            return None
+
+    class AllowedGate:
+        def wait_until_allowed(self, endpoint, *, max_wait_sec):
+            return True
+
+    class NoWaitLimiter:
+        def wait(self, endpoint):
+            return None
+
+    class NotFoundResponse:
+        status_code = 200
+        text = "test only"
+
+        def json(self):
+            return {"rt_cd": "1", "msg1": "simulated quote miss"}
+
+    monkeypatch.setenv("KIS_WS_INITIAL_WAIT_SEC", "0")
+    monkeypatch.setenv("KIS_RETRY_MAX", "5")
+    monkeypatch.setattr(kis_wrapper, "get_kis_ws_price_service", lambda: NoWs())
+    monkeypatch.setattr(kis_wrapper, "get_kis_gate", lambda: AllowedGate())
+    monkeypatch.setattr(kis_wrapper, "_pick_tr", lambda env, key: ["TEST_TR"])
+    monkeypatch.setattr(kis_wrapper, "_kr_sleep_with_budget", lambda *a, **k: True)
+    kis_wrapper.price_cache.cache.pop(("inquire-price", "096530"), None)
+
+    api = object.__new__(kis_wrapper.KisAPI)
+    api.env = "practice"
+    api._concurrency_sem = threading.Semaphore(1)
+    api._limiter = NoWaitLimiter()
+    api._headers = lambda tr: {}
+    api._log_kis_resp = lambda *a, **k: None
+    calls = []
+
+    def _stub_request(method, url, **kwargs):
+        calls.append(dict(kwargs.get("params") or {}))
+        return NotFoundResponse()
+
+    api._safe_request = _stub_request
+
+    import pytest
+    with pytest.raises(RuntimeError, match="get_price_quote failed"):
+        api.get_price_quote("096530", retry_cap=2)
+
+    assert len(calls) == 2
+    assert all(row["fid_cond_mrkt_div_code"] == "J" for row in calls)
+    assert all(row["fid_input_iscd"] == "096530" for row in calls)
+
+
+def test_source_time_freshness_is_still_rejected_when_quote_is_old():
+    stale = {"prpr": 10000.0, "_source_ts": time.time() - 12}
+    checked, reason = freshness._validate_source_freshness(
+        stale, max_age_sec=5.0, source_kind="KIS_REST"
+    )
+    assert checked is None
+    assert reason.startswith("quote_stale:")
