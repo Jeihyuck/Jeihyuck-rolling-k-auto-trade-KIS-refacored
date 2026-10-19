@@ -2613,8 +2613,14 @@ class KisAPI:
             return {}
 
         start_time = time.time()
-        code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-        markets = ("J", "U")
+        # PB1 KR pretrade receives a normalized six-digit domestic symbol.
+        # Its governed REST fallback must not fan out to U/A variants on every
+        # transient failure: those are legacy generic-quote compatibility paths.
+        # Bound only the PB1 pretrade call; other callers keep all alternatives.
+        pretrade_kr_canonical = retry_cap is not None and c.isdigit() and len(c) == 6
+        code_variants = ([c] if pretrade_kr_canonical else
+                         ([c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]))
+        markets = ("J",) if pretrade_kr_canonical else ("J", "U")
         base = normalize_base_url(API_BASE_URL)
         url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
         last_error: Exception | None = None
@@ -2635,8 +2641,8 @@ class KisAPI:
         attempts = _bounded_quote_attempt_count(attempts, retry_max, retry_cap)
         if retry_cap is not None:
             logger.info(
-                "[KIS][QUOTE][BOUNDED_PRETRADE_RETRY] code=%s max_attempts=%s general_retry_max=%s",
-                c, attempts, retry_max,
+                "[KIS][QUOTE][BOUNDED_PRETRADE_RETRY] code=%s max_attempts=%s general_retry_max=%s canonical_kr=%s",
+                c, attempts, retry_max, int(pretrade_kr_canonical),
             )
         for attempt in range(1, attempts + 1):
             with self._concurrency_sem:
