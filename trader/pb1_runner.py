@@ -7245,14 +7245,33 @@ def run_once(
         # exits. The engine invokes these hooks on the SAME tick/deadline.
         engine_runner._kr_deferred_entry_scan = _kr_entry_scan_after_exit
 
+        # The previous KR_INFINITE dispatch lived after all PB1 BUY and
+        # postprocessing, causing twelve budget deferrals on Oct 19. The
+        # existing callback runs only AFTER PB1 protective exit evaluation,
+        # before unrelated PB1 entry scans. Reuse its single balance snapshot
+        # and preserve the KR_INFINITE owner and risk/sizing policy unchanged.
+        kr_inf_run_result = None
+        kr_inf_invoked = False
+
         def _kr_after_protective_exit():
-            # KR_INFINITE owns this sleeve. Only schedule price subscription;
-            # do not change strategy owner, signal, sizing or risk policy.
+            nonlocal kr_inf_run_result, kr_inf_invoked
+            if kr_inf_invoked:
+                return
+            kr_inf_invoked = True
             try:
-                from trader.kr.infinite.runner import prewarm_kr_infinite_price
-                prewarm_kr_infinite_price("122630")
-            except Exception as inf_prewarm_exc:
-                logger.warning("[KR_INF][PRICE_PREWARM][FAIL_SOFT] err=%s", inf_prewarm_exc)
+                from trader.kr.infinite.runner import run_kr_infinite_sleeve_tick
+                kr_inf_run_result = run_kr_infinite_sleeve_tick(
+                    kis=kis, balance_snapshot=balance_snapshot_raw or {},
+                    env=env_effective, trade_date=trade_date,
+                    allow_entry=bool(order_allowed and calc_allowed),
+                )
+                logger.info(
+                    "[KR_INF][TICK][AFTER_PROTECTIVE_SELL] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
+                    kr_inf_run_result.decision.action.value,
+                    kr_inf_run_result.decision.reason,
+                )
+            except Exception as inf_exc:
+                logger.exception("[KR_INF][BLOCK] reason=isolated_exception_after_protective_exit error=%s", inf_exc)
 
         engine_runner._kr_after_protective_exit = _kr_after_protective_exit
 
@@ -7670,21 +7689,16 @@ def run_once(
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
-    # The PB1 tick owns reconciliation and the single authoritative balance
-    # snapshot.  Invoke the KR Infinite sleeve here (not from a scheduler or a
-    # session boundary) and isolate failures from standard PB1 processing.
-    try:
-        from trader.kr.infinite.runner import run_kr_infinite_sleeve_tick
-        inf = run_kr_infinite_sleeve_tick(
-            kis=kis, balance_snapshot=balance_snapshot_raw or {}, env=env_effective,
-            trade_date=trade_date, allow_entry=bool(order_allowed and calc_allowed),
+    # KR_INFINITE ran at the first safe point AFTER protective exits and
+    # BEFORE PB1 entries. Never dispatch it a second time after engine.run().
+    inf = locals().get("kr_inf_run_result")
+    metrics["kr_infinite_decision"] = (
+        inf.decision.action.value if inf is not None else "BLOCK"
+    )
+    if not locals().get("kr_inf_invoked", False):
+        logger.warning(
+            "[KR_INF][NOT_RUN] reason=protective_exit_handoff_not_completed action=FAIL_CLOSED"
         )
-        metrics["kr_infinite_decision"] = inf.decision.action.value
-        logger.info("[KR_INF][TICK] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
-                    inf.decision.action.value, inf.decision.reason)
-    except Exception as exc:
-        metrics["kr_infinite_decision"] = "BLOCK"
-        logger.exception("[KR_INF][BLOCK] reason=isolated_exception error=%s", exc)
     result_status = result.status if result else "UNKNOWN"
     
     # ✅ DIAG 모드 실행 요약 로그
