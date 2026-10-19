@@ -95,3 +95,106 @@ def test_missing_final30_row_never_invents_completed_daily_proof():
     )
     assert "as_of" not in result
     assert "candidate_family_screens" not in result
+
+
+@pytest.mark.parametrize(
+    "old_style,old_policy,new_family,old_horizon,expected_horizon,expected_policy,expected_eod,expected_force",
+    [
+        # Codex P1 (review comment #4311533045): PREP originally Pullback
+        # but final arbitration promotes verified Momentum. A stale swing
+        # exit policy must NOT override the selected intraday contract.
+        ("PULLBACK", "SWING_STAGED_EXIT", "MOMENTUM", "SWING",
+         "DAY_TRADE", "INTRADAY_PROFIT_PROTECT", "FORCE_EXIT", True),
+        # Reverse direction: original Momentum policy must not leak into a
+        # final qualifying Pullback/SWING position.
+        ("MOMENTUM", "INTRADAY_PROFIT_PROTECT", "PULLBACK", "DAY_TRADE",
+         "SWING", "SWING_STAGED_EXIT", "CARRY_IF_NO_EXIT_SIGNAL", False),
+        ("PULLBACK", "SWING_STAGED_EXIT", "BREAKOUT", "SWING",
+         "DAY_TRADE", "INTRADAY_PROFIT_PROTECT", "FORCE_EXIT", True),
+        ("MOMENTUM", "INTRADAY_PROFIT_PROTECT", "VCP", "DAY_TRADE",
+         "SWING", "SWING_STAGED_EXIT", "CARRY_IF_NO_EXIT_SIGNAL", False),
+    ],
+)
+def test_arbitrated_final_style_owns_exit_plan_not_stale_prep_policy(
+    monkeypatch, old_style, old_policy, new_family, old_horizon,
+    expected_horizon, expected_policy, expected_eod, expected_force,
+):
+    from trader.kr_four_family_candidate_admission import (
+        apply_verified_family_final_arbitration,
+    )
+    from trader.trade_plan import build_entry_exit_plan, classify_close_action_from_plan
+
+    monkeypatch.setenv("PB1_ALLOW_STYLE_MAPPED_ENTRY_EXIT_PLAN", "1")
+    code = "096530"
+    source_row = {
+        "code": code, "entry_style_selected": old_style,
+        "exit_policy_family": old_policy,
+        "trade_horizon": old_horizon,
+        "eod_action": "FORCE_EXIT" if old_horizon == "DAY_TRADE" else "CARRY_IF_NO_EXIT_SIGNAL",
+        "force_eod_close": old_horizon == "DAY_TRADE",
+        "as_of": "2026-10-16",
+        "candidate_family_proof_as_of": "2026-10-16",
+        "candidate_family_screens": {old_style: True, new_family: True},
+        "candidate_family_quality_percentiles": {
+            old_style: 0.65, new_family: 0.99,
+        },
+        "score_final": 85.0,
+        "meta": {},
+    }
+
+    apply_verified_family_final_arbitration([source_row])
+    assert source_row["entry_style_selected"] == new_family
+    # Legacy PREP metadata remains stale: copying it would repeat the P1.
+    assert source_row["exit_policy_family"] == old_policy
+
+    features = copy_final30_completed_daily_proof(
+        {
+            "entry_style_selected": source_row["entry_style_selected"],
+            "score_final": source_row["score_final"],
+            "atr_pct": 3.0,
+        },
+        source_row,
+        expected_code=code,
+    )
+    assert features["candidate_family_proof_as_of"] == "2026-10-16"
+    assert features["candidate_family_screens"][new_family] is True
+    assert features["selected_family_quality_percentile"] == 0.99
+    for key in ("exit_policy_family", "trade_horizon", "eod_action", "force_eod_close", "entry_thesis"):
+        assert key not in features, f"PREP policy must not leak into final plan: {key}"
+
+    # Exercise the actual plan builder, not only a dictionary comparison.
+    plan = build_entry_exit_plan(
+        code=code, market="KOSDAQ",
+        entry_style_selected=features["entry_style_selected"],
+        entry_reason=features["entry_style_selected"],
+        entry_price=10000.0,
+        features=features,
+    ).to_dict()
+    assert plan["entry_style_selected"] == "ENTRY_" + new_family
+    assert plan["trade_horizon"] == expected_horizon
+    assert plan["exit_policy_family"] == expected_policy
+    assert plan["eod_action"] == expected_eod
+    assert plan["force_eod_close"] is expected_force
+
+    close_action, close_reason = classify_close_action_from_plan(plan)
+    if expected_force:
+        assert (close_action, close_reason) == ("FORCE_SELL", "EOD_FORCE_EXIT")
+    else:
+        assert close_action == "CARRY"
+        assert close_reason == "SWING_CARRY"
+
+
+def test_final30_proof_transfer_does_not_override_runtime_exit_policy():
+    """The helper transports proof, never synthesizes/replaces live plan state."""
+    final30 = {
+        "code": "096530", "as_of": "2026-10-16",
+        "candidate_family_proof_as_of": "2026-10-16",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+    }
+    copied = copy_final30_completed_daily_proof(
+        {"entry_style_selected": "MOMENTUM",
+         "exit_policy_family": "INTRADAY_PROFIT_PROTECT"},
+        final30, expected_code="096530",
+    )
+    assert copied["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+    assert copied["candidate_family_proof_as_of"] == "2026-10-16"
