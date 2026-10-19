@@ -323,6 +323,27 @@ def _kr_pb1_can_create_buy_intent(*, remaining_sec: float, required_sec: float =
     )
 
 
+def _close_pb1_prebroker_buy_intent(orders_repo, *, env: str, client_order_key: str, code: str, reason: str) -> bool:
+    """Close only known pre-broker BUY intents; never handle ambiguous broker ACK here."""
+    if not client_order_key:
+        return False
+    try:
+        orders_repo.mark_error(env, client_order_key, {
+            "rt_cd": "LOCAL_PREBROKER_ABORT",
+            "msg_cd": str(reason),
+            "msg1": "broker_not_called; safe_to_retry",
+            "broker_submit": False,
+        })
+        logger.info("[ORDER][PRE_BROKER][INTENT_CLOSED] code=%s key=%s reason=%s", code, client_order_key, reason)
+        return True
+    except Exception:
+        logger.exception(
+            "[ORDER][PRE_BROKER][INTENT_CLOSE_UNRESOLVED] code=%s key=%s reason=%s action=KEEP_BLOCK_UNTIL_RECONCILED",
+            code, client_order_key, reason,
+        )
+        return False
+
+
 def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
     try:
         flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
@@ -11058,6 +11079,7 @@ class PB1Engine:
             entry_meta.get("pivot_price_at_entry"),
             entry_meta.get("score_final_at_entry"),
         )
+        os.environ["PB1_LAST_STAGE"] = "buy.intent.ledger"
         try:
             self._append_ledger_event(
                 event_type="ORDER_INTENT",
@@ -11076,6 +11098,11 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][LEDGER][INTENT_FAIL] code=%s", display_code)
             if not self.dry_run:
+                # This exception occurred before any KIS order request.
+                _close_pb1_prebroker_buy_intent(
+                    self.orders_repo, env=self.env, client_order_key=effective_client_order_key,
+                    code=display_code, reason="INTENT_LEDGER_ABORT",
+                )
                 raise
             status["skipped_reason"] = "intent_log_fail"
             return status
@@ -11118,6 +11145,10 @@ class PB1Engine:
         
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
+            _close_pb1_prebroker_buy_intent(
+                self.orders_repo, env=self.env, client_order_key=effective_client_order_key,
+                code=display_code, reason="KIS_MISSING",
+            )
             self._log_final_skip(
                 cf=cf,
                 reason_code="KIS_MISSING",
