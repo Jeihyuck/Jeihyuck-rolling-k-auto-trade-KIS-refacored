@@ -209,3 +209,79 @@ def test_failed_prebroker_db_cleanup_is_not_falsely_reported_as_reconciled():
         FailedOrdersRepo(), env="practice", client_order_key="",
         code="096530", reason="INTENT_LEDGER_ABORT"
     )
+
+
+def test_real_kr_loop_allows_240s_candidate_before_360s_deadline_without_overlap(monkeypatch, tmp_path):
+    """Offline session-runner replay: at 180s the 240s candidate would expire."""
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from zoneinfo import ZoneInfo
+    from trader import pb1_runner as runner
+
+    market_start = datetime(2026, 10, 19, 13, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    clock = {"elapsed": 0.0}
+    started_at = []
+    timeout_values = []
+
+    def _sleep(seconds):
+        assert seconds >= 0
+        clock["elapsed"] += seconds
+
+    monkeypatch.setattr(
+        runner, "time_mod",
+        SimpleNamespace(monotonic=lambda: clock["elapsed"], sleep=_sleep),
+    )
+    monkeypatch.setattr(
+        runner, "_get_now_kst", lambda: market_start + timedelta(seconds=clock["elapsed"])
+    )
+    monkeypatch.setattr(runner, "_resolve_session_kind", lambda: "afternoon")
+    monkeypatch.setattr(
+        runner, "_resolve_session_end_dt", lambda _: market_start + timedelta(seconds=400)
+    )
+    monkeypatch.setattr(runner, "_resolve_loop_limits", lambda: (10, 10, 400, False))
+    monkeypatch.setattr(runner, "make_engine", lambda: MagicMock())
+    monkeypatch.setattr(runner, "RunsRepo", lambda _: MagicMock())
+    monkeypatch.setattr(runner, "try_acquire_lock", lambda *a, **k: True)
+    monkeypatch.setattr(runner, "_acquire_session_guard_or_takeover", lambda **k: {})
+    monkeypatch.setattr(runner, "runtime_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "decide_window", lambda **k: object())
+    monkeypatch.setattr(runner, "_run_nontrading_smoke_if_needed", lambda **k: False)
+    monkeypatch.setattr(runner.signal, "signal", lambda *a, **k: None)
+    for name in (
+        "_touch_session_guard", "_ensure_bootstrap_migrations", "_write_change_flag",
+        "_finish_session_guard", "release_advisory_xact_lock", "dispose_engine_safely",
+        "_record_session_execution_marker", "_write_session_result_file",
+    ):
+        monkeypatch.setattr(runner, name, lambda *a, **k: None)
+
+    def _watchdog(*, timeout_sec, call):
+        timeout_values.append(timeout_sec)
+        return call()
+
+    def _offline_candidate(**kwargs):
+        started_at.append(clock["elapsed"])
+        assert kwargs["max_seconds"] == 360
+        clock["elapsed"] += 240
+        return [], True, {
+            "api_submitted": 1, "buy_orders": 1, "buy_orders_ack": 1,
+            "order_candidates": 1, "accepted": 1,
+        }, "entry", "OK"
+
+    monkeypatch.setattr(runner, "_run_once_with_hard_timeout", _watchdog)
+    monkeypatch.setattr(runner, "run_once", _offline_candidate)
+    monkeypatch.setenv("PB1_CANDIDATE_ONLY", "1")
+    monkeypatch.setenv("PB1_LOOP_INTERVAL_SEC", "60")
+    monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "360")
+    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "380")
+    monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+
+    runner._run_loop(
+        args=SimpleNamespace(window="day", env="practice", strategy_mode="LIVE")
+    )
+
+    assert started_at == [0.0]
+    assert timeout_values == [360]
+    assert clock["elapsed"] >= 240
