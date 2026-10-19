@@ -17572,6 +17572,10 @@ class PB1Engine:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
         
+        # Share the actual protective-exit pass outcome with the owner handoff.
+        # A degraded/failed PB1 protection pass must never enable a new
+        # KR_INFINITE entry using an unverified shared portfolio snapshot.
+        self._kr_exit_pass_ok = bool(exit_pass_ok)
         _after_exit = getattr(self, "_kr_after_protective_exit", None)
         if callable(_after_exit):
             _after_exit()
