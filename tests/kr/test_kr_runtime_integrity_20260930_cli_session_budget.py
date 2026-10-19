@@ -36,8 +36,8 @@ def test_direct_cli_am_refreshes_budget_after_guard_was_installed_without_sessio
     guarded_init(object())
 
     assert len(calls) == 1
-    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "180"
-    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "360"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "380"
     assert os.environ["KR_POST_ENGINE_RESERVE_SEC"] == "20"
     assert os.environ["KR_ORDER_SUBMIT_MIN_REMAINING_SEC"] == "20"
 
