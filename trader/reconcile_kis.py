@@ -2022,6 +2022,30 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     filled_qty=cumulative_filled_qty,
                 )
 
+    # Repair only claims with a durable, explicit before-KIS-request error.
+    # The normal submit path already attempts release_before_submit, but a DB
+    # failure there may leave the action IN_FLIGHT across restart.  Missing
+    # broker IDs, EXPIRED rows, and ambiguous ACKs are never sufficient proof.
+    if (
+        strategy == "pb1_pullback_close"
+        and degraded_reason is None
+        and str(ccld_status).lower() == "ok"
+        and hasattr(orders_repo, "recover_proven_kr_pb1_prebroker_claims")
+    ):
+        try:
+            recovered_claims = orders_repo.recover_proven_kr_pb1_prebroker_claims(env=env)
+            if recovered_claims:
+                logger.info(
+                    "[RECONCILE][KR_PB1][PROVEN_PREBROKER_CLAIMS_RECOVERED] count=%s",
+                    recovered_claims,
+                )
+        except Exception as exc:
+            degraded_reason = "prebroker_claim_recovery_failed"
+            logger.warning(
+                "[RECONCILE][KR_PB1][PREBROKER_CLAIM_RECOVERY_FAIL] err_type=%s action=RETAIN_FENCE",
+                type(exc).__name__,
+            )
+
     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
     if execution_claim_observation_failures:
         degraded_reason = degraded_reason or "execution_claim_observation_failed"
