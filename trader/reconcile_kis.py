@@ -2039,6 +2039,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     "[RECONCILE][KR_PB1][PROVEN_PREBROKER_CLAIMS_RECOVERED] count=%s",
                     recovered_claims,
                 )
+            # 2026-10-13's source SHA proves five historical SELL errors
+            # occurred in get_positions() BEFORE order HTTP. Their old handler
+            # wrongly called them UNRESOLVED_ACK. This source-proven migration
+            # is tightly scoped to practice / original SHA / exact code/date/
+            # exception; true ambiguous broker orders retain their fence.
+            if hasattr(orders_repo, "recover_audited_oct13_kr_pb1_prehttp_sells"):
+                recovered_legacy_sells = orders_repo.recover_audited_oct13_kr_pb1_prehttp_sells(env=env)
+                if recovered_legacy_sells:
+                    logger.warning(
+                        "[RECONCILE][KR_PB1][OCT13_LEGACY_PREHTTP_SELLS_CORRECTED] count=%s",
+                        recovered_legacy_sells,
+                    )
         except Exception as exc:
             degraded_reason = "prebroker_claim_recovery_failed"
             logger.warning(
