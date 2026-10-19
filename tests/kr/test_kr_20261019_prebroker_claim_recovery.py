@@ -5,7 +5,7 @@ broker-ambiguous order must retain its durable execution fence.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from uuid import uuid4
 
 import sqlalchemy as sa
@@ -161,7 +161,7 @@ def test_broker_uncertainty_expired_and_other_owner_are_not_released():
         ),
         _claim(
             engine, schema, repo, epoch, code="007000",
-            submitted_at="2026-10-19 10:00:00",
+            submitted_at=datetime(2026, 10, 19, 10, 0),
         ),
         _claim(engine, schema, repo, epoch, code="123123", owner="KR_INFINITE"),
         _claim(
