@@ -61,6 +61,31 @@ logger = logging.getLogger(__name__)
 KR_BUY_ENTRY_CONTRACT_VERSION = "kr_buy_entry_contract_v1"
 
 
+def _proven_kr_pb1_before_kis_request(order: dict[str, Any]) -> bool:
+    """Only explicit local pre-HTTP failure permits claim release; never infer from absent ID."""
+    if str(order.get("status") or "").upper() != "ERROR":
+        return False
+    if any(order.get(field) is not None for field in (
+        "submitted_at", "acked_at", "kis_odno", "broker_order_id",
+    )):
+        return False
+    response = order.get("response_json")
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(response, dict):
+        return False
+    return (
+        response.get("broker_submit") is False
+        and str(response.get("rt_cd") or "") == "LOCAL_SUBMIT_FAILURE"
+        and str(response.get("msg_cd") or "") == "KisTemporaryError"
+        and str(response.get("msg1") or "").strip()
+        == "KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_REQUEST"
+    )
+
+
 def _kr_buy_entry_contract_payload(request_json: dict[str, Any]) -> dict[str, Any]:
     """Return the immutable fields reconciliation needs to promote a BUY fill."""
     plan = request_json.get("entry_exit_plan")
@@ -3175,6 +3200,76 @@ class OrdersRepo:
             )
         action_key, attempt_id = attempt
         self._execution_claim_repo.release_before_submit(action_key, attempt_id=attempt_id)
+
+    def recover_proven_kr_pb1_prebroker_claims(self, *, env: str, trade_date: date | None = None, limit: int = 32) -> int:
+        """Release only PB1 local pre-KIS timeout claims in the active KR epoch."""
+        env = str(env or "").strip().lower()
+        if env not in {"practice", "real", "live"}:
+            return 0
+        today = trade_date or now_kst().date()
+        account_key = get_account_key(env=env)
+        actions = self._execution_claim_repo.actions
+        attempts = self._execution_claim_repo.attempts
+        orders = self._schema.orders
+        with self.engine.connect() as conn:
+            active_epoch = active_trading_epoch_id(
+                conn, env=env, account_id=account_key,
+                required=trading_epoch_enforced(),
+            )
+            if not active_epoch:
+                return 0
+            join = actions.join(
+                attempts,
+                and_(actions.c.action_key == attempts.c.action_key,
+                     actions.c.active_attempt_id == attempts.c.attempt_id),
+            ).join(
+                orders,
+                and_(orders.c.client_order_key == attempts.c.client_order_key,
+                     orders.c.env == actions.c.env,
+                     orders.c.trading_epoch_id == actions.c.trading_epoch_id),
+            )
+            rows = conn.execute(
+                select(
+                    actions.c.action_key, attempts.c.attempt_id, orders.c.status,
+                    orders.c.response_json, orders.c.submitted_at, orders.c.acked_at,
+                    orders.c.kis_odno, orders.c.broker_order_id,
+                ).select_from(join).where(
+                    actions.c.env == env,
+                    actions.c.account_id == account_key,
+                    actions.c.market == "KR",
+                    actions.c.strategy_owner == "PB1",
+                    actions.c.trading_epoch_id == active_epoch,
+                    actions.c.trade_date == today,
+                    actions.c.action.like("BUY_ENTRY:PB1-%"),
+                    actions.c.action_state == "IN_FLIGHT",
+                    attempts.c.attempt_state == "CREATED",
+                    attempts.c.authoritative.is_(False),
+                    orders.c.strategy == "pb1_pullback_close",
+                    orders.c.side == "BUY",
+                    orders.c.status == "ERROR",
+                    orders.c.submitted_at.is_(None),
+                    orders.c.acked_at.is_(None),
+                    orders.c.kis_odno.is_(None),
+                    orders.c.broker_order_id.is_(None),
+                ).limit(min(max(1, int(limit)), 64))
+            ).mappings().all()
+        released = 0
+        for row in rows:
+            if not _proven_kr_pb1_before_kis_request(dict(row)):
+                continue
+            try:
+                self._execution_claim_repo.release_before_submit(
+                    str(row["action_key"]), attempt_id=str(row["attempt_id"]),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[KR][CLAIM][PROVEN_PREBROKER_RELEASE_FAIL] err_type=%s action=RETAIN_FENCE",
+                    type(exc).__name__,
+                )
+                continue
+            released += 1
+            logger.info("[KR][CLAIM][PROVEN_PREBROKER_RELEASED] proof=BEFORE_KIS_REQUEST")
+        return released
 
     def _read_mappings_with_guard(
         self,
