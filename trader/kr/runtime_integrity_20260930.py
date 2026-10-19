@@ -5,8 +5,8 @@ changing PB1 entry thresholds, sizing, exit policy, durable order economics, or
 KR_INFINITE ownership.
 
 1. AM/afternoon PB1 keeps the PR148 20s pre-submit and 20s post-engine reserves,
-   but raises the legacy 90s tick ceiling to 180s and requires 200s remaining
-   before starting a new tick near the session end.
+   but raises legacy 90s/180s tick ceilings to 360s and requires 380s remaining
+   before starting a new tick near the session end. The close session is unchanged.
 2. PB1 BUY pretrade no longer uses the independent ``get_quote_safe`` path.
    Immediately before pretrade validation it discards only a REST price-cache
    row older than the existing 5s KR freshness contract, then calls the PR140
@@ -287,12 +287,15 @@ def _apply_live_session_budget_contract() -> None:
         return
 
     timeout_raw = str(os.getenv("PB1_TICK_HARD_TIMEOUT_SEC") or "").strip()
-    if timeout_raw in {"", "90", "90.0"}:
-        os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] = "180"
+    if timeout_raw in {"", "90", "90.0", "180", "180.0"}:
+        # Retire the 180s live AM/PM ceiling observed aborting KR orders on Oct 19.
+        # Other explicit operator settings (e.g. 210s) still take precedence.
+        os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] = "360"
 
     min_budget_raw = str(os.getenv("PB1_MIN_TICK_BUDGET_SEC") or "").strip()
-    if min_budget_raw in {"", "75", "75.0", "105", "105.0"}:
-        os.environ["PB1_MIN_TICK_BUDGET_SEC"] = "200"
+    if min_budget_raw in {"", "75", "75.0", "105", "105.0", "200", "200.0"}:
+        # Reserve a complete 360s tick plus 20s session-boundary cushion.
+        os.environ["PB1_MIN_TICK_BUDGET_SEC"] = "380"
 
     os.environ.setdefault("KR_POST_ENGINE_RESERVE_SEC", "20")
     os.environ.setdefault("KR_ORDER_SUBMIT_MIN_REMAINING_SEC", "20")

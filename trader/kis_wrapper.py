@@ -328,6 +328,16 @@ def set_kr_tick_deadline(deadline_monotonic: float | None) -> None:
     )
 
 
+def _bounded_quote_attempt_count(requested: int, retry_max: int, cap: int | None = None) -> int:
+    """Preserve the general quote retry policy, optionally cap PB1 pretrade retries.
+
+    A pretrade quote must still pass the unchanged source-time freshness and
+    tradeability checks; a bounded failure only defers that BUY to a later tick.
+    """
+    attempts = max(1, int(requested), int(retry_max))
+    return min(attempts, max(1, int(cap))) if cap is not None else attempts
+
+
 def get_kr_tick_deadline() -> float | None:
     """Expose the shared deadline so safety layers can reserve tail budget."""
     value = getattr(_KR_TICK_DEADLINE_STATE, "deadline", None)
@@ -2555,7 +2565,7 @@ class KisAPI:
         
         raise RuntimeError(f"invalid last price 0 for {code}")
 
-    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None) -> dict:
         """
         inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
@@ -2603,8 +2613,14 @@ class KisAPI:
             return {}
 
         start_time = time.time()
-        code_variants = [c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]
-        markets = ("J", "U")
+        # PB1 KR pretrade receives a normalized six-digit domestic symbol.
+        # Its governed REST fallback must not fan out to U/A variants on every
+        # transient failure: those are legacy generic-quote compatibility paths.
+        # Bound only the PB1 pretrade call; other callers keep all alternatives.
+        pretrade_kr_canonical = retry_cap is not None and c.isdigit() and len(c) == 6
+        code_variants = ([c] if pretrade_kr_canonical else
+                         ([c, f"A{c}"] if not c.startswith("A") else [c, c[1:]]))
+        markets = ("J",) if pretrade_kr_canonical else ("J", "U")
         base = normalize_base_url(API_BASE_URL)
         url = f"{base}/uapi/domestic-stock/v1/quotations/inquire-price"
         last_error: Exception | None = None
@@ -2622,7 +2638,12 @@ class KisAPI:
         retry_max = _env_int("KIS_RETRY_MAX", 5)
         base_sleep = _env_float("KIS_RETRY_BASE_SLEEP", 1.2)
         jitter = _env_float("KIS_RETRY_JITTER", 0.5)
-        attempts = max(attempts, retry_max)
+        attempts = _bounded_quote_attempt_count(attempts, retry_max, retry_cap)
+        if retry_cap is not None:
+            logger.info(
+                "[KIS][QUOTE][BOUNDED_PRETRADE_RETRY] code=%s max_attempts=%s general_retry_max=%s canonical_kr=%s",
+                c, attempts, retry_max, int(pretrade_kr_canonical),
+            )
         for attempt in range(1, attempts + 1):
             with self._concurrency_sem:
                 self._limiter.wait("price-quote")

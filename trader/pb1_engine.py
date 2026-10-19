@@ -307,6 +307,43 @@ class PB1StageTimeout(RuntimeError):
     pass
 
 
+def _kr_pb1_can_create_buy_intent(*, remaining_sec: float, required_sec: float = 45.0) -> bool:
+    """Avoid durable CREATED orders when KR's shared tick has too little runway.
+
+    This is a pre-broker gate, not evidence that any existing CREATED row is safe
+    to expire. Existing uncertain rows remain subject to broker reconciliation.
+    """
+    try:
+        remaining = float(remaining_sec)
+        minimum = max(25.0, float(required_sec))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (math.isinf(remaining) and remaining > 0) or (
+        math.isfinite(remaining) and remaining >= minimum
+    )
+
+
+def _close_pb1_prebroker_buy_intent(orders_repo, *, env: str, client_order_key: str, code: str, reason: str) -> bool:
+    """Close only known pre-broker BUY intents; never handle ambiguous broker ACK here."""
+    if not client_order_key:
+        return False
+    try:
+        orders_repo.mark_error(env, client_order_key, {
+            "rt_cd": "LOCAL_PREBROKER_ABORT",
+            "msg_cd": str(reason),
+            "msg1": "broker_not_called; safe_to_retry",
+            "broker_submit": False,
+        })
+        logger.info("[ORDER][PRE_BROKER][INTENT_CLOSED] code=%s key=%s reason=%s", code, client_order_key, reason)
+        return True
+    except Exception:
+        logger.exception(
+            "[ORDER][PRE_BROKER][INTENT_CLOSE_UNRESOLVED] code=%s key=%s reason=%s action=KEEP_BLOCK_UNTIL_RECONCILED",
+            code, client_order_key, reason,
+        )
+        return False
+
+
 def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
     try:
         flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
@@ -10931,6 +10968,32 @@ class PB1Engine:
         }
         logger.info("[ORDER][BASELINE] code=%s side=BUY snapshot_id=%s pre_qty=%s requested_qty=%s",
                     cf.code, request_payload.get("balance_snapshot_id"), pre_order_holding_qty, qty)
+        # An intent becomes a blocking CREATED row before KIS is contacted.
+        # Reserve room for fresh quote and 20s broker-submit checks before
+        # persisting it; last-second attempts on Oct 19 stranded CREATED rows.
+        # This PB1-only condition does not apply to the KR_INFINITE owner.
+        if self._is_kr_equity_context() and str(cf.code).lstrip("A").zfill(6) != str(os.getenv("KR_INFINITE_SYMBOL", "122630")).lstrip("A").zfill(6):
+            from trader.kis_wrapper import kr_tick_remaining_sec
+            remaining_before_intent = kr_tick_remaining_sec()
+            min_before_intent = os.getenv("KR_PB1_BUY_PREINTENT_MIN_REMAINING_SEC", "45")
+            if not _kr_pb1_can_create_buy_intent(
+                remaining_sec=remaining_before_intent,
+                required_sec=min_before_intent,
+            ):
+                logger.warning(
+                    "[ORDER][PRE_INTENT][LOW_TICK_BUDGET] code=%s remaining_sec=%.2f min_required_sec=%s action=DEFER_WITHOUT_CREATED_ROW",
+                    display_code, remaining_before_intent, min_before_intent,
+                )
+                self._log_final_skip(
+                    cf=cf, reason_code="LOW_PREINTENT_TICK_BUDGET",
+                    reason_detail="Insufficient shared tick time before durable BUY intent",
+                    stage=stage, price=record_price,
+                )
+                status["skipped"] = 1
+                status["skipped_reason"] = "LOW_PREINTENT_TICK_BUDGET"
+                status["submit_terminal_status"] = "SKIPPED_RETRYABLE_PRE_BROKER"
+                status["terminal_event"] = "FINAL_SKIP"
+                return status
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()
@@ -10943,6 +11006,7 @@ class PB1Engine:
                 effective_client_order_key,
                 existing_status,
             )
+        os.environ["PB1_LAST_STAGE"] = "buy.intent.persist"
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -11015,6 +11079,7 @@ class PB1Engine:
             entry_meta.get("pivot_price_at_entry"),
             entry_meta.get("score_final_at_entry"),
         )
+        os.environ["PB1_LAST_STAGE"] = "buy.intent.ledger"
         try:
             self._append_ledger_event(
                 event_type="ORDER_INTENT",
@@ -11033,6 +11098,11 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][LEDGER][INTENT_FAIL] code=%s", display_code)
             if not self.dry_run:
+                # This exception occurred before any KIS order request.
+                _close_pb1_prebroker_buy_intent(
+                    self.orders_repo, env=self.env, client_order_key=effective_client_order_key,
+                    code=display_code, reason="INTENT_LEDGER_ABORT",
+                )
                 raise
             status["skipped_reason"] = "intent_log_fail"
             return status
@@ -11075,6 +11145,10 @@ class PB1Engine:
         
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
+            _close_pb1_prebroker_buy_intent(
+                self.orders_repo, env=self.env, client_order_key=effective_client_order_key,
+                code=display_code, reason="KIS_MISSING",
+            )
             self._log_final_skip(
                 cf=cf,
                 reason_code="KIS_MISSING",
@@ -11087,6 +11161,7 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        os.environ["PB1_LAST_STAGE"] = "buy.pretrade_quote"
         if not self._pretrade_check(
             code=cf.code,
             market=cf.market,
@@ -11131,6 +11206,7 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        os.environ["PB1_LAST_STAGE"] = "buy.execution_claim"
         try:
             claim_identity, claim = self._claim_pb1_submit_action(
                 client_order_key=effective_client_order_key or "",
@@ -15385,6 +15461,23 @@ class PB1Engine:
                     "precomputed_usable_row": bool(usable_precomputed_row),
                     "precomputed_usable_reasons": list(usable_reasons),
                 }
+                # The four-family gate consumes completed-daily proof fields.
+                # Those fields exist in Final30 but were dropped when features
+                # were manually rebuilt, falsely rejecting October 19's scored
+                # candidates with completed_daily_proof_date_mismatch.
+                # Only copy the original scored Final30 row; never manufacture
+                # proof from runtime scores or fill a missing date with today.
+                from trader.kr.final30_proof import copy_final30_completed_daily_proof
+                source_final30 = self._precomputed_final30_map.get(code)
+                features = copy_final30_completed_daily_proof(
+                    features, source_final30, expected_code=code,
+                )
+                logger.info(
+                    "[KR][FINAL30][PROOF_TRANSFER] code=%s source_row=%s as_of=%s proof_as_of=%s screen_keys=%s",
+                    code, int(isinstance(source_final30, dict)),
+                    features.get("as_of"), features.get("candidate_family_proof_as_of"),
+                    sorted((features.get("candidate_family_screens") or {}).keys()),
+                )
                 features["market"] = market
                 filter_thresholds = getattr(self, "filter_thresholds", None)
                 features["_pb1_vol_max"] = float(getattr(filter_thresholds, "vol_contraction_max", PB1_VOL_MAX))
@@ -17479,6 +17572,10 @@ class PB1Engine:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
         
+        # Share the actual protective-exit pass outcome with the owner handoff.
+        # A degraded/failed PB1 protection pass must never enable a new
+        # KR_INFINITE entry using an unverified shared portfolio snapshot.
+        self._kr_exit_pass_ok = bool(exit_pass_ok)
         _after_exit = getattr(self, "_kr_after_protective_exit", None)
         if callable(_after_exit):
             _after_exit()

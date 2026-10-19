@@ -61,6 +61,31 @@ logger = logging.getLogger(__name__)
 KR_BUY_ENTRY_CONTRACT_VERSION = "kr_buy_entry_contract_v1"
 
 
+def _proven_kr_pb1_before_kis_request(order: dict[str, Any]) -> bool:
+    """Only explicit local pre-HTTP failure permits claim release; never infer from absent ID."""
+    if str(order.get("status") or "").upper() != "ERROR":
+        return False
+    if any(order.get(field) is not None for field in (
+        "submitted_at", "acked_at", "kis_odno", "broker_order_id",
+    )):
+        return False
+    response = order.get("response_json")
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(response, dict):
+        return False
+    return (
+        response.get("broker_submit") is False
+        and str(response.get("rt_cd") or "") == "LOCAL_SUBMIT_FAILURE"
+        and str(response.get("msg_cd") or "") == "KisTemporaryError"
+        and str(response.get("msg1") or "").strip()
+        == "KR_TICK_DEADLINE_EXHAUSTED_BEFORE_KIS_REQUEST"
+    )
+
+
 def _kr_buy_entry_contract_payload(request_json: dict[str, Any]) -> dict[str, Any]:
     """Return the immutable fields reconciliation needs to promote a BUY fill."""
     plan = request_json.get("entry_exit_plan")
@@ -3175,6 +3200,217 @@ class OrdersRepo:
             )
         action_key, attempt_id = attempt
         self._execution_claim_repo.release_before_submit(action_key, attempt_id=attempt_id)
+
+    def recover_audited_oct13_kr_pb1_prehttp_sells(self, *, env: str, limit: int = 12) -> int:
+        """Atomically repair audited 2026-10-13 false-ambiguous SELL records.
+
+        This is NOT a generic UNRESOLVED_ACK expiry. The exact source commit
+        proves that its balance-budget exception happened before sell_stock_*
+        could issue any order HTTP request, even though older bookkeeping
+        wrote optimistic submitted_at and broker_submit:true. Preserve that
+        legacy response in the correction audit; leave all other unknown ACKs
+        fenced until KIS reconciliation proves their actual outcome.
+        """
+        if str(env).strip().lower() != "practice":
+            return 0
+        from trader.kr.legacy_sell_prebroker import (
+            LEGACY_PROVEN_PRE_HTTP_SHA, LEGACY_PROVEN_PRE_HTTP_DATE,
+            LEGACY_PROVEN_CODES, proven_oct13_prehttp_sell,
+        )
+        account_key = get_account_key(env="practice")
+        account_identity = hashlib.sha256(account_key.encode("utf-8")).hexdigest()
+        actions = self._execution_claim_repo.actions
+        attempts = self._execution_claim_repo.attempts
+        orders = self._schema.orders
+        runs = self._schema.runs
+        fills = self._schema.fills
+        clock = now_kst()
+        recovered = 0
+        with self.engine.begin() as conn:
+            epoch = active_trading_epoch_id(
+                conn, env="practice", account_id=account_key,
+                required=trading_epoch_enforced(),
+            )
+            if not epoch:
+                return 0
+            joined = (
+                actions.join(attempts, and_(
+                    actions.c.action_key == attempts.c.action_key,
+                    actions.c.active_attempt_id == attempts.c.attempt_id,
+                ))
+                .join(orders, and_(
+                    attempts.c.client_order_key == orders.c.client_order_key,
+                    orders.c.trading_epoch_id == actions.c.trading_epoch_id,
+                    orders.c.env == actions.c.env,
+                ))
+                .join(runs, orders.c.run_id == runs.c.run_id)
+            )
+            fill_present = select(fills.c.fill_id).where(
+                fills.c.order_id == orders.c.order_id,
+            ).exists()
+            query = select(
+                actions.c.action_key, actions.c.active_attempt_id,
+                actions.c.action, actions.c.action_state, actions.c.strategy_owner,
+                actions.c.trade_date, attempts.c.attempt_state,
+                orders.c.order_id, orders.c.code, orders.c.status.label("order_status"),
+                orders.c.side, orders.c.strategy, orders.c.stage,
+                orders.c.response_json, orders.c.acked_at, orders.c.kis_odno,
+                orders.c.broker_order_id, orders.c.submitted_at,
+                runs.c.git_sha, orders.c.env,
+            ).select_from(joined).where(
+                actions.c.env == "practice",
+                actions.c.market == "KR",
+                actions.c.account_id == account_identity,
+                actions.c.trading_epoch_id == epoch,
+                actions.c.trade_date == LEGACY_PROVEN_PRE_HTTP_DATE,
+                actions.c.strategy_owner == "PB1",
+                actions.c.action == "SELL:STOP_HIT_EFFECTIVE:FULL_EXIT",
+                actions.c.action_state == "UNCERTAIN",
+                attempts.c.attempt_state == "UNRESOLVED",
+                attempts.c.authoritative.is_(False),
+                orders.c.code.in_(tuple(LEGACY_PROVEN_CODES)),
+                orders.c.status == "UNRESOLVED_ACK",
+                orders.c.strategy == "pb1_pullback_close",
+                orders.c.side == "SELL",
+                orders.c.stage == "FULL_EXIT",
+                orders.c.acked_at.is_(None),
+                orders.c.kis_odno.is_(None),
+                orders.c.broker_order_id.is_(None),
+                runs.c.git_sha == LEGACY_PROVEN_PRE_HTTP_SHA,
+                ~fill_present,
+            ).limit(min(max(1, int(limit)), 32)).with_for_update()
+            for row in conn.execute(query).mappings().all():
+                row_dict = dict(row)
+                if not proven_oct13_prehttp_sell(row_dict):
+                    continue
+                old_response = row_dict["response_json"]
+                if isinstance(old_response, str):
+                    old_response = json.loads(old_response)
+                corrected = {
+                    **old_response,
+                    "broker_submit": False,
+                    "rt_cd": "LOCAL_PREBROKER_ABORT",
+                    "msg_cd": "HISTORICAL_KR_BALANCE_PRE_HTTP_PROVEN",
+                    "reconcile_required": False,
+                    "legacy_misclassified_response": old_response,
+                    "proof": {
+                        "source_commit": LEGACY_PROVEN_PRE_HTTP_SHA,
+                        "reason": "KR_BALANCE_BUDGET_EXHAUSTED_BEFORE_FETCH",
+                        "control_flow": "sell_stock_market/sell_stock_limit.get_positions BEFORE broker HTTP",
+                        "corrected_at": clock.isoformat(),
+                    },
+                }
+                action_result = conn.execute(sa.update(actions).where(
+                    actions.c.action_key == row_dict["action_key"],
+                    actions.c.active_attempt_id == row_dict["active_attempt_id"],
+                    actions.c.action_state == "UNCERTAIN",
+                ).values(
+                    active_attempt_id=None,
+                    action_state="OPEN",
+                    cumulative_filled_qty=actions.c.filled_qty_before_attempt,
+                    remaining_target_qty=actions.c.target_qty - actions.c.filled_qty_before_attempt,
+                    updated_at=clock,
+                ))
+                if action_result.rowcount != 1:
+                    raise RuntimeError("legacy SELL pre-HTTP action state changed concurrently")
+                attempt_result = conn.execute(sa.update(attempts).where(
+                    attempts.c.attempt_id == row_dict["active_attempt_id"],
+                    attempts.c.attempt_state == "UNRESOLVED",
+                ).values(
+                    attempt_state="ABANDONED_PRE_SUBMIT", authoritative=True,
+                    updated_at=clock,
+                ))
+                if attempt_result.rowcount != 1:
+                    raise RuntimeError("legacy SELL pre-HTTP attempt state changed concurrently")
+                order_result = conn.execute(sa.update(orders).where(
+                    orders.c.order_id == row_dict["order_id"],
+                    orders.c.status == "UNRESOLVED_ACK",
+                    orders.c.acked_at.is_(None),
+                    orders.c.kis_odno.is_(None),
+                    orders.c.broker_order_id.is_(None),
+                ).values(status="ERROR", response_json=corrected, updated_at=clock))
+                if order_result.rowcount != 1:
+                    raise RuntimeError("legacy SELL pre-HTTP order state changed concurrently")
+                recovered += 1
+                logger.warning(
+                    "[KR][LEGACY_SELL][PROVEN_PREHTTP_REPAIRED] code=%s date=2026-10-13 source_sha=%s broker_submit=0",
+                    row_dict["code"], LEGACY_PROVEN_PRE_HTTP_SHA[:12],
+                )
+        return recovered
+
+    def recover_proven_kr_pb1_prebroker_claims(self, *, env: str, trade_date: date | None = None, limit: int = 32) -> int:
+        """Release only PB1 local pre-KIS timeout claims in the active KR epoch."""
+        env = str(env or "").strip().lower()
+        if env not in {"practice", "real", "live"}:
+            return 0
+        today = trade_date or now_kst().date()
+        account_key = get_account_key(env=env)
+        # SemanticActionIdentity.account_id is the SHA-256 digest of the
+        # canonical account key (see claim_execution_action).  Comparing the
+        # unhashed key silently matched no rows during the 2026-10-19 incident.
+        account_identity = hashlib.sha256(account_key.encode("utf-8")).hexdigest()
+        actions = self._execution_claim_repo.actions
+        attempts = self._execution_claim_repo.attempts
+        orders = self._schema.orders
+        with self.engine.connect() as conn:
+            active_epoch = active_trading_epoch_id(
+                conn, env=env, account_id=account_key,
+                required=trading_epoch_enforced(),
+            )
+            if not active_epoch:
+                return 0
+            join = actions.join(
+                attempts,
+                and_(actions.c.action_key == attempts.c.action_key,
+                     actions.c.active_attempt_id == attempts.c.attempt_id),
+            ).join(
+                orders,
+                and_(orders.c.client_order_key == attempts.c.client_order_key,
+                     orders.c.env == actions.c.env,
+                     orders.c.trading_epoch_id == actions.c.trading_epoch_id),
+            )
+            rows = conn.execute(
+                select(
+                    actions.c.action_key, attempts.c.attempt_id, orders.c.status,
+                    orders.c.response_json, orders.c.submitted_at, orders.c.acked_at,
+                    orders.c.kis_odno, orders.c.broker_order_id,
+                ).select_from(join).where(
+                    actions.c.env == env,
+                    actions.c.account_id == account_identity,
+                    actions.c.market == "KR",
+                    actions.c.strategy_owner == "PB1",
+                    actions.c.trading_epoch_id == active_epoch,
+                    actions.c.trade_date == today,
+                    actions.c.action.like("BUY_ENTRY:PB1-%"),
+                    actions.c.action_state == "IN_FLIGHT",
+                    attempts.c.attempt_state == "CREATED",
+                    attempts.c.authoritative.is_(False),
+                    orders.c.strategy == "pb1_pullback_close",
+                    orders.c.side == "BUY",
+                    orders.c.status == "ERROR",
+                    orders.c.submitted_at.is_(None),
+                    orders.c.acked_at.is_(None),
+                    orders.c.kis_odno.is_(None),
+                    orders.c.broker_order_id.is_(None),
+                ).limit(min(max(1, int(limit)), 64))
+            ).mappings().all()
+        released = 0
+        for row in rows:
+            if not _proven_kr_pb1_before_kis_request(dict(row)):
+                continue
+            try:
+                self._execution_claim_repo.release_before_submit(
+                    str(row["action_key"]), attempt_id=str(row["attempt_id"]),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[KR][CLAIM][PROVEN_PREBROKER_RELEASE_FAIL] err_type=%s action=RETAIN_FENCE",
+                    type(exc).__name__,
+                )
+                continue
+            released += 1
+            logger.info("[KR][CLAIM][PROVEN_PREBROKER_RELEASED] proof=BEFORE_KIS_REQUEST")
+        return released
 
     def _read_mappings_with_guard(
         self,

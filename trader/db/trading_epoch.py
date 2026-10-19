@@ -7,7 +7,10 @@ from typing import Any
 from sqlalchemy import bindparam, inspect, text
 
 from trader.account_state import get_account_key, resolve_env_name
-from trader.db.engine import get_engine
+from trader.db.engine import (
+    get_engine, _is_connection_poison_error, _is_runner_tick_timeout,
+    dispose_engine_safely,
+)
 
 
 LEGACY_TRADING_EPOCH_ID = "legacy-unscoped-0052"
@@ -50,8 +53,13 @@ def active_trading_epoch_id(
     env_name, account_key = _identity(env=env, account_id=account_id)
     owns_connection = bind is None or hasattr(bind, "connect")
     engine = bind or get_engine()
-    conn = engine.connect() if owns_connection else bind
+    conn = None
     try:
+        # Connection checkout itself performs psycopg pool pre-ping. On Oct 19
+        # the KR tick watchdog interrupted the ping, and psycopg failed while
+        # restoring autocommit with a still-ACTIVE transaction. That happened
+        # OUTSIDE the old try/except and left the stale pool available.
+        conn = engine.connect() if owns_connection else bind
         # Legacy/test fixtures and the migration bootstrap may legitimately run
         # before migration 0052 exists.  Never probe a missing table with a
         # SELECT on PostgreSQL: even when Python catches the exception it would
@@ -73,14 +81,31 @@ def active_trading_epoch_id(
             {"env": env_name, "account_id": account_key},
         ).all()
     except Exception as exc:
+        # Do not convert an unknown epoch or a poisoned connection into a
+        # permissive order lookup. Dispose the connection pool so the *next*
+        # tick uses a fresh connection; keep this tick fail-closed.
+        if owns_connection and (
+            _is_connection_poison_error(exc) or _is_runner_tick_timeout(exc)
+        ):
+            dispose_engine_safely(
+                engine, reason=f"active_trading_epoch_id:{type(exc).__name__}",
+            )
         if required:
             raise TradingEpochError(
                 f"ACTIVE_TRADING_EPOCH_UNAVAILABLE env={env_name} account={account_key}"
             ) from exc
         return None
     finally:
-        if owns_connection:
-            conn.close()
+        if owns_connection and conn is not None:
+            try:
+                conn.close()
+            except Exception as close_exc:
+                # An interrupted psycopg transaction must never be recycled.
+                if _is_connection_poison_error(close_exc) or _is_runner_tick_timeout(close_exc):
+                    dispose_engine_safely(
+                        engine, reason=f"active_trading_epoch_id:close:{type(close_exc).__name__}",
+                    )
+                raise
 
     if len(rows) == 1:
         return str(rows[0][0])
