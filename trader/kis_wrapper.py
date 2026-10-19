@@ -328,6 +328,16 @@ def set_kr_tick_deadline(deadline_monotonic: float | None) -> None:
     )
 
 
+def _bounded_quote_attempt_count(requested: int, retry_max: int, cap: int | None = None) -> int:
+    """Preserve the general quote retry policy, optionally cap PB1 pretrade retries.
+
+    A pretrade quote must still pass the unchanged source-time freshness and
+    tradeability checks; a bounded failure only defers that BUY to a later tick.
+    """
+    attempts = max(1, int(requested), int(retry_max))
+    return min(attempts, max(1, int(cap))) if cap is not None else attempts
+
+
 def get_kr_tick_deadline() -> float | None:
     """Expose the shared deadline so safety layers can reserve tail budget."""
     value = getattr(_KR_TICK_DEADLINE_STATE, "deadline", None)
@@ -2555,7 +2565,7 @@ class KisAPI:
         
         raise RuntimeError(f"invalid last price 0 for {code}")
 
-    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2) -> dict:
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None) -> dict:
         """
         inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
@@ -2622,7 +2632,12 @@ class KisAPI:
         retry_max = _env_int("KIS_RETRY_MAX", 5)
         base_sleep = _env_float("KIS_RETRY_BASE_SLEEP", 1.2)
         jitter = _env_float("KIS_RETRY_JITTER", 0.5)
-        attempts = max(attempts, retry_max)
+        attempts = _bounded_quote_attempt_count(attempts, retry_max, retry_cap)
+        if retry_cap is not None:
+            logger.info(
+                "[KIS][QUOTE][BOUNDED_PRETRADE_RETRY] code=%s max_attempts=%s general_retry_max=%s",
+                c, attempts, retry_max,
+            )
         for attempt in range(1, attempts + 1):
             with self._concurrency_sem:
                 self._limiter.wait("price-quote")
