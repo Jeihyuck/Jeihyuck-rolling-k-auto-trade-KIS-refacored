@@ -226,7 +226,7 @@ def test_non_buy_and_kr_infinite_keep_existing_owner_paths():
     assert len(called) == 2
 
 
-def test_github_am_session_kind_applies_180_200_budget(monkeypatch):
+def test_github_am_session_kind_applies_360_380_budget(monkeypatch):
     _clear_session_aliases(monkeypatch)
     monkeypatch.setenv("PB1_SESSION_KIND", "am")
     monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "90")
@@ -236,13 +236,13 @@ def test_github_am_session_kind_applies_180_200_budget(monkeypatch):
 
     fix._apply_live_session_budget_contract()
 
-    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "180"
-    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "360"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "380"
     assert os.environ["KR_POST_ENGINE_RESERVE_SEC"] == "20"
     assert os.environ["KR_ORDER_SUBMIT_MIN_REMAINING_SEC"] == "20"
 
 
-def test_github_afternoon_session_kind_applies_180_200_budget(monkeypatch):
+def test_github_afternoon_session_kind_applies_360_380_budget(monkeypatch):
     _clear_session_aliases(monkeypatch)
     monkeypatch.setenv("PB1_SESSION_KIND", "afternoon")
     monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "90")
@@ -250,8 +250,8 @@ def test_github_afternoon_session_kind_applies_180_200_budget(monkeypatch):
 
     fix._apply_live_session_budget_contract()
 
-    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "180"
-    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "360"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "380"
 
 
 def test_legacy_pb1_session_alias_still_applies_budget(monkeypatch):
@@ -262,8 +262,8 @@ def test_legacy_pb1_session_alias_still_applies_budget(monkeypatch):
 
     fix._apply_live_session_budget_contract()
 
-    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "180"
-    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "200"
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "360"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "380"
 
 
 def test_explicit_operator_budget_override_is_preserved(monkeypatch):
@@ -293,3 +293,16 @@ def test_session_kind_close_wins_over_legacy_am_alias_and_is_not_rewritten(monke
 
     assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "45"
     assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "30"
+
+
+def test_prior_explicit_180_200_live_budget_is_migrated(monkeypatch):
+    """Existing .env values must not silently pin AM/PM to the broken limit."""
+    _clear_session_aliases(monkeypatch)
+    monkeypatch.setenv("PB1_SESSION_KIND", "afternoon")
+    monkeypatch.setenv("PB1_TICK_HARD_TIMEOUT_SEC", "180")
+    monkeypatch.setenv("PB1_MIN_TICK_BUDGET_SEC", "200")
+
+    fix._apply_live_session_budget_contract()
+
+    assert os.environ["PB1_TICK_HARD_TIMEOUT_SEC"] == "360"
+    assert os.environ["PB1_MIN_TICK_BUDGET_SEC"] == "380"
