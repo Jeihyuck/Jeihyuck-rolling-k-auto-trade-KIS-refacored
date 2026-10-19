@@ -7270,7 +7270,10 @@ def run_once(
                 kr_inf_run_result = run_kr_infinite_sleeve_tick(
                     kis=kis, balance_snapshot=balance_snapshot_raw or {},
                     env=env_effective, trade_date=trade_date,
-                    allow_entry=bool(order_allowed and calc_allowed),
+                    allow_entry=bool(
+                        order_allowed and calc_allowed
+                        and getattr(engine_runner, "_kr_exit_pass_ok", False)
+                    ),
                 )
                 logger.info(
                     "[KR_INF][TICK][AFTER_PROTECTIVE_SELL] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
