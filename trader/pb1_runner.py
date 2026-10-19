@@ -7259,6 +7259,13 @@ def run_once(
                 return
             kr_inf_invoked = True
             try:
+                # Preserve the original 40-slot WS owner-first prewarm.  The
+                # early owner evaluation must not regress subscription timing.
+                from trader.kr.infinite.runner import prewarm_kr_infinite_price
+                prewarm_kr_infinite_price("122630")
+            except Exception as prewarm_exc:
+                logger.warning("[KR_INF][PRICE_PREWARM][FAIL_SOFT] err=%s", prewarm_exc)
+            try:
                 from trader.kr.infinite.runner import run_kr_infinite_sleeve_tick
                 kr_inf_run_result = run_kr_infinite_sleeve_tick(
                     kis=kis, balance_snapshot=balance_snapshot_raw or {},
