@@ -172,3 +172,40 @@ def test_source_time_freshness_is_still_rejected_when_quote_is_old():
     )
     assert checked is None
     assert reason.startswith("quote_stale:")
+
+
+def test_proven_prebroker_abort_closes_created_order_without_submitting():
+    from trader.pb1_engine import _close_pb1_prebroker_buy_intent
+
+    calls = []
+
+    class FakeOrdersRepo:
+        def mark_error(self, env, key, payload):
+            calls.append((env, key, payload))
+
+    assert _close_pb1_prebroker_buy_intent(
+        FakeOrdersRepo(), env="practice", client_order_key="pb1:test:1",
+        code="096530", reason="INTENT_LEDGER_ABORT"
+    )
+    assert len(calls) == 1
+    env, key, payload = calls[0]
+    assert env == "practice" and key == "pb1:test:1"
+    assert payload["broker_submit"] is False
+    assert payload["msg_cd"] == "INTENT_LEDGER_ABORT"
+
+
+def test_failed_prebroker_db_cleanup_is_not_falsely_reported_as_reconciled():
+    from trader.pb1_engine import _close_pb1_prebroker_buy_intent
+
+    class FailedOrdersRepo:
+        def mark_error(self, *args, **kwargs):
+            raise TimeoutError("database unavailable")
+
+    assert not _close_pb1_prebroker_buy_intent(
+        FailedOrdersRepo(), env="practice", client_order_key="pb1:test:1",
+        code="096530", reason="INTENT_LEDGER_ABORT"
+    )
+    assert not _close_pb1_prebroker_buy_intent(
+        FailedOrdersRepo(), env="practice", client_order_key="",
+        code="096530", reason="INTENT_LEDGER_ABORT"
+    )
