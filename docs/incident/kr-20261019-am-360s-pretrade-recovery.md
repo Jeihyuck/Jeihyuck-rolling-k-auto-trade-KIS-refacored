@@ -61,3 +61,43 @@ Required before merge:
 ```
 
 **Do not infer a successful KIS order from those budget logs.** Prove `ORDER_INTENT -> attempt -> KIS submit -> broker ACK -> reconciliation -> fill` independently and retain broker-ambiguous protections.
+
+## Full Oct 19 archive follow-up — additional blockers
+
+Source archive: `nullim-dual-agent-kr-logs-20261019-160004.tar.gz`. This is **2026-10-19 old runtime SHA `28ceff3c...`**, not verification of this PR. AM + PM had zero confirmed broker submissions despite valid candidates; PREP Final30 scored 30 rows.
+
+### P0: completed-daily Final30 evidence dropped in runtime projection
+
+- Final30 artifact rows store `as_of=2026-10-16`, `candidate_family_proof_as_of=2026-10-16`, `candidate_family_screens`, family percentiles and breakout proof fields.
+- `PB1Engine._map_precomputed_candidate_row` merged those fields, but `_compute_candidates_from_codes` rebuilt `features` with a limited dictionary and omitted the proof fields before calling `_evaluate_final30_entry_setup`. That produced false `completed_daily_proof_date_mismatch` for many families.
+- Fix: copy only matching-code original scored Final30 PREP-row proof fields into runtime features. Missing or mismatched proof remains missing and fails closed. No synthetic pass flags, score changes, or new strategy owner.
+
+### P0: Oct13 historical protective SELL misclassification
+
+- Supabase ties the blocked October 13 stop SELLs on `036540,039030,042700,066570,067310` to exact git SHA `eb924b380ace9a5e2a0d9e7b65fa1ca15a379d81`.
+- **Code-path proof:** in that exact SHA, `sell_stock_market` called `get_positions` **before** `_order_cash` (the first broker order HTTP path). The uniquely thrown `KisBalanceUnavailable('KR_BALANCE_BUDGET_EXHAUSTED_BEFORE_FETCH')` therefore occurred before submitting any broker order. The then-current ambiguity classifier did not recognize that exception, incorrectly writing `UNRESOLVED_ACK`, `broker_submit:true` and an optimistic `submitted_at` timestamp. No order number/ACK was stored.
+- Added a one-time, transactional **source-SHA + original run + 2026-10-13 date + active epoch + hashed account + practice-only + exact five-code + action + response-code + no-fill** recovery. Preserve original misclassified response inside the corrected order evidence. Release ONLY those proven pre-HTTP claims to retryable OPEN and mark old order ERROR; retain everything else fenced. This is a legacy incident migration, not a generalized release of uncertain ACKs.
+- If the historical proof or healthy daily-ccld reconciliation is unavailable, the claim **remains blocked**; do not bypass its protection.
+
+### P1: KR_INFINITE owner timing
+
+- Old runner invoked `run_kr_infinite_sleeve_tick` only after PB1 entry, yielding 12 `KR_INF_TICK_BUDGET_DEFERRED` across AM + PM; unrelated PB1 BUY should not consume all owner evaluation time.
+- New runner calls owner once via existing `_kr_after_protective_exit` handoff, **after PB1 protective SELL evaluation and before unrelated PB1 entry**. Uses the same authoritative balance snapshot and `allow_entry` gate. KR_INFINITE logic/sizing/capital controls unchanged. If handoff fails, the sleeve is not re-run after a partial engine exception.
+
+### P1: poisoned psycopg transaction during trading-epoch checkout
+
+- The old timestamped traceback shows a `_HardTickAbort` interrupting psycopg `pool_pre_ping` before `active_trading_epoch_id` entered its exception handler, causing `can't change 'autocommit' now: connection in transaction status ACTIVE` during driver ping cleanup.
+- The new epoch lookup wraps connection checkout, disposes poisoned pools and fails closed on unknown epoch, using a fresh pool on next tick. This does not weaken epoch or duplicate-order safety.
+
+### Known separate broker-truth issue, not repairable from this archive alone
+
+- A **different** 2026-10-14 066570 SELL has genuine KIS broker order `0000002941`, and holdings-based confirmation of quantity 5, but missing execution price and unresolved realized PnL. This order **must not** be treated as the October 13 false-ambiguous one. Never fabricate price/fills/PnL from the limit price or average cost.
+- Existing read-only `python -m trader.kr.unpriced_sell_audit --env practice --trade-date 2026-10-14` reports the missing broker price. Resolution requires authoritative order/fill-price proof from KIS, then immutable audited reconciliation. Do not turn such unpriced orders into new broker SELL intents.
+
+### Release gate for next market session
+
+- GitHub CI for **final PR head**, including targeted Final30 family-provenance tests, exact-historical-SHA SELL recovery tests, epoch poisoned-checkout tests and KR_INFINITE ordering tests.
+- Deploy only after the trading-day SHA is quiescent; no mid-session hot replacement of code or pin. Confirm AM/PM `360/380` effective runtime logs.
+- Reconcile 10/13 source-proven prebroker claims *before* new protective SELL signals; verify `OPEN` claim state and no active attempt, then require full KIS order submit → ACK → fill/reconciliation evidence for any new SELL.
+- Validate PB1 candidate setup proof provenance, KIS quote, broker submit timing and no duplicate intents. Monitor KR_INFINITE timing and owner capital gates separately.
+- CI success does not prove that tomorrow's live KIS API, market conditions, or fills will succeed. No test orders are authorized.
