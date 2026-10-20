@@ -1,0 +1,52 @@
+name: KR244 Oct19 Practice KIS BUY Readonly Proof
+"on":
+  pull_request:
+    types: [synchronize]
+    branches: [dual-agent]
+    paths:
+      - "ops/kr244-192820-kis-proof.trigger"
+permissions:
+  contents: read
+concurrency:
+  group: kr244-practice-kis-token-probe
+  cancel-in-progress: false
+jobs:
+  readonly-practice-original-buy:
+    if: ${{ github.event.pull_request.number == 244 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'fix/kr-20261020-submit-latency-sell-reconcile' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      STRATEGY_MODE: LIVE
+      KIS_HTTP_ENABLED: "1"
+      KIS_CCLD_FAIL_OPEN: "0"
+      KIS_CCLD_RETRY_MAX: "3"
+      KIS_CCLD_READ_TIMEOUT_SEC: "7"
+      DISABLE_REAL_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      DRY_RUN: "1"
+      NO_TRADE: "1"
+      PYTHONPATH: "."
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install readonly runtime
+        run: python -m pip install --quiet -r requirements.txt
+      - name: Verify no broker submission or database writer in probe
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s=Path("scripts/kr244_oct19_buy_kis_readonly_probe.py").read_text()
+          for forbidden in ("place_order(","order_cash(","cancel_order(","get_engine(","engine.begin(","update orders"):
+              assert forbidden not in s, forbidden
+          PY
+      - name: Query complete Oct19 KIS daily executions read-only
+        run: python -m scripts.kr244_oct19_buy_kis_readonly_probe
