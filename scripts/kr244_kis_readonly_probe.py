@@ -115,6 +115,17 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("PRACTICE_KIS_CREDENTIALS_UNAVAILABLE")
     import time
     from trader.kis_wrapper import KisAPI, KisTokenRateLimitError
+    from trader.account_state import get_account_key
+    import hashlib
+    # Only the non-reversible prefix of the Oct-20 durable execution claim
+    # account digest is retained here; never print or expose account numbers.
+    expected_claim_digest_prefix = "fef5d08b17"
+    actual_claim_digest_prefix = hashlib.sha256(
+        get_account_key(env="practice").encode("utf-8")
+    ).hexdigest()[:len(expected_claim_digest_prefix)]
+    if actual_claim_digest_prefix != expected_claim_digest_prefix:
+        raise SystemExit("KIS_CREDENTIAL_ACCOUNT_SCOPE_MISMATCH_WITH_OCT20_DB")
+    print("KIS_ACCOUNT_SCOPE_MATCH=1", flush=True)
     from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
     # This is strictly a GET-only diagnostic. KIS already waits up to 65 s
     # on EGW00133; allow one additional AUTH attempt after that cooldown.
