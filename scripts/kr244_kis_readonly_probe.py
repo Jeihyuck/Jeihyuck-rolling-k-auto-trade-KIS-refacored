@@ -113,9 +113,23 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("PRACTICE_KIS_ENDPOINT_REQUIRED")
     if not all(os.getenv(k) for k in ("KIS_APP_KEY", "KIS_APP_SECRET", "CANO", "ACNT_PRDT_CD")):
         raise SystemExit("PRACTICE_KIS_CREDENTIALS_UNAVAILABLE")
-    from trader.kis_wrapper import KisAPI
+    import time
+    from trader.kis_wrapper import KisAPI, KisTokenRateLimitError
     from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
-    client = KisAPI(kis_env="practice")
+    # This is strictly a GET-only diagnostic. KIS already waits up to 65 s
+    # on EGW00133; allow one additional AUTH attempt after that cooldown.
+    client = None
+    for auth_attempt in range(2):
+        try:
+            client = KisAPI(kis_env="practice")
+            break
+        except KisTokenRateLimitError:
+            if auth_attempt:
+                raise
+            print("KIS_TOKEN_LIMIT_RECOVERY: retrying read-only authorization after broker cooldown", flush=True)
+            time.sleep(2)
+    if client is None:
+        raise SystemExit("KIS_READONLY_AUTH_UNAVAILABLE")
     response = _daily_ccld_all_pages_for_date(client, trade_date)
     if str(response.get("rt_cd") or "") != "0" or not response.get("_sep29_complete"):
         raise SystemExit("KIS_DAILY_CCLD_INCOMPLETE")
