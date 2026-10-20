@@ -81,15 +81,49 @@ def evaluate_broker_sell_evidence(
             observed_fill_ids.add(trade_id)
             observed_qty += qty_i
             priced_notional += qty_i * px_f
+        # The official KIS VTTC0081R output is an ORDER summary, not an
+        # individual execution: it exposes tot_ccld_qty, tot_ccld_amt and
+        # avg_prvs but no ccld_no/ccld_qty/ccld_prc. Confirm economic truth
+        # from the broker's full cumulative quantity AND two independent
+        # monetary fields, never from an order's intended limit price.
+        broker_cumulative_reported = 0
+        broker_aggregate_proven = False
+        if not observed_fill_ids:
+            aggregate: list[tuple[int, float, float]] = []
+            for row in matched:
+                try:
+                    cum = int(float(_val(row, "tot_ccld_qty", "cumulative_filled_qty") or 0))
+                    amount = float(_val(row, "tot_ccld_amt", "confirmed_fill_notional") or 0)
+                    avg = float(_val(row, "avg_prvs") or 0)
+                except (ValueError, TypeError):
+                    continue
+                broker_cumulative_reported = max(broker_cumulative_reported, cum)
+                if not (0 < cum <= requested_qty and amount > 0 and avg > 0):
+                    continue
+                # KIS average price can be rounded. 0.1% max tolerance
+                # accommodates price rounding, not arbitrary stale quotes.
+                if abs((amount / cum) - avg) > max(1.0, avg * 0.001):
+                    continue
+                aggregate.append((cum, amount, avg))
+            if aggregate:
+                highest_cum = max(item[0] for item in aggregate)
+                full_rows = [item for item in aggregate if item[0] == highest_cum]
+                if all(abs(item[1] - full_rows[0][1]) <= max(1.0, item[1] * 0.001) for item in full_rows):
+                    observed_qty = highest_cum
+                    priced_notional = full_rows[0][1]
+                    broker_aggregate_proven = True
         verified = observed_qty == requested_qty and observed_qty > 0
         results.append({
             "code": code,
             "kis_odno_suffix": odno[-4:],
             "requested_qty": requested_qty,
+            "broker_cumulative_qty_reported": broker_cumulative_reported,
             "priced_execution_qty": observed_qty,
             "verified": verified,
-            "weighted_execution_price": (round(priced_notional / observed_qty, 4) if verified else None),
-            "evidence": "KIS_ACTUAL_FILL" if verified else "UNRESOLVED_KIS_EXECUTION_PROOF",
+            "weighted_execution_price": (round(priced_notional / observed_qty, 4) if observed_qty > 0 else None),
+            "evidence": ("KIS_CUMULATIVE_QTY_AMOUNT_AVG_PROVEN" if broker_aggregate_proven
+                         else "KIS_ACTUAL_FILL" if verified
+                         else "UNRESOLVED_KIS_EXECUTION_PROOF"),
         })
     return {
         "trade_date": trade_date.isoformat(),
