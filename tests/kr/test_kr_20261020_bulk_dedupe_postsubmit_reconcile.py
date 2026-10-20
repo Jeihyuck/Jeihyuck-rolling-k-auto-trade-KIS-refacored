@@ -246,7 +246,7 @@ def test_kr244_reconcile_today_strict_pagination_contract():
     import inspect
     from trader.reconcile_kis import reconcile_today
     source = inspect.getsource(reconcile_today)
-    assert "require_authoritative: bool = False" in str(inspect.signature(reconcile_today))
+    assert inspect.signature(reconcile_today).parameters["require_authoritative"].default is False
     assert "_daily_ccld_all_pages_for_date" in source
     assert "KR_KIS_EXECUTION_EVIDENCE_NOT_AUTHORITATIVE" in source
     close_source = Path("trader/pb1_runner.py").read_text(encoding="utf-8")
