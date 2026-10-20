@@ -1197,7 +1197,7 @@ TR_MAP = {
         "DAILY_CHART": [os.getenv("KIS_TR_ID_DAILY_CHART", "FHKST03010100")],
         "INTRADAY_CHART": [os.getenv("KIS_TR_ID_INTRADAY_CHART", "FHKST03010200")],
         "PSBL_ORDER": [os.getenv("KIS_TR_ID_PSBL_ORDER", "VTTC8908R")],
-        "DAILY_CCLD": [os.getenv("KIS_TR_ID_DAILY_CCLD", "VTTC8001R")],
+        "DAILY_CCLD": [os.getenv("KIS_TR_ID_DAILY_CCLD", "VTTC0081R")],
         "TOKEN": "/oauth2/tokenP",
     },
     "real": {
@@ -4457,6 +4457,19 @@ class KisAPI:
             "CTX_AREA_FK100": str(ctx_area_fk100 or ""),
             "CTX_AREA_NK100": str(ctx_area_nk100 or ""),
         }
+        # KIS current official domestic stock sample uses EXCG_ID_DVSN_CD
+        # to cover KRX/NXT/SOR together. Without ALL, Oct-20 practice fills
+        # were absent even though the broker ACKed the orders.
+        # Preserve existing real-account behavior unless explicitly configured.
+        exchange_scope_override = str(os.getenv("KIS_CCLD_EXCG_ID_DVSN_CD") or "").strip().upper()
+        if self.env == "practice":
+            params["EXCG_ID_DVSN_CD"] = exchange_scope_override or "ALL"
+        elif exchange_scope_override:
+            params["EXCG_ID_DVSN_CD"] = exchange_scope_override
+        logger.info(
+            "[RECONCILE][CCLD][QUERY_CONTRACT] env=%s tr_ids=%s exchange_scope=%s",
+            self.env, tr_ids, params.get("EXCG_ID_DVSN_CD", "legacy_unspecified"),
+        )
         retryable_statuses = {500, 502, 503, 504}
         retry_max = max(1, int(os.getenv("KIS_CCLD_RETRY_MAX", "2") or "2"))
         read_timeout = float(os.getenv("KIS_CCLD_READ_TIMEOUT_SEC", "7") or "7")
