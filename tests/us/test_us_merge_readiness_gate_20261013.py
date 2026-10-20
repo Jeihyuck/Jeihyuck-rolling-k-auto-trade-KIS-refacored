@@ -34,9 +34,12 @@ def _fixture(root, *, sha=SHA, tick_sec=48, sell_sec=8,
                 "generation=test-generation age_sec=0.1" + chr(10)
             )
         if session == "am" and sell_sec is not None:
-            body += (
+            body += "".join(
                 "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
-                f"attempt=synthetic delay_ms={sell_sec * 1000}" + chr(10)
+                f"attempt=selected-sim-{i} signal_id=sim-{i} "
+                "source=selected_intent_exact "
+                f"delay_ms={sell_sec * 1000}" + chr(10)
+                for i in range(20)
             )
         (folder / f"{session}.log").write_text(body)
     (daily / "close_summary.json").write_text(json.dumps({
@@ -240,3 +243,39 @@ def test_old_duplicate_claim_conflicts_are_not_ignored_after_inflight_to_uncerta
     report = evaluate(tmp_path, DATE, SHA)
     assert report["result"] == "NOT_MERGE_READY"
     assert "CLOSE_BROKER_RECOVERY_HEALTH_NOT_CLEAN" in report["reasons"]
+
+
+def test_one_sel_sell_submit_must_not_satisfy_20_sample_operational_gate(tmp_path):
+    _fixture(tmp_path)
+    log=tmp_path/"runtime"/"logs"/"us"/DATE/"am"/"am.log"
+    lines=log.read_text().splitlines()
+    keep=[line for line in lines if "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY]" not in line]
+    keep.append("[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
+                "attempt=only-one source=selected_intent_exact delay_ms=100")
+    log.write_text("\n".join(keep)+"\n")
+    report=evaluate(tmp_path,DATE,SHA)
+    assert report["result"]=="NOT_MERGE_READY"
+    assert report["sell_distinct_selected_http_attempts"]==1
+    assert "INSUFFICIENT_DISTINCT_SELECTED_SELL_HTTP_SAMPLES" in report["reasons"]
+
+
+def test_repeated_and_legacy_sell_logs_never_inflate_operational_p95(tmp_path):
+    _fixture(tmp_path)
+    log=tmp_path/"runtime"/"logs"/"us"/DATE/"am"/"am.log"
+    lines=log.read_text().splitlines()
+    keep=[line for line in lines if "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY]" not in line]
+    keep.extend(
+        "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
+        "attempt=ONE-SAME-ATTEMPT source=selected_intent_exact delay_ms=8000"
+        for _ in range(20)
+    )
+    keep.append("[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=MSFT "
+                "attempt=legacy-1 source=first_observed_candidate delay_ms=1")
+    log.write_text("\n".join(keep)+"\n")
+    report=evaluate(tmp_path,DATE,SHA)
+    assert report["result"]=="NOT_MERGE_READY"
+    assert report["sell_submits_measured"]==1
+    assert report["sell_duplicate_attempt_log_count"]==19
+    assert report["sell_legacy_or_unattributed_log_count"]==1
+    assert "INSUFFICIENT_DISTINCT_SELECTED_SELL_HTTP_SAMPLES" in report["reasons"]
+    assert "SELL_HTTP_SIGNAL_ATTRIBUTION_INTEGRITY_FAILED" in report["reasons"]
