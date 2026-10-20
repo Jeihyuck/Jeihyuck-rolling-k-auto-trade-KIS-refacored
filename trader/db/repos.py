@@ -4127,6 +4127,33 @@ class OrdersRepo:
             stmt, op_name="orders.list_orders_by_client_order_keys", fail_open=False,
         )
 
+    def list_existing_client_order_keys_for_retry(
+        self, env: str, base_client_order_key: str,
+    ) -> set[str]:
+        """Fetch a retry-key family once, rather than N sequential DB reads.
+
+        Must be fail-closed: if this read is unavailable, generating an
+        apparently unused retry key could duplicate a broker order. The
+        atomic execution claim remains responsible for concurrency races.
+        """
+        base = str(base_client_order_key or "").strip()
+        if not base:
+            return set()
+        key_column = self._schema.orders.c.client_order_key
+        stmt = select(key_column.label("client_order_key")).where(and_(
+            self._schema.orders.c.env == env,
+            or_(key_column == base, key_column.startswith(base + ":retry", autoescape=True)),
+        ))
+        rows = self._read_mappings_with_guard(
+            stmt, op_name="orders.list_existing_client_order_keys_for_retry",
+            fail_open=False,
+        )
+        return {
+            str(row.get("client_order_key") or "") for row in rows
+            if str(row.get("client_order_key") or "") == base
+            or str(row.get("client_order_key") or "").startswith(base + ":retry")
+        }
+
     def get_order_by_kis_odno(self, env: str, kis_odno: str) -> dict | None:
         broker_id = str(kis_odno or "").strip()
         if not broker_id:
