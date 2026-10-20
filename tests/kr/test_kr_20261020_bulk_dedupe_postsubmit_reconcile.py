@@ -213,3 +213,43 @@ def test_historical_reconcile_needs_explicit_trade_date_and_apply_flag():
         main(["--env", "real", "--trade-date", "2026-10-20", "--apply-verified"])
     with pytest.raises(SystemExit):
         main(["--env", "practice", "--trade-date", "2030-01-01"])
+
+
+def test_kr244_probe_requires_real_same_day_kis_fill_id_price_and_side():
+    from scripts.kr244_kis_readonly_probe import evaluate_broker_sell_evidence
+    from datetime import date
+
+    base = {
+        "ord_dt": "20261020", "pdno": "036540", "odno": "0000004318",
+        "sll_buy_dvsn_cd": "01", "ccld_no": "TRADE-1",
+        "ccld_qty": "2", "ccld_prc": "9000",
+    }
+    expected = {"036540": ("0000004318", 2)}
+    exact = evaluate_broker_sell_evidence([base, base], date(2026, 10, 20), expected)
+    assert exact["orders_verified"] == 1
+    assert exact["results"][0]["priced_execution_qty"] == 2
+    assert exact["results"][0]["weighted_execution_price"] == 9000
+    for wrong in (
+        {**base, "ord_dt": "20261019"},
+        {**base, "pdno": "039030"},
+        {**base, "sll_buy_dvsn_cd": "02"},
+        {**base, "odno": "0000009999"},
+        {**base, "ccld_no": ""},
+        {**base, "ccld_prc": ""},
+    ):
+        outcome = evaluate_broker_sell_evidence([wrong], date(2026, 10, 20), expected)
+        assert outcome["orders_verified"] == 0
+        assert outcome["orders_unresolved"] == 1
+
+
+def test_kr244_reconcile_today_strict_pagination_contract():
+    import inspect
+    from trader.reconcile_kis import reconcile_today
+    source = inspect.getsource(reconcile_today)
+    assert "require_authoritative: bool = False" in str(inspect.signature(reconcile_today))
+    assert "_daily_ccld_all_pages_for_date" in source
+    assert "KR_KIS_EXECUTION_EVIDENCE_NOT_AUTHORITATIVE" in source
+    close_source = Path("trader/pb1_runner.py").read_text(encoding="utf-8")
+    replay_source = Path("scripts/kr244_reconcile_day.py").read_text(encoding="utf-8")
+    assert "reconcile_today(engine=engine, kis=kis, ctx=post_ctx, require_authoritative=True)" in close_source
+    assert "ctx=ctx, trade_date=trade_date, require_authoritative=True" in replay_source
