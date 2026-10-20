@@ -1,7 +1,11 @@
-"""Regression for KIS KST order dates vs US (ET/EST) trading dates.
+"""Regression for KIS authenticated overseas order-date and KST clock contract.
 
-The 2026-10-06 AMD order at 15:14 UTC is 2026-10-07 KST. Single-day
-ORD_STRT_DT=ORD_END_DT=20261006 did not even query its broker KST date.
+The official KIS inquire-ccnl ORD_STRT_DT/ORD_END_DT and response ORD_DT
+represent the US market-local trading session date. ORD_TMD is the Korea
+wall clock; DMST_ORD_DT, when supplied, carries its actual KST calendar
+date. Never combine ORD_DT and ORD_TMD as one KST calendar timestamp.
+The previous mock fixtures incorrectly used KST ORD_DT and could not match
+the authenticated Oct 20 KIS order evidence.
 """
 from __future__ import annotations
 
@@ -39,9 +43,9 @@ def _client_with_rows(monkeypatch, rows):
 def test_oct6_amd_post_midnight_kst_is_visible_in_oct6_ny_broker_query(monkeypatch):
     rows = [
         _row("MRVL", "0000034237", "20261006", "225919"),  # same KST date
-        _row("AMD", "0000035281", "20261007", "001429"),   # next KST date
+        _row("AMD", "0000035281", "20261006", "001429"),   # same US day, next KST date
         _row("MSFT", "tomorrow", "20261007", "224500"),    # next US day; exclude
-        _row("AAPL", "yesterday", "20261006", "004500"),   # previous US day; exclude
+        _row("AAPL", "yesterday", "20261005", "004500"),   # previous US day; exclude
     ]
     client, seen = _client_with_rows(monkeypatch, rows)
     result = client.get_us_fills_today("2026-10-06")
@@ -54,7 +58,7 @@ def test_oct6_amd_post_midnight_kst_is_visible_in_oct6_ny_broker_query(monkeypat
 def test_oct12_msft_kst_next_day_belongs_to_oct12_ny(monkeypatch):
     # 2026-10-12 15:28 UTC = 2026-10-13 00:28 KST.
     client, seen = _client_with_rows(monkeypatch, [
-        _row("MSFT", "0000044796", "20261013", "002823"),
+        _row("MSFT", "0000044796", "20261012", "002823"),
     ])
     assert [r["odno"] for r in client.get_us_today_orders("2026-10-12")] == ["0000044796"]
     assert seen[0]["ORD_END_DT"] == "20261013"
@@ -62,7 +66,7 @@ def test_oct12_msft_kst_next_day_belongs_to_oct12_ny(monkeypatch):
 
 def test_est_winter_midnight_boundary_does_not_adopt_next_session(monkeypatch):
     client, seen = _client_with_rows(monkeypatch, [
-        _row("AMD", "winter", "20270113", "013500"),     # 2027-01-12 11:35 EST
+        _row("AMD", "winter", "20270112", "013500"),     # US Jan 12, KST Jan 13
         _row("AAPL", "next", "20270113", "234000"),      # 2027-01-13 09:40 EST
     ])
     assert [r["odno"] for r in client.get_us_fills_today("2027-01-12")] == ["winter"]
@@ -93,7 +97,7 @@ def test_sparse_mock_rows_preserve_pagination_fixture_contract(monkeypatch):
 
 def test_exact_trade_date_bridge_is_independent_of_current_wall_clock(monkeypatch):
     client, seen = _client_with_rows(monkeypatch, [
-        _row("NVDA", "older", "20260821", "020000"),
+        _row("NVDA", "older", "20260820", "020000"),
     ])
     assert [r["odno"] for r in client.get_us_fills_today("2026-08-20")] == ["older"]
     assert seen[0]["ORD_STRT_DT"] == "20260820"
@@ -104,7 +108,7 @@ def test_live_fill_parser_retains_actual_oct6_fill_from_oct7_kst(monkeypatch):
     from trader.us.execution.fills import get_fills_today
     client, seen = _client_with_rows(monkeypatch, [
         {
-            **_row("AMD", "0000035281", "20261007", "001429", fill="1"),
+            **_row("AMD", "0000035281", "20261006", "001429", fill="1"),
             "ft_ccld_unpr3": "165.55", "ovrs_excg_cd": "NASD",
         },
         _row("NVDA", "next-us-session", "20261007", "224500", fill="1"),
@@ -123,24 +127,25 @@ def test_live_fill_parser_retains_actual_oct6_fill_from_oct7_kst(monkeypatch):
     assert result["fills"][0]["order_timestamp_utc"].startswith(
         "2026-10-06T15:14:29"
     )
-    assert result["fills"][0]["meta"]["source_timestamp_date"] == "20261007"
+    assert result["fills"][0]["meta"]["source_timestamp_date"] == "20261006"
     assert seen[0]["ORD_END_DT"] == "20261007"
 
 
 def test_broker_date_filter_prevents_kst_day_order_cross_contamination(monkeypatch):
     client, _ = _client_with_rows(monkeypatch, [
-        _row("AMD", "same-number-prev-us-day", "20261007", "000010"),
+        _row("AMD", "same-number-prev-us-day", "20261005", "000010"),
+        _row("AMD", "same-number-current-us-day", "20261006", "230010"),
         _row("AMD", "same-number-new-us-day", "20261007", "230010"),
     ])
     assert [r["odno"] for r in client.get_us_today_orders("2026-10-06")] == [
-        "same-number-prev-us-day",
+        "same-number-current-us-day",
     ]
 
 
 def test_unfilled_oct6_amd_order_is_normalized_as_open_not_missing(monkeypatch):
     from trader.us.data_provider import USDataProvider
     client, seen = _client_with_rows(monkeypatch, [
-        _row("AMD", "0000035281", "20261007", "001429", fill="0"),
+        _row("AMD", "0000035281", "20261006", "001429", fill="0"),
     ])
     provider = object.__new__(USDataProvider)
     provider._offline = False
@@ -150,7 +155,7 @@ def test_unfilled_oct6_amd_order_is_normalized_as_open_not_missing(monkeypatch):
     assert orders[0]["canonical_order_no"] == "35281"
     assert orders[0]["status"] == "OPEN"
     assert orders[0]["us_trade_date"] == "2026-10-06"
-    assert orders[0]["source_timestamp_date"] == "20261007"
+    assert orders[0]["source_timestamp_date"] == "20261006"
     assert seen[0]["ORD_END_DT"] == "20261007"
 
 
