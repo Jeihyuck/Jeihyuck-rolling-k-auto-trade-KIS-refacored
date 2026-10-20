@@ -148,7 +148,64 @@ def verify_claim(row: dict, events: list[dict], broker_rows: list[dict] | None,
         )
     ]
     if not matches:
-        return {**base, "reason": "NO_EXACT_ORDER_IN_KIS_HISTORY"}
+        # Diagnostics are aggregate counts ONLY. Never expose KIS account
+        # identity, broker order numbers, tokens or response payloads.
+        # Do not use these relaxed matches to promote actual fill evidence.
+        symbol_rows = [
+            r for r in broker_rows
+            if str(r.get("symbol") or "").upper() == symbol
+        ]
+        side_rows = [
+            r for r in symbol_rows
+            if str(r.get("side") or "").upper() == side
+        ]
+        order_no_rows = [
+            r for r in broker_rows
+            if normalize_us_order_no(r.get("order_no") or r.get("raw_order_no") or "")
+               == normalize_us_order_no(order_no)
+        ]
+        identity_rows = [
+            r for r in side_rows
+            if normalize_us_order_no(r.get("order_no") or r.get("raw_order_no") or "")
+               == normalize_us_order_no(order_no)
+        ]
+        diagnostic = {
+            "source_day_rows": len(broker_rows),
+            "symbol_rows": len(symbol_rows),
+            "symbol_side_rows": len(side_rows),
+            "same_broker_order_no_rows": len(order_no_rows),
+            "same_broker_no_symbol_side_rows": len(identity_rows),
+            "same_symbol_side_qty_rows": sum(
+                _safe_qty(r.get("requested_qty")) == qty for r in side_rows
+            ),
+            "broker_order_no_conflict_rows": len(order_no_rows) - len(identity_rows),
+            "identity_quarantined_rows": sum(
+                str(r.get("normalization_result") or "").lower() == "quarantined"
+                for r in identity_rows
+            ),
+            "same_order_missing_explicit_qty": sum(
+                r.get("filled_qty_present") is False for r in identity_rows
+            ),
+            "same_order_same_qty": sum(
+                _safe_qty(r.get("requested_qty")) == qty for r in identity_rows
+            ),
+            "same_order_exact_identity_rejected": sum(
+                not _replay_order_row_matches(
+                    r, order_no=order_no, symbol=symbol, side=side,
+                    requested_qty=qty, source_trade_date=day,
+                    journal_event=submit, lookup_context=scope,
+                ) for r in identity_rows
+            ),
+            "same_order_detail_identity_conflicts": sum(
+                _replay_detail_identity_conflicts(
+                    r, order_no=order_no, symbol=symbol, side=side,
+                    requested_qty=qty, source_trade_date=day,
+                    journal_event=submit, lookup_context=scope,
+                ) for r in identity_rows
+            ),
+        }
+        return {**base, "reason": "NO_EXACT_ORDER_IN_KIS_HISTORY",
+                "broker_match_diagnostics": diagnostic}
     evidence = {
         (
             str(o.get("status") or "").upper().replace("CANCELED", "CANCELLED"),
