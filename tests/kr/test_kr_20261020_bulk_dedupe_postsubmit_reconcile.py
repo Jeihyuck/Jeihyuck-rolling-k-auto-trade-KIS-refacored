@@ -479,3 +479,31 @@ def test_kr244_cumulative_price_only_replay_preserves_existing_holding_qty(monke
     assert fills.inserts[0]["fill_meta_json"]["fill_source"] == "daily_ccld_order_cumulative"
     assert orders.events[-1]["response_json"]["confirmed_fill_notional"] == 1272600
     assert orders.events[-1]["response_json"]["confirmed_fill_price"] == 9090
+
+
+def test_kr244_247_candidate_keys_one_db_select_no_n_plus_one():
+    """Real Oct20 afternoon had 247 finalized candidates and slow per-key DB calls.
+
+    Verify SQL query complexity, not an invented live tick latency target.
+    """
+    engine, schema = _db()
+    keys = [f"practice:kr:test:2026-10-20:{i:06d}:BUY" for i in range(247)]
+    with engine.begin() as conn:
+        conn.execute(schema.orders.insert(), [
+            _order(schema, key=keys[i], code=f"{i:06d}")
+            for i in range(0, 247, 17)
+        ])
+    queries = []
+    def track(_conn, _cursor, statement, _params, _context, _many):
+        if "SELECT" in statement.upper() and "orders" in statement.lower():
+            queries.append(statement)
+    sa.event.listen(engine, "before_cursor_execute", track)
+    try:
+        rows = OrdersRepo(engine).list_orders_by_client_order_keys(
+            "practice", keys,
+        )
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", track)
+    assert len(rows) == len(range(0, 247, 17))
+    assert len(queries) == 1
+    engine.dispose()
