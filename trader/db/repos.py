@@ -3338,12 +3338,23 @@ class OrdersRepo:
                 )
         return recovered
 
-    def recover_proven_kr_pb1_prebroker_claims(self, *, env: str, trade_date: date | None = None, limit: int = 32) -> int:
-        """Release only PB1 local pre-KIS timeout claims in the active KR epoch."""
+    def recover_proven_kr_pb1_prebroker_claims(
+        self, *, env: str, trade_date: date | None = None,
+        limit: int = 32, lookback_days: int = 2,
+    ) -> int:
+        """Release only fully PROVEN pre-HTTP KR PB1 BUY claims in active epoch.
+
+        In practice allow at most two prior trade dates for restart repair;
+        an exact historical trade_date remains an explicit single-day probe.
+        Real accounts retain today's-only behavior. EXPIRED/CREATED and missing
+        order numbers are never standalone proof of no broker submission.
+        """
         env = str(env or "").strip().lower()
         if env not in {"practice", "real", "live"}:
             return 0
         today = trade_date or now_kst().date()
+        lookback_days = min(2, max(0, int(lookback_days))) if env == "practice" and trade_date is None else 0
+        earliest_proven_day = today - timedelta(days=lookback_days)
         account_key = get_account_key(env=env)
         # SemanticActionIdentity.account_id is the SHA-256 digest of the
         # canonical account key (see claim_execution_action).  Comparing the
@@ -3380,7 +3391,7 @@ class OrdersRepo:
                     actions.c.market == "KR",
                     actions.c.strategy_owner == "PB1",
                     actions.c.trading_epoch_id == active_epoch,
-                    actions.c.trade_date == today,
+                    actions.c.trade_date.between(earliest_proven_day, today),
                     actions.c.action.like("BUY_ENTRY:PB1-%"),
                     actions.c.action_state == "IN_FLIGHT",
                     attempts.c.attempt_state == "CREATED",
