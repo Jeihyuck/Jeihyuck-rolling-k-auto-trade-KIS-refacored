@@ -7,3 +7,5 @@ After restoring, verify 11 FILLED orders and distinct priced cumulative fills an
 This signal is transient; delete after execution result is recorded in PR.
 
 Rearmed once after aligned historical replay test assertion; no scope expansion.
+
+Third controlled attempt after disabling automatic KIS token probes; no other scope changed.
