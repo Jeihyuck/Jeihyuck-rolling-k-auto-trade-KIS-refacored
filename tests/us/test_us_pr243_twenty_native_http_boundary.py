@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import time
@@ -145,6 +146,8 @@ def test_pr243_twenty_native_sell_http_and_generated_buy(monkeypatch, tmp_path):
         "restart_ack_only_fenced":20,
         "production_p95_60s_verified":False,
     }
-    out=tmp_path/"pr243-stubbed-native-boundary-20.json"
+    output_dir=Path(os.environ.get("US243_BENCH_REPORT_DIR",str(tmp_path)))
+    output_dir.mkdir(parents=True,exist_ok=True)
+    out=output_dir/"pr243-stubbed-native-boundary-20.json"
     out.write_text(json.dumps(report,sort_keys=True),encoding="utf-8")
     print("PR243_STUBBED_NATIVE_BOUNDARY_REPORT",json.dumps(report,sort_keys=True))
