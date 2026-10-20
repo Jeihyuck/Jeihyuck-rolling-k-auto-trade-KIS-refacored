@@ -391,6 +391,7 @@ def test_kr244_cumulative_sell_avoids_duplicate_prior_individual_fills():
             "env": "practice", "code": "036540", "side": "SELL",
             "trade_id": "ACTUAL-TRADE", "broker_fill_id": "ACTUAL-TRADE",
             "qty": 1, "price": 9090.0, "fee": 0.0, "tax": 0.0,
+            "filled_at": datetime(2026, 10, 20, 9, 5),
             "fill_meta_json": {"fill_source": "daily_ccld"},
         })
     from trader.db.repos import FillsRepo
