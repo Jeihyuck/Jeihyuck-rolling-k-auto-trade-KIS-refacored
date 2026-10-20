@@ -1556,20 +1556,21 @@ def route_exit_orders_immediately(
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
             if stage:
-                # A route exception before the durable broker boundary is safe
-                # to retry. Once BROKER_SUBMIT_STARTED exists, keep the stage
-                # pending/ambiguous until reconciliation proves a terminal
-                # outcome; releasing it here could submit the same TP twice.
+                # A proven pre-HTTP abort can release a TP reservation, while
+                # unknown/ACK evidence requires a fence. A STARTED event alone
+                # is insufficient: reconcile per-attempt abort certificates.
+                # If journaling cannot be read, fail closed as ambiguous.
                 submit_may_have_happened = True
                 try:
-                    from trader.us.execution.order_journal import load_order_events
+                    from trader.us.execution.order_journal import (
+                        broker_submission_possible_for_client_key,
+                        load_order_events,
+                    )
                     td = str(intent.get("trade_date") or getattr(context, "trade_date", ""))
                     key = str(intent.get("client_order_key") or "")
                     events = load_order_events(td)
-                    submit_may_have_happened = any(
-                        str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
-                        and str(event.get("client_order_key") or "") == key
-                        for event in events
+                    submit_may_have_happened = broker_submission_possible_for_client_key(
+                        events, key
                     )
                 except Exception as journal_exc:
                     logger.error(
@@ -1798,6 +1799,9 @@ def run_trade_tick(
         deadline=(tick_deadline_monotonic if tick_deadline_monotonic is not None else
                   tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0)),
     )
+    # Monotonic tick origin for the REAL native KIS HTTP-boundary hook.
+    # Do not substitute selected-signal readiness for end-to-end tick latency.
+    tick_context.metrics["tick_start_monotonic"] = tick_started_at
     if hasattr(provider, "bind_tick_context"):
         provider.bind_tick_context(tick_context)
     else:
@@ -2175,13 +2179,23 @@ def run_trade_tick(
         _active_claim_replay_started = time.monotonic()
         try:
             from trader.us.execution.order_journal import replay_order_journal
+            # Historical recovery is bounded before protective exits. The
+            # original provider/client keeps its normal order deadline; only
+            # this isolated read-only client receives the short stage budget.
+            recovery_deadline = time.monotonic() + 10.0
+            recovery_provider = (
+                provider.fork_for_stage(stage_deadline=recovery_deadline)
+                if callable(getattr(provider, "fork_for_stage", None)) else provider
+            )
             active_claim_recovery_result = replay_order_journal(
                 trade_date,
                 session_run_id=session_run_id,
                 tick_id=tick_id,
-                provider=provider,
+                provider=recovery_provider,
                 include_active_claims=True,
                 active_claims_only=True,
+                deadline_monotonic=recovery_deadline,
+                active_claim_offset=max(0, int(tick_index or 1) - 1),
             )
             ack_recon["active_claim_recovery"] = active_claim_recovery_result
             logger.info("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY] result=%s", active_claim_recovery_result)
@@ -2451,6 +2465,11 @@ def run_trade_tick(
     tick_context.pending_ack_orders = pending_ack_orders
     tick_context.today_order_keys = set(today_order_keys or set())
     tick_context.blocked_symbol_sides = {(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2}
+    tick_context.blocked_symbol_sides.update(
+        (str(x[0]).upper(), str(x[1]).upper())
+        for x in (active_claim_recovery_result.get("unresolved_symbol_sides") or [])
+        if len(x) >= 2 and x[0] and x[1]
+    )
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -4556,6 +4575,11 @@ def run_trade_tick(
     tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
     # Per-order data is bounded, explicit, and labeled separately from
     # summary statistics. No telemetry I/O is performed on the order path.
+    _tick_to_http = tick_context.metrics.get(
+        "sell_tick_to_broker_boundary_by_attempt_ms", {}
+    )
+    _tick_to_http = _tick_to_http if isinstance(_tick_to_http, dict) else {}
+    _tick_to_http_bounded = dict(list(_tick_to_http.items())[:128])
     _by_attempt = tick_context.metrics.get("sell_signal_to_broker_boundary_by_attempt_ms", {})
     _by_attempt = _by_attempt if isinstance(_by_attempt, dict) else {}
     _per_attempt_observations = dict(list(_by_attempt.items())[:128])
@@ -4566,6 +4590,11 @@ def run_trade_tick(
     _first_candidate_observations = dict(list(_first_by_attempt.items())[:128])
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
+        "sell_tick_to_broker_boundary_by_attempt_ms": _tick_to_http_bounded,
+        "sell_tick_to_broker_boundary_truncated_count": (
+            max(0, len(_tick_to_http) - len(_tick_to_http_bounded))
+            + int(tick_context.metrics.get("sell_tick_to_broker_boundary_dropped_count", 0))
+        ),
         "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
         "sell_first_candidate_to_broker_by_attempt_ms": _first_candidate_observations,
         "sell_first_candidate_truncated_count": (

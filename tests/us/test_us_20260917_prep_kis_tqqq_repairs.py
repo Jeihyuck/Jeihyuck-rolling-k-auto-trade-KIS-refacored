@@ -114,9 +114,10 @@ def test_preflight_uses_canonical_final30_loader_and_recovery_protects_completed
     preflight = Path("scripts/wsl/check-us-prep-before-am.sh").read_text(encoding="utf-8")
     recovery = Path("scripts/wsl/run-us-prep-recovery.sh").read_text(encoding="utf-8")
 
-    assert "load_us_final30_scored" in preflight
-    assert "load_us_prep_contract" in preflight
-    assert "final30_scored.json" in preflight
+    assert "check_effective_prep_sources(trade_date)" in preflight
+    helper = Path("trader/us/prep_effective.py").read_text(encoding="utf-8")
+    assert "load_us_final30_scored(trade_date)" in helper
+    assert "load_us_prep_contract(trade_date)" in helper
     assert "data.get('rows', data)" not in preflight
     assert "SKIP_EFFECTIVE_PREP" in recovery
     assert "exec bash scripts/wsl/run-us-prep.sh" in recovery

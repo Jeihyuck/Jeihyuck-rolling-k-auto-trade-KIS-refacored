@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -430,6 +431,58 @@ def load_order_events(trade_date: str, *, session_run_id: str | None = None) -> 
     return list(unique.values())
 
 
+# Both events certify that no order HTTP call occurred. An ACK/fill/unknown
+# outcome contradicts that certificate and must remain fenced for inspection.
+_PRE_IO_ABORTS = {"BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY", "BROKER_SUBMIT_ABORTED_PRE_IO"}
+_BROKER_POSSIBLE = {
+    "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED", "BROKER_SUBMIT_RESULT_UNKNOWN",
+    "DB_ACK_PERSISTED", "JOURNAL_REPLAY_DB_ACK_RESTORED",
+    "ORDER_FILLED", "ORDER_PARTIALLY_FILLED", "ORDER_REJECTED",
+    "ORDER_OPEN", "ORDER_CANCELLED", "JOURNAL_REPLAY_FILL_CONFIRMED",
+    "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE",
+}
+
+
+def _proven_unsent(types: set[str]) -> bool:
+    return bool(types & _PRE_IO_ABORTS) and not bool(types & _BROKER_POSSIBLE)
+
+
+def proven_unsent_attempts(events: list[dict]) -> set[tuple[str, str]]:
+    """Classify immutable attempts; contradictory broker evidence wins."""
+    types_by_attempt: dict[tuple[str, str], set[str]] = {}
+    for event in events:
+        identity = (str(event.get("client_order_key") or ""),
+                    str(event.get("submit_attempt_id") or ""))
+        types_by_attempt.setdefault(identity, set()).add(str(event.get("event_type") or ""))
+    return {identity for identity, types in types_by_attempt.items() if _proven_unsent(types)}
+
+
+def broker_submission_possible_for_client_key(events: list[dict], client_order_key: str) -> bool:
+    """Conservatively classify TP route exceptions from immutable journal proof.
+
+    BROKER_SUBMIT_STARTED alone is *not* proof of a sent order: a later
+    before-boundary / PRE_IO abort certifies the attempt never reached HTTP.
+    This applies per attempt; another ACK, actual fill or unknown outcome for
+    the same client key must still keep the protective SELL reservation fenced.
+    """
+    key = str(client_order_key or "").strip()
+    if not key:
+        # An exception lacking a stable key cannot be safely correlated.
+        return True
+    filtered = [event for event in events
+                if str(event.get("client_order_key") or "").strip() == key]
+    proven_unsent = proven_unsent_attempts(filtered)
+    for event in filtered:
+        event_type = str(event.get("event_type") or "")
+        attempt = str(event.get("submit_attempt_id") or "")
+        if event_type in _BROKER_POSSIBLE:
+            return True
+        if (event_type == "BROKER_SUBMIT_STARTED"
+                and (key, attempt) not in proven_unsent):
+            return True
+    return False
+
+
 def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None) -> dict:
     """Aggregate immutable unique submit attempts; reconciliation never adds submits."""
     events = load_order_events(trade_date, session_run_id=session_run_id)
@@ -437,11 +490,11 @@ def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None
     lifecycle: dict[str, set[str]] = {}
     fill_execution_keys: set[tuple] = set()
     partial_observation_keys: set[tuple] = set()
-    aborted = {
-        str(event.get("submit_attempt_id") or "").strip()
-        for event in events
-        if event.get("event_type") == "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"
-    }
+    attempt_types: dict[str, set[str]] = {}
+    for event in events:
+        attempt_types.setdefault(str(event.get("submit_attempt_id") or "").strip(), set()).add(
+            str(event.get("event_type") or ""))
+    aborted = {attempt for attempt, types in attempt_types.items() if _proven_unsent(types)}
     for event in events:
         attempt = str(event.get("submit_attempt_id") or "").strip()
         if not attempt:
@@ -566,8 +619,17 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
 def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                          tick_id: str | None = None, provider: Any | None = None,
                          include_active_claims: bool = False,
-                         active_claims_only: bool = False) -> dict:
-    """Restore DB evidence and independently classify broker truth; never resubmit."""
+                         active_claims_only: bool = False,
+                         deadline_monotonic: float | None = None,
+                         active_claim_offset: int = 0) -> dict:
+    """Restore broker truth without resubmission.
+
+    An optional pre-route deadline defers work, never resolves a claim. Full
+    close replay has no such deadline and still examines every historical fill.
+    """
+    def budget_available() -> bool:
+        return deadline_monotonic is None or time.monotonic() < deadline_monotonic
+
     events = load_order_events(trade_date, session_run_id=session_run_id)
     if tick_id:
         events = [e for e in events if e.get("tick_id") == tick_id]
@@ -620,6 +682,17 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         "symbol": "", "side": "", "reason": "active_claim_submit_journal_missing",
                     })
                     continue
+                if _proven_unsent({str(e.get("event_type") or "") for e in attempt_events}):
+                    # A still-active claim means its original pre-I/O release
+                    # failed. Do not report recovery OK or silently release it
+                    # from replay; keep the durable fence visible for audit.
+                    submit = next(e for e in attempt_events
+                                  if e.get("event_type") == "BROKER_SUBMIT_STARTED")
+                    active_claim_errors.append({
+                        "symbol": str(submit.get("symbol") or "").upper(),
+                        "side": str(submit.get("side") or "").upper(),
+                        "reason": "active_claim_pre_io_release_requires_audit",
+                    })
                 events.extend(attempt_events)
             logger.info(
                 "[US_ORDER_JOURNAL][ACTIVE_CLAIM_SOURCE_MEMO] "
@@ -668,7 +741,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     for (client_key, attempt), attempt_events in evidence_grouped.items():
         types = {event.get("event_type") for event in attempt_events}
         if ("BROKER_SUBMIT_STARTED" in types
-                and "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" not in types):
+                and not _proven_unsent(types)):
             possible_attempts_by_client_key.setdefault(client_key, set()).add(attempt)
         from trader.us.utils.order_no import normalize_us_order_no
         broker_numbers = {
@@ -686,12 +759,23 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     counts = {"db_ack_restored_count": 0, "broker_full_fill_count": 0,
               "broker_partial_fill_count": 0, "broker_unfilled_ack_count": 0,
               "broker_rejected_count": 0, "broker_unknown_count": 0,
-              "identity_mismatch_count": 0, "failed_count": 0}
+              "identity_mismatch_count": 0, "failed_count": 0, "deferred_count": 0,
+              "balance_estimate_count": 0}
     unresolved_symbol_sides: list[list[str]] = []
     for error in active_claim_errors:
         counts["failed_count"] += 1
         unresolved_symbol_sides.append([error["symbol"], error["side"]])
-    if active_claims_only and not events:
+    grouped = {
+        identity: attempt_events for identity, attempt_events in grouped.items()
+        if not _proven_unsent({str(e.get("event_type") or "") for e in attempt_events})
+    }
+    if deadline_monotonic is not None and grouped:
+        # Rotate only bounded pre-route work so an old unresolved first action
+        # cannot monopolize every tick. All attempts retain durable fences.
+        items = list(grouped.items())
+        offset = int(active_claim_offset) % len(items)
+        grouped = dict(items[offset:] + items[:offset])
+    if not grouped:
         unresolved = counts["failed_count"]
         return {
             "status": "ERROR" if unresolved else "OK",
@@ -719,6 +803,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     fills_by_trade_date: dict[str, list[dict] | None] = {}
 
     def orders_for_trade_date(source_trade_date: str) -> list[dict] | None:
+        if not budget_available():
+            return None
         if source_trade_date not in orders_by_trade_date:
             try:
                 method = getattr(provider, "get_today_orders", None)
@@ -732,6 +818,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         return orders_by_trade_date[source_trade_date]
 
     def fills_for_trade_date(source_trade_date: str) -> list[dict] | None:
+        if not budget_available():
+            return None
         if source_trade_date not in fills_by_trade_date:
             try:
                 from trader.us.execution.fills import get_fills_today
@@ -747,7 +835,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     # order/fill books. Every source day is resolved only when an attempt
     # actually needs it. This is a per-invocation cache, never shared with a
     # later tick or generation.
-    if provider is not None:
+    if provider is not None and budget_available():
         try: balance = provider.get_balance(force_refresh=True)
         except TypeError: balance = provider.get_balance()
         except Exception: balance = None
@@ -768,11 +856,19 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         if submitted is None:
             continue
         types = {e.get("event_type") for e in order_events}
-        if "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY" in types:
+        if _proven_unsent(types):
             continue
         # Later ORDER_OPEN/REPLAY snapshots may have empty original session,
         # generation=0 or qty=0. They cannot overwrite submitted identity.
         latest = submitted
+        if not budget_available():
+            # Keep the durable fence and expose every deferred identity. No
+            # fabricated cancellation/fill/terminal state and no journal churn.
+            counts["deferred_count"] += 1
+            counts["broker_unknown_count"] += 1
+            unresolved_symbol_sides.append([str(latest.get("symbol") or "").upper(),
+                                            str(latest.get("side") or "").upper()])
+            continue
         if key in conflicting_client_keys:
             # The broker may have filled an older attempt after the newer
             # submit. Never rewrite the one-key DB row with either order no.
@@ -936,7 +1032,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         )
                 if broker_fill is None:
                     detail = getattr(provider, "get_fills_by_order_no", None)
-                    if callable(detail):
+                    if callable(detail) and budget_available():
                         try:
                             broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=event_trade_date)
                         except TypeError as exc:
@@ -1030,11 +1126,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     side=side,
                     requested_qty=requested,
                     filled_qty=cumulative,
-                    remaining_qty=(
-                        int(broker_fill["remaining_qty"])
-                        if broker_fill.get("remaining_qty") not in (None, "")
-                        else max(0, requested - cumulative)
-                    ),
+                    # Open broker quantity is zero after a partial cancel;
+                    # the semantic target still has requested-cumulative left.
+                    remaining_qty=max(0, requested - cumulative),
                     broker_status=(
                         str(broker_fill.get("status") or "").upper().replace("CANCELED", "CANCELLED")
                         if str(broker_fill.get("status") or "").upper() in
@@ -1050,14 +1144,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="EVIDENCE_QUANTITY_CONFLICT", raw_response=result)
                     continue
                 if result.get("status") != "OK": raise RuntimeError(result.get("status"))
-                if result.get("observation_ignored"):
+                if result.get("observation_ignored") or result.get("requires_reconcile"):
                     counts["failed_count"] += 1
                     unresolved_symbol_sides.append([symbol, side])
                     append_order_event(
                         "JOURNAL_REPLAY_FAILED",
                         ack,
                         broker_order_no=order_no,
-                        broker_status=str(result["observation_ignored"]),
+                        broker_status=str(result.get("observation_ignored") or "EXECUTION_STATE_NOT_RECONCILED"),
                         raw_response=result,
                     )
                     continue
@@ -1076,6 +1170,13 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     journal_event=latest,
                     lookup_context=source_scope_by_trade_date.get(event_trade_date),
                 )), None)
+                # A scoped per-order response is also broker evidence. Do not
+                # lose a verified zero-fill cancellation/rejection merely
+                # because the historical list endpoint omitted that order.
+                if broker_order is None and isinstance(broker_fill, dict) and broker_fill_status in {
+                    "ACK", "OPEN", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"
+                }:
+                    broker_order = broker_fill
                 if broker_order:
                     broker_symbol=str(broker_order.get("symbol") or broker_order.get("pdno") or symbol).upper()
                     broker_side=str(broker_order.get("side") or side).upper()
@@ -1088,11 +1189,12 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                             canonical_order_no=normalize_us_order_no(broker_order.get("order_no") or order_no),
                             symbol=symbol, side=side, requested_qty=requested,
                             filled_qty=broker_order.get("filled_qty"),
-                            remaining_qty=int(broker_order.get("remaining_qty") or requested),
+                            remaining_qty=(None if broker_order.get("filled_qty") is None
+                                           else max(0, requested - int(broker_order["filled_qty"]))),
                             broker_status=observed_status, evidence_type="KIS_ORDER_STATUS_ACTUAL",
                             observed_at=broker_order.get("observed_at"), raw_row=broker_order)
                         if result.get("status") != "OK": raise RuntimeError(result.get("status"))
-                        if result.get("requires_reconcile"):
+                        if result.get("requires_reconcile") or result.get("observation_ignored"):
                             counts["broker_unknown_count"] += 1
                             unresolved_symbol_sides.append([symbol, side])
                             append_order_event(
@@ -1139,9 +1241,13 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                                 avg_price_usd=float(latest.get("limit_price") or latest.get("price") or 0),source="journal_replay_balance_delta",
                                 evidence_type="BALANCE_DELTA_SYNTHETIC",trade_date=event_trade_date,meta={"journal_replay":True})
                             if result.get("status") != "OK": raise RuntimeError(result.get("status"))
-                            counts["broker_full_fill_count" if cumulative>=requested else "broker_partial_fill_count"] += 1
-                            append_order_event("JOURNAL_REPLAY_FILL_CONFIRMED",ack,broker_order_no=order_no,
-                                               broker_status="BROKER_FILL_CONFIRMED" if cumulative>=requested else "BROKER_PARTIAL_FILL_CONFIRMED")
+                            # Accounting estimate is not execution proof and
+                            # cannot clean a durable execution fence.
+                            counts["balance_estimate_count"] += 1
+                            counts["broker_unknown_count"] += 1
+                            unresolved_symbol_sides.append([symbol, side])
+                            append_order_event("JOURNAL_REPLAY_BALANCE_ESTIMATE",ack,broker_order_no=order_no,
+                                               broker_status="BALANCE_ESTIMATE_PENDING_BROKER")
                         else:
                             counts["broker_unknown_count"]+=1; unresolved_symbol_sides.append([symbol,side])
                     else:

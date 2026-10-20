@@ -391,6 +391,23 @@ def _semantic_action_identity(intent: dict, *, account_env: str):
         or meta.get("reason")
         or ("ENTRY" if side == "BUY" else "")
     )
+    # PR243 2026-10-19 production replay: US_STANDARD's executable
+    # GIVEBACK / TRAILING_STOP family was stable across ticks but the human
+    # explanation contained live percentages. Using that prose as action
+    # created 48 unrelated claims for only two position lifecycles, while
+    # client_order_key remained stable. Preserve the numeric reason for
+    # diagnostics; key the claim on the *stable* strategy family instead.
+    # Explicit semantic actions / staged TP / TQQQ_INFINITE always win.
+    if side == "SELL" and owner == "US_STANDARD" and not (
+        meta.get("semantic_action") or intent.get("semantic_action")
+        or meta.get("profit_capture_stage") or intent.get("profit_capture_stage")
+        or intent.get("stage")
+    ):
+        stable_family = str(
+            intent.get("exit_family") or meta.get("exit_family") or ""
+        ).strip().upper()
+        if stable_family in {"GIVEBACK", "TRAILING_STOP"}:
+            action = stable_family
     if not action:
         raise ValueError("semantic action stage is required")
     try:
@@ -681,6 +698,20 @@ def _semantic_action_instance(
         return trade_date.isoformat()
     if side != "SELL":
         return None
+    # Preserve the existing US_STANDARD trailing partial-sell philosophy:
+    # after an ACTUAL fill reduces the held quantity, the next partial trim
+    # must be a distinct economic tranche. The pre-order position quantity
+    # is invariant while an earlier submission remains unresolved or fails
+    # before HTTP, unlike fluctuating price/ratio explanation strings.
+    if owner == "US_STANDARD" and action.strip().upper() == "TRAILING_STOP":
+        try:
+            held = int(intent.get("holding_qty") or
+                       meta.get("pre_order_holding_qty") or 0)
+            requested = int(intent.get("qty") or 0)
+        except (TypeError, ValueError, OverflowError):
+            held, requested = 0, 0
+        if held > 0 and 0 < requested < held:
+            return f"PRE_HOLDING_QTY:{held}"
     labels = {
         str(value or "").strip().upper()
         for value in (
@@ -1779,6 +1810,36 @@ def route_order(
             "broker_submit": False,
             "intent": intent,
         }
+    # Fail at the router boundary, BEFORE durable STARTED or claim creation,
+    # when the *native* KIS client would refuse the order. Do not weaken or
+    # auto-clear DISABLE_REAL_TRADING; also protect direct tick/router callers
+    # that did not run the session permission precheck.
+    from trader.us.execution.kis_us_client import KisUSClient
+    # Synthetic broker adapters (including injected harness clients) are
+    # not a KIS HTTP submitter; they preserve their explicit test semantics.
+    # Only the genuine KIS client must pass the native HTTP gate.
+    _native_kis = (
+        type(kis_client).__module__ == KisUSClient.__module__
+        and type(kis_client).__name__ == "KisUSClient"
+    )
+    if _native_kis:
+        try:
+            us_cfg.assert_us_paper_order_allowed()
+        except RuntimeError as _permission_exc:
+            logger.error(
+                "[US_ORDER][KIS_NATIVE_PERMISSION_PRECHECK][BLOCK] "
+                "symbol=%s side=%s reason=%s broker_submit=0",
+                symbol_upper, side, _permission_exc,
+            )
+            return {
+                "status": "ORDER_DISABLED_NATIVE_KIS_PERMISSION",
+                "reason": str(_permission_exc),
+                "broker_submit": False,
+                "requires_reconcile": False,
+                "retry_order": False,
+                "intent": intent,
+            }
+
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation
@@ -1930,6 +1991,35 @@ def route_order(
             else None
         )
         _metrics = getattr(context, "metrics", None)
+        # Includes synchronous journal/DB work, recovery and all risk checks
+        # from run_trade_tick() start to the actual native HTTP boundary.
+        # It is independent of selected signal/candidate timing.
+        _tick_origin = (
+            _metrics.get("tick_start_monotonic")
+            if isinstance(_metrics, dict) else None
+        )
+        if (side == "SELL" and isinstance(_tick_origin, (int, float))
+                and _tick_origin <= _http_boundary_mono):
+            _tick_ms = (_http_boundary_mono - _tick_origin) * 1000.0
+            logger.info(
+                "[US_EXIT][TICK_TO_BROKER_BOUNDARY] "
+                "symbol=%s attempt=%s origin=tick_start boundary=native_http_begin delay_ms=%.2f",
+                symbol_upper, intent["submit_attempt_id"], _tick_ms,
+            )
+            if isinstance(_metrics, dict):
+                _metrics["sell_tick_to_broker_boundary_ms"] = _tick_ms
+                _tick_samples = _metrics.setdefault(
+                    "sell_tick_to_broker_boundary_by_attempt_ms", {},
+                )
+                if isinstance(_tick_samples, dict) and (
+                    len(_tick_samples) < 128
+                    or str(intent["submit_attempt_id"]) in _tick_samples
+                ):
+                    _tick_samples[str(intent["submit_attempt_id"])] = _tick_ms
+                else:
+                    _metrics["sell_tick_to_broker_boundary_dropped_count"] = (
+                        int(_metrics.get("sell_tick_to_broker_boundary_dropped_count", 0)) + 1
+                    )
         if side == "SELL" and isinstance(_first_ready, (int, float)):
             _first_wait_ms = max(
                 0.0, (_http_boundary_mono - _first_ready) * 1000.0
@@ -2008,6 +2098,22 @@ def route_order(
                 type(exc).__name__,
             )
         if isinstance(exc, KisUSPreSubmitError):
+            # Exception text may contain credentials/URLs: log only allowlisted
+            # guard codes and exception classes, while preserving journal detail.
+            guard_codes = (
+                "trading_region_not_us", "kis_env_not_practice",
+                "paper_trading_not_enabled", "us_live_trading_disabled",
+                "disable_real_trading_enabled", "dry_run_enabled",
+                "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP", "US_KIS_ORDER_ALLOWED=0",
+            )
+            failure_code = next((code for code in guard_codes if code in str(exc)),
+                                "pre_http_setup_failed")
+            logger.error(
+                "[US_ORDER][PRE_IO_FAILURE] symbol=%s side=%s attempt=%s "
+                "code=%s error_type=%s cause_type=%s broker_submit=0",
+                symbol_upper, side, intent["submit_attempt_id"], failure_code,
+                type(exc).__name__, type(exc.__cause__).__name__,
+            )
             integrity_error = str(exc)
             try:
                 append_order_event(

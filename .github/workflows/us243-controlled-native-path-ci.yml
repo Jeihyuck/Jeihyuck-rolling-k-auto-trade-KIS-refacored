@@ -1,0 +1,72 @@
+name: US243 Controlled Native Order Path and 20-Sample Gate
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - ".github/workflows/us243-controlled-native-path-ci.yml"
+      - "tests/us/test_us_pr243_twenty_native_http_boundary.py"
+      - "tests/us/test_us_pr243_latency_fail_closed.py"
+      - "scripts/us_latency_compare.py"
+      - "trader/us/execution/order_router.py"
+      - "trader/us/runner/trade_tick_runner.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-kis-stubbed-boundary-only:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.number == 243 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/us-20261020-execution-recovery'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: .
+      # NO KIS CREDENTIALS, NO LIVE DATABASE. All HTTP calls are mocked;
+      # any stray KIS GET/POST is a test failure.
+      PBCORE_DB_URL: ""
+      DATABASE_URL: ""
+      KIS_APP_KEY: ""
+      KIS_APP_SECRET: ""
+      KIS_ENV: practice
+      US243_BENCH_REPORT_DIR: ${{ github.workspace }}/artifacts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: 20 genuine route functions with stubbed native HTTP
+        run: |
+          set -euo pipefail
+          python -m pytest -q -s \
+            tests/us/test_us_pr243_twenty_native_http_boundary.py \
+            tests/us/test_us_pr243_latency_fail_closed.py
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          report=json.loads(Path("artifacts/pr243-stubbed-native-boundary-20.json").read_text())
+          assert report["eligible_protective_sell_attempts"]==20
+          assert report["stubbed_http_post_count"]==20
+          assert report["native_boundary_samples"]==20
+          assert report["broker_real_orders"]==0
+          assert report["broker_real_fills"]==0
+          assert report["production_p95_60s_verified"] is False
+          print("PR243 CONTROLLED STATUS: 20 mock POSTs; native HTTP boundary measured;"
+                " real WSL latency and real KIS fill NOT CLAIMED")
+          PY
+      - name: Preserve mock-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us243-controlled-not-production-${{ github.run_id }}
+          path: artifacts/pr243-stubbed-native-boundary-20.json
+          retention-days: 7
+          if-no-files-found: ignore

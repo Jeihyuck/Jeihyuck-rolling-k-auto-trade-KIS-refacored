@@ -16,6 +16,7 @@ name: "US Agent Manual"
           - trade-close
           - report
           - kis-diag
+          - recovery-audit
       dry_run:
         description: "DRY_RUN (true = no order submission)"
         required: false
@@ -56,6 +57,7 @@ defaults:
 
 jobs:
   manual:
+    if: ${{ inputs.mode != 'recovery-audit' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -308,4 +310,95 @@ jobs:
             repo/artifacts/
             repo/reports/us_daily/
           if-no-files-found: warn
+          retention-days: 7
+
+
+  # Operator-triggered, GET-only evidence audit. Completely separate from the
+  # manual dispatcher and any trade/prep/scheduler job. Never touches live DB.
+  original_day_recovery_evidence:
+    if: ${{ inputs.mode == 'recovery-audit' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: "."
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      TRADING_REGION: "US"
+      KIS_ENV: "practice"
+      DRY_RUN: "1"
+      US_ORDER_ARMED: "0"
+      US_KIS_ORDER_ALLOWED: "0"
+      ALLOW_REAL_ORDER: "0"
+      US_LIVE_TRADING_ENABLED: "0"
+      LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DISABLE_LIVE_TRADING: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Refuse invalid broker / DB or insecure trading mode
+        run: |
+          set -euo pipefail
+          test -n "${KIS_APP_KEY:-}"
+          test -n "${KIS_APP_SECRET:-}"
+          test -n "${CANO:-}"
+          test -n "${ACNT_PRDT_CD:-}"
+          test -n "${PBCORE_DB_URL:-}"
+          [[ "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]] || exit 1
+          [[ "${KIS_REST_URL:-}" == "https://openapivts.koreainvestment.com:29443" ]] || {
+            echo "::error::Read-only evidence is practice API only"
+            exit 1
+          }
+          [[ "${KIS_ENV}" == "practice" && "${US_KIS_ORDER_ALLOWED}" == "0" &&
+             "${DRY_RUN}" == "1" && "${US_ORDER_ARMED}" == "0" ]] || exit 1
+          echo "Authenticated KIS PRACTICE GET-only evidence verification enabled"
+      - name: Read-only historical US execution audit
+        id: audit
+        run: |
+          set -uo pipefail
+          python scripts/us_kis_original_day_evidence.py \
+            --from-date 2026-10-01 --to-date 2026-10-20 \
+            --require-all-terminal > us243-original-day-evidence.json
+          rc=$?
+          echo "audit_rc=$rc" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = Path("us243-original-day-evidence.json")
+          if report.exists() and report.stat().st_size:
+              d = json.loads(report.read_text(encoding="utf-8"))
+              summary = d.get("summary") or {}
+              print("claim_count", summary.get("claim_count"))
+              print("terminal_proven_count", summary.get("terminal_proven_count"))
+              print("unresolved_or_open_count", summary.get("unresolved_or_open_count"))
+              for item in d.get("claims") or []:
+                  print("original_day", item.get("trade_date"),
+                        "symbol", item.get("symbol"),
+                        "side", item.get("side"),
+                        "proof", item.get("proof_status"),
+                        "reason", item.get("reason"))
+          else:
+              print("AUDIT_NO_REPORT: unable to certify KIS evidence")
+          PY
+          exit "$rc"
+      - name: Preserve sanitized evidence report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us243-original-day-evidence-${{ github.run_id }}
+          path: us243-original-day-evidence.json
+          if-no-files-found: ignore
           retention-days: 7

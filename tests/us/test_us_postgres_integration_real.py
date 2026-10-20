@@ -1449,6 +1449,61 @@ def test_same_cumulative_kis_price_correction_is_not_skipped(pg_engine):
     assert order["status"] == "PARTIALLY_FILLED"
 
 
+def test_real_postgres_synthetic_price_is_not_actual_and_claim_proof_survives_restart(
+        pg_engine, monkeypatch, tmp_path):
+    from datetime import date
+    import json
+    import sqlalchemy as sa
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db import repos
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+
+    monkeypatch.setenv('US_ORDER_JOURNAL_DIR', str(tmp_path))
+    identity = SemanticActionIdentity(env='practice', account_id='test-account',
+        market='US', trading_epoch_id='test-epoch', strategy_owner='US_STANDARD',
+        lifecycle_id='pg-life', action='TP1', trade_date=date(2026,7,16))
+    claims = DurableExecutionClaimRepo(pg_engine, us_execution_claims, us_execution_attempts)
+    monkeypatch.setattr(repos, '_execution_claim_repo', lambda: claims)
+    claims.acquire(identity, attempt_id='pg-proof-attempt', requested_qty=10, client_order_key='PG-PROOF')
+    claims.record_observation(identity, attempt_id='pg-proof-attempt', state='ACKED',
+                              cumulative_filled_qty=None, authoritative=False)
+    from scripts.us_order_evidence_dry_run import ACTIVE_CLAIM_SQL
+    with pg_engine.connect() as conn:
+        inventory=conn.execute(sa.text(ACTIVE_CLAIM_SQL),{
+            'env':'practice','account_id':'test-account','market':'US',
+            'trading_epoch_id':'test-epoch','start_date':date(2026,7,1),
+            'end_date':date(2026,7,31)}).mappings().all()
+    assert len(inventory)==1  # The active attempt is visible even without us_orders.
+    _seed_order(pg_engine, key='PG-PROOF', order_no='PG-PROOF-NO')
+    with pg_engine.begin() as conn:
+        conn.execute(sa.text('UPDATE us_orders SET meta=CAST(:meta AS jsonb) WHERE client_order_key=:key'),
+            {'key':'PG-PROOF','meta':json.dumps({'execution_action_key':identity.action_key,
+                'submit_attempt_id':'pg-proof-attempt','strategy_owner':'US_STANDARD',
+                'position_lifecycle_id':'pg-life'})})
+    observation = dict(trade_date='2026-07-16', client_order_key='PG-PROOF',
+        raw_order_no='PG-PROOF-NO', canonical_order_no='PG-PROOF-NO', symbol='AMD',
+        side='SELL', requested_qty=10, filled_qty=3, remaining_qty=7,
+        broker_status='PARTIALLY_FILLED', evidence_type='KIS_ORDER_CUMULATIVE_ACTUAL')
+    missing = repos.apply_broker_order_observation(**observation,
+        raw_row={'filled_qty':3,'requested_qty':10})
+    assert missing.get('requires_reconcile') is True
+    assert claims.get(identity).active_attempt_id
+    for qty in (3,10,10):
+        result = repos.apply_broker_order_observation(**{**observation,'filled_qty':qty,
+            'remaining_qty':10-qty,'broker_status':'FILLED' if qty==10 else 'PARTIALLY_FILLED'},
+            raw_row={'filled_qty':qty,'requested_qty':10,'avg_price':105})
+        assert result['status']=='OK' and not result.get('requires_reconcile'), result
+    restarted = DurableExecutionClaimRepo(pg_engine, us_execution_claims, us_execution_attempts)
+    assert restarted.get(identity).action_state=='SATISFIED'
+    assert restarted.get(identity).active_attempt_id is None
+    with pg_engine.connect() as conn:
+        attempt=conn.execute(sa.select(us_execution_attempts)).mappings().one()
+        actual=conn.execute(sa.text("SELECT qty,price_usd FROM us_fills WHERE client_order_key='PG-PROOF' AND NOT COALESCE((meta->>'is_synthetic')::boolean,false)")).mappings().all()
+    assert attempt['authoritative'] is True
+    assert len(actual)==1 and actual[0]['qty']==10 and float(actual[0]['price_usd'])==105
+
+
 def test_real_postgres_multi_broker_observation_persists_verified_evidence_and_is_idempotent(
         pg_engine, monkeypatch, tmp_path):
     """The real us_order_events JSONB and UNIQUE idem preserve broker truth."""
@@ -1522,3 +1577,48 @@ def test_real_postgres_multi_broker_observation_persists_verified_evidence_and_i
         if r["event_type"] == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
         and r["client_order_key"] == intent["client_order_key"]
     ]) == 1
+
+
+def test_equal_qty_price_synthetic_broker_promotion_preserves_unique_tuple(pg_engine):
+    """Oct 2026 GILD/PG: original synthetic is exactly same qty AND price.
+
+    Schema uq_us_fills_idempotent ignores evidence_type, so a separate real
+    fill row with that tuple would violate UNIQUE and leave a false claim.
+    Promote only the scoped superseded synthetic with an immutable provenance
+    breadcrumb; the second actual replay is idempotent.
+    """
+    import trader.us.db.repos as repos
+    from sqlalchemy import text
+    _seed_order(pg_engine, key="SAME-TUPLE-REPAIR", order_no="0000900123",
+                qty_requested=4, qty_filled=4)
+    opts = dict(
+        trade_date="2026-07-16",order_no="0000900123",
+        client_order_key="SAME-TUPLE-REPAIR",
+        symbol="AMD",side="SELL",filled_qty=4,
+        requested_qty=4,cumulative_filled_qty=4,
+        avg_price_usd=100,evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="broker_order_observation",
+    )
+    first = repos.mark_order_filled_by_reconcile(**opts)
+    second = repos.mark_order_filled_by_reconcile(**opts)
+    assert first["status"] == "OK",first
+    assert second["status"] == "OK",second
+    with pg_engine.begin() as conn:
+        fills=conn.execute(text("""
+            SELECT qty,price_usd,meta FROM us_fills
+            WHERE client_order_key='SAME-TUPLE-REPAIR'
+        """)).mappings().all()
+        order=conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd FROM us_orders
+            WHERE client_order_key='SAME-TUPLE-REPAIR'
+        """)).mappings().one()
+    assert len(fills)==1
+    assert fills[0]["qty"]==4
+    assert float(fills[0]["price_usd"])==100.0
+    assert fills[0]["meta"]["fill_evidence_type"]=="KIS_ORDER_CUMULATIVE_ACTUAL"
+    assert fills[0]["meta"]["is_synthetic"] is False
+    assert fills[0]["meta"]["accounting_active"] is True
+    assert fills[0]["meta"]["synthetic_actual_same_tuple_promoted"] is True
+    assert fills[0]["meta"]["original_synthetic_evidence_type"]=="BALANCE_DELTA_SYNTHETIC"
+    assert order["status"]=="FILLED"
+    assert order["qty_filled"]==4

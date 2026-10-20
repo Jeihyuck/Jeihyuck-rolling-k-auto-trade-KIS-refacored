@@ -186,8 +186,10 @@ def test_us_health_and_preflight_have_contract_integrity_gates():
 
     assert "[US_ENTRY][CONTRACT_INTEGRITY_FAIL]" in tick
     assert 'entry_degraded_reason = "entry_contract_integrity_fail"' in tick
-    assert "validate_us_entry_provenance_contract" in preflight
-    assert "DB_LIVE_CONTRACT_FAIL" in preflight
+    assert "check_effective_prep_sources(trade_date)" in preflight
+    helper = Path("trader/us/prep_effective.py").read_text(encoding="utf-8")
+    assert "validate_us_entry_provenance_contract(locked_rows)" in helper
+    assert "db_live_contract_invalid" in helper
 
 
 def test_us_intentional_balance_interval_skip_is_not_a_failure_marker():

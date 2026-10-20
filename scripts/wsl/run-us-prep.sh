@@ -142,41 +142,10 @@ if [[ "$prep_rc" == 0 ]]; then
 import sys
 from pathlib import Path
 trade_date = sys.argv[1]
-from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
-from trader.us.prep_effective import (
-    is_effective_prep_contract,
-    is_effective_prep_status,
-    locked_rows_match_prep_run,
-)
-from trader.us.db.repos import load_us_prep_completion_for_run, load_locked_us_watchlist
-from trader.us.score_columns import validate_us_entry_provenance_contract
-contract = load_us_prep_contract(trade_date) or {}
-artifact_rows = load_us_final30_scored(trade_date) or []
-if not is_effective_prep_contract(contract, artifact_rows, trade_date=trade_date, min_rows=10):
-    raise SystemExit(1)
-prep = load_us_prep_completion_for_run(trade_date, str(contract.get('run_id') or '')) or {}
-locked_rows = load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
-provenance = validate_us_entry_provenance_contract(locked_rows)
-prep_run_id = str(prep.get("run_id") or "").strip()
-contract_run_id = str(contract.get("run_id") or "").strip()
-run_id_ok = locked_rows_match_prep_run(prep, locked_rows)
-artifact_run_id_ok = (not contract_run_id) or contract_run_id == prep_run_id
-db_ok = (
-    is_effective_prep_status(prep.get("status"))
-    and len(locked_rows) >= 10
-    and provenance.get("ok") is True
-    and run_id_ok
-    and artifact_run_id_ok
-)
-if not db_ok:
-    locked_run_ids = sorted({str(row.get("run_id") or "").strip() for row in locked_rows if isinstance(row, dict)})
-    print(
-        "[US_PREP][POST_COMPLETE_CONTRACT_CHECK] status=DB_PROVENANCE_NOT_EFFECTIVE "
-        f"prep_status={prep.get('status')} prep_run_id={prep_run_id or '-'} "
-        f"contract_run_id={contract_run_id or '-'} locked_run_ids={locked_run_ids} "
-        f"locked={len(locked_rows)} provenance_ok={provenance.get('ok')} run_id_ok={int(run_id_ok)} "
-        f"artifact_run_id_ok={int(artifact_run_id_ok)}"
-    )
+from trader.us.prep_effective import check_effective_prep_sources
+result = check_effective_prep_sources(trade_date)
+print('[US_PREP][POST_COMPLETE_CONTRACT_CHECK]', result)
+if not result['ok']:
     raise SystemExit(1)
 marker = Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
 if marker.exists():

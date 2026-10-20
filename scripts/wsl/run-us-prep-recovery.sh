@@ -23,20 +23,23 @@ export PB1_SESSION="prep_recovery"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
+source "$SCRIPT_DIR/resolve-nullim-python.sh"
+PYTHON_BIN="$(nullim_resolve_python "$APP_DIR")"
 mkdir -p runtime runtime/locks runtime/health
 
 is_effective_prep() {
-python - "$NULLIM_TRADE_DATE" <<'PY'
+"$PYTHON_BIN" - "$NULLIM_TRADE_DATE" <<'PY'
 import sys
 trade_date = sys.argv[1]
-from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
-from trader.us.prep_effective import is_effective_prep_contract
-contract = load_us_prep_contract(trade_date) or {}
-rows = load_us_final30_scored(trade_date) or []
-status = str(contract.get("status") or "").upper()
-if is_effective_prep_contract(contract, rows, trade_date=trade_date, min_rows=10):
-    print(f"[US_PREP_RECOVERY][SKIP_EFFECTIVE_PREP] trade_date={trade_date} status={status} final30={len(rows)}")
-    raise SystemExit(0)
+from trader.us.prep_effective import check_effective_prep_sources
+try:
+    result = check_effective_prep_sources(trade_date)
+    print('[US_PREP_RECOVERY][SOURCE_CHECK]', result)
+    if result['ok']:
+        print(f"[US_PREP_RECOVERY][SKIP_EFFECTIVE_PREP] trade_date={trade_date}")
+        raise SystemExit(0)
+except Exception as exc:
+    print('[US_PREP_RECOVERY][SOURCE_CHECK_ERROR] type=%s' % type(exc).__name__)
 raise SystemExit(1)
 PY
 }

@@ -1398,3 +1398,129 @@ def test_route_post_io_observation_failure_surfaces_reconcile_integrity(monkeypa
     assert broker.calls == 1
     assert claim_repo.health()["unresolved_execution_actions"] == 1
     assert repos.load_execution_claim_health()["unresolved_execution_actions"] == 1
+
+
+def test_oct19_native_practice_guard_reaches_http_ack_and_duplicate_is_fenced(monkeypatch):
+    """Actual router + actual client guard (previous tests bypassed this guard)."""
+    import requests
+    from trader.us import config
+    native_guard = config.assert_us_paper_order_allowed
+    _engine, claim_repo, _broker = _route_fixture(monkeypatch)
+    http_events = []
+    client = _native_kis_client(monkeypatch, http_events)
+    monkeypatch.setattr(config, 'assert_us_paper_order_allowed', native_guard)
+    for key, value in dict(TRADING_REGION='US', KIS_ENV='practice',
+                           US_PAPER_TRADING_ENABLED=True, US_LIVE_TRADING_ENABLED=True,
+                           DISABLE_REAL_TRADING=True, DRY_RUN=False).items():
+        monkeypatch.setattr(config, key, value)
+
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {'rt_cd': '0', 'order_no': 'PRACTICE-1'}
+    def post(*args, **kwargs):
+        http_events.append('HTTP')
+        return Response()
+    monkeypatch.setattr(requests, 'post', post)
+    monkeypatch.setattr(client, 'get_balance', lambda **kw: {
+        'positions': [{'symbol': 'TEST_SYMBOL', 'qty': 1, 'orderable_qty': 1,
+                       'exchange': 'NASDAQ'}]}, raising=False)
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: pytest.fail('unexpected network GET'))
+    intent = _intent('2026-10-19', side='SELL', action='HARD_STOP',
+                     client_order_key='oct19-native-practice-sell')
+    result = route_order(intent, kis_client=client)
+    assert result['status'] == 'ACK', result
+    assert http_events == ['HTTP']
+
+    second = route_order(intent, kis_client=client)
+    assert second['status'] in {'ORDER_FENCED_UNRESOLVED_ACTION', 'WARN_DUPLICATE_EXIT_BLOCKED'}
+    assert http_events == ['HTTP']
+
+
+@pytest.mark.parametrize('side', ['BUY', 'SELL'])
+def test_native_practice_ack_partial_full_fill_position_and_restart(monkeypatch, tmp_path, side):
+    """Native guard/router/client, real accounting and file-backed claims.
+
+    HTTP, credentials, market/risk inputs and order-identity normalization use
+    the explicit test adapters above. This is not a live strategy/KIS test.
+    """
+    import requests
+    from trader.us import config
+    from trader.us.db import repos
+    from trader.us.execution import order_journal
+    native_guard = config.assert_us_paper_order_allowed
+    real_ack, real_journal = repos.save_order_ack, order_journal.append_order_event
+    engine = sa.create_engine('sqlite:///' + str(tmp_path / 'native.sqlite'))
+    _engine, claim_repo, _broker = _route_fixture(monkeypatch, engine=engine)
+    _enable_in_memory_reconciliation(monkeypatch, claim_repo, real_ack)
+    monkeypatch.setattr(repos, '_MEM_POSITIONS', [])
+    monkeypatch.setattr(order_journal, 'append_order_event', real_journal)
+    monkeypatch.setenv('US_ORDER_JOURNAL_DIR', str(tmp_path / 'journal'))
+    http_events = []
+    client = _native_kis_client(monkeypatch, http_events)
+    monkeypatch.setattr(config, 'assert_us_paper_order_allowed', native_guard)
+    for key,value in dict(TRADING_REGION='US', KIS_ENV='practice',
+        US_PAPER_TRADING_ENABLED=True, US_LIVE_TRADING_ENABLED=True,
+        DISABLE_REAL_TRADING=True, DRY_RUN=False).items():
+        monkeypatch.setattr(config,key,value)
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return {'rt_cd':'0','order_no':'CONNECTED-1'}
+    def post(*args,**kwargs):
+        http_events.append('HTTP')
+        return Response()
+    monkeypatch.setattr(requests,'post',post)
+    monkeypatch.setattr(requests,'get',lambda *a,**k:pytest.fail('unexpected network GET'))
+    monkeypatch.setattr(client,'get_balance',lambda **kw:{'positions':[
+        {'symbol':'TEST_SYMBOL','qty':4,'orderable_qty':4,'exchange':'NASDAQ'}]},raising=False)
+    intent=_intent('2026-10-19',qty=2,side=side,action='CONNECTED',client_order_key='connected-'+side)
+    assert route_order(intent,kis_client=client)['status']=='ACK'
+    assert http_events==['HTTP']
+    identity=_identity('2026-10-19','CONNECTED')
+    for qty in (1,2,2):
+        applied=repos.apply_broker_order_observation(trade_date='2026-10-19',
+            client_order_key=intent['client_order_key'],raw_order_no='CONNECTED-1',
+            canonical_order_no='CONNECTED-1',symbol='TEST_SYMBOL',side=side,
+            requested_qty=2,filled_qty=qty,remaining_qty=2-qty,
+            broker_status='FILLED' if qty==2 else 'PARTIALLY_FILLED',
+            evidence_type='KIS_ORDER_CUMULATIVE_ACTUAL',
+            raw_row={'filled_qty':qty,'requested_qty':2,'avg_price':11})
+        assert applied['status']=='OK' and not applied.get('requires_reconcile'),applied
+    final_qty=6 if side=='BUY' else 2
+    repos.save_position_snapshot([{'symbol':'TEST_SYMBOL','qty':final_qty,
+        'avg_cost':11,'current_px':11,'exchange':'NASDAQ'}],trade_date='2026-10-19',
+        authoritative_positions=True,balance_fetch_status='OK',balance_parse_status='OK',
+        preserve_previous_positions=False)
+    assert repos._MEM_POSITIONS[0]['qty']==final_qty
+    restarted=DurableExecutionClaimRepo(engine,us_execution_claims)
+    assert restarted.get(identity).action_state=='SATISFIED'
+    assert restarted.get(identity).remaining_target_qty==0
+    assert len(repos._MEM_FILLS)==1 and repos._MEM_FILLS[0]['qty']==2
+    assert repos._MEM_FILLS[0]['price_usd']==11
+    assert route_order(intent,kis_client=client)['status']!='ACK'
+    assert http_events==['HTTP']
+    engine.dispose()
+
+
+def test_protective_sell_tick_to_native_http_metric_includes_pre_route_time(
+    monkeypatch,
+):
+    """The real route boundary, not a fabricated order-attempt timestamp."""
+    _engine, claims, broker = _route_fixture(monkeypatch)
+    context = TickExecutionContext(
+        "2026-10-02", "am", "run-timing", 1, "tick-timing",
+        deadline=time.monotonic() + 10,
+    )
+    context.metrics["tick_start_monotonic"] = time.monotonic() - 1.2
+    order = _intent("2026-10-02", action="TP1",
+                    client_order_key="timing-sell", side="SELL")
+    result = route_order(order, kis_client=broker, context=context)
+    assert result["status"] == "ACK", result
+    assert broker.calls == 1
+    attempt = str(result["intent"]["submit_attempt_id"])
+    samples = context.metrics["sell_tick_to_broker_boundary_by_attempt_ms"]
+    assert attempt in samples
+    assert samples[attempt] >= 1200
+    assert context.metrics["sell_tick_to_broker_boundary_ms"] == samples[attempt]
+    assert claims.health()["unresolved_execution_actions"] == 1

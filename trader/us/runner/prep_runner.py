@@ -288,6 +288,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             mode="prep",
             env=env,
         )
+        if not run_id:
+            raise RuntimeError("PREP run identity was not persisted")
         logger.info("[US_PREP][RUN_ID] %s", run_id)
     except Exception as exc:
         logger.error("[US_PREP][ERROR] save_us_prep_run failed: %s", exc)
@@ -698,6 +700,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             paths=paths,
             daily_sync_summary=daily_sync_summary,
         )
+        # Bind artifact, locked rows and completed DB run to the same identity.
+        contract["run_id"] = run_id
         contract["daily_sync_summary"] = daily_sync_summary
         contract["benchmark_data_quality"] = benchmark_gate.get("benchmark_data_quality")
         contract["benchmark_missing_symbols"] = benchmark_missing_symbols
@@ -823,11 +827,14 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             run_id=run_id,
             prep_status=final_status,
         )
-        saved_count = save_result.get("unique_count", len(final30_scored)) if isinstance(save_result, dict) else len(final30_scored)
+        saved_count = int(save_result.get("saved_count", 0)) if isinstance(save_result, dict) else 0
+        if saved_count != len(final30_scored):
+            raise RuntimeError("locked watchlist persistence incomplete")
         logger.info("[US_PREP][LEGACY_WATCHLIST][SAVED] unique=%d", saved_count)
     except Exception as exc:
-        logger.warning("[US_PREP][WARN] legacy locked watchlist save failed: %s", exc)
-        saved_count = len(final30_scored)
+        logger.error("[US_PREP][ERROR] locked watchlist save failed type=%s", type(exc).__name__)
+        finish_us_prep_run(run_id, status="ERROR", result={"stage": "locked_watchlist_save"})
+        return {"status": "ERROR", "stage": "locked_watchlist_save", "trade_date": trade_date}
 
     # ── 11. finish run ────────────────────────────────────────────────────
     result_dict = dict(contract)
@@ -869,7 +876,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "daily_sync_summary": daily_sync_summary,
         **market_state_fields,
     })
-    finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
+    if not finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict):
+        return {"status": "ERROR", "stage": "prep_run_finish", "trade_date": trade_date}
 
     logger.info(
         "[US_PREP][FINISH] status=%s final30=%d score_nonzero=%d trade_can_proceed=%d",

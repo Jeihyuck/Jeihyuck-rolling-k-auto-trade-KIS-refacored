@@ -467,6 +467,8 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         and _parse_json_meta(event.get("meta")).get("broker_recovery_status") == "REBOUND"
         for event in events
     )
+    from trader.us.execution.order_journal import proven_unsent_attempts
+    unsent_attempts = proven_unsent_attempts(events)
     failed_attempts: dict[tuple[str, str], bool] = {}
     failure_events = {
         "JOURNAL_REPLAY_UNRESOLVED",
@@ -495,6 +497,8 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         )
         if not any(attempt_key):
             attempt_key = ("", str(event.get("event_id") or id(event)))
+        if attempt_key in unsent_attempts:
+            continue
         failed_attempts[attempt_key] = event_type in failure_events
     failed_rebounds = sum(failed_attempts.values()) + len(unattributed)
     cumulative_fill_qty_by_key: dict[str, int] = {}
@@ -1279,7 +1283,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if status not in allowed:
         return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
     filled_qty_value = None if filled_qty is None else int(filled_qty)
-    if filled_qty_value is None:
+    if (raw_row or {}).get("filled_qty_present") is False:
+        if status in {"FILLED", "PARTIALLY_FILLED"}:
+            return {"status": "PENDING", "reason": "broker_filled_quantity_missing",
+                    "requires_reconcile": True, "retry_order": False, "entry_fence": True}
+        filled_qty_value = None
+    if filled_qty_value is None and (raw_row or {}).get("filled_qty_present") is not False:
         for name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty"):
             raw_filled = (raw_row or {}).get(name)
             if raw_filled not in (None, ""):
@@ -1352,6 +1361,10 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         and filled_qty_value is not None
         and filled_qty_value > 0
     )
+    if fill_bearing_status and not broker_requested_valid:
+        return {"status": "BROKER_OBSERVATION_QUARANTINED",
+                "reason": "broker_requested_quantity_missing", "requires_reconcile": True,
+                "retry_order": False, "entry_fence": True}
     if fill_bearing_status and broker_requested_raw not in (None, ""):
         if not broker_requested_valid or broker_requested_qty != int(requested_qty):
             mismatch_reason = (
@@ -1486,8 +1499,13 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         fill_price = observed_fill_price
         fill_price_source = "broker_observation"
         if not (math.isfinite(fill_price) and fill_price > 0):
+            persisted_evidence = _active_fill_cumulatives_for_order(
+                trade_date=td, order_no=raw_order_no, client_order_key=key,
+                symbol=symbol, side=side,
+            )
             if (
                 old_filled >= filled_qty_value
+                and int(persisted_evidence.get("actual", 0)) >= filled_qty_value
                 and math.isfinite(old_avg_price)
                 and old_avg_price > 0
             ):
@@ -1731,12 +1749,16 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if (raw_row or {}).get("filled_qty_present") is False:
         broker_fill_raw = None
     observation_qty = filled_qty_value if broker_fill_raw is not None else None
-    authoritative = status == "REJECTED" and (
+    authoritative = status in {"FILLED", "PARTIALLY_FILLED"} and (
+        _is_kis_order_cumulative_evidence(evidence_type)
+        and observation_qty is not None and observation_qty > 0
+    )
+    authoritative = authoritative or (status == "REJECTED" and (
         broker_requested_valid
         and broker_requested_qty == int(requested_qty)
         and broker_fill_raw is not None
         and observation_qty == 0
-    )
+    ))
     if status == "CANCELLED":
         authoritative = bool(
             broker_requested_valid
@@ -1787,6 +1809,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             "requires_reconcile": True,
             "retry_order": False,
         })
+    if status == "EXPIRED":
+        # The legacy claim contract deliberately does not terminalize expiry
+        # from an order-status row. Do not advertise a clean recovery while
+        # its execution attempt still requires original-date fill proof.
+        result.update({"requires_reconcile": True, "retry_order": False,
+                       "reason": "expired_execution_claim_requires_proof"})
     if claim_update_error:
         result.update({
             "execution_claim_update_error": claim_update_error,
@@ -3045,6 +3073,8 @@ def _broker_fill_recovery_candidates(fill: dict, *, trade_date: str) -> tuple[st
     potential_candidates: list[dict] = []
     exact_candidates: list[dict] = []
     qualified_candidates: list[dict] = []
+    from trader.us.execution.order_journal import proven_unsent_attempts
+    unsent_attempts = proven_unsent_attempts(events)
     for key in sorted(set(order_by_key) | set(intent_by_key)):
         local_order = order_by_key.get(key) or {}
         local_intent = intent_by_key.get(key) or {}
@@ -3056,6 +3086,7 @@ def _broker_fill_recovery_candidates(fill: dict, *, trade_date: str) -> tuple[st
             event for event in events
             if str(event.get("client_order_key") or "") == key
             and str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
+            and (key, str(event.get("submit_attempt_id") or "")) not in unsent_attempts
         ]
         if not key_events:
             continue
@@ -4778,7 +4809,9 @@ def mark_order_filled_by_reconcile(
         cumulative = max(previous, min(observed_cumulative, requested))
         remaining = max(0, requested - cumulative)
         status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
-        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}), "remaining_qty": remaining}
+        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}),
+                      "remaining_qty": remaining, "fill_evidence_type": evidence,
+                      "is_synthetic": synthetic}
         promotion = {"superseded": 0, "conflict": 0}
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", cumulative=observed_cumulative)
@@ -4921,6 +4954,8 @@ def mark_order_filled_by_reconcile(
             **_parse_json_meta(order.get("meta")),
             **(meta or {}),
             "remaining_qty": remaining,
+            "fill_evidence_type": evidence,
+            "is_synthetic": synthetic,
         }
         if order_epoch_id:
             merged["trading_epoch_id"] = order_epoch_id
@@ -5042,7 +5077,70 @@ def mark_order_filled_by_reconcile(
                         (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
                         VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
                         ON CONFLICT (fill_idempotency_key) DO NOTHING"""
-            conn.execute(text(insert_sql), insert_params)
+            # On production's uq_us_fills_idempotent the column tuple does
+            # NOT contain evidence_type. If synthetic and actual broker
+            # cumulative have identical qty AND price, the otherwise-correct
+            # actual INSERT collides with a superseded synthetic. Promote that
+            # exact, already-deactivated synthetic row in place. Its original
+            # provenance survives inside meta and the immutable order journal.
+            # No inferred fill or unrelated row may be promoted here.
+            same_tuple_params = {
+                "td": td, "symbol": sym, "side": side_u, "order_no": on,
+                "cok": resolved_client_order_key, "qty": fill_delta,
+                "price": price, **fill_epoch_params,
+            }
+            candidates = []
+            if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+                candidates = conn.execute(text("""
+                    SELECT id, meta FROM us_fills
+                    WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                      AND order_no=:order_no AND client_order_key=:cok
+                      AND qty=:qty AND price_usd=:price
+                """ + fill_epoch_clause + """
+                      AND COALESCE((meta->>'is_synthetic')::boolean,
+                          (meta->>'synthetic')::boolean,
+                          (meta->>'synthetic_fill')::boolean,false)
+                      AND COALESCE((meta->>'accounting_active')::boolean,true)=false
+                    FOR UPDATE
+                """), same_tuple_params).mappings().all()
+            if len(candidates) > 1:
+                raise FillAccountingInvariantError({
+                    "status": "SYNTHETIC_PROMOTION_IDENTITY_COLLISION",
+                    "entry_fence": True, "retry_order": False,
+                })
+            if len(candidates) == 1:
+                original_meta = _parse_json_meta(candidates[0]["meta"])
+                original_evidence = str(original_meta.get("fill_evidence_type") or "")
+                if original_evidence not in {"BALANCE_DELTA_SYNTHETIC","LEGACY_SYNTHETIC"}:
+                    raise FillAccountingInvariantError({
+                        "status": "SYNTHETIC_PROMOTION_SOURCE_NOT_ALLOWED",
+                        "entry_fence": True, "retry_order": False,
+                    })
+                promoted_meta = {
+                    **original_meta, **fill_meta,
+                    "is_synthetic": False, "synthetic": False,
+                    "synthetic_fill": False, "accounting_active": True,
+                    "fill_evidence_type": evidence,
+                    "original_synthetic_evidence_type": original_evidence,
+                    "synthetic_actual_same_tuple_promoted": True,
+                }
+                promote = conn.execute(text("""
+                    UPDATE us_fills SET meta=CAST(:promoted_meta AS jsonb)
+                    WHERE id=:fill_id AND trade_date=:td
+                      AND order_no=:order_no AND client_order_key=:cok
+                      AND qty=:qty AND price_usd=:price
+                """ + fill_epoch_clause), {
+                    **same_tuple_params,
+                    "fill_id": candidates[0]["id"],
+                    "promoted_meta": _json_param(promoted_meta),
+                })
+                if int(promote.rowcount or 0) != 1:
+                    raise FillAccountingInvariantError({
+                        "status": "SYNTHETIC_PROMOTION_UPDATE_FAILED",
+                        "entry_fence": True, "retry_order": False,
+                    })
+            else:
+                conn.execute(text(insert_sql), insert_params)
         rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
         """ + fill_epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),

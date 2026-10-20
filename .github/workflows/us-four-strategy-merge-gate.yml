@@ -96,6 +96,79 @@ jobs:
           # install their own explicit event fixtures, so do not inherit the
           # ambient Actions event or workflow name into dispatcher policy.
           env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q tests/test_kis_ws_price.py tests/us
+      - name: PR243 incident / full tick / performance three-gate acceptance
+        env:
+          US243_BENCH_REPORT_DIR: artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q -s \
+            tests/us/test_us243_oct19_live_evidence_replay.py \
+            tests/us/test_us243_oct19_permission_hash_regression.py \
+            tests/us/test_us_20261020_execution_incident.py::test_bounded_replay_rotates_and_preserves_full_close_recovery \
+            tests/us/test_us_20261007_sustained_real_buy_ack.py \
+            tests/us/test_us_pr243_latency_fail_closed.py \
+            | tee artifacts/pr243-three-gate-test.log
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          lines=Path("artifacts/pr243-three-gate-test.log").read_text().splitlines()
+          samples=[json.loads(x.split("US_PB1_BUY_ACK_20TICK_METRICS=",1)[1])
+                   for x in lines if "US_PB1_BUY_ACK_20TICK_METRICS=" in x]
+          fills=[json.loads(x.split("US_PB1_MOCK_KIS_FILL_RESTART=",1)[1])
+                 for x in lines if "US_PB1_MOCK_KIS_FILL_RESTART=" in x]
+          assert len(samples)==2, "both full-tick PG acceptance variants required"
+          assert len(fills)==2, "both full-tick PG mock cumulative fills required"
+          for fill in fills:
+              assert fill["filled_sides"]==["BUY","SELL"]
+              assert fill["postgres_restart_read_verified"] is True
+              assert fill["original_broker_http_count"]==0
+          for sample in samples:
+              assert sample["ticks"]==20
+              assert sample["buy_ack"] in (18,20)
+              assert sample["protective_sell_ack"]==1
+              assert sample["first_broker_submit"]=="SELL"
+              assert sample["sql_read_total"]>0 and sample["sql_write_total"]>0
+              assert sample["duplicate_replay_blocked"] is True
+              assert sample["tick_wall_p95_sec"]<=60.0
+              # The injected unresolved-ACK scenario must block BUY;
+              # that intentional safety degradation is not a performance
+              # failure, unlike entry-defer on an otherwise clean tick.
+              assert sample["entry_defer_count"]<=len(sample["unresolved_ticks"])
+              assert sample["measurement"]=="scaled_ci_nonproduction_latency"
+          acceptance={
+              "historical_oct19_original_86_pre_io_replay":"PASS",
+              "historical_abort_hash_permission_mismatch":"PASS",
+              "mock_kis_real_postgres_full_tick":"PASS",
+              "full_tick_sample_count_each":20,
+              "bounded_pre_route_journal_replay_virtual_clock":{
+                  "baseline_seconds":100,"bounded_seconds":10,
+                  "deferred_unresolved_attempts":18,
+                  "status":"PASS_ALL_FENCES_PRESERVED",
+                  "evidence":"test_bounded_replay_rotates_and_preserves_full_close_recovery",
+              },
+              "full_tick_p95_sec_each":[x["tick_wall_p95_sec"] for x in samples],
+              "full_tick_broker_ack_each":[x["buy_ack"] for x in samples],
+              "protective_sell_ack_each":[x["protective_sell_ack"] for x in samples],
+              "both_side_authoritative_mock_fill_after_reconnect_each":[x["postgres_restart_read_verified"] for x in fills],
+              "durable_duplicates_blocked_each":[x["duplicate_replay_blocked"] for x in samples],
+              "no_kis_order_posts":True,
+              "production_wsl_p95_verification":"NOT_PERFORMED",
+              "production_natural_buy_sell_and_real_fills":"NOT_PERFORMED",
+              "test_provenance":"CI_SCALED_MOCK_KIS_REAL_POSTGRES",
+          }
+          out=Path("artifacts/pr243-three-gate-acceptance.json")
+          out.write_text(json.dumps(acceptance,indent=2)+"\n")
+          print("US243_THREE_GATE_ACCEPTANCE="+json.dumps(acceptance,sort_keys=True))
+          PY
+      - name: Preserve PR243 three-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us243-three-gate-offline-not-live-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 7
       - name: Run all broker-free offline scenario replays
         run: |
           python -m trader.us.harness.runner --scenario all --offline

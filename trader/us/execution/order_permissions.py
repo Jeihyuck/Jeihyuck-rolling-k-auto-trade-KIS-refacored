@@ -35,7 +35,11 @@ def resolve_us_order_permissions(session: str, env: str, run_mode: str | None, e
     if dry_run: reasons.append("dry_run_enabled")
     if signal_only: reasons.append("signal_only_enabled")
     if disable_live: reasons.append("disable_live_trading_enabled")
-    if disable_real and env.lower() not in {"practice","paper"}: reasons.append("disable_real_trading_enabled")
+    # PR243 canonical KIS policy: DISABLE_REAL_TRADING fences REAL accounts.
+    # KIS_ENV=practice is separately gated by US_PAPER_TRADING_ENABLED,
+    # US_LIVE_TRADING_ENABLED, US_ORDER_ARMED and DRY_RUN. Never conflate.
+    if disable_real and env.lower() not in {"practice","paper"}:
+        reasons.append("disable_real_trading_enabled")
     if not live: reasons.append("live_trading_flag_disabled")
     if not us_live: reasons.append("us_live_trading_disabled")
     if not armed: reasons.append("us_order_not_armed")

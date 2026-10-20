@@ -114,7 +114,8 @@ def test_partial_sell_ack_balance_delta_confirm_via_reconcile_path(monkeypatch):
 
     assert provider.force_refresh_values == [True]
     assert result["balance_reconcile_count"] == 1
-    assert result["unresolved_count"] == 0
+    assert result["unresolved_count"] == 1
+    assert result["confirmed_orders"] == []
     assert "FLEX" in result["symbols_by_status"]["balance_confirmed"]
     assert captured[0]["source"] == "balance_reconcile_sell"
     assert captured[0]["meta"]["balance_delta_status"] == "BALANCE_CONFIRMED_SELL"
@@ -155,7 +156,8 @@ def test_reconcile_bypasses_stale_balance_cache_for_partial_sell(monkeypatch):
 
     assert provider.force_refresh_values == [True]
     assert result["balance_reconcile_count"] == 1
-    assert result["unresolved_count"] == 0
+    assert result["unresolved_count"] == 1
+    assert result["confirmed_orders"] == []
     assert captured[0]["filled_qty"] == 4
 
 
@@ -201,5 +203,6 @@ def test_full_sell_position_absent_fallback_still_confirms(monkeypatch):
     result = reconcile.reconcile_ack_orders_with_balance(provider=Provider(), trade_date="2026-07-02", env="practice")
 
     assert result["balance_reconcile_count"] == 1
-    assert result["unresolved_count"] == 0
+    assert result["unresolved_count"] == 1
+    assert result["confirmed_orders"] == []
     assert captured[0]["source"] in {"balance_reconcile_sell", "balance_reconcile_delta_sell"}

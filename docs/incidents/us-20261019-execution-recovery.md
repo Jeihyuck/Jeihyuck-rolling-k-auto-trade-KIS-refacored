@@ -1,0 +1,330 @@
+# US 2026-10-19 execution incident recovery
+
+Base: `dual-agent` / `8406a8ef2a8e0d6d5a85a7372a852a253b6cecd9`.
+Evidence: user-supplied `nullim-dual-agent-us-logs-20261020-070002.tar.gz`.
+No private logs, account identities, credentials or broker responses are committed.
+
+## Observed failure and reproduced causes
+
+- 22:30 KST AM startup denied `US_LIVE_TRADING_ENABLED=0`. This is an intentional gate, not bypassed.
+- 23:23 restarted AM and 02:00 afternoon had permission allowed, with
+  `KIS_ENV=practice`, `DISABLE_REAL_TRADING=1`, paper/live/armed enabled.
+  The startup resolver explicitly permits practice under the real-account stop,
+  but `config.assert_us_paper_order_allowed` rejected it. The native-client guard
+  now follows that practice policy. The client still accepts ONLY practice,
+  uses the fixed VTS URL, and retains paper/live/dry-run gates. Real accounts
+  remain rejected; this change does not set any runtime permission flags.
+- PREP's saved contract omitted the run_id that exact-run DB preflight requires.
+  Thirty valid scored rows therefore did not establish a completed live
+  contract. Recovery used only the artifact and incorrectly skipped rebuilding.
+  The writer now persists its DB run_id; recovery, preflight and post-completion
+  cleanup use one exact-run/artifact/provenance verdict. Missing identity,
+  mixed-run rows and DB failures cannot clear EXIT_ONLY.
+- The router wrote `BROKER_SUBMIT_ABORTED_PRE_IO`, but aggregation/replay only
+  understood `BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY`. All 86 known-unsent
+  attempts were counted as submitted and replayed as potentially real orders.
+  Both certificates now exclude an attempt from sent counts, broker recovery
+  and fill attribution. Contradictory ACK/fill/unknown evidence keeps it
+  broker-possible. A still-active claim after a failed release remains an
+  explicit unresolved error; no historical claim is automatically deleted.
+- PREP locked-row write failure and DB completion failure were allowed to
+  produce a successful result. Both now fail the PREP run explicitly.
+- Pre-I/O errors now expose an allowlisted cause code and exception classes
+  without logging arbitrary exception text, URLs, accounts or tokens.
+
+## Latency evidence and scope
+
+Observed tick-start to first **submit attempt log**, not HTTP send:
+
+| Session | n | Median seconds | Max seconds |
+| --- | ---: | ---: | ---: |
+| AM | 16 | 267.6305 | 292.154 |
+| Afternoon | 27 | 260.752 | 291.281 |
+
+Active-claim replay median was approximately 103 seconds in both sessions.
+Before-route replay now receives a 10-second broker-read stage budget on an
+isolated provider/client, with a rotating starting action. Deferred actions
+retain durable fences and are counted as unresolved. Full close replay stays
+unbounded by this stage budget and continues to examine old source-day fills.
+This is not a hard 10-second wall-clock guarantee: initial DB/journal reads,
+in-flight DB writes and synchronous provider work can overrun the deadline.
+The entire protective SELL path is NOT proven below 60 seconds.
+
+The deterministic same-input replay test uses 20 source-day queries, each with
+5 seconds of virtual I/O cost. Full replay costs 100 virtual seconds; bounded
+replay costs 10, defers 18 actions and still reports all 20 unresolved actions.
+This proves request scheduling and conservative deferral, not live KIS speed.
+
+## Validation
+
+Initial unmodified-code incident regressions: 3 failed, 2 passed. Failures were
+native practice permission, false sent count and unnecessary broker lookup.
+
+Tests include native router + native client guard + mocked HTTP ACK, duplicate
+fence, response loss/restart fencing, contradictory abort/ACK preservation,
+exact-run PREP source checks, actual PREP runner identity propagation and DB
+save/completion failure, historical replay and bounded-work fairness.
+
+Linux offline test command (kernel-enforced network denial inherited by every
+child process; fails closed if seccomp cannot be installed):
+
+```bash
+PYTHONPATH=. python scripts/run_pytest_no_network.py -q tests/us tests/test_us_order_permission.py
+PYTHONPATH=. python scripts/run_pytest_no_network.py -q tests/kr tests/test_execution_claim_contract.py tests/test_reconcile_execution_claims.py
+```
+
+PostgreSQL tests requiring an actual server cannot pass in this network-denied
+local mode. Two local collector IPC tests also require socket operations that
+this execution sandbox disallows. Repository CI supplies PostgreSQL and the
+IPC environment: the verified US merge-gate run on `95c044bc` passed **2,657
+US tests (2 skipped)** and **7/7 offline scenarios**. CI and WSL/KIS practice
+acceptance are separate results.
+
+The KR suite exposed one pre-existing date-sensitive test failure on both
+`8406a8ef` and the candidate: a fixed Oct-19 reconcile clock was combined with
+the repository's actual current date. The test now freezes both module clock
+references to the same Oct-19 instant; all original fence assertions remain.
+There is no KR production-code change in this PR.
+
+## Deployment and outstanding operational acceptance
+
+1. Review the single Draft PR and its exact HEAD CI. No auto-merge or deployment.
+2. On approved rollout, use a fresh same-day PREP; confirm the artifact run_id,
+   completed DB run and all locked rows agree. Existing revision-pin and broker
+   progress safeguards remain in force; never delete pins or markers to force BUYs.
+3. Confirm order-permission diagnosis at both session start and native client.
+   Do not set `DISABLE_REAL_TRADING=0` to work around the old mismatch.
+4. Observe a strategy-valid practice order through HTTP begin, broker order
+   number, exact fill and position update. Do not create an order just to make
+   the acceptance metric pass or weaken the strategy/safety conditions.
+5. Confirm original-date late fills and actual position ownership. The archive's
+   seven recovered fills are not asserted to belong to the 86 unsent attempts.
+6. Read-only Oct-20 DB inspection found 13 active historical SELL claims,
+   not 88 active orders. The 86 pre-I/O failures were attempts. Exact original-
+   date broker evidence must reconcile the 13 claims; never bulk-reset unknown
+   claims. See the expanded recovery evidence below.
+7. Compare at least 20 baseline/candidate ticks at the actual HTTP boundary.
+   Any claim of operational recovery or a 60-second target requires this new
+   WSL/KIS practice evidence; unit tests and CI alone do not establish it.
+
+Rollback: revert this PR's single implementation commit through a reviewed
+change. No schema migration, operational DB cleanup, scheduler mutation,
+strategy threshold change or runtime flag change is included.
+
+
+## Expanded restoration implementation (Oct 20)
+
+Five additional regressions failed against the preceding PR head, then passed
+with these changes: synthetic journal fills counted as broker-confirmed; a
+claim-write failure reported as recovered; a synthetic order average reused as
+an actual execution price; direct zero-fill cancel proof lost when list lookup
+was empty; actual fill authority overwritten as false by the final observation.
+A connected 13-claim replay exposed a sixth defect: partial cancellation used
+broker open quantity (zero) as the remaining semantic target. That now retains
+requested minus actual cumulative quantity while preserving broker open zero.
+
+- Journal estimates have their own `balance_estimate_count` and
+  `JOURNAL_REPLAY_BALANCE_ESTIMATE` event. They remain unresolved and never
+  emit broker fill confirmation. ACK reconciliation returns estimates in
+  `balance_estimated_orders`, not `confirmed_orders`; they cannot clean its
+  unresolved gate. Historical `balance_confirmed` / `balance_delta_confirmed`
+  diagnostic labels remain compatible but mean a holdings delta only. Close
+  explicitly counts such estimates and position-absence guesses as pending
+  broker verification, and marks `broker_verification_required`.
+- Both memory and PostgreSQL order writers persist synthetic/actual provenance.
+  A synthetic or still-active-claim local FILLED quantity cannot alone make close
+  report a confirmed broker fill. Missing actual prices cannot be copied from
+  synthetic accounting. Explicitly missing quantity fields are not proof.
+- A result with ignored observation, execution-state write error or
+  `requires_reconcile` cannot increment recovered fill totals. Historical
+  unresolved symbol/side fences now propagate into the new tick's router context.
+  Expiry stays pending under the existing conservative claim contract, and
+  close cannot report clean while a durable claim remains active, even when
+  a broker fill has already been observed.
+- Exact per-order cancellation/rejection observations can reconcile an original
+  source-date claim when the history list has no row. Empty history itself
+  never terminalizes or releases a claim. Contradictory quantities/identity
+  remain fenced. Actual cumulative fills retain authoritative status on replay.
+
+### Reproducible evidence and its limits
+
+`test_us_restoration_consistency_20261020.py` seeds 13 independently persisted
+claims matching the dates/quantities and synthetic-vs-unknown shape of the
+observed backlog. This fixture uses invented order/account identities, not raw
+production data. With no broker proof, all 13 stay unresolved. With controlled
+original-date proof, seven full fills, one partial cancellation and two
+zero-fill terminal outcomes recover; three deliberately unknown attempts stay
+fenced. Reopening a file-backed SQLite claim database and replaying produces no
+duplicate actual fill. These simulated outcomes do NOT assert the real broker
+outcome of any of the 13 production claims.
+
+The BUY/SELL native-client connected tests exercise actual router/client guard,
+mock HTTP ACK, real in-memory order/fill accounting, partial then full fill,
+controlled authoritative balance snapshot persistence and durable claim reopen.
+Credentials, HTTP, risk/market inputs and identity normalization are explicit
+adapters. PREP propagation tests, sustained production-tick/risk tests and real
+PostgreSQL tests provide complementary coverage; this is not an unstubbed
+WSL/strategy/KIS end-to-end certificate. A PostgreSQL regression verifies missing
+synthetic price rejection, promotion to actual cumulative evidence, final claim
+authority and replay idempotence using production migrations.
+
+Read-only active-attempt inventory, scoped by effective environment, account,
+market and epoch (fails closed on missing scope; never resets claims):
+
+```bash
+PYTHONPATH=. python scripts/us_order_evidence_dry_run.py \
+  --from-date 2026-10-01 --to-date 2026-10-20 --active-claims-only
+```
+
+### Operational acceptance remains separate
+
+Actual broker evidence is still required for ABBV, COST, DHR, GILD, MCK, NET,
+PG (seven synthetic-only local fills) and AMD, MSFT, CL, KO, KR, MRVL (six
+zero-recorded-fill active attempts). No production claim, order, fill, price,
+runtime flag or scheduler was changed by this patch. The recovery implementation
+processes subsequent authenticated observations; it does not invent outcomes or
+unlock unknown NET protection orders. A real unknown order must remain fenced.
+
+After authorized deployment, record fresh same-day PREP/run/locked-row agreement,
+effective permissions, naturally occurring strategy-valid BUY/protective SELL,
+HTTP/ACK/exact original-date fill and balance/claim agreement, including restart.
+At least 20 comparable WSL ticks and sufficient eligible SELL samples are needed
+for the <=60s p95 target. Code/CI validation, latency verification and operational
+restoration are three independent verdicts. External evidence that has not been
+observed remains pending; this PR is not authorization to merge or place orders.
+
+
+## Oct 20 blocker closure: broker-original-day read-only operator audit
+
+The new `scripts/us_kis_original_day_evidence.py` queries the **authenticated
+KIS practice US order book by the original US trade date**, once per day, and
+correlates each active scoped execution claim to the immutable source journal.
+It is GET-only and uses a read-only DB transaction. It does not call an order
+POST, cancel, save order, append journal event, release a claim, or infer a fill
+from account holdings. It does not print account/order identifiers or tokens.
+
+Run only on the operator WSL host with its existing KIS practice credentials,
+a valid read-only/connectable PostgreSQL configuration and the reviewed candidate
+checked out. No scheduler or trading flag changes are necessary for the audit:
+
+```bash
+cd ~/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
+git status --short
+git rev-parse HEAD  # must match the explicitly reviewed PR #243 candidate
+PYTHONPATH=. python scripts/us_kis_original_day_evidence.py \
+  --from-date 2026-10-01 --to-date 2026-10-20 \
+  --require-all-terminal > /tmp/us243-kis-original-day-evidence.json
+result=$?
+echo "KIS_AUDIT_EXIT_CODE=$result"
+python - <<'PY'
+import json
+p='/tmp/us243-kis-original-day-evidence.json'
+with open(p, encoding='utf-8') as fp:
+    doc=json.load(fp)
+print(json.dumps(doc['summary'], ensure_ascii=False, sort_keys=True))
+for item in doc['claims']:
+    print(item['trade_date'], item['symbol'], item['side'],
+          item['proof_status'], item['reason'],
+          item.get('actual_filled_qty'), item.get('actual_avg_price'))
+PY
+```
+
+A nonzero exit / missing output means **NOT VERIFIED**, never a reason to
+reset a claim. The `--require-all-terminal` flag exits 2 whenever any action
+is open or not affirmatively proven terminal. The command does **not** run a
+broker reconciliation or clear even a verified full-fill claim: the proven
+transition must still pass the existing identity-checked
+`replay_order_journal(include_active_claims=True, active_claims_only=True)`
+path and persisted order/fill/attempt/claim consistency checks after an
+operator-authorized rollout.
+
+Evidence-fail-closed conditions include: missing session/attempt identity,
+multiple attempted submissions or broker orders under one client action,
+KIS account/env/trade-date disagreement, broker order no/symbol/side/qty
+mismatch, quarantined/incomplete schemas, conflicting cumulative observations,
+no original-date results, non-finite or absent actual fill price, and a
+client whose KIS HTTP capability is disabled. Existing anomalous
+`JOURNAL_REPLAY_FILL_CONFIRMED` events or synthetic `us_fills` rows
+are **not** treated as a real broker confirmation.
+
+Observed Oct 20 Supabase status: all 13 original SELL actions have one
+`BROKER_SUBMIT_STARTED`, one ACK and one unique ACK broker order number
+per action; seven are synthetic-only local FILLED and six lack any
+local fill. No `broker_settlement_evidence` records match these 13
+current active attempts. This supplies original local correlation but **not**
+the external KIS proof. Therefore none was automatically unfenced.
+
+**Acceptance gate**: a complete KIS per-order report, identity-safe replay
+of every positively established transition, after-restart unchanged
+idempotent persistence, a newly deployed practice PREP / BUY / protective-SELL
+end-to-end observation when the strategies naturally signal, and >=20
+comparable WSL full-path HTTP-boundary timing observations. An empty claim
+list does not certify successful trading or the <=60s protective SELL p95.
+
+
+## 2026-10-20 verified production KIS history repair — DONE for seven fills
+
+**Authoritative source:** GitHub Actions, original-day authenticated KIS
+practice order-inquiry GET and existing Supabase practice-US account/epoch.
+Source US session date was initially misread as a KST day, excluding nine of
+13 original order identities; the KIS date-bridge fix is in this PR.
+The successful exact-source-day GET run was #39382477602. Full 13-claim,
+owner/qty/account/epoch/ACK-identity and KIS actual-fill-price preflight
+succeeded at #39383378576 and again after partial recovery #39384684541.
+
+**Broker-full-fill and persisted order/claim states (all US_STANDARD SELL):**
+
+| Original NY day | Symbol | Quantity | Actual USD avg | Persistence |
+|---|---|---:|---:|---|
+| Oct 13 | MCK | 1 | 968.29 | SATISFIED, authoritative |
+| Oct 14 | ABBV | 2 | 283.86 | SATISFIED, authoritative |
+| Oct 14 | COST | 1 | 974.52 | SATISFIED, authoritative |
+| Oct 14 | GILD | 4 | 153.69 | SATISFIED, authoritative |
+| Oct 14 | NET | 1 | 331.19 | SATISFIED, authoritative |
+| Oct 14 | PG | 4 | 155.93 | SATISFIED, authoritative |
+| Oct 15 | DHR | 2 | 231.54 | SATISFIED, authoritative |
+
+Total **seven original SELL actions / 15 shares**, exact source broker price,
+one active KIS actual fill per claim, no active synthetic accounting, terminal
+SATISFIED claim with no active attempt and attempt.authoritative=true. This
+was independently verified in a fresh Python process and then with Supabase
+read-only SQL after the successful write run #39385065770. **Six KIS
+zero-filled OPEN/nonterminal original orders** (AMD, MRVL, MSFT, CL, KO, KR)
+remain **not authoritative, with durable claim fences**. An old OPEN status is
+not evidence the brokerage order was cancelled, and cannot be released merely
+because time passed.
+
+**Implementation bug discovered by REAL production restore:** first one-shot
+#39383920968 settled MCK/ABBV/COST, then GILD failed on physical PostgreSQL
+unique index `uq_us_fills_idempotent`: existing deactivated synthetic and new
+KIS actual had identical (date, symbol, side, order_no, client key, qty, USD
+price), despite different evidence types. No second fill could be inserted.
+The code now promotes only the exact scoped superseded synthetic physical row
+in place, retaining original provenance in meta and the journal, and prevents
+double counting. New real-PostgreSQL regression
+`test_equal_qty_price_synthetic_broker_promotion_preserves_unique_tuple`
+passed in the 2,713-US-test suite (2 skipped), offline harness 7/7.
+The repair script safely resumed the earlier three proven terminal actions
+without modifying them and then applied four additional fills, including
+GILD and PG's exact-tuple in-place promotions. All seven are now complete.
+
+**Verification evidence:**
+- Broker proof/read-only workflow: #39382477602, #39383378576 and #39384684541
+- Actual production repaired-state workflow: #39385065770 **SUCCESS**
+- Receipt: `us243-proven-seven-db-repair-39385065770`
+- Independent post-restart validation: seven actual fills, six unfilled
+  fenced actions, no duplicate active synthetic, original correct prices
+- Final Supabase order/fill/claim read-only audit: all seven SATISFIED,
+  exactly one actual KIS fill each, physical promotion markers on GILD/PG
+- One-time database repair workflow removed from PR after successful execution
+  to avoid accidental future re-execution. Scripts and GET-only diagnostics
+  remain available for review. **No broker orders/cancels were submitted.**
+
+**Still outside this historical repair's verified scope:**
+the PR candidate has not been deployed to the user's Windows/WSL scheduler,
+no new naturally signaled practice BUY/protective SELL and subsequent restart
+were observed on that runtime, and there are no 20 baseline/candidate
+protective-SELL tick-to-KIS HTTP measurements proving p95 <=60 sec.
+Neither CI nor this archival KIS reconciliation can assert that overall
+new-trading operations or latency targets are restored. The six zero-fill
+orders remain on the exception list pending explicit terminal KIS proof.

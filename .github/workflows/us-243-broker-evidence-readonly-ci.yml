@@ -1,0 +1,247 @@
+name: US243 KIS Broker Evidence Readonly CI
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - ".github/workflows/us-243-broker-evidence-readonly-ci.yml"
+      - "scripts/us_kis_original_day_evidence.py"
+      - "scripts/us_kis_raw_window_diagnostic.py"
+      - "scripts/us243_verified_sell_recovery.py"
+      - "tests/us/test_us_kis_original_day_evidence_20261020.py"
+      - "tests/us/test_us_kis_broker_order_date_bridge_20261013.py"
+      - "tests/us/test_us243_broker_evidence_ci_isolation.py"
+  workflow_dispatch:
+    inputs:
+      run_live_kis_audit:
+        description: "Explicitly run a GET-only authenticated practice KIS historical audit (network may fail)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: us243-historical-kis-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kis-evidence-contract-offline:
+    # The PR gate must be deterministic. No secrets, KIS credentials, tokenP,
+    # Supabase database connection or external broker traffic in this job.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.number == 243 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/us-20261020-execution-recovery'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: "."
+      KIS_ENV: "practice"
+      DRY_RUN: "1"
+      US_KIS_ORDER_ALLOWED: "0"
+      US_ORDER_ARMED: "0"
+      ALLOW_REAL_ORDER: "0"
+      KIS_HTTP_BLOCK: "1"
+      US_OFFLINE_MODE: "1"
+      OFFLINE_MODE: "1"
+      PBCORE_DB_URL: ""
+      DATABASE_URL: ""
+      KIS_APP_KEY: ""
+      KIS_APP_SECRET: ""
+      CANO: ""
+    steps:
+      - name: Checkout exact PR source without persisting credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install offline test dependencies
+        run: |
+          python -m pip install -r requirements.txt pytest
+      - name: Check broker-proof and no-write invariants without KIS network
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/us/test_us_kis_original_day_evidence_20261020.py \
+            tests/us/test_us_kis_broker_order_date_bridge_20261013.py \
+            tests/us/test_us_recovery_gha_safety_contract_20261020.py \
+            tests/us/test_us243_broker_evidence_ci_isolation.py
+      - name: Report explicit evidence boundary
+        run: |
+          echo "[US243][PR_GATE] OFFLINE_CONTRACT_PASS does not mean authenticated KIS GET succeeded"
+          echo "[US243][PR_GATE] Prior proven seven fills stay authoritative; six active claims remain fenced"
+          echo "[US243][PR_GATE] Explicit workflow_dispatch(run_live_kis_audit=true) required for new broker observations"
+
+  kis-original-day-evidence:
+    # The historical broker repair has already completed. Reissuing tokenP
+    # for every PR commit caused transient CI failures and KIS throttling.
+    # An actual network check now REQUIRES the operator to opt in explicitly.
+    # Only the original repository's exact recovery branch may use secrets.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_live_kis_audit == true &&
+      github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
+      github.ref == 'refs/heads/fix/us-20261020-execution-recovery'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: "."
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      TRADING_REGION: "US"
+      KIS_ENV: "practice"
+      OFFLINE_MODE: "0"
+      US_OFFLINE_MODE: "0"
+      KIS_HTTP_BLOCK: "0"
+      US_PAPER_TRADING_ENABLED: "0"
+      US_LIVE_TRADING_ENABLED: "0"
+      US_KIS_ORDER_ALLOWED: "0"
+      US_ORDER_ARMED: "0"
+      LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DISABLE_LIVE_TRADING: "1"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+    steps:
+      - name: Checkout PR candidate; no checkout of fork or arbitrary PR
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Verify exact practice endpoint and refuse trading
+        run: |
+          set -euo pipefail
+          test -n "${PBCORE_DB_URL:-}" || { echo "::error::MISSING_PBCORE_DB_URL"; exit 1; }
+          test -n "${KIS_APP_KEY:-}" || { echo "::error::MISSING_KIS_APP_KEY"; exit 1; }
+          test -n "${KIS_APP_SECRET:-}" || { echo "::error::MISSING_KIS_APP_SECRET"; exit 1; }
+          test -n "${CANO:-}" || { echo "::error::MISSING_CANO"; exit 1; }
+          test -n "${ACNT_PRDT_CD:-}" || { echo "::error::MISSING_ACNT_PRDT_CD"; exit 1; }
+          case "${PBCORE_DB_URL}" in postgres://*|postgresql://*|postgresql+*://*) ;; *) echo "::error::INVALID_DB_SCHEME"; exit 1 ;; esac
+          [[ "${KIS_REST_URL:-}" == "https://openapivts.koreainvestment.com:29443" ]] || {
+            echo "::error::NON_PRACTICE_KIS_ENDPOINT"; exit 1;
+          }
+          [[ "${KIS_ENV}" == "practice" && "${DRY_RUN}" == "1" &&
+             "${US_ORDER_ARMED}" == "0" && "${US_KIS_ORDER_ALLOWED}" == "0" &&
+             "${DISABLE_REAL_TRADING}" == "1" ]] || {
+            echo "::error::ORDER_SAFETY_GUARD_NOT_MET"; exit 1;
+          }
+          echo "[US243] PRACTICE_GET_ONLY_FROM_GITHUB_HOSTED_RUNNER"
+      - name: Validate immutable original-day audit no-write invariants
+        run: |
+          python -m pytest -q \
+            tests/us/test_us_kis_original_day_evidence_20261020.py \
+            tests/us/test_us_recovery_gha_safety_contract_20261020.py
+      - name: Independent raw KIS two-day source window bridge diagnostic (GET ONLY)
+        run: |
+          set -euo pipefail
+          python scripts/us_kis_raw_window_diagnostic.py \
+            --from-date 2026-10-01 --to-date 2026-10-20 \
+            > us243-kis-source-window.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          doc=json.loads(Path("us243-kis-source-window.json").read_text(encoding="utf-8"))
+          print("[US243][RAW_WINDOW] claims",doc["claim_count"],
+                "excluded_with_order_identity",doc["excluded_with_same_original_order"],
+                "source_window_broker_numbers_present",doc["source_window_order_number_found"])
+          for r in doc["results"]:
+              print("[US243][RAW_WINDOW][ROW]",r["day"],r["symbol"],r["side"],
+                    r["reason"],"same_qty",r["source_window_qty_match"])
+          PY
+      - name: Authenticated historical KIS GET and scoped PostgreSQL READ ONLY
+        run: |
+          # A trustworthy 0-fill historical OPEN remains fenced and is NOT
+          # a failed audit. Exit 2 means documented outstanding claims, not
+          # an exception in the GET-only proof pipeline.
+          set +e
+          python scripts/us_kis_original_day_evidence.py \
+            --from-date 2026-10-01 --to-date 2026-10-20 \
+            --require-all-terminal > us243-kis-original-day-audit.json
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::KIS_SOURCE_AUDIT_FAILURE"
+            exit "$rc"
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          file=Path("us243-kis-original-day-audit.json")
+          if not file.exists() or file.stat().st_size == 0:
+              print("[US243] NO_REPORT: failure before successful broker audit")
+              raise SystemExit(4)
+          data=json.loads(file.read_text(encoding="utf-8"))
+          info=data.get("summary", {})
+          print("[US243] LIVE_KIS_PROOF", json.dumps(info,sort_keys=True))
+          for row in data.get("claims",[]):
+              print("[US243][ACTION]", row.get("trade_date"),row.get("symbol"),
+                    row.get("side"),row.get("proof_status"),row.get("reason"),
+                    "actual_qty",row.get("actual_filled_qty"))
+          if not info.get("claim_count"):
+              print("[US243] ZERO_CLAIMS: cannot certify historical 13-claim reconciliation")
+              raise SystemExit(3)
+          if info.get("database_mutated") is not False or info.get("claims_released") != 0:
+              raise SystemExit("READ_ONLY_CONTRACT_VIOLATION")
+          allowed = {"VERIFIED_FULL_FILL", "VERIFIED_PARTIAL_TERMINAL",
+                     "VERIFIED_ZERO_FILL_TERMINAL", "BROKER_ORDER_STILL_ACTIVE"}
+          unknown = [(x.get("symbol"),x.get("proof_status"))
+                     for x in data.get("claims",[])
+                     if x.get("proof_status") not in allowed]
+          if unknown:
+              print("[US243][ERROR] MISSING_OR_CONFLICTING_ORIGINAL_BROKER_EVIDENCE",unknown)
+              raise SystemExit(4)
+          if info.get("unresolved_or_open_count",0):
+              print("::warning::Original broker orders remain unfilled/nonterminal;"
+                    " keep durable claim fences. This check verifies KIS evidence,"
+                    " NOT operational completion.")
+          PY
+          echo "[US243] audit completed with script rc=$rc (2 means known pending claim)"
+          exit 0
+      - name: Preflight exact seven broker-proven SELL fills against production claims (read-only)
+        run: |
+          set -euo pipefail
+          python scripts/us243_verified_sell_recovery.py > us243-fill-repair-preflight.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          lines=Path("us243-fill-repair-preflight.json").read_text(encoding="utf-8").splitlines()
+          for line in lines:
+              doc=json.loads(line)
+              if doc.get("mode")=="PRE_APPLY_KIS_EVIDENCE":
+                  print("[US243][REPAIR_PREFLIGHT] KIS actual full fills",
+                        doc["verified_count"])
+                  for row in doc["actions"]:
+                      print("[US243][REPAIR_PREFLIGHT]", row["date"],row["symbol"],
+                            "quantity",row["qty"],"proof",row["proof"])
+          PY
+      - name: Export sanitized KIS practice evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us243-kis-original-day-practice-readonly-${{ github.run_id }}
+          path: |
+            us243-kis-original-day-audit.json
+            us243-kis-source-window.json
+            us243-fill-repair-preflight.json
+          retention-days: 3
+          if-no-files-found: ignore

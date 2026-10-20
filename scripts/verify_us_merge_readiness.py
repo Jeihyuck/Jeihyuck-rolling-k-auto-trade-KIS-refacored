@@ -19,8 +19,10 @@ import sys
 
 _TICK_RE = re.compile(r"\[US_TICK\]\[LATENCY\]\s+tick=(\d+)\s+total_ms=([0-9.]+)")
 _SELL_RE = re.compile(
-    r"\[US_EXIT\]\[SIGNAL_TO_BROKER_BOUNDARY\].*?delay_ms=([0-9.]+)"
+    r"\[US_EXIT\]\[SIGNAL_TO_BROKER_BOUNDARY\].*?"
+    r"\battempt=([^\s]+).*?\bsource=selected_intent_exact\s+delay_ms=([0-9.]+)"
 )
+
 _FALLBACK_RE = re.compile(r"\[US_KIS\]\[WS_COLLECTOR_FALLBACK\]")
 _COLLECTOR_HIT_RE = re.compile(r"\[US_KIS\]\[WS_COLLECTOR_HIT\]")
 _ACCEPT_CLOSE = frozenset(("OK", "SUCCESS", "COMPLETED"))
@@ -101,6 +103,10 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
 
     tick_samples: list[float] = []
     sell_samples: list[float] = []
+    seen_selected_sell_attempts: dict[str, float] = {}
+    duplicated_sell_attempts = 0
+    conflicting_sell_attempts = 0
+    rejected_sell_signal_lines = 0
     fallback_count = 0
     collector_hit_count = 0
     for session in ("am", "afternoon"):
@@ -112,8 +118,22 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
             for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
                 if match := _TICK_RE.search(line):
                     tick_samples.append(float(match.group(2)) / 1000.0)
-                if match := _SELL_RE.search(line):
-                    sell_samples.append(float(match.group(1)) / 1000.0)
+                if "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY]" in line:
+                    match = _SELL_RE.search(line)
+                    if not match:
+                        # First-candidate and legacy aggregate timestamps are
+                        # not a selected-intent-to-HTTP proof.
+                        rejected_sell_signal_lines += 1
+                    else:
+                        attempt = match.group(1)
+                        measured = float(match.group(2)) / 1000.0
+                        if attempt in seen_selected_sell_attempts:
+                            duplicated_sell_attempts += 1
+                            if abs(seen_selected_sell_attempts[attempt] - measured) > 0.000001:
+                                conflicting_sell_attempts += 1
+                        else:
+                            seen_selected_sell_attempts[attempt] = measured
+                            sell_samples.append(measured)
                 if _FALLBACK_RE.search(line):
                     fallback_count += 1
                 if _COLLECTOR_HIT_RE.search(line):
@@ -123,6 +143,10 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         "tick_p95_sec": nearest_rank(tick_samples, 0.95),
         "tick_max_sec": max(tick_samples) if tick_samples else None,
         "sell_submits_measured": len(sell_samples),
+        "sell_distinct_selected_http_attempts": len(seen_selected_sell_attempts),
+        "sell_duplicate_attempt_log_count": duplicated_sell_attempts,
+        "sell_conflicting_attempt_log_count": conflicting_sell_attempts,
+        "sell_legacy_or_unattributed_log_count": rejected_sell_signal_lines,
         "sell_signal_to_broker_boundary_p95_sec": nearest_rank(sell_samples, 0.95),
         "sell_signal_to_broker_boundary_max_sec": max(sell_samples) if sell_samples else None,
         "ws_collector_fallback_log_count": fallback_count,
@@ -169,8 +193,21 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         reasons.append("TICK_P95_ABOVE_60_SEC_OR_UNMEASURED")
     if not sell_samples:
         reasons.append("NO_ACTUAL_SELL_BROKER_SUBMISSION_LATENCY_EVIDENCE")
-    elif nearest_rank(sell_samples, 0.95) > 15.0 or max(sell_samples) > 30.0:
+    if len(sell_samples) < 20:
+        reasons.append("INSUFFICIENT_DISTINCT_SELECTED_SELL_HTTP_SAMPLES")
+    if conflicting_sell_attempts:
+        reasons.append("SELL_HTTP_SIGNAL_ATTRIBUTION_INTEGRITY_FAILED")
+    # Nonselected/legacy evidence is excluded, not treated as a fatal
+    # condition when sufficient independent selected samples do exist.
+    # Preserve the existing 15s p95/30s max guard. An additional 60s
+    # p95 acceptance metric must not silently weaken this stricter policy.
+    if sell_samples and (
+        nearest_rank(sell_samples, 0.95) > 15.0
+        or max(sell_samples) > 30.0
+    ):
         reasons.append("PROTECTIVE_SELL_LATENCY_LIMIT_FAILED")
+    if not sell_samples or nearest_rank(sell_samples, 0.95) > 60.0:
+        reasons.append("PROTECTIVE_SELL_P95_60_SEC_NOT_PROVEN")
     if metrics["buy_entry_deferred_count"] > 0:
         reasons.append("BUY_EVALUATION_DEFERRED_FOR_TIME")
     if metrics["close_status"] not in _ACCEPT_CLOSE:
