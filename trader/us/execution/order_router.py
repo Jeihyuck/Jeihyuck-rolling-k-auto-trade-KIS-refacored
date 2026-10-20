@@ -391,6 +391,23 @@ def _semantic_action_identity(intent: dict, *, account_env: str):
         or meta.get("reason")
         or ("ENTRY" if side == "BUY" else "")
     )
+    # PR243 2026-10-19 production replay: US_STANDARD's executable
+    # GIVEBACK / TRAILING_STOP family was stable across ticks but the human
+    # explanation contained live percentages. Using that prose as action
+    # created 48 unrelated claims for only two position lifecycles, while
+    # client_order_key remained stable. Preserve the numeric reason for
+    # diagnostics; key the claim on the *stable* strategy family instead.
+    # Explicit semantic actions / staged TP / TQQQ_INFINITE always win.
+    if side == "SELL" and owner == "US_STANDARD" and not (
+        meta.get("semantic_action") or intent.get("semantic_action")
+        or meta.get("profit_capture_stage") or intent.get("profit_capture_stage")
+        or intent.get("stage")
+    ):
+        stable_family = str(
+            intent.get("exit_family") or meta.get("exit_family") or ""
+        ).strip().upper()
+        if stable_family in {"GIVEBACK", "TRAILING_STOP"}:
+            action = stable_family
     if not action:
         raise ValueError("semantic action stage is required")
     try:
