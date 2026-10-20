@@ -1930,6 +1930,35 @@ def route_order(
             else None
         )
         _metrics = getattr(context, "metrics", None)
+        # Includes synchronous journal/DB work, recovery and all risk checks
+        # from run_trade_tick() start to the actual native HTTP boundary.
+        # It is independent of selected signal/candidate timing.
+        _tick_origin = (
+            _metrics.get("tick_start_monotonic")
+            if isinstance(_metrics, dict) else None
+        )
+        if (side == "SELL" and isinstance(_tick_origin, (int, float))
+                and _tick_origin <= _http_boundary_mono):
+            _tick_ms = (_http_boundary_mono - _tick_origin) * 1000.0
+            logger.info(
+                "[US_EXIT][TICK_TO_BROKER_BOUNDARY] "
+                "symbol=%s attempt=%s origin=tick_start boundary=native_http_begin delay_ms=%.2f",
+                symbol_upper, intent["submit_attempt_id"], _tick_ms,
+            )
+            if isinstance(_metrics, dict):
+                _metrics["sell_tick_to_broker_boundary_ms"] = _tick_ms
+                _tick_samples = _metrics.setdefault(
+                    "sell_tick_to_broker_boundary_by_attempt_ms", {},
+                )
+                if isinstance(_tick_samples, dict) and (
+                    len(_tick_samples) < 128
+                    or str(intent["submit_attempt_id"]) in _tick_samples
+                ):
+                    _tick_samples[str(intent["submit_attempt_id"])] = _tick_ms
+                else:
+                    _metrics["sell_tick_to_broker_boundary_dropped_count"] = (
+                        int(_metrics.get("sell_tick_to_broker_boundary_dropped_count", 0)) + 1
+                    )
         if side == "SELL" and isinstance(_first_ready, (int, float)):
             _first_wait_ms = max(
                 0.0, (_http_boundary_mono - _first_ready) * 1000.0
