@@ -44,6 +44,39 @@ ORDER BY o.trade_date,o.symbol,o.side,o.id
 LIMIT 2000
 """
 
+# Recovery inventory starts at the durable active attempt, not the orders
+# table: missing orders must remain visible, and old/superseded attempts must
+# not multiply the current claim. All identity filters are bound parameters.
+ACTIVE_CLAIM_SQL = """
+SELECT c.trade_date, o.symbol, o.side, a.requested_qty AS qty_requested,
+       o.qty_filled, o.status AS order_status, a.attempt_state, a.authoritative,
+       c.action_state, c.remaining_target_qty,
+       count(f.id) FILTER (WHERE f.meta->>'fill_evidence_type' IN
+         ('BALANCE_DELTA_SYNTHETIC','LEGACY_SYNTHETIC')
+         OR coalesce(f.meta->>'is_synthetic','false')='true') AS synthetic_count,
+       count(f.id) FILTER (WHERE f.meta->>'fill_evidence_type' IN
+         ('KIS_ORDER_CUMULATIVE_ACTUAL','KIS_EXECUTION_ACTUAL')
+         AND coalesce(f.meta->>'is_synthetic','false')<>'true') AS broker_count
+FROM us_execution_claims c
+JOIN us_execution_attempts a ON a.action_key=c.action_key
+ AND a.attempt_id=c.active_attempt_id
+LEFT JOIN us_orders o ON o.client_order_key=a.client_order_key
+ AND o.trade_date=c.trade_date AND o.env=c.env
+ AND o.trading_epoch_id=c.trading_epoch_id
+LEFT JOIN us_fills f ON f.client_order_key=a.client_order_key
+ AND f.trade_date=c.trade_date AND f.trading_epoch_id=c.trading_epoch_id
+ AND f.symbol=o.symbol AND f.side=o.side
+ AND coalesce(f.meta->>'accounting_active','true')<>'false'
+WHERE c.env=:env AND c.account_id=:account_id AND c.market=:market
+ AND c.trading_epoch_id=:trading_epoch_id AND c.active_attempt_id IS NOT NULL
+ AND c.trade_date BETWEEN :start_date AND :end_date
+GROUP BY c.action_key,c.trade_date,o.id,o.symbol,o.side,a.requested_qty,
+         o.qty_filled,o.status,a.attempt_state,a.authoritative,
+         c.action_state,c.remaining_target_qty
+ORDER BY c.trade_date,o.symbol,c.action_key
+LIMIT 2000
+"""
+
 
 def classify(row: dict) -> dict:
     synth = int(row.get("synthetic_count") or 0)
@@ -55,7 +88,9 @@ def classify(row: dict) -> dict:
     if requires_review:
         plan = "VERIFY_ORIGINAL_ORDER_WITH_ACCOUNT_SCOPED_KIS_EVIDENCE"
         defer_reason = "BALANCE_DELTA_IS_NOT_BROKER_EXECUTION_PROOF"
-    elif broker and (claim in {"IN_FLIGHT", "UNCERTAIN"} or attempt_state not in {"FILLED"}):
+    elif broker and (claim in {"IN_FLIGHT", "UNCERTAIN"}
+                     or attempt_state not in {"FILLED"}
+                     or row.get("authoritative") is not True):
         plan = "VALIDATE_ORDER_ATTEMPT_IDENTITY_BEFORE_IDEMPOTENT_RECONCILIATION"
         defer_reason = "FILL_ROW_COUNT_ALONE_DOES_NOT_VERIFY_ATTEMPT_IDENTITY"
     elif broker:
@@ -75,6 +110,7 @@ def classify(row: dict) -> dict:
         "attempt_state": str(row.get("attempt_state") or ""),
         "claim_state": claim,
         "attempt_authoritative": row.get("authoritative"),
+        "remaining_target_qty": row.get("remaining_target_qty"),
         "synthetic_evidence_count": synth,
         "broker_evidence_count": broker,
         "finding": "SYNTHETIC_ONLY_FILLED_ORDER" if requires_review else
@@ -86,7 +122,7 @@ def classify(row: dict) -> dict:
         "proposed_change_plan": plan,
         "defer_reason": defer_reason,
         "release_fence": False,
-        "verification_required": bool(requires_review),
+        "verification_required": bool(requires_review or plan != "NO_STATE_MUTATION_NEEDED"),
     }
 
 
@@ -94,6 +130,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from-date", required=True)
     ap.add_argument("--to-date", required=True)
+    ap.add_argument("--active-claims-only", action="store_true")
     args = ap.parse_args()
     start_date = date.fromisoformat(args.from_date)
     end_date = date.fromisoformat(args.to_date)
@@ -102,13 +139,21 @@ def main():
     engine = _get_engine_or_none()
     if engine is None:
         raise SystemExit("DATABASE_UNAVAILABLE: dry-run cannot establish evidence")
+    params = {"start_date": start_date, "end_date": end_date}
+    query = READ_ONLY_SQL
+    if args.active_claims_only:
+        from trader.us.db.repos import _us_execution_claim_scope
+        scope = _us_execution_claim_scope()
+        if any(not scope.get(key) for key in ('env','account_id','market','trading_epoch_id')):
+            raise SystemExit("CLAIM_SCOPE_UNAVAILABLE: refusing unscoped active-claim audit")
+        params.update(scope)
+        query = ACTIVE_CLAIM_SQL
     with engine.connect() as conn:
         with conn.begin():
             conn.execute(text("SET TRANSACTION READ ONLY"))
-            rows = conn.execute(text(READ_ONLY_SQL), {
-                "start_date": start_date, "end_date": end_date,
-            }).mappings().all()
+            rows = conn.execute(text(query), params).mappings().all()
     print(json.dumps({"dry_run": True, "no_mutations": True,
+                      "active_claims_only": args.active_claims_only,
                       "date_from": str(start_date), "date_to": str(end_date),
                       "rows": [classify(dict(row)) for row in rows]},
                      ensure_ascii=False, sort_keys=True, default=str))

@@ -199,7 +199,7 @@ def test_us_unresolved_ack_fences_new_buy_but_preserves_unrelated_sell(monkeypat
     assert _journal_has_unrecovered_buy_ack("2099-01-01") is False
 
 
-def test_close_balance_absent_sell_is_not_unresolved(monkeypatch):
+def test_close_balance_absent_sell_requires_broker_proof(monkeypatch):
     orders = [{
         "symbol": "AAPL", "side": "SELL", "qty_requested": 1, "status": "ACK",
         "order_no": "0000041216", "client_order_key": "aapl-sell",
@@ -207,7 +207,8 @@ def test_close_balance_absent_sell_is_not_unresolved(monkeypatch):
     monkeypatch.setattr(reconcile, "_get_balance_force_refresh", lambda provider: {"positions": []})
     monkeypatch.setattr(reconcile, "validate_reconcile_identity", lambda **kwargs: {"status": "OK"})
     result = reconcile.classify_ack_orders_with_final_balance(provider=object(), trade_date="2026-07-21", orders=orders)
-    assert result["pending_order_count"] == 0
+    assert result["pending_order_count"] == 1
+    assert result["orders"][0]["broker_verification_required"] is True
     assert result["orders"][0]["final_status"] == "position_absent_confirmed_sell"
 
 

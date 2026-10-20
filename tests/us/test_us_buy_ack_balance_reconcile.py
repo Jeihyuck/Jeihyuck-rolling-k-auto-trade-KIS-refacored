@@ -31,7 +31,7 @@ def test_buy_ack_reconciles_from_kis_balance(monkeypatch) -> None:
     )
 
     assert result["balance_reconcile_count"] == 1
-    assert result["unresolved_count"] == 0
+    assert result["unresolved_count"] == 1
     assert captured[0]["symbol"] == "AMD"
     assert captured[0]["side"] == "BUY"
     assert captured[0]["source"] == "balance_reconcile_buy"

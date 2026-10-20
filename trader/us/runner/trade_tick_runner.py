@@ -2461,6 +2461,11 @@ def run_trade_tick(
     tick_context.pending_ack_orders = pending_ack_orders
     tick_context.today_order_keys = set(today_order_keys or set())
     tick_context.blocked_symbol_sides = {(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2}
+    tick_context.blocked_symbol_sides.update(
+        (str(x[0]).upper(), str(x[1]).upper())
+        for x in (active_claim_recovery_result.get("unresolved_symbol_sides") or [])
+        if len(x) >= 2 and x[0] and x[1]
+    )
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)

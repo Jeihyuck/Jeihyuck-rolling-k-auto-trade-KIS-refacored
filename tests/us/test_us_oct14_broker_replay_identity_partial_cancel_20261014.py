@@ -121,7 +121,8 @@ def test_submit_cancel_and_late_fill_require_fresh_replay_snapshot(monkeypatch):
     assert second["broker_partial_fill_count"] == 1
     assert observations[-1]["requested_qty"] == 2
     assert observations[-1]["filled_qty"] == 1
-    assert observations[-1]["remaining_qty"] == 0
+    assert observations[-1]["remaining_qty"] == 1
+    assert observations[-1]["raw_row"]["remaining_qty"] == 0
     assert observations[-1]["broker_status"] == "CANCELLED"
 
 

@@ -28,10 +28,10 @@ def test_reconcile_ack_orders_confirms_fill_api_and_balance_delta(monkeypatch):
 
     assert result["confirmed_count"] == 4
     assert result["balance_reconcile_count"] == 2
-    assert result["unresolved_count"] == 0
+    assert result["unresolved_count"] == 2
     assert len(result["symbols_by_status"]["fill_api_confirmed"]) == 4
     assert set(result["symbols_by_status"]["balance_confirmed"]) == {"B1", "B2"}
-    assert result["symbols_by_status"].get("unresolved", []) == []
+    assert set(result["symbols_by_status"]["unresolved"]) == {"B1", "B2"}
     assert len(marked) == 6
     assert sum(1 for call in marked if call["source"] == "fills_reconcile") == 4
     assert sum(1 for call in marked if call["source"] == "balance_reconcile_buy") == 2
@@ -60,7 +60,7 @@ def test_buy_balance_reconcile_requires_pre_order_position_qty(monkeypatch):
     assert marked == []
 
 
-def test_close_final_balance_delta_classifies_pending_out_of_report():
+def test_close_balance_delta_still_requires_broker_proof():
     from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
 
     orders = [
@@ -78,7 +78,7 @@ def test_close_final_balance_delta_classifies_pending_out_of_report():
     assert by_symbol["B1"]["final_status"] == "balance_delta_confirmed"
     assert by_symbol["S1"]["final_status"] == "balance_delta_confirmed"
     assert by_symbol["U1"]["final_status"] == "ack_unresolved_error"
-    assert result["pending_order_count"] == 1
+    assert result["pending_order_count"] == 3
 
 
 def test_partial_sell_balance_delta_uses_authoritative_pre_order_qty(monkeypatch):
@@ -106,8 +106,9 @@ def test_partial_sell_balance_delta_uses_authoritative_pre_order_qty(monkeypatch
     result = reconcile.reconcile_ack_orders_with_balance(
         provider=Provider(), trade_date="2026-09-08", env="practice"
     )
-    assert result["unresolved_count"] == 0
+    assert result["unresolved_count"] == 1
     assert result["balance_reconcile_count"] == 1
-    assert result["confirmed_orders"][0]["symbol"] == "ABBV"
-    assert result["confirmed_orders"][0]["filled_qty"] == 2
+    assert result["balance_estimated_orders"][0]["symbol"] == "ABBV"
+    assert result["balance_estimated_orders"][0]["filled_qty"] == 2
+    assert result["confirmed_orders"] == []
     assert marked[0]["source"] == "balance_reconcile_sell"

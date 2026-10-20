@@ -1283,7 +1283,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if status not in allowed:
         return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
     filled_qty_value = None if filled_qty is None else int(filled_qty)
-    if filled_qty_value is None:
+    if (raw_row or {}).get("filled_qty_present") is False:
+        if status in {"FILLED", "PARTIALLY_FILLED"}:
+            return {"status": "PENDING", "reason": "broker_filled_quantity_missing",
+                    "requires_reconcile": True, "retry_order": False, "entry_fence": True}
+        filled_qty_value = None
+    if filled_qty_value is None and (raw_row or {}).get("filled_qty_present") is not False:
         for name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty"):
             raw_filled = (raw_row or {}).get(name)
             if raw_filled not in (None, ""):
@@ -1356,6 +1361,10 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         and filled_qty_value is not None
         and filled_qty_value > 0
     )
+    if fill_bearing_status and not broker_requested_valid:
+        return {"status": "BROKER_OBSERVATION_QUARANTINED",
+                "reason": "broker_requested_quantity_missing", "requires_reconcile": True,
+                "retry_order": False, "entry_fence": True}
     if fill_bearing_status and broker_requested_raw not in (None, ""):
         if not broker_requested_valid or broker_requested_qty != int(requested_qty):
             mismatch_reason = (
@@ -1490,8 +1499,13 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         fill_price = observed_fill_price
         fill_price_source = "broker_observation"
         if not (math.isfinite(fill_price) and fill_price > 0):
+            persisted_evidence = _active_fill_cumulatives_for_order(
+                trade_date=td, order_no=raw_order_no, client_order_key=key,
+                symbol=symbol, side=side,
+            )
             if (
                 old_filled >= filled_qty_value
+                and int(persisted_evidence.get("actual", 0)) >= filled_qty_value
                 and math.isfinite(old_avg_price)
                 and old_avg_price > 0
             ):
@@ -1735,12 +1749,16 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     if (raw_row or {}).get("filled_qty_present") is False:
         broker_fill_raw = None
     observation_qty = filled_qty_value if broker_fill_raw is not None else None
-    authoritative = status == "REJECTED" and (
+    authoritative = status in {"FILLED", "PARTIALLY_FILLED"} and (
+        _is_kis_order_cumulative_evidence(evidence_type)
+        and observation_qty is not None and observation_qty > 0
+    )
+    authoritative = authoritative or (status == "REJECTED" and (
         broker_requested_valid
         and broker_requested_qty == int(requested_qty)
         and broker_fill_raw is not None
         and observation_qty == 0
-    )
+    ))
     if status == "CANCELLED":
         authoritative = bool(
             broker_requested_valid
@@ -4785,7 +4803,9 @@ def mark_order_filled_by_reconcile(
         cumulative = max(previous, min(observed_cumulative, requested))
         remaining = max(0, requested - cumulative)
         status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
-        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}), "remaining_qty": remaining}
+        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}),
+                      "remaining_qty": remaining, "fill_evidence_type": evidence,
+                      "is_synthetic": synthetic}
         promotion = {"superseded": 0, "conflict": 0}
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(trade_date=td, order_no=on, client_order_key=cok or order.get("client_order_key") or "", cumulative=observed_cumulative)
@@ -4928,6 +4948,8 @@ def mark_order_filled_by_reconcile(
             **_parse_json_meta(order.get("meta")),
             **(meta or {}),
             "remaining_qty": remaining,
+            "fill_evidence_type": evidence,
+            "is_synthetic": synthetic,
         }
         if order_epoch_id:
             merged["trading_epoch_id"] = order_epoch_id

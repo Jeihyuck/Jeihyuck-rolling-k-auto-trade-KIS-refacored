@@ -43,6 +43,12 @@ def test_real_fill_is_not_automatically_attributed_to_wrong_attempt():
 def test_confirmed_satisfied_order_needs_no_repair():
     out = classify(_order(symbol="NET", qty_requested=2, qty_filled=2,
                           broker_count=1, synthetic_count=0,
-                          attempt_state="FILLED", action_state="SATISFIED"))
+                          attempt_state="FILLED", action_state="SATISFIED", authoritative=True))
     assert out["proposed_change_plan"] == "NO_STATE_MUTATION_NEEDED"
     assert out["defer_reason"] == "NONE"
+
+
+def test_satisfied_label_without_authority_still_needs_reconciliation():
+    out = classify(_order(broker_count=1, synthetic_count=0,
+                          attempt_state="FILLED", action_state="SATISFIED"))
+    assert out["proposed_change_plan"] == "VALIDATE_ORDER_ATTEMPT_IDENTITY_BEFORE_IDEMPOTENT_RECONCILIATION"

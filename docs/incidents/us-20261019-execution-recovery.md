@@ -99,9 +99,10 @@ There is no KR production-code change in this PR.
    the acceptance metric pass or weaken the strategy/safety conditions.
 5. Confirm original-date late fills and actual position ownership. The archive's
    seven recovered fills are not asserted to belong to the 86 unsent attempts.
-6. Existing uncertain NET/META/TMO actions require exact broker evidence. This
-   PR does not manufacture fill prices, reset unknown claims or erase the 88
-   unresolved actions. Broker/local fill mismatches must remain visible.
+6. Read-only Oct-20 DB inspection found 13 active historical SELL claims,
+   not 88 active orders. The 86 pre-I/O failures were attempts. Exact original-
+   date broker evidence must reconcile the 13 claims; never bulk-reset unknown
+   claims. See the expanded recovery evidence below.
 7. Compare at least 20 baseline/candidate ticks at the actual HTTP boundary.
    Any claim of operational recovery or a 60-second target requires this new
    WSL/KIS practice evidence; unit tests and CI alone do not establish it.
@@ -109,3 +110,82 @@ There is no KR production-code change in this PR.
 Rollback: revert this PR's single implementation commit through a reviewed
 change. No schema migration, operational DB cleanup, scheduler mutation,
 strategy threshold change or runtime flag change is included.
+
+
+## Expanded restoration implementation (Oct 20)
+
+Five additional regressions failed against the preceding PR head, then passed
+with these changes: synthetic journal fills counted as broker-confirmed; a
+claim-write failure reported as recovered; a synthetic order average reused as
+an actual execution price; direct zero-fill cancel proof lost when list lookup
+was empty; actual fill authority overwritten as false by the final observation.
+A connected 13-claim replay exposed a sixth defect: partial cancellation used
+broker open quantity (zero) as the remaining semantic target. That now retains
+requested minus actual cumulative quantity while preserving broker open zero.
+
+- Journal estimates have their own `balance_estimate_count` and
+  `JOURNAL_REPLAY_BALANCE_ESTIMATE` event. They remain unresolved and never
+  emit broker fill confirmation. ACK reconciliation returns estimates in
+  `balance_estimated_orders`, not `confirmed_orders`; they cannot clean its
+  unresolved gate. Historical `balance_confirmed` / `balance_delta_confirmed`
+  diagnostic labels remain compatible but mean a holdings delta only. Close
+  explicitly counts such estimates and position-absence guesses as pending
+  broker verification, and marks `broker_verification_required`.
+- Both memory and PostgreSQL order writers persist synthetic/actual provenance.
+  A synthetic or still-active-claim local FILLED quantity cannot alone make close
+  report a confirmed broker fill. Missing actual prices cannot be copied from
+  synthetic accounting. Explicitly missing quantity fields are not proof.
+- A result with ignored observation, execution-state write error or
+  `requires_reconcile` cannot increment recovered fill totals. Historical
+  unresolved symbol/side fences now propagate into the new tick's router context.
+- Exact per-order cancellation/rejection observations can reconcile an original
+  source-date claim when the history list has no row. Empty history itself
+  never terminalizes or releases a claim. Contradictory quantities/identity
+  remain fenced. Actual cumulative fills retain authoritative status on replay.
+
+### Reproducible evidence and its limits
+
+`test_us_restoration_consistency_20261020.py` seeds 13 independently persisted
+claims matching the dates/quantities and synthetic-vs-unknown shape of the
+observed backlog. This fixture uses invented order/account identities, not raw
+production data. With no broker proof, all 13 stay unresolved. With controlled
+original-date proof, seven full fills, one partial cancellation and two
+zero-fill terminal outcomes recover; three deliberately unknown attempts stay
+fenced. Reopening a file-backed SQLite claim database and replaying produces no
+duplicate actual fill. These simulated outcomes do NOT assert the real broker
+outcome of any of the 13 production claims.
+
+The BUY/SELL native-client connected tests exercise actual router/client guard,
+mock HTTP ACK, real in-memory order/fill accounting, partial then full fill,
+controlled authoritative balance snapshot persistence and durable claim reopen.
+Credentials, HTTP, risk/market inputs and identity normalization are explicit
+adapters. PREP propagation tests, sustained production-tick/risk tests and real
+PostgreSQL tests provide complementary coverage; this is not an unstubbed
+WSL/strategy/KIS end-to-end certificate. A PostgreSQL regression verifies missing
+synthetic price rejection, promotion to actual cumulative evidence, final claim
+authority and replay idempotence using production migrations.
+
+Read-only active-attempt inventory, scoped by effective environment, account,
+market and epoch (fails closed on missing scope; never resets claims):
+
+```bash
+PYTHONPATH=. python scripts/us_order_evidence_dry_run.py \
+  --from-date 2026-10-01 --to-date 2026-10-20 --active-claims-only
+```
+
+### Operational acceptance remains separate
+
+Actual broker evidence is still required for ABBV, COST, DHR, GILD, MCK, NET,
+PG (seven synthetic-only local fills) and AMD, MSFT, CL, KO, KR, MRVL (six
+zero-recorded-fill active attempts). No production claim, order, fill, price,
+runtime flag or scheduler was changed by this patch. The recovery implementation
+processes subsequent authenticated observations; it does not invent outcomes or
+unlock unknown NET protection orders. A real unknown order must remain fenced.
+
+After authorized deployment, record fresh same-day PREP/run/locked-row agreement,
+effective permissions, naturally occurring strategy-valid BUY/protective SELL,
+HTTP/ACK/exact original-date fill and balance/claim agreement, including restart.
+At least 20 comparable WSL ticks and sufficient eligible SELL samples are needed
+for the <=60s p95 target. Code/CI validation, latency verification and operational
+restoration are three independent verdicts. External evidence that has not been
+observed remains pending; this PR is not authorization to merge or place orders.

@@ -35,8 +35,8 @@ def test_mck_unique_real_sell_can_recover_missing_qty_from_close_delta():
         orders=[_mck()],
     )
     order = result["orders"][0]
-    assert result["status"] == "OK"
-    assert result["pending_order_count"] == 0
+    assert result["status"] == "DEGRADED_ACK_UNRESOLVED"
+    assert result["pending_order_count"] == 1
     assert order["qty"] == 1
     assert order["final_position_qty"] == 1
     assert order["balance_delta_confirmed"] is True

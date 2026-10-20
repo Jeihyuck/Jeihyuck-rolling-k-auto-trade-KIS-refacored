@@ -661,6 +661,7 @@ def reconcile_ack_orders_with_balance(
     canceled_count = 0
     rejected_count = 0
     confirmed_orders: list[dict] = []
+    balance_estimated_orders: list[dict] = []
     symbols_by_status: dict[str, list[str]] = {
         "confirmed": [], "fill_api_confirmed": [], "balance_confirmed": [],
         "open_order_pending": [], "cancelled": [], "rejected": [], "expired": [],
@@ -903,7 +904,9 @@ def reconcile_ack_orders_with_balance(
                         requested_qty=qty, cumulative_filled_qty=fill_qty,
                         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", avg_price_usd=fill_price,
                         source="fills_reconcile", trade_date=trade_date, meta=_order_meta(order))
-                if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
+                if (isinstance(mark_result, dict) and mark_result.get("status") == "OK"
+                        and not mark_result.get("requires_reconcile")
+                        and not mark_result.get("observation_ignored")):
                     confirmed_count += 1
                     symbols_by_status["fill_api_confirmed"].append(symbol)
                     symbols_by_status["confirmed"].append(symbol)
@@ -990,7 +993,9 @@ def reconcile_ack_orders_with_balance(
                 if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
                     balance_reconcile_count += 1
                     symbols_by_status["balance_confirmed"].append(symbol)
-                    confirmed_orders.append({
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
+                    balance_estimated_orders.append({
                         **order,
                         "symbol": symbol, "side": side, "order_no": order_no,
                         "client_order_key": client_order_key,
@@ -1067,7 +1072,9 @@ def reconcile_ack_orders_with_balance(
                     if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
                         balance_reconcile_count += 1
                         symbols_by_status["balance_confirmed"].append(symbol)
-                        confirmed_orders.append({
+                        unresolved_count += 1
+                        symbols_by_status["unresolved"].append(symbol)
+                        balance_estimated_orders.append({
                             **order,
                             "symbol": symbol, "side": "BUY", "order_no": order_no,
                             "client_order_key": client_order_key,
@@ -1166,6 +1173,7 @@ def reconcile_ack_orders_with_balance(
         "failed_count": failed_count,
         "canceled_count": canceled_count,
         "confirmed_orders": confirmed_orders,
+        "balance_estimated_orders": balance_estimated_orders,
         "symbols_by_status": symbols_by_status,
         "order_nos_by_status": order_nos_by_status,
         "manual_reconcile_required": int(unresolved_count > 0),
@@ -1361,6 +1369,9 @@ def classify_ack_orders_with_final_balance(
         final_orderable = int((final_positions.get(symbol) or {}).get("orderable_qty") or 0)
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
+        from trader.us.db.repos import is_synthetic_fill_meta
+        if is_synthetic_fill_meta(_order_meta(order)) or order.get("active_claim"):
+            fill_qty = 0
         broker = order.get("_broker_observation") if isinstance(order.get("_broker_observation"), dict) else {}
         # 2026-10-13 MCK: the journal+claim preserved a unique KIS ACK
         # identity and pre-order balance (2), but neither source carried qty.
@@ -1493,7 +1504,7 @@ def classify_ack_orders_with_final_balance(
             final_status = "ack_open_order_pending"
         else:
             final_status = "ack_unresolved_error"
-        if final_status == "ack_unresolved_error":
+        if final_status in {"ack_unresolved_error", "balance_delta_confirmed", "position_absent_confirmed_sell"}:
             pending += 1
         elif final_status in {"ack_open_order_pending", "partial_fill_open"}:
             open_order_pending += 1
@@ -1529,6 +1540,9 @@ def classify_ack_orders_with_final_balance(
             "final_status": final_status,
             "order_final_classification": "BALANCE_DELTA_CONFIRMED" if final_status == "balance_delta_confirmed" else final_status.upper(),
             "balance_delta_confirmed": final_status == "balance_delta_confirmed",
+            "broker_verification_required": final_status in {
+                "ack_unresolved_error", "balance_delta_confirmed", "position_absent_confirmed_sell"
+            },
             "price_source": str((order.get("meta") or {}).get("price_source") or order.get("price_source") or ""),
             "pnl_if_sell": (order.get("meta") or {}).get("pnl_if_sell") if isinstance(order.get("meta") or {}, dict) else None,
             "pre_order_position_qty": pre_qty,

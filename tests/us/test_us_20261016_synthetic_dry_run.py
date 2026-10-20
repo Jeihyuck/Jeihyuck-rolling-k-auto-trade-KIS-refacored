@@ -1,5 +1,5 @@
 """Read-only evidence audit classification; no DB calls."""
-from scripts.us_order_evidence_dry_run import classify, READ_ONLY_SQL
+from scripts.us_order_evidence_dry_run import classify, READ_ONLY_SQL, ACTIVE_CLAIM_SQL
 
 
 def test_synthetic_only_fill_is_review_not_authoritative_close():
@@ -33,3 +33,7 @@ def test_sql_is_bounded_account_date_and_read_only():
     assert "UPDATE " not in READ_ONLY_SQL
     assert "DELETE " not in READ_ONLY_SQL
     assert "INSERT " not in READ_ONLY_SQL
+    assert all(':'+key in ACTIVE_CLAIM_SQL for key in
+               ('env','account_id','market','trading_epoch_id','start_date','end_date'))
+    assert 'a.attempt_id=c.active_attempt_id' in ACTIVE_CLAIM_SQL
+    assert 'LEFT JOIN us_orders' in ACTIVE_CLAIM_SQL

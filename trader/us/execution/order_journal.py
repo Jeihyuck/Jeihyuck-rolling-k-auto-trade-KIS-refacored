@@ -733,7 +733,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     counts = {"db_ack_restored_count": 0, "broker_full_fill_count": 0,
               "broker_partial_fill_count": 0, "broker_unfilled_ack_count": 0,
               "broker_rejected_count": 0, "broker_unknown_count": 0,
-              "identity_mismatch_count": 0, "failed_count": 0, "deferred_count": 0}
+              "identity_mismatch_count": 0, "failed_count": 0, "deferred_count": 0,
+              "balance_estimate_count": 0}
     unresolved_symbol_sides: list[list[str]] = []
     for error in active_claim_errors:
         counts["failed_count"] += 1
@@ -1099,11 +1100,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     side=side,
                     requested_qty=requested,
                     filled_qty=cumulative,
-                    remaining_qty=(
-                        int(broker_fill["remaining_qty"])
-                        if broker_fill.get("remaining_qty") not in (None, "")
-                        else max(0, requested - cumulative)
-                    ),
+                    # Open broker quantity is zero after a partial cancel;
+                    # the semantic target still has requested-cumulative left.
+                    remaining_qty=max(0, requested - cumulative),
                     broker_status=(
                         str(broker_fill.get("status") or "").upper().replace("CANCELED", "CANCELLED")
                         if str(broker_fill.get("status") or "").upper() in
@@ -1119,14 +1118,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="EVIDENCE_QUANTITY_CONFLICT", raw_response=result)
                     continue
                 if result.get("status") != "OK": raise RuntimeError(result.get("status"))
-                if result.get("observation_ignored"):
+                if result.get("observation_ignored") or result.get("requires_reconcile"):
                     counts["failed_count"] += 1
                     unresolved_symbol_sides.append([symbol, side])
                     append_order_event(
                         "JOURNAL_REPLAY_FAILED",
                         ack,
                         broker_order_no=order_no,
-                        broker_status=str(result["observation_ignored"]),
+                        broker_status=str(result.get("observation_ignored") or "EXECUTION_STATE_NOT_RECONCILED"),
                         raw_response=result,
                     )
                     continue
@@ -1145,6 +1144,13 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     journal_event=latest,
                     lookup_context=source_scope_by_trade_date.get(event_trade_date),
                 )), None)
+                # A scoped per-order response is also broker evidence. Do not
+                # lose a verified zero-fill cancellation/rejection merely
+                # because the historical list endpoint omitted that order.
+                if broker_order is None and isinstance(broker_fill, dict) and broker_fill_status in {
+                    "ACK", "OPEN", "REJECTED", "CANCELLED", "CANCELED", "EXPIRED"
+                }:
+                    broker_order = broker_fill
                 if broker_order:
                     broker_symbol=str(broker_order.get("symbol") or broker_order.get("pdno") or symbol).upper()
                     broker_side=str(broker_order.get("side") or side).upper()
@@ -1157,11 +1163,12 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                             canonical_order_no=normalize_us_order_no(broker_order.get("order_no") or order_no),
                             symbol=symbol, side=side, requested_qty=requested,
                             filled_qty=broker_order.get("filled_qty"),
-                            remaining_qty=int(broker_order.get("remaining_qty") or requested),
+                            remaining_qty=(None if broker_order.get("filled_qty") is None
+                                           else max(0, requested - int(broker_order["filled_qty"]))),
                             broker_status=observed_status, evidence_type="KIS_ORDER_STATUS_ACTUAL",
                             observed_at=broker_order.get("observed_at"), raw_row=broker_order)
                         if result.get("status") != "OK": raise RuntimeError(result.get("status"))
-                        if result.get("requires_reconcile"):
+                        if result.get("requires_reconcile") or result.get("observation_ignored"):
                             counts["broker_unknown_count"] += 1
                             unresolved_symbol_sides.append([symbol, side])
                             append_order_event(
@@ -1208,9 +1215,13 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                                 avg_price_usd=float(latest.get("limit_price") or latest.get("price") or 0),source="journal_replay_balance_delta",
                                 evidence_type="BALANCE_DELTA_SYNTHETIC",trade_date=event_trade_date,meta={"journal_replay":True})
                             if result.get("status") != "OK": raise RuntimeError(result.get("status"))
-                            counts["broker_full_fill_count" if cumulative>=requested else "broker_partial_fill_count"] += 1
-                            append_order_event("JOURNAL_REPLAY_FILL_CONFIRMED",ack,broker_order_no=order_no,
-                                               broker_status="BROKER_FILL_CONFIRMED" if cumulative>=requested else "BROKER_PARTIAL_FILL_CONFIRMED")
+                            # Accounting estimate is not execution proof and
+                            # cannot clean a durable execution fence.
+                            counts["balance_estimate_count"] += 1
+                            counts["broker_unknown_count"] += 1
+                            unresolved_symbol_sides.append([symbol, side])
+                            append_order_event("JOURNAL_REPLAY_BALANCE_ESTIMATE",ack,broker_order_no=order_no,
+                                               broker_status="BALANCE_ESTIMATE_PENDING_BROKER")
                         else:
                             counts["broker_unknown_count"]+=1; unresolved_symbol_sides.append([symbol,side])
                     else:
