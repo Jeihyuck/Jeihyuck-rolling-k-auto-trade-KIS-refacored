@@ -7,6 +7,7 @@ on:
       - ".github/workflows/us-243-broker-evidence-readonly-ci.yml"
       - "scripts/us_kis_original_day_evidence.py"
       - "scripts/us_kis_raw_window_diagnostic.py"
+      - "scripts/us243_verified_sell_recovery.py"
       - "tests/us/test_us_kis_original_day_evidence_20261020.py"
       - "tests/us/test_us_kis_broker_order_date_bridge_20261013.py"
   workflow_dispatch:
@@ -153,6 +154,23 @@ jobs:
           PY
           echo "[US243] audit completed with script rc=$rc (2 means known pending claim)"
           exit 0
+      - name: Preflight exact seven broker-proven SELL fills against production claims (read-only)
+        run: |
+          set -euo pipefail
+          python scripts/us243_verified_sell_recovery.py > us243-fill-repair-preflight.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          lines=Path("us243-fill-repair-preflight.json").read_text(encoding="utf-8").splitlines()
+          for line in lines:
+              doc=json.loads(line)
+              if doc.get("mode")=="PRE_APPLY_KIS_EVIDENCE":
+                  print("[US243][REPAIR_PREFLIGHT] KIS actual full fills",
+                        doc["verified_count"])
+                  for row in doc["actions"]:
+                      print("[US243][REPAIR_PREFLIGHT]", row["date"],row["symbol"],
+                            "quantity",row["qty"],"proof",row["proof"])
+          PY
       - name: Export sanitized KIS practice evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -161,5 +179,6 @@ jobs:
           path: |
             us243-kis-original-day-audit.json
             us243-kis-source-window.json
+            us243-fill-repair-preflight.json
           retention-days: 3
           if-no-files-found: ignore
