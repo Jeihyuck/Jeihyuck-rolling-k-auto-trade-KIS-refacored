@@ -334,3 +334,146 @@ def test_kr244_official_kis_cumulative_sell_economics_without_individual_fill():
     ], date(2026,10,20), expected)
     assert partial["orders_verified"] == 0
     assert partial["results"][0]["priced_execution_qty"] == 70
+
+
+def test_kr244_kis_aggregate_sell_proof_requires_exact_identity_and_two_prices():
+    from trader.reconcile_kis import _verified_kr_cumulative_sell_evidence
+    source = {
+        "env": "practice", "side": "SELL", "code": "036540",
+        "kis_odno": "0000004318", "qty": 140,
+        "order_id": "evidence-id", "client_order_key": "original-sell-key",
+    }
+    row = {
+        "ord_dt": "20261020", "ord_tmd": "093000", "pdno": "036540",
+        "sll_buy_dvsn_cd": "01", "odno": "0000004318",
+        "ord_qty": "140", "tot_ccld_qty": "140",
+        "tot_ccld_amt": "1272600", "avg_prvs": "9090",
+    }
+    kwargs = {
+        "source_order": source, "side": "SELL",
+        "trade_date": date(2026, 10, 20),
+        "kis_odno": "0000004318", "env": "practice",
+    }
+    verified = _verified_kr_cumulative_sell_evidence(row, **kwargs)
+    assert verified is not None
+    assert verified["qty"] == 140
+    assert verified["notional"] == 1272600
+    assert verified["avg_price"] == 9090
+    assert verified["kind"] == "KIS_ORDER_CUMULATIVE_EXECUTION"
+    assert verified["evidence_id"] == _verified_kr_cumulative_sell_evidence(row, **kwargs)["evidence_id"]
+
+    for bad in (
+        {**row, "tot_ccld_qty": "139"},
+        {**row, "tot_ccld_amt": "0"},
+        {**row, "avg_prvs": "0"},
+        {**row, "avg_prvs": "9000"},
+        {**row, "ord_dt": "20261019"},
+        {**row, "sll_buy_dvsn_cd": "02"},
+        {**row, "pdno": "039030"},
+        {**row, "odno": "0000009999"},
+        {**row, "ccld_no": "REAL_EXECUTED_FILL"},
+    ):
+        assert _verified_kr_cumulative_sell_evidence(bad, **kwargs) is None
+
+
+def test_kr244_cumulative_sell_avoids_duplicate_prior_individual_fills():
+    from trader.reconcile_kis import _kr_source_has_individual_sell_fills
+    engine, schema = _db()
+    source_id = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(schema.orders.insert(), {
+            **_order(schema, key="owned-sell", code="036540", side="SELL",
+                     status="SUBMITTED", odno="0000004318"),
+            "order_id": source_id,
+        })
+        conn.execute(schema.fills.insert(), {
+            "fill_id": str(uuid4()), "order_id": source_id,
+            "env": "practice", "code": "036540", "side": "SELL",
+            "trade_id": "ACTUAL-TRADE", "broker_fill_id": "ACTUAL-TRADE",
+            "qty": 1, "price": 9090.0, "fee": 0.0, "tax": 0.0,
+            "fill_meta_json": {"fill_source": "daily_ccld"},
+        })
+    from trader.db.repos import FillsRepo
+    assert _kr_source_has_individual_sell_fills(
+        fills_repo=FillsRepo(engine),
+        source_order={"order_id": source_id}, env="practice",
+    ) is True
+    engine.dispose()
+
+
+def test_kr244_cumulative_price_only_replay_preserves_existing_holding_qty(monkeypatch):
+    import trader.reconcile_kis as rk
+    from trader.run_context import RunContext
+    from types import SimpleNamespace
+
+    source = {
+        "env": "practice", "side": "SELL", "code": "036540",
+        "kis_odno": "0000004318", "qty": 140,
+        "order_id": "original-id", "client_order_key": "original-key",
+        "strategy": "pb1_pullback_close", "sid": 1, "mode": 1,
+        "position_cycle_id": "same-cycle", "portfolio_epoch_id": "same-epoch",
+        "request_json": {"pre_order_holding_qty": 140},
+        "response_json": {"confirmed_fill_qty": 140, "confirmed_fill_notional": 0},
+    }
+    class Orders:
+        def __init__(self):
+            self.events = []
+        def get_order_by_kis_odno(self, env, no):
+            return source
+        def upsert_reconciled_order(self, **kwargs):
+            self.events.append(kwargs)
+        def record_execution_claim_for_order(self, *args, **kwargs):
+            return None
+        def execution_claim_health(self, *, market=None):
+            return {"available": True, "unresolved_execution_actions": 0}
+
+    class Fills:
+        def __init__(self):
+            self.inserts = []
+        def upsert_fill(self, **kwargs):
+            self.inserts.append(kwargs)
+            return "fill-id"
+
+    class Positions:
+        def __init__(self):
+            self.sells = []
+        def reconcile_sell_execution(self, **kwargs):
+            self.sells.append(kwargs)
+            return {"qty_applied": 0, "pnl_qty_applied": 140}
+
+    class NoOp:
+        def __getattr__(self, _name):
+            return lambda **kwargs: None
+
+    orders, fills, positions = Orders(), Fills(), Positions()
+    monkeypatch.setattr(rk, "OrdersRepo", lambda _: orders)
+    monkeypatch.setattr(rk, "FillsRepo", lambda _: fills)
+    monkeypatch.setattr(rk, "PositionsRepo", lambda _: positions)
+    monkeypatch.setattr(rk, "LedgerEventsRepo", lambda _: NoOp())
+    monkeypatch.setattr(rk, "ReconcileLogRepo", lambda _: NoOp())
+    monkeypatch.setattr(rk, "_resolve_reconcile_run_id", lambda *_: None)
+    monkeypatch.setattr(rk, "_kr_source_has_individual_sell_fills", lambda **_: False)
+    monkeypatch.setattr(rk, "_execution_claim_health", lambda *_args, **_kwargs: {"available": True})
+    monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *_args, **_kwargs: None)
+    class FakeKIS:
+        def inquire_daily_ccld(self, **kwargs):
+            return {"rt_cd": "0", "output1": [{
+                "ord_dt": "20261020", "ord_tmd": "093000", "pdno": "036540",
+                "sll_buy_dvsn_cd": "01", "odno": "0000004318",
+                "ord_qty": "140", "tot_ccld_qty": "140",
+                "tot_ccld_amt": "1272600", "avg_prvs": "9090",
+            }], "output2": []}
+    ctx = RunContext(
+        run_id="test-kr244", env="practice", strategy="pb1_pullback_close",
+        started_at=datetime(2026, 10, 20, 15, 0), dry_run=True,
+    )
+    first = rk.reconcile_today(engine=None, kis=FakeKIS(), ctx=ctx)
+    assert first["orders"] == 1
+    assert first["fills"] == 0  # qty was proven before broker price arrived
+    assert len(positions.sells) == 1
+    assert positions.sells[0]["confirmed_cumulative_qty"] == 140
+    assert positions.sells[0]["fill_price"] == 9090
+    assert len(fills.inserts) == 1
+    assert fills.inserts[0]["fill_meta_json"]["fill_source"] == "daily_ccld_order_cumulative"
+    assert orders.events[-1]["response_json"]["confirmed_fill_notional"] == 1272600
+    assert orders.events[-1]["response_json"]["confirmed_fill_price"] == 9090
