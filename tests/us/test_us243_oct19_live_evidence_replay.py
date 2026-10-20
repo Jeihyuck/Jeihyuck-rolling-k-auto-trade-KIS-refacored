@@ -192,3 +192,25 @@ def test_original_pre_io_failure_releases_only_that_attempt_and_can_retry(monkey
     again=route_order(next_intent,kis_client=broker)
     assert again["status"]=="ACK",again
     assert claims.health()["unresolved_execution_actions"]==1
+
+
+def test_standard_trailing_partial_tranches_repeat_only_after_held_qty_changes(
+    monkeypatch,
+):
+    from tests.us.test_us_route_order_claim_boundary import _route_fixture
+    _route_fixture(monkeypatch,production_identity=True)
+    def make(held,qty,ratio):
+        return _semantic_action_identity({
+            "trade_date":"2026-10-19", "symbol":"META", "side":"SELL",
+            "strategy_owner":"US_STANDARD", "position_lifecycle_id":"meta-life",
+            "holding_qty":held, "qty":qty,
+            "exit_family":"TRAILING_STOP",
+            "reason":f"MAX_PROFIT=0.044 TRAIL_PCT={ratio:.3f} > 0.05",
+        },account_env="practice")
+    first=make(4,2,.080)
+    quote_changed=make(4,2,.090)
+    after_genuine_sell_fill_reduces_holdings=make(2,1,.090)
+    assert first.action_key==quote_changed.action_key
+    assert first.action_instance=="PRE_HOLDING_QTY:4"
+    assert after_genuine_sell_fill_reduces_holdings.action_instance=="PRE_HOLDING_QTY:2"
+    assert first.action_key!=after_genuine_sell_fill_reduces_holdings.action_key
