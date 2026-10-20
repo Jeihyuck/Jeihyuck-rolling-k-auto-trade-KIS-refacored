@@ -18,15 +18,11 @@ _ET = ZoneInfo("America/New_York")
 def resolve_kis_us_order_datetime(
     us_trade_date: str, korea_order_time: str,
     domestic_order_date: str | None = None,
-    *,
-    authenticated_us_session_date: bool = False,
 ) -> datetime:
     """Unique KST wall-time whose America/New_York date equals KIS ord_dt.
 
     Return a timezone-aware datetime. Fail closed on an ambiguous/broken
     timestamp rather than silently accepting a wrong chronological proof.
-    Only the authenticated KIS CCNL GET path may set
-    authenticated_us_session_date=True. Legacy input remains unchanged.
     """
     raw_date = str(us_trade_date or "").strip().replace("-", "")
     raw_time = str(korea_order_time or "").strip().replace(":", "").zfill(6)
@@ -35,7 +31,7 @@ def resolve_kis_us_order_datetime(
         raise ValueError("invalid KIS US trade date / Korea order time")
     session_day = datetime.strptime(raw_date, "%Y%m%d").date()
     clock = datetime.strptime(raw_time, "%H%M%S").time()
-    if domestic_order_date in (None, "") and not authenticated_us_session_date:
+    if domestic_order_date in (None, ""):
         # Legacy records and test fixtures sometimes omit DMST_ORD_DT.
         # Without it we cannot prove that ORD_DT is a US session date;
         # preserve the legacy literal KST date rather than invent rollover.
