@@ -253,3 +253,48 @@ def test_kr244_reconcile_today_strict_pagination_contract():
     replay_source = Path("scripts/kr244_reconcile_day.py").read_text(encoding="utf-8")
     assert "reconcile_today(engine=engine, kis=kis, ctx=post_ctx, require_authoritative=True)" in close_source
     assert "ctx=ctx, trade_date=trade_date, require_authoritative=True" in replay_source
+
+
+def test_kis_practice_ccld_uses_verified_official_tr_and_all_exchange(monkeypatch):
+    from types import SimpleNamespace
+    from trader import kis_wrapper
+
+    calls = []
+    class Response:
+        status_code = 200
+        headers = {"tr_cont": "D"}
+        def json(self):
+            return {"rt_cd": "0", "output1": [], "output2": []}
+
+    def get(*args, **kwargs):
+        calls.append(kwargs)
+        return Response()
+
+    monkeypatch.setattr(kis_wrapper, "kis_http_enabled", lambda: True)
+    monkeypatch.setattr(
+        kis_wrapper, "_pick_tr",
+        lambda env, category: ["VTTC0081R"] if env == "practice" else ["TTTC8001R"],
+    )
+    api = kis_wrapper.KisAPI.__new__(kis_wrapper.KisAPI)
+    api.CANO = "00000001"
+    api.ACNT_PRDT_CD = "01"
+    api.env = "practice"
+    api.session = SimpleNamespace(request=get)
+    api._headers = lambda tr_id: {"tr_id": tr_id}
+    result = api.inquire_daily_ccld(start_date="20261020", end_date="20261020")
+    assert result["rt_cd"] == "0"
+    assert calls[0]["headers"]["tr_id"] == "VTTC0081R"
+    assert calls[0]["params"]["EXCG_ID_DVSN_CD"] == "ALL"
+
+    # Do not silently change real-account behavior in the KR practice P0 fix.
+    api.env = "real"
+    calls.clear()
+    api.inquire_daily_ccld(start_date="20261020", end_date="20261020")
+    assert "EXCG_ID_DVSN_CD" not in calls[0]["params"]
+
+
+def test_kis_practice_official_ccld_default_is_not_legacy():
+    from pathlib import Path
+    s = Path("trader/kis_wrapper.py").read_text(encoding="utf-8")
+    assert 'KIS_TR_ID_DAILY_CCLD", "VTTC0081R"' in s
+    assert 'params["EXCG_ID_DVSN_CD"] = exchange_scope_override or "ALL"' in s
