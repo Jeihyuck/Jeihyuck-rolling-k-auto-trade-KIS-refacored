@@ -1556,10 +1556,10 @@ def route_exit_orders_immediately(
             meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
             stage = str(meta.get("profit_capture_stage") or "")
             if stage:
-                # A route exception before the durable broker boundary is safe
-                # to retry. Once BROKER_SUBMIT_STARTED exists, keep the stage
-                # pending/ambiguous until reconciliation proves a terminal
-                # outcome; releasing it here could submit the same TP twice.
+                # A proven pre-HTTP abort can release a TP reservation, while
+                # unknown/ACK evidence requires a fence. A STARTED event alone
+                # is insufficient: reconcile per-attempt abort certificates.
+                # If journaling cannot be read, fail closed as ambiguous.
                 submit_may_have_happened = True
                 try:
                     from trader.us.execution.order_journal import (
@@ -1799,6 +1799,9 @@ def run_trade_tick(
         deadline=(tick_deadline_monotonic if tick_deadline_monotonic is not None else
                   tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0)),
     )
+    # Monotonic tick origin for the REAL native KIS HTTP-boundary hook.
+    # Do not substitute selected-signal readiness for end-to-end tick latency.
+    tick_context.metrics["tick_start_monotonic"] = tick_started_at
     if hasattr(provider, "bind_tick_context"):
         provider.bind_tick_context(tick_context)
     else:
@@ -4572,6 +4575,11 @@ def run_trade_tick(
     tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
     # Per-order data is bounded, explicit, and labeled separately from
     # summary statistics. No telemetry I/O is performed on the order path.
+    _tick_to_http = tick_context.metrics.get(
+        "sell_tick_to_broker_boundary_by_attempt_ms", {}
+    )
+    _tick_to_http = _tick_to_http if isinstance(_tick_to_http, dict) else {}
+    _tick_to_http_bounded = dict(list(_tick_to_http.items())[:128])
     _by_attempt = tick_context.metrics.get("sell_signal_to_broker_boundary_by_attempt_ms", {})
     _by_attempt = _by_attempt if isinstance(_by_attempt, dict) else {}
     _per_attempt_observations = dict(list(_by_attempt.items())[:128])
@@ -4582,6 +4590,11 @@ def run_trade_tick(
     _first_candidate_observations = dict(list(_first_by_attempt.items())[:128])
     latency_metrics = {
         "tick_total_ms": tick_total_ms,
+        "sell_tick_to_broker_boundary_by_attempt_ms": _tick_to_http_bounded,
+        "sell_tick_to_broker_boundary_truncated_count": (
+            max(0, len(_tick_to_http) - len(_tick_to_http_bounded))
+            + int(tick_context.metrics.get("sell_tick_to_broker_boundary_dropped_count", 0))
+        ),
         "sell_signal_to_broker_boundary_by_attempt_ms": _per_attempt_observations,
         "sell_first_candidate_to_broker_by_attempt_ms": _first_candidate_observations,
         "sell_first_candidate_truncated_count": (
