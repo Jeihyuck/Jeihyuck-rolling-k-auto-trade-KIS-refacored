@@ -26,6 +26,10 @@ jobs:
       PYTHONPATH: "."
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      # Canonical account identity uses these KIS account identifiers even
+      # though this job never calls KIS HTTP.
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
