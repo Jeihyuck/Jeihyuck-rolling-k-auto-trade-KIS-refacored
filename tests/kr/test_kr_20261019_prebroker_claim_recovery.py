@@ -233,3 +233,64 @@ def test_reconcile_tick_releases_only_proven_before_kis_attempt(monkeypatch):
     assert repo._execution_claim_repo.get(releasable).action_state == "OPEN"
     assert repo._execution_claim_repo.get(ambiguous).action_state == "IN_FLIGHT"
     engine.dispose()
+
+
+def test_oct20_automatic_lookback_only_releases_oct19_explicit_prehttp(monkeypatch):
+    """Oct19 251970 unlocks on Oct20; Oct19 192820 EXPIRED stays fenced."""
+    engine, schema, repo, epoch = _setup()
+    proven, _ = _claim(engine, schema, repo, epoch, code="251970")
+    expired, _ = _claim(engine, schema, repo, epoch, code="192820", order_status="EXPIRED", response=None)
+    older, _ = _claim(
+        engine, schema, repo, epoch, code="003333",
+        trade_date=date(2026, 10, 16),
+    )
+    monkeypatch.setattr("trader.db.repos.now_kst", lambda: datetime(2026, 10, 20, 14, 30))
+    assert repo.recover_proven_kr_pb1_prebroker_claims(env="practice") == 1
+    assert repo._execution_claim_repo.get(proven).action_state == "OPEN"
+    assert repo._execution_claim_repo.get(expired).action_state == "IN_FLIGHT"
+    assert repo._execution_claim_repo.get(older).action_state == "IN_FLIGHT"
+    assert repo.recover_proven_kr_pb1_prebroker_claims(env="practice") == 0
+    engine.dispose()
+
+
+def test_oct19_recovery_explicit_day_remains_exact_scope(monkeypatch):
+    engine, schema, repo, epoch = _setup()
+    proven, _ = _claim(engine, schema, repo, epoch, code="251970")
+    monkeypatch.setattr("trader.db.repos.now_kst", lambda: datetime(2026, 10, 22, 14, 30))
+    # Explicit historical day is valid only with the same active epoch and
+    # 100% pre-broker proof; older work doesn't silently enter daily sweeps.
+    assert repo.recover_proven_kr_pb1_prebroker_claims(
+        env="practice", trade_date=date(2026, 10, 19)
+    ) == 1
+    assert repo._execution_claim_repo.get(proven).action_state == "OPEN"
+    engine.dispose()
+
+
+def test_kr244_expired_buy_recovery_requires_entire_authoritative_zero_kis_day():
+    from scripts.kr244_oct19_expired_claim_kis_zero_repair import prove_broker_zero_day
+    good={"rt_cd":"0","output1":[],"output2":[],
+          "_sep29_complete":True,"_sep29_pages":1}
+    assert prove_broker_zero_day(good)
+    for bad in (
+        {**good,"rt_cd":"1"},
+        {**good,"output1":[{"pdno":"192820","sll_buy_dvsn_cd":"02"}]},
+        {**good,"output1":None},
+        {**good,"_sep29_complete":False},
+        {**good,"_diag_stub":True},
+        {**good,"_ccld_status":"degraded"},
+        None,
+    ):
+        assert not prove_broker_zero_day(bad)
+
+
+def test_kr244_historical_expired_claim_has_no_broker_submit_or_mutation_in_probe():
+    from pathlib import Path
+    probe=Path("scripts/kr244_oct19_buy_kis_readonly_probe.py").read_text()
+    assert "place_order(" not in probe
+    assert "cancel_order(" not in probe
+    source=Path("scripts/kr244_oct19_expired_claim_kis_zero_repair.py").read_text()
+    assert "prove_broker_zero_day(r)" in source
+    assert 'orders.c.status=="EXPIRED"' in source
+    assert 'attempts.c.attempt_state=="CREATED"' in source
+    assert "original_accepted or original_fills or target_fills" in source
+    assert "release_before_submit(" in source

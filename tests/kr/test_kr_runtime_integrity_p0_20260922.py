@@ -40,7 +40,7 @@ class _TimeoutDuringSetConnection:
         return False
 
     def exec_driver_sql(self, sql: str):
-        if str(sql).startswith("SET statement_timeout"):
+        if str(sql).startswith(("SET LOCAL statement_timeout", "SET statement_timeout")):
             raise TickTimeoutError(
                 "tick_hard_timeout timeout_sec=90 "
                 "last_stage=entry.buyable_gate.finalize.047050"

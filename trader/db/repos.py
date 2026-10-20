@@ -3338,12 +3338,23 @@ class OrdersRepo:
                 )
         return recovered
 
-    def recover_proven_kr_pb1_prebroker_claims(self, *, env: str, trade_date: date | None = None, limit: int = 32) -> int:
-        """Release only PB1 local pre-KIS timeout claims in the active KR epoch."""
+    def recover_proven_kr_pb1_prebroker_claims(
+        self, *, env: str, trade_date: date | None = None,
+        limit: int = 32, lookback_days: int = 2,
+    ) -> int:
+        """Release only fully PROVEN pre-HTTP KR PB1 BUY claims in active epoch.
+
+        In practice allow at most two prior trade dates for restart repair;
+        an exact historical trade_date remains an explicit single-day probe.
+        Real accounts retain today's-only behavior. EXPIRED/CREATED and missing
+        order numbers are never standalone proof of no broker submission.
+        """
         env = str(env or "").strip().lower()
         if env not in {"practice", "real", "live"}:
             return 0
         today = trade_date or now_kst().date()
+        lookback_days = min(2, max(0, int(lookback_days))) if env == "practice" and trade_date is None else 0
+        earliest_proven_day = today - timedelta(days=lookback_days)
         account_key = get_account_key(env=env)
         # SemanticActionIdentity.account_id is the SHA-256 digest of the
         # canonical account key (see claim_execution_action).  Comparing the
@@ -3380,7 +3391,7 @@ class OrdersRepo:
                     actions.c.market == "KR",
                     actions.c.strategy_owner == "PB1",
                     actions.c.trading_epoch_id == active_epoch,
-                    actions.c.trade_date == today,
+                    actions.c.trade_date.between(earliest_proven_day, today),
                     actions.c.action.like("BUY_ENTRY:PB1-%"),
                     actions.c.action_state == "IN_FLIGHT",
                     attempts.c.attempt_state == "CREATED",
@@ -4102,6 +4113,58 @@ class OrdersRepo:
             self._last_read_fail_open_op = "orders.get_order_by_client_order_key" if not rows else None
         return rows[0] if rows else None
 
+    def list_orders_by_client_order_keys(
+        self, env: str, client_order_keys: Iterable[str],
+    ) -> list[dict]:
+        """One strict pre-submit dedupe read for all KR PB1 candidate keys.
+
+        This query MUST fail closed. An unavailable DB cannot prove that an
+        order has not already crossed KIS and must never become an empty map.
+        The order submit claim/idempotency fence remains authoritative for
+        concurrent workers after this snapshot.
+        """
+        keys = sorted({str(key).strip() for key in client_order_keys if str(key).strip()})
+        if not keys:
+            return []
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.client_order_key.in_(keys),
+            ))
+            .order_by(self._schema.orders.c.created_at.desc())
+        )
+        return self._read_mappings_with_guard(
+            stmt, op_name="orders.list_orders_by_client_order_keys", fail_open=False,
+        )
+
+    def list_existing_client_order_keys_for_retry(
+        self, env: str, base_client_order_key: str,
+    ) -> set[str]:
+        """Fetch a retry-key family once, rather than N sequential DB reads.
+
+        Must be fail-closed: if this read is unavailable, generating an
+        apparently unused retry key could duplicate a broker order. The
+        atomic execution claim remains responsible for concurrency races.
+        """
+        base = str(base_client_order_key or "").strip()
+        if not base:
+            return set()
+        key_column = self._schema.orders.c.client_order_key
+        stmt = select(key_column.label("client_order_key")).where(and_(
+            self._schema.orders.c.env == env,
+            or_(key_column == base, key_column.startswith(base + ":retry", autoescape=True)),
+        ))
+        rows = self._read_mappings_with_guard(
+            stmt, op_name="orders.list_existing_client_order_keys_for_retry",
+            fail_open=False,
+        )
+        return {
+            str(row.get("client_order_key") or "") for row in rows
+            if str(row.get("client_order_key") or "") == base
+            or str(row.get("client_order_key") or "").startswith(base + ":retry")
+        }
+
     def get_order_by_kis_odno(self, env: str, kis_odno: str) -> dict | None:
         broker_id = str(kis_odno or "").strip()
         if not broker_id:
@@ -4122,6 +4185,47 @@ class OrdersRepo:
             fail_open=_resolve_lookup_fail_open(),
         )
         return rows[0] if rows else None
+
+    def get_order_by_kis_odno_scoped(
+        self, env: str, kis_odno: str, *, trade_date: date, code: str, side: str,
+    ) -> dict | None:
+        """Bind actual KIS execution ONLY to a unique same-day KR source order.
+
+        Broker numbers may be recycled across days. Never use symbol-only or
+        unscoped order-number lookup to mutate an existing position lifecycle.
+        Missing/ambiguous matches remain unattributed for later review.
+        """
+        broker_id = str(kis_odno or "").strip()
+        symbol = str(code or "").strip().lstrip("A").zfill(6)
+        direction = str(side or "").strip().upper()
+        if not broker_id or not isinstance(trade_date, date) or not symbol or direction not in {"BUY", "SELL"}:
+            return None
+        start_kst = pytz.timezone("Asia/Seoul").localize(datetime.combine(trade_date, datetime.min.time()))
+        end_kst = start_kst + timedelta(days=1)
+        if self.engine.dialect.name == "postgresql":
+            start, end = start_kst.astimezone(pytz.UTC), end_kst.astimezone(pytz.UTC)
+        else:
+            start, end = start_kst.replace(tzinfo=None), end_kst.replace(tzinfo=None)
+        stmt = select(self._schema.orders).where(and_(
+            self._schema.orders.c.env == env,
+            self._schema.orders.c.side == direction,
+            self._schema.orders.c.code == symbol,
+            self._schema.orders.c.created_at >= start,
+            self._schema.orders.c.created_at < end,
+            or_(self._schema.orders.c.kis_odno == broker_id,
+                self._schema.orders.c.broker_order_id == broker_id),
+        )).limit(2)
+        matches = self._read_mappings_with_guard(
+            stmt, op_name="orders.get_order_by_kis_odno_scoped", fail_open=False,
+        )
+        if len(matches) > 1:
+            logger.error(
+                "[RECONCILE][BROKER_ORDER_AMBIGUOUS] code=%s side=%s trade_date=%s "
+                "matched=%s action=KEEP_UNATTRIBUTED",
+                symbol, direction, trade_date, len(matches),
+            )
+            return None
+        return matches[0] if matches else None
 
     def has_blocking_order_today(
         self,

@@ -96,6 +96,64 @@ def audit_kr_unpriced_sell_orders(engine, *, env: str, trade_date: date) -> dict
     }
 
 
+def audit_kr_pending_sell_orders(engine, *, env: str, trade_date: date) -> dict[str, Any]:
+    """Read-only, broker-order-number queue for all unsettled KR SELLs.
+
+    SUBMITTED is an ACK, *not* proof of execution. Holdings-confirmed qty
+    without a broker execution price is also unresolved. Never synthesize a
+    SELL fill or infer price from its limit/closing quotation.
+    """
+    if env not in {"practice", "real"} or not isinstance(trade_date, date):
+        raise ValueError("explicit supported env and KST trade_date required")
+    if engine.dialect.name == "sqlite":
+        start = datetime.combine(trade_date, time.min)
+        end = start + timedelta(days=1)
+    else:
+        start = datetime.combine(trade_date, time.min, _KST).astimezone(timezone.utc)
+        end = (datetime.combine(trade_date, time.min, _KST) + timedelta(days=1)).astimezone(timezone.utc)
+    unresolved_statuses = (
+        "SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+        "PARTIAL_FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+    )
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.orders).where(sa.and_(
+            schema.orders.c.env == env,
+            schema.orders.c.side == "SELL",
+            schema.orders.c.status.in_(unresolved_statuses),
+            schema.orders.c.created_at >= start,
+            schema.orders.c.created_at < end,
+        )).order_by(schema.orders.c.created_at)).mappings().all()
+    queue = []
+    for row in rows:
+        order = dict(row)
+        response = _json_dict(order.get("response_json"))
+        output = _json_dict(response.get("output"))
+        broker_order_no = str(
+            order.get("kis_odno") or order.get("broker_order_id") or output.get("ODNO") or ""
+        ).strip()
+        qty = int(response.get("confirmed_fill_qty") or 0)
+        price = response.get("confirmed_fill_price")
+        queue.append({
+            "order_id": str(order.get("order_id") or ""),
+            "code": str(order.get("code") or ""),
+            "side": "SELL",
+            "status": str(order.get("status") or ""),
+            "kis_odno": broker_order_no,
+            "broker_order_identified": _actual_broker_order_number(order),
+            "submitted_qty": int(order.get("qty") or 0),
+            "confirmed_qty": qty,
+            "broker_price_confirmed": price not in (None, "", 0),
+            "required_action": "MATCH_KIS_ORDER_NUMBER_AND_EXECUTION_PRICE",
+        })
+    return {
+        "market": "KR", "env": env, "trade_date": trade_date.isoformat(),
+        "unsettled_sell_count": len(queue),
+        "missing_order_number_count": sum(not x["broker_order_identified"] for x in queue),
+        "missing_broker_price_count": sum(not x["broker_price_confirmed"] for x in queue),
+        "orders": queue,
+    }
+
 def main(argv: list[str] | None = None) -> int:
     """Read-only operator audit: python -m trader.kr.unpriced_sell_audit."""
     import argparse
@@ -103,17 +161,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit KR quantity-only SELLs missing execution price")
     parser.add_argument("--env", required=True, choices=("practice", "real"))
     parser.add_argument("--trade-date", required=True, help="KST YYYY-MM-DD")
+    parser.add_argument("--include-pending", action="store_true", help="Include ACKs with unresolved fill/price, read-only")
     args = parser.parse_args(argv)
     from trader.db.engine import get_engine
 
     trade_date = date.fromisoformat(args.trade_date)
     engine = get_engine()
     try:
-        report = audit_kr_unpriced_sell_orders(engine, env=args.env, trade_date=trade_date)
+        report = (
+            audit_kr_pending_sell_orders(engine, env=args.env, trade_date=trade_date)
+            if args.include_pending
+            else audit_kr_unpriced_sell_orders(engine, env=args.env, trade_date=trade_date)
+        )
     finally:
         engine.dispose()
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-    return 2 if report["unpriced_sell_count"] else 0
+    return 2 if report.get("unpriced_sell_count", report.get("unsettled_sell_count", 0)) else 0
 
 
 if __name__ == "__main__":

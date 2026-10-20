@@ -340,8 +340,11 @@ def safe_read_mappings(
             timeouts_applied = False
             if is_pg:
                 try:
-                    conn.exec_driver_sql(f"SET statement_timeout = {read_timeout_ms}")
-                    conn.exec_driver_sql(f"SET lock_timeout = {lock_timeout_ms}")
+                    # Transaction-local only: on rollback/timeout the pool
+                    # must not retain a mutated session setting. Never switch
+                    # a busy psycopg connection to AUTOCOMMIT to set timeouts.
+                    conn.exec_driver_sql(f"SET LOCAL statement_timeout = {max(1, read_timeout_ms)}")
+                    conn.exec_driver_sql(f"SET LOCAL lock_timeout = {max(1, lock_timeout_ms)}")
                     timeouts_applied = True
                     logger.info(
                         "[DB][READ][TIMEOUTS_APPLIED] op=%s lock_timeout_ms=%s statement_timeout_ms=%s",
@@ -372,15 +375,11 @@ def safe_read_mappings(
                             ) from _tset_exc
                         raise
 
-            try:
-                rows = conn.execute(stmt).mappings().all()
-            finally:
-                if timeouts_applied:
-                    try:
-                        conn.exec_driver_sql("RESET statement_timeout")
-                        conn.exec_driver_sql("RESET lock_timeout")
-                    except Exception:
-                        pass
+            # Both limits are SET LOCAL and automatically discarded by the
+            # connection context rollback (including on a tick watchdog abort).
+            # Explicit RESET in an already-poisoned transaction can re-poison
+            # pooled connections and has no benefit here.
+            rows = conn.execute(stmt).mappings().all()
 
             logger.info(
                 "[DB][READ][OK] op=%s rows=%s fail_open=%s",

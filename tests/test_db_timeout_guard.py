@@ -35,6 +35,7 @@ class _Conn:
     def __init__(self, *, fail=None):
         self.fail = fail
         self.autocommit_called = False
+        self.commands = []
         self.dialect = type("D", (), {"name": "postgresql"})()
     def execution_options(self, **kwargs):
         if kwargs.get("isolation_level") == "AUTOCOMMIT":
@@ -45,6 +46,7 @@ class _Conn:
     def __exit__(self, *args):
         return False
     def exec_driver_sql(self, _sql):
+        self.commands.append(_sql)
         return None
     def execute(self, _stmt):
         if self.fail:
@@ -67,6 +69,10 @@ def test_safe_read_mappings_does_not_switch_autocommit():
     assert conn.autocommit_called is False
     assert rows == [{"ok": 1}]
     assert fail_open is False
+    assert any(cmd.startswith("SET LOCAL statement_timeout") for cmd in conn.commands)
+    assert any(cmd.startswith("SET LOCAL lock_timeout") for cmd in conn.commands)
+    assert not any(cmd.startswith("RESET ") for cmd in conn.commands)
+    assert not any(cmd.startswith("SET statement_timeout") for cmd in conn.commands)
 
 
 def test_safe_read_mappings_timeout_fail_open_returns_empty(monkeypatch):
