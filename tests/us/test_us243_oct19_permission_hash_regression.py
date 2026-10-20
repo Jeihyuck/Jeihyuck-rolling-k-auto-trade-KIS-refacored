@@ -74,3 +74,67 @@ def test_allowed_practice_profile_requires_explicit_operator_disarm_clear():
         assert p.allowed
     env["DISABLE_REAL_TRADING"]="1"
     assert not resolve_us_order_permissions("am","practice","TRADE",env).allowed
+
+
+def test_actual_session_runner_passes_disarmed_false_to_full_tick(monkeypatch,tmp_path):
+    from unittest.mock import patch
+    from trader.us.runner import trade_session_runner as session
+    monkeypatch.chdir(tmp_path)
+    for key,value in {
+        "TRADING_REGION":"US", "KIS_ENV":"practice",
+        "DRY_RUN":"0", "DISABLE_LIVE_TRADING":"0",
+        "DISABLE_REAL_TRADING":"1", "LIVE_TRADING_ENABLED":"1",
+        "US_LIVE_TRADING_ENABLED":"1", "US_ORDER_ARMED":"1",
+        "US_PAPER_TRADING_ENABLED":"1", "US_KIS_ORDER_ALLOWED":"1",
+        "US_SIGNAL_ONLY":"0",
+    }.items():
+        monkeypatch.setenv(key,value)
+    observed=[]
+    def fake_trade_tick(*_args,**kwargs):
+        observed.append(bool(kwargs["kis_order_allowed"]))
+        return {"status":"OK","orders":[]}
+    with (
+        patch("trader.us.runner.trade_tick_runner.run_trade_tick", side_effect=fake_trade_tick),
+        patch("trader.us.market_calendar.is_us_trading_day",return_value=True),
+        patch("trader.us.budget.resolve_us_order_budget",return_value={"capital_usd_cap":10000.0}),
+    ):
+        result=session.run_trade_session(
+            session="am",env="practice",offline=True,
+            force_now="2026-05-01T10:15:00-04:00",
+            max_ticks=1,interval_sec=1,max_minutes=20,
+        )
+    assert observed==[False], (observed,result)
+    assert result.get("tick_count")==1
+
+
+def test_native_kis_router_disarm_is_checked_before_durable_submit(monkeypatch):
+    from trader.us.execution import order_router
+    from trader.us import config as us_cfg
+    from tests.us.test_us_route_order_claim_boundary import (
+        _route_fixture,_native_kis_client,_intent
+    )
+    _db,claims,_broker=_route_fixture(monkeypatch)
+    events=[]
+    native=_native_kis_client(monkeypatch,events)
+    monkeypatch.setattr(
+        order_router, "_get_broker_position",
+        lambda *_args,**_kwargs: {
+            "symbol":"TEST_SYMBOL","qty":1,"holding_qty":1,
+            "orderable_qty":1,"exchange":"NASDAQ","currency":"USD",
+        }
+    )
+    def operator_disarmed():
+        raise RuntimeError(
+            "[US_ORDER][BLOCKED] reason=disable_real_trading_enabled "
+            "required=DISABLE_REAL_TRADING=0"
+        )
+    monkeypatch.setattr(us_cfg,"assert_us_paper_order_allowed",operator_disarmed)
+    result=order_router.route_order(
+        _intent("2026-10-20",side="SELL",action="HARD_STOP"),
+        kis_client=native,
+        current_position_symbols={"TEST_SYMBOL"},
+    )
+    assert result["status"]=="ORDER_DISABLED_NATIVE_KIS_PERMISSION",result
+    assert result["broker_submit"] is False
+    assert claims.health()["unresolved_execution_actions"]==0
+    assert events==[]
