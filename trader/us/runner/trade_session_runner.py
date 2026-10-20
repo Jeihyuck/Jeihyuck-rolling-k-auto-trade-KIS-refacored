@@ -1201,7 +1201,10 @@ def run_trade_session(
         # before creating any BUY/SELL execution attempt. On 2026-10-19
         # DISABLE_REAL_TRADING=1 was ignored by the session but rejected by
         # KisUSClient, producing 86 PRE_IO aborts for META/TMO.
-        if kis_order_allowed:
+        # A dry-run still exercises policy/strategy and records DRY_RUN
+        # outcomes, but must NEVER call KIS order HTTP. Only real (practice)
+        # order mode needs native order permission precheck.
+        if kis_order_allowed and os.getenv("DRY_RUN", "1") != "1":
             from trader.us.execution.order_permissions import resolve_us_order_permissions
             _us_permission = resolve_us_order_permissions(
                 session, env, resolved_run_mode, os.environ,
