@@ -1,12 +1,6 @@
 name: KR244 Practice KIS Original Fills Readonly
 "on":
-  pull_request:
-    branches: [dual-agent]
-    paths:
-      - "scripts/kr244_kis_readonly_probe.py"
-      - "trader/kis_wrapper.py"
-      - "trader/kr/runtime_integrity_20260929.py"
-      - ".github/workflows/kr244-kis-original-readonly.yml"
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
@@ -14,7 +8,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   readonly-kis-evidence:
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'fix/kr-20261020-submit-latency-sell-reconcile' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name == 'dual-agent' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
