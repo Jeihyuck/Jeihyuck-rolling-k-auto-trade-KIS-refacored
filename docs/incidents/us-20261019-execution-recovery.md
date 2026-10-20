@@ -192,3 +192,71 @@ At least 20 comparable WSL ticks and sufficient eligible SELL samples are needed
 for the <=60s p95 target. Code/CI validation, latency verification and operational
 restoration are three independent verdicts. External evidence that has not been
 observed remains pending; this PR is not authorization to merge or place orders.
+
+
+## Oct 20 blocker closure: broker-original-day read-only operator audit
+
+The new `scripts/us_kis_original_day_evidence.py` queries the **authenticated
+KIS practice US order book by the original US trade date**, once per day, and
+correlates each active scoped execution claim to the immutable source journal.
+It is GET-only and uses a read-only DB transaction. It does not call an order
+POST, cancel, save order, append journal event, release a claim, or infer a fill
+from account holdings. It does not print account/order identifiers or tokens.
+
+Run only on the operator WSL host with its existing KIS practice credentials,
+a valid read-only/connectable PostgreSQL configuration and the reviewed candidate
+checked out. No scheduler or trading flag changes are necessary for the audit:
+
+```bash
+cd ~/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
+git status --short
+git rev-parse HEAD  # must match the explicitly reviewed PR #243 candidate
+PYTHONPATH=. python scripts/us_kis_original_day_evidence.py \
+  --from-date 2026-10-01 --to-date 2026-10-20 \
+  --require-all-terminal > /tmp/us243-kis-original-day-evidence.json
+result=$?
+echo "KIS_AUDIT_EXIT_CODE=$result"
+python - <<'PY'
+import json
+p='/tmp/us243-kis-original-day-evidence.json'
+with open(p, encoding='utf-8') as fp:
+    doc=json.load(fp)
+print(json.dumps(doc['summary'], ensure_ascii=False, sort_keys=True))
+for item in doc['claims']:
+    print(item['trade_date'], item['symbol'], item['side'],
+          item['proof_status'], item['reason'],
+          item.get('actual_filled_qty'), item.get('actual_avg_price'))
+PY
+```
+
+A nonzero exit / missing output means **NOT VERIFIED**, never a reason to
+reset a claim. The `--require-all-terminal` flag exits 2 whenever any action
+is open or not affirmatively proven terminal. The command does **not** run a
+broker reconciliation or clear even a verified full-fill claim: the proven
+transition must still pass the existing identity-checked
+`replay_order_journal(include_active_claims=True, active_claims_only=True)`
+path and persisted order/fill/attempt/claim consistency checks after an
+operator-authorized rollout.
+
+Evidence-fail-closed conditions include: missing session/attempt identity,
+multiple attempted submissions or broker orders under one client action,
+KIS account/env/trade-date disagreement, broker order no/symbol/side/qty
+mismatch, quarantined/incomplete schemas, conflicting cumulative observations,
+no original-date results, non-finite or absent actual fill price, and a
+client whose KIS HTTP capability is disabled. Existing anomalous
+`JOURNAL_REPLAY_FILL_CONFIRMED` events or synthetic `us_fills` rows
+are **not** treated as a real broker confirmation.
+
+Observed Oct 20 Supabase status: all 13 original SELL actions have one
+`BROKER_SUBMIT_STARTED`, one ACK and one unique ACK broker order number
+per action; seven are synthetic-only local FILLED and six lack any
+local fill. No `broker_settlement_evidence` records match these 13
+current active attempts. This supplies original local correlation but **not**
+the external KIS proof. Therefore none was automatically unfenced.
+
+**Acceptance gate**: a complete KIS per-order report, identity-safe replay
+of every positively established transition, after-restart unchanged
+idempotent persistence, a newly deployed practice PREP / BUY / protective-SELL
+end-to-end observation when the strategies naturally signal, and >=20
+comparable WSL full-path HTTP-boundary timing observations. An empty claim
+list does not certify successful trading or the <=60s protective SELL p95.
