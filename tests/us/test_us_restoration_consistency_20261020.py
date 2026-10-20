@@ -224,3 +224,24 @@ def test_explicit_missing_quantity_flag_prevents_actual_promotion(recovery, flag
     assert result['filled_count']==0 and result['unresolved_count']==1
     assert claims.get(identity).active_attempt_id
     assert all(repos.is_synthetic_fill_meta(f['meta']) for f in repos._MEM_FILLS)
+
+
+def test_expiry_without_claim_terminalization_is_not_recovery_success(recovery):
+    claims,seed=recovery
+    identity,event,_=seed()
+    result=journal.replay_order_journal(event['trade_date'],provider=Broker(detail={
+        'status':'EXPIRED','requested_qty':2,'filled_qty':0,'remaining_qty':0}))
+    assert result['broker_confirmed_count']==0 and result['unresolved_count']==1
+    assert claims.get(identity).active_attempt_id
+
+
+def test_close_broker_fill_does_not_hide_pending_claim(recovery):
+    from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
+    _,seed=recovery
+    _,event,number=seed()
+    order={**repos._MEM_ORDERS[0],'active_claim':True,'_broker_observation':{
+        'status':'FILLED','requested_qty':2,'filled_qty':2,'remaining_qty':0}}
+    result=classify_ack_orders_with_final_balance(provider=Broker(),
+        trade_date=event['trade_date'],orders=[order])
+    assert result['pending_order_count']==1
+    assert result['orders'][0]['execution_claim_reconciliation_required']

@@ -138,6 +138,9 @@ requested minus actual cumulative quantity while preserving broker open zero.
 - A result with ignored observation, execution-state write error or
   `requires_reconcile` cannot increment recovered fill totals. Historical
   unresolved symbol/side fences now propagate into the new tick's router context.
+  Expiry stays pending under the existing conservative claim contract, and
+  close cannot report clean while a durable claim remains active, even when
+  a broker fill has already been observed.
 - Exact per-order cancellation/rejection observations can reconcile an original
   source-date claim when the history list has no row. Empty history itself
   never terminalizes or releases a claim. Contradictory quantities/identity

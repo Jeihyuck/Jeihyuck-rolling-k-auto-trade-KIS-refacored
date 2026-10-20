@@ -1809,6 +1809,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             "requires_reconcile": True,
             "retry_order": False,
         })
+    if status == "EXPIRED":
+        # The legacy claim contract deliberately does not terminalize expiry
+        # from an order-status row. Do not advertise a clean recovery while
+        # its execution attempt still requires original-date fill proof.
+        result.update({"requires_reconcile": True, "retry_order": False,
+                       "reason": "expired_execution_claim_requires_proof"})
     if claim_update_error:
         result.update({
             "execution_claim_update_error": claim_update_error,
