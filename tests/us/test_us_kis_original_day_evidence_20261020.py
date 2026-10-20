@@ -170,3 +170,35 @@ def test_historical_multi_order_or_retry_conflict_cannot_prove_recovery(
     assert result["reason"] == "MULTI_ATTEMPT_OR_BROKER_ORDER_COLLISION"
     assert result["terminal_proven"] is False
     assert result["fence_release_authorized"] is False
+
+
+@pytest.mark.parametrize("local_us_day,kst_clock,domestic_day,expected", [
+    ("20261014","011210","20261015","2026-10-14"),
+    ("20261013","020447","20261014","2026-10-13"),
+    ("20261015","233857","20261015","2026-10-15"),
+    ("20261006","001427","20261007","2026-10-06"),
+])
+def test_real_kis_market_day_is_not_misread_as_kst_calendar_date(
+    local_us_day, kst_clock, domestic_day, expected
+):
+    from trader.us.execution.kis_us_client import KisUSClient
+    from trader.us.data_provider import normalize_us_order_status_row
+    raw = {
+        "ord_dt": local_us_day, "ord_tmd": kst_clock,
+        "dmst_ord_dt": domestic_day, "odno": "00000012345",
+        "pdno": "TEST", "sll_buy_dvsn_cd": "01",
+        "ft_ord_qty": "2", "ft_ccld_qty": "2", "nccs_qty": "0",
+        "ft_ccld_unpr3": "283.86",
+    }
+    assert KisUSClient._broker_order_us_trade_date(raw) == expected
+    assert KisUSClient._filter_broker_rows_for_us_trade_date(
+        [raw], expected
+    ) == [raw]
+    assert KisUSClient._filter_broker_rows_for_us_trade_date(
+        [raw], "2026-10-15" if expected != "2026-10-15" else "2026-10-14"
+    ) == []
+    normalized = normalize_us_order_status_row(raw)
+    assert normalized["us_trade_date"] == expected
+    assert normalized["normalization_result"] == "normalized"
+    assert normalized["filled_qty"] == 2
+    assert normalized["avg_price"] == 283.86
