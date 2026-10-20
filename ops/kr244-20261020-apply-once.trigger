@@ -9,3 +9,5 @@ This signal is transient; delete after execution result is recorded in PR.
 Rearmed once after aligned historical replay test assertion; no scope expansion.
 
 Third controlled attempt after disabling automatic KIS token probes; no other scope changed.
+
+Independent recovery-only runner group; same 11 practice orders; no new strategy or broker order action.
