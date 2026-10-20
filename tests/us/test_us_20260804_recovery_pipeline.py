@@ -3,6 +3,8 @@ from unittest.mock import patch
 import json
 from pathlib import Path
 
+import pytest
+
 from trader.us.db import repos
 from trader.us.execution.order_journal import append_order_event, aggregate_order_events, replay_order_journal
 from trader.us.execution.order_journal import match_ambiguous_submit_to_broker_order
@@ -92,16 +94,38 @@ def test_recovered_ack_preserves_all_tp_metadata(tmp_path,monkeypatch):
         assert meta[field]==intent["meta"][field]
 
 
-def test_explicit_cancel_and_reject_update_db_and_release_tp(tmp_path,monkeypatch):
-    for status in ("CANCELLED","REJECTED","EXPIRED"):
-        case=tmp_path/status; _seed(case,monkeypatch)
-        append_order_event("BROKER_ACK_RECEIVED",_intent(),broker_order_no="0000040991",broker_status="ACK")
-        cancel_row = _row(status, filled=0, remaining=0)
-        result=replay_order_journal("2026-08-04",provider=Provider([cancel_row]))
-        assert result["status"]=="OK" and repos._MEM_ORDERS[-1]["status"]==status
-        state=repos.load_us_profit_capture_state("2026-08-04",["JPM"],{"JPM":"L1"})["JPM"]
-        assert not state["tp1_pending"] and not state["tp1_done"]
-
+@pytest.mark.parametrize(
+    ("broker_status", "expected_replay_status"),
+    [
+        ("CANCELLED", "OK"),
+        ("REJECTED", "OK"),
+        # Expiry does not prove that no late execution exists. The durable
+        # attempt must remain unresolved pending original-date broker proof.
+        ("EXPIRED", "UNRESOLVED"),
+    ],
+)
+def test_explicit_cancel_and_reject_update_db_and_release_tp(
+    tmp_path, monkeypatch, broker_status, expected_replay_status
+):
+    case = tmp_path / broker_status
+    _seed(case, monkeypatch)
+    append_order_event(
+        "BROKER_ACK_RECEIVED", _intent(),
+        broker_order_no="0000040991", broker_status="ACK",
+    )
+    terminal_row = _row(broker_status, filled=0, remaining=0)
+    result = replay_order_journal("2026-08-04", provider=Provider([terminal_row]))
+    assert repos._MEM_ORDERS[-1]["status"] == broker_status
+    assert result["status"] == expected_replay_status
+    if broker_status == "EXPIRED":
+        assert result["unresolved_count"] == 1
+        assert result["broker_confirmed_count"] == 0
+        assert ["JPM", "SELL"] in result["unresolved_symbol_sides"]
+    else:
+        assert result["unresolved_count"] == 0
+        assert result["broker_rejected_count"] == 1
+    state = repos.load_us_profit_capture_state("2026-08-04", ["JPM"], {"JPM": "L1"})["JPM"]
+    assert not state["tp1_pending"] and not state["tp1_done"]
 
 def test_jpm_two_page_provider_pipeline_preserves_all_seven(monkeypatch):
     from trader.us.execution.kis_us_client import KisUSClient, KisUSClientError
