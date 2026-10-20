@@ -54,7 +54,11 @@ def _dist(values: list[float]) -> dict:
 
 def summarize(path: Path) -> dict:
     values = {key: [] for key in _FIELDS}
+    seen_sell_attempts: dict[str, float] = {}
     counters = {
+        "sell_http_duplicate_attempts": 0,
+        "sell_http_conflicting_duplicate_attempts": 0,
+        "sell_http_missing_attempt_id": 0,
         "ws_hit": 0, "ws_fallback": 0,
         "sell_http_exact": 0, "sell_http_legacy_aggregate": 0,
         "early_pilot_submissions": 0,
@@ -87,7 +91,25 @@ def summarize(path: Path) -> dict:
                     continue
                 match = re.search(r"(?<![A-Za-z_])" + field + r"=([0-9]+(?:\.[0-9]+)?)", line)
                 if match:
-                    values[key].append(float(match.group(1)) / 1000.0)
+                    seconds = float(match.group(1)) / 1000.0
+                    if key == "exact_selected_sell_to_http_sec":
+                        # One durable broker HTTP submit attempt = one
+                        # latency sample. Duplicated log copies/retries must
+                        # not make a 3-sample run appear to contain 20 samples.
+                        attempt_match = re.search(
+                            r"(?<![A-Za-z_])attempt=([^\\s]+)", line
+                        )
+                        if not attempt_match:
+                            counters["sell_http_missing_attempt_id"] += 1
+                            continue
+                        attempt = attempt_match.group(1)
+                        if attempt in seen_sell_attempts:
+                            counters["sell_http_duplicate_attempts"] += 1
+                            if abs(seen_sell_attempts[attempt]-seconds) > .000001:
+                                counters["sell_http_conflicting_duplicate_attempts"] += 1
+                            continue
+                        seen_sell_attempts[attempt] = seconds
+                    values[key].append(seconds)
     return {
         "path": str(path),
         "counters": counters,
@@ -97,6 +119,7 @@ def summarize(path: Path) -> dict:
             "unobserved_signals_are_not_assigned_times": True,
             "low_sample_p95_is_not_operational_proof": True,
             "broker_submit_is_not_fill": True,
+            "one_observation_per_original_broker_submit_attempt": True,
         },
     }
 
@@ -109,6 +132,16 @@ def compare(baseline: dict, candidate: dict) -> dict:
         comparable = (
             before["count"] >= 20 and after["count"] >= 20
             and before["p95"] is not None and after["p95"] is not None
+            and (
+                key != "exact_selected_sell_to_http_sec"
+                or all(
+                    sum(report["counters"].get(k, 0) for k in (
+                        "sell_http_conflicting_duplicate_attempts",
+                        "sell_http_missing_attempt_id",
+                    )) == 0
+                    for report in (baseline, candidate)
+                )
+            )
         )
         comparison[key] = {
             "baseline_p95_sec": before["p95"],
@@ -131,6 +164,12 @@ def main() -> None:
     p.add_argument("baseline", type=Path)
     p.add_argument("candidate", type=Path)
     p.add_argument("--output", type=Path)
+    p.add_argument(
+        "--require-sell-p95-60", action="store_true",
+        help="Fail closed unless both sides have 20 unique actual selected-"
+             "intent samples and candidate p95 is <=60 seconds; does not "
+             "establish live WSL provenance without independent run records.",
+    )
     a = p.parse_args()
     baseline = summarize(a.baseline)
     candidate = summarize(a.candidate)
@@ -138,10 +177,27 @@ def main() -> None:
         "baseline": baseline, "candidate": candidate,
         "p95_comparison": compare(baseline, candidate),
     }
+    sell_check = output["p95_comparison"]["exact_selected_sell_to_http_sec"]
+    output["sell_60s_evidence_gate"] = {
+        "status": (
+            "PASS_LOG_TIMING_ONLY"
+            if sell_check["comparison_valid"]
+            and sell_check["candidate_p95_sec"] <= 60.0
+            else "NOT_VERIFIED"
+        ),
+        "reason": (
+            "requires >=20 unique actual submit attempts on EACH side,"
+            " no missing/conflicting identity and candidate p95 <=60 sec"
+        ),
+        "live_runtime_provenance_verified": False,
+        "real_broker_fill_verified": False,
+    }
     serialized = json.dumps(output, ensure_ascii=False, indent=2)
     if a.output:
         a.output.write_text(serialized + "\n", encoding="utf-8")
     print(serialized)
+    if a.require_sell_p95_60 and output["sell_60s_evidence_gate"]["status"] != "PASS_LOG_TIMING_ONLY":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
