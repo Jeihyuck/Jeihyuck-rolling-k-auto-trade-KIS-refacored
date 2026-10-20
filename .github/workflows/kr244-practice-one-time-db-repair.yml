@@ -8,7 +8,7 @@ name: KR244 Oct20 Practice Exact SELL One-Time Recovery
 permissions:
   contents: read
 concurrency:
-  group: kr244-practice-kis-token-probe
+  group: kr244-practice-exact-sell-recovery-only
   cancel-in-progress: false
 jobs:
   evidence-backed-db-repair:
