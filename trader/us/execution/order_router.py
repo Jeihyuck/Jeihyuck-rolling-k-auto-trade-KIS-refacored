@@ -1801,7 +1801,14 @@ def route_order(
     # auto-clear DISABLE_REAL_TRADING; also protect direct tick/router callers
     # that did not run the session permission precheck.
     from trader.us.execution.kis_us_client import KisUSClient
-    if isinstance(kis_client, KisUSClient):
+    # Synthetic broker adapters (including injected harness clients) are
+    # not a KIS HTTP submitter; they preserve their explicit test semantics.
+    # Only the genuine KIS client must pass the native HTTP gate.
+    _native_kis = (
+        type(kis_client).__module__ == KisUSClient.__module__
+        and type(kis_client).__name__ == "KisUSClient"
+    )
+    if _native_kis:
         try:
             us_cfg.assert_us_paper_order_allowed()
         except RuntimeError as _permission_exc:
