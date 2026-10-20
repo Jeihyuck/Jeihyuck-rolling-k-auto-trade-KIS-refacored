@@ -5866,6 +5866,23 @@ class PB1Engine:
     def _next_retry_client_order_key(self, client_order_key: str) -> str:
         if not client_order_key:
             return client_order_key
+        # Previous per-suffix SELECT caused ~424 DB lookups during the
+        # 2026-10-20 KR afternoon session. Preserve the exact suffix scheme
+        # (base, retry2, retry3, ...) with a single fail-closed family read.
+        if hasattr(self.orders_repo, "list_existing_client_order_keys_for_retry"):
+            existing_keys = self.orders_repo.list_existing_client_order_keys_for_retry(
+                self.env, client_order_key,
+            )
+            suffix = 1
+            candidate = client_order_key
+            while candidate in existing_keys:
+                suffix += 1
+                candidate = f"{client_order_key}:retry{suffix}"
+            logger.info(
+                "[PB1][RETRY_KEY][BULK] known=%s suffix=%s fail_closed=1",
+                len(existing_keys), suffix,
+            )
+            return candidate
         suffix = 1
         candidate = client_order_key
         while hasattr(self.orders_repo, "has_client_order_key") and self.orders_repo.has_client_order_key(self.env, candidate):
