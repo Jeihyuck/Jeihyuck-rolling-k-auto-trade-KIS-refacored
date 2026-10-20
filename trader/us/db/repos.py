@@ -5077,7 +5077,70 @@ def mark_order_filled_by_reconcile(
                         (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
                         VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
                         ON CONFLICT (fill_idempotency_key) DO NOTHING"""
-            conn.execute(text(insert_sql), insert_params)
+            # On production's uq_us_fills_idempotent the column tuple does
+            # NOT contain evidence_type. If synthetic and actual broker
+            # cumulative have identical qty AND price, the otherwise-correct
+            # actual INSERT collides with a superseded synthetic. Promote that
+            # exact, already-deactivated synthetic row in place. Its original
+            # provenance survives inside meta and the immutable order journal.
+            # No inferred fill or unrelated row may be promoted here.
+            same_tuple_params = {
+                "td": td, "symbol": sym, "side": side_u, "order_no": on,
+                "cok": resolved_client_order_key, "qty": fill_delta,
+                "price": price, **fill_epoch_params,
+            }
+            candidates = []
+            if not synthetic and _is_kis_order_cumulative_evidence(evidence):
+                candidates = conn.execute(text("""
+                    SELECT id, meta FROM us_fills
+                    WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                      AND order_no=:order_no AND client_order_key=:cok
+                      AND qty=:qty AND price_usd=:price
+                """ + fill_epoch_clause + """
+                      AND COALESCE((meta->>'is_synthetic')::boolean,
+                          (meta->>'synthetic')::boolean,
+                          (meta->>'synthetic_fill')::boolean,false)
+                      AND COALESCE((meta->>'accounting_active')::boolean,true)=false
+                    FOR UPDATE
+                """), same_tuple_params).mappings().all()
+            if len(candidates) > 1:
+                raise FillAccountingInvariantError({
+                    "status": "SYNTHETIC_PROMOTION_IDENTITY_COLLISION",
+                    "entry_fence": True, "retry_order": False,
+                })
+            if len(candidates) == 1:
+                original_meta = _parse_json_meta(candidates[0]["meta"])
+                original_evidence = str(original_meta.get("fill_evidence_type") or "")
+                if original_evidence not in {"BALANCE_DELTA_SYNTHETIC","LEGACY_SYNTHETIC"}:
+                    raise FillAccountingInvariantError({
+                        "status": "SYNTHETIC_PROMOTION_SOURCE_NOT_ALLOWED",
+                        "entry_fence": True, "retry_order": False,
+                    })
+                promoted_meta = {
+                    **original_meta, **fill_meta,
+                    "is_synthetic": False, "synthetic": False,
+                    "synthetic_fill": False, "accounting_active": True,
+                    "fill_evidence_type": evidence,
+                    "original_synthetic_evidence_type": original_evidence,
+                    "synthetic_actual_same_tuple_promoted": True,
+                }
+                promote = conn.execute(text("""
+                    UPDATE us_fills SET meta=CAST(:promoted_meta AS jsonb)
+                    WHERE id=:fill_id AND trade_date=:td
+                      AND order_no=:order_no AND client_order_key=:cok
+                      AND qty=:qty AND price_usd=:price
+                """ + fill_epoch_clause), {
+                    **same_tuple_params,
+                    "fill_id": candidates[0]["id"],
+                    "promoted_meta": _json_param(promoted_meta),
+                })
+                if int(promote.rowcount or 0) != 1:
+                    raise FillAccountingInvariantError({
+                        "status": "SYNTHETIC_PROMOTION_UPDATE_FAILED",
+                        "entry_fence": True, "retry_order": False,
+                    })
+            else:
+                conn.execute(text(insert_sql), insert_params)
         rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
         """ + fill_epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
