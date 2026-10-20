@@ -1416,6 +1416,7 @@ def _verified_kr_cumulative_sell_evidence(
         code != _normalize_code(source_order.get("code"))
         or str(source_order.get("side") or "").upper() != "SELL"
         or str(source_order.get("kis_odno") or source_order.get("broker_order_id") or "").strip() != str(kis_odno).strip()
+        or str(_first_value(row, ["odno", "ODNO", "ordno"]) or "").strip() != str(kis_odno).strip()
         or _parse_date_time(row).date() != trade_date
     ):
         return None
