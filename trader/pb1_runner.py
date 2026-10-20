@@ -6057,7 +6057,7 @@ def run_once(
                     started_at=now_kst(),
                     dry_run=False,
                 )
-                post_result = reconcile_today(engine=engine, kis=kis, ctx=post_ctx) or {}
+                post_result = reconcile_today(engine=engine, kis=kis, ctx=post_ctx, require_authoritative=True) or {}
                 logger.info(
                     "[KR_CLOSE][POSTSUBMIT_RECONCILE] accepted=%s broker_rows=%s "
                     "fills_added=%s ok=%s ccld_status=%s degraded=%s "
