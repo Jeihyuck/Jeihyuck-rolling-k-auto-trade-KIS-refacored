@@ -1577,3 +1577,48 @@ def test_real_postgres_multi_broker_observation_persists_verified_evidence_and_i
         if r["event_type"] == "JOURNAL_REPLAY_MULTI_ATTEMPT_BROKER_EVIDENCE"
         and r["client_order_key"] == intent["client_order_key"]
     ]) == 1
+
+
+def test_equal_qty_price_synthetic_broker_promotion_preserves_unique_tuple(pg_engine):
+    """Oct 2026 GILD/PG: original synthetic is exactly same qty AND price.
+
+    Schema uq_us_fills_idempotent ignores evidence_type, so a separate real
+    fill row with that tuple would violate UNIQUE and leave a false claim.
+    Promote only the scoped superseded synthetic with an immutable provenance
+    breadcrumb; the second actual replay is idempotent.
+    """
+    import trader.us.db.repos as repos
+    from sqlalchemy import text
+    _seed_order(pg_engine, key="SAME-TUPLE-REPAIR", order_no="0000900123",
+                qty_requested=4, qty_filled=4)
+    opts = dict(
+        trade_date="2026-07-16",order_no="0000900123",
+        client_order_key="SAME-TUPLE-REPAIR",
+        symbol="AMD",side="SELL",filled_qty=4,
+        requested_qty=4,cumulative_filled_qty=4,
+        avg_price_usd=100,evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="broker_order_observation",
+    )
+    first = repos.mark_order_filled_by_reconcile(**opts)
+    second = repos.mark_order_filled_by_reconcile(**opts)
+    assert first["status"] == "OK",first
+    assert second["status"] == "OK",second
+    with pg_engine.begin() as conn:
+        fills=conn.execute(text("""
+            SELECT qty,price_usd,meta FROM us_fills
+            WHERE client_order_key='SAME-TUPLE-REPAIR'
+        """)).mappings().all()
+        order=conn.execute(text("""
+            SELECT status,qty_filled,avg_price_usd FROM us_orders
+            WHERE client_order_key='SAME-TUPLE-REPAIR'
+        """)).mappings().one()
+    assert len(fills)==1
+    assert fills[0]["qty"]==4
+    assert float(fills[0]["price_usd"])==100.0
+    assert fills[0]["meta"]["fill_evidence_type"]=="KIS_ORDER_CUMULATIVE_ACTUAL"
+    assert fills[0]["meta"]["is_synthetic"] is False
+    assert fills[0]["meta"]["accounting_active"] is True
+    assert fills[0]["meta"]["synthetic_actual_same_tuple_promoted"] is True
+    assert fills[0]["meta"]["original_synthetic_evidence_type"]=="BALANCE_DELTA_SYNTHETIC"
+    assert order["status"]=="FILLED"
+    assert order["qty_filled"]==4
