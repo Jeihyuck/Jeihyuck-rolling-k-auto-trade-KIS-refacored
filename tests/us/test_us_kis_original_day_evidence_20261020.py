@@ -148,3 +148,25 @@ def test_unavailable_kis_preserves_fence_instead_of_reporting_success(fixture):
     )
     assert out[0]["proof_status"] == "UNRESOLVED"
     assert out[0]["terminal_proven"] is False
+
+
+@pytest.mark.parametrize("another_attempt, another_order", [
+    (False, "0000009999"),
+    (True, "0000001234"),
+])
+def test_historical_multi_order_or_retry_conflict_cannot_prove_recovery(
+    fixture, another_attempt, another_order
+):
+    claim, journal, scope, broker = fixture
+    other = {
+        **journal[1], "broker_order_no": another_order,
+        "submit_attempt_id": "submit-2" if another_attempt else "submit-1",
+    }
+    records = list(journal)
+    if another_attempt:
+        records.append({**journal[0], "submit_attempt_id": "submit-2"})
+    records.append(other)
+    result = _audit().verify_claim(claim, records, [broker], scope)
+    assert result["reason"] == "MULTI_ATTEMPT_OR_BROKER_ORDER_COLLISION"
+    assert result["terminal_proven"] is False
+    assert result["fence_release_authorized"] is False
