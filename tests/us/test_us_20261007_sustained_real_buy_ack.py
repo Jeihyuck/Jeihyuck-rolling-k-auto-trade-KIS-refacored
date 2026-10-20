@@ -302,6 +302,69 @@ def test_sustained_twenty_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     )
     assert duplicate_result["status"] != "ACK", duplicate_result
     assert len(broker.submission_sequence) == prev_kis_submits
+    # Convert one actual ACK of EACH side into an authenticated-shape
+    # synthetic KIS cumulative fill. The reconciliation and physical
+    # PostgreSQL writes here are production code, not faked repositories.
+    # Check the durable order+fill after opening an independent DB connection.
+    from sqlalchemy import create_engine, text
+    with pg_engine.connect() as conn:
+        matching = conn.execute(text(
+            "SELECT client_order_key,symbol,side,qty_requested,order_no "
+            "FROM us_orders WHERE trade_date='2026-10-06' "
+            "AND order_no IN ('MOCK-SELL-1','MOCK-BUY-1')"
+        )).mappings().all()
+    assert {x["side"] for x in matching} == {"BUY","SELL"}, matching
+    applied_orders=[]
+    for item in matching:
+        qty=int(item["qty_requested"])
+        amount=90.0 if item["side"]=="SELL" else 100.0
+        applied=repos.apply_broker_order_observation(
+            trade_date="2026-10-06",
+            client_order_key=str(item["client_order_key"]),
+            raw_order_no=str(item["order_no"]),
+            canonical_order_no=str(item["order_no"]),
+            symbol=str(item["symbol"]),side=str(item["side"]),
+            requested_qty=qty,filled_qty=qty,remaining_qty=0,
+            broker_status="FILLED",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+            raw_row={
+                "requested_qty":qty,"filled_qty":qty,
+                "remaining_qty":0,"avg_price":amount,
+                "symbol":str(item["symbol"]), "side":str(item["side"]),
+                "order_no":str(item["order_no"]),
+            },
+        )
+        assert applied["status"]=="OK", (item,applied)
+        applied_orders.append(str(item["order_no"]))
+    restarted=create_engine(os.environ["PBCORE_TEST_POSTGRES_URL"],future=True)
+    try:
+        with restarted.connect() as conn:
+            verify=conn.execute(text(
+                "SELECT o.side,o.status,o.qty_filled, "
+                "f.qty AS fill_qty,f.meta->>'fill_evidence_type' AS evidence, "
+                "f.meta->>'is_synthetic' AS synthetic "
+                "FROM us_orders o JOIN us_fills f "
+                "ON f.client_order_key=o.client_order_key "
+                "WHERE o.trade_date='2026-10-06' "
+                "AND o.order_no IN ('MOCK-SELL-1','MOCK-BUY-1')"
+            )).mappings().all()
+        assert len(verify)==2, verify
+        assert {x["side"] for x in verify}=={"BUY","SELL"}
+        assert all(
+            x["status"]=="FILLED"
+            and int(x["qty_filled"])==int(x["fill_qty"])>0
+            and x["evidence"]=="KIS_ORDER_CUMULATIVE_ACTUAL"
+            and str(x["synthetic"]).lower() in ("false","none")
+            for x in verify
+        ),verify
+    finally:
+        restarted.dispose()
+    print("US_PB1_MOCK_KIS_FILL_RESTART=" + __import__("json").dumps({
+        "filled_sides":["BUY","SELL"],"postgres_restart_read_verified":True,
+        "original_broker_http_count":0,
+        "source":"CI_MOCK_KIS_CUMULATIVE_ORDER_EVIDENCE",
+    },sort_keys=True))
+
     print("US_PB1_BUY_ACK_20TICK_METRICS=" + __import__("json").dumps({
         "ticks": 20, "tick_wall_p95_sec": round(p95_wall, 4),
         "tick_wall_max_sec": round(max(tick_wall_sec), 4),
