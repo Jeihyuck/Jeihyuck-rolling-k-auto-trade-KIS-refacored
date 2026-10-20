@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from pathlib import Path
 
@@ -1385,7 +1385,7 @@ def _restore_entry_meta_for_promoted_positions(
     return restored_count
 
 
-def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
+def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None) -> dict[str, object]:
     env = ctx.env
     env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
     reconcile_run_id = _resolve_reconcile_run_id(
@@ -1394,7 +1394,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         env_run_id,
     )
     strategy = ctx.strategy
-    today = now_kst().strftime("%Y%m%d")
+    if trade_date is not None and not isinstance(trade_date, date):
+        raise TypeError("trade_date must be a datetime.date")
+    today = (trade_date or now_kst().date()).strftime("%Y%m%d")
     degraded_reason: str | None = None
     try:
         resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
