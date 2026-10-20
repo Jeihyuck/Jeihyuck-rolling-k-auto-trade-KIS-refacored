@@ -1448,7 +1448,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         source_response: dict[str, Any] = {}
         if kis_odno:
             try:
-                source_order = orders_repo.get_order_by_kis_odno(env, kis_odno)
+                if hasattr(orders_repo, "get_order_by_kis_odno_scoped"):
+                    source_order = orders_repo.get_order_by_kis_odno_scoped(
+                        env, kis_odno,
+                        trade_date=order_time.date(), code=code, side=side,
+                    )
+                else:
+                    # Compatibility with isolated legacy/mock repositories;
+                    # production OrdersRepo must use exact source matching.
+                    source_order = orders_repo.get_order_by_kis_odno(env, kis_odno)
             except Exception as exc:
                 logger.warning(
                     "[RECONCILE][SOURCE_LOOKUP_FAIL] side=%s code=%s kis_odno=%s err=%s",
