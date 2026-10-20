@@ -60,7 +60,16 @@ def _verified_environment():
 
 
 def _active_claims(engine,scope):
-    sql = CLAIMS_SQL.replace("SELECT c.trade_date,", "SELECT c.action_key, c.trade_date,")
+    sql = CLAIMS_SQL.replace(
+        "SELECT c.trade_date,",
+        "SELECT c.action_key, c.active_attempt_id, a.authoritative AS attempt_authoritative, c.trade_date,",
+    ).replace(
+        "a.attempt_id = c.active_attempt_id",
+        "(a.attempt_id = c.active_attempt_id OR (c.active_attempt_id IS NULL AND a.authoritative IS TRUE))",
+    ).replace(
+        "AND c.active_attempt_id IS NOT NULL",
+        "AND (c.active_attempt_id IS NOT NULL OR a.authoritative IS TRUE)",
+    )
     with engine.connect() as conn:
         with conn.begin():
             conn.execute(text("SET TRANSACTION READ ONLY"))
@@ -89,13 +98,21 @@ def _claim_metas(engine, scope, rows):
 
 
 def preflight(provider, engine, scope):
-    rows=_active_claims(engine,scope)
+    rows=[
+        r for r in _active_claims(engine,scope)
+        if (str(r["trade_date"]),str(r.get("symbol") or "").upper()) in EXPECTED
+        and str(r.get("side") or "").upper()=="SELL"
+        and str(r.get("strategy_owner") or "")=="US_STANDARD"
+        and int(r.get("requested_qty") or -1)==EXPECTED[
+            (str(r["trade_date"]),str(r.get("symbol") or "").upper())][0]
+    ]
     by_key={(str(r["trade_date"]),str(r.get("symbol") or "").upper()):r for r in rows}
-    if len(rows)!=13 or set(by_key)!=set(EXPECTED):
-        raise RuntimeError("HISTORICAL_ACTIVE_CLAIM_SET_CHANGED")
+    if len(rows)!=13 or len(by_key)!=13 or set(by_key)!=set(EXPECTED):
+        raise RuntimeError("HISTORICAL_ACTIVE_OR_PROVEN_SET_CHANGED")
     stored=_claim_metas(engine,scope,rows)
     per_day={}
     fully_verified=[]
+    already_verified=0
     summary=[]
     for (day,symbol), row in sorted(by_key.items()):
         qty, expected_fill=EXPECTED[(day,symbol)]
@@ -141,7 +158,18 @@ def preflight(provider, engine, scope):
                 "proof":proof["proof_status"],"price":proof.get("actual_avg_price")}
         summary.append(report)
         if not expected_fill:
+            if row.get("active_attempt_id") is None:
+                raise RuntimeError(f"UNFILLED_FENCE_MISSING_{symbol}")
             continue
+        if (row.get("active_attempt_id") is None
+                and str(row.get("action_state") or "")=="SATISFIED"
+                and row.get("attempt_authoritative") is True):
+            # Previously repaired claims must still have a single actual
+            # broker fill. Later verification after restart also proves this.
+            already_verified+=1
+            continue
+        if str(row.get("active_attempt_id") or "")!=str(row["attempt_id"]):
+            raise RuntimeError(f"UNPROVEN_REPAIR_ATTEMPT_STATE_{symbol}")
         key=str(row["client_order_key"])
         attempt=str(row["attempt_id"])
         submit=next((e for e in reversed(events)
@@ -169,16 +197,16 @@ def preflight(provider, engine, scope):
             or not source.get("filled_qty_present",True)):
             raise RuntimeError(f"FILL_SOURCE_CONTRADICTION_{symbol}")
         fully_verified.append((row,order_no,source))
-    if len(fully_verified)!=EXPECTED_FULL:
+    if len(fully_verified)+already_verified!=EXPECTED_FULL:
         raise RuntimeError("NOT_EXACTLY_SEVEN_VERIFIED_FILLS")
-    return summary,fully_verified
+    return summary,fully_verified,already_verified
 
 
 def verify_after(engine,scope,expected_terminal):
     # Used both after same-process mutation and after a fresh Python process.
     sql=text("""
         SELECT c.trade_date, c.strategy_owner,c.action_state,c.active_attempt_id,
-               a.authoritative,a.attempt_state,
+               a.authoritative,a.attempt_state, a.requested_qty,
                o.symbol,o.side,o.status,o.qty_filled,o.avg_price_usd,
                COUNT(f.id) FILTER (
                  WHERE f.meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
@@ -186,14 +214,16 @@ def verify_after(engine,scope,expected_terminal):
                  AND COALESCE((f.meta->>'accounting_active')::boolean,true)=true
                ) AS actual_fills
         FROM us_execution_claims c JOIN us_execution_attempts a ON a.action_key=c.action_key
+          AND (a.attempt_id=c.active_attempt_id OR (c.active_attempt_id IS NULL AND a.authoritative IS TRUE))
         JOIN us_orders o ON o.env=c.env AND o.trading_epoch_id=c.trading_epoch_id
           AND o.trade_date=c.trade_date AND o.client_order_key=a.client_order_key
         LEFT JOIN us_fills f ON f.client_order_key=o.client_order_key
           AND f.trade_date=o.trade_date AND f.trading_epoch_id=o.trading_epoch_id
         WHERE c.env=:env AND c.account_id=:account_id AND c.market=:market
           AND c.trading_epoch_id=:trading_epoch_id AND c.trade_date BETWEEN :start AND :end
+          AND (c.active_attempt_id IS NOT NULL OR a.authoritative IS TRUE)
         GROUP BY c.action_key,c.trade_date,c.strategy_owner,c.action_state,
-          c.active_attempt_id,a.authoritative,a.attempt_state,o.symbol,o.side,
+          c.active_attempt_id,a.authoritative,a.attempt_state,a.requested_qty,o.symbol,o.side,
           o.status,o.qty_filled,o.avg_price_usd
     """)
     with engine.connect() as conn:
@@ -207,8 +237,13 @@ def verify_after(engine,scope,expected_terminal):
     bysymbol={}
     for r in records:
         key=(str(r["trade_date"]),str(r.get("symbol") or "").upper())
-        if key in EXPECTED and key not in bysymbol:
-            bysymbol[key]=r
+        if (key not in EXPECTED or r.get("side")!="SELL"
+            or r.get("strategy_owner")!="US_STANDARD"
+            or int(r.get("requested_qty") or -1)!=EXPECTED.get(key,(-1,False))[0]):
+            continue
+        if key in bysymbol:
+            raise RuntimeError(f"POST_REPAIR_ACTION_IDENTITY_COLLISION_{key[1]}")
+        bysymbol[key]=r
     if len(bysymbol)!=13:
         raise RuntimeError("POST_REPAIR_ACTION_SET_INCOMPLETE")
     result=[]
@@ -242,8 +277,11 @@ def main(argv=None):
         return 0
     provider=USDataProvider(env="practice",offline=False)
     if provider._offline:raise RuntimeError("KIS_HTTP_UNAVAILABLE")
-    proof,verified=preflight(provider,engine,scope)
-    print(json.dumps({"mode":"PRE_APPLY_KIS_EVIDENCE","verified_count":len(verified),
+    proof,verified,already=preflight(provider,engine,scope)
+    print(json.dumps({"mode":"PRE_APPLY_KIS_EVIDENCE",
+                      "verified_count":len(verified)+already,
+                      "already_settled_count":already,
+                      "pending_actual_promotion_count":len(verified),
                       "actions":proof},sort_keys=True),flush=True)
     if not a.apply:
         print(json.dumps({"mode":"AUDIT_ONLY","database_mutated":False}))
