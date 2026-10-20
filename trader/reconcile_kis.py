@@ -1385,7 +1385,7 @@ def _restore_entry_meta_for_promoted_positions(
     return restored_count
 
 
-def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None) -> dict[str, object]:
+def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False) -> dict[str, object]:
     env = ctx.env
     env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
     reconcile_run_id = _resolve_reconcile_run_id(
@@ -1399,7 +1399,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
     today = (trade_date or now_kst().date()).strftime("%Y%m%d")
     degraded_reason: str | None = None
     try:
-        resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
+        if require_authoritative:
+            # Complete pagination is required for a replay claiming to repair
+            # missing KIS SELL economics. A partial page/HTTP timeout is never
+            # proof that an order did not fill; retain its unresolved fence.
+            from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
+            resp = _daily_ccld_all_pages_for_date(
+                kis, trade_date or now_kst().date(),
+            )
+        else:
+            resp = kis.inquire_daily_ccld(start_date=today, end_date=today)
     except KisTemporaryError as exc:
         logger.warning("[RECONCILE][DEGRADED] temporary error: %s", exc)
         degraded_reason = "temporary"
@@ -1407,6 +1416,13 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
     if not isinstance(resp, dict):
         degraded_reason = degraded_reason or "invalid_response"
         resp = {"output1": [], "output2": []}
+    if require_authoritative and (
+        str(resp.get("rt_cd") or "") != "0"
+        or not resp.get("_sep29_complete")
+        or resp.get("_diag_stub")
+        or resp.get("_ccld_status")
+    ):
+        raise RuntimeError("KR_KIS_EXECUTION_EVIDENCE_NOT_AUTHORITATIVE")
     # KIS domestic daily-ccld contract: output1 contains order/execution rows.
     # output2 is an aggregate summary and must never be promoted into an order.
     rows = resp.get("output1") or []
