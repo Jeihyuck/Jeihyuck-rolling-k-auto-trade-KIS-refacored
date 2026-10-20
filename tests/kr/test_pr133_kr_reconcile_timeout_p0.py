@@ -203,7 +203,7 @@ def test_daily_ccld_preserves_original_buy_request_and_applies_position_once():
                     "ccld_prc": "9555.507",
                     "ccld_no": "EXEC-293490-1",
                     "ord_stat_cd": "FILLED",
-                    "ord_dt": "20260918",
+                    "ord_dt": now_kst().strftime("%Y%m%d"),
                     "ord_tmd": "093200",
                 }],
                 "output2": [],
