@@ -10,7 +10,14 @@ on:
       - "scripts/us243_verified_sell_recovery.py"
       - "tests/us/test_us_kis_original_day_evidence_20261020.py"
       - "tests/us/test_us_kis_broker_order_date_bridge_20261013.py"
+      - "tests/us/test_us243_broker_evidence_ci_isolation.py"
   workflow_dispatch:
+    inputs:
+      run_live_kis_audit:
+        description: "Explicitly run a GET-only authenticated practice KIS historical audit (network may fail)"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,13 +27,69 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  kis-original-day-evidence:
-    # Same-repository, exact intended PR only. Never run credentials for forked PRs.
+  kis-evidence-contract-offline:
+    # The PR gate must be deterministic. No secrets, KIS credentials, tokenP,
+    # Supabase database connection or external broker traffic in this job.
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.number == 243 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'fix/us-20261020-execution-recovery'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: "."
+      KIS_ENV: "practice"
+      DRY_RUN: "1"
+      US_KIS_ORDER_ALLOWED: "0"
+      US_ORDER_ARMED: "0"
+      ALLOW_REAL_ORDER: "0"
+      KIS_HTTP_BLOCK: "1"
+      US_OFFLINE_MODE: "1"
+      OFFLINE_MODE: "1"
+      PBCORE_DB_URL: ""
+      DATABASE_URL: ""
+      KIS_APP_KEY: ""
+      KIS_APP_SECRET: ""
+      CANO: ""
+    steps:
+      - name: Checkout exact PR source without persisting credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install offline test dependencies
+        run: |
+          python -m pip install -r requirements.txt pytest
+      - name: Check broker-proof and no-write invariants without KIS network
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/us/test_us_kis_original_day_evidence_20261020.py \
+            tests/us/test_us_kis_broker_order_date_bridge_20261013.py \
+            tests/us/test_us_recovery_gha_safety_contract_20261020.py \
+            tests/us/test_us243_broker_evidence_ci_isolation.py
+      - name: Report explicit evidence boundary
+        run: |
+          echo "[US243][PR_GATE] OFFLINE_CONTRACT_PASS does not mean authenticated KIS GET succeeded"
+          echo "[US243][PR_GATE] Prior proven seven fills stay authoritative; six active claims remain fenced"
+          echo "[US243][PR_GATE] Explicit workflow_dispatch(run_live_kis_audit=true) required for new broker observations"
+
+  kis-original-day-evidence:
+    # The historical broker repair has already completed. Reissuing tokenP
+    # for every PR commit caused transient CI failures and KIS throttling.
+    # An actual network check now REQUIRES the operator to opt in explicitly.
+    # Only the original repository's exact recovery branch may use secrets.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.run_live_kis_audit == true &&
+      github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored' &&
+      github.ref == 'refs/heads/fix/us-20261020-execution-recovery'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
