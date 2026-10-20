@@ -298,3 +298,39 @@ def test_kis_practice_official_ccld_default_is_not_legacy():
     s = Path("trader/kis_wrapper.py").read_text(encoding="utf-8")
     assert 'KIS_TR_ID_DAILY_CCLD", "VTTC0081R"' in s
     assert 'params["EXCG_ID_DVSN_CD"] = exchange_scope_override or "ALL"' in s
+
+
+def test_kr244_official_kis_cumulative_sell_economics_without_individual_fill():
+    from scripts.kr244_kis_readonly_probe import evaluate_broker_sell_evidence
+    from datetime import date
+    common = {
+        "ord_dt": "20261020", "pdno": "036540", "odno": "0000004318",
+        "sll_buy_dvsn_cd": "01",
+        "tot_ccld_qty": "140", "tot_ccld_amt": "1272600",
+        "avg_prvs": "9090", "ord_qty": "140", "ord_unpr": "9200",
+    }
+    expected = {"036540": ("0000004318", 140)}
+    good = evaluate_broker_sell_evidence([common, common], date(2026,10,20), expected)
+    assert good["orders_verified"] == 1
+    assert good["results"][0]["priced_execution_qty"] == 140
+    assert good["results"][0]["weighted_execution_price"] == 9090
+    assert good["results"][0]["evidence"] == "KIS_CUMULATIVE_QTY_AMOUNT_AVG_PROVEN"
+
+    invalids = [
+        {**common, "tot_ccld_qty": "0"},
+        {**common, "tot_ccld_amt": "0"},
+        {**common, "avg_prvs": "0"},
+        {**common, "tot_ccld_amt": "200000"},
+        {**common, "tot_ccld_qty": "150"},
+        {**common, "sll_buy_dvsn_cd": "02"},
+        {**common, "ord_dt": "20261019"},
+        {**common, "odno": "0000004319"},
+    ]
+    for bad in invalids:
+        result = evaluate_broker_sell_evidence([bad], date(2026,10,20), expected)
+        assert result["orders_verified"] == 0
+    partial = evaluate_broker_sell_evidence([
+        {**common, "tot_ccld_qty": "70", "tot_ccld_amt": "636300"}
+    ], date(2026,10,20), expected)
+    assert partial["orders_verified"] == 0
+    assert partial["results"][0]["priced_execution_qty"] == 70
