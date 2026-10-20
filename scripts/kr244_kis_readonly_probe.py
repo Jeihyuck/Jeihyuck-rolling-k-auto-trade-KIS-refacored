@@ -123,17 +123,23 @@ def diagnose_empty_kr_ccld_readonly(client: Any, trade_date: date) -> list[dict[
         "INQR_DVSN_1": "", "ORD_GNO_BRNO": "", "ODNO": "",
         "SORT_SQN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
     }
+    # KIS official 2025+ sample uses VTTC0081R for practice recent
+    # executions while this repository currently defaults to VTTC8001R.
+    # Diagnose the mismatch before changing any production KIS behavior.
     variants = [
-        ("ascending", {"INQR_DVSN": "01"}),
-        ("sell_only", {"SLL_BUY_DVSN_CD": "01"}),
-        ("exact_order", {"SLL_BUY_DVSN_CD": "01", "PDNO": "036540", "ODNO": "0000004318"}),
+        ("official_recent_krx", {"EXCG_ID_DVSN_CD": "KRX"}, "VTTC0081R"),
+        ("official_recent_all", {"EXCG_ID_DVSN_CD": "ALL"}, "VTTC0081R"),
+        ("legacy_ascending", {"INQR_DVSN": "01"}, tr_ids[0]),
+        ("legacy_exact", {"SLL_BUY_DVSN_CD": "01", "PDNO": "036540", "ODNO": "0000004318"}, tr_ids[0]),
     ]
     report = []
-    for name, overrides in variants:
+    import time
+    for name, overrides, tr_id in variants:
+        time.sleep(0.40)
         try:
             response = client.session.request(
                 "GET", url, params={**params, **overrides},
-                headers=client._headers(tr_ids[0]), timeout=(3.0, 7.0),
+                headers=client._headers(tr_id), timeout=(3.0, 7.0),
             )
             data = response.json() if response.ok else {}
             rows = data.get("output1") if isinstance(data, dict) else []
