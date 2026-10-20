@@ -103,7 +103,9 @@ def test_close_submit_then_reconcile_only_with_broker_evidence_contract():
 def test_buyable_dedupe_bulk_guard_preserves_fallback():
     source = Path("trader/pb1_engine.py").read_text(encoding="utf-8")
     assert 'with self._stage_timer("entry.prior_intents_bulk_lookup")' in source
-    assert 'bulk_prior_intents_enabled and str(cf.client_order_key) in prior_intent_keys' in source
+    assert 'if bulk_prior_intents_enabled:' in source
+    assert 'if str(cf.client_order_key) in prior_intent_keys:' in source
+    assert 'late_rows = self.orders_repo.list_orders_by_client_order_keys(' in source
     assert 'self.orders_repo.get_order_by_client_order_key(' in source
 
 
