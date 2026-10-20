@@ -5,3 +5,5 @@ Do NOT submit any KIS broker order. Do not modify schedules or strategy paramete
 Preflight pytest and all-KIS-evidence checks must pass before any database mutation.
 After restoring, verify 11 FILLED orders and distinct priced cumulative fills and zero matching open positions.
 This signal is transient; delete after execution result is recorded in PR.
+
+Rearmed once after aligned historical replay test assertion; no scope expansion.
