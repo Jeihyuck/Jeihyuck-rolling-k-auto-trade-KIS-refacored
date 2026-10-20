@@ -252,7 +252,8 @@ def test_kr244_reconcile_today_strict_pagination_contract():
     close_source = Path("trader/pb1_runner.py").read_text(encoding="utf-8")
     replay_source = Path("scripts/kr244_reconcile_day.py").read_text(encoding="utf-8")
     assert "reconcile_today(engine=engine, kis=kis, ctx=post_ctx, require_authoritative=True)" in close_source
-    assert "ctx=ctx, trade_date=trade_date, require_authoritative=True" in replay_source
+    assert "trade_date=trade_date, require_authoritative=True" in replay_source
+    assert "strict_sell_targets=EXPECTED_OCT20_SELLS" in replay_source
 
 
 def test_kis_practice_ccld_uses_verified_official_tr_and_all_exchange(monkeypatch):
