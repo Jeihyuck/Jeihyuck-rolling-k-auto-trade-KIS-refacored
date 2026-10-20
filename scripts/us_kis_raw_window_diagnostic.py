@@ -89,8 +89,20 @@ def explain_source_window(row, journal, raw_rows, strict_rows, *, verified_scope
     cum_qty = sorted({str(r.get("filled_qty")) for r in combined})
     same_qty = any(str(r.get("requested_qty")) == str(row.get("requested_qty"))
                    for r in combined)
+    source_dates = sorted({str(r.get("source_timestamp_date") or "") for r in combined})
+    source_kst_clocks = sorted({str(r.get("source_timestamp_time") or "") for r in combined})
+    derived_us_dates = sorted({str(r.get("us_trade_date") or "") for r in combined})
+    fill_prices = sorted({
+        float(r.get("avg_price"))
+        for r in combined
+        if r.get("avg_price") is not None and float(r.get("avg_price")) > 0
+    })
     return {
         **base,
+        "source_kis_order_dates": source_dates,
+        "source_kis_order_clock_kst": source_kst_clocks,
+        "derived_kst_to_us_dates": derived_us_dates,
+        "broker_verified_fill_price_candidates": fill_prices[:4],
         "source_window_broker_number_found": bool(candidates),
         "source_window_symbol_side_identity": bool(combined),
         "source_window_qty_match": same_qty,
