@@ -85,6 +85,23 @@ jobs:
           python -m pytest -q \
             tests/us/test_us_kis_original_day_evidence_20261020.py \
             tests/us/test_us_recovery_gha_safety_contract_20261020.py
+      - name: Independent raw KIS two-day source window bridge diagnostic (GET ONLY)
+        run: |
+          set -euo pipefail
+          python scripts/us_kis_raw_window_diagnostic.py \
+            --from-date 2026-10-01 --to-date 2026-10-20 \
+            > us243-kis-source-window.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          doc=json.loads(Path("us243-kis-source-window.json").read_text(encoding="utf-8"))
+          print("[US243][RAW_WINDOW] claims",doc["claim_count"],
+                "excluded_with_order_identity",doc["excluded_with_same_original_order"],
+                "source_window_broker_numbers_present",doc["source_window_order_number_found"])
+          for r in doc["results"]:
+              print("[US243][RAW_WINDOW][ROW]",r["day"],r["symbol"],r["side"],
+                    r["reason"],"same_qty",r["source_window_qty_match"])
+          PY
       - name: Authenticated historical KIS GET and scoped PostgreSQL READ ONLY
         run: |
           set -uo pipefail
@@ -117,6 +134,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: us243-kis-original-day-practice-readonly-${{ github.run_id }}
-          path: us243-kis-original-day-audit.json
+          path: |
+            us243-kis-original-day-audit.json
+            us243-kis-source-window.json
           retention-days: 3
           if-no-files-found: ignore
