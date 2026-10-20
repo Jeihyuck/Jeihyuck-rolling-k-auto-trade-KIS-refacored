@@ -7,6 +7,9 @@ on:
       - "trader/pb1_engine.py"
       - "trader/pb1_runner.py"
       - "trader/db/repos.py"
+      - "trader/db/engine.py"
+      - "tests/kr/test_kr_20261019_prebroker_claim_recovery.py"
+      - "scripts/kr244_proven_prehttp_claim_recovery.py"
       - "trader/reconcile_kis.py"
       - "trader/kr/unpriced_sell_audit.py"
       - "tests/kr/test_kr_20261020_bulk_dedupe_postsubmit_reconcile.py"
@@ -40,6 +43,6 @@ jobs:
           python -m pip install pytest
       - name: Compile changed modules
         run: |
-          python -m py_compile trader/db/repos.py trader/pb1_engine.py trader/pb1_runner.py trader/reconcile_kis.py trader/kr/unpriced_sell_audit.py scripts/kr244_reconcile_day.py
+          python -m py_compile trader/db/engine.py trader/db/repos.py scripts/kr244_proven_prehttp_claim_recovery.py trader/pb1_engine.py trader/pb1_runner.py trader/reconcile_kis.py trader/kr/unpriced_sell_audit.py scripts/kr244_reconcile_day.py
       - name: Run isolated SQLite and source-path regressions
-        run: python -m pytest -q tests/kr/test_kr_20261020_bulk_dedupe_postsubmit_reconcile.py
+        run: python -m pytest -q tests/kr/test_kr_20261020_bulk_dedupe_postsubmit_reconcile.py tests/kr/test_kr_20261019_prebroker_claim_recovery.py
