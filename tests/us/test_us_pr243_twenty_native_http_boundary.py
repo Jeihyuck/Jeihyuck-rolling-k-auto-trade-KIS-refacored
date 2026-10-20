@@ -49,6 +49,23 @@ def test_pr243_twenty_native_sell_http_and_generated_buy(monkeypatch, tmp_path):
     events=[]
     client = _native_kis_client(monkeypatch, events)
     client._base_url = "https://openapivts.koreainvestment.com:29443"
+    # Native SELL fresh KIS balance logic stays active, but its input is a
+    # fixed account-scoped mocked broker snapshot, never actual HTTP. Route
+    # selection cannot silently fall back to an unavailable live account.
+    broker_snapshot = {"positions": [
+        {"symbol":f"SIM_PROTECT_{idx:02d}", "exchange":"NASDAQ",
+         "qty":1, "holding_qty":1, "orderable_qty":1,
+         "currency":"USD", "avg_price":10.0}
+        for idx in range(20)
+    ]}
+    monkeypatch.setattr(client,"get_us_balance",lambda force_refresh=True: broker_snapshot)
+    monkeypatch.setattr(
+        "trader.us.data_provider.normalize_us_balance",
+        lambda snapshot: snapshot,
+    )
+    def deny_unmocked_http(*_args,**_kwargs):
+        raise AssertionError("No real KIS GET permitted in mocked-HTTP endurance")
+    monkeypatch.setattr(requests,"get",deny_unmocked_http)
 
     def fake_http(url, headers, json, timeout):
         assert url.startswith("https://openapivts.koreainvestment.com:29443/")
