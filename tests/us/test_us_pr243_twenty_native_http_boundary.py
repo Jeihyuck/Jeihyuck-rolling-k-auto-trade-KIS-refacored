@@ -73,6 +73,7 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
         assert "/trading/order" in url
         assert timeout > 0
         # This is a stubbed HTTP response, never a real broker ACK/fill.
+        events.append("HTTP")
         events.append("INTERCEPTED_POST")
         class Response:
             def raise_for_status(self): pass
