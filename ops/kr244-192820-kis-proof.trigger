@@ -1,0 +1,1 @@
+Original date 2026-10-19, practice account read-only query, exact BUY 192820/251970, no orders, no DB writes.
