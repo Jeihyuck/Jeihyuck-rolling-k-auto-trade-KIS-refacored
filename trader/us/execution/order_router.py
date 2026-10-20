@@ -698,6 +698,20 @@ def _semantic_action_instance(
         return trade_date.isoformat()
     if side != "SELL":
         return None
+    # Preserve the existing US_STANDARD trailing partial-sell philosophy:
+    # after an ACTUAL fill reduces the held quantity, the next partial trim
+    # must be a distinct economic tranche. The pre-order position quantity
+    # is invariant while an earlier submission remains unresolved or fails
+    # before HTTP, unlike fluctuating price/ratio explanation strings.
+    if owner == "US_STANDARD" and action.strip().upper() == "TRAILING_STOP":
+        try:
+            held = int(intent.get("holding_qty") or
+                       meta.get("pre_order_holding_qty") or 0)
+            requested = int(intent.get("qty") or 0)
+        except (TypeError, ValueError, OverflowError):
+            held, requested = 0, 0
+        if held > 0 and 0 < requested < held:
+            return f"PRE_HOLDING_QTY:{held}"
     labels = {
         str(value or "").strip().upper()
         for value in (
