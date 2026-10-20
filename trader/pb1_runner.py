@@ -6078,6 +6078,24 @@ def run_once(
                     type(exc).__name__,
                     exc_info=True,
                 )
+        if accepted_policy_sells:
+            try:
+                from trader.kr.unpriced_sell_audit import audit_kr_pending_sell_orders
+                pending = audit_kr_pending_sell_orders(
+                    engine, env=env_effective, trade_date=now_kst().date(),
+                )
+                logger.warning(
+                    "[KR_CLOSE][SELL_EVIDENCE_QUEUE] unsettled=%s missing_order_no=%s "
+                    "missing_broker_price=%s action=NO_RETRY_WAIT_EXACT_KIS_PROOF",
+                    pending["unsettled_sell_count"],
+                    pending["missing_order_number_count"],
+                    pending["missing_broker_price_count"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[KR_CLOSE][SELL_EVIDENCE_QUEUE][READ_FAIL] err_type=%s "
+                    "action=RETAIN_PENDING_NO_RETRY", type(exc).__name__,
+                )
         return [], True, {
             "buy_orders": 0,
             "sell_orders": accepted_policy_sells,
