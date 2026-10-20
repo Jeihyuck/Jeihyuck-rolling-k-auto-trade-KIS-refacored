@@ -133,3 +133,62 @@ def test_explicit_profit_stage_and_tqqq_owner_remain_independent(monkeypatch):
     standard=action("US_STANDARD","TRAILING_STOP")
     assert len({tp1.action_key,tp2.action_key,tqqq.action_key,standard.action_key})==4
     assert tqqq.action=="floating=0.50"
+
+
+def test_oct19_real_route_refuses_duplicate_when_trailing_ratio_changes(monkeypatch):
+    from trader.us.execution.order_router import route_order
+    from tests.us.test_us_route_order_claim_boundary import _route_fixture, _intent
+    _db,claims,broker=_route_fixture(
+        monkeypatch, fail_submit=True,production_identity=True,
+    )
+    def make(prose):
+        i=_intent(
+            "2026-10-19",side="SELL",
+            action="TRAILING_STOP",
+            client_order_key="oct19-meta-stable-client-key",
+        )
+        i.update({
+            "symbol":"META","position_lifecycle_id":"1ebcff3e982d4e099002056c",
+            "reason":prose,"exit_family":"TRAILING_STOP",
+            "meta":{"reason":prose,"exit_family":"TRAILING_STOP"},
+        })
+        return i
+    first=route_order(
+        make("MAX_PROFIT=0.044 TRAIL_PCT=0.080 > 0.05"),kis_client=broker,
+    )
+    second=route_order(
+        make("MAX_PROFIT=0.044 TRAIL_PCT=0.091 > 0.05"),kis_client=broker,
+    )
+    assert first["status"]=="BROKER_SUBMIT_RESULT_UNKNOWN",first
+    assert second["status"]=="ORDER_FENCED_UNRESOLVED_ACTION",second
+    assert broker.calls==1
+    assert claims.health()["unresolved_execution_actions"]==1
+
+
+def test_original_pre_io_failure_releases_only_that_attempt_and_can_retry(monkeypatch):
+    from trader.us.execution.order_router import route_order
+    from tests.us.test_us_route_order_claim_boundary import _route_fixture, _intent
+    _db,claims,broker=_route_fixture(monkeypatch,production_identity=True)
+    broker.fail_before_submit=True
+    intent=_intent(
+        "2026-10-19",side="SELL",action="TRAILING_STOP",
+        client_order_key="oct19-pre-io-retry",
+    )
+    intent.update({
+        "symbol":"META","position_lifecycle_id":"meta-life",
+        "exit_family":"TRAILING_STOP",
+        "reason":"MAX_PROFIT=0.044 TRAIL_PCT=0.081 > 0.05",
+    })
+    pre=route_order(intent,kis_client=broker)
+    assert pre["status"] in (
+        "BROKER_SUBMIT_PRE_IO_FAILED",
+        "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED",
+    ),pre
+    assert claims.health()["unresolved_execution_actions"]==0
+    broker.fail_before_submit=False
+    next_intent=dict(intent)
+    next_intent["meta"]=dict(intent.get("meta") or {})
+    next_intent["reason"]="MAX_PROFIT=0.044 TRAIL_PCT=0.084 > 0.05"
+    again=route_order(next_intent,kis_client=broker)
+    assert again["status"]=="ACK",again
+    assert claims.health()["unresolved_execution_actions"]==1
