@@ -21,6 +21,83 @@ from trader.kr.unpriced_sell_audit import audit_kr_pending_sell_orders
 from trader.time_utils import now_kst
 
 
+
+def verify_exact_oct20_sell_restoration(engine, targets: dict[str, tuple[str, int]]) -> dict:
+    """Fail closed until each proven KIS cumulative SELL has a priced DB fill.
+
+    This validates durable source order, exact lifecycle and broker-fill ID.
+    It never writes or attempts a broker order.
+    """
+    import sqlalchemy as sa
+    from trader.db.repos import OrdersRepo
+    from trader.db.schema import schema_for_engine, uuid_value_for_url
+
+    schema = schema_for_engine(engine)
+    repo = OrdersRepo(engine)
+    incomplete = []
+    verified = 0
+    for code, (odno, requested_qty) in targets.items():
+        order = repo.get_order_by_kis_odno_scoped(
+            "practice", odno, trade_date=date(2026, 10, 20),
+            code=code, side="SELL",
+        )
+        if not order:
+            incomplete.append((code, "ORIGINAL_ORDER_MISSING"))
+            continue
+        if str(order.get("status") or "") != "FILLED":
+            incomplete.append((code, "ORDER_NOT_FILLED"))
+            continue
+        resp = order.get("response_json") or {}
+        if isinstance(resp, str):
+            resp = json.loads(resp)
+        if (
+            int(resp.get("confirmed_fill_qty") or 0) != requested_qty
+            or float(resp.get("confirmed_fill_notional") or 0) <= 0
+            or float(resp.get("confirmed_fill_price") or 0) <= 0
+        ):
+            incomplete.append((code, "ORDER_PRICING_NOT_CONFIRMED"))
+            continue
+        with engine.connect() as conn:
+            fill_rows = conn.execute(sa.select(
+                schema.fills.c.qty, schema.fills.c.price, schema.fills.c.fill_meta_json,
+            ).where(sa.and_(
+                schema.fills.c.env == "practice",
+                schema.fills.c.order_id ==
+                uuid_value_for_url(str(engine.url), str(order["order_id"])),
+                schema.fills.c.side == "SELL",
+            ))).mappings().all()
+            pos = conn.execute(sa.select(
+                schema.positions.c.qty, schema.positions.c.status,
+                schema.positions.c.position_cycle_id,
+            ).where(sa.and_(
+                schema.positions.c.env == "practice",
+                schema.positions.c.code == code,
+                schema.positions.c.strategy == order["strategy"],
+                schema.positions.c.position_cycle_id == order["position_cycle_id"],
+                schema.positions.c.portfolio_epoch_id == order["portfolio_epoch_id"],
+            ))).mappings().first()
+        relevant = []
+        for fill in fill_rows:
+            meta = fill["fill_meta_json"] or {}
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            if meta.get("fill_source") == "daily_ccld_order_cumulative":
+                relevant.append(fill)
+        if sum(int(x["qty"]) for x in relevant) != requested_qty or any(
+            float(x["price"] or 0) <= 0 for x in relevant
+        ):
+            incomplete.append((code, "EXACT_CUMULATIVE_FILL_MISSING"))
+        elif not pos or int(pos.get("qty") or 0) != 0 or pos.get("status") != "CLOSED":
+            incomplete.append((code, "POSITION_QTY_NOT_RECONCILED"))
+        else:
+            verified += 1
+    return {
+        "expected": len(targets),
+        "fully_restored": verified,
+        "unresolved": incomplete,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="KR practice exact-order SELL reconciliation")
     parser.add_argument("--env", choices=("practice", "real"), required=True)
@@ -74,8 +151,17 @@ def main(argv: list[str] | None = None) -> int:
                 strict_sell_targets=EXPECTED_OCT20_SELLS,
             )
             after = audit_kr_pending_sell_orders(engine, env=args.env, trade_date=trade_date)
-            result = {"before": before, "broker_reconciliation": evidence, "after": after,
-                      "mode": "APPLY_KIS_EXECUTION_EVIDENCE_ONLY"}
+            verification = verify_exact_oct20_sell_restoration(
+                engine, EXPECTED_OCT20_SELLS,
+            )
+            result = {
+                "before": before, "broker_reconciliation": evidence,
+                "after": after, "verification": verification,
+                "mode": "APPLY_KIS_EXECUTION_EVIDENCE_ONLY",
+            }
+            if verification["fully_restored"] != verification["expected"]:
+                print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+                raise RuntimeError("KR244_11_SELLS_NOT_FULLY_RESTORED")
         print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
         return 0
     finally:
