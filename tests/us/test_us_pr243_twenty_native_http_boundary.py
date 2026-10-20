@@ -100,6 +100,11 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
             "2026-10-20","am","pr243-20-boundaries",1,f"sim-tick-{ix}",
             deadline=time.monotonic()+30,
         )
+        # The merge selects exact signal evidence by *source intent object*.
+        # Preloading only a symbol timestamp is insufficient and would make
+        # the test silently use a first-candidate surrogate instead.
+        context._sell_selected_ready_by_identity={id(intent):ready}
+        context._sell_signal_id_by_identity={id(intent):f"signal-{ix}"}
         context._sell_selected_ready_by_symbol={symbol:ready}
         context._sell_signal_ready_by_symbol={symbol:ready}
         context._sell_selected_trace_id_by_symbol={symbol:f"signal-{ix}"}
