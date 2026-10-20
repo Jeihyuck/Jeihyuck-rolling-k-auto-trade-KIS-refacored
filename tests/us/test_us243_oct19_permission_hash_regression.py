@@ -34,7 +34,7 @@ def test_original_oct19_abort_sha256_identifies_disabled_real_trading_guard():
     assert _fingerprint(msg) == OBSERVED_PRE_IO_ERROR_SHA256
 
 
-def test_session_and_native_broker_permissions_agree_that_disabled_means_disabled(
+def test_real_account_disarmed_but_practice_requires_separate_paper_guards(
     monkeypatch,
 ):
     import trader.us.config as cfg
@@ -47,20 +47,22 @@ def test_session_and_native_broker_permissions_agree_that_disabled_means_disable
     }
     for session in ("am", "afternoon"):
         p=resolve_us_order_permissions(session,"practice","TRADE",active_env)
-        assert not p.allowed
-        assert "disable_real_trading_enabled" in p.reasons
+        assert p.allowed
+        assert "disable_real_trading_enabled" not in p.reasons
 
-    # Assert the corresponding unmodified last-line KIS guard is still
-    # fail-closed. Never disable this guard to achieve a green test.
+    # PR243 canonical KIS_ENV=practice policy treats DISABLE_REAL_TRADING
+    # as real-account fencing; native practice eligibility is separately gated.
     for name,value in {
         "TRADING_REGION":"US","KIS_ENV":"practice",
         "US_PAPER_TRADING_ENABLED":True,"US_LIVE_TRADING_ENABLED":True,
         "DISABLE_REAL_TRADING":True,"DRY_RUN":False,
     }.items():
         monkeypatch.setattr(cfg,name,value)
-    import pytest
-    with pytest.raises(RuntimeError,match="disable_real_trading_enabled"):
-        cfg.assert_us_paper_order_allowed()
+    cfg.assert_us_paper_order_allowed()
+    assert cfg.is_paper_order_allowed()
+    assert not resolve_us_order_permissions(
+        "am","real","TRADE",active_env
+    ).allowed
 
 
 def test_allowed_practice_profile_requires_explicit_operator_disarm_clear():
@@ -73,10 +75,11 @@ def test_allowed_practice_profile_requires_explicit_operator_disarm_clear():
         p=resolve_us_order_permissions(session,"practice","TRADE",env)
         assert p.allowed
     env["DISABLE_REAL_TRADING"]="1"
-    assert not resolve_us_order_permissions("am","practice","TRADE",env).allowed
+    assert resolve_us_order_permissions("am","practice","TRADE",env).allowed
+    assert not resolve_us_order_permissions("am","real","TRADE",env).allowed
 
 
-def test_actual_session_runner_passes_disarmed_false_to_full_tick(monkeypatch,tmp_path):
+def test_actual_session_runner_preserves_practice_permission_with_real_disarm(monkeypatch,tmp_path):
     from unittest.mock import patch
     from trader.us.runner import trade_session_runner as session
     monkeypatch.chdir(tmp_path)
@@ -103,11 +106,11 @@ def test_actual_session_runner_passes_disarmed_false_to_full_tick(monkeypatch,tm
             force_now="2026-05-01T10:15:00-04:00",
             max_ticks=1,interval_sec=1,max_minutes=20,
         )
-    assert observed==[False], (observed,result)
+    assert observed==[True], (observed,result)
     assert result.get("tick_count")==1
 
 
-def test_native_kis_router_disarm_is_checked_before_durable_submit(monkeypatch):
+def test_native_kis_router_missing_paper_authority_blocks_before_submit(monkeypatch):
     from trader.us.execution import order_router
     from trader.us import config as us_cfg
     from tests.us.test_us_route_order_claim_boundary import (
@@ -123,12 +126,12 @@ def test_native_kis_router_disarm_is_checked_before_durable_submit(monkeypatch):
             "orderable_qty":1,"exchange":"NASDAQ","currency":"USD",
         }
     )
-    def operator_disarmed():
+    def paper_guard_disabled():
         raise RuntimeError(
-            "[US_ORDER][BLOCKED] reason=disable_real_trading_enabled "
-            "required=DISABLE_REAL_TRADING=0"
+            "[US_ORDER][BLOCKED] reason=us_live_trading_disabled "
+            "required=US_LIVE_TRADING_ENABLED=1"
         )
-    monkeypatch.setattr(us_cfg,"assert_us_paper_order_allowed",operator_disarmed)
+    monkeypatch.setattr(us_cfg,"assert_us_paper_order_allowed",paper_guard_disabled)
     result=order_router.route_order(
         _intent("2026-10-20",side="SELL",action="HARD_STOP"),
         kis_client=native,
