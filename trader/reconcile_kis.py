@@ -1434,6 +1434,16 @@ def _verified_kr_cumulative_sell_evidence(
     avg = total / Decimal(actual)
     if not avg.is_finite() or avg <= 0:
         return None
+    # KIS publishes both executed total and avg_prvs. A contradictory
+    # monetary pair is not authoritative economic evidence.
+    try:
+        broker_avg = Decimal(str(row.get("avg_prvs") or ""))
+    except (InvalidOperation, ValueError):
+        return None
+    if not broker_avg.is_finite() or broker_avg <= 0:
+        return None
+    if abs(avg - broker_avg) > max(Decimal("1"), broker_avg * Decimal("0.001")):
+        return None
     # Scope this aggregate fill identifier to account/date/order/symbol.
     # It is a deterministic database evidence key, NOT a KIS trade number.
     account_scope = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
