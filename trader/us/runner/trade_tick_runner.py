@@ -1562,14 +1562,15 @@ def route_exit_orders_immediately(
                 # outcome; releasing it here could submit the same TP twice.
                 submit_may_have_happened = True
                 try:
-                    from trader.us.execution.order_journal import load_order_events
+                    from trader.us.execution.order_journal import (
+                        broker_submission_possible_for_client_key,
+                        load_order_events,
+                    )
                     td = str(intent.get("trade_date") or getattr(context, "trade_date", ""))
                     key = str(intent.get("client_order_key") or "")
                     events = load_order_events(td)
-                    submit_may_have_happened = any(
-                        str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
-                        and str(event.get("client_order_key") or "") == key
-                        for event in events
+                    submit_may_have_happened = broker_submission_possible_for_client_key(
+                        events, key
                     )
                 except Exception as journal_exc:
                     logger.error(
