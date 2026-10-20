@@ -318,7 +318,7 @@ def test_authentic_oct20_kis_source_contract_replay_seven_actual_six_open_restar
     assert first["broker_full_fill_count"]==7, first
     assert first["broker_unknown_count"]+first["broker_unfilled_ack_count"]==6, first
     assert first["failed_count"]==0, first
-    remaining={r["symbol"] for r in claims.active_attempts()}
+    remaining={str(r["lifecycle_id"])[5:] for r in claims.active_attempts()}
     assert remaining=={"AMD","MRVL","MSFT","CL","KO","KR"},remaining
     actual=[f for f in repos._MEM_FILLS
             if not repos.is_synthetic_fill_meta(f["meta"])]
