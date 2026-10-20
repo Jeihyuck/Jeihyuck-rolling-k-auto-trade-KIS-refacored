@@ -8,6 +8,7 @@ on:
       - "scripts/us_kis_original_day_evidence.py"
       - "scripts/us_kis_raw_window_diagnostic.py"
       - "tests/us/test_us_kis_original_day_evidence_20261020.py"
+      - "tests/us/test_us_kis_broker_order_date_bridge_20261013.py"
   workflow_dispatch:
 
 permissions:
