@@ -1197,6 +1197,23 @@ def run_trade_session(
             and actual_is_trading_day
         )
         
+        # Check the same disarm contract that the native KIS POST enforces,
+        # before creating any BUY/SELL execution attempt. On 2026-10-19
+        # DISABLE_REAL_TRADING=1 was ignored by the session but rejected by
+        # KisUSClient, producing 86 PRE_IO aborts for META/TMO.
+        if kis_order_allowed:
+            from trader.us.execution.order_permissions import resolve_us_order_permissions
+            _us_permission = resolve_us_order_permissions(
+                session, env, resolved_run_mode, os.environ,
+            )
+            if not _us_permission.allowed:
+                kis_order_allowed = False
+                logger.error(
+                    "[US_SESSION][KIS_ORDER_PERMISSION_PRECHECK][BLOCK] "
+                    "session=%s env=%s reasons=%s "
+                    "action=NO_BROKER_SUBMIT_KEEP_OPERATOR_DISARM",
+                    session, env, ",".join(_us_permission.reasons),
+                )
         logger.info(
             "[US_SESSION][RUN_MODE] session=%s run_mode=%s signal_only=%s kis_order_allowed=%s",
             session, resolved_run_mode, int(resolved_signal_only), int(kis_order_allowed),
