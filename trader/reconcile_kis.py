@@ -1593,6 +1593,34 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 kis_odno,
             )
 
+        # Broker recent-history can supply an exact full-order cumulative
+        # quantity/amount WITHOUT any individual execution-id/price fields.
+        # Only a uniquely attributed SELL and a complete, positive broker
+        # executed notional may restore economic truth.
+        cumulative_sell_evidence = _verified_kr_cumulative_sell_evidence(
+            broker_row,
+            source_order=source_order,
+            side=side,
+            trade_date=order_time.date(),
+            kis_odno=kis_odno,
+            env=env,
+        )
+        if cumulative_sell_evidence is not None:
+            if _kr_source_has_individual_sell_fills(
+                fills_repo=fills_repo, source_order=source_order, env=env,
+            ):
+                logger.warning(
+                    "[RECONCILE][KIS_CUMULATIVE][INDIVIDUAL_FILLS_EXIST] code=%s action=KEEP_INDIVIDUAL_FILLS",
+                    code,
+                )
+                cumulative_sell_evidence = None
+            else:
+                status = "FILLED"
+                logger.info(
+                    "[RECONCILE][KIS_CUMULATIVE][VERIFIED] code=%s qty=%s "
+                    "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
+                    code, cumulative_sell_evidence["qty"], cumulative_sell_evidence["notional"],
+                )
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=reconcile_run_id,
@@ -1624,6 +1652,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         filled_qty = _to_int(_first_value(row, ["ccld_qty", "tot_ccld_qty", "filled_qty"]))
         filled_price = _to_float(_first_value(row, ["ccld_prc", "avg_prvs", "filled_price"]))
         trade_id = str(_first_value(row, ["ccld_no", "trade_id", "exec_id"]) or "") or None
+        if cumulative_sell_evidence is not None:
+            filled_qty = int(cumulative_sell_evidence["qty"])
+            filled_price = float(cumulative_sell_evidence["avg_price"])
+            trade_id = str(cumulative_sell_evidence["evidence_id"])
+        elif side == "SELL" and not trade_id:
+            # avg_prvs or a quote alone is not trustworthy economic truth.
+            # Keep any partial/zero-amount SELL unresolved until order-level
+            # notional proof or individual broker fills arrive.
+            filled_price = None
         applied_fill_ids = {
             str(item) for item in (source_response.get("applied_broker_fill_ids") or [])
             if str(item or "").strip()
@@ -1663,7 +1700,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             # The raw per-fill row can describe quantity already confirmed
             # through holdings; it must not inflate the execution claim.
             claim_filled_qty = next_confirmed_qty
-        if incremental_daily_qty > 0 and filled_price is not None:
+        if cumulative_sell_evidence is not None:
+            next_confirmed_notional = float(cumulative_sell_evidence["notional"])
+        elif incremental_daily_qty > 0 and filled_price is not None:
             next_confirmed_notional = (
                 previous_confirmed_notional
                 + float(filled_price) * float(incremental_daily_qty)
@@ -1693,8 +1732,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     ),
                     requested_qty=_to_int(source_order.get("qty")) or qty,
                     cumulative_qty=next_confirmed_qty,
-                    evidence_type="KIS_EXECUTION_ACTUAL",
-                    evidence_digest=f"daily_ccld:{trade_id}",
+                    evidence_type=(
+                        "KIS_EXECUTION_CUMULATIVE" if cumulative_sell_evidence
+                        else "KIS_EXECUTION_ACTUAL"
+                    ),
+                    evidence_digest=(
+                        f"daily_ccld_cumulative:{trade_id}" if cumulative_sell_evidence
+                        else f"daily_ccld:{trade_id}"
+                    ),
                     execution_price=filled_price,
                     execution_qty=int(filled_qty),
                 )
@@ -1771,7 +1816,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     "entry_exit_plan_source": request_json.get("entry_exit_plan_source") if isinstance(request_json, dict) else None,
                 },
                 fill_meta_json={
-                    "fill_source": "daily_ccld",
+                    "fill_source": (
+                        "daily_ccld_order_cumulative" if cumulative_sell_evidence
+                        else "daily_ccld"
+                    ),
+                    "evidence_kind": (
+                        "KIS_ORDER_CUMULATIVE_EXECUTION" if cumulative_sell_evidence
+                        else "KIS_INDIVIDUAL_EXECUTION"
+                    ),
+                    "has_broker_individual_trade_id": not bool(cumulative_sell_evidence),
                     "ccld_status": ccld_status,
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
@@ -1953,15 +2006,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             # order average or overwrite a confirmed cost with a guess.
             verified_cumulative_sell_price = None
             if side == "SELL" and source_order and next_confirmed_qty > 0:
+                if cumulative_sell_evidence is not None:
+                    verified_cumulative_sell_price = float(cumulative_sell_evidence["avg_price"])
                 # A single exact KIS execution for the whole broker-confirmed
                 # order is itself complete execution-price proof.
                 if (
-                    broker_cumulative_qty == next_confirmed_qty
+                    verified_cumulative_sell_price is None
+                    and broker_cumulative_qty == next_confirmed_qty
                     and filled_qty == next_confirmed_qty
                     and filled_price is not None and filled_price > 0
                 ):
                     verified_cumulative_sell_price = float(filled_price)
-                elif isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
+                elif verified_cumulative_sell_price is None and isinstance(getattr(fills_repo, "engine", None), sa.engine.Engine):
                     # For multiple partial executions, derive the weighted
                     # average from exact order-linked persisted broker fills.
                     # Test/diagnostic repositories without an engine cannot
@@ -2074,12 +2130,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     source_order.get("position_cycle_id"),
                     source_order.get("portfolio_epoch_id"),
                 )
-            if incremental_daily_qty > 0:
-                fill_count += 1
-                filled_codes.append(code)
+            if incremental_daily_qty > 0 or cumulative_sell_evidence is not None:
+                if incremental_daily_qty > 0:
+                    fill_count += 1
+                    filled_codes.append(code)
                 if trade_id:
                     applied_fill_ids.add(trade_id)
-                # Persist cumulative proof only after the position bridge succeeds.
+                # Persist actual KIS notional even if qty was already confirmed
+                # by a prior holdings-only observation (price-only recovery).
+                # Keep the historical strategy/position provenance unchanged.
                 orders_repo.upsert_reconciled_order(
                     env=env,
                     run_id=reconcile_run_id,
@@ -2102,6 +2161,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         **broker_row,
                         "confirmed_fill_qty": next_confirmed_qty,
                         "confirmed_fill_notional": next_confirmed_notional,
+                        "confirmed_fill_price": (
+                            float(cumulative_sell_evidence["avg_price"])
+                            if cumulative_sell_evidence else source_response.get("confirmed_fill_price")
+                        ),
+                        "broker_cumulative_evidence_type": (
+                            "KIS_ORDER_CUMULATIVE_EXECUTION"
+                            if cumulative_sell_evidence else source_response.get("broker_cumulative_evidence_type")
+                        ),
                         "applied_broker_fill_ids": sorted(applied_fill_ids),
                         "source_order_id": (source_order or {}).get("order_id"),
                         "source_client_order_key": (source_order or {}).get("client_order_key"),
