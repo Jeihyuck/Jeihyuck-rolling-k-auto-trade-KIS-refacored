@@ -278,4 +278,5 @@ def test_repeated_and_legacy_sell_logs_never_inflate_operational_p95(tmp_path):
     assert report["sell_duplicate_attempt_log_count"]==19
     assert report["sell_legacy_or_unattributed_log_count"]==1
     assert "INSUFFICIENT_DISTINCT_SELECTED_SELL_HTTP_SAMPLES" in report["reasons"]
-    assert "SELL_HTTP_SIGNAL_ATTRIBUTION_INTEGRITY_FAILED" in report["reasons"]
+    assert "SELL_HTTP_SIGNAL_ATTRIBUTION_INTEGRITY_FAILED" not in report["reasons"]
+    # Legacy timing is ignored; underpowered exact selected samples are fatal.
