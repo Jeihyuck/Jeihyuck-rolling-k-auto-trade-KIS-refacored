@@ -18775,6 +18775,31 @@ class PB1Engine:
                 prior = blocking_prior_by_code.get(code_key)
                 self._tick_db_cache[("today_fills", code_key, "BUY")] = list(today_buy_fill_by_code.get(code_key, []))
                 self._tick_db_cache[("blocking_order", code_key, "BUY", "PB1-CLOSE", self._today)] = (prior is not None, prior)
+            # 2026-10-20: Final30 was re-querying each client key inside
+            # entry.buyable_gate.finalize (~1s/stock on pooled Postgres).
+            # Snapshot all keys in ONE fail-closed DB read; the durable atomic
+            # execution claim still prevents races at broker submission.
+            prior_intent_keys = {
+                str(cf.client_order_key).strip()
+                for cf in ok_after_risk if str(cf.client_order_key or "").strip()
+            }
+            prior_intent_by_key: dict[str, dict[str, Any]] = {}
+            bulk_prior_intents_enabled = hasattr(
+                self.orders_repo, "list_orders_by_client_order_keys"
+            )
+            if bulk_prior_intents_enabled and prior_intent_keys:
+                with self._stage_timer("entry.prior_intents_bulk_lookup"):
+                    prior_intent_rows = self.orders_repo.list_orders_by_client_order_keys(
+                        self.env, prior_intent_keys,
+                    )
+                for row in prior_intent_rows:
+                    key = str((row or {}).get("client_order_key") or "").strip()
+                    if key and key not in prior_intent_by_key:
+                        prior_intent_by_key[key] = dict(row)
+                logger.info(
+                    "[PB1][DEDUP][BULK] requested=%s existing=%s fail_closed=1",
+                    len(prior_intent_keys), len(prior_intent_by_key),
+                )
             buyable_gate_context: dict[str, dict[str, Any]] = {}
             self._buyable_gate_context = buyable_gate_context
             today_buy_codes: set[str] = set()
@@ -19005,7 +19030,13 @@ class PB1Engine:
                             duplicate_intent_exists = False
                             duplicate_intent_status = ""
                             if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
-                                existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
+                                if bulk_prior_intents_enabled and str(cf.client_order_key) in prior_intent_keys:
+                                    existing_order = prior_intent_by_key.get(str(cf.client_order_key))
+                                else:
+                                    # Compatibility with stub repos / keys created after the snapshot.
+                                    existing_order = self.orders_repo.get_order_by_client_order_key(
+                                        self.env, cf.client_order_key,
+                                    )
                                 duplicate_intent_status = str((existing_order or {}).get("status") or "").upper()
                                 retryable_unsubmitted = bool(
                                     existing_order
