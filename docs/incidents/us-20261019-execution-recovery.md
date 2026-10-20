@@ -74,8 +74,17 @@ PYTHONPATH=. python scripts/run_pytest_no_network.py -q tests/kr tests/test_exec
 ```
 
 PostgreSQL tests requiring an actual server cannot pass in this network-denied
-local mode. Repository CI supplies the isolated PostgreSQL service. CI and
-WSL/KIS practice acceptance are separate results.
+local mode. Two local collector IPC tests also require socket operations that
+this execution sandbox disallows. Repository CI supplies PostgreSQL and the
+IPC environment: the verified US merge-gate run on `95c044bc` passed **2,657
+US tests (2 skipped)** and **7/7 offline scenarios**. CI and WSL/KIS practice
+acceptance are separate results.
+
+The KR suite exposed one pre-existing date-sensitive test failure on both
+`8406a8ef` and the candidate: a fixed Oct-19 reconcile clock was combined with
+the repository's actual current date. The test now freezes both module clock
+references to the same Oct-19 instant; all original fence assertions remain.
+There is no KR production-code change in this PR.
 
 ## Deployment and outstanding operational acceptance
 

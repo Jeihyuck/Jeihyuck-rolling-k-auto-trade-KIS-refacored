@@ -210,6 +210,11 @@ def test_reconcile_tick_releases_only_proven_before_kis_attempt(monkeypatch):
     monkeypatch.setattr(
         reconcile, "now_kst", lambda: datetime(2026, 10, 19, 14, 30)
     )
+    # Both modules own a clock reference. Leaving the repository on wall
+    # time makes this fixed Oct-19 regression fail on every later trade date.
+    monkeypatch.setattr(
+        "trader.db.repos.now_kst", lambda: datetime(2026, 10, 19, 14, 30)
+    )
     result = reconcile.reconcile_today(
         engine=engine,
         kis=FakeKis(),
