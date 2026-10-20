@@ -1385,6 +1385,91 @@ def _restore_entry_meta_for_promoted_positions(
     return restored_count
 
 
+
+def _verified_kr_cumulative_sell_evidence(
+    row: dict[str, Any], *,
+    source_order: dict[str, Any] | None,
+    side: str,
+    trade_date: date,
+    kis_odno: str | None,
+    env: str,
+) -> dict[str, Any] | None:
+    """Order-level KIS cumulative execution proof, never an invented trade.
+
+    VTTC0081R practice returns tot_ccld_qty + tot_ccld_amt without
+    ccld_no/ccld_qty/ccld_prc. Only an EXACT, FULL, positive cumulative
+    SELL with a durable (date, code, side, ODNO) matched source may
+    produce one synthetic *identifier* for a real broker aggregate.
+    A partial or contradictory broker result remains unresolved.
+    """
+    from decimal import Decimal, InvalidOperation
+    import hashlib
+
+    if side != "SELL" or not source_order or not kis_odno:
+        return None
+    if _first_value(row, ["ccld_no", "trade_id", "exec_id"]):
+        return None  # Individual executions use the original exact-fill route.
+    if _parse_side(row) != "SELL":
+        return None
+    code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
+    if (
+        code != _normalize_code(source_order.get("code"))
+        or str(source_order.get("side") or "").upper() != "SELL"
+        or str(source_order.get("kis_odno") or source_order.get("broker_order_id") or "").strip() != str(kis_odno).strip()
+        or _parse_date_time(row).date() != trade_date
+    ):
+        return None
+    requested = _to_int(source_order.get("qty"))
+    actual = _to_int(row.get("tot_ccld_qty"))
+    if not requested or requested <= 0 or actual != requested:
+        return None
+    try:
+        total = Decimal(str(row.get("tot_ccld_amt") or ""))
+    except (InvalidOperation, ValueError):
+        return None
+    if not total.is_finite() or total <= 0:
+        return None
+    # Price is derived solely from actual KIS executed notional and quantity,
+    # never from an order limit or displayed market quote.
+    avg = total / Decimal(actual)
+    if not avg.is_finite() or avg <= 0:
+        return None
+    # Scope this aggregate fill identifier to account/date/order/symbol.
+    # It is a deterministic database evidence key, NOT a KIS trade number.
+    account_scope = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
+    evidence = f"KR_KIS_CUM:{account_scope}:{trade_date:%Y%m%d}:{kis_odno}:{code}:SELL"
+    return {
+        "qty": actual,
+        "notional": float(total),
+        "avg_price": float(avg),
+        "evidence_id": evidence,
+        "kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+    }
+
+
+def _kr_source_has_individual_sell_fills(
+    *, fills_repo: FillsRepo, source_order: dict[str, Any], env: str,
+) -> bool:
+    """Never duplicate previously stored per-execution fills with an aggregate."""
+    order_id = str(source_order.get("order_id") or "").strip()
+    if not order_id:
+        return True  # fail closed
+    schema = schema_for_engine(fills_repo.engine)
+    with fills_repo.engine.connect() as conn:
+        rows = conn.execute(sa.select(
+            schema.fills.c.fill_meta_json,
+        ).where(sa.and_(
+            schema.fills.c.env == env,
+            schema.fills.c.order_id == uuid_value_for_url(str(fills_repo.engine.url), order_id),
+            schema.fills.c.side == "SELL",
+        ))).all()
+    for item in rows:
+        meta = _json_dict(item[0])
+        if str(meta.get("fill_source") or "") != "daily_ccld_order_cumulative":
+            return True
+    return False
+
+
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False) -> dict[str, object]:
     env = ctx.env
     env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
