@@ -457,6 +457,32 @@ def proven_unsent_attempts(events: list[dict]) -> set[tuple[str, str]]:
     return {identity for identity, types in types_by_attempt.items() if _proven_unsent(types)}
 
 
+def broker_submission_possible_for_client_key(events: list[dict], client_order_key: str) -> bool:
+    """Conservatively classify TP route exceptions from immutable journal proof.
+
+    BROKER_SUBMIT_STARTED alone is *not* proof of a sent order: a later
+    before-boundary / PRE_IO abort certifies the attempt never reached HTTP.
+    This applies per attempt; another ACK, actual fill or unknown outcome for
+    the same client key must still keep the protective SELL reservation fenced.
+    """
+    key = str(client_order_key or "").strip()
+    if not key:
+        # An exception lacking a stable key cannot be safely correlated.
+        return True
+    filtered = [event for event in events
+                if str(event.get("client_order_key") or "").strip() == key]
+    proven_unsent = proven_unsent_attempts(filtered)
+    for event in filtered:
+        event_type = str(event.get("event_type") or "")
+        attempt = str(event.get("submit_attempt_id") or "")
+        if event_type in _BROKER_POSSIBLE:
+            return True
+        if (event_type == "BROKER_SUBMIT_STARTED"
+                and (key, attempt) not in proven_unsent):
+            return True
+    return False
+
+
 def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None) -> dict:
     """Aggregate immutable unique submit attempts; reconciliation never adds submits."""
     events = load_order_events(trade_date, session_run_id=session_run_id)
