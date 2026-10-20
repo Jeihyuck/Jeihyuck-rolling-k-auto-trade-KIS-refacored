@@ -7,6 +7,19 @@ import os
 import sys
 
 
+def prove_broker_zero_day(response: dict) -> bool:
+    """Complete KIS broker response with no orders at all, not an HTTP stub."""
+    return bool(
+        isinstance(response, dict)
+        and str(response.get("rt_cd") or "") == "0"
+        and response.get("_sep29_complete") is True
+        and not response.get("_diag_stub")
+        and not response.get("_ccld_status")
+        and isinstance(response.get("output1"), list)
+        and not response["output1"]
+    )
+
+
 def main() -> int:
     if os.getenv("KIS_ENV","").lower()!="practice" or os.getenv("STRATEGY_ENV","").lower()!="practice":
         raise SystemExit("PRACTICE_ONLY")
