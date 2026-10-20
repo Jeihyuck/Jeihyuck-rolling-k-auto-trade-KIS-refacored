@@ -105,3 +105,51 @@ def test_buyable_dedupe_bulk_guard_preserves_fallback():
     assert 'with self._stage_timer("entry.prior_intents_bulk_lookup")' in source
     assert 'bulk_prior_intents_enabled and str(cf.client_order_key) in prior_intent_keys' in source
     assert 'self.orders_repo.get_order_by_client_order_key(' in source
+
+
+def test_broker_order_number_scoped_identity_excludes_other_dates_and_symbols():
+    engine, schema = _db()
+    with engine.begin() as conn:
+        conn.execute(schema.orders.insert(), [
+            _order(schema, key="old", code="036540", side="SELL",
+                   status="SUBMITTED", odno="0000004318",
+                   created_at=datetime(2026, 10, 19, 9, 5)),
+            _order(schema, key="same-id-different-code", code="042700", side="SELL",
+                   status="SUBMITTED", odno="0000004318",
+                   created_at=datetime(2026, 10, 20, 9, 5)),
+            _order(schema, key="correct", code="036540", side="SELL",
+                   status="SUBMITTED", odno="0000004318",
+                   created_at=datetime(2026, 10, 20, 9, 6)),
+        ])
+    repo = OrdersRepo(engine)
+    row = repo.get_order_by_kis_odno_scoped(
+        "practice", "0000004318", trade_date=date(2026, 10, 20),
+        code="036540", side="SELL",
+    )
+    assert row["client_order_key"] == "correct"
+    assert repo.get_order_by_kis_odno_scoped(
+        "practice", "0000004318", trade_date=date(2026, 10, 21),
+        code="036540", side="SELL",
+    ) is None
+    assert repo.get_order_by_kis_odno_scoped(
+        "practice", "0000004318", trade_date=date(2026, 10, 20),
+        code="036540", side="BUY",
+    ) is None
+    engine.dispose()
+
+
+def test_broker_order_number_ambiguity_is_not_attributed():
+    engine, schema = _db()
+    with engine.begin() as conn:
+        conn.execute(schema.orders.insert(), [
+            _order(schema, key="first", code="036540", side="SELL",
+                   status="SUBMITTED", odno="0000004318"),
+            _order(schema, key="second", code="036540", side="SELL",
+                   status="SUBMITTED", odno="0000004318"),
+        ])
+    repo = OrdersRepo(engine)
+    assert repo.get_order_by_kis_odno_scoped(
+        "practice", "0000004318", trade_date=date(2026, 10, 20),
+        code="036540", side="SELL",
+    ) is None
+    engine.dispose()
