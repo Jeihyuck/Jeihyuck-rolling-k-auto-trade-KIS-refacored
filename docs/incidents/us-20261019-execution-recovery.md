@@ -260,3 +260,71 @@ idempotent persistence, a newly deployed practice PREP / BUY / protective-SELL
 end-to-end observation when the strategies naturally signal, and >=20
 comparable WSL full-path HTTP-boundary timing observations. An empty claim
 list does not certify successful trading or the <=60s protective SELL p95.
+
+
+## 2026-10-20 verified production KIS history repair — DONE for seven fills
+
+**Authoritative source:** GitHub Actions, original-day authenticated KIS
+practice order-inquiry GET and existing Supabase practice-US account/epoch.
+Source US session date was initially misread as a KST day, excluding nine of
+13 original order identities; the KIS date-bridge fix is in this PR.
+The successful exact-source-day GET run was #39382477602. Full 13-claim,
+owner/qty/account/epoch/ACK-identity and KIS actual-fill-price preflight
+succeeded at #39383378576 and again after partial recovery #39384684541.
+
+**Broker-full-fill and persisted order/claim states (all US_STANDARD SELL):**
+
+| Original NY day | Symbol | Quantity | Actual USD avg | Persistence |
+|---|---|---:|---:|---|
+| Oct 13 | MCK | 1 | 968.29 | SATISFIED, authoritative |
+| Oct 14 | ABBV | 2 | 283.86 | SATISFIED, authoritative |
+| Oct 14 | COST | 1 | 974.52 | SATISFIED, authoritative |
+| Oct 14 | GILD | 4 | 153.69 | SATISFIED, authoritative |
+| Oct 14 | NET | 1 | 331.19 | SATISFIED, authoritative |
+| Oct 14 | PG | 4 | 155.93 | SATISFIED, authoritative |
+| Oct 15 | DHR | 2 | 231.54 | SATISFIED, authoritative |
+
+Total **seven original SELL actions / 15 shares**, exact source broker price,
+one active KIS actual fill per claim, no active synthetic accounting, terminal
+SATISFIED claim with no active attempt and attempt.authoritative=true. This
+was independently verified in a fresh Python process and then with Supabase
+read-only SQL after the successful write run #39385065770. **Six KIS
+zero-filled OPEN/nonterminal original orders** (AMD, MRVL, MSFT, CL, KO, KR)
+remain **not authoritative, with durable claim fences**. An old OPEN status is
+not evidence the brokerage order was cancelled, and cannot be released merely
+because time passed.
+
+**Implementation bug discovered by REAL production restore:** first one-shot
+#39383920968 settled MCK/ABBV/COST, then GILD failed on physical PostgreSQL
+unique index `uq_us_fills_idempotent`: existing deactivated synthetic and new
+KIS actual had identical (date, symbol, side, order_no, client key, qty, USD
+price), despite different evidence types. No second fill could be inserted.
+The code now promotes only the exact scoped superseded synthetic physical row
+in place, retaining original provenance in meta and the journal, and prevents
+double counting. New real-PostgreSQL regression
+`test_equal_qty_price_synthetic_broker_promotion_preserves_unique_tuple`
+passed in the 2,713-US-test suite (2 skipped), offline harness 7/7.
+The repair script safely resumed the earlier three proven terminal actions
+without modifying them and then applied four additional fills, including
+GILD and PG's exact-tuple in-place promotions. All seven are now complete.
+
+**Verification evidence:**
+- Broker proof/read-only workflow: #39382477602, #39383378576 and #39384684541
+- Actual production repaired-state workflow: #39385065770 **SUCCESS**
+- Receipt: `us243-proven-seven-db-repair-39385065770`
+- Independent post-restart validation: seven actual fills, six unfilled
+  fenced actions, no duplicate active synthetic, original correct prices
+- Final Supabase order/fill/claim read-only audit: all seven SATISFIED,
+  exactly one actual KIS fill each, physical promotion markers on GILD/PG
+- One-time database repair workflow removed from PR after successful execution
+  to avoid accidental future re-execution. Scripts and GET-only diagnostics
+  remain available for review. **No broker orders/cancels were submitted.**
+
+**Still outside this historical repair's verified scope:**
+the PR candidate has not been deployed to the user's Windows/WSL scheduler,
+no new naturally signaled practice BUY/protective SELL and subsequent restart
+were observed on that runtime, and there are no 20 baseline/candidate
+protective-SELL tick-to-KIS HTTP measurements proving p95 <=60 sec.
+Neither CI nor this archival KIS reconciliation can assert that overall
+new-trading operations or latency targets are restored. The six zero-fill
+orders remain on the exception list pending explicit terminal KIS proof.
