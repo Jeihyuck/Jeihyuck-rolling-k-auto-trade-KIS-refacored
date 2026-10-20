@@ -100,6 +100,55 @@ def evaluate_broker_sell_evidence(
     }
 
 
+def diagnose_empty_kr_ccld_readonly(client: Any, trade_date: date) -> list[dict[str, Any]]:
+    """Compare safe GET inquiry filters without persisting or trusting partial pages.
+
+    A variant with rows is diagnostic only; this does not promote broker fills.
+    The result deliberately includes no account numbers, tokens, or raw rows.
+    """
+    from trader.kis_wrapper import _pick_tr
+    tr_ids = _pick_tr("practice", "DAILY_CCLD")
+    if not tr_ids:
+        return [{"variant": "no_tr_id", "rows": 0, "status": "UNAVAILABLE"}]
+    base = os.getenv("KIS_REST_URL", "").rstrip("/")
+    if "openapivts.koreainvestment.com" not in base:
+        return [{"variant": "not_practice", "rows": 0, "status": "BLOCKED"}]
+    url = base + "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+    day = trade_date.strftime("%Y%m%d")
+    params = {
+        "CANO": client.CANO, "ACNT_PRDT_CD": client.ACNT_PRDT_CD,
+        "INQR_STRT_DT": day, "INQR_END_DT": day,
+        "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00",
+        "PDNO": "", "CCLD_DVSN": "00", "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "", "ORD_GNO_BRNO": "", "ODNO": "",
+        "SORT_SQN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+    }
+    variants = [
+        ("ascending", {"INQR_DVSN": "01"}),
+        ("sell_only", {"SLL_BUY_DVSN_CD": "01"}),
+        ("exact_order", {"SLL_BUY_DVSN_CD": "01", "PDNO": "036540", "ODNO": "0000004318"}),
+    ]
+    report = []
+    for name, overrides in variants:
+        try:
+            response = client.session.request(
+                "GET", url, params={**params, **overrides},
+                headers=client._headers(tr_ids[0]), timeout=(3.0, 7.0),
+            )
+            data = response.json() if response.ok else {}
+            rows = data.get("output1") if isinstance(data, dict) else []
+            report.append({
+                "variant": name,
+                "http": response.status_code,
+                "rt_cd": str(data.get("rt_cd") or "") if isinstance(data, dict) else "",
+                "rows": len(rows) if isinstance(rows, list) else int(bool(rows)),
+                "page_complete": str(response.headers.get("tr_cont") or "").upper() not in {"F", "M"},
+            })
+        except Exception as exc:
+            report.append({"variant": name, "status": "QUERY_FAILED", "error_type": type(exc).__name__})
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only KIS practice SELL evidence proof")
     parser.add_argument("--trade-date", default="2026-10-20")
@@ -149,6 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     result["kis_response_complete"] = True
     result["kis_pages"] = int(response.get("_sep29_pages") or 0)
     result["kis_rows"] = len(rows)
+    if not rows:
+        result["empty_response_diagnostics"] = diagnose_empty_kr_ccld_readonly(client, trade_date)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["orders_unresolved"] == 0 else 2
 
