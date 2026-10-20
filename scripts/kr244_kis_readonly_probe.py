@@ -254,6 +254,14 @@ def main(argv: list[str] | None = None) -> int:
             "has_execution_price": bool(_val(raw, "ccld_prc", "filled_price")),
             "has_cumulative_qty": bool(_val(raw, "tot_ccld_qty", "cumulative_filled_qty")),
             "has_broker_avg_price": bool(_val(raw, "avg_prvs")),
+            "broker_cumulative_qty": int(float(_val(raw, "tot_ccld_qty") or 0)),
+            "broker_cumulative_notional_positive": float(_val(raw, "tot_ccld_amt") or 0) > 0,
+            "broker_average_positive": float(_val(raw, "avg_prvs") or 0) > 0,
+            "requested_qty_matches_broker_cumulative": (
+                bool(order_no in expected_by_od and expected_by_od[order_no] == code)
+                and int(float(_val(raw, "tot_ccld_qty") or 0))
+                == EXPECTED_OCT20_SELLS[code][1]
+            ) if code in EXPECTED_OCT20_SELLS else False,
         })
     result["broker_row_schema"] = sorted(str(k) for k in rows[0].keys()) if rows and isinstance(rows[0], dict) else []
     result["identity_profile"] = row_profile
