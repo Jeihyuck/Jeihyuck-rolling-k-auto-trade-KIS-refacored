@@ -1796,6 +1796,29 @@ def route_order(
             "broker_submit": False,
             "intent": intent,
         }
+    # Fail at the router boundary, BEFORE durable STARTED or claim creation,
+    # when the *native* KIS client would refuse the order. Do not weaken or
+    # auto-clear DISABLE_REAL_TRADING; also protect direct tick/router callers
+    # that did not run the session permission precheck.
+    from trader.us.execution.kis_us_client import KisUSClient
+    if isinstance(kis_client, KisUSClient):
+        try:
+            us_cfg.assert_us_paper_order_allowed()
+        except RuntimeError as _permission_exc:
+            logger.error(
+                "[US_ORDER][KIS_NATIVE_PERMISSION_PRECHECK][BLOCK] "
+                "symbol=%s side=%s reason=%s broker_submit=0",
+                symbol_upper, side, _permission_exc,
+            )
+            return {
+                "status": "ORDER_DISABLED_NATIVE_KIS_PERMISSION",
+                "reason": str(_permission_exc),
+                "broker_submit": False,
+                "requires_reconcile": False,
+                "retry_order": False,
+                "intent": intent,
+            }
+
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation
