@@ -50,6 +50,15 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
     events=[]
     client = _native_kis_client(monkeypatch, events)
     client._base_url = "https://openapivts.koreainvestment.com:29443"
+    from trader.us.execution import kis_us_client
+    monkeypatch.setattr(
+        kis_us_client,"get_tr_info",
+        lambda operation: {
+            "tr_id":"practice-sell" if operation=="us_sell_order" else "practice-buy",
+            "path":"/uapi/overseas-stock/v1/trading/order",
+            "order_side":"S" if operation=="us_sell_order" else "B",
+        },
+    )
     # Native SELL fresh KIS balance logic stays active, but its input is a
     # fixed account-scoped mocked broker snapshot, never actual HTTP. Route
     # selection cannot silently fall back to an unavailable live account.
@@ -72,6 +81,9 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
         assert url.startswith("https://openapivts.koreainvestment.com:29443/")
         assert "/trading/order" in url
         assert timeout > 0
+        assert json["PDNO"].startswith("SIM_PROTECT_")
+        assert json["ORD_QTY"]=="1"
+        assert json["OVRS_EXCG_CD"]=="NASD"
         # This is a stubbed HTTP response, never a real broker ACK/fill.
         events.append("HTTP")
         events.append("INTERCEPTED_POST")
