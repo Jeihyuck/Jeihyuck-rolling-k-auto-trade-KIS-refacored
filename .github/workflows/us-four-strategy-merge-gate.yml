@@ -105,6 +105,7 @@ jobs:
           env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q -s \
             tests/us/test_us243_oct19_live_evidence_replay.py \
             tests/us/test_us243_oct19_permission_hash_regression.py \
+            tests/us/test_us_20261020_execution_incident.py::test_bounded_replay_rotates_and_preserves_full_close_recovery \
             tests/us/test_us_20261007_sustained_real_buy_ack.py \
             tests/us/test_us_pr243_latency_fail_closed.py \
             | tee artifacts/pr243-three-gate-test.log
@@ -140,6 +141,12 @@ jobs:
               "historical_abort_hash_permission_mismatch":"PASS",
               "mock_kis_real_postgres_full_tick":"PASS",
               "full_tick_sample_count_each":20,
+              "bounded_pre_route_journal_replay_virtual_clock":{
+                  "baseline_seconds":100,"bounded_seconds":10,
+                  "deferred_unresolved_attempts":18,
+                  "status":"PASS_ALL_FENCES_PRESERVED",
+                  "evidence":"test_bounded_replay_rotates_and_preserves_full_close_recovery",
+              },
               "full_tick_p95_sec_each":[x["tick_wall_p95_sec"] for x in samples],
               "full_tick_broker_ack_each":[x["buy_ack"] for x in samples],
               "protective_sell_ack_each":[x["protective_sell_ack"] for x in samples],
