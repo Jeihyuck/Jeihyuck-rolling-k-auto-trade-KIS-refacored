@@ -1481,7 +1481,7 @@ def _kr_source_has_individual_sell_fills(
     return False
 
 
-def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False) -> dict[str, object]:
+def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False, strict_sell_targets: dict[str, tuple[str, int]] | None = None) -> dict[str, object]:
     env = ctx.env
     env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
     reconcile_run_id = _resolve_reconcile_run_id(
@@ -1525,6 +1525,22 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
     ccld_status = str(resp.get("_ccld_status") or ("ok" if isinstance(resp, dict) else "unknown"))
     if isinstance(rows, dict):
         rows = [rows]
+    if strict_sell_targets is not None:
+        if not require_authoritative or env != "practice" or trade_date is None:
+            raise RuntimeError("KR_CUMULATIVE_REPAIR_NEEDS_PRACTICE_FULL_PAGES_AND_DAY")
+        if not strict_sell_targets:
+            raise RuntimeError("KR_CUMULATIVE_REPAIR_EMPTY_ALLOWLIST")
+        # Preflight ALL required targets before the first DB write. Never
+        # attempt a subset because a KIS page was dropped or incomplete.
+        from scripts.kr244_kis_readonly_probe import evaluate_broker_sell_evidence
+        proof = evaluate_broker_sell_evidence(
+            rows, trade_date, expected=strict_sell_targets,
+        )
+        if (
+            int(proof.get("orders_checked") or 0) != len(strict_sell_targets)
+            or int(proof.get("orders_verified") or 0) != len(strict_sell_targets)
+        ):
+            raise RuntimeError("KR_CUMULATIVE_REPAIR_KIS_EVIDENCE_INCOMPLETE")
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
@@ -1540,6 +1556,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         raw_code = _first_value(broker_row, ["pdno", "stck_shrn_iscd", "code"])
         code = _normalize_code(raw_code)
         side = _parse_side(broker_row)
+        if strict_sell_targets is not None:
+            expected_target = strict_sell_targets.get(code)
+            source_no = str(_first_value(broker_row, ["odno", "ODNO", "ordno"]) or "").strip().zfill(10)
+            if (
+                side != "SELL" or expected_target is None
+                or source_no != str(expected_target[0]).zfill(10)
+                or _parse_date_time(broker_row).date() != trade_date
+            ):
+                continue
         if raw_code is None or not str(raw_code).strip() or code == "000000" or side not in {"BUY", "SELL"}:
             logger.warning(
                 "[RECONCILE][DAILY_CCLD][INVALID_ROW_SKIP] raw_code=%s normalized_code=%s side=%s "
@@ -1576,6 +1601,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     "[RECONCILE][SOURCE_LOOKUP_FAIL] side=%s code=%s kis_odno=%s err=%s",
                     side, code, kis_odno, exc,
                 )
+        if strict_sell_targets is not None and not source_order:
+            raise RuntimeError("KR_CUMULATIVE_REPAIR_DURABLE_SELL_ORDER_NOT_FOUND")
         if source_order:
             source_request = _json_dict(source_order.get("request_json"))
             source_response = _json_dict(source_order.get("response_json"))
@@ -1616,6 +1643,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             kis_odno=kis_odno,
             env=env,
         )
+        if strict_sell_targets is not None and cumulative_sell_evidence is None:
+            raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
         if cumulative_sell_evidence is not None:
             if _kr_source_has_individual_sell_fills(
                 fills_repo=fills_repo, source_order=source_order, env=env,
@@ -2216,7 +2245,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
     # failure there may leave the action IN_FLIGHT across restart.  Missing
     # broker IDs, EXPIRED rows, and ambiguous ACKs are never sufficient proof.
     if (
-        strategy == "pb1_pullback_close"
+        strict_sell_targets is None
+        and strategy == "pb1_pullback_close"
         and degraded_reason is None
         and str(ccld_status).lower() == "ok"
         and hasattr(orders_repo, "recover_proven_kr_pb1_prebroker_claims")
