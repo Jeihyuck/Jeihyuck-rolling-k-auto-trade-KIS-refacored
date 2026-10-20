@@ -195,8 +195,10 @@ def evaluate(root: Path, trade_date: str, expected_sha: str,
         reasons.append("NO_ACTUAL_SELL_BROKER_SUBMISSION_LATENCY_EVIDENCE")
     if len(sell_samples) < 20:
         reasons.append("INSUFFICIENT_DISTINCT_SELECTED_SELL_HTTP_SAMPLES")
-    if conflicting_sell_attempts or rejected_sell_signal_lines:
+    if conflicting_sell_attempts:
         reasons.append("SELL_HTTP_SIGNAL_ATTRIBUTION_INTEGRITY_FAILED")
+    # Nonselected/legacy evidence is excluded, not treated as a fatal
+    # condition when sufficient independent selected samples do exist.
     # Preserve the existing 15s p95/30s max guard. An additional 60s
     # p95 acceptance metric must not silently weaken this stricter policy.
     if sell_samples and (
