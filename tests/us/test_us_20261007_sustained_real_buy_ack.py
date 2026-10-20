@@ -1,4 +1,4 @@
-"""PB1 continuous slow ticks: real tick → preflight/risk → router → stub KIS ACK.
+"""PB1 20 continuous slow ticks: real tick → preflight/risk → router → stub KIS ACK.
 
 The test intentionally keeps nonzero repeated latency on *all* ticks, unlike
 the legacy test where only the first two are slow. This is a scaled replay,
@@ -23,7 +23,7 @@ TICKERS = (
 
 @pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="requires real PostgreSQL broker-claim fixture")
 @pytest.mark.parametrize("unresolved_ticks", [(), (4, 5)])
-def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
+def test_sustained_twenty_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     monkeypatch, tmp_path, pg_engine, unresolved_ticks,
 ):
     from trader.us.db import repos
@@ -250,7 +250,7 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
 
     results = []
     tick_wall_sec = []
-    for tick_index in range(1, 13):
+    for tick_index in range(1, 21):
         tick_wall_start = time.monotonic()
         current_tick["index"] = tick_index
         _prior_buy_count = len(broker.buy_calls)
@@ -267,11 +267,11 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
         if tick_index in unresolved_ticks:
             assert len(broker.buy_calls) == _prior_buy_count, result
     # CI is a scaled mock-KIS/real-PostgreSQL replay, not production latency.
-    # All twelve ticks, including unresolved/blocked ticks, count toward p95.
+    # All twenty ticks, including unresolved/blocked ticks, count toward p95.
     sorted_wall = sorted(tick_wall_sec)
     p95_wall = sorted_wall[int((len(sorted_wall) - 1) * .95)]
     assert p95_wall <= 60.0, {"p95_wall_sec": p95_wall, "wall_sec": tick_wall_sec}
-    expected_buys = 12 - len(unresolved_ticks)
+    expected_buys = 20 - len(unresolved_ticks)
     assert len(seen_eval) == expected_buys, [(x.get("entry_degraded_reason"), x.get("last_stage")) for x in results]
     assert len(broker.buy_calls) == expected_buys, [{
         "status": x.get("status"), "degraded": x.get("entry_degraded_reason"),
@@ -281,6 +281,7 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     } for x in results]
     assert all(x.get("orders_ack", 0) >= 1 for i, x in enumerate(results, 1) if i not in unresolved_ticks)
     assert all(x.get("exit_routed_before_entry") == 1 for x in results)
+    assert len(tick_wall_sec) == 20
     assert len(delay_events) >= 20, delay_events
     assert len({call[0] for call in broker.buy_calls}) == expected_buys
     assert len(broker.sell_calls) == 1, broker.sell_calls
@@ -301,8 +302,8 @@ def test_sustained_twelve_slow_ticks_reach_real_buy_router_and_mock_kis_ack(
     )
     assert duplicate_result["status"] != "ACK", duplicate_result
     assert len(broker.submission_sequence) == prev_kis_submits
-    print("US_PB1_BUY_ACK_12TICK_METRICS=" + __import__("json").dumps({
-        "ticks": 12, "tick_wall_p95_sec": round(p95_wall, 4),
+    print("US_PB1_BUY_ACK_20TICK_METRICS=" + __import__("json").dumps({
+        "ticks": 20, "tick_wall_p95_sec": round(p95_wall, 4),
         "tick_wall_max_sec": round(max(tick_wall_sec), 4),
         "buy_ack": len(broker.buy_calls),
         "unresolved_ticks": list(unresolved_ticks),
