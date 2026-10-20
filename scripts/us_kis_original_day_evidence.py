@@ -100,6 +100,27 @@ def verify_claim(row: dict, events: list[dict], broker_rows: list[dict] | None,
     if (not submit or not ack or not key or not attempt or not symbol
             or side not in {"BUY", "SELL"} or qty is None or qty <= 0):
         return {**base, "reason": "MISSING_ORIGINAL_ATTEMPT_IDENTITY"}
+    # Never confirm a client action by looking only at its newest attempt.
+    # A prior ACK/newer retry with another KIS order number is exactly the
+    # case where a single us_orders row cannot safely resolve exposure.
+    from trader.us.utils.order_no import normalize_us_order_no
+    all_key_events = [
+        event for event in events
+        if str(event.get("client_order_key") or "") == key
+    ]
+    ack_numbers = {
+        normalize_us_order_no(event.get("broker_order_no"))
+        for event in all_key_events
+        if event.get("event_type") in {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED"}
+        and event.get("broker_order_no")
+    }
+    live_attempts = {
+        str(event.get("submit_attempt_id") or "")
+        for event in all_key_events
+        if event.get("event_type") == "BROKER_SUBMIT_STARTED"
+    }
+    if len(ack_numbers) > 1 or len(live_attempts) > 1:
+        return {**base, "reason": "MULTI_ATTEMPT_OR_BROKER_ORDER_COLLISION"}
     if symbol != str(submit.get("symbol") or "").upper() or (
         side != str(submit.get("side") or "").upper()
     ) or qty != _safe_qty(submit.get("qty")):
