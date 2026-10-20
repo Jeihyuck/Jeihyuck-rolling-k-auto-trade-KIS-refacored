@@ -201,6 +201,28 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("KIS_DAILY_CCLD_INCOMPLETE")
     rows = response.get("output1") or []
     result = evaluate_broker_sell_evidence(rows, trade_date)
+    # Strictly read-only KIS schema/identity profiling. No account numbers,
+    # token strings, personal data or unmasked order IDs are emitted.
+    expected_by_od = {odno: code for code, (odno, _qty) in EXPECTED_OCT20_SELLS.items()}
+    row_profile = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        code = _val(raw, "pdno", "PDNO", "stck_shrn_iscd", "code").lstrip("A").zfill(6)
+        order_no = _val(raw, "odno", "ODNO", "ordno").zfill(10)
+        row_profile.append({
+            "expected_code": code if code in EXPECTED_OCT20_SELLS else None,
+            "exact_broker_order_no_match": bool(order_no in expected_by_od and expected_by_od[order_no] == code),
+            "day_source": _val(raw, "ord_dt", "ord_date", "trd_dt", "ccld_dt"),
+            "side_source": _val(raw, "sll_buy_dvsn_cd", "sll_buy_dvsn", "side"),
+            "has_execution_id": bool(_val(raw, "ccld_no", "trade_id", "exec_id")),
+            "has_execution_qty": bool(_val(raw, "ccld_qty", "filled_qty")),
+            "has_execution_price": bool(_val(raw, "ccld_prc", "filled_price")),
+            "has_cumulative_qty": bool(_val(raw, "tot_ccld_qty", "cumulative_filled_qty")),
+            "has_broker_avg_price": bool(_val(raw, "avg_prvs")),
+        })
+    result["broker_row_schema"] = sorted(str(k) for k in rows[0].keys()) if rows and isinstance(rows[0], dict) else []
+    result["identity_profile"] = row_profile
     result["kis_response_complete"] = True
     result["kis_pages"] = int(response.get("_sep29_pages") or 0)
     result["kis_rows"] = len(rows)
