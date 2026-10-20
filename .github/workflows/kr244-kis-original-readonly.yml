@@ -1,0 +1,51 @@
+name: KR244 Practice KIS Original Fills Readonly
+"on":
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "scripts/kr244_kis_readonly_probe.py"
+      - ".github/workflows/kr244-kis-original-readonly.yml"
+permissions:
+  contents: read
+jobs:
+  readonly-kis-evidence:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'fix/kr-20261020-submit-latency-sell-reconcile' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      STRATEGY_MODE: LIVE
+      KIS_HTTP_ENABLED: "1"
+      KIS_CCLD_FAIL_OPEN: "0"
+      KIS_CCLD_RETRY_MAX: "2"
+      KIS_CCLD_READ_TIMEOUT_SEC: "7"
+      DRY_RUN: "1"
+      DISABLE_REAL_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      ALLOW_REAL_ORDER: "0"
+      PYTHONPATH: "."
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install readonly runtime
+        run: |
+          python -m pip install --quiet -r requirements.txt
+      - name: Verify strictly practice and no order calls in probe
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("scripts/kr244_kis_readonly_probe.py").read_text(encoding="utf-8")
+          for forbidden in ("place_order(", "order_cash(", "cancel_order(", "mark_submitted(", "conn.execute(", "reconcile_today("):
+              assert forbidden not in p, forbidden
+          assert 'inquire_daily_ccld' in Path("trader/kr/runtime_integrity_20260929.py").read_text(encoding="utf-8")
+          PY
+      - name: Get 2026-10-20 original KIS executions read-only
+        run: python -m scripts.kr244_kis_readonly_probe --trade-date 2026-10-20
