@@ -216,3 +216,87 @@ def test_failed_pre_io_release_remains_visible_and_fenced(monkeypatch):
     assert result['status'] == 'ERROR'
     assert result['unresolved_count'] == 1
     assert result['unresolved_symbol_sides'] == [['META', 'SELL']]
+
+
+@pytest.mark.parametrize(
+    "event_types, expected",
+    [
+        (["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_PRE_IO"], False),
+        (["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"], False),
+        (["BROKER_SUBMIT_STARTED"], True),
+        (["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_PRE_IO",
+          "BROKER_ACK_RECEIVED"], True),
+        (["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_PRE_IO",
+          "BROKER_SUBMIT_RESULT_UNKNOWN"], True),
+    ],
+)
+def test_tp_exception_submit_proof_respects_boundary_and_conflicts(event_types, expected):
+    events = [dict(event_type=kind, trade_date="2026-10-19",
+                   client_order_key="meta-exit", submit_attempt_id="attempt-1")
+              for kind in event_types]
+    assert journal.broker_submission_possible_for_client_key(
+        events, "meta-exit") is expected
+    assert journal.broker_submission_possible_for_client_key(
+        events, "") is True
+
+
+def test_tp_exception_keeps_other_actual_attempt_fenced():
+    events = [
+        dict(event_type=kind, client_order_key="meta-exit",
+             submit_attempt_id="attempt-1")
+        for kind in ("BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_PRE_IO")
+    ] + [
+        dict(event_type=kind, client_order_key="meta-exit",
+             submit_attempt_id="attempt-2")
+        for kind in ("BROKER_SUBMIT_STARTED", "BROKER_ACK_RECEIVED")
+    ]
+    assert journal.broker_submission_possible_for_client_key(
+        events, "meta-exit") is True
+    assert journal.broker_submission_possible_for_client_key(
+        events, "other-action") is False
+
+
+@pytest.mark.parametrize("contradiction, expected_tp_status", [
+    (False, "FAILED"),
+    (True, "AMBIGUOUS_ACK"),
+])
+def test_protective_sell_exception_uses_same_pre_io_proof_as_replay(
+    monkeypatch, contradiction, expected_tp_status
+):
+    from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
+    intent = dict(
+        trade_date="2026-10-19", client_order_key="meta-exit",
+        symbol="META", side="SELL", qty=2, available_qty=2,
+        limit_price=100, notional_usd=200,
+        position_lifecycle_id="life-meta",
+        meta={"profit_capture_stage": "tp1", "position_lifecycle_id": "life-meta",
+              "strategy_owner": "US_STANDARD", "reason": "TAKE_PROFIT_TP1"},
+    )
+    events = [
+        {**intent, "event_type": "BROKER_SUBMIT_STARTED",
+         "submit_attempt_id": "attempt-1"},
+        {**intent, "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+         "submit_attempt_id": "attempt-1"},
+    ]
+    if contradiction:
+        events.append({
+            **intent, "event_type": "BROKER_ACK_RECEIVED",
+            "submit_attempt_id": "attempt-1", "broker_order_no": "1234",
+        })
+    monkeypatch.setattr(journal, "load_order_events", lambda *a, **kw: events)
+    def fail_route(*args, **kwargs):
+        raise RuntimeError("simulated route exception")
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", fail_route)
+    synced = []
+    monkeypatch.setattr(
+        "trader.us.profit_capture.sync_profit_capture_stage_from_order",
+        lambda **kw: synced.append(kw),
+    )
+    outcome = route_exit_orders_immediately(
+        [intent], buy_daily_notional=0, position_count=1,
+        effective_budget=1000, signal_only=False,
+        kis_order_allowed=True, current_position_symbols={"META"},
+    )
+    assert outcome["orders"][0]["status"] == "ERROR"
+    assert len(synced) == 1
+    assert synced[0]["order_status"] == expected_tp_status
