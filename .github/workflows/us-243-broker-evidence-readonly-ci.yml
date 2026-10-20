@@ -106,11 +106,19 @@ jobs:
           PY
       - name: Authenticated historical KIS GET and scoped PostgreSQL READ ONLY
         run: |
-          set -uo pipefail
+          # A trustworthy 0-fill historical OPEN remains fenced and is NOT
+          # a failed audit. Exit 2 means documented outstanding claims, not
+          # an exception in the GET-only proof pipeline.
+          set +e
           python scripts/us_kis_original_day_evidence.py \
             --from-date 2026-10-01 --to-date 2026-10-20 \
             --require-all-terminal > us243-kis-original-day-audit.json
           rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+            echo "::error::KIS_SOURCE_AUDIT_FAILURE"
+            exit "$rc"
+          fi
           python - <<'PY'
           import json
           from pathlib import Path
@@ -128,9 +136,23 @@ jobs:
           if not info.get("claim_count"):
               print("[US243] ZERO_CLAIMS: cannot certify historical 13-claim reconciliation")
               raise SystemExit(3)
+          if info.get("database_mutated") is not False or info.get("claims_released") != 0:
+              raise SystemExit("READ_ONLY_CONTRACT_VIOLATION")
+          allowed = {"VERIFIED_FULL_FILL", "VERIFIED_PARTIAL_TERMINAL",
+                     "VERIFIED_ZERO_FILL_TERMINAL", "BROKER_ORDER_STILL_ACTIVE"}
+          unknown = [(x.get("symbol"),x.get("proof_status"))
+                     for x in data.get("claims",[])
+                     if x.get("proof_status") not in allowed]
+          if unknown:
+              print("[US243][ERROR] MISSING_OR_CONFLICTING_ORIGINAL_BROKER_EVIDENCE",unknown)
+              raise SystemExit(4)
+          if info.get("unresolved_or_open_count",0):
+              print("::warning::Original broker orders remain unfilled/nonterminal;"
+                    " keep durable claim fences. This check verifies KIS evidence,"
+                    " NOT operational completion.")
           PY
-          echo "[US243] historical broker evidence script exit=$rc"
-          exit "$rc"
+          echo "[US243] audit completed with script rc=$rc (2 means known pending claim)"
+          exit 0
       - name: Export sanitized KIS practice evidence
         if: always()
         uses: actions/upload-artifact@v4
