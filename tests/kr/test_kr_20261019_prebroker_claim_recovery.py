@@ -264,3 +264,33 @@ def test_oct19_recovery_explicit_day_remains_exact_scope(monkeypatch):
     ) == 1
     assert repo._execution_claim_repo.get(proven).action_state == "OPEN"
     engine.dispose()
+
+
+def test_kr244_expired_buy_recovery_requires_entire_authoritative_zero_kis_day():
+    from scripts.kr244_oct19_expired_claim_kis_zero_repair import prove_broker_zero_day
+    good={"rt_cd":"0","output1":[],"output2":[],
+          "_sep29_complete":True,"_sep29_pages":1}
+    assert prove_broker_zero_day(good)
+    for bad in (
+        {**good,"rt_cd":"1"},
+        {**good,"output1":[{"pdno":"192820","sll_buy_dvsn_cd":"02"}]},
+        {**good,"output1":None},
+        {**good,"_sep29_complete":False},
+        {**good,"_diag_stub":True},
+        {**good,"_ccld_status":"degraded"},
+        None,
+    ):
+        assert not prove_broker_zero_day(bad)
+
+
+def test_kr244_historical_expired_claim_has_no_broker_submit_or_mutation_in_probe():
+    from pathlib import Path
+    probe=Path("scripts/kr244_oct19_buy_kis_readonly_probe.py").read_text()
+    assert "place_order(" not in probe
+    assert "cancel_order(" not in probe
+    source=Path("scripts/kr244_oct19_expired_claim_kis_zero_repair.py").read_text()
+    assert "prove_broker_zero_day(r)" in source
+    assert 'orders.c.status=="EXPIRED"' in source
+    assert 'attempts.c.attempt_state=="CREATED"' in source
+    assert "original_accepted or original_fills or target_fills" in source
+    assert "release_before_submit(" in source
