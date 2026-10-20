@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_id=str(uuid4()), env="practice", strategy="pb1_pullback_close",
                 started_at=now_kst(), dry_run=False,
             )
-            evidence = reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=trade_date)
+            evidence = reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=trade_date, require_authoritative=True)
             after = audit_kr_pending_sell_orders(engine, env=args.env, trade_date=trade_date)
             result = {"before": before, "broker_reconciliation": evidence, "after": after,
                       "mode": "APPLY_KIS_EXECUTION_EVIDENCE_ONLY"}
