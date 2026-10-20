@@ -1164,10 +1164,12 @@ class KisUSClient:
             return None
         from zoneinfo import ZoneInfo
         try:
-            source = datetime.strptime(raw_date + raw_time.zfill(6), "%Y%m%d%H%M%S")
-            return source.replace(tzinfo=ZoneInfo("Asia/Seoul")).astimezone(
-                ZoneInfo("America/New_York")
-            ).date().isoformat()
+            # KIS overseas inquire-ccnl ORD_DT is the US market-local
+            # session date. ORD_TMD is a Korea wall clock: combining both
+            # as one Korea calendar day wrongly excludes midnight fills.
+            # Validate the source order clock without re-dating the session.
+            datetime.strptime(raw_date + raw_time.zfill(6), "%Y%m%d%H%M%S")
+            return datetime.strptime(raw_date, "%Y%m%d").date().isoformat()
         except ValueError as exc:
             raise KisUSClientError(
                 f"KIS order date/time schema invalid: source_date={raw_date!r} source_time={raw_time!r}"
