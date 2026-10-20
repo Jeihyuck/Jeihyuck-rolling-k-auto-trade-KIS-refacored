@@ -71,6 +71,10 @@ def test_tokenp_read_timeout_is_inconclusive_not_empty_broker_history(monkeypatc
         lambda _env: (tmp_path / "no-cached-token.json", tmp_path / "token.lock"),
     )
     client = mod.KisUSClient(env="practice", offline=False)
+    # This test deliberately permits only the stubbed in-process auth path,
+    # not external HTTP. The CI job itself remains KIS_HTTP_BLOCK=1; its
+    # normal guard is independently covered by existing safety tests.
+    monkeypatch.setattr(mod, "kis_http_block_enabled", lambda: False)
     client._offline = False
     monkeypatch.setattr(
         client, "_request_new_token",
