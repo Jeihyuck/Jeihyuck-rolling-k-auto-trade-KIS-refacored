@@ -4102,6 +4102,31 @@ class OrdersRepo:
             self._last_read_fail_open_op = "orders.get_order_by_client_order_key" if not rows else None
         return rows[0] if rows else None
 
+    def list_orders_by_client_order_keys(
+        self, env: str, client_order_keys: Iterable[str],
+    ) -> list[dict]:
+        """One strict pre-submit dedupe read for all KR PB1 candidate keys.
+
+        This query MUST fail closed. An unavailable DB cannot prove that an
+        order has not already crossed KIS and must never become an empty map.
+        The order submit claim/idempotency fence remains authoritative for
+        concurrent workers after this snapshot.
+        """
+        keys = sorted({str(key).strip() for key in client_order_keys if str(key).strip()})
+        if not keys:
+            return []
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.client_order_key.in_(keys),
+            ))
+            .order_by(self._schema.orders.c.created_at.desc())
+        )
+        return self._read_mappings_with_guard(
+            stmt, op_name="orders.list_orders_by_client_order_keys", fail_open=False,
+        )
+
     def get_order_by_kis_odno(self, env: str, kis_odno: str) -> dict | None:
         broker_id = str(kis_odno or "").strip()
         if not broker_id:
