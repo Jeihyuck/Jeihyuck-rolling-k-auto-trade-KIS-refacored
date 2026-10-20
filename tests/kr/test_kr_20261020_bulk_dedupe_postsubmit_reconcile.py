@@ -153,3 +153,49 @@ def test_broker_order_number_ambiguity_is_not_attributed():
         code="036540", side="SELL",
     ) is None
     engine.dispose()
+
+
+def test_retry_suffix_family_one_query_preserves_first_available_gap():
+    from types import SimpleNamespace
+    from trader.pb1_engine import PB1Engine
+
+    engine, schema = _db()
+    base = "practice:pb1_pullback_afternoon:2026-10-20:251970:ENTRY:BUY:PB1-PM:afternoon:1"
+    with engine.begin() as conn:
+        conn.execute(schema.orders.insert(), [
+            _order(schema, key=base, code="251970"),
+            _order(schema, key=base + ":retry2", code="251970"),
+            _order(schema, key=base + ":retry4", code="251970"),
+            _order(schema, key=base.replace("pb1_pullback", "pb1Xpullback") + ":retry3", code="251970"),
+        ])
+    repo = OrdersRepo(engine)
+    seen = []
+    actual_read = repo._read_mappings_with_guard
+
+    def counted(*args, **kwargs):
+        seen.append(kwargs["op_name"])
+        return actual_read(*args, **kwargs)
+
+    repo._read_mappings_with_guard = counted
+    obj = SimpleNamespace(orders_repo=repo, env="practice")
+    assert PB1Engine._next_retry_client_order_key(obj, base) == base + ":retry3"
+    assert seen == ["orders.list_existing_client_order_keys_for_retry"]
+    engine.dispose()
+
+
+def test_retry_prefix_read_failure_keeps_candidate_fenced(monkeypatch):
+    from types import SimpleNamespace
+    from trader.pb1_engine import PB1Engine
+
+    engine, _ = _db()
+    repo = OrdersRepo(engine)
+
+    def fail(*args, **kwargs):
+        assert kwargs["fail_open"] is False
+        raise RuntimeError("cannot prove retry key is unused")
+
+    monkeypatch.setattr(repo, "_read_mappings_with_guard", fail)
+    obj = SimpleNamespace(orders_repo=repo, env="practice")
+    with pytest.raises(RuntimeError, match="cannot prove"):
+        PB1Engine._next_retry_client_order_key(obj, "practice:pb1:test")
+    engine.dispose()
