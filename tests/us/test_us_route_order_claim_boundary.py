@@ -1501,3 +1501,26 @@ def test_native_practice_ack_partial_full_fill_position_and_restart(monkeypatch,
     assert route_order(intent,kis_client=client)['status']!='ACK'
     assert http_events==['HTTP']
     engine.dispose()
+
+
+def test_protective_sell_tick_to_native_http_metric_includes_pre_route_time(
+    monkeypatch,
+):
+    """The real route boundary, not a fabricated order-attempt timestamp."""
+    _engine, claims, broker = _route_fixture(monkeypatch)
+    context = TickExecutionContext(
+        "2026-10-02", "am", "run-timing", 1, "tick-timing",
+        deadline=time.monotonic() + 10,
+    )
+    context.metrics["tick_start_monotonic"] = time.monotonic() - 1.2
+    order = _intent("2026-10-02", action="TP1",
+                    client_order_key="timing-sell", side="SELL")
+    result = route_order(order, kis_client=broker, context=context)
+    assert result["status"] == "ACK", result
+    assert broker.calls == 1
+    attempt = str(result["intent"]["submit_attempt_id"])
+    samples = context.metrics["sell_tick_to_broker_boundary_by_attempt_ms"]
+    assert attempt in samples
+    assert samples[attempt] >= 1200
+    assert context.metrics["sell_tick_to_broker_boundary_ms"] == samples[attempt]
+    assert claims.health()["unresolved_execution_actions"] == 1
