@@ -20,7 +20,7 @@ from trader.us.execution.tick_context import TickExecutionContext
 from trader.us.execution.order_router import route_order, _semantic_action_identity
 from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
 from tests.us.test_us_route_order_claim_boundary import (
-    _route_fixture, _native_kis_client, _identity, _intent, _generated_pb1_buy,
+    _route_fixture, _native_kis_client, _identity, _intent,
 )
 
 
@@ -29,7 +29,7 @@ def _p95_nearest_rank(samples: list[float]) -> float:
     return sorted(samples)[math.ceil(len(samples) * .95)-1]
 
 
-def test_pr243_twenty_native_sell_http_and_generated_buy(monkeypatch, tmp_path):
+def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
     from trader.us.execution import order_router
     from trader.us.execution.kis_us_client import KisUSClient
     import requests
