@@ -10,6 +10,7 @@ on:
       - "trader/reconcile_kis.py"
       - "trader/kr/unpriced_sell_audit.py"
       - "tests/kr/test_kr_20261020_bulk_dedupe_postsubmit_reconcile.py"
+      - "scripts/kr244_reconcile_day.py"
       - ".github/workflows/kr244-offline-order-reconcile-ci.yml"
 
 permissions:
@@ -39,6 +40,6 @@ jobs:
           python -m pip install pytest
       - name: Compile changed modules
         run: |
-          python -m py_compile trader/db/repos.py trader/pb1_engine.py trader/pb1_runner.py trader/reconcile_kis.py trader/kr/unpriced_sell_audit.py
+          python -m py_compile trader/db/repos.py trader/pb1_engine.py trader/pb1_runner.py trader/reconcile_kis.py trader/kr/unpriced_sell_audit.py scripts/kr244_reconcile_day.py
       - name: Run isolated SQLite and source-path regressions
         run: python -m pytest -q tests/kr/test_kr_20261020_bulk_dedupe_postsubmit_reconcile.py
