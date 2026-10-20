@@ -15,9 +15,15 @@ from trader.us.execution.kis_us_client import KisUSClient, KisUSClientError
 
 
 def _row(symbol, order, broker_day, broker_time, fill="0", qty="1"):
+    from datetime import datetime, timedelta
+    us_day = datetime.strptime(broker_day, "%Y%m%d")
+    # Actual KIS provides US-local ORD_DT and independent KST DMST_ORD_DT.
+    domestic = (us_day + timedelta(days=1) if int(broker_time[:2]) < 12
+                else us_day).strftime("%Y%m%d")
     return {
         "odno": order, "pdno": symbol, "sll_buy_dvsn_cd": "01",
         "ord_dt": broker_day, "ord_tmd": broker_time,
+        "dmst_ord_dt": domestic,
         "ft_ord_qty": qty, "ft_ccld_qty": fill,
         "nccs_qty": str(int(qty) - int(fill)),
     }
