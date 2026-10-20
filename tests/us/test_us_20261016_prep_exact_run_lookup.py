@@ -92,5 +92,7 @@ def test_preflight_and_cleanup_resolve_specific_completed_artifact():
         "scripts/wsl/run-us-prep.sh",
     ):
         script = Path(file).read_text(encoding="utf-8")
-        assert "load_us_prep_completion_for_run" in script
+        assert "check_effective_prep_sources(trade_date)" in script
+        helper = Path("trader/us/prep_effective.py").read_text(encoding="utf-8")
+        assert "load_us_prep_completion_for_run(trade_date, run_id)" in helper
         assert "load_latest_us_prep_status" not in script
