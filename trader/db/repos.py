@@ -4148,6 +4148,47 @@ class OrdersRepo:
         )
         return rows[0] if rows else None
 
+    def get_order_by_kis_odno_scoped(
+        self, env: str, kis_odno: str, *, trade_date: date, code: str, side: str,
+    ) -> dict | None:
+        """Bind actual KIS execution ONLY to a unique same-day KR source order.
+
+        Broker numbers may be recycled across days. Never use symbol-only or
+        unscoped order-number lookup to mutate an existing position lifecycle.
+        Missing/ambiguous matches remain unattributed for later review.
+        """
+        broker_id = str(kis_odno or "").strip()
+        symbol = str(code or "").strip().lstrip("A").zfill(6)
+        direction = str(side or "").strip().upper()
+        if not broker_id or not isinstance(trade_date, date) or not symbol or direction not in {"BUY", "SELL"}:
+            return None
+        start_kst = pytz.timezone("Asia/Seoul").localize(datetime.combine(trade_date, datetime.min.time()))
+        end_kst = start_kst + timedelta(days=1)
+        if self.engine.dialect.name == "postgresql":
+            start, end = start_kst.astimezone(pytz.UTC), end_kst.astimezone(pytz.UTC)
+        else:
+            start, end = start_kst.replace(tzinfo=None), end_kst.replace(tzinfo=None)
+        stmt = select(self._schema.orders).where(and_(
+            self._schema.orders.c.env == env,
+            self._schema.orders.c.side == direction,
+            self._schema.orders.c.code == symbol,
+            self._schema.orders.c.created_at >= start,
+            self._schema.orders.c.created_at < end,
+            or_(self._schema.orders.c.kis_odno == broker_id,
+                self._schema.orders.c.broker_order_id == broker_id),
+        )).limit(2)
+        matches = self._read_mappings_with_guard(
+            stmt, op_name="orders.get_order_by_kis_odno_scoped", fail_open=False,
+        )
+        if len(matches) > 1:
+            logger.error(
+                "[RECONCILE][BROKER_ORDER_AMBIGUOUS] code=%s side=%s trade_date=%s "
+                "matched=%s action=KEEP_UNATTRIBUTED",
+                symbol, direction, trade_date, len(matches),
+            )
+            return None
+        return matches[0] if matches else None
+
     def has_blocking_order_today(
         self,
         env: str,
