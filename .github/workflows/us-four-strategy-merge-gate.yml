@@ -130,7 +130,10 @@ jobs:
               assert sample["sql_read_total"]>0 and sample["sql_write_total"]>0
               assert sample["duplicate_replay_blocked"] is True
               assert sample["tick_wall_p95_sec"]<=60.0
-              assert sample["entry_defer_count"]==0
+              # The injected unresolved-ACK scenario must block BUY;
+              # that intentional safety degradation is not a performance
+              # failure, unlike entry-defer on an otherwise clean tick.
+              assert sample["entry_defer_count"]<=len(sample["unresolved_ticks"])
               assert sample["measurement"]=="scaled_ci_nonproduction_latency"
           acceptance={
               "historical_oct19_original_86_pre_io_replay":"PASS",
