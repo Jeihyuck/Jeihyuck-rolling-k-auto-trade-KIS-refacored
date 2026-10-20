@@ -19030,10 +19030,17 @@ class PB1Engine:
                             duplicate_intent_exists = False
                             duplicate_intent_status = ""
                             if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
-                                if bulk_prior_intents_enabled and str(cf.client_order_key) in prior_intent_keys:
-                                    existing_order = prior_intent_by_key.get(str(cf.client_order_key))
+                                if bulk_prior_intents_enabled:
+                                    if str(cf.client_order_key) in prior_intent_keys:
+                                        existing_order = prior_intent_by_key.get(str(cf.client_order_key))
+                                    else:
+                                        # Dynamically assigned keys still require strict proof.
+                                        late_rows = self.orders_repo.list_orders_by_client_order_keys(
+                                            self.env, [cf.client_order_key],
+                                        )
+                                        existing_order = late_rows[0] if late_rows else None
                                 else:
-                                    # Compatibility with stub repos / keys created after the snapshot.
+                                    # Legacy stub compatibility; production uses the strict bulk path.
                                     existing_order = self.orders_repo.get_order_by_client_order_key(
                                         self.env, cf.client_order_key,
                                     )
