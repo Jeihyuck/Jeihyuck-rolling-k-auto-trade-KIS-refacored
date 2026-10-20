@@ -3,7 +3,9 @@ from pathlib import Path
 
 def test_preflight_uses_final30_scored_not_locked_watchlist():
     script = Path('scripts/wsl/check-us-prep-before-am.sh').read_text()
-    assert 'final30_scored.json' in script
+    assert 'check_effective_prep_sources' in script
+    helper = Path('trader/us/prep_effective.py').read_text()
+    assert 'load_us_final30_scored(trade_date)' in helper
     assert 'locked_watchlist.json' not in script
 
 

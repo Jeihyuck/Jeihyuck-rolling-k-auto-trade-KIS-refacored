@@ -1398,3 +1398,40 @@ def test_route_post_io_observation_failure_surfaces_reconcile_integrity(monkeypa
     assert broker.calls == 1
     assert claim_repo.health()["unresolved_execution_actions"] == 1
     assert repos.load_execution_claim_health()["unresolved_execution_actions"] == 1
+
+
+def test_oct19_native_practice_guard_reaches_http_ack_and_duplicate_is_fenced(monkeypatch):
+    """Actual router + actual client guard (previous tests bypassed this guard)."""
+    import requests
+    from trader.us import config
+    native_guard = config.assert_us_paper_order_allowed
+    _engine, claim_repo, _broker = _route_fixture(monkeypatch)
+    http_events = []
+    client = _native_kis_client(monkeypatch, http_events)
+    monkeypatch.setattr(config, 'assert_us_paper_order_allowed', native_guard)
+    for key, value in dict(TRADING_REGION='US', KIS_ENV='practice',
+                           US_PAPER_TRADING_ENABLED=True, US_LIVE_TRADING_ENABLED=True,
+                           DISABLE_REAL_TRADING=True, DRY_RUN=False).items():
+        monkeypatch.setattr(config, key, value)
+
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {'rt_cd': '0', 'order_no': 'PRACTICE-1'}
+    def post(*args, **kwargs):
+        http_events.append('HTTP')
+        return Response()
+    monkeypatch.setattr(requests, 'post', post)
+    monkeypatch.setattr(client, 'get_balance', lambda **kw: {
+        'positions': [{'symbol': 'TEST_SYMBOL', 'qty': 1, 'orderable_qty': 1,
+                       'exchange': 'NASDAQ'}]}, raising=False)
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: pytest.fail('unexpected network GET'))
+    intent = _intent('2026-10-19', side='SELL', action='HARD_STOP',
+                     client_order_key='oct19-native-practice-sell')
+    result = route_order(intent, kis_client=client)
+    assert result['status'] == 'ACK', result
+    assert http_events == ['HTTP']
+    second = route_order(intent, kis_client=client)
+    assert second['status'] in {'ORDER_FENCED_UNRESOLVED_ACTION', 'WARN_DUPLICATE_EXIT_BLOCKED'}
+    assert http_events == ['HTTP']

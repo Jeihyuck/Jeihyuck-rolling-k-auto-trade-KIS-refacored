@@ -2175,13 +2175,23 @@ def run_trade_tick(
         _active_claim_replay_started = time.monotonic()
         try:
             from trader.us.execution.order_journal import replay_order_journal
+            # Historical recovery is bounded before protective exits. The
+            # original provider/client keeps its normal order deadline; only
+            # this isolated read-only client receives the short stage budget.
+            recovery_deadline = time.monotonic() + 10.0
+            recovery_provider = (
+                provider.fork_for_stage(stage_deadline=recovery_deadline)
+                if callable(getattr(provider, "fork_for_stage", None)) else provider
+            )
             active_claim_recovery_result = replay_order_journal(
                 trade_date,
                 session_run_id=session_run_id,
                 tick_id=tick_id,
-                provider=provider,
+                provider=recovery_provider,
                 include_active_claims=True,
                 active_claims_only=True,
+                deadline_monotonic=recovery_deadline,
+                active_claim_offset=max(0, int(tick_index or 1) - 1),
             )
             ack_recon["active_claim_recovery"] = active_claim_recovery_result
             logger.info("[US_RECONCILE][ACTIVE_CLAIM_RECOVERY] result=%s", active_claim_recovery_result)

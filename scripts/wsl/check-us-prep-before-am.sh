@@ -43,59 +43,14 @@ check() {
 "$PYTHON_BIN" - "$trade_date" <<'PY'
 import sys
 trade_date=sys.argv[1]
-from trader.us.prep_effective import is_effective_prep_contract, is_effective_prep_status
-artifact_ok=False
-contract={}
+from trader.us.prep_effective import check_effective_prep_sources
 try:
-    # Canonical artifact remains runtime/us/watchlist/<trade_date>/final30_scored.json.
-    # Entry-blocked OK_WITH_WARNINGS_* states are still completed PREP contracts;
-    # preflight must not convert them into EXIT_ONLY solely because of status text.
-    from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
-    contract = load_us_prep_contract(trade_date) or {}
-    rows = load_us_final30_scored(trade_date) or []
-    status = str(contract.get('status') or '').upper()
-    artifact_ok = is_effective_prep_contract(contract, rows, trade_date=trade_date, min_rows=10)
-    if artifact_ok:
-        print('OK artifact final30_scored_count=%d prep_status=%s' % (len(rows), status))
-    else:
-        print('ARTIFACT_CONTRACT_FAIL count=%d prep_status=%s' % (len(rows), status))
+    result = check_effective_prep_sources(trade_date)
+    print('[US_PREP_PREFLIGHT][SOURCE_CHECK]', result)
+    raise SystemExit(0 if result['ok'] else 1)
 except Exception as exc:
-    print('ARTIFACT_CHECK_WARN %s' % exc)
-
-db_ok=False
-try:
-    from trader.us.db.repos import load_us_prep_completion_for_run, load_locked_us_watchlist
-    from trader.us.prep_effective import locked_rows_match_prep_run
-    from trader.us.score_columns import validate_us_entry_provenance_contract
-    prep=load_us_prep_completion_for_run(trade_date, str(contract.get('run_id') or '')) if artifact_ok else {}
-    rows=load_locked_us_watchlist(trade_date=trade_date, min_count=10, allow_degraded=True) or []
-    provenance=validate_us_entry_provenance_contract(rows)
-    # An unrelated STARTED/completed run must not validate an old locked
-    # watchlist.  The artifact, DB completion and rows must refer to one run.
-    artifact_run_id = str(contract.get('run_id') or '').strip() if artifact_ok else ''
-    db_run_id = str(prep.get('run_id') or '').strip()
-    db_ok = (
-        is_effective_prep_status(prep.get('status'))
-        and len(rows) >= 10
-        and provenance.get('ok') is True
-        and locked_rows_match_prep_run(prep, rows)
-        and bool(artifact_run_id)
-        and artifact_run_id == db_run_id
-    )
-    if db_ok:
-        print(
-            'OK db locked_watchlist_count=%d prep_status=%s provenance_valid=%d/%d'
-            % (len(rows), prep.get('status'), provenance.get('valid_count', 0), provenance.get('total', 0))
-        )
-    else:
-        print(
-            'DB_LIVE_CONTRACT_FAIL count=%d prep_status=%s provenance_invalid=%s'
-            % (len(rows), prep.get('status'), provenance.get('invalid', []))
-        )
-except Exception as exc:
-    print('DB_CHECK_WARN %s' % exc)
-
-raise SystemExit(0 if artifact_ok and db_ok else 1)
+    print('[US_PREP_PREFLIGHT][SOURCE_CHECK_ERROR] type=%s' % type(exc).__name__)
+    raise SystemExit(1)
 PY
 }
 if check; then rm -f "$marker"; exit 0; fi

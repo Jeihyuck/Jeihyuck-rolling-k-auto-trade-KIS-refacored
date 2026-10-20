@@ -71,5 +71,4 @@ def test_completed_contract_cannot_clear_exit_only_with_other_run_rows():
 
 def test_preflight_requires_artifact_db_locked_watchlist_same_run_id():
     code = Path("scripts/wsl/check-us-prep-before-am.sh").read_text()
-    assert "locked_rows_match_prep_run(prep, rows)" in code
-    assert "artifact_run_id == db_run_id" in code
+    assert "check_effective_prep_sources(trade_date)" in code

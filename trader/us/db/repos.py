@@ -467,6 +467,8 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         and _parse_json_meta(event.get("meta")).get("broker_recovery_status") == "REBOUND"
         for event in events
     )
+    from trader.us.execution.order_journal import proven_unsent_attempts
+    unsent_attempts = proven_unsent_attempts(events)
     failed_attempts: dict[tuple[str, str], bool] = {}
     failure_events = {
         "JOURNAL_REPLAY_UNRESOLVED",
@@ -495,6 +497,8 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         )
         if not any(attempt_key):
             attempt_key = ("", str(event.get("event_id") or id(event)))
+        if attempt_key in unsent_attempts:
+            continue
         failed_attempts[attempt_key] = event_type in failure_events
     failed_rebounds = sum(failed_attempts.values()) + len(unattributed)
     cumulative_fill_qty_by_key: dict[str, int] = {}
@@ -3045,6 +3049,8 @@ def _broker_fill_recovery_candidates(fill: dict, *, trade_date: str) -> tuple[st
     potential_candidates: list[dict] = []
     exact_candidates: list[dict] = []
     qualified_candidates: list[dict] = []
+    from trader.us.execution.order_journal import proven_unsent_attempts
+    unsent_attempts = proven_unsent_attempts(events)
     for key in sorted(set(order_by_key) | set(intent_by_key)):
         local_order = order_by_key.get(key) or {}
         local_intent = intent_by_key.get(key) or {}
@@ -3056,6 +3062,7 @@ def _broker_fill_recovery_candidates(fill: dict, *, trade_date: str) -> tuple[st
             event for event in events
             if str(event.get("client_order_key") or "") == key
             and str(event.get("event_type") or "") == "BROKER_SUBMIT_STARTED"
+            and (key, str(event.get("submit_attempt_id") or "")) not in unsent_attempts
         ]
         if not key_events:
             continue

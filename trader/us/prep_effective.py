@@ -89,3 +89,37 @@ def is_effective_prep_contract(
     if score_nonzero_count != declared_count:
         return False
     return True
+
+
+def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict[str, Any]:
+    """One read-only artifact/DB/provenance verdict for all WSL PREP gates.
+
+    Recovery may skip rebuilding only when preflight would accept these exact
+    sources. Missing identity never falls back to a newer/unrelated DB run.
+    Entry-blocked completed contracts remain completed without granting BUYs.
+    """
+    from trader.us.path_contract import load_us_final30_scored, load_us_prep_contract
+    from trader.us.db.repos import load_us_prep_completion_for_run, load_locked_us_watchlist
+    from trader.us.score_columns import validate_us_entry_provenance_contract
+
+    contract = load_us_prep_contract(trade_date) or {}
+    artifact_rows = load_us_final30_scored(trade_date) or []
+    run_id = str(contract.get("run_id") or "").strip()
+    result = {"ok": False, "trade_date": trade_date, "reason": "artifact_contract_invalid"}
+    if not is_effective_prep_contract(contract, artifact_rows, trade_date=trade_date, min_rows=min_rows):
+        return result
+    if not run_id:
+        return {**result, "reason": "artifact_run_id_missing"}
+    prep = load_us_prep_completion_for_run(trade_date, run_id) or {}
+    locked_rows = load_locked_us_watchlist(trade_date=trade_date, min_count=min_rows, allow_degraded=True) or []
+    provenance = validate_us_entry_provenance_contract(locked_rows)
+    same_run = run_id == str(prep.get("run_id") or "").strip()
+    ok = (
+        same_run and is_effective_prep_status(prep.get("status"))
+        and len(locked_rows) >= min_rows
+        and provenance.get("ok") is True
+        and locked_rows_match_prep_run(prep, locked_rows)
+    )
+    return {**result, "ok": bool(ok), "reason": "ok" if ok else "db_live_contract_invalid",
+            "status": contract.get("status"), "artifact_count": len(artifact_rows),
+            "locked_count": len(locked_rows), "provenance_ok": provenance.get("ok") is True}

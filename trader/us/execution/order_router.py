@@ -2008,6 +2008,22 @@ def route_order(
                 type(exc).__name__,
             )
         if isinstance(exc, KisUSPreSubmitError):
+            # Exception text may contain credentials/URLs: log only allowlisted
+            # guard codes and exception classes, while preserving journal detail.
+            guard_codes = (
+                "trading_region_not_us", "kis_env_not_practice",
+                "paper_trading_not_enabled", "us_live_trading_disabled",
+                "disable_real_trading_enabled", "dry_run_enabled",
+                "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP", "US_KIS_ORDER_ALLOWED=0",
+            )
+            failure_code = next((code for code in guard_codes if code in str(exc)),
+                                "pre_http_setup_failed")
+            logger.error(
+                "[US_ORDER][PRE_IO_FAILURE] symbol=%s side=%s attempt=%s "
+                "code=%s error_type=%s cause_type=%s broker_submit=0",
+                symbol_upper, side, intent["submit_attempt_id"], failure_code,
+                type(exc).__name__, type(exc.__cause__).__name__,
+            )
             integrity_error = str(exc)
             try:
                 append_order_event(
