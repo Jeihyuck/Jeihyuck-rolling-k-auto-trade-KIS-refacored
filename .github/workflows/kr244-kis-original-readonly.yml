@@ -4,6 +4,8 @@ name: KR244 Practice KIS Original Fills Readonly
     branches: [dual-agent]
     paths:
       - "scripts/kr244_kis_readonly_probe.py"
+      - "trader/kis_wrapper.py"
+      - "trader/kr/runtime_integrity_20260929.py"
       - ".github/workflows/kr244-kis-original-readonly.yml"
 permissions:
   contents: read
