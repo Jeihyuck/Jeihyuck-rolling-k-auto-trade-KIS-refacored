@@ -81,7 +81,12 @@ jobs:
                   print("[US243][APPLIED]",doc["date"],doc["symbol"],doc["qty"],doc["avg_price"])
               if doc["mode"]=="APPLY_DONE":
                   print("[US243][APPLIED][DURABLE]",doc["actual_fills_verified"])
-          assert sum(d.get("mode")=="APPLIED_VERIFIED_BROKER_FILL" for d in records)==7
+          preflight=next(d for d in records if d.get("mode")=="PRE_APPLY_KIS_EVIDENCE")
+          newly_applied=sum(d.get("mode")=="APPLIED_VERIFIED_BROKER_FILL" for d in records)
+          assert preflight["verified_count"]==7
+          assert newly_applied+preflight["already_settled_count"]==7
+          print("[US243][RECOVERY] previously settled",preflight["already_settled_count"],
+                "newly settled",newly_applied)
           assert records[-1]["mode"]=="APPLY_DONE"
           PY
       - name: Independent new-process restart verification, no writes
