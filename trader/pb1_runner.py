@@ -6033,6 +6033,51 @@ def run_once(
             evaluated_positions, len(policy_orders), len(policy_results),
             accepted_policy_sells, max(0, evaluated_positions - len(policy_orders)),
         )
+        # The pre-policy reconciliation cannot observe orders sent *after* it.
+        # After all protective close SELL submissions, fetch KIS daily-ccld
+        # once more and persist ONLY execution details proved by that feed.
+        # No order is created/retried here. A missing broker price must stay
+        # unresolved; accepted KIS order IDs alone are not filled orders.
+        if (
+            accepted_policy_sells > 0
+            and kis is not None
+            and not parse_bool_any(dry_run, default=True)
+            and parse_bool_any(
+                os.getenv(
+                    "KR_CLOSE_POSTSUBMIT_RECONCILE",
+                    "1" if str(env_effective).lower() == "practice" else "0",
+                ), default=False,
+            )
+        ):
+            try:
+                post_ctx = RunContext(
+                    run_id=os.getenv("TRADER_RUN_ID") or "kr-close-postsubmit",
+                    env=env_effective,
+                    strategy="pb1_pullback_close",
+                    started_at=now_kst(),
+                    dry_run=False,
+                )
+                post_result = reconcile_today(engine=engine, kis=kis, ctx=post_ctx) or {}
+                logger.info(
+                    "[KR_CLOSE][POSTSUBMIT_RECONCILE] accepted=%s broker_rows=%s "
+                    "fills_added=%s ok=%s ccld_status=%s degraded=%s "
+                    "unresolved_requires_next_reconcile=1",
+                    accepted_policy_sells,
+                    post_result.get("orders", 0),
+                    post_result.get("fills", 0),
+                    int(bool(post_result.get("ok"))),
+                    post_result.get("ccld_status"),
+                    post_result.get("degraded"),
+                )
+            except Exception as exc:
+                # A read-only broker outage must not re-submit close SELLs,
+                # and an unresolved ACK must remain fenced for later matching.
+                logger.error(
+                    "[KR_CLOSE][POSTSUBMIT_RECONCILE][DEFER] err_type=%s "
+                    "reason=BROKER_EVIDENCE_UNAVAILABLE action=RETAIN_UNRESOLVED_NO_RETRY",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
         return [], True, {
             "buy_orders": 0,
             "sell_orders": accepted_policy_sells,
