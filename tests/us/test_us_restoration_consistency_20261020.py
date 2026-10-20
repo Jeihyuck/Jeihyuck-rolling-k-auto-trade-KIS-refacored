@@ -294,6 +294,8 @@ def test_authentic_oct20_kis_source_contract_replay_seven_actual_six_open_restar
         ))
     client = object.__new__(KisUSClient)
     client.env = "practice"
+    client._cano = "test-cano"
+    client._acnt_prdt_cd = "01"
     client._assert_not_offline = lambda *args: None
     client._build_headers = lambda _trid: {"tr_id": "VTTS3035R"}
     def fake_kis_get(_path, headers, params, suppress_final_log=False):
