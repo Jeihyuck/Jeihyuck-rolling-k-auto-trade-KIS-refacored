@@ -201,3 +201,15 @@ def test_retry_prefix_read_failure_keeps_candidate_fenced(monkeypatch):
     with pytest.raises(RuntimeError, match="cannot prove"):
         PB1Engine._next_retry_client_order_key(obj, "practice:pb1:test")
     engine.dispose()
+
+
+def test_historical_reconcile_needs_explicit_trade_date_and_apply_flag():
+    import inspect
+    from trader.reconcile_kis import reconcile_today
+    from scripts.kr244_reconcile_day import main
+
+    assert "trade_date" in inspect.signature(reconcile_today).parameters
+    with pytest.raises(SystemExit):
+        main(["--env", "real", "--trade-date", "2026-10-20", "--apply-verified"])
+    with pytest.raises(SystemExit):
+        main(["--env", "practice", "--trade-date", "2030-01-01"])
