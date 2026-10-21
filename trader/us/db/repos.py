@@ -1780,18 +1780,41 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                         and (raw_row or {}).get("remaining_qty_present") is True
                         and bool(_cancel_claim_key and _cancel_attempt_id)
                     )
-                    if _cancel_zero_fill_proven:
+                    # A TQQQ order may partly execute before its TTL cancel.
+                    # The economic fill is already persisted above; the
+                    # remaining broker order is now zero, while the strategy
+                    # still needs requested_qty - filled_qty shares.  Mark the
+                    # original Attempt terminal in this same cancellation
+                    # transaction, not merely PARTIALLY_FILLED with an eternal
+                    # active Claim.  Never extend this owner-specific terminal
+                    # rule to unrelated PB1/US_STANDARD strategies.
+                    _tqqq_partial_cancel_proven = (
+                        status == "CANCELLED"
+                        and str(key).startswith("TQQQ_INF_V3:")
+                        and 0 < (filled_qty_value or 0) < int(requested_qty)
+                        and broker_remaining_qty == 0
+                        and action_remaining_qty == int(requested_qty) - int(filled_qty_value)
+                        and broker_requested_valid
+                        and broker_requested_qty == int(requested_qty)
+                        and (raw_row or {}).get("filled_qty_present") is True
+                        and (raw_row or {}).get("remaining_qty_present") is True
+                        and bool(_cancel_claim_key and _cancel_attempt_id)
+                    )
+                    if _cancel_zero_fill_proven or _tqqq_partial_cancel_proven:
                         _cancel_snapshot = record_execution_action_observation_by_key(
                             _cancel_claim_key,
                             attempt_id=_cancel_attempt_id,
                             state="CANCELLED",
-                            cumulative_filled_qty=0,
+                            cumulative_filled_qty=int(filled_qty_value),
                             authoritative=True,
                             _conn=conn,
                         )
-                        if _cancel_snapshot.action_state not in {
-                            "RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED",
-                        }:
+                        _valid_terminal = (
+                            {"PARTIALLY_SATISFIED"}
+                            if _tqqq_partial_cancel_proven
+                            else {"RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED"}
+                        )
+                        if _cancel_snapshot.action_state not in _valid_terminal:
                             raise RuntimeError("cancel_claim_terminal_state_not_confirmed")
                         atomic_cancel_claim_applied = True
             except Exception as _cancel_atomic_exc:
@@ -5273,13 +5296,13 @@ def mark_order_filled_by_reconcile(
                 evidence=evidence, _conn=conn,
             )
         if claim_error:
-            return {
-                **result,
-                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
-                "execution_claim_update_error": claim_error,
-                "requires_reconcile": True,
-                "retry_order": False,
-            }
+            # Never return an error from inside engine.begin(): the context
+            # manager would COMMIT the already-written us_orders/us_fills.
+            # The exact Claim and economic truth must succeed or roll back
+            # as one PostgreSQL transaction (including caller-owned _conn).
+            raise RuntimeError(
+                "US_ATOMIC_CLAIM_FILL_APPLY_FAILED:" + str(claim_error)[:200]
+            )
         return result
     except FillAccountingInvariantError as exc:
         if _conn is not None:
@@ -5290,7 +5313,11 @@ def mark_order_filled_by_reconcile(
         if _conn is not None:
             raise
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
-        return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
+        return {
+            "status": "RECONCILE_UPDATE_FAILED", "error": str(exc),
+            "requires_reconcile": True, "retry_order": False,
+            "entry_fence": True,
+        }
 
 def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
     """Verify order qty_filled against active actual/synthetic accounting evidence."""
