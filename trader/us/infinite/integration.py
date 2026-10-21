@@ -438,6 +438,66 @@ def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: 
         result["pending"] += 1
         return False
 
+    # A prior TTL pass may have persisted us_orders=CANCELLED but failed to
+    # terminalize the matching execution claim (e.g. pre-fix semantic/open
+    # quantity conflation).  Such orders are absent from the pending-order TTL
+    # scan.  Inspect at most a small bounded set, without issuing another
+    # cancel or treating the local CANCELLED row alone as broker proof.
+    cancelled_loader = getattr(repository, "load_cancelled_uncertain_buy_orders", None)
+    if callable(cancelled_loader):
+        try:
+            cancelled_uncertain = cancelled_loader(symbol="TQQQ", limit=5)
+        except Exception as exc:
+            logger.error(
+                "[TQQQ_INF][CANCELLED_CLAIM_RECOVERY][LOAD_FAILED] error=%s",
+                exc,
+            )
+            inc("cancelled_claim_load_failed")
+            cancelled_uncertain = []
+        result["cancelled_claim_candidates"] = len(cancelled_uncertain)
+        for old_order in cancelled_uncertain:
+            original_no = str(old_order.get("order_no") or "")
+            original_key = str(old_order.get("client_order_key") or "")
+            if not original_no or not original_key:
+                inc("cancelled_claim_pending")
+                continue
+            try:
+                fresh_observation = query_order(
+                    order_no=original_no, client_order_key=original_key,
+                    symbol="TQQQ", side="BUY",
+                ) or {}
+                cancel_proof = cancel_ack_zero_remaining_terminal(
+                    old_order, fresh_observation
+                )
+                # Fresh exact terminal order proof also qualifies, but no
+                # amount of locally stored cancellation metadata alone does.
+                proof = cancel_proof or (
+                    fresh_observation
+                    if terminal_observation(old_order, fresh_observation)
+                    else None
+                )
+                if proof is None:
+                    inc("cancelled_claim_pending")
+                    logger.warning(
+                        "[TQQQ_INF][CANCELLED_CLAIM_RECOVERY][PENDING] "
+                        "order_no=%s key=%s reason=fresh_terminal_proof_missing",
+                        original_no, original_key,
+                    )
+                    continue
+                if persist_terminal_or_pending(
+                    old_order, proof, trigger="cancelled_claim_durable_recovery",
+                ):
+                    inc("cancelled_claim_recovered")
+                else:
+                    inc("cancelled_claim_pending")
+            except Exception as exc:
+                inc("cancelled_claim_pending")
+                logger.exception(
+                    "[TQQQ_INF][CANCELLED_CLAIM_RECOVERY][ERROR] "
+                    "order_no=%s key=%s error=%s",
+                    original_no, original_key, exc,
+                )
+
     for order in expired:
         order_no = str(order.get("order_no") or "")
         client_order_key = str(order.get("client_order_key") or "")
