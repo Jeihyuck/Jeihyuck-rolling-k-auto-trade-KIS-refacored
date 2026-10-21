@@ -1370,11 +1370,12 @@ def run_trade_session(
             if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
                 raise RuntimeError("US_SHADOW_RECONCILE_PRACTICE_ONLY")
             _shadow_env = dict(os.environ)
-            # Child requires only DB read credentials and process scope. Even
-            # accidental future KIS helpers fail closed without broker keys.
+            # Keep CANO/product identity for the SAME canonical hashed
+            # account-scope derivation as the parent. They are never logged.
+            # Strip API credentials so accidental KIS use remains impossible.
             for _name in (
                 "KIS_APP_KEY", "KIS_APP_SECRET", "APP_KEY", "APP_SECRET",
-                "CANO", "ACNT_PRDT_CD", "KIS_ACCESS_TOKEN", "KIS_REFRESH_TOKEN",
+                "KIS_ACCESS_TOKEN", "KIS_REFRESH_TOKEN",
             ):
                 _shadow_env.pop(_name, None)
             _shadow_env["US_OFFLINE"] = "1"
