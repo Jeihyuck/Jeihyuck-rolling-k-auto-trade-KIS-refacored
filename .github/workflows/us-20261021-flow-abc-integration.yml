@@ -36,7 +36,9 @@ jobs:
       ALLOW_REAL_ORDER: "0"
       US_LIVE_TRADING_ENABLED: "0"
       DISABLE_REAL_TRADING: "1"
-      DRY_RUN: "1"
+      # Do not force DRY_RUN into tests that intentionally prove risk-gate
+      # acceptance with synthetic router adapters. US_OFFLINE and no-order
+      # credentials still prevent live broker requests.
       PYTHONPATH: "."
       PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
     steps:
