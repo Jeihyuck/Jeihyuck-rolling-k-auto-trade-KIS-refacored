@@ -1319,7 +1319,82 @@ def _load_close_order_attempt_truth(*, provider: Any, trade_date: str, env: str)
         broker_rows = provider.get_today_orders(trade_date)
         if not isinstance(broker_rows, list):
             raise RuntimeError("broker_order_book_unavailable_or_invalid")
+        # KIS practice inquiry may omit the cancel-operation marker and
+        # original-order reference on the *cancel ACK ODNO* row.  Associate it
+        # only when the durable original ORDER_CANCELLED event also retains a
+        # successful exact cancel ACK for that ODNO, and a fresh original-order
+        # broker row proves zero fill/zero open.  An unrelated zero-fill BUY
+        # must never be hidden as a cancellation.
+        cancel_links: dict[str, list[dict]] = {}
+        for event in events:
+            if str(event.get("event_type") or "") != "ORDER_CANCELLED":
+                continue
+            key = str(event.get("client_order_key") or "")
+            if not key.startswith("TQQQ_INF_V3:"):
+                continue
+            metadata = event.get("meta") or {}
+            if not isinstance(metadata, dict):
+                continue
+            ack = metadata.get("tqqq_ttl_cancel_result") or {}
+            if not isinstance(ack, dict):
+                continue
+            output = ack.get("output") if isinstance(ack.get("output"), dict) else {}
+            cancel_no = normalize_us_order_no(output.get("ODNO") or "")
+            original_no = normalize_us_order_no(_order_no(event))
+            if not cancel_no or not original_no or cancel_no == original_no:
+                continue
+            if str(ack.get("rt_cd") or "") != "0":
+                continue
+            if not (
+                str(ack.get("msg_cd") or "") == "40630000"
+                or "취소주문이 완료" in str(ack.get("msg1") or "")
+                or ("cancel order" in str(ack.get("msg1") or "").lower()
+                    and "complete" in str(ack.get("msg1") or "").lower())
+            ):
+                continue
+            cancel_links.setdefault(cancel_no, []).append({
+                "original_order_no": original_no,
+                "symbol": str(event.get("symbol") or "").upper(),
+                "side": str(event.get("side") or "").upper(),
+                "client_order_key": key,
+            })
+
         for broker_row in broker_rows:
+            cancel_no = normalize_us_order_no(_order_no(broker_row))
+            durable = cancel_links.get(cancel_no) or []
+            if len(durable) == 1:
+                link = durable[0]
+                originals = [
+                    row for row in broker_rows
+                    if normalize_us_order_no(_order_no(row)) == link["original_order_no"]
+                    and str(row.get("symbol") or "").upper() == link["symbol"]
+                    and str(row.get("side") or "").upper() == link["side"]
+                ]
+                matching_attempts = [
+                    attempt for attempt in attempts
+                    if normalize_us_order_no(_order_no(attempt)) == link["original_order_no"]
+                    and str(attempt.get("client_order_key") or "") == link["client_order_key"]
+                ]
+                orig = originals[0] if len(originals) == 1 else {}
+                explicit_zero = (
+                    orig.get("filled_qty_present") is True
+                    and orig.get("remaining_qty_present") is True
+                    and orig.get("filled_qty") == 0
+                    and orig.get("remaining_qty") == 0
+                    and int(orig.get("requested_qty") or 0) > 0
+                    and int(orig.get("requested_qty") or 0) == int(broker_row.get("requested_qty") or 0)
+                    and broker_row.get("filled_qty_present") is True
+                    and broker_row.get("filled_qty") == 0
+                    and broker_row.get("remaining_qty_present") is True
+                    and broker_row.get("remaining_qty") == 0
+                    and str(broker_row.get("symbol") or "").upper() == link["symbol"]
+                    and str(broker_row.get("side") or "").upper() == link["side"]
+                )
+                if len(matching_attempts) == 1 and explicit_zero:
+                    matching_attempts[0].setdefault(
+                        "_broker_cancel_operation_nos", []
+                    ).append(cancel_no)
+                    continue
             if str(broker_row.get("broker_operation") or "").upper() == "CANCEL":
                 # A KIS cancel request has its own ODNO and inherits the
                 # original BUY/SELL side.  It is NOT an additional trade.
