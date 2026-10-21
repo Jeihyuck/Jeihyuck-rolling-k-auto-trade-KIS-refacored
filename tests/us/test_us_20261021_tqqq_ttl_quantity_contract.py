@@ -230,7 +230,9 @@ def test_cancelled_uncertain_claim_retains_fence_without_broker_evidence():
         repository=Repo(), now=datetime(2026, 10, 20, 15, tzinfo=timezone.utc),
         ttl_seconds=180,
         cancel_order=lambda **kw: pytest.fail("no second cancel"),
-        query_order=lambda **kw: _observation(),
+        # A broker-confirmed CANCELLED row is itself terminal proof.  Use
+        # a nonterminal ACK_PENDING row to test the missing-proof fence.
+        query_order=lambda **kw: {**_observation(), "status": "ACK_PENDING"},
     )
     assert result["cancelled_claim_pending"] == 1
     assert result.get("cancelled_claim_recovered", 0) == 0
