@@ -213,6 +213,42 @@ class InfiniteRepository:
             rows = conn.execute(text(sql), params).mappings().all()
         return [dict(row) for row in rows]
 
+    def load_cancelled_uncertain_buy_orders(
+        self, *, symbol: str = "TQQQ", limit: int = 5,
+    ) -> list[dict]:
+        """Find terminal local orders whose exact durable claim is still active.
+
+        A cancelled order drops out of the regular pending-order TTL scan.
+        Without this query a failed claim update can fence the sleeve forever.
+        This is read-only; no stale claim is released without fresh KIS proof.
+        """
+        if symbol.upper() != "TQQQ":
+            raise ValueError("cancelled claim recovery is TQQQ owner scoped")
+        with self.engine.connect() as conn:
+            epoch_id = self._epoch_id(conn)
+            sql = """
+                SELECT o.* FROM us_orders o
+                JOIN us_execution_claims a
+                  ON a.action_key = o.meta->>'execution_action_key'
+                 AND a.active_attempt_id = o.meta->>'submit_attempt_id'
+                 AND a.trade_date = o.trade_date
+                 AND a.env = o.env
+                 AND a.trading_epoch_id = o.trading_epoch_id
+                 AND a.strategy_owner = 'TQQQ_INFINITE'
+                 AND a.market = 'US'
+                WHERE o.symbol=:symbol AND o.side='BUY'
+                  AND o.status='CANCELLED'
+                  AND o.client_order_key LIKE 'TQQQ_INF_V3:%'
+                  AND a.action_state='UNCERTAIN'
+            """
+            params = {"symbol": symbol.upper(), "limit": min(max(1, int(limit)), 20)}
+            if epoch_id:
+                sql += " AND o.trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY o.updated_at ASC LIMIT :limit"
+            rows = conn.execute(text(sql), params).mappings().all()
+        return [dict(row) for row in rows]
+
     def mark_ttl_cancel_requested(self, order: dict, *, requested_at: datetime,
                                    cancel_result: dict | None = None) -> None:
         """Journal a cancel request without treating its acknowledgement as terminal."""
