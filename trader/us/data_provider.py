@@ -616,9 +616,31 @@ def normalize_us_order_status_row(row: dict) -> dict:
         if normalization_result == "normalized"
         else time_error or quantity_error or "required_order_schema_missing"
     )
+    original_order_no = str(
+        _get_first_valid(row, ("orgn_odno", "ORGN_ODNO", "original_order_no"), "") or ""
+    )
+    operation_code = str(
+        _get_first_valid(row, (
+            "rvse_cncl_dvsn_cd", "RVSE_CNCL_DVSN_CD",
+            "rvse_cncl_dvsn", "RVSE_CNCL_DVSN",
+        ), "") or ""
+    ).strip().upper()
+    # KIS may return a *cancellation request* in the same inquiry-ccnl feed
+    # as executable BUY/SELL orders.  Its side is inherited from the original
+    # order but the cancellation ODNO is not a new execution attempt.
+    # Explicit broker operation + original identity are required; do not
+    # infer cancellation merely from a zero-fill/zero-open row.
+    broker_operation = (
+        "CANCEL" if operation_code in {"02", "CANCEL", "CANCELLED"}
+        and original_order_no
+        and normalize_us_order_no(original_order_no) != normalize_us_order_no(order_no)
+        else "ORDER"
+    )
     return {
         "order_no": order_no, "raw_order_no": order_no,
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
+        "broker_operation": broker_operation,
+        "broker_operation_code": operation_code,
         "requested_qty": requested,
         "requested_qty_present": bool(
             requested_raw is not None
@@ -653,7 +675,7 @@ def normalize_us_order_status_row(row: dict) -> dict:
         "exchange": str(_get_first_valid(row, ("exchange", "ovrs_excg_cd", "OVRS_EXCG_CD"), "") or ""),
         "limit_price": _safe_float(_get_first_valid(row, ("limit_price", "ft_ord_unpr3", "ord_unpr"), 0.0)),
         "submitted_at_utc": submitted_at_utc,
-        "original_order_no": str(_get_first_valid(row, ("orgn_odno", "original_order_no"), "") or ""),
+        "original_order_no": original_order_no,
         "raw_row_id": row.get("raw_row_id"), "page_index": row.get("page_index", 0),
         "normalization_result": normalization_result, "filter_reason": filter_reason,
         "avg_price": _safe_float(_get_first_valid(row, ("avg_price", "ft_ccld_unpr3", "avg_prvs"), 0.0)),
