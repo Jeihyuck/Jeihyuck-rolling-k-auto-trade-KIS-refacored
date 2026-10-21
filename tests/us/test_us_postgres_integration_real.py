@@ -1820,3 +1820,84 @@ def test_oct20_zero_fill_cancel_and_claim_update_are_one_pg_transaction(pg_engin
     assert row["status"] == "CANCELLED"
     assert row["meta"]["broker_open_qty"] == 0
     assert row["meta"]["semantic_action_remaining_qty"] == 3
+
+
+def test_oct20_actual_fill_claim_failure_rolls_back_pg_order_and_fill(
+    pg_engine, monkeypatch,
+):
+    """A failed Claim update must not commit KIS economic truth independently.
+
+    Covers both the normal engine.begin() call and a caller-owned transaction
+    in disposable PostgreSQL.  Never contacts KIS/operational Supabase.
+    """
+    import json
+    import pytest
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    key = "tqqq-pg-claim-atomic-fill-20261020"
+    broker_no = "0000039009"
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env, meta
+            )
+            VALUES (
+                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                3, 0, :order_no, 'ACK', 'practice', CAST(:meta AS jsonb)
+            )
+        """), {
+            "key": key, "order_no": broker_no,
+            "meta": json.dumps({
+                "execution_action_key": "claim-key-test",
+                "submit_attempt_id": "attempt-key-test",
+                "strategy_owner": "TQQQ_INFINITE",
+            }),
+        })
+
+    def injected_failure(*args, **kwargs):
+        assert kwargs.get("_conn") is not None
+        raise RuntimeError("injected_claim_failure_after_fill_write")
+
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation_by_key", injected_failure
+    )
+    observation = dict(
+        order_no=broker_no, client_order_key=key, symbol="TQQQ", side="BUY",
+        filled_qty=1, requested_qty=3, cumulative_filled_qty=1,
+        avg_price_usd=70.5, trade_date="2026-10-20",
+        source="fills_by_order_no", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+    )
+
+    # The repository owns the connection: failure is structured, never
+    # retried automatically, and writes from its transaction must roll back.
+    first = repos.mark_order_filled_by_reconcile(**observation)
+    assert first["status"] == "RECONCILE_UPDATE_FAILED"
+    assert first["entry_fence"] is True
+    assert first["retry_order"] is False
+    assert "US_ATOMIC_CLAIM_FILL_APPLY_FAILED" in first["error"]
+
+    def assert_no_economic_commit():
+        with pg_engine.connect() as conn:
+            order = conn.execute(text("""
+                SELECT status, qty_filled FROM us_orders
+                WHERE client_order_key=:key
+            """), {"key": key}).mappings().one()
+            fills = conn.execute(text("""
+                SELECT count(*) FROM us_fills
+                WHERE client_order_key=:key
+            """), {"key": key}).scalar_one()
+        assert order["status"] == "ACK"
+        assert order["qty_filled"] == 0
+        assert fills == 0
+
+    assert_no_economic_commit()
+
+    # A higher-level reconciler can supply its own transaction.  The nested
+    # function must RAISE so that the outer unit of work is also rolled back.
+    with pytest.raises(RuntimeError, match="US_ATOMIC_CLAIM_FILL_APPLY_FAILED"):
+        with pg_engine.begin() as conn:
+            repos.mark_order_filled_by_reconcile(**observation, _conn=conn)
+
+    assert_no_economic_commit()
