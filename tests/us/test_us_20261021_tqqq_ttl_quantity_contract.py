@@ -283,6 +283,10 @@ def test_close_links_unmarked_cancel_odono_only_with_durable_ack_and_original_ze
     )
     assert len(rows) == 1
     assert rows[0]["_broker_cancel_operation_nos"] == ["38961"]
+    assert rows[0]["_broker_observation"]["status"] == "CANCELLED"
+    assert rows[0]["_broker_observation"]["terminal_proof_source"] == (
+        "durable_tqqq_cancel_ack_and_fresh_original_zero_fill_zero_open"
+    )
 
     events[0]["meta"]["tqqq_ttl_cancel_result"]["rt_cd"] = "1"
     rows_no_proof = reconcile._load_close_order_attempt_truth(
