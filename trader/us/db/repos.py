@@ -1731,8 +1731,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                         and action_remaining_qty == int(requested_qty)
                         and broker_requested_valid
                         and broker_requested_qty == int(requested_qty)
-                        and (raw_row or {}).get("filled_qty_present") is not False
-                        and (raw_row or {}).get("remaining_qty_present") is not False
+                        and (raw_row or {}).get("filled_qty_present") is True
+                        and any(
+                            (raw_row or {}).get(_name) not in (None, "")
+                            for _name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
+                        )
+                        and (raw_row or {}).get("remaining_qty_present") is True
                         and bool(_cancel_claim_key and _cancel_attempt_id)
                     )
                     if _cancel_zero_fill_proven:
