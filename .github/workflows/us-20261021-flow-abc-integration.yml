@@ -1,0 +1,73 @@
+name: US 20261021 A-B-C Integrated Readonly Acceptance
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - 'trader/us/**'
+      - 'trader/execution_claims.py'
+      - 'tests/us/**'
+      - '.github/workflows/us-20261021-flow-abc-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrated-us-postgres-no-broker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      KIS_ENV: practice
+      US_OFFLINE: "1"
+      ALLOW_REAL_ORDER: "0"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+      PYTHONPATH: "."
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install psycopg2-binary
+      - name: Static Python and importing integrated paths
+        run: |
+          python -m py_compile \
+            trader/execution_claims.py \
+            trader/us/infinite/repository.py \
+            trader/us/infinite/integration.py \
+            trader/us/data_provider.py \
+            trader/us/execution/reconcile.py \
+            trader/us/execution/reconcile_shadow_worker.py \
+            trader/us/runner/trade_tick_runner.py \
+            trader/us/runner/trade_session_runner.py
+      - name: Focused A-B-C runner/repository/worker regressions
+        run: |
+          env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q \
+            tests/us/test_us_20261021_claim_late_fill.py \
+            tests/us/test_us_20261021_tqqq_ttl_quantity_contract.py \
+            tests/us/test_us_20261021_reconcile_shadow_worker.py \
+            tests/us/test_us_early_hard_stop_tick_integration_20261016.py \
+            tests/us/test_us_postgres_integration_real.py
+      - name: Full US regression suite without network or orders
+        run: |
+          env -u GITHUB_EVENT_NAME -u GITHUB_WORKFLOW python -m pytest -q \
+            tests/test_kis_ws_price.py tests/us
