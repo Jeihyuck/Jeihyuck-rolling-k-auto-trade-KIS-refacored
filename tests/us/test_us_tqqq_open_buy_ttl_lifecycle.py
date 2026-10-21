@@ -272,7 +272,10 @@ def test_repository_preserves_broker_zero_remaining_for_cancel(monkeypatch):
         },
     )
     assert result["status"] == "OK"
-    assert captured["remaining_qty"] == 0
+    # KIS open quantity is zero after cancel; the strategy still needs the
+    # two unfilled shares.  The common reconciliation input is semantic.
+    assert captured["remaining_qty"] == 2
+    assert captured["raw_row"]["remaining_qty"] == 0
     assert captured["filled_qty"] == 0
 
 
