@@ -439,6 +439,7 @@ def _enrich_single_position(
     trade_date: str | None,
     env: str,
     preloaded_risk_candidates: list[dict] | None = None,
+    scoped_identity_cache: dict[tuple[str, str, str], bool] | None = None,
 ) -> dict:
     """단일 position의 entry_price를 표준 contract로 채운다.
 
@@ -449,7 +450,22 @@ def _enrich_single_position(
     exchange = str(pos.get("exchange") or "NASDAQ").strip() or "NASDAQ"
     qty = _safe_int(pos.get("qty"))
     identity = _position_identity(pos, env=env)
-    identity_is_current = _identity_is_current(identity)
+    # Identity authority depends on account/env/trading epoch, not the
+    # individual symbol or position lifecycle. Only cache this immutable
+    # account scope for ONE enrichment call; never reuse across ticks/epochs.
+    _scope = (
+        identity.get("env") or "", identity.get("account_id") or "",
+        identity.get("trading_epoch_id") or "",
+    )
+    if scoped_identity_cache is not None and _scope in scoped_identity_cache:
+        identity_is_current = bool(
+            _identity_is_complete(identity)
+            and scoped_identity_cache[_scope]
+        )
+    else:
+        identity_is_current = _identity_is_current(identity)
+        if scoped_identity_cache is not None:
+            scoped_identity_cache[_scope] = identity_is_current
 
     # qty <= 0 은 exit 대상 아님
     if qty <= 0:
@@ -675,11 +691,16 @@ def enrich_us_positions_for_exit(
     source_counts: dict[str, int] = {}
     missing_symbols: list[str] = []
     integrity_counts: dict[str, int] = {}
+    # Avoid N identical DB epoch queries for N held positions while keeping
+    # the exact owner/lifecycle verification in the per-position candidate
+    # matcher. A new call/tick constructs a new dictionary.
+    scoped_identity_cache: dict[tuple[str, str, str], bool] = {}
     ok_count = 0
 
     for pos in positions:
         ep = _enrich_single_position(
             pos, trade_date=trade_date, env=env,
+            scoped_identity_cache=scoped_identity_cache,
             preloaded_risk_candidates=(
                 risk_candidates_by_symbol.get(_normalize_symbol(pos.get("symbol")))
                 if risk_candidates_by_symbol is not None else None
