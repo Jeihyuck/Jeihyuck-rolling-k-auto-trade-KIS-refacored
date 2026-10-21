@@ -1320,6 +1320,25 @@ def _load_close_order_attempt_truth(*, provider: Any, trade_date: str, env: str)
         if not isinstance(broker_rows, list):
             raise RuntimeError("broker_order_book_unavailable_or_invalid")
         for broker_row in broker_rows:
+            if str(broker_row.get("broker_operation") or "").upper() == "CANCEL":
+                # A KIS cancel request has its own ODNO and inherits the
+                # original BUY/SELL side.  It is NOT an additional trade.
+                # Require explicit KIS operation marker plus a single matching
+                # original durable attempt; otherwise fail closed rather than
+                # quietly dropping broker evidence or inventing a new BUY.
+                original_no = normalize_us_order_no(broker_row.get("original_order_no") or "")
+                cancel_no = normalize_us_order_no(_order_no(broker_row))
+                matches = [
+                    row for row in attempts
+                    if original_no and original_no != cancel_no
+                    and normalize_us_order_no(_order_no(row)) == original_no
+                    and str(row.get("symbol") or "").upper() == str(broker_row.get("symbol") or "").upper()
+                    and str(row.get("side") or "").upper() == str(broker_row.get("side") or "").upper()
+                ]
+                if len(matches) != 1:
+                    raise RuntimeError("broker_cancel_operation_original_attempt_unresolved")
+                matches[0].setdefault("_broker_cancel_operation_nos", []).append(cancel_no)
+                continue
             _add(broker_row, "broker")
     return attempts
 
