@@ -1394,6 +1394,7 @@ def _load_close_order_attempt_truth(*, provider: Any, trade_date: str, env: str)
                     matching_attempts[0].setdefault(
                         "_broker_cancel_operation_nos", []
                     ).append(cancel_no)
+                    matching_attempts[0]["_broker_ttl_cancel_proven"] = True
                     continue
             if str(broker_row.get("broker_operation") or "").upper() == "CANCEL":
                 # A KIS cancel request has its own ODNO and inherits the
@@ -1415,6 +1416,27 @@ def _load_close_order_attempt_truth(*, provider: Any, trade_date: str, env: str)
                 matches[0].setdefault("_broker_cancel_operation_nos", []).append(cancel_no)
                 continue
             _add(broker_row, "broker")
+        for attempt in attempts:
+            if not attempt.get("_broker_ttl_cancel_proven"):
+                continue
+            # Broker's original row may be ACK_PENDING even after KIS returns
+            # zero filled/zero live shares.  Only the conjunctive fresh KIS
+            # original + durable, order-number-matched cancel acknowledgement
+            # above permits a derived terminal classification.
+            broker_original = attempt.get("_broker_observation")
+            if not isinstance(broker_original, dict):
+                continue
+            if str(broker_original.get("status") or "").upper() not in {
+                "ACK_PENDING", "OPEN", "ACK",
+            }:
+                continue
+            derived = dict(broker_original)
+            derived["status"] = "CANCELLED"
+            derived["terminal_proof_source"] = (
+                "durable_tqqq_cancel_ack_and_fresh_original_zero_fill_zero_open"
+            )
+            attempt["_broker_observation"] = derived
+            attempt["broker_status"] = "CANCELLED"
     return attempts
 
 
