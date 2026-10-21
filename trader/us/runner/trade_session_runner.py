@@ -891,6 +891,7 @@ def run_trade_session(
     run_source = os.getenv("US_RUN_SOURCE", "OPERATOR_MANUAL")
     session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
     _unreaped_child_seen = False
+    _shadow_reconcile_child: subprocess.Popen | None = None
     final_status = "OK"
     final_reason = "session_end"
     last_stage = "session_start"
@@ -1361,8 +1362,52 @@ def run_trade_session(
         skipped_slot_count = 0
         timeout_blocked_symbol_sides: set[tuple[str, str]] = set()
         timeout_entry_block = False
+        # Worker-mode authority is NOT released. The only non-legacy option
+        # is read-only SHADOW diagnostics in the actual session lifecycle.
+        from trader.us.execution.reconcile_shadow_worker import parse_mode
+        _reconcile_mode = parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))
+        if _reconcile_mode == "SHADOW":
+            if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
+                raise RuntimeError("US_SHADOW_RECONCILE_PRACTICE_ONLY")
+            _shadow_env = dict(os.environ)
+            # Child requires only DB read credentials and process scope. Even
+            # accidental future KIS helpers fail closed without broker keys.
+            for _name in (
+                "KIS_APP_KEY", "KIS_APP_SECRET", "APP_KEY", "APP_SECRET",
+                "CANO", "ACNT_PRDT_CD", "KIS_ACCESS_TOKEN", "KIS_REFRESH_TOKEN",
+            ):
+                _shadow_env.pop(_name, None)
+            _shadow_env["US_OFFLINE"] = "1"
+            _shadow_env["US_RECONCILE_WORKER_MODE"] = "SHADOW"
+            _shadow_reconcile_child = subprocess.Popen(
+                [
+                    sys.executable, "-m",
+                    "trader.us.execution.reconcile_shadow_worker",
+                    "--trade-date", trade_date,
+                    "--session-run-id", session_run_id,
+                    "--env", "practice",
+                    "--interval-sec", str(
+                        max(5, int(os.getenv("US_SHADOW_RECONCILE_INTERVAL_SEC", "15")))
+                    ),
+                ],
+                env=_shadow_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            logger.info(
+                "[US_SHADOW_RECONCILE][STARTED] session=%s run=%s pid=%s "
+                "authority=READ_ONLY broker_access=NONE",
+                session, session_run_id, _shadow_reconcile_child.pid,
+            )
         try:
             while True:
+                if (_shadow_reconcile_child is not None
+                        and _shadow_reconcile_child.poll() is not None):
+                    logger.error(
+                        "[US_SHADOW_RECONCILE][EXITED] session=%s run=%s code=%s "
+                        "trading_authority=LEGACY_UNCHANGED",
+                        session, session_run_id,
+                        _shadow_reconcile_child.returncode,
+                    )
+                    _shadow_reconcile_child = None
                 if force_now:
                     tick_now_dt = simulated_now + timedelta(seconds=interval_sec * tick_count)
                     tick_force_now = tick_now_dt.isoformat()
@@ -2528,6 +2573,27 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        # Reap the *read-only* observer independently of Tick children.
+        # It never owns the order submission lock, so its lifecycle cannot
+        # clear an unverified live Tick or an unresolved execution Claim.
+        if _shadow_reconcile_child is not None:
+            try:
+                if _shadow_reconcile_child.poll() is None:
+                    _shadow_reconcile_child.terminate()
+                _shadow_reconcile_child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _shadow_reconcile_child.kill()
+                _shadow_reconcile_child.wait(timeout=5)
+            except Exception as _observer_stop_exc:
+                logger.error(
+                    "[US_SHADOW_RECONCILE][STOP_FAILED] run=%s err=%s",
+                    session_run_id, _observer_stop_exc,
+                )
+            else:
+                logger.info(
+                    "[US_SHADOW_RECONCILE][STOPPED] run=%s pid=%s",
+                    session_run_id, _shadow_reconcile_child.pid,
+                )
         from trader.us.utils.session_guard import read_us_session_child_unverified_fence
         try:
             _fence_record = read_us_session_child_unverified_fence(
