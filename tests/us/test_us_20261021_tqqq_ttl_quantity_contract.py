@@ -167,3 +167,70 @@ def test_close_fails_closed_on_unlinked_cancel(monkeypatch):
         reconcile._load_close_order_attempt_truth(
             provider=Broker(), trade_date="2026-10-20", env="practice"
         )
+
+
+def test_cancelled_uncertain_claim_is_revisited_without_second_cancel():
+    from datetime import datetime, timezone
+    from trader.us.infinite.integration import reconcile_tqqq_open_buy_ttl
+
+    order = {
+        **_ORDER,
+        "meta": {
+            "tqqq_ttl_cancel_result": {
+                "rt_cd": "0", "msg_cd": "40630000",
+                "output": {"ODNO": "0000038961"},
+            },
+        },
+    }
+    observed = _observation()
+    observed["status"] = "ACK_PENDING"  # original KIS row may lack terminal status
+    submitted = []
+    queried = []
+
+    class Repo:
+        def load_expired_open_buy_orders(self, **kwargs):
+            return []
+
+        def load_cancelled_uncertain_buy_orders(self, **kwargs):
+            return [order]
+
+        def apply_ttl_terminal_observation(self, original, evidence):
+            submitted.append((original, evidence))
+            return {"status": "OK", "order_status": "CANCELLED"}
+
+    result = reconcile_tqqq_open_buy_ttl(
+        repository=Repo(), now=datetime(2026, 10, 20, 15, tzinfo=timezone.utc),
+        ttl_seconds=180,
+        cancel_order=lambda **kw: pytest.fail("old cancelled order must not be cancelled again"),
+        query_order=lambda **kw: queried.append(kw) or observed,
+    )
+    assert result["cancelled_claim_candidates"] == 1
+    assert result["cancelled_claim_recovered"] == 1
+    assert len(submitted) == 1
+    assert submitted[0][1]["status"] == "CANCELLED"
+    assert submitted[0][1]["cancel_broker_order_no"] == "0000038961"
+    assert queried[0]["order_no"] == "0000038776"
+
+
+def test_cancelled_uncertain_claim_retains_fence_without_broker_evidence():
+    from datetime import datetime, timezone
+    from trader.us.infinite.integration import reconcile_tqqq_open_buy_ttl
+
+    class Repo:
+        def load_expired_open_buy_orders(self, **kwargs):
+            return []
+
+        def load_cancelled_uncertain_buy_orders(self, **kwargs):
+            return [{**_ORDER, "meta": {}}]
+
+        def apply_ttl_terminal_observation(self, *a, **kw):
+            pytest.fail("absence of cancel ACK must retain UNCERTAIN")
+
+    result = reconcile_tqqq_open_buy_ttl(
+        repository=Repo(), now=datetime(2026, 10, 20, 15, tzinfo=timezone.utc),
+        ttl_seconds=180,
+        cancel_order=lambda **kw: pytest.fail("no second cancel"),
+        query_order=lambda **kw: _observation(),
+    )
+    assert result["cancelled_claim_pending"] == 1
+    assert result.get("cancelled_claim_recovered", 0) == 0
