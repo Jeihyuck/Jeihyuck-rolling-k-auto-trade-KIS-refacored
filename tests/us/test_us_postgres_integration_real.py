@@ -1820,3 +1820,82 @@ def test_oct20_zero_fill_cancel_and_claim_update_are_one_pg_transaction(pg_engin
     assert row["status"] == "CANCELLED"
     assert row["meta"]["broker_open_qty"] == 0
     assert row["meta"]["semantic_action_remaining_qty"] == 3
+
+
+def test_shadow_observer_detects_scoped_cancelled_order_uncertain_claim(pg_engine, monkeypatch):
+    """Detect the Oct20 cancellation/claim mismatch read-only; never repair it.
+
+    A matching terminal Claim eliminates the diagnostic count. Other epochs and
+    dates are invisible to this worker's authenticated account scope.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.db import repos
+
+    scope = {
+        "env": "practice",
+        "account_id": "scoped-shadow-account",
+        "market": "US",
+        "trading_epoch_id": "scoped-shadow-epoch",
+    }
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: dict(scope))
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: pg_engine)
+    identity = SemanticActionIdentity(
+        env="practice", account_id=scope["account_id"], market="US",
+        trading_epoch_id=scope["trading_epoch_id"],
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="scoped-shadow-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    claim = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    attempt_id = "scoped-38776"
+    key = "TQQQ_INF_V3:scoped-shadow-cycle:2026-10-20:BUY"
+    assert claim.acquire(
+        identity, attempt_id=attempt_id, requested_qty=3,
+        client_order_key=key,
+    ).acquired
+    claim.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env,
+                trading_epoch_id, meta
+            ) VALUES (
+                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                3, 0, '0000038776', 'CANCELLED', 'practice',
+                'scoped-shadow-epoch', CAST(:meta AS jsonb)
+            )
+        """), {
+            "key": key,
+            "meta": json.dumps({
+                "execution_action_key": identity.action_key,
+                "submit_attempt_id": attempt_id,
+                "strategy_owner": "TQQQ_INFINITE",
+            }),
+        })
+    assert repos.count_us_terminal_order_claim_mismatches(
+        trade_date="2026-10-20", env="practice",
+    ) == 1
+    assert repos.count_us_terminal_order_claim_mismatches(
+        trade_date="2026-10-19", env="practice",
+    ) == 0
+    claim.record_observation(
+        identity, attempt_id=attempt_id, state="CANCELLED",
+        cumulative_filled_qty=0, authoritative=True,
+    )
+    assert repos.count_us_terminal_order_claim_mismatches(
+        trade_date="2026-10-20", env="practice",
+    ) == 0
+    scope["trading_epoch_id"] = "other-epoch"
+    assert repos.count_us_terminal_order_claim_mismatches(
+        trade_date="2026-10-20", env="practice",
+    ) == 0
