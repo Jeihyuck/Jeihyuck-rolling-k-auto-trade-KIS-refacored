@@ -5232,13 +5232,13 @@ def mark_order_filled_by_reconcile(
                 evidence=evidence, _conn=conn,
             )
         if claim_error:
-            return {
-                **result,
-                "status": "EXECUTION_CLAIM_UPDATE_FAILED",
-                "execution_claim_update_error": claim_error,
-                "requires_reconcile": True,
-                "retry_order": False,
-            }
+            # Never return an error from inside engine.begin(): the context
+            # manager would COMMIT the already-written us_orders/us_fills.
+            # The exact Claim and economic truth must succeed or roll back
+            # as one PostgreSQL transaction (including caller-owned _conn).
+            raise RuntimeError(
+                "US_ATOMIC_CLAIM_FILL_APPLY_FAILED:" + str(claim_error)[:200]
+            )
         return result
     except FillAccountingInvariantError as exc:
         if _conn is not None:
@@ -5249,7 +5249,11 @@ def mark_order_filled_by_reconcile(
         if _conn is not None:
             raise
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
-        return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
+        return {
+            "status": "RECONCILE_UPDATE_FAILED", "error": str(exc),
+            "requires_reconcile": True, "retry_order": False,
+            "entry_fence": True,
+        }
 
 def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
     """Verify order qty_filled against active actual/synthetic accounting evidence."""
