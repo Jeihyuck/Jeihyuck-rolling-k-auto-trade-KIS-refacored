@@ -357,8 +357,7 @@ class DurableExecutionClaimRepo:
             .order_by(attempts.c.attempt_no.desc())
             .limit(1)
         ).scalar_one()
-        if str(latest_id) != str(attempt_id):
-            raise RuntimeError("observation for superseded submit attempt")
+        superseded = str(latest_id) != str(attempt_id)
         requested = int(attempt_row["requested_qty"])
         previous = attempt_row["cumulative_filled_qty"]
         if observed_qty is not None and observed_qty > requested:
@@ -372,13 +371,58 @@ class DurableExecutionClaimRepo:
         if state in {"CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL"}:
             state = "CANCELLED"
 
-        before = int(action_row["filled_qty_before_attempt"] or 0)
-        total = None if observed_qty is None else before + observed_qty
+        # Old ACK/OPEN observations must never resurrect a terminal attempt.
+        terminal_attempt = str(attempt_row["attempt_state"] or "") in {
+            "FILLED", "CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL",
+            "REJECTED_EXPLICIT", "ABANDONED_PRE_SUBMIT",
+        }
+        prior_filled = None if previous is None else int(previous)
+        is_new_fill = (
+            observed_qty is not None
+            and (prior_filled is None or observed_qty > prior_filled)
+        )
+        if superseded:
+            # Keep the immutable Attempt and its fills, not its obsolete state
+            # transitions.  An old observation may only change economic truth
+            # when the broker has *authoritatively* increased cumulative fill.
+            if not (authoritative and is_new_fill and observed_qty > 0):
+                return self._snapshot(action_row)
+            if str(attempt_row["attempt_state"] or "") == "ABANDONED_PRE_SUBMIT":
+                raise RuntimeError("broker fill contradicts proven pre-submit abort")
+            if terminal_attempt:
+                attempt_state = str(attempt_row["attempt_state"])
+                if attempt_state.startswith("CANCELLED_"):
+                    attempt_state = "CANCELLED_PARTIAL_FILL"
+            else:
+                attempt_state = "FILLED" if observed_qty == requested else "PARTIALLY_FILLED"
+        else:
+            # A terminal observation cannot be regressed by a late ACK/OPEN.
+            if terminal_attempt and state in {
+                "CREATED", "SUBMITTED", "ACKED", "UNRESOLVED",
+                "RECONCILE_ERROR", "PARTIALLY_FILLED",
+            } and not (authoritative and is_new_fill and observed_qty > 0):
+                return self._snapshot(action_row)
+            attempt_state = state
+
+        # Every attempt is a separate broker order.  The historic
+        # filled_qty_before_attempt is a snapshot, NOT a live rollup; using
+        # it after a late old fill loses economic quantity.
+        previous_attempts = conn.execute(
+            sa.select(attempts.c.cumulative_filled_qty)
+            .where(
+                attempts.c.action_key == key,
+                attempts.c.attempt_id != str(attempt_id),
+            )
+        ).scalars().all()
+        known_other = sum(int(qty) for qty in previous_attempts if qty is not None)
+        total = None if observed_qty is None else known_other + observed_qty
         target = int(action_row["target_qty"])
-        remaining = None if total is None else max(0, target - total)
+        overfilled = total is not None and total > target
+        # Never hide an action overfill by max(0, target-total).  A fence is
+        # required until the original orders and reserves are reconciled.
+        remaining = None if total is None or overfilled else target - total
         action_state = "IN_FLIGHT"
         active_attempt_id: str | None = str(attempt_id)
-        attempt_state = state
         if state in {"CREATED", "SUBMITTED", "ACKED", "UNRESOLVED", "RECONCILE_ERROR"}:
             action_state = "UNCERTAIN" if state in {"UNRESOLVED", "RECONCILE_ERROR"} else "IN_FLIGHT"
         elif state == "PARTIALLY_FILLED":
@@ -404,13 +448,27 @@ class DurableExecutionClaimRepo:
             else:
                 action_state = "UNCERTAIN"
 
+        if superseded:
+            # Another Attempt might already have reached KIS.  Never release
+            # its live claim or auto-offset shares merely because an earlier
+            # order reported a delayed fill.
+            active_attempt_id = action_row["active_attempt_id"]
+            action_state = "UNCERTAIN" if active_attempt_id else (
+                "SATISFIED" if remaining == 0 else "UNCERTAIN"
+            )
+        if overfilled:
+            action_state = "UNCERTAIN"
+            active_attempt_id = action_row["active_attempt_id"]
+        if terminal_attempt and not superseded and state == "PARTIALLY_FILLED":
+            attempt_state = str(attempt_row["attempt_state"])
+
         conn.execute(
             sa.update(attempts)
             .where(attempts.c.attempt_id == str(attempt_id))
             .values(
                 cumulative_filled_qty=observed_qty,
                 attempt_state=attempt_state,
-                authoritative=bool(authoritative),
+                authoritative=bool(authoritative or attempt_row["authoritative"]),
                 updated_at=datetime.now(timezone.utc),
             )
         )
