@@ -448,6 +448,47 @@ def load_active_execution_claim_attempts() -> list[dict]:
     return _execution_claim_repo().active_attempts(**_us_execution_claim_scope())
 
 
+def count_us_terminal_order_claim_mismatches(*, trade_date: str, env: str) -> int:
+    """Read-only exact claim/order mismatches for shadow diagnostics.
+
+    The query is account/epoch/environment scoped and cannot mutate broker
+    orders, journal, positions, fills, or execution claims. Missing identity
+    fails closed: zero means a *successful* check, never a DB error.
+    """
+    scope = _us_execution_claim_scope()
+    if (str(env).lower() != "practice"
+            or scope["env"] != "practice"
+            or not scope["account_id"]
+            or not scope["trading_epoch_id"]):
+        raise RuntimeError("shadow_claim_scope_missing_or_nonpractice")
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("shadow_claim_db_unavailable")
+    with engine.connect() as conn:
+        count = conn.execute(text("""
+            SELECT COUNT(*)
+            FROM us_orders AS o
+            JOIN us_execution_claims AS c
+              ON c.action_key = o.meta->>'execution_action_key'
+             AND c.active_attempt_id = o.meta->>'submit_attempt_id'
+             AND c.trade_date = o.trade_date
+             AND c.env = o.env
+             AND c.trading_epoch_id = o.trading_epoch_id
+            WHERE o.trade_date = :trade_date
+              AND o.env = :env
+              AND o.trading_epoch_id = :epoch
+              AND o.status IN ('CANCELLED', 'FILLED', 'REJECTED', 'EXPIRED')
+              AND c.account_id = :account
+              AND c.market = 'US'
+              AND c.action_state IN ('UNCERTAIN', 'IN_FLIGHT')
+        """), {
+            "trade_date": trade_date, "env": scope["env"],
+            "epoch": scope["trading_epoch_id"],
+            "account": scope["account_id"],
+        }).scalar_one()
+    return int(count)
+
+
 def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
     """Expose unresolved and unattributed broker truth in close/report health."""
     from trader.us.execution.order_journal import load_order_events
@@ -1672,6 +1713,9 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             return result if isinstance(result, dict) else {
                 "status": "RECONCILE_UPDATE_FAILED", "error": str(result)
             }
+    # KIS-confirmed no-fill cancel must never commit to us_orders without
+    # terminalizing its exact Execution Claim in the SAME SQL transaction.
+    atomic_cancel_claim_applied = False
     if status not in {"PARTIALLY_FILLED", "FILLED"}:
         if engine is None:
             matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
@@ -1690,30 +1734,78 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             order["meta"] = {**_parse_json_meta(order.get("meta")), **meta_patch}
             order_meta = order["meta"]
         else:
-            with engine.begin() as conn:
-                active_epoch_id = _active_us_epoch(conn)
-                epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
-                epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
-                row = conn.execute(
-                    text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause + " FOR UPDATE"),
-                    {"td": td, "key": key, **epoch_params},
-                ).mappings().first()
-                if not row:
-                    return {"status": "ORDER_NOT_FOUND"}
-                _assert_us_order_epoch(dict(row), active_epoch_id)
-                order_meta = {**_parse_json_meta(row.get("meta")), **meta_patch}
-                result = conn.execute(text("""UPDATE us_orders SET status=CASE
-                    WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
-                    WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
-                    ELSE :status END,
-                    qty_filled=GREATEST(qty_filled,:filled),
-                    order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
-                    WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
-                    {"status": status, "filled": old_filled if filled_qty_value is None else filled_qty_value,
-                     "ono": raw_order_no, "meta": _json_param(order_meta),
-                     "td": td, "key": key, **epoch_params})
-                if int(result.rowcount or 0) != 1:
-                    return {"status": "ORDER_NOT_FOUND"}
+            try:
+                with engine.begin() as conn:
+                    active_epoch_id = _active_us_epoch(conn)
+                    epoch_clause = " AND trading_epoch_id=:epoch_id" if active_epoch_id else ""
+                    epoch_params = {"epoch_id": active_epoch_id} if active_epoch_id else {}
+                    row = conn.execute(
+                        text("SELECT meta,trading_epoch_id FROM us_orders WHERE trade_date=:td AND client_order_key=:key" + epoch_clause + " FOR UPDATE"),
+                        {"td": td, "key": key, **epoch_params},
+                    ).mappings().first()
+                    if not row:
+                        return {"status": "ORDER_NOT_FOUND"}
+                    _assert_us_order_epoch(dict(row), active_epoch_id)
+                    order_meta = {**_parse_json_meta(row.get("meta")), **meta_patch}
+                    result = conn.execute(text("""UPDATE us_orders SET status=CASE
+                        WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
+                        WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
+                        ELSE :status END,
+                        qty_filled=GREATEST(qty_filled,:filled),
+                        order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
+                        WHERE trade_date=:td AND client_order_key=:key""" + epoch_clause),
+                        {"status": status, "filled": old_filled if filled_qty_value is None else filled_qty_value,
+                         "ono": raw_order_no, "meta": _json_param(order_meta),
+                         "td": td, "key": key, **epoch_params})
+                    if int(result.rowcount or 0) != 1:
+                        return {"status": "ORDER_NOT_FOUND"}
+                    # Same DB transaction: never persist CANCELLED when the
+                    # exact durable Claim remains UNCERTAIN due to a write
+                    # error. All other (including partial-fill) observations
+                    # retain the existing settlement handling.
+                    _cancel_claim_key = str(order_meta.get("execution_action_key") or "")
+                    _cancel_attempt_id = str(order_meta.get("submit_attempt_id") or "")
+                    _cancel_zero_fill_proven = (
+                        status == "CANCELLED"
+                        and filled_qty_value == 0
+                        and broker_remaining_qty == 0
+                        and action_remaining_qty == int(requested_qty)
+                        and broker_requested_valid
+                        and broker_requested_qty == int(requested_qty)
+                        and (raw_row or {}).get("filled_qty_present") is True
+                        and any(
+                            (raw_row or {}).get(_name) not in (None, "")
+                            for _name in ("filled_qty", "qty_filled", "tot_ccld_qty", "ft_ccld_qty", "ccld_qty")
+                        )
+                        and (raw_row or {}).get("remaining_qty_present") is True
+                        and bool(_cancel_claim_key and _cancel_attempt_id)
+                    )
+                    if _cancel_zero_fill_proven:
+                        _cancel_snapshot = record_execution_action_observation_by_key(
+                            _cancel_claim_key,
+                            attempt_id=_cancel_attempt_id,
+                            state="CANCELLED",
+                            cumulative_filled_qty=0,
+                            authoritative=True,
+                            _conn=conn,
+                        )
+                        if _cancel_snapshot.action_state not in {
+                            "RETRYABLE", "PARTIALLY_SATISFIED", "SATISFIED",
+                        }:
+                            raise RuntimeError("cancel_claim_terminal_state_not_confirmed")
+                        atomic_cancel_claim_applied = True
+            except Exception as _cancel_atomic_exc:
+                logger.exception(
+                    "[US_RECONCILE][CANCEL_ATOMIC_ROLLBACK] order=%s symbol=%s",
+                    raw_order_no, symbol,
+                )
+                return {
+                    "status": "RECONCILE_UPDATE_FAILED",
+                    "reason": "cancel_order_claim_atomic_rollback",
+                    "requires_reconcile": True,
+                    "retry_order": False,
+                    "entry_fence": True,
+                }
         if (
             side.upper() == "SELL"
             and order_meta.get("profit_capture_stage")
@@ -1768,7 +1860,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             and broker_remaining_qty == 0
             and action_remaining_qty == int(requested_qty) - observation_qty
         )
-    if action_key and attempt_id and not locals().get("settlement_atomic_applied", False):
+    if action_key and attempt_id and not locals().get("settlement_atomic_applied", False) and not atomic_cancel_claim_applied:
         claim_state = {
             "ACK": "ACKED",
             "OPEN": "ACKED",
