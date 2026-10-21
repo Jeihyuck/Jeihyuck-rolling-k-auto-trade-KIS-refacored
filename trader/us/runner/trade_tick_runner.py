@@ -2623,8 +2623,10 @@ def run_trade_tick(
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
-    # Explicitly disabled unless a practice-only pilot is approved. A pilot
-    # routes at most one PB1 standard hard-stop via the existing durable router.
+    # Explicitly disabled unless a practice-only pilot is approved.
+    # Default legacy pilot routes at most one PB1 standard hard-stop. A
+    # separate, default-OFF multi-symbol option can route further independent
+    # hard-stops after each validated snapshot through the same durable router.
     _early_pilot_attempted_symbols: set[str] = set()
     _early_pilot_stream_incomplete = False
     _early_pilot_intents: list[dict] = []
@@ -2710,7 +2712,18 @@ def run_trade_tick(
                     for i in _pilot_safety_intents
                 )
                 _pilot_safety_intents.extend(_new_intents)
-                if _early_pilot_attempted_symbols or _earlier_sells:
+                # Legacy pilot intentionally submitted at most one early
+                # HARD_STOP. An additional explicit *practice-only* opt-in
+                # allows independent unique symbols to reach the canonical
+                # router as their own safety snapshots become ready. The
+                # shared router/claim gate still owns every KIS submit.
+                _multi_hard_stop_enabled = (
+                    os.getenv("US_EARLY_MULTI_HARD_STOP_ENABLED", "0") == "1"
+                    and _early_pilot_enabled
+                )
+                if not _multi_hard_stop_enabled and (
+                    _early_pilot_attempted_symbols or _earlier_sells
+                ):
                     return
                 if str(snapshot.get("strategy_owner") or "").upper() != "US_STANDARD":
                     return
@@ -2732,6 +2745,17 @@ def run_trade_tick(
                 ]
                 if len(_eligible) != 1:
                     return
+                if _multi_hard_stop_enabled:
+                    # The streamed candidate must be the only protective
+                    # SELL for this *same symbol*. Never choose a hard stop
+                    # before a competing TP/soft-stop strategy arbitration.
+                    _same_symbol_sells = [
+                        i for i in _new_intents
+                        if str(i.get("side") or "").upper() == "SELL"
+                        and str(i.get("symbol") or "").upper() == _sym
+                    ]
+                    if len(_same_symbol_sells) != 1:
+                        return
                 # Preserve historical TP fences and same-symbol pending-order
                 # suppression before any possible broker submission.
                 _eligible = _suppress_pending_sell_exit_intents(
