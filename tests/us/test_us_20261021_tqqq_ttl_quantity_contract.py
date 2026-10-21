@@ -236,3 +236,57 @@ def test_cancelled_uncertain_claim_retains_fence_without_broker_evidence():
     )
     assert result["cancelled_claim_pending"] == 1
     assert result.get("cancelled_claim_recovered", 0) == 0
+
+
+def test_close_links_unmarked_cancel_odono_only_with_durable_ack_and_original_zero(
+    monkeypatch,
+):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal, reconcile
+    from trader.us.data_provider import normalize_us_order_status_row
+    monkeypatch.setattr(
+        repos, "load_pending_ack_orders_result",
+        lambda *a, **kw: {"status": "OK", "orders": []},
+    )
+    monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
+    events = [{
+        "event_type": "ORDER_CANCELLED",
+        "symbol": "TQQQ", "side": "BUY",
+        "broker_order_no": "0000038776",
+        "client_order_key": "TQQQ_INF_V3:cycle:2026-10-20:BUY",
+        "submit_attempt_id": "attempt-A", "qty_requested": 3,
+        "meta": {
+            "tqqq_ttl_cancel_result": {
+                "rt_cd": "0", "msg_cd": "40630000",
+                "output": {"ODNO": "0000038961"},
+            },
+        },
+    }]
+    monkeypatch.setattr(order_journal, "load_order_events", lambda day: events)
+
+    class Broker:
+        def get_today_orders(self, day):
+            return [
+                normalize_us_order_status_row({
+                    "odno": "0000038776", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "3", "ft_ccld_qty": "0", "nccs_qty": "0",
+                }),
+                # Production KIS may omit RVSE_CNCL_DVSN_CD and ORGN_ODNO.
+                normalize_us_order_status_row({
+                    "odno": "0000038961", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "3", "ft_ccld_qty": "0", "nccs_qty": "0",
+                }),
+            ]
+
+    rows = reconcile._load_close_order_attempt_truth(
+        provider=Broker(), trade_date="2026-10-20", env="practice"
+    )
+    assert len(rows) == 1
+    assert rows[0]["_broker_cancel_operation_nos"] == ["38961"]
+
+    events[0]["meta"]["tqqq_ttl_cancel_result"]["rt_cd"] = "1"
+    rows_no_proof = reconcile._load_close_order_attempt_truth(
+        provider=Broker(), trade_date="2026-10-20", env="practice"
+    )
+    assert len(rows_no_proof) == 2
+    assert all("_broker_cancel_operation_nos" not in row for row in rows_no_proof)
