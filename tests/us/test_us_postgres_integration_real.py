@@ -1820,3 +1820,168 @@ def test_oct20_zero_fill_cancel_and_claim_update_are_one_pg_transaction(pg_engin
     assert row["status"] == "CANCELLED"
     assert row["meta"]["broker_open_qty"] == 0
     assert row["meta"]["semantic_action_remaining_qty"] == 3
+
+
+def test_oct20_actual_fill_claim_failure_rolls_back_pg_order_and_fill(
+    pg_engine, monkeypatch,
+):
+    """A failed Claim update must not commit KIS economic truth independently.
+
+    Covers both the normal engine.begin() call and a caller-owned transaction
+    in disposable PostgreSQL.  Never contacts KIS/operational Supabase.
+    """
+    import json
+    import pytest
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    key = "tqqq-pg-claim-atomic-fill-20261020"
+    broker_no = "0000039009"
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env, meta
+            )
+            VALUES (
+                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                3, 0, :order_no, 'ACK', 'practice', CAST(:meta AS jsonb)
+            )
+        """), {
+            "key": key, "order_no": broker_no,
+            "meta": json.dumps({
+                "execution_action_key": "claim-key-test",
+                "submit_attempt_id": "attempt-key-test",
+                "strategy_owner": "TQQQ_INFINITE",
+            }),
+        })
+
+    def injected_failure(*args, **kwargs):
+        assert kwargs.get("_conn") is not None
+        raise RuntimeError("injected_claim_failure_after_fill_write")
+
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation_by_key", injected_failure
+    )
+    observation = dict(
+        order_no=broker_no, client_order_key=key, symbol="TQQQ", side="BUY",
+        filled_qty=1, requested_qty=3, cumulative_filled_qty=1,
+        avg_price_usd=70.5, trade_date="2026-10-20",
+        source="fills_by_order_no", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+    )
+
+    # The repository owns the connection: failure is structured, never
+    # retried automatically, and writes from its transaction must roll back.
+    first = repos.mark_order_filled_by_reconcile(**observation)
+    assert first["status"] == "RECONCILE_UPDATE_FAILED"
+    assert first["entry_fence"] is True
+    assert first["retry_order"] is False
+    assert "US_ATOMIC_CLAIM_FILL_APPLY_FAILED" in first["error"]
+
+    def assert_no_economic_commit():
+        with pg_engine.connect() as conn:
+            order = conn.execute(text("""
+                SELECT status, qty_filled FROM us_orders
+                WHERE client_order_key=:key
+            """), {"key": key}).mappings().one()
+            fills = conn.execute(text("""
+                SELECT count(*) FROM us_fills
+                WHERE client_order_key=:key
+            """), {"key": key}).scalar_one()
+        assert order["status"] == "ACK"
+        assert order["qty_filled"] == 0
+        assert fills == 0
+
+    assert_no_economic_commit()
+
+    # A higher-level reconciler can supply its own transaction.  The nested
+    # function must RAISE so that the outer unit of work is also rolled back.
+    with pytest.raises(RuntimeError, match="US_ATOMIC_CLAIM_FILL_APPLY_FAILED"):
+        with pg_engine.begin() as conn:
+            repos.mark_order_filled_by_reconcile(**observation, _conn=conn)
+
+    assert_no_economic_commit()
+
+
+def test_oct20_tqqq_partial_cancel_releases_exact_attempt(pg_engine, monkeypatch):
+    """One of three TQQQ shares filled before cancel: preserve two as semantic
+    remainder, broker-open zero, and terminalize the immutable Attempt.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.db import repos
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id="partial-cancel-test-account",
+        market="US", trading_epoch_id="partial-cancel-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="partial-cycle",
+        action="TQQQ_INFINITE_BUY", trade_date=date(2026, 10, 20),
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: ledger)
+    key = "TQQQ_INF_V3:partial-cycle:2026-10-20:BUY"
+    attempt_id = "partial-cancel-38776"
+    assert ledger.acquire(
+        identity, attempt_id=attempt_id, requested_qty=3, client_order_key=key
+    ).acquired
+    ledger.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,order_no,status,env,trading_epoch_id,meta
+            ) VALUES (
+                '2026-10-20',:key,'TQQQ','NASDAQ','BUY',
+                3,0,'0000038776','ACK','practice','partial-cancel-epoch',
+                CAST(:meta AS jsonb)
+            )
+        """), {"key": key, "meta": json.dumps({
+            "execution_action_key": identity.action_key,
+            "submit_attempt_id": attempt_id,
+            "strategy_owner": "TQQQ_INFINITE",
+        })})
+
+    row = {
+        "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+        "status": "CANCELLED", "requested_qty": 3,
+        "requested_qty_present": True,
+        "filled_qty": 1, "filled_qty_present": True,
+        "remaining_qty": 0, "remaining_qty_present": True,
+        "broker_open_qty": 0, "broker_open_qty_present": True,
+        "avg_price": 70.5,
+    }
+    result = repos.apply_broker_order_observation(
+        trade_date="2026-10-20", client_order_key=key,
+        raw_order_no="0000038776", canonical_order_no="38776",
+        symbol="TQQQ", side="BUY", requested_qty=3, filled_qty=1,
+        remaining_qty=2, broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", raw_row=row,
+    )
+    assert result["status"] == "OK", result
+    assert result["order_status"] == "CANCELLED"
+    snap = ledger.get(identity)
+    assert snap.action_state == "PARTIALLY_SATISFIED"
+    assert snap.remaining_target_qty == 2
+    assert snap.cumulative_filled_qty == 1
+    assert snap.active_attempt_id is None
+    with pg_engine.connect() as conn:
+        order = conn.execute(text(
+            "SELECT status,qty_filled,meta FROM us_orders WHERE client_order_key=:key"
+        ), {"key": key}).mappings().one()
+        fills = conn.execute(text(
+            "SELECT COALESCE(SUM(qty),0) FROM us_fills WHERE client_order_key=:key"
+        ), {"key": key}).scalar_one()
+    assert order["status"] == "CANCELLED"
+    assert order["qty_filled"] == 1
+    assert order["meta"]["semantic_action_remaining_qty"] == 2
+    assert order["meta"]["broker_open_qty"] == 0
+    assert fills == 1
