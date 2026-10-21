@@ -1722,3 +1722,101 @@ def test_oct20_cancelled_tqqq_uncertain_claim_recovers_with_proven_semantic_qty(
     assert db_row["meta"]["broker_open_qty"] == 0
     assert db_row["meta"]["semantic_action_remaining_qty"] == 3
     assert repo.load_cancelled_uncertain_buy_orders(symbol="TQQQ") == []
+
+
+def test_oct20_zero_fill_cancel_and_claim_update_are_one_pg_transaction(pg_engine, monkeypatch, tmp_path):
+    """One failure cannot create CANCELLED local order with UNCERTAIN Claim.
+
+    Real PostgreSQL fixture is disposable CI only. KIS is never called.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_attempts, us_execution_claims
+    from trader.us.db import repos
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    identity = SemanticActionIdentity(
+        env="practice", account_id="atomic-tqqq-account",
+        market="US", trading_epoch_id="atomic-tqqq-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="atomic-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    key = "TQQQ_INF_V3:atomic-cycle:2026-10-20:BUY"
+    attempt = "attempt-atomic-38776"
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt, requested_qty=3, client_order_key=key,
+    ).acquired
+    claim_repo.record_observation(
+        identity, attempt_id=attempt, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders
+                (trade_date, client_order_key, symbol, exchange, side,
+                 qty_requested, qty_filled, order_no, status, env,
+                 trading_epoch_id, meta)
+            VALUES ('2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                    3, 0, '0000038776', 'ACK', 'practice',
+                    'atomic-tqqq-epoch', CAST(:meta AS jsonb))
+        """), {
+            "key": key, "meta": json.dumps({
+                "execution_action_key": identity.action_key,
+                "submit_attempt_id": attempt,
+                "strategy_owner": "TQQQ_INFINITE",
+            }),
+        })
+
+    evidence = {
+        "trade_date": "2026-10-20", "client_order_key": key,
+        "raw_order_no": "0000038776", "canonical_order_no": "38776",
+        "symbol": "TQQQ", "side": "BUY", "requested_qty": 3,
+        "filled_qty": 0, "remaining_qty": 3, "broker_open_qty": 0,
+        "broker_status": "CANCELLED",
+        "evidence_type": "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        "raw_row": {
+            "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+            "status": "CANCELLED", "requested_qty": 3,
+            "requested_qty_present": True,
+            "filled_qty": 0, "filled_qty_present": True,
+            "remaining_qty": 0, "remaining_qty_present": True,
+            "broker_open_qty": 0, "broker_open_qty_present": True,
+        },
+    }
+
+    actual = repos.record_execution_action_observation_by_key
+    def failed_claim(*args, **kwargs):
+        assert kwargs.get("_conn") is not None
+        raise RuntimeError("injected_claim_db_failure")
+    monkeypatch.setattr(repos, "record_execution_action_observation_by_key", failed_claim)
+    failed = repos.apply_broker_order_observation(**evidence)
+    assert failed["status"] == "RECONCILE_UPDATE_FAILED"
+    assert failed["retry_order"] is False
+    assert failed["entry_fence"] is True
+    with pg_engine.connect() as conn:
+        state = conn.execute(text(
+            "SELECT status FROM us_orders WHERE client_order_key=:key"
+        ), {"key": key}).scalar_one()
+    assert state == "ACK", "order status must rollback with failed Claim write"
+    assert claim_repo.get(identity).action_state == "UNCERTAIN"
+
+    monkeypatch.setattr(repos, "record_execution_action_observation_by_key", actual)
+    success = repos.apply_broker_order_observation(**evidence)
+    assert success["status"] == "OK"
+    assert success["authoritative"] is True
+    assert success["order_status"] == "CANCELLED"
+    assert claim_repo.get(identity).action_state == "RETRYABLE"
+    with pg_engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, meta FROM us_orders WHERE client_order_key=:key"
+        ), {"key": key}).mappings().one()
+    assert row["status"] == "CANCELLED"
+    assert row["meta"]["broker_open_qty"] == 0
+    assert row["meta"]["semantic_action_remaining_qty"] == 3
