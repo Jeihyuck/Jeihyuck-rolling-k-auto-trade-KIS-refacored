@@ -1409,6 +1409,40 @@ def run_trade_session(
                         _shadow_reconcile_child.returncode,
                     )
                     _shadow_reconcile_child = None
+                elif _shadow_reconcile_child is not None:
+                    try:
+                        from trader.us.execution.reconcile_shadow_worker import observer_report_path
+                        _shadow_report_path = observer_report_path(trade_date, session_run_id)
+                        if _shadow_report_path.is_file():
+                            _shadow_report = json.loads(
+                                _shadow_report_path.read_text(encoding="utf-8")
+                            )
+                            _sampled = dt.fromisoformat(
+                                str(_shadow_report.get("sampled_at_utc") or "").replace("Z", "+00:00")
+                            )
+                            _lag = max(
+                                0.0,
+                                dt.now(_sampled.tzinfo).timestamp() - _sampled.timestamp(),
+                            )
+                            _status = str(_shadow_report.get("read_status") or "ERROR")
+                            logger.info(
+                                "[US_SHADOW_RECONCILE][HEALTH] session=%s "
+                                "status=%s lag_sec=%.1f pending=%s active_claims=%s",
+                                session, _status, _lag,
+                                _shadow_report.get("pending_order_count"),
+                                _shadow_report.get("active_claim_count"),
+                            )
+                            if _status != "OK" or _lag > 60:
+                                logger.warning(
+                                    "[US_SHADOW_RECONCILE][DEGRADED] "
+                                    "status=%s lag_sec=%.1f trading_authority=LEGACY_UNCHANGED",
+                                    _status, _lag,
+                                )
+                    except Exception as _shadow_health_exc:
+                        logger.warning(
+                            "[US_SHADOW_RECONCILE][HEALTH_UNAVAILABLE] err=%s",
+                            _shadow_health_exc,
+                        )
                 if force_now:
                     tick_now_dt = simulated_now + timedelta(seconds=interval_sec * tick_count)
                     tick_force_now = tick_now_dt.isoformat()
