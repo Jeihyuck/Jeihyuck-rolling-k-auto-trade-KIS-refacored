@@ -53,12 +53,16 @@ def observe_once(*, trade_date: str, session_run_id: str, env: str,
         load_active_execution_claim_attempts,
         load_execution_claim_health,
         load_pending_ack_orders_result,
+        count_us_terminal_order_claim_mismatches,
     )
     if str(env).lower() != "practice":
         raise RuntimeError("read-only shadow observer restricted to practice")
     active_claims = load_active_execution_claim_attempts()
     health = load_execution_claim_health()
     pending = load_pending_ack_orders_result(trade_date, env=env)
+    mismatch_count = count_us_terminal_order_claim_mismatches(
+        trade_date=trade_date, env=env,
+    )
     status = str(pending.get("status") or "").upper()
     if status != "OK":
         raise RuntimeError(f"shadow_order_read_failed:{status}")
@@ -73,6 +77,7 @@ def observe_once(*, trade_date: str, session_run_id: str, env: str,
         "sampled_at_utc": datetime.now(timezone.utc).isoformat(),
         "active_claim_count": len(active_claims),
         "pending_order_count": len(pending_orders),
+        "terminal_order_active_claim_mismatch_count": mismatch_count,
         "execution_claim_health": {
             k: int(v) for k, v in (health or {}).items()
             if isinstance(v, int) and not isinstance(v, bool)
