@@ -1622,3 +1622,103 @@ def test_equal_qty_price_synthetic_broker_promotion_preserves_unique_tuple(pg_en
     assert fills[0]["meta"]["original_synthetic_evidence_type"]=="BALANCE_DELTA_SYNTHETIC"
     assert order["status"]=="FILLED"
     assert order["qty_filled"]==4
+
+
+def test_oct20_cancelled_tqqq_uncertain_claim_recovers_with_proven_semantic_qty(
+    pg_engine, monkeypatch, tmp_path,
+):
+    """Real PostgreSQL path: broker-open=0, action remaining=3, Claim RETRYABLE.
+
+    All test data are in the disposable CI PostgreSQL service; no real KIS or
+    operating database is touched.  This repros the mismatched Oct20 lifecycle.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    from trader.us.infinite.repository import InfiniteRepository
+    from trader.us.db import repos
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "us-journal"))
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *_a, **_k: "pg-tqqq-epoch")
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id="pg-tqqq-account", market="US",
+        trading_epoch_id="pg-tqqq-epoch",
+        strategy_owner="TQQQ_INFINITE",
+        lifecycle_id="pg-tqqq-cycle",
+        action="TQQQ_INFINITE_BUY",
+        trade_date=date(2026, 10, 20),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    key = "TQQQ_INF_V3:pg-tqqq-cycle:2026-10-20:BUY"
+    attempt_id = "pg-tqqq-attempt-38776"
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt_id, requested_qty=3, client_order_key=key,
+    ).acquired
+    claim_repo.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    meta = {
+        "execution_action_key": identity.action_key,
+        "submit_attempt_id": attempt_id,
+        "tqqq_ttl_cancel_result": {
+            "rt_cd": "0", "msg_cd": "40630000",
+            "output": {"ODNO": "0000038961"},
+        },
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env,
+                trading_epoch_id, meta
+            ) VALUES (
+                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                3, 0, '0000038776', 'CANCELLED', 'practice',
+                'pg-tqqq-epoch', CAST(:meta AS jsonb)
+            )
+        """), {"key": key, "meta": json.dumps(meta)})
+
+    repo = InfiniteRepository(pg_engine)
+    rows = repo.load_cancelled_uncertain_buy_orders(symbol="TQQQ")
+    assert len(rows) == 1
+    assert claim_repo.get(identity).action_state == "UNCERTAIN"
+
+    observed = {
+        "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+        "status": "CANCELLED", "requested_qty": 3,
+        "requested_qty_present": True, "filled_qty": 0,
+        "filled_qty_present": True, "remaining_qty": 0,
+        "remaining_qty_present": True, "broker_open_qty": 0,
+        "broker_open_qty_present": True,
+        "evidence_type": "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        "observed_at": "2026-10-20T14:17:00+00:00",
+    }
+    updated = repo.apply_ttl_terminal_observation(rows[0], observed)
+    assert updated["status"] == "OK"
+    assert updated["authoritative"] is True
+    assert updated["semantic_action_remaining_qty"] == 3
+    assert updated["broker_open_qty"] == 0
+    snapshot = claim_repo.get(identity)
+    assert snapshot.action_state == "RETRYABLE"
+    assert snapshot.remaining_target_qty == 3
+    assert snapshot.active_attempt_id is None
+    with pg_engine.connect() as conn:
+        db_row = conn.execute(text("""
+            SELECT status, qty_filled, meta FROM us_orders
+            WHERE trade_date='2026-10-20' AND client_order_key=:key
+        """), {"key": key}).mappings().one()
+    assert db_row["status"] == "CANCELLED"
+    assert db_row["qty_filled"] == 0
+    assert db_row["meta"]["broker_open_qty"] == 0
+    assert db_row["meta"]["semantic_action_remaining_qty"] == 3
+    assert repo.load_cancelled_uncertain_buy_orders(symbol="TQQQ") == []
