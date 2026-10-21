@@ -79,3 +79,91 @@ def test_cancel_fails_closed_without_terminal_quantity_proof(
         _observation(filled=filled, broker_open=broker_open),
     )
     assert actual == {"status": "PENDING", "reason": expected_reason}
+
+
+def test_kis_cancel_operation_has_original_reference_not_new_buy():
+    from trader.us.data_provider import normalize_us_order_status_row
+    normalized = normalize_us_order_status_row({
+        "odno": "0000038961", "orgn_odno": "0000038776",
+        "rvse_cncl_dvsn_cd": "02",
+        "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+        "ord_qty": "3", "ft_ccld_qty": "0", "nccs_qty": "0",
+    })
+    assert normalized["side"] == "BUY"  # inherited KIS side
+    assert normalized["broker_operation"] == "CANCEL"
+    assert normalized["original_order_no"] == "0000038776"
+    assert normalized["order_no"] == "0000038961"
+
+
+def test_kis_zero_open_without_explicit_cancel_proof_is_not_discarded():
+    from trader.us.data_provider import normalize_us_order_status_row
+    normalized = normalize_us_order_status_row({
+        "odno": "0000038961", "pdno": "TQQQ",
+        "sll_buy_dvsn_cd": "02", "ord_qty": "3",
+        "ft_ccld_qty": "0", "nccs_qty": "0",
+    })
+    assert normalized["broker_operation"] == "ORDER"
+
+
+def test_close_matches_proven_cancel_operation_to_original(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal, reconcile
+    from trader.us.data_provider import normalize_us_order_status_row
+
+    monkeypatch.setattr(
+        repos, "load_pending_ack_orders_result",
+        lambda *a, **kw: {"status": "OK", "orders": []},
+    )
+    monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
+    monkeypatch.setattr(order_journal, "load_order_events", lambda day: [{
+        "event_type": "BROKER_ACK_RECEIVED",
+        "symbol": "TQQQ", "side": "BUY", "broker_order_no": "0000038776",
+        "client_order_key": "cycle-A", "submit_attempt_id": "attempt-A",
+        "qty_requested": 3,
+    }])
+
+    class Broker:
+        def get_today_orders(self, day):
+            return [
+                normalize_us_order_status_row({
+                    "odno": "0000038776", "pdno": "TQQQ", "sll_buy_dvsn_cd": "02",
+                    "ord_qty": "3", "ft_ccld_qty": "0", "nccs_qty": "0",
+                }),
+                normalize_us_order_status_row({
+                    "odno": "0000038961", "orgn_odno": "0000038776",
+                    "rvse_cncl_dvsn_cd": "02", "pdno": "TQQQ",
+                    "sll_buy_dvsn_cd": "02", "ord_qty": "3",
+                    "ft_ccld_qty": "0", "nccs_qty": "0",
+                }),
+            ]
+
+    attempts = reconcile._load_close_order_attempt_truth(
+        provider=Broker(), trade_date="2026-10-20", env="practice"
+    )
+    assert len(attempts) == 1
+    assert attempts[0]["order_no"] == "0000038776"
+    assert attempts[0]["_broker_cancel_operation_nos"] == ["38961"]
+
+
+def test_close_fails_closed_on_unlinked_cancel(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal, reconcile
+    monkeypatch.setattr(
+        repos, "load_pending_ack_orders_result",
+        lambda *a, **kw: {"status": "OK", "orders": []},
+    )
+    monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
+    monkeypatch.setattr(order_journal, "load_order_events", lambda day: [])
+
+    class Broker:
+        def get_today_orders(self, day):
+            return [{
+                "broker_operation": "CANCEL",
+                "order_no": "38961", "original_order_no": "38776",
+                "symbol": "TQQQ", "side": "BUY",
+            }]
+
+    with pytest.raises(RuntimeError, match="broker_cancel_operation_original_attempt_unresolved"):
+        reconcile._load_close_order_attempt_truth(
+            provider=Broker(), trade_date="2026-10-20", env="practice"
+        )
