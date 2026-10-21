@@ -34,12 +34,19 @@ def test_shadow_diagnostic_reads_only_and_redacts_identity(monkeypatch):
 
     monkeypatch.setattr(repos, "load_active_execution_claim_attempts", active)
     monkeypatch.setattr(repos, "load_execution_claim_health", health)
+    monkeypatch.setattr(
+        repos, "count_us_terminal_order_claim_mismatches",
+        lambda **kwargs: calls.append("scoped_mismatch_read") or 1,
+    )
     monkeypatch.setattr(repos, "load_pending_ack_orders_result", pending)
     result = worker.observe_once(
         trade_date="2026-10-20", session_run_id="../../MY_SESSION",
         env="practice",
     )
-    assert calls == ["claim_read", "health_read", "pending_read"]
+    assert calls == [
+        "claim_read", "health_read", "pending_read", "scoped_mismatch_read",
+    ]
+    assert result["terminal_order_active_claim_mismatch_count"] == 1
     assert result["active_claim_count"] == 1
     assert result["pending_order_count"] == 1
     assert result["execution_claim_health"]["unresolved_execution_actions"] == 1
@@ -52,6 +59,9 @@ def test_shadow_missing_db_is_error_not_empty_orders(monkeypatch):
     from trader.us.db import repos
     monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
     monkeypatch.setattr(repos, "load_execution_claim_health", lambda: {})
+    monkeypatch.setattr(
+        repos, "count_us_terminal_order_claim_mismatches", lambda **kwargs: 0,
+    )
     monkeypatch.setattr(
         repos, "load_pending_ack_orders_result",
         lambda *a, **kw: {"status": "DB_UNAVAILABLE"},
@@ -67,6 +77,9 @@ def test_observer_writes_only_separate_local_diagnostics(tmp_path, monkeypatch):
     monkeypatch.setattr(repos, "load_execution_claim_health",
                         lambda: {"unresolved_execution_actions": 0})
     monkeypatch.setattr(
+        repos, "count_us_terminal_order_claim_mismatches", lambda **kwargs: 0,
+    )
+    monkeypatch.setattr(
         repos, "load_pending_ack_orders_result",
         lambda *a, **kw: {"status": "OK", "orders": []},
     )
@@ -79,6 +92,7 @@ def test_observer_writes_only_separate_local_diagnostics(tmp_path, monkeypatch):
     data = json.loads(report.read_text(encoding="utf-8"))
     assert data["read_status"] == "OK"
     assert data["write_authority"] == "NONE"
+    assert data["terminal_order_active_claim_mismatch_count"] == 0
     assert list(tmp_path.rglob("*.json")) == [report]
 
 
