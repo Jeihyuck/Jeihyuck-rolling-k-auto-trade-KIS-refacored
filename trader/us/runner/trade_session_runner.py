@@ -1403,6 +1403,8 @@ def run_trade_session(
                 ],
                 env=_shadow_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
+            if _reconcile_mode == "RESERVATION_ONLY":
+                os.environ["US_RESERVATION_WORKER_PID"] = str(_shadow_reconcile_child.pid)
             logger.info(
                 "[US_RECONCILE_CHILD][STARTED] session=%s run=%s pid=%s "
                 "authority=%s broker_access=NONE",
@@ -1420,6 +1422,8 @@ def run_trade_session(
                         _shadow_reconcile_child.returncode,
                     )
                     _shadow_reconcile_child = None
+                    if _reconcile_mode == "RESERVATION_ONLY":
+                        os.environ.pop("US_RESERVATION_WORKER_PID", None)
                 elif _shadow_reconcile_child is not None:
                     try:
                         if _reconcile_mode == "RESERVATION_ONLY":
@@ -2626,6 +2630,7 @@ def run_trade_session(
         # Reap the *read-only* observer independently of Tick children.
         # It never owns the order submission lock, so its lifecycle cannot
         # clear an unverified live Tick or an unresolved execution Claim.
+        os.environ.pop("US_RESERVATION_WORKER_PID", None)
         if _shadow_reconcile_child is not None:
             try:
                 if _shadow_reconcile_child.poll() is None:
