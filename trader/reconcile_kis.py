@@ -1460,6 +1460,65 @@ def _verified_kr_cumulative_sell_evidence(
     }
 
 
+
+def _verified_kr_cumulative_buy_evidence(
+    row: dict[str, Any], *, source_order: dict[str, Any] | None,
+    side: str, trade_date: date, kis_odno: str | None, env: str,
+) -> dict[str, Any] | None:
+    """A BUY order cumulative snapshot is not an individual execution.
+
+    Source identity, date, monotonic quantity and executed notional are
+    mandatory. Never fill from a displayed quote or unscoped symbol.
+    """
+    from decimal import Decimal, InvalidOperation
+    import hashlib
+
+    if side != "BUY" or not source_order or not kis_odno:
+        return None
+    if _first_value(row, ["ccld_no", "trade_id", "exec_id"]):
+        return None
+    if _parse_side(row) != "BUY":
+        return None
+    code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
+    if (
+        code != _normalize_code(source_order.get("code"))
+        or str(source_order.get("side") or "").upper() != "BUY"
+        or str(source_order.get("kis_odno") or source_order.get("broker_order_id") or "").strip() != str(kis_odno).strip()
+        or str(_first_value(row, ["odno", "ODNO", "ordno"]) or "").strip() != str(kis_odno).strip()
+        or _parse_date_time(row).date() != trade_date
+    ):
+        return None
+    requested = _to_int(source_order.get("qty"))
+    actual = _to_int(row.get("tot_ccld_qty"))
+    if not requested or not actual or not (0 < actual <= requested):
+        return None
+    try:
+        total = Decimal(str(row.get("tot_ccld_amt") or ""))
+    except (InvalidOperation, ValueError):
+        return None
+    if not total.is_finite() or total <= 0:
+        return None
+    avg = total / Decimal(actual)
+    if not avg.is_finite() or avg <= 0:
+        return None
+    if row.get("avg_prvs") not in (None, ""):
+        try:
+            displayed_avg = Decimal(str(row["avg_prvs"]))
+        except (InvalidOperation, ValueError):
+            return None
+        if not displayed_avg.is_finite() or displayed_avg <= 0:
+            return None
+        if abs(avg - displayed_avg) > max(Decimal("1"), displayed_avg * Decimal("0.001")):
+            return None
+    account_scope = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
+    return {
+        "qty": actual, "notional": float(total), "avg_price": float(avg),
+        "evidence_id": f"KR_KIS_CUM:{account_scope}:{trade_date:%Y%m%d}:{kis_odno}:{code}:BUY",
+        "kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+    }
+
+
+
 def _kr_source_has_individual_sell_fills(
     *, fills_repo: FillsRepo, source_order: dict[str, Any], env: str,
 ) -> bool:
@@ -1645,6 +1704,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             kis_odno=kis_odno,
             env=env,
         )
+        cumulative_buy_evidence = _verified_kr_cumulative_buy_evidence(
+            broker_row, source_order=source_order, side=side,
+            trade_date=order_time.date(), kis_odno=kis_odno, env=env,
+        )
         if strict_sell_targets is not None and cumulative_sell_evidence is None:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
         if cumulative_sell_evidence is not None:
@@ -1699,6 +1762,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             filled_qty = int(cumulative_sell_evidence["qty"])
             filled_price = float(cumulative_sell_evidence["avg_price"])
             trade_id = str(cumulative_sell_evidence["evidence_id"])
+        elif cumulative_buy_evidence is not None:
+            filled_qty = int(cumulative_buy_evidence["qty"])
+            filled_price = float(cumulative_buy_evidence["avg_price"])
+            trade_id = str(cumulative_buy_evidence["evidence_id"])
+        elif side == "BUY" and not trade_id:
+            # An unverified order aggregate must not be recorded as an
+            # individual execution (the prior 15+17 and 22+48 defect).
+            filled_price = None
         elif side == "SELL" and not trade_id:
             # avg_prvs or a quote alone is not trustworthy economic truth.
             # Keep any partial/zero-amount SELL unresolved until order-level
@@ -1745,6 +1816,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             claim_filled_qty = next_confirmed_qty
         if cumulative_sell_evidence is not None:
             next_confirmed_notional = float(cumulative_sell_evidence["notional"])
+        elif cumulative_buy_evidence is not None:
+            next_confirmed_notional = float(cumulative_buy_evidence["notional"])
         elif incremental_daily_qty > 0 and filled_price is not None:
             next_confirmed_notional = (
                 previous_confirmed_notional
@@ -1776,11 +1849,11 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     requested_qty=_to_int(source_order.get("qty")) or qty,
                     cumulative_qty=next_confirmed_qty,
                     evidence_type=(
-                        "KIS_EXECUTION_CUMULATIVE" if cumulative_sell_evidence
+                        "KIS_EXECUTION_CUMULATIVE" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else "KIS_EXECUTION_ACTUAL"
                     ),
                     evidence_digest=(
-                        f"daily_ccld_cumulative:{trade_id}" if cumulative_sell_evidence
+                        f"daily_ccld_cumulative:{trade_id}" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else f"daily_ccld:{trade_id}"
                     ),
                     execution_price=filled_price,
@@ -1860,18 +1933,26 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 },
                 fill_meta_json={
                     "fill_source": (
-                        "daily_ccld_order_cumulative" if cumulative_sell_evidence
+                        "daily_ccld_order_cumulative" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else "daily_ccld"
                     ),
                     "evidence_kind": (
-                        "KIS_ORDER_CUMULATIVE_EXECUTION" if cumulative_sell_evidence
+                        "KIS_ORDER_CUMULATIVE_EXECUTION" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else "KIS_INDIVIDUAL_EXECUTION"
                     ),
-                    "has_broker_individual_trade_id": not bool(cumulative_sell_evidence),
+                    "has_broker_individual_trade_id": not bool(cumulative_sell_evidence or cumulative_buy_evidence),
                     "ccld_status": ccld_status,
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
             )
+            # KIS cumulative BUY average is the *whole order* average, not
+            # the price of the incremental shares. Preserve broker notional.
+            buy_delta_price = float(filled_price)
+            if cumulative_buy_evidence is not None and incremental_daily_qty > 0:
+                economic_delta = next_confirmed_notional - previous_confirmed_notional
+                if economic_delta <= 0 or (previous_confirmed_qty > 0 and previous_confirmed_notional <= 0):
+                    raise RuntimeError("KR_BUY_CUMULATIVE_NOTIONAL_WATERMARK_MISSING")
+                buy_delta_price = economic_delta / float(incremental_daily_qty)
             if (
                 side == "BUY"
                 and source_order
@@ -1888,7 +1969,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         market=source_order.get("market") or market,
                         side="BUY",
                         qty=incremental_daily_qty,
-                        price=float(filled_price),
+                        price=float(buy_delta_price),
                         fee=0.0,
                         tax=0.0,
                         filled_at=order_time,
@@ -1914,7 +1995,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                                 market=source_order.get("market") or market,
                                 side="BUY",
                                 qty=int(decision.qty_delta),
-                                price=float(filled_price),
+                                price=float(buy_delta_price),
                                 fee=0.0,
                                 tax=0.0,
                                 filled_at=order_time,
