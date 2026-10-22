@@ -304,6 +304,18 @@ def _parse_date_time(row: dict) -> datetime:
     return now_kst()
 
 
+
+
+def _parse_execution_time_with_source(row: dict) -> tuple[datetime, str]:
+    """Prefer KIS execution timestamp; label the order-time fallback as a proxy."""
+    filled_time = _first_value(row, ["ccld_tmd", "trd_tmd"])
+    filled_date = _first_value(row, ["ccld_dt", "trd_dt", "ord_dt"])
+    if filled_date and filled_time:
+        return _parse_date_time({"ord_dt": filled_date, "ord_tmd": filled_time}), "KIS_EXECUTION_TIMESTAMP"
+    return _parse_date_time(row), "ORDER_TIME_PROXY"
+
+
+
 def _parse_side(row: dict) -> str:
     raw = str(_first_value(row, ["sll_buy_dvsn_cd", "sll_buy_dvsn", "buy_sell_gb", "side"]) or "").strip()
     if raw in {"01", "1", "SELL", "S"} or "매도" in raw.upper():
@@ -1643,6 +1655,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         status = str(_first_value(broker_row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
         market = MARKET_MAP.get(code) or str(_first_value(broker_row, ["excg_dvsn_cd", "market"]) or "").strip() or None
         order_time = _parse_date_time(broker_row)
+        execution_time, execution_time_source = _parse_execution_time_with_source(broker_row)
         client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         request_json = dict(broker_row)
         source_order = None
@@ -1937,7 +1950,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 price=filled_price,
                 fee=0.0,
                 tax=0.0,
-                filled_at=order_time,
+                filled_at=execution_time,
                 raw_json={
                     "kis_response": row,
                     "entry_meta": (request_json.get("entry_meta") if isinstance(request_json, dict) else {}) or {},
@@ -1955,7 +1968,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     ),
                     "has_broker_individual_trade_id": not bool(cumulative_sell_evidence or cumulative_buy_evidence),
                     "ccld_status": ccld_status,
-                    "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                    "entry_ts": execution_time.isoformat(),
+                    "filled_at_source": execution_time_source,
+                    "filled_at_confidence": (
+                        "BROKER_EXECUTION" if execution_time_source == "KIS_EXECUTION_TIMESTAMP"
+                        else "ORDER_TIME_PROXY"
+                    ),
                 },
             )
             # KIS cumulative BUY average is the *whole order* average, not
