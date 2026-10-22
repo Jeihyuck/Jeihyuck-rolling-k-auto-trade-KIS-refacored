@@ -1985,3 +1985,81 @@ def test_oct20_tqqq_partial_cancel_releases_exact_attempt(pg_engine, monkeypatch
     assert order["meta"]["semantic_action_remaining_qty"] == 2
     assert order["meta"]["broker_open_qty"] == 0
     assert fills == 1
+
+
+def test_claim_pre_submit_outbox_atomic_rollback(pg_engine):
+    """Crash during DB outbox insert rolls back the exact execution Claim.
+
+    Disposable PostgreSQL only. No broker HTTP or production Supabase.
+    """
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db import repos
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_claims, us_execution_attempts,
+    )
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id="pg-outbox-test-account",
+        market="US", trading_epoch_id="pg-outbox-test-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="pg-outbox-test-lifecycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    attempt = "pg-outbox-test-attempt"
+    key = "TQQQ_INF_V3:pg-outbox-test-lifecycle:2026-10-20:BUY"
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    event = {
+        "event_id": str(uuid4()), "trade_date": "2026-10-20",
+        "event_type": "BROKER_CLAIM_PREPARED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "unit-run",
+        "tick_id": "unit-tick", "client_order_key": key,
+        "submit_attempt_id": attempt, "symbol": "TQQQ",
+        "side": "BUY", "requested_qty": 3,
+        "raw_broker_order_no": None, "canonical_broker_order_no": None,
+        "position_lifecycle_id": "pg-outbox-test-lifecycle",
+        "profit_capture_stage": "", "cumulative_filled_qty": 0,
+        "payload": {"submission_status": "NOT_YET_AT_HTTP_BOUNDARY"},
+        "idempotency_key": "us-claim-prepared:" + attempt,
+    }
+    with pytest.raises(RuntimeError, match="injected_outbox_failure"):
+        with pg_engine.begin() as conn:
+            acquired = claim_repo.acquire(
+                identity, attempt_id=attempt, requested_qty=3,
+                client_order_key=key, _conn=conn,
+            )
+            assert acquired.acquired
+            assert repos.append_us_order_event(event, _conn=conn)
+            raise RuntimeError("injected_outbox_failure")
+
+    with pg_engine.connect() as conn:
+        claim_count = conn.execute(text("""
+            SELECT count(*) FROM us_execution_claims WHERE action_key=:key
+        """), {"key": identity.action_key}).scalar_one()
+        event_count = conn.execute(text("""
+            SELECT count(*) FROM us_order_events WHERE idempotency_key=:key
+        """), {"key": event["idempotency_key"]}).scalar_one()
+    assert claim_count == event_count == 0
+
+    with pg_engine.begin() as conn:
+        acquired = claim_repo.acquire(
+            identity, attempt_id=attempt, requested_qty=3,
+            client_order_key=key, _conn=conn,
+        )
+        assert acquired.acquired
+        assert repos.append_us_order_event(event, _conn=conn)
+    with pg_engine.connect() as conn:
+        counts = (
+            conn.execute(text("""
+                SELECT count(*) FROM us_execution_claims WHERE action_key=:key
+            """), {"key": identity.action_key}).scalar_one(),
+            conn.execute(text("""
+                SELECT count(*) FROM us_order_events WHERE idempotency_key=:key
+            """), {"key": event["idempotency_key"]}).scalar_one(),
+        )
+    assert counts == (1, 1)
