@@ -156,6 +156,19 @@ export KIS_BALANCE_BREAKER_COOLDOWN_SEC="${KIS_BALANCE_BREAKER_COOLDOWN_SEC:-30}
 export KIS_BALANCE_MAX_RETRIES="${KIS_BALANCE_MAX_RETRIES:-2}"
 export KIS_BALANCE_TIMEOUT_SEC="${KIS_BALANCE_TIMEOUT_SEC:-5}"
 
+# Stage 1/2/3 KIS PRACTICE: feature switches default ON for order-capable
+# canonical WSL sessions. Explicit operator OFF remains supported.
+# These do not authorize trading; existing permission resolver still decides.
+source scripts/wsl/us-stage123-paper-defaults.sh
+if [[ "${US_STAGE123_PAPER_PROFILE}" == "ON" ]]; then
+  if ! "${PYTHON_BIN}" scripts/us_stage123_paper_preflight.py >> "${LOG_FILE}" 2>&1; then
+    export NULLIM_SESSION_FINAL_STATUS=FAILED_STAGE123_PREFLIGHT
+    export NULLIM_SESSION_FINAL_REASON=ACCOUNT_RESERVATION_SCHEMA_OR_EPOCH_NOT_READY
+    echo "[US_STAGE123][PREFLIGHT][BLOCK] session=${SESSION_NAME} reason=SCHEMA_OR_ACCOUNT_SCOPE_UNVERIFIED no_broker_submit=1" >> "${LOG_FILE}"
+    exit 43
+  fi
+fi
+
 max_minutes="${US_AFTERNOON_MAX_MINUTES:-185}"
 interval_sec="${US_SESSION_INTERVAL_SEC:-300}"
 run_mode="${US_RUN_MODE:-TRADE}"
