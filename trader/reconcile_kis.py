@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 from pathlib import Path
 
@@ -292,12 +293,12 @@ def _parse_date_time(row: dict) -> datetime:
         time_raw = str(time_raw).replace(":", "")
     if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
         try:
-            return datetime.strptime(f"{date_raw}{time_raw[:6]}", "%Y%m%d%H%M%S")
+            return datetime.strptime(f"{date_raw}{time_raw[:6]}", "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Seoul"))
         except Exception:
             pass
     if date_raw and len(date_raw) == 8:
         try:
-            return datetime.strptime(date_raw, "%Y%m%d")
+            return datetime.strptime(date_raw, "%Y%m%d").replace(tzinfo=ZoneInfo("Asia/Seoul"))
         except Exception:
             pass
     return now_kst()
@@ -1398,9 +1399,10 @@ def _verified_kr_cumulative_sell_evidence(
 
     VTTC0081R practice returns tot_ccld_qty + tot_ccld_amt without
     ccld_no/ccld_qty/ccld_prc. Only an EXACT, FULL, positive cumulative
-    SELL with a durable (date, code, side, ODNO) matched source may
-    produce one synthetic *identifier* for a real broker aggregate.
-    A partial or contradictory broker result remains unresolved.
+    SELL (full or partial) with a durable (date, code, side, ODNO)
+    matched source may produce one synthetic *identifier* for a real
+    broker aggregate. The stable ID represents an evolving cumulative
+    snapshot, never a new individual broker trade; no automatic re-sell.
     """
     from decimal import Decimal, InvalidOperation
     import hashlib
@@ -1422,7 +1424,7 @@ def _verified_kr_cumulative_sell_evidence(
         return None
     requested = _to_int(source_order.get("qty"))
     actual = _to_int(row.get("tot_ccld_qty"))
-    if not requested or requested <= 0 or actual != requested:
+    if not requested or requested <= 0 or actual is None or not (0 < actual <= requested):
         return None
     try:
         total = Decimal(str(row.get("tot_ccld_amt") or ""))
@@ -1655,7 +1657,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
                 cumulative_sell_evidence = None
             else:
-                status = "FILLED"
+                status = ("FILLED" if cumulative_sell_evidence["qty"] == int(source_order.get("qty") or 0)
+                          else "PARTIAL_FILLED")
                 logger.info(
                     "[RECONCILE][KIS_CUMULATIVE][VERIFIED] code=%s qty=%s "
                     "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
