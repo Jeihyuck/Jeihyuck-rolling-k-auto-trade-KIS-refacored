@@ -25,11 +25,12 @@ logger = logging.getLogger(__name__)
 def reconcile_proven_reservations_once(
     *, env: str, trade_date: str, max_candidates: int = 50,
 ) -> dict[str, Any]:
-    """One bounded, account-scoped DB-only sweep.
+    """Reconcile exact terminal evidence for ALL epochs of one broker account.
 
-    A separate Worker lease serializes this sweep with optional native Router
-    transactional reservation acquisition. Every release re-checks broker
-    order, Attempt and Claim truth under a fresh row-locked DB transaction.
+    Reconciliation follows original-order source trade date and per-epoch
+    fencing tokens, but capacity holds are account-global. Never strand an
+    earlier epoch's unresolved reservation when AM turns into Afternoon.
+    This worker cannot place/cancel any KIS order or fabricate terminality.
     """
     if str(env or "").strip().lower() != "practice":
         raise RuntimeError("US_RESERVATION_RECONCILER_PRACTICE_ONLY")
@@ -42,107 +43,123 @@ def reconcile_proven_reservations_once(
     engine = _get_engine_or_none()
     if engine is None:
         raise RuntimeError("US_RESERVATION_RECONCILER_DB_UNAVAILABLE")
-    authority = AccountExecutionAuthority(
-        engine, env=scope["env"], account_fingerprint=scope["account_id"],
-        trading_epoch_id=scope["trading_epoch_id"],
-    )
-    lease = authority.acquire_lease(
-        holder_id="reservation-worker:" + uuid.uuid4().hex, ttl_seconds=30,
-    )
     import hashlib
-    _digest = hashlib.sha256((
+    digest = hashlib.sha256((
         scope["env"] + "|" + scope["account_id"] + "|" + scope["trading_epoch_id"]
     ).encode("utf-8")).hexdigest()
-    result = {"mode": "RESERVATION_ONLY", "attempted": 0,
-              "released": 0, "consumed": 0, "unresolved": 0,
-              "account_scope_fingerprint": _digest,
-              "write_authority": "FENCED_ACCOUNT_RESERVATIONS_ONLY"}
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT r.action_key AS attempt_id, a.client_order_key,
-                       o.trade_date AS source_trade_date
-                FROM us_execution_account_reservations AS r
-                JOIN us_execution_attempts AS a
-                  ON a.attempt_id=r.action_key
-                JOIN us_execution_claims AS c
-                  ON c.action_key=a.action_key
-                JOIN us_orders AS o ON o.client_order_key=a.client_order_key
-                  AND o.env=r.env AND o.trading_epoch_id=r.trading_epoch_id
-                  AND o.meta->>'submit_attempt_id'=a.attempt_id
-                WHERE r.env=:env AND r.account_fingerprint=:account
-                  AND r.trading_epoch_id=:epoch
-                  AND c.env=:env AND c.account_id=:account
-                  AND c.trading_epoch_id=:epoch
-                  AND r.state IN ('RESERVED','UNCERTAIN')
-                  AND a.authoritative IS TRUE
-                  AND a.attempt_state IN (
-                    'FILLED','CANCELLED_ZERO_FILL','CANCELLED_PARTIAL_FILL'
-                  )
-                  AND a.client_order_key IS NOT NULL
-                  AND o.trade_date<=CAST(:trade_date AS DATE)
-                ORDER BY r.created_at
-                LIMIT :limit
-            """), {
-                "env": "practice", "account": scope["account_id"],
-                "epoch": scope["trading_epoch_id"],
-                "trade_date": trade_date, "limit": min(100, max(1, int(max_candidates))),
-            }).mappings().all()
-        # A Router can prove it never crossed HTTP and abandon the Attempt
-        # before us_orders exists. It has no broker terminal record; a second,
-        # strictly scoped path releases those durable *pre-submit* holds only.
-        with engine.connect() as conn:
-            pre_submit_aborts = conn.execute(text("""
-                SELECT r.action_key AS attempt_id, a.client_order_key,
-                       NULL::DATE AS source_trade_date,
-                       'ABANDONED_PRE_SUBMIT' AS attempt_state
-                FROM us_execution_account_reservations AS r
-                JOIN us_execution_attempts AS a ON a.attempt_id=r.action_key
-                JOIN us_execution_claims AS c ON c.action_key=a.action_key
-                WHERE r.env=:env AND r.account_fingerprint=:account
-                  AND r.trading_epoch_id=:epoch
-                  AND c.env=:env AND c.account_id=:account
-                  AND c.trading_epoch_id=:epoch
-                  AND r.state='RESERVED'
-                  AND a.authoritative IS TRUE
-                  AND a.attempt_state='ABANDONED_PRE_SUBMIT'
-                  AND c.active_attempt_id IS DISTINCT FROM a.attempt_id
-                  AND a.client_order_key IS NOT NULL
-                ORDER BY r.created_at LIMIT :limit
-            """), {
-                "env": "practice", "account": scope["account_id"],
-                "epoch": scope["trading_epoch_id"],
-                "limit": min(100, max(1, int(max_candidates))),
-            }).mappings().all()
-        for row in list(rows) + list(pre_submit_aborts):
-            result["attempted"] += 1
-            try:
-                if str(row.get("attempt_state") or "") == "ABANDONED_PRE_SUBMIT":
-                    authority.release_proven_pre_submit_abort(
-                        lease=lease, attempt_id=str(row["attempt_id"]),
-                        client_order_key=str(row["client_order_key"]),
+    result = {
+        "mode": "RESERVATION_ONLY", "attempted": 0, "released": 0,
+        "consumed": 0, "unresolved": 0,
+        "account_scope_fingerprint": digest,
+        "write_authority": "FENCED_ACCOUNT_RESERVATIONS_ONLY",
+    }
+    limit = min(100, max(1, int(max_candidates)))
+    with engine.connect() as conn:
+        all_epochs = conn.execute(text("""
+            SELECT DISTINCT trading_epoch_id
+            FROM us_execution_account_reservations
+            WHERE env=:env AND account_fingerprint=:account
+              AND state IN ('RESERVED','UNCERTAIN')
+            ORDER BY trading_epoch_id
+            LIMIT 9
+        """), {"env": "practice", "account": scope["account_id"]}).scalars().all()
+    # Unbounded stale epochs must not silently become an empty/clean read.
+    if len(all_epochs) > 8:
+        result["unresolved"] += 1
+        result["incomplete_epoch_scan"] = True
+        return result
+    epochs = list(dict.fromkeys(
+        [str(epoch) for epoch in all_epochs] + [str(scope["trading_epoch_id"])]
+    ))
+    result["epoch_count"] = len(epochs)
+    for epoch in epochs:
+        authority = AccountExecutionAuthority(
+            engine, env="practice", account_fingerprint=scope["account_id"],
+            trading_epoch_id=epoch,
+        )
+        lease = authority.acquire_lease(
+            holder_id="reservation-worker:" + uuid.uuid4().hex, ttl_seconds=30,
+        )
+        params = {
+            "env": "practice", "account": scope["account_id"],
+            "epoch": epoch, "trade_date": trade_date, "limit": limit,
+        }
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT r.action_key AS attempt_id, a.client_order_key,
+                           o.trade_date AS source_trade_date,
+                           a.attempt_state
+                    FROM us_execution_account_reservations AS r
+                    JOIN us_execution_attempts AS a
+                      ON a.attempt_id=r.action_key
+                    JOIN us_execution_claims AS c
+                      ON c.action_key=a.action_key
+                    JOIN us_orders AS o ON o.client_order_key=a.client_order_key
+                      AND o.env=r.env AND o.trading_epoch_id=r.trading_epoch_id
+                      AND o.meta->>'submit_attempt_id'=a.attempt_id
+                    WHERE r.env=:env AND r.account_fingerprint=:account
+                      AND r.trading_epoch_id=:epoch
+                      AND c.env=:env AND c.account_id=:account
+                      AND c.trading_epoch_id=:epoch
+                      AND r.state IN ('RESERVED','UNCERTAIN')
+                      AND a.authoritative IS TRUE
+                      AND a.attempt_state IN (
+                          'FILLED','CANCELLED_ZERO_FILL','CANCELLED_PARTIAL_FILL'
+                      )
+                      AND a.client_order_key IS NOT NULL
+                      AND o.trade_date<=CAST(:trade_date AS DATE)
+                    ORDER BY r.created_at LIMIT :limit
+                """), params).mappings().all()
+                abandoned = conn.execute(text("""
+                    SELECT r.action_key AS attempt_id, a.client_order_key,
+                           NULL::DATE AS source_trade_date,
+                           a.attempt_state
+                    FROM us_execution_account_reservations AS r
+                    JOIN us_execution_attempts AS a
+                      ON a.attempt_id=r.action_key
+                    JOIN us_execution_claims AS c
+                      ON c.action_key=a.action_key
+                    WHERE r.env=:env AND r.account_fingerprint=:account
+                      AND r.trading_epoch_id=:epoch
+                      AND c.env=:env AND c.account_id=:account
+                      AND c.trading_epoch_id=:epoch
+                      AND r.state='RESERVED'
+                      AND a.authoritative IS TRUE
+                      AND a.attempt_state='ABANDONED_PRE_SUBMIT'
+                      AND c.active_attempt_id IS DISTINCT FROM a.attempt_id
+                      AND a.client_order_key IS NOT NULL
+                    ORDER BY r.created_at LIMIT :limit
+                """), params).mappings().all()
+            for row in list(rows) + list(abandoned):
+                result["attempted"] += 1
+                try:
+                    if row["attempt_state"] == "ABANDONED_PRE_SUBMIT":
+                        released = authority.release_proven_pre_submit_abort(
+                            lease=lease, attempt_id=str(row["attempt_id"]),
+                            client_order_key=str(row["client_order_key"]),
+                        )
+                        result["released"] += int(released)
+                    else:
+                        receipt = authority.terminalize_verified_attempt(
+                            lease=lease, attempt_id=str(row["attempt_id"]),
+                            client_order_key=str(row["client_order_key"]),
+                            trade_date=str(row["source_trade_date"]),
+                        )
+                        if not receipt.get("idempotent"):
+                            if receipt["state"] == "RELEASED":
+                                result["released"] += 1
+                            elif receipt["state"] == "CONSUMED":
+                                result["consumed"] += 1
+                except (ReservationConflict, AuthorityUnavailable) as exc:
+                    # A failed exact proof leaves broker capacity reserved.
+                    result["unresolved"] += 1
+                    logger.warning(
+                        "[US_RESERVATION_WORKER][NOT_PROVEN] reason=%s",
+                        type(exc).__name__,
                     )
-                    result["released"] += 1
-                    continue
-                receipt = authority.terminalize_verified_attempt(
-                    lease=lease, attempt_id=str(row["attempt_id"]),
-                    client_order_key=str(row["client_order_key"]),
-                    trade_date=str(row["source_trade_date"]),
-                )
-                if receipt["state"] == "RELEASED":
-                    result["released"] += 1
-                elif receipt["state"] == "CONSUMED":
-                    result["consumed"] += 1
-            except (ReservationConflict, AuthorityUnavailable) as exc:
-                # Fail closed and leave the hold in place. Don't print
-                # account credentials or broker evidence contents.
-                result["unresolved"] += 1
-                logger.warning(
-                    "[US_RESERVATION_WORKER][NOT_PROVEN] reason=%s",
-                    type(exc).__name__,
-                )
-    finally:
-        authority.release_lease(lease=lease)
+        finally:
+            authority.release_lease(lease=lease)
     return result
 
 
@@ -192,7 +209,7 @@ def assert_fresh_reservation_worker(
         or payload.get("account_scope_fingerprint") != expected
         or payload.get("trade_date") != trade_date
         or payload.get("session_run_id") != session_run_id
-        or payload.get("read_status") not in {"OK", "DEGRADED"}
+        or payload.get("read_status") != "OK"
         or lag < 0 or lag > max_age_sec
     ):
         raise AuthorityUnavailable("US_RESERVATION_WORKER_HEALTH_STALE_OR_SCOPE_MISMATCH")
