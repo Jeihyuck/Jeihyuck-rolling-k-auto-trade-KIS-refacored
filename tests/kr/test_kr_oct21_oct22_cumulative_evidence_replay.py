@@ -246,3 +246,64 @@ def test_execution_timestamp_preferred_over_order_timestamp_with_provenance():
     )
     assert order_proxy.isoformat() == "2026-10-22T15:18:10+09:00"
     assert proxy_source == "ORDER_TIME_PROXY"
+
+
+def test_two_independent_cumulative_writers_and_restart_keep_one_fill(tmp_path):
+    """SQLite WAL file is a separate-connection concurrency stress fixture.
+
+    Real Postgres concurrent isolation and broker account authorization are
+    separate release gates; this test specifically guards fill identity.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.repos import FillsRepo
+    from trader.db.schema import schema_for_engine
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+
+    db_file = tmp_path / "kr249_fills.sqlite3"
+    engine = sa.create_engine(
+        "sqlite:///" + str(db_file),
+        connect_args={"check_same_thread": False, "timeout": 20},
+        poolclass=sa.pool.NullPool,
+    )
+    schema = create_schema_with_active_test_epoch(engine)
+    order_id = str(uuid.uuid4())
+    barrier = Barrier(2)
+
+    def write(qty, price):
+        barrier.wait(timeout=5)
+        return FillsRepo(engine).upsert_fill(
+            env="practice", run_id=None, order_id=order_id,
+            kis_odno="0000040226",
+            trade_id="KR_KIS_CUM:practice:20261021:0000040226:251970:SELL",
+            code="251970", market="KOSPI", side="SELL", qty=qty, price=price,
+            fee=0.0, tax=0.0,
+            filled_at=datetime(2026, 10, 21, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+            raw_json={"broker_snapshot_qty": qty},
+            fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(write, 10, 68500.0), pool.submit(write, 17, 68500.0)]
+        for future in futures:
+            assert future.result(timeout=25)
+    engine.dispose()
+    # Reopening a new engine simulates cold process restart and replay.
+    restarted = sa.create_engine("sqlite:///" + str(db_file))
+    FillsRepo(restarted).upsert_fill(
+        env="practice", run_id=None, order_id=order_id,
+        kis_odno="0000040226",
+        trade_id="KR_KIS_CUM:practice:20261021:0000040226:251970:SELL",
+        code="251970", market="KOSPI", side="SELL", qty=17, price=68500.0,
+        fee=0, tax=0,
+        filled_at=datetime(2026, 10, 21, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+        raw_json={"broker_snapshot_qty": 17, "post_restart": True},
+        fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+    )
+    with restarted.connect() as conn:
+        records = conn.execute(sa.select(schema_for_engine(restarted).fills)).mappings().all()
+    assert len(records) == 1
+    assert records[0]["qty"] == 17
+    restarted.dispose()
