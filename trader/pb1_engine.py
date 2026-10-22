@@ -13992,6 +13992,8 @@ class PB1Engine:
             stage,
         )
 
+        # Log all pre-submit DB/claim delay, not only KIS method time.
+        _kr_exit_ready_monotonic = time.monotonic()
         submit_block_reasons = self._resolve_exit_submit_gate_reasons(code=code)
         if submit_block_reasons:
             exit_eval_payload["submit_attempted"] = 0
@@ -14250,6 +14252,15 @@ class PB1Engine:
         kis_odno = None
         submit_exc: Exception | None = None
         requested_qty = int(orderable_qty or 0)
+        _kr_submit_start_monotonic = time.monotonic()
+        logger.info(
+            "[KR_LATENCY][SELL_SUBMIT_START] owner=KR_STANDARD code=%s cycle=%s "
+            "run_id=%s order_id=%s client_key=%s from_tick_start_s=%.3f "
+            "from_policy_ready_s=%.3f",
+            code, _cycle_id, self.run_id, order_id, client_key,
+            _kr_submit_start_monotonic - float(getattr(self, "_tick_start_time", _kr_submit_start_monotonic)),
+            _kr_submit_start_monotonic - _kr_exit_ready_monotonic,
+        )
         try:
             resp = self.kis.sell_stock_market(code, requested_qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
@@ -14257,6 +14268,14 @@ class PB1Engine:
             submit_exc = exc
             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
 
+        logger.info(
+            "[KR_LATENCY][SELL_SUBMIT_RETURN] owner=KR_STANDARD code=%s run_id=%s "
+            "order_id=%s elapsed_s=%.3f ack_observed=%s exception_type=%s",
+            code, self.run_id, order_id,
+            time.monotonic() - _kr_submit_start_monotonic,
+            int(submit_exc is None and bool(isinstance(resp, dict) and resp.get("rt_cd") == "0")),
+            type(submit_exc).__name__ if submit_exc is not None else "NONE",
+        )
         if submit_exc is not None:
             if is_kr_order_submit_outcome_ambiguous(submit_exc):
                 self.orders_repo.mark_unresolved_ack(
