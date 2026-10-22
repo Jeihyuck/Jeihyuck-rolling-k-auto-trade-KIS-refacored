@@ -243,3 +243,136 @@ class AccountExecutionAuthority:
                    "holder": lease.holder_id,
                    "token": lease.fencing_token})
             return result.rowcount == 1
+
+    def terminalize_verified_attempt(
+        self, *, lease: Lease, attempt_id: str,
+        client_order_key: str, trade_date: str,
+    ) -> dict:
+        """Release *only* a KIS-proven terminal Attempt's reservation.
+
+        This query is intended for a fenced reconciliation writer *after*
+        broker evidence has atomically updated us_orders and execution Claims.
+        Arbitrary 'KIS_TERMINAL:' strings and local cancel requests cannot
+        authorize this transition. A later superseding Attempt is independent.
+        """
+        if not attempt_id or not client_order_key or not trade_date:
+            raise ReservationConflict("terminal_reservation_identity_missing")
+        with self.engine.begin() as conn:
+            self._guard(conn, lease)
+            reserved = conn.execute(text("""
+                SELECT * FROM us_execution_account_reservations
+                WHERE action_key=:attempt_id AND env=:env
+                  AND account_fingerprint=:account AND trading_epoch_id=:epoch
+                FOR UPDATE
+            """), {**self.scope, "attempt_id": attempt_id}).mappings().first()
+            if reserved is None:
+                raise ReservationConflict("terminal_reservation_missing")
+            if reserved["state"] in {"RELEASED", "CONSUMED"}:
+                return {
+                    "state": reserved["state"], "idempotent": True,
+                    "attempt_id": attempt_id,
+                }
+            if reserved["state"] not in {"RESERVED", "UNCERTAIN"}:
+                raise ReservationConflict("terminal_reservation_not_active")
+            attempt = conn.execute(text("""
+                SELECT action_key, attempt_state, cumulative_filled_qty,
+                       authoritative, requested_qty, client_order_key
+                FROM us_execution_attempts
+                WHERE attempt_id=:attempt_id FOR UPDATE
+            """), {"attempt_id": attempt_id}).mappings().first()
+            if (
+                attempt is None or not attempt["authoritative"]
+                or str(attempt["client_order_key"] or "") != client_order_key
+                or int(attempt["requested_qty"]) != int(reserved["requested_qty"])
+            ):
+                raise ReservationConflict("terminal_attempt_proof_unverified")
+            action = conn.execute(text("""
+                SELECT env, account_id, trading_epoch_id, strategy_owner,
+                       active_attempt_id
+                FROM us_execution_claims WHERE action_key=:key FOR UPDATE
+            """), {"key": attempt["action_key"]}).mappings().first()
+            if (
+                action is None
+                or action["env"] != self.scope["env"]
+                or action["account_id"] != self.scope["account"]
+                or action["trading_epoch_id"] != self.scope["epoch"]
+                or action["strategy_owner"] != reserved["strategy_owner"]
+                or action["active_attempt_id"] == attempt_id
+            ):
+                raise ReservationConflict("terminal_claim_not_proven")
+            rows = conn.execute(text("""
+                SELECT status, qty_requested, qty_filled, order_no,
+                       symbol, side, meta
+                FROM us_orders
+                WHERE client_order_key=:client_order_key
+                  AND trade_date=CAST(:trade_date AS DATE)
+                  AND env=:env AND trading_epoch_id=:epoch
+                FOR UPDATE
+            """), {
+                "client_order_key": client_order_key,
+                "trade_date": trade_date,
+                "env": self.scope["env"], "epoch": self.scope["epoch"],
+            }).mappings().all()
+            if len(rows) != 1:
+                raise ReservationConflict("terminal_original_order_not_unique")
+            order = dict(rows[0])
+            meta = order.get("meta") or {}
+            if not isinstance(meta, dict):
+                raise ReservationConflict("terminal_order_meta_invalid")
+            cumulative = int(order["qty_filled"] or 0)
+            if (
+                str(meta.get("execution_action_key") or "") != attempt["action_key"]
+                or str(meta.get("submit_attempt_id") or "") != attempt_id
+                or str(order["symbol"]).upper() != str(reserved["symbol"]).upper()
+                or str(order["side"]).upper() != str(reserved["side"]).upper()
+                or int(order["qty_requested"]) != int(reserved["requested_qty"])
+                or int(attempt["cumulative_filled_qty"] or 0) != cumulative
+                or not order["order_no"]
+            ):
+                raise ReservationConflict("terminal_order_attempt_mismatch")
+            state = str(order["status"] or "").upper()
+            attempt_state = str(attempt["attempt_state"] or "").upper()
+            if state == "FILLED":
+                if (
+                    cumulative != int(order["qty_requested"])
+                    or attempt_state != "FILLED"
+                    or str(meta.get("fill_evidence_type") or "")
+                        != "KIS_ORDER_CUMULATIVE_ACTUAL"
+                ):
+                    raise ReservationConflict("terminal_fill_proof_missing")
+            elif state == "CANCELLED":
+                row = meta.get("broker_raw_row") or {}
+                if (
+                    attempt_state not in {"CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL"}
+                    or meta.get("broker_open_qty") != 0
+                    or not meta.get("broker_observed_at")
+                    or not isinstance(row, dict)
+                    or str(row.get("status") or "").upper() not in {"CANCELLED", "CANCELED"}
+                    or row.get("filled_qty_present") is not True
+                    or row.get("remaining_qty_present") is not True
+                    or int(row.get("filled_qty") or -1) != cumulative
+                ):
+                    raise ReservationConflict("terminal_cancel_proof_missing")
+            else:
+                raise ReservationConflict("terminal_order_not_final")
+            new_state = "CONSUMED" if cumulative > 0 else "RELEASED"
+            changed = conn.execute(text("""
+                UPDATE us_execution_account_reservations
+                SET state=:state, terminal_evidence=:evidence,
+                    holder_id=:holder, fencing_token=:token,
+                    updated_at=clock_timestamp()
+                WHERE action_key=:attempt_id
+                  AND env=:env AND account_fingerprint=:account
+                  AND trading_epoch_id=:epoch
+                  AND state IN ('RESERVED','UNCERTAIN')
+            """), {
+                **self.scope, "attempt_id": attempt_id, "state": new_state,
+                "evidence": "KIS_DB_PROVEN:" + str(order["order_no"]),
+                "holder": lease.holder_id, "token": lease.fencing_token,
+            })
+            if changed.rowcount != 1:
+                raise ReservationConflict("terminal_reservation_update_race")
+            return {
+                "state": new_state, "idempotent": False,
+                "attempt_id": attempt_id, "broker_order_no": str(order["order_no"]),
+            }
