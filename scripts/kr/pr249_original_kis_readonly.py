@@ -14,6 +14,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 import json
 import os
+from urllib.parse import urlparse
 from typing import Any
 
 # Grounded in 2026-10-22 read-only Supabase original order records. They are
@@ -135,13 +136,31 @@ def classify_original_kis_rows(
         "results": report,
     }
 
+\ndef _is_practice_kis_base_url(url: str) -> bool:
+    """Check exact HTTPS authority, not untrusted substring or unused env."""
+    try:
+        parsed = urlparse(str(url or ""))
+        return (parsed.scheme == "https"
+                and parsed.hostname == "openapivts.koreainvestment.com"
+                and parsed.port == 29443
+                and parsed.username is None and parsed.password is None)
+    except ValueError:
+        return False
+
 
 def run_practice_readonly() -> list[dict[str, Any]]:
-    url = (os.getenv("KIS_REST_URL") or "").lower()
+    # The actual KisAPI constructs HTTP URLs from settings.API_BASE_URL.
+    # KIS_REST_URL is an optional configuration override, not the source of
+    # truth; requiring it would prevent GET-only evidence in normal WSL setups.
     if (os.getenv("KIS_ENV") != "practice" or
-        os.getenv("STRATEGY_ENV") != "practice" or
-        "openapivts.koreainvestment.com" not in url):
+        os.getenv("STRATEGY_ENV") != "practice"):
         raise RuntimeError("PR249_PRACTICE_READONLY_ENV_REQUIRED")
+    from settings import API_BASE_URL, KIS_ENV as EFFECTIVE_KIS_ENV
+    optional_url = (os.getenv("KIS_REST_URL") or "").strip()
+    if (EFFECTIVE_KIS_ENV != "practice" or
+        not _is_practice_kis_base_url(API_BASE_URL) or
+        (optional_url and not _is_practice_kis_base_url(optional_url))):
+        raise RuntimeError("PR249_PRACTICE_READONLY_URL_MISMATCH")
     for required in ("KIS_APP_KEY", "KIS_APP_SECRET", "CANO", "ACNT_PRDT_CD"):
         if not os.getenv(required):
             raise RuntimeError("PR249_PRACTICE_READONLY_CREDENTIAL_UNAVAILABLE")
@@ -149,6 +168,8 @@ def run_practice_readonly() -> list[dict[str, Any]]:
     from trader.account_state import get_account_key
     from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
     kis = KisAPI(kis_env="practice")
+    if getattr(kis, "env", None) != "practice":
+        raise RuntimeError("PR249_KIS_CLIENT_ENV_MISMATCH")
     scope_digest = hashlib.sha256(
         get_account_key(env="practice", kis=kis).encode("utf-8")
     ).hexdigest()
