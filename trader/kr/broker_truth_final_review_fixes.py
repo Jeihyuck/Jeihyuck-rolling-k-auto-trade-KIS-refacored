@@ -197,6 +197,17 @@ def _link_buy_fills_retry_safe(*, engine, env: str, strategy: str) -> dict[str, 
             cumulative_fee = sum(base._px(row.get("fee")) for row in attributed)
             cumulative_tax = sum(base._px(row.get("tax")) for row in attributed)
             order_qty = base._qty(order.get("qty"))
+            # A prior cumulative snapshot may already have been written as a
+            # separate fill. Summing 22+48 for a 48-share order is NOT 70
+            # independently executed shares; never replay such economics.
+            if order_qty <= 0 or cumulative_qty > order_qty:
+                logger.error(
+                    "[KR_BROKER_TRUTH][BUY_RETRY][BLOCK] code=%s order_id=%s "
+                    "reason=BROKER_FILL_CUMULATIVE_OVERCOUNT observed=%s ordered=%s "
+                    "action=KEEP_RAW_EVIDENCE_NO_POSITION_WRITE",
+                    code, order_id, cumulative_qty, order_qty,
+                )
+                continue
             canonical_status = (
                 "FILLED" if order_qty > 0 and cumulative_qty >= order_qty else "PARTIAL_FILLED"
             )
@@ -235,6 +246,27 @@ def _link_buy_fills_retry_safe(*, engine, env: str, strategy: str) -> dict[str, 
             continue
 
         position = exact_rows[0] if exact_rows else None
+        if position is None:
+            # An earlier completed BUY/SELL lifecycle is never reconstructed
+            # by inserting the same position_cycle_id a second time. That
+            # produced uq_positions_cycle_id for 086450 on 2026-10-21.
+            with engine.connect() as conn:
+                historical = conn.execute(
+                    sa.select(schema.positions.c.status).where(sa.and_(
+                        schema.positions.c.env == env,
+                        schema.positions.c.strategy == strategy,
+                        schema.positions.c.position_cycle_id == cycle,
+                        schema.positions.c.portfolio_epoch_id == epoch,
+                    )).limit(1)
+                ).scalar_one_or_none()
+            if historical is not None:
+                logger.error(
+                    "[KR_BROKER_TRUTH][BUY_RETRY][BLOCK] code=%s cycle=%s "
+                    "status=%s reason=EXISTING_NONOPEN_CYCLE "
+                    "action=KEEP_BROKER_PROOF_DO_NOT_RECREATE",
+                    code, cycle, historical,
+                )
+                continue
         entry_json = base._json_dict((position or {}).get("entry_meta_json"))
         legacy_pos_meta = base._json_dict((position or {}).get("position_meta"))
         applied_map = base._json_dict(entry_json.get(_BUY_APPLIED_KEY))
