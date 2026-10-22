@@ -6,6 +6,7 @@ on:
     paths:
       - 'trader/us/**'
       - 'trader/execution_claims.py'
+      - 'migrations/0056_us_execution_authority_reservations.sql'
       - 'tests/us/**'
       - '.github/workflows/us-20261021-flow-abc-integration.yml'
   workflow_dispatch:
@@ -60,6 +61,7 @@ jobs:
             trader/us/data_provider.py \
             trader/us/execution/reconcile.py \
             trader/us/execution/reconcile_shadow_worker.py \
+            trader/us/execution/account_authority.py \
             trader/us/runner/trade_tick_runner.py \
             trader/us/runner/trade_session_runner.py
       - name: Focused A-B-C runner/repository/worker regressions
@@ -68,6 +70,7 @@ jobs:
             tests/us/test_us_20261021_claim_late_fill.py \
             tests/us/test_us_20261021_tqqq_ttl_quantity_contract.py \
             tests/us/test_us_20261021_reconcile_shadow_worker.py \
+            tests/us/test_us_20261022_account_authority.py \
             tests/us/test_us_early_hard_stop_tick_integration_20261016.py \
             tests/us/test_us_postgres_integration_real.py
       - name: Full US regression suite without network or orders
