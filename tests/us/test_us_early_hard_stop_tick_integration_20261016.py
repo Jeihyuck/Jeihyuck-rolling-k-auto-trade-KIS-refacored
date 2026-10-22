@@ -12,8 +12,9 @@ import pytest
 @pytest.mark.parametrize("early_enabled", [False, True])
 @pytest.mark.parametrize("multi_enabled", [False, True])
 @pytest.mark.parametrize("route_status", ["ACK", "BROKER_SUBMIT_RESULT_UNKNOWN"])
+@pytest.mark.parametrize("soft_stop_mode", [False, True])
 def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
-    monkeypatch, early_enabled, multi_enabled, route_status,
+    monkeypatch, early_enabled, multi_enabled, route_status, soft_stop_mode,
 ):
     from tests.us.test_us_exit_first_routing import _patch_tick_basics
     from trader.us.db import repos
@@ -25,6 +26,7 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     _patch_tick_basics(monkeypatch, calls)
     monkeypatch.setenv("US_EARLY_HARD_STOP_PILOT_ENABLED", "1" if early_enabled else "0")
     monkeypatch.setenv("US_EARLY_MULTI_HARD_STOP_ENABLED", "1" if multi_enabled else "0")
+    monkeypatch.setenv("US_EARLY_SOFT_STOP_PILOT_ENABLED", "1" if soft_stop_mode else "0")
     monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0")
     monkeypatch.setenv("US_ENTRY_ENABLED", "0")
     monkeypatch.setenv("KIS_ENV", "practice")
@@ -64,9 +66,8 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
         def get_current_price(self, symbol, exchange):
             calls.append(("quote_" + symbol, None, {}))
             return {
-                "last": "90.0"
-                if (symbol == "AAA" or (multi_enabled and symbol == "BBB"))
-                else "101.0"
+                "last": ("94.0" if soft_stop_mode else "90.0")
+                if symbol == "AAA" else ("90.0" if multi_enabled and symbol == "BBB" else "101.0")
             }
 
         def get_orderable_cash(self, symbol, exchange, price):
@@ -114,7 +115,7 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     state_updates = {"risk": [], "hwm": []}
     def update_risk(**kwargs):
         state_updates["risk"].append(kwargs["symbol"])
-        return {"soft_stop_breach_count": 0}
+        return {"soft_stop_breach_count": 2 if soft_stop_mode and kwargs["symbol"] == "AAA" else 0}
     def update_hwm(**kwargs):
         state_updates["hwm"].append(kwargs["symbol"])
         return {
@@ -171,7 +172,7 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     events = [call[0] for call in calls]
     assert events.count("submit_AAA") == 1, events
     assert "quote_BBB" in events
-    if early_enabled:
+    if early_enabled and (not soft_stop_mode or multi_enabled):
         assert events.index("submit_AAA") < events.index("quote_BBB"), events
     else:
         assert events.index("quote_BBB") < events.index("submit_AAA"), events
