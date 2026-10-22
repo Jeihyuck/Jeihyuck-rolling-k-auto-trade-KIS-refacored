@@ -193,3 +193,52 @@ def test_account_execution_authority_tables_are_rls_protected(authority):
         """)).all()
     assert len(rows) == 2
     assert all(rls is True for _, rls in rows)
+
+
+def test_concurrent_am_afternoon_across_strategies_never_overspends(authority):
+    """Real PostgreSQL simultaneous writes across different trading epochs.
+
+    One account, 8 independent strategy/epoch writers, 4 affordable shares.
+    The DB advisory lock must preserve account-global reservations without
+    a lost-update or a double-spend when KIS cash has not yet changed.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(8, timeout=12)
+    def submit(index):
+        distinct_epoch = AccountExecutionAuthority(
+            authority.engine, env="practice",
+            account_fingerprint=authority.scope["account"],
+            trading_epoch_id="overlap-epoch-" + str(index),
+        )
+        barrier.wait()
+        lease = distinct_epoch.acquire_lease(
+            holder_id="session-" + str(index), ttl_seconds=30,
+        )
+        try:
+            distinct_epoch.reserve(
+                lease=lease, action_key="simultaneous-buy-" + str(index),
+                strategy_owner=("US_STANDARD" if index % 2 == 0 else "TQQQ_INFINITE"),
+                symbol=("AMD" if index % 2 == 0 else "TQQQ"),
+                side="BUY", qty=1, price_usd="100", broker_cash_usd="400",
+            )
+            return "RESERVED"
+        except ReservationConflict as exc:
+            assert "account_capacity_reserved" in str(exc)
+            return "FENCED"
+        finally:
+            distinct_epoch.release_lease(lease=lease)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(submit, range(8)))
+    assert results.count("RESERVED") == 4, results
+    assert results.count("FENCED") == 4, results
+    with authority.engine.connect() as conn:
+        total = conn.execute(text("""
+            SELECT COALESCE(SUM(reserved_cash_usd),0)
+            FROM us_execution_account_reservations
+            WHERE env='practice' AND account_fingerprint=:account
+              AND state IN ('RESERVED','UNCERTAIN') AND side='BUY'
+        """), {"account": authority.scope["account"]}).scalar_one()
+    assert float(total) == 400.0
