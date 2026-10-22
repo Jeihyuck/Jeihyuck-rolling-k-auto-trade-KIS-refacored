@@ -234,6 +234,7 @@ class AccountExecutionAuthority:
                 SELECT r.state, r.strategy_owner, r.symbol, r.side,
                        r.requested_qty,
                        a.client_order_key, a.requested_qty AS attempt_qty,
+                       a.attempt_state, a.authoritative,
                        c.active_attempt_id, c.strategy_owner AS claim_owner,
                        c.action_state
                 FROM us_execution_account_reservations r
@@ -257,7 +258,12 @@ class AccountExecutionAuthority:
                 or str(row["client_order_key"]) != client_order_key
                 or str(row["active_attempt_id"]) != attempt_id
                 or str(row["claim_owner"]) != strategy_owner.upper()
-                or str(row["action_state"]) not in {"IN_FLIGHT", "OPEN"}
+                or str(row["action_state"]) != "IN_FLIGHT"
+                # Exactly one first attempt may cross KIS native HTTP. If
+                # an ACK was lost or a client attempts an implicit retry,
+                # the durable CREATED->SUBMITTED transition fences it.
+                or str(row["attempt_state"]) != "CREATED"
+                or row["authoritative"] is not False
             ):
                 raise AuthorityUnavailable("US_RESERVED_SUBMIT_AUTHORITY_STALE")
 
