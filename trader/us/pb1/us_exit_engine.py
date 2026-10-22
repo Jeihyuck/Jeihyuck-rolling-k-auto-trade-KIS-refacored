@@ -1018,14 +1018,41 @@ def prepare_exit_position_snapshots(
         getattr(provider, "get_current_price", None)
         or getattr(provider, "get_current_price_usd", None)
     )
+    _isolated_quote_reader = getattr(provider, "get_isolated_exit_quote", None)
     _prefetch_requested = (
         os.getenv("US_EXIT_QUOTE_PREFETCH_ENABLED", "0") == "1"
         and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
-        and bool(getattr(provider, "concurrent_price_reads_safe", False))
-        and callable(_quote_method)
+        and (
+            bool(getattr(provider, "concurrent_price_reads_safe", False))
+            or callable(_isolated_quote_reader)
+        )
+        and (callable(_quote_method) or callable(_isolated_quote_reader))
         and len(positions or []) > 1
     )
+    # One wall-clock budget for the entire quote batch (not one timeout per
+    # symbol). Without it, a hung REST quote can stall every protected exit.
+    _prefetch_deadline = None
     if _prefetch_requested:
+        _budget = max(0.2, min(10.0, float(
+            os.getenv("US_EXIT_QUOTE_PREFETCH_DEADLINE_SEC", "5")
+        )))
+        _tick_context = getattr(provider, "_tick_context", None)
+        if _tick_context is not None and callable(
+            getattr(_tick_context, "remaining_sec", None)
+        ):
+            _budget = min(_budget, max(0.0, float(_tick_context.remaining_sec()) - 0.1))
+        if _budget <= 0:
+            _prefetch_requested = False
+        else:
+            _prefetch_deadline = time.monotonic() + _budget
+    if _prefetch_requested:
+        if callable(_isolated_quote_reader):
+            # Only the isolated quote implementation receives a shared
+            # deadline; it must use its own KIS client/cache and leave the
+            # main Tick-bound trading provider untouched.
+            _quote_method = lambda sym, exch: _isolated_quote_reader(
+                sym, exch, stage_deadline=_prefetch_deadline,
+            )
         _workers = min(4, max(1, int(os.getenv("US_EXIT_QUOTE_PREFETCH_WORKERS", "3"))))
         _pool = ThreadPoolExecutor(max_workers=_workers, thread_name_prefix="us-exit-quote")
         try:
@@ -1073,7 +1100,9 @@ def prepare_exit_position_snapshots(
             try:
                 if hasattr(provider, "get_current_price"):
                     price_data = (
-                        _quote_futures[_position_index].result()
+                        _quote_futures[_position_index].result(
+                            timeout=max(0.0, _prefetch_deadline - time.monotonic())
+                        )
                         if _pool is not None else provider.get_current_price(symbol, exchange)
                     )
                     if isinstance(price_data, dict):
@@ -1098,7 +1127,9 @@ def prepare_exit_position_snapshots(
                         current_price = float(price_data or 0)
                 elif hasattr(provider, "get_current_price_usd"):
                     _value = (
-                        _quote_futures[_position_index].result()
+                        _quote_futures[_position_index].result(
+                            timeout=max(0.0, _prefetch_deadline - time.monotonic())
+                        )
                         if _pool is not None else provider.get_current_price_usd(symbol, exchange)
                     )
                     current_price = float(_value or 0)
@@ -1219,7 +1250,14 @@ def prepare_exit_position_snapshots(
                 on_snapshot_ready(pos)
     finally:
         if _pool is not None:
-            _pool.shutdown(wait=True, cancel_futures=True)
+            # Never block exits on an already timed-out read-only quote.
+            # Slow futures must not be used for prices after the shared
+            # deadline. A provider must explicitly guarantee isolated,
+            # bounded and concurrency-safe I/O before opting in.
+            for _future in _quote_futures.values():
+                if not _future.done():
+                    _future.cancel()
+            _pool.shutdown(wait=False, cancel_futures=True)
     return snapshots
 
 
