@@ -12633,9 +12633,6 @@ class PB1Engine:
         return status
 
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> dict[str, Any] | None:
-        avg = self._to_float(pos.get("avg_buy_price"))
-        if not avg:
-            return None
         code = str(pos.get("code") or "").zfill(6)
         _contract_meta = pos.get("position_meta") or {}
         if not isinstance(_contract_meta, dict):
@@ -12658,6 +12655,11 @@ class PB1Engine:
                 "submit_attempted": 0, "order_result": "ORDER_SKIPPED_CYCLE_BINDING",
                 "order_skip_reasons": ["CYCLE_BINDING_CONFLICT"],
             }
+        # Validate lineage before invoking the price/strategy path. A closed or
+        # ambiguous position must not be able to submit even with a valid quote.
+        avg = self._to_float(pos.get("avg_buy_price"))
+        if not avg:
+            return None
         display_code = self._display_code(code)
         market = pos.get("market")
         mode = int(pos.get("mode") or 1)
