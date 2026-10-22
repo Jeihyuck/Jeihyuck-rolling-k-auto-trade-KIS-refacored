@@ -49,3 +49,14 @@ def test_repeated_attempt_lines_cannot_fabricate_twenty_samples():
         for _ in range(30)
     ])
     assert evaluate_logs(log)["unique_selected_sell_attempts"] == 1
+
+
+
+def test_runtime_acceptance_rejects_failed_ticks_even_if_p95_passes():
+    evidence = _runtime_log() + (
+        "\n2026-10-22 23:03:02,000 ERROR "
+        "[US_TICK][DONE] session=am status=FAILED reason=fill_persistence_failed"
+    )
+    result = evaluate_logs(evidence)
+    assert result["status"] == "FAIL"
+    assert "tick_failures_present_in_evidence_window" in result["issues"]
