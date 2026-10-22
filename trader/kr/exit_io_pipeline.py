@@ -69,3 +69,56 @@ def ordered_exit_ohlcv(
         if future is not None:
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+def ordered_bounded_entry_reads(
+    holdings: Sequence[T],
+    *,
+    needs_history: Callable[[T], bool],
+    fetch: Callable[[T], R],
+    empty: Callable[[], R],
+    max_workers: int = 3,
+) -> Iterator[tuple[T, R]]:
+    """Bounded, ordered final30 BUY data IO — NEVER evaluates or places orders.
+
+    Submit at most max_workers reads ahead; consume them in the original
+    strategy evaluation order. The authoritative KR tick deadline travels
+    into every worker, so no quote call may outlive the caller budget.
+    """
+    from trader.kis_wrapper import (
+        get_kr_tick_deadline, set_kr_tick_deadline, clear_kr_tick_deadline,
+    )
+
+    items = list(holdings)
+    concurrency = max(1, min(4, int(max_workers)))
+    if concurrency == 1 or len(items) <= 1:
+        yield from ordered_exit_ohlcv(
+            items, needs_history=needs_history, fetch=fetch,
+            empty=empty, enabled=False,
+        )
+        return
+    shared_deadline = get_kr_tick_deadline()
+
+    def fetch_scoped(item: T) -> R:
+        set_kr_tick_deadline(shared_deadline)
+        try:
+            return fetch(item)
+        finally:
+            clear_kr_tick_deadline()
+
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="kr-entry-ohlcv")
+    pending: dict[int, Future[R]] = {}
+    next_index = 0
+    try:
+        for i, item in enumerate(items):
+            # Bounded lookahead: never scan/fetch more than N future symbols.
+            while next_index < len(items) and next_index < i + concurrency:
+                if needs_history(items[next_index]):
+                    pending[next_index] = executor.submit(fetch_scoped, items[next_index])
+                next_index += 1
+            result = pending.pop(i).result() if i in pending else empty()
+            yield item, result
+    finally:
+        for future in pending.values():
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
