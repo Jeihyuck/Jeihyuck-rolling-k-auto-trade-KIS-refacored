@@ -14294,13 +14294,21 @@ class PB1Engine:
         submit_exc: Exception | None = None
         requested_qty = int(orderable_qty or 0)
         _kr_submit_start_monotonic = time.monotonic()
+        try:
+            _full_tick_origin = float(os.getenv("KR_TICK_ORIGIN_MONOTONIC") or "")
+            if not (0 < _full_tick_origin <= _kr_submit_start_monotonic):
+                raise ValueError("tick_origin_invalid")
+            _kr_tick_origin_source = "RUNNER_FULL_TICK"
+        except (TypeError, ValueError):
+            _full_tick_origin = float(getattr(self, "_tick_start_time", _kr_submit_start_monotonic))
+            _kr_tick_origin_source = "ENGINE_ONLY_UNQUALIFIED"
         logger.info(
             "[KR_LATENCY][SELL_SUBMIT_START] owner=KR_STANDARD code=%s cycle=%s "
             "run_id=%s order_id=%s client_key=%s from_tick_start_s=%.3f "
-            "from_policy_ready_s=%.3f",
+            "tick_origin_source=%s from_policy_ready_s=%.3f",
             code, _cycle_id, self.run_id, order_id, client_key,
-            _kr_submit_start_monotonic - float(getattr(self, "_tick_start_time", _kr_submit_start_monotonic)),
-            _kr_submit_start_monotonic - _kr_exit_ready_monotonic,
+            _kr_submit_start_monotonic - _full_tick_origin,
+            _kr_tick_origin_source, _kr_submit_start_monotonic - _kr_exit_ready_monotonic,
         )
         try:
             resp = self.kis.sell_stock_market(code, requested_qty)
