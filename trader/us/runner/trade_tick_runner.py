@@ -2730,18 +2730,34 @@ def run_trade_tick(
                 _sym = str(snapshot.get("symbol") or "").upper()
                 if _sym == "TQQQ" or _pb1_symbol_counts.get(_sym) != 1:
                     return
+                # A separately approved practice-only SOFT_STOP pilot may
+                # route a uniquely selected, strategy-confirmed soft stop
+                # before an unrelated symbol's quote. The hard-stop legacy
+                # behaviour remains unchanged by default. Never preempt TP,
+                # defense, trend, trailing or owner-specific Infinite policy.
+                _soft_stop_early = (
+                    _multi_hard_stop_enabled
+                    and os.getenv("US_EARLY_SOFT_STOP_PILOT_ENABLED", "0") == "1"
+                )
                 _eligible = [
                     i for i in _new_intents
                     if str(i.get("side") or "").upper() == "SELL"
-                    # SWING routing canonicalizes hard_stop_loss to hard_stop.
-                    # Require BOTH the canonical exit reason and exit family
-                    # to avoid admitting unrelated high-priority exits.
-                    and str(i.get("exit_type") or "").lower()
-                        in {"hard_stop", "hard_stop_loss"}
-                    and str(i.get("exit_reason") or "").lower()
-                        == "hard_stop_full_exit"
-                    and _exit_family(i) == "HARD_STOP"
                     and str(i.get("symbol") or "").upper() == _sym
+                    and (
+                        (
+                            str(i.get("exit_type") or "").lower()
+                                in {"hard_stop", "hard_stop_loss"}
+                            and str(i.get("exit_reason") or "").lower()
+                                == "hard_stop_full_exit"
+                            and _exit_family(i) == "HARD_STOP"
+                        )
+                        or (
+                            _soft_stop_early
+                            and str(i.get("exit_type") or "").lower()
+                                == "soft_stop_loss"
+                            and _exit_family(i) == "SOFT_STOP"
+                        )
+                    )
                 ]
                 if len(_eligible) != 1:
                     return
@@ -2775,9 +2791,9 @@ def run_trade_tick(
                     if _chosen_trace_id:
                         tick_context._sell_selected_trace_id_by_symbol[_sym] = _chosen_trace_id
                 logger.warning(
-                    "[US_EXIT][EARLY_HARD_STOP_PILOT] tick=%s symbol=%s "
-                    "action=route_via_canonical_router_before_unrelated_snapshots",
-                    tick_index, _sym,
+                    "[US_EXIT][EARLY_PROTECTIVE_PILOT] tick=%s symbol=%s "
+                    "family=%s action=route_via_canonical_router_before_unrelated_snapshots",
+                    tick_index, _sym, _exit_family(_eligible[0]),
                 )
                 try:
                     _pilot_result = route_exit_orders_immediately(
