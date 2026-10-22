@@ -11,7 +11,7 @@ SCRIPT = Path("scripts/wsl/us-stage123-paper-defaults.sh")
 def _source(env):
     base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env}
     proc = subprocess.run(
-        ["bash", "-c", 'source "$1"; echo "RESULT:${US_STAGE123_PAPER_PROFILE}:${US_ATOMIC_CLAIM_OUTBOX_ENABLED:-unset}:${US_ACCOUNT_RESERVATION_MODE:-unset}:${US_RECONCILE_WORKER_MODE:-unset}:${US_SHARED_KIS_LIMITER_ENABLED:-unset}:${US_EXIT_QUOTE_PREFETCH_ENABLED:-unset}:${US_EARLY_HARD_STOP_PILOT_ENABLED:-unset}:${US_EARLY_MULTI_HARD_STOP_ENABLED:-unset}:${US_EARLY_SOFT_STOP_PILOT_ENABLED:-unset}"', "shell", str(SCRIPT)],
+        ["bash", "-c", 'source "$1" || exit $?; echo "RESULT:${US_STAGE123_PAPER_PROFILE}:${US_ATOMIC_CLAIM_OUTBOX_ENABLED:-unset}:${US_ACCOUNT_RESERVATION_MODE:-unset}:${US_RECONCILE_WORKER_MODE:-unset}:${US_SHARED_KIS_LIMITER_ENABLED:-unset}:${US_EXIT_QUOTE_PREFETCH_ENABLED:-unset}:${US_EARLY_HARD_STOP_PILOT_ENABLED:-unset}:${US_EARLY_MULTI_HARD_STOP_ENABLED:-unset}:${US_EARLY_SOFT_STOP_PILOT_ENABLED:-unset}"', "shell", str(SCRIPT)],
         env=base, capture_output=True, text=True,
     )
     return proc
