@@ -88,10 +88,29 @@ def prove_safe_protective_sell_handoff(
                     return False, "BROKER_ORDER_MULTIPLE_ROWS_REQUIRE_RECONCILE"
                 broker_rows[key] = row
             db_by_key: dict[tuple[str, str, str], dict] = {}
+            # orders intentionally has no account_id column: its durable
+            # account/strategy scope is owned by portfolio_epochs. Query in
+            # one batch, never trust a missing order field or code-only join.
+            portfolio_ids = {str(item.get("portfolio_epoch_id") or "") for item in stored}
+            if stored and "" in portfolio_ids:
+                return False, "DURABLE_ORDER_PORTFOLIO_EPOCH_MISSING"
+            epochs = {}
+            if portfolio_ids:
+                epoch_rows = conn.execute(sa.select(schema.portfolio_epochs).where(
+                    schema.portfolio_epochs.c.portfolio_epoch_id.in_(portfolio_ids)
+                )).mappings().all()
+                epochs = {str(row["portfolio_epoch_id"]): row for row in epoch_rows}
             scope = get_account_key(env=env, kis=kis)
             for order in stored:
                 no = str(order.get("kis_odno") or order.get("broker_order_id") or "").strip()
-                if not no or str(order.get("account_id") or "") != scope:
+                epoch = epochs.get(str(order.get("portfolio_epoch_id") or ""))
+                if (
+                    not no or epoch is None
+                    or str(epoch.get("account_id") or "") != scope
+                    or str(epoch.get("env") or "") != env
+                    or str(epoch.get("strategy") or "") != str(order.get("strategy") or "")
+                    or (order.get("trading_epoch_id") and str(order["trading_epoch_id"]) != str(epoch.get("trading_epoch_id") or ""))
+                ):
                     return False, "DURABLE_ORDER_ACCOUNT_IDENTITY_MISSING"
                 key = (str(order["code"]).zfill(6), str(order["side"]).upper(), no)
                 if key in db_by_key:
