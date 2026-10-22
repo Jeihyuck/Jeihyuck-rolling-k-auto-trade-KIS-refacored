@@ -2248,15 +2248,31 @@ def test_account_reservation_only_terminalizes_after_exact_tqqq_broker_proof(
     )
     assert proof["status"] == "OK", proof
     assert ledger.get(identity).action_state == "RETRYABLE"
-    resolved = owner.terminalize_verified_attempt(
-        lease=lease, attempt_id=attempt,
-        client_order_key=key, trade_date="2026-10-20",
-    )
-    assert resolved["state"] == "RELEASED"
-    assert not resolved["idempotent"]
-    replay = owner.terminalize_verified_attempt(
-        lease=lease, attempt_id=attempt,
-        client_order_key=key, trade_date="2026-10-20",
-    )
-    assert replay["idempotent"]
     owner.release_lease(lease=lease)
+    # The standalone fenced worker may release this reservation only AFTER
+    # the exact original KIS cancel + durable Claim transition is stored.
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE")
+    monkeypatch.setattr(
+        repos, "_us_execution_claim_scope",
+        lambda: {
+            "env": "practice", "account_id": account,
+            "market": "US", "trading_epoch_id": "test-tqqq-epoch",
+        },
+    )
+    from trader.us.execution.reservation_reconcile_worker import (
+        reconcile_proven_reservations_once,
+    )
+    worker_result = reconcile_proven_reservations_once(
+        env="practice", trade_date="2026-10-20",
+    )
+    assert worker_result["attempted"] == 1, worker_result
+    assert worker_result["released"] == 1, worker_result
+    assert worker_result["unresolved"] == 0, worker_result
+    next_lease = owner.acquire_lease(holder_id="verify-after-worker")
+    replay = owner.terminalize_verified_attempt(
+        lease=next_lease, attempt_id=attempt,
+        client_order_key=key, trade_date="2026-10-20",
+    )
+    assert replay["state"] == "RELEASED"
+    assert replay["idempotent"]
+    owner.release_lease(lease=next_lease)
