@@ -350,7 +350,7 @@ class AccountExecutionAuthority:
                     or str(row.get("status") or "").upper() not in {"CANCELLED", "CANCELED"}
                     or row.get("filled_qty_present") is not True
                     or row.get("remaining_qty_present") is not True
-                    or int(row.get("filled_qty") or -1) != cumulative
+                    or int(row["filled_qty"] if row.get("filled_qty") is not None else -1) != cumulative
                 ):
                     raise ReservationConflict("terminal_cancel_proof_missing")
             else:
