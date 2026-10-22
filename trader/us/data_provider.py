@@ -771,6 +771,11 @@ class USDataProvider:
         from trader.us.execution.kis_us_client import KisUSTemporaryError
         if self._env != "practice" or _time.monotonic() >= stage_deadline:
             raise KisUSTemporaryError("isolated exit quote deadline or env blocked")
+        # Concurrent KIS clients each keep a local endpoint clock. Do not
+        # permit them to burst the same broker account until the cross-PID
+        # limiter serializes every native HTTP call.
+        if os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") != "1":
+            raise KisUSTemporaryError("isolated exit quote requires account rate limiter")
         isolate = USDataProvider(
             offline=self._offline, cache_enabled=False, env=self._env,
         )
