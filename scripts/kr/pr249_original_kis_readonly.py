@@ -136,7 +136,8 @@ def classify_original_kis_rows(
         "results": report,
     }
 
-\ndef _is_practice_kis_base_url(url: str) -> bool:
+
+def _is_practice_kis_base_url(url: str) -> bool:
     """Check exact HTTPS authority, not untrusted substring or unused env."""
     try:
         parsed = urlparse(str(url or ""))
