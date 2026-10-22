@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import os
 from typing import Any
 
 from sqlalchemy import text
@@ -224,6 +225,14 @@ class AccountExecutionAuthority:
         ACK or locally inferred timeout is not terminal evidence.
         KIS truth must be reconciled before invoking this method.
         """
+        # Kept for isolated legacy regression fixtures only. A caller's
+        # string is NOT authoritative broker proof; real workers must instead
+        # call terminalize_verified_attempt() under the same DB fencing row.
+        if not (
+            os.getenv("PYTEST_CURRENT_TEST")
+            and os.getenv("PBCORE_TEST_POSTGRES_URL")
+        ):
+            raise ReservationConflict("unverified_terminalization_forbidden")
         if not action_key or not str(terminal_evidence or "").startswith("KIS_TERMINAL:"):
             raise ReservationConflict("authoritative_terminal_evidence_required")
         with self.engine.begin() as conn:
