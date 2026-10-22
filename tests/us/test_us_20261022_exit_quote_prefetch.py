@@ -95,6 +95,7 @@ def test_isolated_production_provider_keeps_session_broker_state_separate(monkey
     from trader.us.data_provider import USDataProvider
     from trader.us.execution.kis_us_client import KisUSTemporaryError
 
+    monkeypatch.setenv("US_SHARED_KIS_LIMITER_ENABLED", "1")
     parents = []
     clients = []
     class FakeReadOnlyClient:
@@ -128,6 +129,11 @@ def test_isolated_production_provider_keeps_session_broker_state_separate(monkey
     with pytest.raises(KisUSTemporaryError):
         main.get_isolated_exit_quote(
             "AAA", "NASDAQ", stage_deadline=time.monotonic() - 1,
+        )
+    monkeypatch.setenv("US_SHARED_KIS_LIMITER_ENABLED", "0")
+    with pytest.raises(KisUSTemporaryError, match="rate limiter"):
+        main.get_isolated_exit_quote(
+            "AAA", "NASDAQ", stage_deadline=time.monotonic() + 5,
         )
 
 
