@@ -8224,7 +8224,11 @@ class PB1Engine:
                     )
                     return pd.DataFrame(), {"source": "ohlcv_read_failed"}
 
-            _entry_read_workers = max(1, min(4, int(os.getenv("KR_ENTRY_OHLCV_READ_WORKERS", "3") or "3")))
+            try:
+                _entry_read_workers = max(1, min(4, int(os.getenv("KR_ENTRY_OHLCV_READ_WORKERS", "3") or "3")))
+            except (TypeError, ValueError):
+                _entry_read_workers = 3
+                logger.warning("[KR_ENTRY][READAHEAD_WORKERS][INVALID] action=USE_SAFE_DEFAULT_3")
             if _entry_read_ahead:
                 _candidate_history = ordered_bounded_entry_reads(
                     members_list,
