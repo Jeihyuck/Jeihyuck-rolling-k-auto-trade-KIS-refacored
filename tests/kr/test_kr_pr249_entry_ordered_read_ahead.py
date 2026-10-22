@@ -34,3 +34,53 @@ def test_entry_prefetch_only_wraps_data_not_signal_or_broker_decisions():
     assert code.index('for m, (df, meta) in _candidate_history') < code.index('features = compute_features(df)')
     assert 'self._fetch_daily(_code, days=need_days)' in code
     assert 'logger.warning(' in code
+
+
+def test_three_worker_market_reads_preserve_thirty_ordered_final30():
+    import time
+    from threading import Lock
+    from trader.kr.exit_io_pipeline import ordered_bounded_entry_reads
+    lock=Lock()
+    currently=0
+    peak=0
+    order=list(range(30))
+
+    def fetch(i):
+        nonlocal currently,peak
+        with lock:
+            currently+=1
+            peak=max(peak,currently)
+        try:
+            time.sleep(0.005 if i % 2 else 0.01)
+            return i * 10
+        finally:
+            with lock:
+                currently-=1
+
+    actual=list(ordered_bounded_entry_reads(
+        order,needs_history=lambda _: True,fetch=fetch,
+        empty=lambda: None,max_workers=3,
+    ))
+    assert actual==[(i,i*10) for i in order]
+    assert 1 < peak <=3
+
+
+def test_three_workers_propagate_deadline_but_never_share_policy_state():
+    import time
+    from trader.kis_wrapper import (
+        set_kr_tick_deadline,get_kr_tick_deadline,clear_kr_tick_deadline,
+    )
+    from trader.kr.exit_io_pipeline import ordered_bounded_entry_reads
+    expected=time.monotonic()+8
+    set_kr_tick_deadline(expected)
+    try:
+        results=list(ordered_bounded_entry_reads(
+            ["A","B","C","D"],needs_history=lambda _: True,
+            fetch=lambda code: (code,get_kr_tick_deadline()),
+            empty=lambda: None,max_workers=3,
+        ))
+        assert [p[1][0] for p in results]==["A","B","C","D"]
+        assert all(p[1][1]==expected for p in results)
+        assert get_kr_tick_deadline()==expected
+    finally:
+        clear_kr_tick_deadline()
