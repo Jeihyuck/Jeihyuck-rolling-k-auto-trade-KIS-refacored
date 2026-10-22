@@ -36,6 +36,20 @@ def ordered_exit_ohlcv(
             yield holding, fetch(holding) if needs_history(holding) else empty()
         return
 
+    # KIS deadlines are thread-local. A worker without this transfer would
+    # silently bypass the single authoritative per-tick HTTP timeout.
+    from trader.kis_wrapper import (
+        get_kr_tick_deadline, set_kr_tick_deadline, clear_kr_tick_deadline,
+    )
+    shared_deadline = get_kr_tick_deadline()
+
+    def _bounded_worker_read(holding: T) -> R:
+        set_kr_tick_deadline(shared_deadline)
+        try:
+            return fetch(holding)
+        finally:
+            clear_kr_tick_deadline()
+
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kr-exit-ohlcv")
     future: Future[R] | None = None
     try:
@@ -49,7 +63,7 @@ def ordered_exit_ohlcv(
             # eligible holding. Never submit a broker operation to the worker.
             if i + 1 < len(items) and needs_history(items[i + 1]):
                 next_holding = items[i + 1]
-                future = executor.submit(fetch, next_holding)
+                future = executor.submit(_bounded_worker_read, next_holding)
             yield holding, result
     finally:
         if future is not None:
