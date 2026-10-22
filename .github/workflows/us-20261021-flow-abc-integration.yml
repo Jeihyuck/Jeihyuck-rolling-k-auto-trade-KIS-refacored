@@ -63,6 +63,8 @@ jobs:
             trader/us/execution/reconcile_shadow_worker.py \
             trader/us/execution/account_authority.py \
             trader/us/execution/reservation_reconcile_worker.py \
+            trader/us/execution/shared_kis_limiter.py \
+            trader/us/execution/kis_us_client.py \
             trader/us/runner/trade_tick_runner.py \
             trader/us/runner/trade_session_runner.py
       - name: Focused A-B-C runner/repository/worker regressions
@@ -72,6 +74,7 @@ jobs:
             tests/us/test_us_20261021_tqqq_ttl_quantity_contract.py \
             tests/us/test_us_20261021_reconcile_shadow_worker.py \
             tests/us/test_us_20261022_account_authority.py \
+            tests/us/test_us_20261022_shared_kis_limiter.py \
             tests/us/test_us_early_hard_stop_tick_integration_20261016.py \
             tests/us/test_us_postgres_integration_real.py
       - name: Full US regression suite without network or orders
