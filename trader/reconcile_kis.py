@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -2472,8 +2473,21 @@ def reconcile_kis(
     )
     holdings_error = None
     holdings_rows: list[dict] = []
+    _kr_reconcile_started = time.monotonic()
+    fresh_balance_proven = False
     try:
         snapshot = balance_snapshot or kis.get_balance_cached(force=True)
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("KR_BALANCE_SNAPSHOT_NOT_DICT")
+        if balance_snapshot is None:
+            fresh_balance_proven = isinstance(snapshot.get("output1"), list) and bool(snapshot.get("output2"))
+        else:
+            try:
+                at = datetime.fromisoformat(str(snapshot.get("_kr_verified_fresh_at_kst") or ""))
+                age = (now_kst() - at).total_seconds()
+                fresh_balance_proven = bool(at.tzinfo and 0 <= age <= 20 and isinstance(snapshot.get("output1"), list))
+            except (TypeError, ValueError):
+                fresh_balance_proven = False
         holdings_rows = snapshot.get("output1") or []
     except KisTemporaryError as exc:
         holdings_error = str(exc)
@@ -2498,6 +2512,8 @@ def reconcile_kis(
     except Exception as exc:
         logger.error("[KIS][HTTP][FAIL_SOFT] step=reconcile_today err=%s", exc, exc_info=True)
         reconcile_result = {"ok": False, "reason": "reconcile_today_failed", "err": str(exc)}
+    logger.info("[KR_RECONCILE][BROKER_CRITICAL] elapsed_ms=%.1f run_id=%s",
+                1000 * (time.monotonic() - _kr_reconcile_started), reconcile_run_id)
     orders_count = int(reconcile_result.get("orders") or 0)
     fills_count = int(reconcile_result.get("fills") or 0)
     reset_mode = bool(env == "practice" and account_reset_mode())
@@ -2549,7 +2565,7 @@ def reconcile_kis(
     repair_fastpath = False
     repair_fastpath_reason = "STALE_OR_UNPROVEN_BALANCE"
     if (os.getenv("KR_EXACT_PARITY_HISTORICAL_REPAIR_FASTPATH", "1") == "1"
-            and not reset_mode and balance_snapshot is None):
+            and not reset_mode and fresh_balance_proven):
         try:
             from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
             _current_active = positions_repo.list_active_positions_for_exit(env, strategy)
@@ -2569,7 +2585,9 @@ def reconcile_kis(
             repair_fastpath = False
             repair_fastpath_reason = "PARITY_READ_FAILED"
             logger.warning("[KR_RECONCILE][HISTORICAL_PARITY][FAIL_CLOSED] type=%s", type(_parity_exc).__name__)
-    logger.info("[KR_RECONCILE][HISTORICAL_PARITY] fastpath=%s reason=%s", int(repair_fastpath), repair_fastpath_reason)
+    logger.info("[KR_RECONCILE][HISTORICAL_PARITY] fastpath=%s reason=%s fresh_balance=%s",
+                int(repair_fastpath), repair_fastpath_reason, int(fresh_balance_proven))
+    _kr_history_started = time.monotonic()
     restored = 0
     if repair_fastpath:
         logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=EXACT_BROKER_ACTIVE_CYCLE_PARITY")
@@ -2653,6 +2671,8 @@ def reconcile_kis(
     except Exception as _meta_exc:
         logger.warning("[RECONCILE][META_RESTORE][SKIP] err=%s", _meta_exc)
 
+    logger.info("[KR_RECONCILE][HISTORICAL_REPAIR] elapsed_ms=%.1f skipped=%s",
+                1000 * (time.monotonic() - _kr_history_started), int(repair_fastpath))
     guard_result = None
     guard_reason = None
     allow_purge = None
@@ -2769,4 +2789,7 @@ def reconcile_kis(
     if observation_failure_count:
         execution_claim_health["observation_persistence_failures"] = observation_failure_count
     reconcile_result["execution_claim_health"] = execution_claim_health
+    logger.info("[KR_RECONCILE][TOTAL] elapsed_ms=%.1f mode=%s run_id=%s",
+                1000 * (time.monotonic() - _kr_reconcile_started),
+                "PROVEN_PARITY_FASTPATH" if repair_fastpath else "FULL_RECOVERY", reconcile_run_id)
     return reconcile_result
