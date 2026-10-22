@@ -34,3 +34,9 @@ CREATE TABLE IF NOT EXISTS us_execution_account_reservations (
 );
 CREATE INDEX IF NOT EXISTS ix_us_execution_reservation_scope
   ON us_execution_account_reservations(env, account_fingerprint, trading_epoch_id, state, side, symbol);
+
+-- Supabase public is an exposed schema. No anon/authenticated policy is
+-- intentionally granted; only the trusted database owner/service role may
+-- operate account-wide reservations. Deployment must separately audit grants.
+ALTER TABLE us_execution_authority_leases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE us_execution_account_reservations ENABLE ROW LEVEL SECURITY;
