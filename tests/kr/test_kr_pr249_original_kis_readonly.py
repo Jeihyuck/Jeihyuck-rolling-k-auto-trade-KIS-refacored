@@ -24,11 +24,12 @@ OBSERVED = {
 
 def _valid_rows(trade_day):
     rows = []
-    for (code, side, no), _requested in TARGETS[trade_day].items():
+    for (code, side, no), requested in TARGETS[trade_day].items():
         qty, amount = OBSERVED[(code, side)]
         rows.append({
             "pdno": code, "sll_buy_dvsn_cd": "01" if side == "SELL" else "02",
             "odno": no, "ord_dt": trade_day.strftime("%Y%m%d"),
+            "ord_qty": str(requested),
             "tot_ccld_qty": str(qty), "tot_ccld_amt": str(amount),
             "avg_prvs": str(round(amount / qty, 4)),
         })
@@ -101,3 +102,15 @@ def test_live_environment_denied_before_any_network(monkeypatch):
     monkeypatch.setenv("KIS_REST_URL", "https://openapi.koreainvestment.com:9443")
     with pytest.raises(RuntimeError, match="PRACTICE_READONLY_ENV_REQUIRED"):
         run_practice_readonly()
+
+
+def test_kis_returned_order_quantity_mismatch_cannot_pass_by_od_no_alone():
+    day = date(2026, 10, 22)
+    data = _valid_rows(day)
+    row = next(item for item in data["output1"] if item["pdno"] == "053800"
+               and item["sll_buy_dvsn_cd"] == "01")
+    row["ord_qty"] = "17"  # durable request 12, wrong original identity
+    evidence = classify_original_kis_rows(data, day, TARGETS[day])
+    sell = next(item for item in evidence["results"] if item["code"] == "053800"
+                and item["side"] == "SELL")
+    assert sell["status"] == "UNVERIFIED_OR_MISSING"
