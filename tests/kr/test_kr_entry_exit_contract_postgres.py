@@ -256,3 +256,42 @@ def test_postgres_any_profitable_imported_policy_missing_position_adopts_and_tp1
     assert intents[0]["reason"] == "KR_TAKE_PROFIT_TP1"
     assert intents[0]["qty"] == 10
     assert intents[0]["exit_rule_source"] == "POLICY_ADOPTION_CONTRACT"
+
+
+def test_postgres_oct21_oct22_partial_sell_quantity_and_pnl_are_idempotent(pg_contract_engine):
+    """Real PostgreSQL: priced cumulative SELL replay never double-applies."""
+    from trader.account_state import get_account_key
+    from trader.db.repos import PositionsRepo
+
+    repo = PositionsRepo(pg_contract_engine)
+    for code, held_qty, avg, sold_qty, notional, order_key in (
+        ("251970", 17, 68400.0, 10, 685000.0, "kr-postgres-251970-20261021"),
+        ("253590", 79, 16130.0, 52, 836180.0, "kr-postgres-253590-20261022"),
+    ):
+        position, created = repo.get_or_create_imported_cycle_for_kis_holding(
+            env="practice", strategy="pb1_pullback_close",
+            account_id=get_account_key(env="practice"),
+            sid=1, mode=1, code=code, market="J", qty=held_qty, avg_price=avg,
+        )
+        assert created
+        params = {
+            "env": "practice", "strategy": "pb1_pullback_close", "sid": 1, "mode": 1,
+            "code": code, "market": "J", "confirmed_cumulative_qty": sold_qty,
+            "fill_price": notional / sold_qty,
+            "filled_at": datetime(2026, 10, 22, 15, 18, tzinfo=timezone.utc),
+            "position_cycle_id": str(position["position_cycle_id"]),
+            "portfolio_epoch_id": str(position["portfolio_epoch_id"]),
+            "order_id": order_key, "pre_order_holding_qty": held_qty,
+        }
+        for attempt in range(10):
+            applied = repo.reconcile_sell_execution(**params)
+            assert applied["qty_applied"] == (sold_qty if attempt == 0 else 0)
+            assert applied["pnl_qty_applied"] == (sold_qty if attempt == 0 else 0)
+        current = repo.get_position(
+            env="practice", strategy="pb1_pullback_close", sid=1, mode=1, code=code,
+            position_cycle_id=str(position["position_cycle_id"]),
+            portfolio_epoch_id=str(position["portfolio_epoch_id"]),
+        )
+        assert current["qty"] == held_qty - sold_qty
+        assert float(current["realized_pnl"]) == pytest.approx(notional - avg * sold_qty)
+        assert current["position_meta"]["realized_pnl_status"] == "CONFIRMED"

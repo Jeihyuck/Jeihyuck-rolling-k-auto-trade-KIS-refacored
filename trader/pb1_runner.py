@@ -5947,6 +5947,19 @@ def run_once(
         return reconcile_ok_local, close_stale_ok_local
 
     if exit_reconcile_first:
+        # CLOSE bypasses the ordinary run registration below. Register the
+        # actual execution owner before broker reads and order submission.
+        close_run_id = str(os.getenv("TRADER_RUN_ID") or "").strip()
+        if not close_run_id:
+            raise RuntimeError("KR_CLOSE_DURABLE_RUN_ID_REQUIRED")
+        close_run_repo = RunsRepo(engine)
+        close_run_repo.upsert_run(
+            run_id=close_run_id, env=env_effective, strategy="pb1_pullback_close",
+            ts_start=now, run_window="close", phase="exit",
+            event_name=event_name_lower, dry_run=bool(dry_run),
+        )
+        ctx.run_id = close_run_id
+        logger.info("[KR_CLOSE][RUN_REGISTERED] run_id=%s strategy=pb1_pullback_close", close_run_id)
         logger.info(
             "[KR_CLOSE][PREPOLICY_RECONCILE] start remaining_s=%.1f continue_to_owner_policy=1",
             remaining_s,
@@ -6096,6 +6109,10 @@ def run_once(
                     "[KR_CLOSE][SELL_EVIDENCE_QUEUE][READ_FAIL] err_type=%s "
                     "action=RETAIN_PENDING_NO_RETRY", type(exc).__name__,
                 )
+        close_run_repo.finish_run(
+            close_run_id, status="OK",
+            notes="CLOSE_POLICY_ACK_ONLY_NOT_ECONOMIC_FILL",
+        )
         return [], True, {
             "buy_orders": 0,
             "sell_orders": accepted_policy_sells,
@@ -6501,13 +6518,48 @@ def run_once(
                 if state == "OK" and snapshot:
                     balance_state = BALANCE_STATE_OK
                     balance_snapshot_raw = snapshot
+                    # PRECHECK is a snapshot, not a perpetual session-wide
+                    # balance. Mark as verified only while its source and
+                    # timestamp satisfy the conservative freshness contract.
+                    try:
+                        try:
+                            prechecked = datetime.fromisoformat(str(pre.get("checked_at_kst") or ""))
+                        except (ValueError, TypeError):
+                            prechecked = None
+                        age_sec = (
+                            (now_kst() - prechecked).total_seconds()
+                            if prechecked is not None and prechecked.tzinfo else float("inf")
+                        )
+                        if prechecked is not None and pre.get("source") == "KIS" and 0 <= age_sec <= 20:
+                            balance_snapshot_raw = dict(snapshot)
+                            balance_snapshot_raw["_kr_verified_fresh_at_kst"] = prechecked.isoformat()
+                        elif kis is not None:
+                            logger.info("[KR_BALANCE][PRECHECK_STALE] age_sec=%.1f action=FORCE_FRESH_BROKER_BALANCE", age_sec)
+                            fresh = kis.get_balance_cached(force=True)
+                            if not isinstance(fresh, dict) or not isinstance(fresh.get("output1"), list) or not fresh.get("output2"):
+                                raise RuntimeError("KR_BALANCE_FRESH_RESPONSE_INCOMPLETE")
+                            balance_snapshot_raw = {**fresh, "_kr_verified_fresh_at_kst": now_kst().isoformat()}
+                            balance_source = "KIS_FORCE_REFRESH_STALE_PRECHECK"
+                            balance_state = BALANCE_STATE_OK
+                    except Exception as _balance_refresh_exc:
+                        # Never silently reuse an hours-old balance for new BUY
+                        # or claim order-safe reconciliation when it was stale.
+                        balance_state = BALANCE_STATE_UNKNOWN
+                        balance_snapshot_raw = None
+                        logger.error(
+                            "[KR_BALANCE][PRECHECK_REFRESH_FAILED] type=%s action=BLOCK_NEW_ENTRY_KEEP_PROTECTIVE_EXIT_GUARDS",
+                            type(_balance_refresh_exc).__name__,
+                        )
                 elif state == "OK":
                     state = "UNKNOWN_WITHOUT_SNAPSHOT"
                     balance_state = BALANCE_STATE_UNKNOWN
                 else:
                     balance_state = BALANCE_STATE_UNKNOWN
-                balance_source = str(pre.get("source") or "NONE")
-                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=%d", state, balance_source, int(bool(balance_snapshot_raw)))
+                if balance_source != "KIS_FORCE_REFRESH_STALE_PRECHECK":
+                    balance_source = str(pre.get("source") or "NONE")
+                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=%s snapshot=%d",
+                            state, balance_source, int(balance_source == "KIS_FORCE_REFRESH_STALE_PRECHECK"),
+                            int(bool(balance_snapshot_raw)))
                 if state != "OK":
                     logger.warning("[PB1][ENTRY_BLOCKED] reason=balance_unknown")
                     if bool(pre.get("exit_allowed")):
@@ -6797,7 +6849,32 @@ def run_once(
         ctx.run_id = str(run_record_id)
         db_write_reasons.append("run_start")
         reconcile_result: dict | None = None
-        if kis and not nontrading_eval_mode:
+        deferred_full_reconcile = False
+        if (
+            kis is not None and not nontrading_eval_mode
+            and os.getenv("KR_PROTECTIVE_SELL_RECONCILE_HANDOFF", "1") == "1"
+            and _resolve_session_kind() in {"am", "pm", "morning", "afternoon"}
+        ):
+            try:
+                from trader.kr.protective_sell_handoff import prove_safe_protective_sell_handoff
+                deferred_full_reconcile, _handoff_reason = prove_safe_protective_sell_handoff(
+                    engine=engine, kis=kis, env=env_effective,
+                    strategy="pb1_pullback_close", trade_date=trade_date,
+                    balance_snapshot=balance_snapshot_raw,
+                )
+                logger.info(
+                    "[KR_RECONCILE_LANES][PRE_EXIT] deferred=%s reason=%s "
+                    "owner=PB1 full_reconcile_requires_post_exit_before_buy=1",
+                    int(deferred_full_reconcile), _handoff_reason,
+                )
+            except Exception as _handoff_exc:
+                deferred_full_reconcile = False
+                logger.warning("[KR_RECONCILE_LANES][PROOF_FAIL] type=%s action=FULL_PRE_EXIT_RECONCILE",
+                               type(_handoff_exc).__name__)
+        if deferred_full_reconcile:
+            reconcile_result = {"ok": True, "status": "PRE_EXIT_EXACT_PROOF",
+                                "deferred_to": "AFTER_PROTECTIVE_SELL_BEFORE_ANY_BUY"}
+        if kis and not nontrading_eval_mode and not deferred_full_reconcile:
             try:
                 reconcile_result = reconcile_kis(
                     engine=engine,
@@ -7317,10 +7394,34 @@ def run_once(
         kr_inf_invoked = False
 
         def _kr_after_protective_exit():
-            nonlocal kr_inf_run_result, kr_inf_invoked
+            nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
+            # Protected SELL has been offered to every PB1 holder. For a
+            # clean, exact pretrade proof only, full economic reconciliation
+            # moves here. This executes before KR_INFINITE BUY and PB1 BUY,
+            # preserving identical post-reconciliation entry safety gates.
+            engine_runner._kr_post_exit_reconcile_ok = True
+            if deferred_full_reconcile:
+                try:
+                    reconcile_result = reconcile_kis(
+                        engine=engine, kis=kis, env=env_effective,
+                        run_id=run_record_id, strategy="pb1_pullback_close",
+                        tick_ts=now, balance_snapshot=balance_snapshot_raw,
+                        runtime_dir=str(runtime_root_dir),
+                    )
+                    engine_runner._kr_post_exit_reconcile_ok = bool(reconcile_result.get("ok", False))
+                    if engine_runner._kr_post_exit_reconcile_ok:
+                        db_write_reasons.append("reconcile_after_protective_sell")
+                    else:
+                        logger.error("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] reason=%s "
+                                     "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS",
+                                     reconcile_result.get("degraded") or reconcile_result.get("reason"))
+                except Exception as _deferred_exc:
+                    engine_runner._kr_post_exit_reconcile_ok = False
+                    logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
+                                     "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
             try:
                 # Preserve the original 40-slot WS owner-first prewarm.  The
                 # early owner evaluation must not regress subscription timing.
@@ -7336,6 +7437,7 @@ def run_once(
                     allow_entry=bool(
                         order_allowed and calc_allowed
                         and getattr(engine_runner, "_kr_exit_pass_ok", False)
+                        and getattr(engine_runner, "_kr_post_exit_reconcile_ok", True)
                     ),
                 )
                 logger.info(
@@ -7917,7 +8019,25 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     workflow_attempt = _parse_optional_int_env("GITHUB_RUN_ATTEMPT")
     event_name = str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() or "schedule"
-    git_sha = os.getenv("GITHUB_SHA")
+    # Ground measured PR249 latency in the code actually loaded by WSL.
+    # GitHub-specific GITHUB_SHA may be absent in the Windows Task/WSL path
+    # or may identify a stale parent environment after an auto-sync.
+    from trader.db.repos import _pb1_checkout_sha
+    _kr_latency_checkout_sha = _pb1_checkout_sha()
+    _declared_git_sha = str(os.getenv("GITHUB_SHA") or "").strip()
+    if _declared_git_sha and _kr_latency_checkout_sha and _declared_git_sha != _kr_latency_checkout_sha:
+        logger.warning(
+            "[KR_LATENCY][SHA_MISMATCH] declared_sha=%s running_checkout_sha=%s "
+            "action=USE_PINNED_CHECKOUT_FOR_TICK_EVIDENCE",
+            _declared_git_sha, _kr_latency_checkout_sha,
+        )
+    if not _kr_latency_checkout_sha:
+        logger.error("[KR_LATENCY][SHA_UNVERIFIED] reason=NO_PINNED_CHECKOUT_SHA proof=BLOCK")
+    else:
+        # run_once creates the DB run row in this same process. Its revision
+        # must describe the same pinned checkout as the monotonic tick trace.
+        os.environ["GITHUB_SHA"] = _kr_latency_checkout_sha
+    git_sha = _kr_latency_checkout_sha or None
     exec_mode = resolve_mode(os.getenv("STRATEGY_MODE", "DIAG"))
     ctx = RunContext.new(
         account_env=env,
@@ -8176,7 +8296,9 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     session_end_dt.isoformat(),
                 )
                 tick_started_monotonic = time_mod.monotonic()
+                os.environ["KR_TICK_ORIGIN_MONOTONIC"] = f"{tick_started_monotonic:.9f}"
                 set_kr_tick_deadline(tick_deadline_monotonic)
+                _tick_result_status_for_latency = "TIMEOUT_OR_FAILURE"
                 try:
                     _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
                         timeout_sec=tick_timeout_sec,
@@ -8190,8 +8312,31 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                             runs_ledger_fail_open=runs_ledger_fail_open,
                         ),
                     )
+                    _tick_result_status_for_latency = str(result_status or "UNKNOWN")
                 finally:
+                    # A timeout/error MUST be included in measured tick p95;
+                    # never count only successful ticks or reuse the previous
+                    # iteration's result_status. This also records the Git SHA
+                    # and durable run scope required for identical-workload proof.
+                    elapsed_tick_sec = time_mod.monotonic() - tick_started_monotonic
+                    logger.info(
+                        "[KR_LATENCY][TICK_END] kind=%s index=%s total_elapsed_s=%.3f "
+                        "result_status=%s sha=%s run_id=%s tick_run_id=%s",
+                        session_kind, tick_index, elapsed_tick_sec,
+                        _tick_result_status_for_latency,
+                        str(_kr_latency_checkout_sha or "UNVERSIONED"),
+                        str(os.getenv("TRADER_RUN_ID") or "NO_RUN_ID"),
+                        str(getattr(ctx, "run_id", None) or "UNRESOLVED_TICK_RUN_ID"),
+                    )
+                    if elapsed_tick_sec > 180.0:
+                        logger.warning(
+                            "[KR_LATENCY][TICK_TARGET_MISS] kind=%s index=%s elapsed_s=%.3f "
+                            "limit_s=180.000 result_status=%s",
+                            session_kind, tick_index, elapsed_tick_sec,
+                            _tick_result_status_for_latency,
+                        )
                     clear_kr_tick_deadline()
+                    os.environ.pop("KR_TICK_ORIGIN_MONOTONIC", None)
                 last_tick_metrics = dict(metrics or {})
                 session_metrics["ticks_total"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
@@ -9271,6 +9416,17 @@ def main() -> int:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
+        # On CLOSE exceptions, mark any registered run terminal before
+        # writing the session summary; never create a placeholder here.
+        if _resolve_session_kind() == "close" and os.getenv("TRADER_RUN_ID"):
+            try:
+                RunsRepo(engine).finish_run(
+                    os.environ["TRADER_RUN_ID"],
+                    status="OK" if result_status == "OK_CLOSE_POLICY" else "ERROR",
+                    notes="CLOSE_ACK_SEPARATE_FROM_ECONOMIC_SETTLEMENT",
+                )
+            except Exception:
+                logger.exception("[KR_CLOSE][RUN_TERMINAL][FAIL] preserve_unresolved=1")
         os.environ["PB1_LAST_RESULT_STATUS"] = str(result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(main_exit_reason)
         normalized = normalize_session_result(

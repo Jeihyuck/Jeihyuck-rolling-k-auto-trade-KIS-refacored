@@ -4864,14 +4864,46 @@ class PB1Engine:
         balance_rows: Iterable[dict],
         ledger_positions: Iterable[dict] | None = None,
     ) -> list[HoldingContext]:
-        positions_by_code = {
-            str((row or {}).get("code") or "").zfill(6): dict(row or {})
-            for row in (ledger_positions or [])
-            if str((row or {}).get("code") or "").strip()
-        }
+        # Broker holdings have quantities, not a strategy policy. Never attach
+        # today's KIS quantity to a CLOSED cycle from a previous entry.
+        positions_by_code: dict[str, dict] = {}
+        ambiguous_codes: set[str] = set()
+        for original in ledger_positions or []:
+            candidate = dict(original or {})
+            code_key = str(candidate.get("code") or "").strip().zfill(6)
+            if not code_key or code_key == "000000":
+                continue
+            if str(candidate.get("status") or "OPEN").upper() != "OPEN":
+                continue
+            if int(candidate.get("qty") or 0) <= 0:
+                continue
+            previous = positions_by_code.get(code_key)
+            if previous is not None and (
+                str(previous.get("position_cycle_id") or "") != str(candidate.get("position_cycle_id") or "")
+                or str(previous.get("portfolio_epoch_id") or "") != str(candidate.get("portfolio_epoch_id") or "")
+                or str(previous.get("trading_epoch_id") or "") != str(candidate.get("trading_epoch_id") or "")
+            ):
+                ambiguous_codes.add(code_key)
+            else:
+                positions_by_code[code_key] = candidate
+        for code_key in ambiguous_codes:
+            # Preserve the KIS holding for audit, but do not choose a policy
+            # based on dict iteration order or create another imported cycle.
+            positions_by_code[code_key] = {
+                "code": code_key,
+                "status": "CYCLE_BINDING_CONFLICT",
+                "position_meta": {"lifecycle_blocked": True,
+                                  "binding_conflict": "AMBIGUOUS_ACTIVE_CYCLE"},
+            }
         for balance_row in balance_rows or []:
             code_key = str(balance_row.get("pdno") or balance_row.get("code") or "").zfill(6)
             current = positions_by_code.get(code_key)
+            if code_key in ambiguous_codes:
+                logger.error(
+                    "[LIFECYCLE][CYCLE_BINDING_CONFLICT] code=%s reason=AMBIGUOUS_ACTIVE_CYCLE action=BLOCK_EXIT",
+                    code_key,
+                )
+                continue
             if current and lifecycle_is_authoritative(current):
                 continue
             if not hasattr(self.positions_repo, "get_or_create_imported_cycle_for_kis_holding"):
@@ -6095,11 +6127,29 @@ class PB1Engine:
             self.env,
             self._masked_account(),
         )
-        db_by_code = {str((row or {}).get("code") or "").zfill(6): dict(row or {}) for row in (positions or [])}
+        # Legacy account-sanity mode must not select an arbitrary lifecycle
+        # when a code has two OPEN rows or recycle a CLOSED one from history.
+        db_by_code: dict[str, dict] = {}
+        ambiguous: set[str] = set()
+        for original in positions or []:
+            candidate = dict(original or {})
+            if str(candidate.get("status") or "OPEN").upper() != "OPEN":
+                continue
+            code_key = str(candidate.get("code") or "").zfill(6)
+            if code_key in db_by_code and str(db_by_code[code_key].get("position_cycle_id")) != str(candidate.get("position_cycle_id")):
+                ambiguous.add(code_key)
+            else:
+                db_by_code[code_key] = candidate
         corrected_count = 0
         for row in holdings_rows or []:
             code = str(row.get("pdno") or row.get("code") or "").zfill(6)
             if not code:
+                continue
+            if code in ambiguous:
+                logger.error(
+                    "[POSITIONS][RECONCILE][BLOCK] code=%s reason=AMBIGUOUS_ACTIVE_CYCLE "
+                    "action=KEEP_BROKER_PROOF_NO_LEDGER_MUTATION", code,
+                )
                 continue
             kis_qty = int(float(row.get("hldg_qty") or row.get("qty") or 0) or 0)
             db_row = db_by_code.get(code) or {}
@@ -6130,6 +6180,8 @@ class PB1Engine:
                             "market": market,
                             "last_reconciled_at": now_kst(),
                         },
+                        position_cycle_id=str(db_row.get("position_cycle_id") or "") or None,
+                        portfolio_epoch_id=str(db_row.get("portfolio_epoch_id") or "") or None,
                     )
                 elif kis_qty > 0:
                     self.positions_repo.bootstrap_from_kis_holdings(
@@ -6141,7 +6193,7 @@ class PB1Engine:
                         account_id=get_account_key(env=self.env, kis=self.kis),
                     )
                 corrected_count += 1
-        refreshed = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        refreshed = self.positions_repo.list_active_positions_for_exit(self.env, self.STRATEGY_NAME)
         logger.info(
             "[POSITIONS][RECONCILE][OK] holdings=%s corrected=%s",
             len(holdings_rows or []),
@@ -8153,7 +8205,49 @@ class PB1Engine:
             early_stop = PB1_EARLY_STOP_ENABLED
             early_n = int(os.getenv("PB1_EARLY_STOP_CANDIDATES", "12"))
             
-            for m in members_list:
+            # ENTRY signal/sizing/order logic is still serialized in the
+            # original candidate order. Only the next independent OHLCV read
+            # overlaps current-symbol feature computation, *after* protective
+            # SELL and KR_INFINITE owner handoff are already complete.
+            from trader.kr.exit_io_pipeline import ordered_exit_ohlcv, ordered_bounded_entry_reads
+            _entry_read_ahead = bool(trade_mode and os.getenv("KR_ENTRY_ORDERED_OHLCV_READAHEAD", "1") == "1")
+
+            def _read_candidate_bars(member: dict) -> tuple[pd.DataFrame, dict]:
+                _code = str(member.get("code") or "").zfill(6)
+                try:
+                    return self._fetch_daily(_code, days=need_days)
+                except Exception as _market_exc:
+                    logger.warning(
+                        "[KR_ENTRY][READAHEAD][DATA_FAILED] code=%s type=%s "
+                        "action=SKIP_ONLY_THIS_CANDIDATE",
+                        _code, type(_market_exc).__name__,
+                    )
+                    return pd.DataFrame(), {"source": "ohlcv_read_failed"}
+
+            try:
+                _entry_read_workers = max(1, min(4, int(os.getenv("KR_ENTRY_OHLCV_READ_WORKERS", "3") or "3")))
+            except (TypeError, ValueError):
+                _entry_read_workers = 3
+                logger.warning("[KR_ENTRY][READAHEAD_WORKERS][INVALID] action=USE_SAFE_DEFAULT_3")
+            if _entry_read_ahead:
+                _candidate_history = ordered_bounded_entry_reads(
+                    members_list,
+                    needs_history=lambda row: str(row.get("code") or "").zfill(6) in derived_map,
+                    fetch=_read_candidate_bars,
+                    empty=lambda: (pd.DataFrame(), {"source": "derived_contract_missing"}),
+                    max_workers=_entry_read_workers,
+                )
+            else:
+                _candidate_history = ordered_exit_ohlcv(
+                    members_list,
+                    needs_history=lambda row: not trade_mode or str(row.get("code") or "").zfill(6) in derived_map,
+                    fetch=_read_candidate_bars,
+                    empty=lambda: (pd.DataFrame(), {"source": "derived_contract_missing"}),
+                    enabled=False,
+                )
+            logger.info("[KR_ENTRY][ORDERED_READAHEAD] enabled=%s candidate_count=%s workers=%s policy_order=SERIAL",
+                        int(_entry_read_ahead), len(members_list), _entry_read_workers if _entry_read_ahead else 1)
+            for m, (df, meta) in _candidate_history:
                 # ✅ 조기 종료 체크 (충분한 후보 확보 시) - PB1_EARLY_STOP_ENABLED=0이면 절대 실행 안 됨
                 if early_stop and len(candidates) >= max(early_n, int(PB1_MIN_CANDIDATES or 1)):
                     reason = "EARLY_STOP_CANDIDATES_SUFFICIENT"
@@ -8178,7 +8272,6 @@ class PB1Engine:
                     if trade_mode and not derived_row:
                         continue
 
-                    df, meta = self._fetch_daily(code, days=need_days)
                     if df is None or df.empty or len(df) < required_candles:
                         if df is None or df.empty:
                             skip_reason = "data_empty"
@@ -12601,10 +12694,33 @@ class PB1Engine:
         return status
 
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> dict[str, Any] | None:
+        code = str(pos.get("code") or "").zfill(6)
+        _contract_meta = pos.get("position_meta") or {}
+        if not isinstance(_contract_meta, dict):
+            try:
+                _contract_meta = json.loads(_contract_meta)
+            except (TypeError, ValueError):
+                _contract_meta = {}
+        if (
+            str(pos.get("status") or "OPEN").upper() != "OPEN"
+            or pos.get("lifecycle_blocked")
+            or _contract_meta.get("lifecycle_blocked")
+        ):
+            logger.error(
+                "[LIFECYCLE][BLOCK_EXIT] code=%s cycle=%s status=%s reason=%s",
+                code, pos.get("position_cycle_id"), pos.get("status"),
+                _contract_meta.get("binding_conflict") or "INACTIVE_OR_UNPROVEN_CYCLE",
+            )
+            return {
+                "code": code, "exit_ok": False, "submitted": 0,
+                "submit_attempted": 0, "order_result": "ORDER_SKIPPED_CYCLE_BINDING",
+                "order_skip_reasons": ["CYCLE_BINDING_CONFLICT"],
+            }
+        # Validate lineage before invoking the price/strategy path. A closed or
+        # ambiguous position must not be able to submit even with a valid quote.
         avg = self._to_float(pos.get("avg_buy_price"))
         if not avg:
             return None
-        code = str(pos.get("code") or "").zfill(6)
         display_code = self._display_code(code)
         market = pos.get("market")
         mode = int(pos.get("mode") or 1)
@@ -13917,6 +14033,8 @@ class PB1Engine:
             stage,
         )
 
+        # Log all pre-submit DB/claim delay, not only KIS method time.
+        _kr_exit_ready_monotonic = time.monotonic()
         submit_block_reasons = self._resolve_exit_submit_gate_reasons(code=code)
         if submit_block_reasons:
             exit_eval_payload["submit_attempted"] = 0
@@ -14175,6 +14293,23 @@ class PB1Engine:
         kis_odno = None
         submit_exc: Exception | None = None
         requested_qty = int(orderable_qty or 0)
+        _kr_submit_start_monotonic = time.monotonic()
+        try:
+            _full_tick_origin = float(os.getenv("KR_TICK_ORIGIN_MONOTONIC") or "")
+            if not (0 < _full_tick_origin <= _kr_submit_start_monotonic):
+                raise ValueError("tick_origin_invalid")
+            _kr_tick_origin_source = "RUNNER_FULL_TICK"
+        except (TypeError, ValueError):
+            _full_tick_origin = float(getattr(self, "_tick_start_time", _kr_submit_start_monotonic))
+            _kr_tick_origin_source = "ENGINE_ONLY_UNQUALIFIED"
+        logger.info(
+            "[KR_LATENCY][SELL_SUBMIT_START] owner=KR_STANDARD code=%s cycle=%s "
+            "run_id=%s order_id=%s client_key=%s from_tick_start_s=%.3f "
+            "tick_origin_source=%s from_policy_ready_s=%.3f",
+            code, _cycle_id, self.run_id, order_id, client_key,
+            _kr_submit_start_monotonic - _full_tick_origin,
+            _kr_tick_origin_source, _kr_submit_start_monotonic - _kr_exit_ready_monotonic,
+        )
         try:
             resp = self.kis.sell_stock_market(code, requested_qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
@@ -14182,6 +14317,14 @@ class PB1Engine:
             submit_exc = exc
             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
 
+        logger.info(
+            "[KR_LATENCY][SELL_SUBMIT_RETURN] owner=KR_STANDARD code=%s run_id=%s "
+            "order_id=%s elapsed_s=%.3f ack_observed=%s exception_type=%s",
+            code, self.run_id, order_id,
+            time.monotonic() - _kr_submit_start_monotonic,
+            int(submit_exc is None and bool(isinstance(resp, dict) and resp.get("rt_cd") == "0")),
+            type(submit_exc).__name__ if submit_exc is not None else "NONE",
+        )
         if submit_exc is not None:
             if is_kr_order_submit_outcome_ambiguous(submit_exc):
                 self.orders_repo.mark_unresolved_ack(
@@ -14490,7 +14633,24 @@ class PB1Engine:
         # live at exit-pass (tick) scope rather than inside the helper call.
         self._kr_defense_trim_symbols_this_tick = set()
         exit_evaluations: list[dict[str, Any]] = []
-        for pos in pos_list:
+        # The main thread still evaluates and submits every SELL in exactly
+        # the original order. Only ONE independent OHLCV read may overlap with
+        # the preceding holding's strategy/order path; no parallel broker I/O.
+        from trader.kr.exit_io_pipeline import ordered_exit_ohlcv
+        read_ahead_enabled = os.getenv("KR_EXIT_ORDERED_OHLCV_READAHEAD", "1") == "1"
+        exit_ohlcv_iter = ordered_exit_ohlcv(
+            pos_list,
+            needs_history=lambda row: int(row.get("holding_days") or 0) > 0,
+            fetch=lambda pos: self._fetch_exit_ohlcv(pos["code"]),
+            empty=lambda: (pd.DataFrame(), {"source": "same_day_holdings_skip"}),
+            enabled=read_ahead_enabled,
+        )
+        logger.info(
+            "[KR_EXIT][ORDERED_READAHEAD] enabled=%s holdings=%s "
+            "max_data_workers=1 sell_policy_and_submit=SERIAL",
+            int(read_ahead_enabled), len(pos_list),
+        )
+        for pos, (df, meta) in exit_ohlcv_iter:
             display_code = self._display_code(pos.get("code"))
             logger.info(
                 "[PB1][POST_CAPITAL][EXIT_PASS][HOLDING] code=%s step=start qty=%s holding_days=%s",
@@ -14498,11 +14658,6 @@ class PB1Engine:
                 int(pos.get("qty") or 0),
                 int(pos.get("holding_days") or 0),
             )
-            if int(pos.get("holding_days") or 0) <= 0:
-                df = pd.DataFrame()
-                meta = {"source": "same_day_holdings_skip"}
-            else:
-                df, meta = self._fetch_exit_ohlcv(pos["code"])
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
@@ -17300,12 +17455,12 @@ class PB1Engine:
         logger.info("[PB1][POST_CAPITAL][START] phase=%s window=%s", self.phase, self.window_internal)
         with self._stage_timer("exit.positions_lookup"):
             try:
-                pos_cache_key = ("positions", self.env, self.STRATEGY_NAME)
+                pos_cache_key = ("exit_active_positions", self.env, self.STRATEGY_NAME)
                 if pos_cache_key in self._tick_db_cache:
                     logger.info("[PB1][DB_CACHE][HIT] key=%s", pos_cache_key)
                     positions = list(self._tick_db_cache[pos_cache_key])
                 else:
-                    positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+                    positions = self.positions_repo.list_active_positions_for_exit(self.env, self.STRATEGY_NAME)
                     self._tick_db_cache[pos_cache_key] = list(positions)
             except Exception as _pos_exc:
                 _krx_pos = str(os.getenv("PB1_MARKET_SCOPE") or os.getenv("EXCHANGE") or "").upper() in {"KRX", "KR"}
@@ -17350,8 +17505,8 @@ class PB1Engine:
             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
             with self._stage_timer("exit.positions_lookup"):
                 try:
-                    positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-                    self._tick_db_cache[("positions", self.env, self.STRATEGY_NAME)] = list(positions)
+                    positions = self.positions_repo.list_active_positions_for_exit(self.env, self.STRATEGY_NAME)
+                    self._tick_db_cache[("exit_active_positions", self.env, self.STRATEGY_NAME)] = list(positions)
                 except Exception as _pos_exc2:
                     self._bump_warning("db_read_fail_open_count")
                     dispose_engine_safely(self.engine, reason=f"positions_lookup_bootstrap:{type(_pos_exc2).__name__}")
@@ -17596,6 +17751,20 @@ class PB1Engine:
         _after_exit = getattr(self, "_kr_after_protective_exit", None)
         if callable(_after_exit):
             _after_exit()
+        if not getattr(self, "_kr_post_exit_reconcile_ok", True):
+            # In a proved SELL-first lane, any failure of later broker
+            # reconciliation must block ALL new entries.  The already
+            # submitted protective SELL receipt remains durable; do not
+            # roll it back or re-submit. This is not an exit policy change.
+            order_allowed = False
+            entry_allowed = False
+            skip_entry_scan = True
+            self.order_allowed = False
+            self.entry_block_reason = "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED"
+            logger.error(
+                "[KR_RECONCILE_LANES][ENTRY_FENCE] reason=POST_EXIT_BROKER_PROOF_UNVERIFIED "
+                "pb1_buy=BLOCKED kr_infinite_buy=BLOCKED protective_sell=ALREADY_EVALUATED"
+            )
 
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")

@@ -5405,6 +5405,17 @@ class FillsRepo:
             "portfolio_epoch_id": portfolio_epoch_id,
             **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
+        # A broker order cumulative snapshot has a stable *evidence* identity,
+        # but its qty and notional increase as the order fills. Do not append
+        # a second fill for 10->52 or 15->17, and never regress on a stale
+        # snapshot arriving after a newer one. Individual fills are immutable.
+        order_cumulative = bool(
+            (fill_meta_json or {}).get("evidence_kind") == "KIS_ORDER_CUMULATIVE_EXECUTION"
+        )
+        if order_cumulative:
+            if not broker_fill_id or not order_id or qty <= 0 or price <= 0:
+                raise RuntimeError("KR_CUMULATIVE_FILL_MISSING_IDENTITY_OR_PRICE")
+            update_cols.update({"qty": qty, "price": price})
         with self.engine.begin() as conn:
             if active_epoch_id is not None:
                 collision_conditions = [
@@ -5417,9 +5428,19 @@ class FillsRepo:
                         self._schema.fills.c.trading_epoch_id,
                         self._schema.fills.c.portfolio_epoch_id,
                         self._schema.fills.c.position_cycle_id,
+                        self._schema.fills.c.qty,
+                        self._schema.fills.c.price,
                     ).where(and_(*collision_conditions))
                 ).mappings().first()
                 if existing_fill is not None:
+                    if order_cumulative:
+                        old_qty = int(existing_fill.get("qty") or 0)
+                        old_amount = old_qty * float(existing_fill.get("price") or 0.0)
+                        new_amount = int(qty) * float(price)
+                        if qty == old_qty and abs(new_amount - old_amount) > 0.01:
+                            raise RuntimeError("KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT")
+                        if qty > old_qty and new_amount + 0.01 < old_amount:
+                            raise RuntimeError("KR_CUMULATIVE_FILL_NOTIONAL_REGRESSION")
                     if (
                         str(existing_fill.get("trading_epoch_id") or "")
                         != str(active_epoch_id)
@@ -5442,6 +5463,14 @@ class FillsRepo:
                 stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
                     index_elements=conflict_cols,
                     set_=update_cols,
+                    **({"where": sa.and_(
+                        self._schema.fills.c.qty <= qty,
+                        self._schema.fills.c.qty * self._schema.fills.c.price <= (qty * price) + 0.01,
+                        sa.or_(
+                            self._schema.fills.c.qty < qty,
+                            sa.func.abs(self._schema.fills.c.price * self._schema.fills.c.qty - qty * price) <= 0.01,
+                        ),
+                    )} if order_cumulative else {}),
                 ).returning(self._schema.fills.c.fill_id)
                 res = conn.execute(stmt)
                 fill_id = res.scalar()
@@ -5459,7 +5488,16 @@ class FillsRepo:
                     # Update existing row
                     where_conditions = [self._schema.fills.c[col] == payload[col] for col in conflict_cols]
                     conn.execute(
-                        sa.update(self._schema.fills).where(and_(*where_conditions)).values(**update_cols)
+                        sa.update(self._schema.fills).where(and_(*where_conditions)).where(
+                            sa.and_(
+                                self._schema.fills.c.qty <= qty,
+                                self._schema.fills.c.qty * self._schema.fills.c.price <= qty * price + 0.01,
+                                sa.or_(
+                                    self._schema.fills.c.qty < qty,
+                                    sa.func.abs(self._schema.fills.c.price * self._schema.fills.c.qty - qty * price) <= 0.01,
+                                ),
+                            ) if order_cumulative else sa.true()
+                        ).values(**update_cols)
                     )
                     existing = conn.execute(
                         select(self._schema.fills.c.fill_id).where(and_(*where_conditions))
@@ -6517,6 +6555,30 @@ class PositionsRepo:
             fail_open=_resolve_position_fail_open(),
         )
 
+    def list_active_positions_for_exit(self, env: str, strategy: str) -> list[dict]:
+        """EXIT input must never include a CLOSED position from an earlier buy cycle.
+
+        This is deliberately a separate API: audit/reconciliation readers still
+        need list_positions() to include closed historical positions.
+        """
+        conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.status == "OPEN",
+            self._schema.positions.c.qty > 0,
+        ]
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id:
+            conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
+        stmt = select(self._schema.positions).where(and_(*conditions))
+        return _safe_repo_read(
+            self.engine, stmt, op_name="positions.list_active_positions_for_exit",
+            fail_open=False,
+        )
+
     def get_position(
         self, *, env: str, strategy: str, sid: int, mode: int, code: str,
         position_cycle_id: str | None = None, portfolio_epoch_id: str | None = None,
@@ -7379,6 +7441,31 @@ class PositionsRepo:
             avg_buy_price = 0.0
             total_cost = 0.0
             realized_pnl = 0.0
+
+        if side.upper() == "BUY" and row is None and position_cycle_id:
+            # Prevent every historical BUY recovery path (not just the
+            # reviewed retry adapter) from resurrecting a completed cycle.
+            # Preserve the evidence for an explicit audit/reconciliation;
+            # never INSERT the same cycle again or silently discard a delta.
+            previous_cycle = conn.execute(
+                sa.select(
+                    self._schema.positions.c.status,
+                    self._schema.positions.c.env,
+                    self._schema.positions.c.strategy,
+                    self._schema.positions.c.code,
+                ).where(
+                    sa.cast(self._schema.positions.c.position_cycle_id, sa.String)
+                    == str(position_cycle_id)
+                ).limit(1)
+            ).mappings().first()
+            if previous_cycle is not None:
+                logger.error(
+                    "[KR_BUY_CYCLE_REUSE][BLOCK] code=%s cycle=%s old_status=%s "
+                    "old_strategy=%s action=RETAIN_BROKER_EVIDENCE_NO_INSERT",
+                    code, position_cycle_id, previous_cycle.get("status"),
+                    previous_cycle.get("strategy"),
+                )
+                raise RuntimeError("KR_BUY_REPLAY_CLOSED_OR_FOREIGN_CYCLE")
 
         if side.upper() != "BUY" and not row:
             logger.error(

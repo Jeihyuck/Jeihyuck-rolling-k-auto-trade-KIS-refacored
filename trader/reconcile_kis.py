@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 from pathlib import Path
 
@@ -292,15 +294,27 @@ def _parse_date_time(row: dict) -> datetime:
         time_raw = str(time_raw).replace(":", "")
     if date_raw and time_raw and len(date_raw) == 8 and len(time_raw) >= 4:
         try:
-            return datetime.strptime(f"{date_raw}{time_raw[:6]}", "%Y%m%d%H%M%S")
+            return datetime.strptime(f"{date_raw}{time_raw[:6]}", "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("Asia/Seoul"))
         except Exception:
             pass
     if date_raw and len(date_raw) == 8:
         try:
-            return datetime.strptime(date_raw, "%Y%m%d")
+            return datetime.strptime(date_raw, "%Y%m%d").replace(tzinfo=ZoneInfo("Asia/Seoul"))
         except Exception:
             pass
     return now_kst()
+
+
+
+
+def _parse_execution_time_with_source(row: dict) -> tuple[datetime, str]:
+    """Prefer KIS execution timestamp; label the order-time fallback as a proxy."""
+    filled_time = _first_value(row, ["ccld_tmd", "trd_tmd"])
+    filled_date = _first_value(row, ["ccld_dt", "trd_dt", "ord_dt"])
+    if filled_date and filled_time:
+        return _parse_date_time({"ord_dt": filled_date, "ord_tmd": filled_time}), "KIS_EXECUTION_TIMESTAMP"
+    return _parse_date_time(row), "ORDER_TIME_PROXY"
+
 
 
 def _parse_side(row: dict) -> str:
@@ -1398,9 +1412,10 @@ def _verified_kr_cumulative_sell_evidence(
 
     VTTC0081R practice returns tot_ccld_qty + tot_ccld_amt without
     ccld_no/ccld_qty/ccld_prc. Only an EXACT, FULL, positive cumulative
-    SELL with a durable (date, code, side, ODNO) matched source may
-    produce one synthetic *identifier* for a real broker aggregate.
-    A partial or contradictory broker result remains unresolved.
+    SELL (full or partial) with a durable (date, code, side, ODNO)
+    matched source may produce one synthetic *identifier* for a real
+    broker aggregate. The stable ID represents an evolving cumulative
+    snapshot, never a new individual broker trade; no automatic re-sell.
     """
     from decimal import Decimal, InvalidOperation
     import hashlib
@@ -1422,7 +1437,7 @@ def _verified_kr_cumulative_sell_evidence(
         return None
     requested = _to_int(source_order.get("qty"))
     actual = _to_int(row.get("tot_ccld_qty"))
-    if not requested or requested <= 0 or actual != requested:
+    if not requested or requested <= 0 or actual is None or not (0 < actual <= requested):
         return None
     try:
         total = Decimal(str(row.get("tot_ccld_amt") or ""))
@@ -1458,10 +1473,70 @@ def _verified_kr_cumulative_sell_evidence(
     }
 
 
+
+def _verified_kr_cumulative_buy_evidence(
+    row: dict[str, Any], *, source_order: dict[str, Any] | None,
+    side: str, trade_date: date, kis_odno: str | None, env: str,
+) -> dict[str, Any] | None:
+    """A BUY order cumulative snapshot is not an individual execution.
+
+    Source identity, date, monotonic quantity and executed notional are
+    mandatory. Never fill from a displayed quote or unscoped symbol.
+    """
+    from decimal import Decimal, InvalidOperation
+    import hashlib
+
+    if side != "BUY" or not source_order or not kis_odno:
+        return None
+    if _first_value(row, ["ccld_no", "trade_id", "exec_id"]):
+        return None
+    if _parse_side(row) != "BUY":
+        return None
+    code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
+    if (
+        code != _normalize_code(source_order.get("code"))
+        or str(source_order.get("side") or "").upper() != "BUY"
+        or str(source_order.get("kis_odno") or source_order.get("broker_order_id") or "").strip() != str(kis_odno).strip()
+        or str(_first_value(row, ["odno", "ODNO", "ordno"]) or "").strip() != str(kis_odno).strip()
+        or _parse_date_time(row).date() != trade_date
+    ):
+        return None
+    requested = _to_int(source_order.get("qty"))
+    actual = _to_int(row.get("tot_ccld_qty"))
+    if not requested or not actual or not (0 < actual <= requested):
+        return None
+    try:
+        total = Decimal(str(row.get("tot_ccld_amt") or ""))
+    except (InvalidOperation, ValueError):
+        return None
+    if not total.is_finite() or total <= 0:
+        return None
+    avg = total / Decimal(actual)
+    if not avg.is_finite() or avg <= 0:
+        return None
+    if row.get("avg_prvs") not in (None, ""):
+        try:
+            displayed_avg = Decimal(str(row["avg_prvs"]))
+        except (InvalidOperation, ValueError):
+            return None
+        if not displayed_avg.is_finite() or displayed_avg <= 0:
+            return None
+        if abs(avg - displayed_avg) > max(Decimal("1"), displayed_avg * Decimal("0.001")):
+            return None
+    account_scope = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
+    return {
+        "qty": actual, "notional": float(total), "avg_price": float(avg),
+        "evidence_id": f"KR_KIS_CUM:{account_scope}:{trade_date:%Y%m%d}:{kis_odno}:{code}:BUY",
+        "kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+    }
+
+
+
 def _kr_source_has_individual_sell_fills(
     *, fills_repo: FillsRepo, source_order: dict[str, Any], env: str,
+    side: str = "SELL",
 ) -> bool:
-    """Never duplicate previously stored per-execution fills with an aggregate."""
+    """Never duplicate individual executions with a cumulative BUY or SELL snapshot."""
     order_id = str(source_order.get("order_id") or "").strip()
     if not order_id:
         return True  # fail closed
@@ -1472,7 +1547,7 @@ def _kr_source_has_individual_sell_fills(
         ).where(sa.and_(
             schema.fills.c.env == env,
             schema.fills.c.order_id == uuid_value_for_url(str(fills_repo.engine.url), order_id),
-            schema.fills.c.side == "SELL",
+            schema.fills.c.side == side,
         ))).all()
     for item in rows:
         meta = _json_dict(item[0])
@@ -1581,6 +1656,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         status = str(_first_value(broker_row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
         market = MARKET_MAP.get(code) or str(_first_value(broker_row, ["excg_dvsn_cd", "market"]) or "").strip() or None
         order_time = _parse_date_time(broker_row)
+        execution_time, execution_time_source = _parse_execution_time_with_source(broker_row)
         client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
         request_json = dict(broker_row)
         source_order = None
@@ -1643,6 +1719,22 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             kis_odno=kis_odno,
             env=env,
         )
+        cumulative_buy_evidence = _verified_kr_cumulative_buy_evidence(
+            broker_row, source_order=source_order, side=side,
+            trade_date=order_time.date(), kis_odno=kis_odno, env=env,
+        )
+        if cumulative_buy_evidence is not None and isinstance(
+            getattr(fills_repo, "engine", None), sa.engine.Engine
+        ):
+            if _kr_source_has_individual_sell_fills(
+                fills_repo=fills_repo, source_order=source_order,
+                env=env, side="BUY",
+            ):
+                logger.warning(
+                    "[RECONCILE][KIS_BUY_CUMULATIVE][INDIVIDUAL_FILLS_EXIST] "
+                    "code=%s action=KEEP_INDIVIDUAL_FILLS_NO_AGGREGATE", code,
+                )
+                cumulative_buy_evidence = None
         if strict_sell_targets is not None and cumulative_sell_evidence is None:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
         if cumulative_sell_evidence is not None:
@@ -1655,7 +1747,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
                 cumulative_sell_evidence = None
             else:
-                status = "FILLED"
+                status = ("FILLED" if cumulative_sell_evidence["qty"] == int(source_order.get("qty") or 0)
+                          else "PARTIAL_FILLED")
                 logger.info(
                     "[RECONCILE][KIS_CUMULATIVE][VERIFIED] code=%s qty=%s "
                     "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
@@ -1696,6 +1789,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             filled_qty = int(cumulative_sell_evidence["qty"])
             filled_price = float(cumulative_sell_evidence["avg_price"])
             trade_id = str(cumulative_sell_evidence["evidence_id"])
+        elif cumulative_buy_evidence is not None:
+            filled_qty = int(cumulative_buy_evidence["qty"])
+            filled_price = float(cumulative_buy_evidence["avg_price"])
+            trade_id = str(cumulative_buy_evidence["evidence_id"])
+        elif side == "BUY" and not trade_id:
+            # An unverified order aggregate must not be recorded as an
+            # individual execution (the prior 15+17 and 22+48 defect).
+            filled_price = None
         elif side == "SELL" and not trade_id:
             # avg_prvs or a quote alone is not trustworthy economic truth.
             # Keep any partial/zero-amount SELL unresolved until order-level
@@ -1742,6 +1843,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             claim_filled_qty = next_confirmed_qty
         if cumulative_sell_evidence is not None:
             next_confirmed_notional = float(cumulative_sell_evidence["notional"])
+        elif cumulative_buy_evidence is not None:
+            next_confirmed_notional = float(cumulative_buy_evidence["notional"])
         elif incremental_daily_qty > 0 and filled_price is not None:
             next_confirmed_notional = (
                 previous_confirmed_notional
@@ -1773,11 +1876,11 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     requested_qty=_to_int(source_order.get("qty")) or qty,
                     cumulative_qty=next_confirmed_qty,
                     evidence_type=(
-                        "KIS_EXECUTION_CUMULATIVE" if cumulative_sell_evidence
+                        "KIS_EXECUTION_CUMULATIVE" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else "KIS_EXECUTION_ACTUAL"
                     ),
                     evidence_digest=(
-                        f"daily_ccld_cumulative:{trade_id}" if cumulative_sell_evidence
+                        f"daily_ccld_cumulative:{trade_id}" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else f"daily_ccld:{trade_id}"
                     ),
                     execution_price=filled_price,
@@ -1848,7 +1951,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 price=filled_price,
                 fee=0.0,
                 tax=0.0,
-                filled_at=order_time,
+                filled_at=execution_time,
                 raw_json={
                     "kis_response": row,
                     "entry_meta": (request_json.get("entry_meta") if isinstance(request_json, dict) else {}) or {},
@@ -1857,18 +1960,31 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 },
                 fill_meta_json={
                     "fill_source": (
-                        "daily_ccld_order_cumulative" if cumulative_sell_evidence
+                        "daily_ccld_order_cumulative" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else "daily_ccld"
                     ),
                     "evidence_kind": (
-                        "KIS_ORDER_CUMULATIVE_EXECUTION" if cumulative_sell_evidence
+                        "KIS_ORDER_CUMULATIVE_EXECUTION" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else "KIS_INDIVIDUAL_EXECUTION"
                     ),
-                    "has_broker_individual_trade_id": not bool(cumulative_sell_evidence),
+                    "has_broker_individual_trade_id": not bool(cumulative_sell_evidence or cumulative_buy_evidence),
                     "ccld_status": ccld_status,
-                    "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                    "entry_ts": execution_time.isoformat(),
+                    "filled_at_source": execution_time_source,
+                    "filled_at_confidence": (
+                        "BROKER_EXECUTION" if execution_time_source == "KIS_EXECUTION_TIMESTAMP"
+                        else "ORDER_TIME_PROXY"
+                    ),
                 },
             )
+            # KIS cumulative BUY average is the *whole order* average, not
+            # the price of the incremental shares. Preserve broker notional.
+            buy_delta_price = float(filled_price)
+            if cumulative_buy_evidence is not None and incremental_daily_qty > 0:
+                economic_delta = next_confirmed_notional - previous_confirmed_notional
+                if economic_delta <= 0 or (previous_confirmed_qty > 0 and previous_confirmed_notional <= 0):
+                    raise RuntimeError("KR_BUY_CUMULATIVE_NOTIONAL_WATERMARK_MISSING")
+                buy_delta_price = economic_delta / float(incremental_daily_qty)
             if (
                 side == "BUY"
                 and source_order
@@ -1885,7 +2001,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         market=source_order.get("market") or market,
                         side="BUY",
                         qty=incremental_daily_qty,
-                        price=float(filled_price),
+                        price=float(buy_delta_price),
                         fee=0.0,
                         tax=0.0,
                         filled_at=order_time,
@@ -1911,7 +2027,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                                 market=source_order.get("market") or market,
                                 side="BUY",
                                 qty=int(decision.qty_delta),
-                                price=float(filled_price),
+                                price=float(buy_delta_price),
                                 fee=0.0,
                                 tax=0.0,
                                 filled_at=order_time,
@@ -2357,8 +2473,21 @@ def reconcile_kis(
     )
     holdings_error = None
     holdings_rows: list[dict] = []
+    _kr_reconcile_started = time.monotonic()
+    fresh_balance_proven = False
     try:
         snapshot = balance_snapshot or kis.get_balance_cached(force=True)
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("KR_BALANCE_SNAPSHOT_NOT_DICT")
+        if balance_snapshot is None:
+            fresh_balance_proven = isinstance(snapshot.get("output1"), list) and bool(snapshot.get("output2"))
+        else:
+            try:
+                at = datetime.fromisoformat(str(snapshot.get("_kr_verified_fresh_at_kst") or ""))
+                age = (now_kst() - at).total_seconds()
+                fresh_balance_proven = bool(at.tzinfo and 0 <= age <= 20 and isinstance(snapshot.get("output1"), list))
+            except (TypeError, ValueError):
+                fresh_balance_proven = False
         holdings_rows = snapshot.get("output1") or []
     except KisTemporaryError as exc:
         holdings_error = str(exc)
@@ -2383,6 +2512,8 @@ def reconcile_kis(
     except Exception as exc:
         logger.error("[KIS][HTTP][FAIL_SOFT] step=reconcile_today err=%s", exc, exc_info=True)
         reconcile_result = {"ok": False, "reason": "reconcile_today_failed", "err": str(exc)}
+    logger.info("[KR_RECONCILE][BROKER_CRITICAL] elapsed_ms=%.1f run_id=%s",
+                1000 * (time.monotonic() - _kr_reconcile_started), reconcile_run_id)
     orders_count = int(reconcile_result.get("orders") or 0)
     fills_count = int(reconcile_result.get("fills") or 0)
     reset_mode = bool(env == "practice" and account_reset_mode())
@@ -2428,8 +2559,39 @@ def reconcile_kis(
             orders_count,
             fills_count,
         )
+    # All broker order observations, fills and claims are checked above.
+    # Skip historical import/meta repair ONLY on exact active-cycle parity;
+    # unknown/partial/stale proofs retain the old fail-closed recovery.
+    repair_fastpath = False
+    repair_fastpath_reason = "STALE_OR_UNPROVEN_BALANCE"
+    if (os.getenv("KR_EXACT_PARITY_HISTORICAL_REPAIR_FASTPATH", "1") == "1"
+            and not reset_mode and fresh_balance_proven):
+        try:
+            from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
+            _current_active = positions_repo.list_active_positions_for_exit(env, strategy)
+            _unresolved_for_fastpath = _has_unresolved_broker_activity(
+                engine=engine, orders_repo=orders_repo, env=env,
+                trade_date=tick_ts.date(),
+            )
+            repair_fastpath, repair_fastpath_reason = historical_repair_unnecessary(
+                holdings=holdings_rows, positions=_current_active,
+                reconcile_ok=bool(reconcile_result.get("ok", False)),
+                holdings_error=holdings_error,
+                order_or_fill_changes=fills_count,
+                unresolved=_unresolved_for_fastpath,
+                expected_strategy=strategy,
+            )
+        except Exception as _parity_exc:
+            repair_fastpath = False
+            repair_fastpath_reason = "PARITY_READ_FAILED"
+            logger.warning("[KR_RECONCILE][HISTORICAL_PARITY][FAIL_CLOSED] type=%s", type(_parity_exc).__name__)
+    logger.info("[KR_RECONCILE][HISTORICAL_PARITY] fastpath=%s reason=%s fresh_balance=%s",
+                int(repair_fastpath), repair_fastpath_reason, int(fresh_balance_proven))
+    _kr_history_started = time.monotonic()
     restored = 0
-    if reset_mode:
+    if repair_fastpath:
+        logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=EXACT_BROKER_ACTIVE_CYCLE_PARITY")
+    elif reset_mode:
         allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
         if holdings_rows and not allow_holdings:
             logger.warning(
@@ -2492,20 +2654,25 @@ def reconcile_kis(
     # [2026-05-21] entry meta 복원 (KIS holdings 복구 포지션 대상)
     meta_restored = 0
     try:
-        ledger_repo = LedgerEventsRepo(engine)
-        meta_restored = _restore_entry_meta_for_promoted_positions(
-            env=env,
-            strategy=strategy,
-            engine=engine,
-            orders_repo=orders_repo,
-            positions_repo=positions_repo,
-            ledger_repo=ledger_repo,
-        )
+        if repair_fastpath:
+            logger.info("[KR_RECONCILE][META_RESTORE][SKIP] reason=FROZEN_CONTRACT_ALREADY_VERIFIED")
+        else:
+            ledger_repo = LedgerEventsRepo(engine)
+            meta_restored = _restore_entry_meta_for_promoted_positions(
+                env=env,
+                strategy=strategy,
+                engine=engine,
+                orders_repo=orders_repo,
+                positions_repo=positions_repo,
+                ledger_repo=ledger_repo,
+            )
         if meta_restored:
             logger.info("[RECONCILE][META_RESTORE][DONE] env=%s count=%s", env, meta_restored)
     except Exception as _meta_exc:
         logger.warning("[RECONCILE][META_RESTORE][SKIP] err=%s", _meta_exc)
 
+    logger.info("[KR_RECONCILE][HISTORICAL_REPAIR] elapsed_ms=%.1f skipped=%s",
+                1000 * (time.monotonic() - _kr_history_started), int(repair_fastpath))
     guard_result = None
     guard_reason = None
     allow_purge = None
@@ -2564,6 +2731,8 @@ def reconcile_kis(
             "filled_codes": refresh_codes,
             "holdings": len(holdings_rows),
             "restored_positions": restored,
+            "historical_repair_fastpath": repair_fastpath,
+            "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
             "reset_mode": reset_mode,
@@ -2581,6 +2750,8 @@ def reconcile_kis(
             "promoted_fills": int(promoted.get("fills") or 0),
             "filled_codes": refresh_codes,
             "restored_positions": restored,
+            "historical_repair_fastpath": repair_fastpath,
+            "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
             "reset_mode": reset_mode,
@@ -2618,4 +2789,7 @@ def reconcile_kis(
     if observation_failure_count:
         execution_claim_health["observation_persistence_failures"] = observation_failure_count
     reconcile_result["execution_claim_health"] = execution_claim_health
+    logger.info("[KR_RECONCILE][TOTAL] elapsed_ms=%.1f mode=%s run_id=%s",
+                1000 * (time.monotonic() - _kr_reconcile_started),
+                "PROVEN_PARITY_FASTPATH" if repair_fastpath else "FULL_RECOVERY", reconcile_run_id)
     return reconcile_result
