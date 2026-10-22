@@ -2063,3 +2063,96 @@ def test_claim_pre_submit_outbox_atomic_rollback(pg_engine):
             """), {"key": event["idempotency_key"]}).scalar_one(),
         )
     assert counts == (1, 1)
+
+
+def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
+    """Full Stage 1+3 DB preparation is one atomic write on PostgreSQL.
+
+    Three durable rows (Claim / account reservation / immutable pre-submit
+    outbox) are never partially visible after an exception, without KIS IO.
+    """
+    from datetime import date, datetime, timezone
+    import hashlib
+    from pathlib import Path
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.execution_state import SemanticActionIdentity
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db import repos
+    from trader.us.db.execution_claim_schema import (
+        us_execution_claims, us_execution_attempts,
+    )
+    from trader.us.execution.account_authority import AccountExecutionAuthority
+
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    fingerprint = hashlib.sha256(b"stage-123-synthetic-test").hexdigest()
+    authority = AccountExecutionAuthority(
+        pg_engine, env="practice", account_fingerprint=fingerprint,
+        trading_epoch_id="stage123-epoch",
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=fingerprint,
+        market="US", trading_epoch_id="stage123-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="stage123-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    key = "TQQQ_INF_V3:stage123-cycle:2026-10-20:BUY"
+    attempt = "stage123-reserved-attempt"
+    event = {
+        "event_id": str(uuid4()), "trade_date": "2026-10-20",
+        "event_type": "BROKER_CLAIM_PREPARED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "synthetic",
+        "tick_id": "synthetic", "client_order_key": key,
+        "submit_attempt_id": attempt, "symbol": "TQQQ", "side": "BUY",
+        "requested_qty": 3, "raw_broker_order_no": None,
+        "canonical_broker_order_no": None,
+        "position_lifecycle_id": "stage123-cycle",
+        "profit_capture_stage": "", "cumulative_filled_qty": 0,
+        "payload": {"submission_status": "NOT_YET_AT_HTTP_BOUNDARY"},
+        "idempotency_key": "stage123:" + attempt,
+    }
+    lease = authority.acquire_lease(holder_id="stage123-router")
+    def write_triplet(conn):
+        assert ledger.acquire(
+            identity, attempt_id=attempt, requested_qty=3,
+            client_order_key=key, _conn=conn,
+        ).acquired
+        authority.reserve(
+            lease=lease, action_key=attempt,
+            strategy_owner="TQQQ_INFINITE",
+            symbol="TQQQ", side="BUY", qty=3,
+            price_usd="100", broker_cash_usd="500",
+            _conn=conn,
+        )
+        assert repos.append_us_order_event(event, _conn=conn)
+
+    with pytest.raises(RuntimeError, match="synthetic_crash"):
+        with pg_engine.begin() as conn:
+            write_triplet(conn)
+            raise RuntimeError("synthetic_crash")
+
+    def counts():
+        with pg_engine.connect() as conn:
+            return (
+                conn.execute(text(
+                    "SELECT count(*) FROM us_execution_claims WHERE action_key=:key"
+                ), {"key": identity.action_key}).scalar_one(),
+                conn.execute(text(
+                    "SELECT count(*) FROM us_execution_account_reservations WHERE action_key=:key"
+                ), {"key": attempt}).scalar_one(),
+                conn.execute(text(
+                    "SELECT count(*) FROM us_order_events WHERE idempotency_key=:key"
+                ), {"key": event["idempotency_key"]}).scalar_one(),
+            )
+    assert counts() == (0, 0, 0)
+    with pg_engine.begin() as conn:
+        write_triplet(conn)
+    assert counts() == (1, 1, 1)
+    authority.release_lease(lease=lease)
