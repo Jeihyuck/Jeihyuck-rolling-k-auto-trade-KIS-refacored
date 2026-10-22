@@ -180,3 +180,16 @@ def test_account_capacity_cannot_be_reused_across_overlapping_epochs(authority):
     )
     assert second["state"] == "RESERVED"
     next_epoch.release_lease(lease=afternoon)
+
+
+def test_account_execution_authority_tables_are_rls_protected(authority):
+    with authority.engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT relname, relrowsecurity FROM pg_class
+            WHERE relname IN (
+                'us_execution_authority_leases',
+                'us_execution_account_reservations'
+            )
+        """)).all()
+    assert len(rows) == 2
+    assert all(rls is True for _, rls in rows)
