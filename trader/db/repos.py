@@ -7418,6 +7418,31 @@ class PositionsRepo:
             total_cost = 0.0
             realized_pnl = 0.0
 
+        if side.upper() == "BUY" and row is None and position_cycle_id:
+            # Prevent every historical BUY recovery path (not just the
+            # reviewed retry adapter) from resurrecting a completed cycle.
+            # Preserve the evidence for an explicit audit/reconciliation;
+            # never INSERT the same cycle again or silently discard a delta.
+            previous_cycle = conn.execute(
+                sa.select(
+                    self._schema.positions.c.status,
+                    self._schema.positions.c.env,
+                    self._schema.positions.c.strategy,
+                    self._schema.positions.c.code,
+                ).where(
+                    sa.cast(self._schema.positions.c.position_cycle_id, sa.String)
+                    == str(position_cycle_id)
+                ).limit(1)
+            ).mappings().first()
+            if previous_cycle is not None:
+                logger.error(
+                    "[KR_BUY_CYCLE_REUSE][BLOCK] code=%s cycle=%s old_status=%s "
+                    "old_strategy=%s action=RETAIN_BROKER_EVIDENCE_NO_INSERT",
+                    code, position_cycle_id, previous_cycle.get("status"),
+                    previous_cycle.get("strategy"),
+                )
+                raise RuntimeError("KR_BUY_REPLAY_CLOSED_OR_FOREIGN_CYCLE")
+
         if side.upper() != "BUY" and not row:
             logger.error(
                 "[RECONCILE][POSITION_STATE_MISMATCH] code=%s kis_qty=unknown cycle_id=none "
