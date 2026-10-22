@@ -128,3 +128,30 @@ def test_real_pb1_exit_pass_keeps_one_serial_order_decision_per_holding(monkeypa
     assert [r["code"] for r in result] == ["111111", "222222", "333333"]
     assert ctx._exit_summary_payload["checked"] == 3
     assert ctx._exit_summary_payload["submitted"] == 0
+
+
+def test_worker_inherits_same_monotonic_tick_deadline_and_cleans_up():
+    import time
+    from trader.kis_wrapper import (
+        set_kr_tick_deadline, get_kr_tick_deadline,
+        clear_kr_tick_deadline, kr_tick_remaining_sec,
+    )
+    main_deadline = time.monotonic() + 10.0
+    observed = []
+
+    def fetch(code):
+        if code == "B":
+            observed.append((get_kr_tick_deadline(), kr_tick_remaining_sec()))
+        return code
+
+    set_kr_tick_deadline(main_deadline)
+    try:
+        assert list(ordered_exit_ohlcv(
+            ["A", "B"], needs_history=lambda _: True,
+            fetch=fetch, empty=lambda: None,
+        )) == [("A", "A"), ("B", "B")]
+        assert observed and observed[0][0] == main_deadline
+        assert 0 < observed[0][1] <= 10.0
+        assert get_kr_tick_deadline() == main_deadline
+    finally:
+        clear_kr_tick_deadline()
