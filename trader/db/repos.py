@@ -6517,6 +6517,30 @@ class PositionsRepo:
             fail_open=_resolve_position_fail_open(),
         )
 
+    def list_active_positions_for_exit(self, env: str, strategy: str) -> list[dict]:
+        """EXIT input must never include a CLOSED position from an earlier buy cycle.
+
+        This is deliberately a separate API: audit/reconciliation readers still
+        need list_positions() to include closed historical positions.
+        """
+        conditions = [
+            self._schema.positions.c.env == env,
+            self._schema.positions.c.strategy == strategy,
+            self._schema.positions.c.status == "OPEN",
+            self._schema.positions.c.qty > 0,
+        ]
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if trading_epoch_id:
+            conditions.append(self._schema.positions.c.trading_epoch_id == trading_epoch_id)
+        stmt = select(self._schema.positions).where(and_(*conditions))
+        return _safe_repo_read(
+            self.engine, stmt, op_name="positions.list_active_positions_for_exit",
+            fail_open=False,
+        )
+
     def get_position(
         self, *, env: str, strategy: str, sid: int, mode: int, code: str,
         position_cycle_id: str | None = None, portfolio_epoch_id: str | None = None,
