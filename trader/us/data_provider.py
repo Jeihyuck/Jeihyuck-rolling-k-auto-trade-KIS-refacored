@@ -756,6 +756,31 @@ class USDataProvider:
         client._stage_max_attempts = 1
         return fork
 
+    def get_isolated_exit_quote(
+        self, symbol: str, exchange: str, *, stage_deadline: float,
+    ) -> dict:
+        """Price-only I/O for concurrent protective-exit snapshot preparation.
+
+        Every call creates a separate USDataProvider and KIS client. Neither
+        the session Tick cache nor its broker HTTP submitter can be touched
+        from an exit-quote thread. KIS read requests are constrained by the
+        shared monotonic deadline; stale fallback remains marked stale.
+        Owner/risk decisions still run in the main Tick thread.
+        """
+        import time as _time
+        from trader.us.execution.kis_us_client import KisUSTemporaryError
+        if self._env != "practice" or _time.monotonic() >= stage_deadline:
+            raise KisUSTemporaryError("isolated exit quote deadline or env blocked")
+        isolate = USDataProvider(
+            offline=self._offline, cache_enabled=False, env=self._env,
+        )
+        # Do not bind the parent Tick context: its caches, counters and
+        # transport must not be concurrently mutated by worker threads.
+        client = isolate._get_client()
+        client._stage_deadline = float(stage_deadline)
+        client._stage_max_attempts = 1
+        return isolate.get_current_price(symbol, exchange)
+
     def _load_daily_prices_from_db(
         self, symbol: str, market: str = "US", days: int = 120
     ) -> list[dict]:
