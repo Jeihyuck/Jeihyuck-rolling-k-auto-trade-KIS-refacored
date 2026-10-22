@@ -126,3 +126,76 @@ def test_order_cumulative_fill_snapshot_is_monotonic_and_one_row(sequence):
         )).mappings().all()
     assert len(rows) == 1
     assert rows[0]["qty"] == max(q for q, _ in sequence)
+
+
+@pytest.mark.parametrize("code,entry_qty,entry_price,sell_qty,sell_notional,order_id", [
+    ("251970", 17, 68400.0, 10, 685000.0, "oct21-251970-close-10of17"),
+    ("253590", 79, 16130.0, 52, 836180.0, "oct22-253590-close-52of79"),
+    ("144960", 81, 14045.0, 81, 1091430.0, "oct22-144960-full-81"),
+])
+def test_priced_partial_sell_converges_economic_position_once(
+    code, entry_qty, entry_price, sell_qty, sell_notional, order_id,
+):
+    """Exercise the *same* PnL/position writer used by reconciliation."""
+    from trader.db.repos import PositionsRepo
+    from tests.kr.test_kr_20261006_execution_convergence import _db, _open_position
+
+    engine = _db()
+    positions = PositionsRepo(engine)
+    position = _open_position(engine, code=code, qty=entry_qty, avg=entry_price)
+    cycle = str(position["position_cycle_id"])
+    epoch = str(position["portfolio_epoch_id"])
+    fill_time = datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul"))
+    expected_pnl = sell_notional - entry_price * sell_qty
+    for attempt in range(100):
+        result = positions.reconcile_sell_execution(
+            env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+            code=code, market="J", confirmed_cumulative_qty=sell_qty,
+            fill_price=sell_notional / sell_qty, filled_at=fill_time,
+            position_cycle_id=cycle, portfolio_epoch_id=epoch,
+            order_id=order_id, pre_order_holding_qty=entry_qty,
+        )
+        assert result["qty_applied"] == (sell_qty if attempt == 0 else 0)
+        assert result["pnl_qty_applied"] == (sell_qty if attempt == 0 else 0)
+        assert result["remaining_qty"] == entry_qty - sell_qty
+    from trader.db.schema import schema_for_engine
+    import sqlalchemy as sa
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        final = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == cycle
+        )).mappings().one()
+    assert final["qty"] == entry_qty - sell_qty
+    assert float(final["realized_pnl"]) == pytest.approx(expected_pnl, abs=0.001)
+    assert final["status"] == ("CLOSED" if entry_qty == sell_qty else "OPEN")
+    assert final["position_meta"]["realized_pnl_status"] == "CONFIRMED"
+
+
+def test_partial_sell_cumulative_increase_and_stale_snapshot_never_double_applies():
+    from trader.db.repos import PositionsRepo
+    from tests.kr.test_kr_20261006_execution_convergence import _db, _open_position
+
+    engine = _db()
+    repo = PositionsRepo(engine)
+    p = _open_position(engine, code="253590", qty=79, avg=16130.0)
+    fields = dict(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="253590", market="J", position_cycle_id=str(p["position_cycle_id"]),
+        portfolio_epoch_id=str(p["portfolio_epoch_id"]), order_id="test-stable-odno-253590",
+        filled_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+        pre_order_holding_qty=79,
+    )
+    repo.reconcile_sell_execution(
+        **fields, confirmed_cumulative_qty=10, fill_price=16100.0,
+    )
+    repo.reconcile_sell_execution(
+        **fields, confirmed_cumulative_qty=52, fill_price=836180.0 / 52,
+    )
+    assert repo.get_position(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="253590"
+    )["qty"] == 27
+    with pytest.raises(RuntimeError, match="KR_SELL_RECONCILE_CUMULATIVE_REGRESSION"):
+        repo.reconcile_sell_execution(
+            **fields, confirmed_cumulative_qty=10, fill_price=16100.0,
+        )
