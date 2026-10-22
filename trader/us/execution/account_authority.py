@@ -385,3 +385,59 @@ class AccountExecutionAuthority:
                 "state": new_state, "idempotent": False,
                 "attempt_id": attempt_id, "broker_order_no": str(order["order_no"]),
             }
+
+    def release_proven_pre_submit_abort(
+        self, *, lease: Lease, attempt_id: str, client_order_key: str,
+    ) -> bool:
+        """Release a reservation only after durable pre-HTTP abandonment.
+
+        This is not a KIS cancellation. The exact Attempt must be marked
+        ABANDONED_PRE_SUBMIT and authoritative by the existing Router before
+        submission, and the Claim must not still own the Attempt. A generic
+        timeout or local cancel request never satisfies these conditions.
+        """
+        if not attempt_id or not client_order_key:
+            raise ReservationConflict("pre_submit_abort_identity_missing")
+        with self.engine.begin() as conn:
+            self._guard(conn, lease)
+            row = conn.execute(text("""
+                SELECT r.state, a.attempt_state, a.authoritative,
+                       a.client_order_key, c.active_attempt_id
+                FROM us_execution_account_reservations AS r
+                JOIN us_execution_attempts AS a ON a.attempt_id=r.action_key
+                JOIN us_execution_claims AS c ON c.action_key=a.action_key
+                WHERE r.action_key=:attempt_id AND r.env=:env
+                  AND r.account_fingerprint=:account
+                  AND r.trading_epoch_id=:epoch
+                  AND c.env=:env AND c.account_id=:account
+                  AND c.trading_epoch_id=:epoch
+                FOR UPDATE OF r,a,c
+            """), {**self.scope, "attempt_id": attempt_id}).mappings().one_or_none()
+            if row is None:
+                raise ReservationConflict("pre_submit_abort_attempt_not_found")
+            if row["state"] == "RELEASED":
+                return False
+            if (
+                row["state"] != "RESERVED"
+                or str(row["attempt_state"]) != "ABANDONED_PRE_SUBMIT"
+                or row["authoritative"] is not True
+                or str(row["client_order_key"] or "") != client_order_key
+                or row["active_attempt_id"] == attempt_id
+            ):
+                raise ReservationConflict("pre_submit_abort_not_authoritatively_proven")
+            result = conn.execute(text("""
+                UPDATE us_execution_account_reservations
+                SET state='RELEASED',
+                    terminal_evidence='DURABLE_ABANDONED_PRE_SUBMIT',
+                    holder_id=:holder, fencing_token=:token,
+                    updated_at=clock_timestamp()
+                WHERE action_key=:attempt_id AND state='RESERVED'
+                  AND env=:env AND account_fingerprint=:account
+                  AND trading_epoch_id=:epoch
+            """), {
+                **self.scope, "attempt_id": attempt_id,
+                "holder": lease.holder_id, "token": lease.fencing_token,
+            })
+            if result.rowcount != 1:
+                raise ReservationConflict("pre_submit_abort_release_race")
+            return True
