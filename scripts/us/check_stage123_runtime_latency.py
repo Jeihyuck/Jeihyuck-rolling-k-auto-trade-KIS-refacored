@@ -50,7 +50,13 @@ def evaluate_logs(text: str, *, min_samples: int = 20,
     ticks = {}
     invalid_signals = 0
     native_permission_blocks = 0
+    tick_failures = 0
+    tick_deadline_events = 0
     for line in text.splitlines():
+        if "[US_TICK][DONE]" in line and ("status=FAILED" in line or "status=ERROR" in line):
+            tick_failures += 1
+        if "[US_TICK][TIMEOUT]" in line or "ORDER_ROUTE_BUDGET_EXHAUSTED" in line:
+            tick_deadline_events += 1
         if NATIVE.search(line):
             native_permission_blocks += 1
         match = SIGNAL.search(line)
@@ -84,6 +90,10 @@ def evaluate_logs(text: str, *, min_samples: int = 20,
         reasons.append("missing_or_conflicting_selected_signal_identity")
     if native_permission_blocks:
         reasons.append("native_KIS_permission_blocked_in_checked_logs")
+    if tick_failures:
+        reasons.append("tick_failures_present_in_evidence_window")
+    if tick_deadline_events:
+        reasons.append("tick_deadline_or_route_budget_exhausted")
     if sell_p95 is not None and sell_p95 > max_signal_sec:
         reasons.append("selected_sell_p95_above_target")
     if tick_p95 is not None and tick_p95 > max_tick_sec:
