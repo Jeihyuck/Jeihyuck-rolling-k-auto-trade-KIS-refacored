@@ -6842,7 +6842,32 @@ def run_once(
         ctx.run_id = str(run_record_id)
         db_write_reasons.append("run_start")
         reconcile_result: dict | None = None
-        if kis and not nontrading_eval_mode:
+        deferred_full_reconcile = False
+        if (
+            kis is not None and not nontrading_eval_mode
+            and os.getenv("KR_PROTECTIVE_SELL_RECONCILE_HANDOFF", "1") == "1"
+            and _resolve_session_kind() in {"am", "pm", "morning", "afternoon"}
+        ):
+            try:
+                from trader.kr.protective_sell_handoff import prove_safe_protective_sell_handoff
+                deferred_full_reconcile, _handoff_reason = prove_safe_protective_sell_handoff(
+                    engine=engine, kis=kis, env=env_effective,
+                    strategy="pb1_pullback_close", trade_date=trade_date,
+                    balance_snapshot=balance_snapshot_raw,
+                )
+                logger.info(
+                    "[KR_RECONCILE_LANES][PRE_EXIT] deferred=%s reason=%s "
+                    "owner=PB1 full_reconcile_requires_post_exit_before_buy=1",
+                    int(deferred_full_reconcile), _handoff_reason,
+                )
+            except Exception as _handoff_exc:
+                deferred_full_reconcile = False
+                logger.warning("[KR_RECONCILE_LANES][PROOF_FAIL] type=%s action=FULL_PRE_EXIT_RECONCILE",
+                               type(_handoff_exc).__name__)
+        if deferred_full_reconcile:
+            reconcile_result = {"ok": True, "status": "PRE_EXIT_EXACT_PROOF",
+                                "deferred_to": "AFTER_PROTECTIVE_SELL_BEFORE_ANY_BUY"}
+        if kis and not nontrading_eval_mode and not deferred_full_reconcile:
             try:
                 reconcile_result = reconcile_kis(
                     engine=engine,
@@ -7362,10 +7387,34 @@ def run_once(
         kr_inf_invoked = False
 
         def _kr_after_protective_exit():
-            nonlocal kr_inf_run_result, kr_inf_invoked
+            nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
+            # Protected SELL has been offered to every PB1 holder. For a
+            # clean, exact pretrade proof only, full economic reconciliation
+            # moves here. This executes before KR_INFINITE BUY and PB1 BUY,
+            # preserving identical post-reconciliation entry safety gates.
+            engine_runner._kr_post_exit_reconcile_ok = True
+            if deferred_full_reconcile:
+                try:
+                    reconcile_result = reconcile_kis(
+                        engine=engine, kis=kis, env=env_effective,
+                        run_id=run_record_id, strategy="pb1_pullback_close",
+                        tick_ts=now, balance_snapshot=balance_snapshot_raw,
+                        runtime_dir=str(runtime_root_dir),
+                    )
+                    engine_runner._kr_post_exit_reconcile_ok = bool(reconcile_result.get("ok", False))
+                    if engine_runner._kr_post_exit_reconcile_ok:
+                        db_write_reasons.append("reconcile_after_protective_sell")
+                    else:
+                        logger.error("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] reason=%s "
+                                     "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS",
+                                     reconcile_result.get("degraded") or reconcile_result.get("reason"))
+                except Exception as _deferred_exc:
+                    engine_runner._kr_post_exit_reconcile_ok = False
+                    logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
+                                     "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
             try:
                 # Preserve the original 40-slot WS owner-first prewarm.  The
                 # early owner evaluation must not regress subscription timing.
@@ -7381,6 +7430,7 @@ def run_once(
                     allow_entry=bool(
                         order_allowed and calc_allowed
                         and getattr(engine_runner, "_kr_exit_pass_ok", False)
+                        and getattr(engine_runner, "_kr_post_exit_reconcile_ok", True)
                     ),
                 )
                 logger.info(
