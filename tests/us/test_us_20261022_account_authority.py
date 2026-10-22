@@ -64,6 +64,20 @@ def test_account_cash_reservation_serializes_strategy_owners(authority):
             symbol="AMD", side="BUY", qty=1, price_usd="100",
             broker_cash_usd="450",
         )
+    # Even an otherwise identical action key belongs to exactly one
+    # account/epoch; colliding keys must never impersonate an existing hold.
+    other_scope = AccountExecutionAuthority(
+        authority.engine, env="practice",
+        account_fingerprint=hashlib.sha256(b"account-beta").hexdigest(),
+        trading_epoch_id="test-epoch",
+    )
+    other_lease = other_scope.acquire_lease(holder_id="session-B")
+    with pytest.raises(ReservationConflict, match="idempotency_collision"):
+        other_scope.reserve(
+            lease=other_lease, action_key="pb1-buy-A",
+            strategy_owner="US_STANDARD", symbol="AMD",
+            side="BUY", qty=3, price_usd="100", broker_cash_usd="450",
+        )
     with pytest.raises(ReservationConflict, match="authoritative_terminal_evidence_required"):
         authority.terminalize(
             lease=lease, action_key="pb1-buy-A", terminal_evidence="ACK"
