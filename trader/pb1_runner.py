@@ -8303,11 +8303,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     elapsed_tick_sec = time_mod.monotonic() - tick_started_monotonic
                     logger.info(
                         "[KR_LATENCY][TICK_END] kind=%s index=%s total_elapsed_s=%.3f "
-                        "result_status=%s sha=%s run_id=%s",
+                        "result_status=%s sha=%s run_id=%s tick_run_id=%s",
                         session_kind, tick_index, elapsed_tick_sec,
                         _tick_result_status_for_latency,
                         str(os.getenv("GITHUB_SHA") or "UNVERSIONED"),
                         str(os.getenv("TRADER_RUN_ID") or "NO_RUN_ID"),
+                        str(getattr(ctx, "run_id", None) or "UNRESOLVED_TICK_RUN_ID"),
                     )
                     if elapsed_tick_sec > 180.0:
                         logger.warning(
