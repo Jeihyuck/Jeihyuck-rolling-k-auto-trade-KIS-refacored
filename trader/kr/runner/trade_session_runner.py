@@ -819,9 +819,19 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = int(_stage(session, ctx.trade_date, ctx.expected_as_of, "pb1_entry_eval", lambda: pb1_runner.main()) or 0)
     finally:
         sys.argv = old_argv
-    _stage(session, ctx.trade_date, ctx.expected_as_of, "order_submit", lambda: None)
-    _stage(session, ctx.trade_date, ctx.expected_as_of, "order_ack_persist", lambda: None)
-    _stage(session, ctx.trade_date, ctx.expected_as_of, "fill_reconcile", lambda: None)
+    # Submission, ACK persistence and fill reconciliation run *inside*
+    # pb1_runner.main(), not as three separate stages in this wrapper. The
+    # previous no-op _stage calls falsely reported successful completion.
+    for delegated_step in ("order_submit", "order_ack_persist", "fill_reconcile"):
+        _write_session_last_stage(
+            session=session, trade_date=ctx.trade_date,
+            expected_as_of=ctx.expected_as_of, stage=delegated_step,
+            status="delegated_to_pb1_unverified",
+        )
+        logger.info(
+            "[STAGE][DELEGATED] stage=%s owner=pb1_runner status=UNVERIFIED_BY_WRAPPER",
+            delegated_step,
+        )
     session_end_entry_allowed = infinite_allow_entry and str(os.getenv("ENTRY_ALLOWED", "1")) == "1" and str(os.getenv("ORDER_ALLOWED", "1")) == "1"
     pb1_result_present = pb1_result_path.exists()
     if pb1_result_present:
