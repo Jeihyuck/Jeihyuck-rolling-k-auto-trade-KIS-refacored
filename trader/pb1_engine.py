@@ -14565,7 +14565,24 @@ class PB1Engine:
         # live at exit-pass (tick) scope rather than inside the helper call.
         self._kr_defense_trim_symbols_this_tick = set()
         exit_evaluations: list[dict[str, Any]] = []
-        for pos in pos_list:
+        # The main thread still evaluates and submits every SELL in exactly
+        # the original order. Only ONE independent OHLCV read may overlap with
+        # the preceding holding's strategy/order path; no parallel broker I/O.
+        from trader.kr.exit_io_pipeline import ordered_exit_ohlcv
+        read_ahead_enabled = os.getenv("KR_EXIT_ORDERED_OHLCV_READAHEAD", "1") == "1"
+        exit_ohlcv_iter = ordered_exit_ohlcv(
+            pos_list,
+            needs_history=lambda row: int(row.get("holding_days") or 0) > 0,
+            fetch=lambda row: self._fetch_exit_ohlcv(row["code"]),
+            empty=lambda: (pd.DataFrame(), {"source": "same_day_holdings_skip"}),
+            enabled=read_ahead_enabled,
+        )
+        logger.info(
+            "[KR_EXIT][ORDERED_READAHEAD] enabled=%s holdings=%s "
+            "max_data_workers=1 sell_policy_and_submit=SERIAL",
+            int(read_ahead_enabled), len(pos_list),
+        )
+        for pos, (df, meta) in exit_ohlcv_iter:
             display_code = self._display_code(pos.get("code"))
             logger.info(
                 "[PB1][POST_CAPITAL][EXIT_PASS][HOLDING] code=%s step=start qty=%s holding_days=%s",
@@ -14573,11 +14590,6 @@ class PB1Engine:
                 int(pos.get("qty") or 0),
                 int(pos.get("holding_days") or 0),
             )
-            if int(pos.get("holding_days") or 0) <= 0:
-                df = pd.DataFrame()
-                meta = {"source": "same_day_holdings_skip"}
-            else:
-                df, meta = self._fetch_exit_ohlcv(pos["code"])
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
