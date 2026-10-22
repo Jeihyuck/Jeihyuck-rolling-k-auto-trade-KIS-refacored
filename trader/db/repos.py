@@ -5428,9 +5428,19 @@ class FillsRepo:
                         self._schema.fills.c.trading_epoch_id,
                         self._schema.fills.c.portfolio_epoch_id,
                         self._schema.fills.c.position_cycle_id,
+                        self._schema.fills.c.qty,
+                        self._schema.fills.c.price,
                     ).where(and_(*collision_conditions))
                 ).mappings().first()
                 if existing_fill is not None:
+                    if order_cumulative:
+                        old_qty = int(existing_fill.get("qty") or 0)
+                        old_amount = old_qty * float(existing_fill.get("price") or 0.0)
+                        new_amount = int(qty) * float(price)
+                        if qty == old_qty and abs(new_amount - old_amount) > 0.01:
+                            raise RuntimeError("KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT")
+                        if qty > old_qty and new_amount + 0.01 < old_amount:
+                            raise RuntimeError("KR_CUMULATIVE_FILL_NOTIONAL_REGRESSION")
                     if (
                         str(existing_fill.get("trading_epoch_id") or "")
                         != str(active_epoch_id)
@@ -5453,7 +5463,14 @@ class FillsRepo:
                 stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
                     index_elements=conflict_cols,
                     set_=update_cols,
-                    **({"where": self._schema.fills.c.qty <= qty} if order_cumulative else {}),
+                    **({"where": sa.and_(
+                        self._schema.fills.c.qty <= qty,
+                        self._schema.fills.c.qty * self._schema.fills.c.price <= (qty * price) + 0.01,
+                        sa.or_(
+                            self._schema.fills.c.qty < qty,
+                            sa.func.abs(self._schema.fills.c.price * self._schema.fills.c.qty - qty * price) <= 0.01,
+                        ),
+                    )} if order_cumulative else {}),
                 ).returning(self._schema.fills.c.fill_id)
                 res = conn.execute(stmt)
                 fill_id = res.scalar()
@@ -5472,7 +5489,14 @@ class FillsRepo:
                     where_conditions = [self._schema.fills.c[col] == payload[col] for col in conflict_cols]
                     conn.execute(
                         sa.update(self._schema.fills).where(and_(*where_conditions)).where(
-                            self._schema.fills.c.qty <= qty if order_cumulative else sa.true()
+                            sa.and_(
+                                self._schema.fills.c.qty <= qty,
+                                self._schema.fills.c.qty * self._schema.fills.c.price <= qty * price + 0.01,
+                                sa.or_(
+                                    self._schema.fills.c.qty < qty,
+                                    sa.func.abs(self._schema.fills.c.price * self._schema.fills.c.qty - qty * price) <= 0.01,
+                                ),
+                            ) if order_cumulative else sa.true()
                         ).values(**update_cols)
                     )
                     existing = conn.execute(
