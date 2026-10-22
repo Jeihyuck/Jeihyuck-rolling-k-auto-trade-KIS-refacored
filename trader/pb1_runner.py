@@ -8280,6 +8280,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 tick_started_monotonic = time_mod.monotonic()
                 os.environ["KR_TICK_ORIGIN_MONOTONIC"] = f"{tick_started_monotonic:.9f}"
                 set_kr_tick_deadline(tick_deadline_monotonic)
+                _tick_result_status_for_latency = "TIMEOUT_OR_FAILURE"
                 try:
                     _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
                         timeout_sec=tick_timeout_sec,
@@ -8293,12 +8294,30 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                             runs_ledger_fail_open=runs_ledger_fail_open,
                         ),
                     )
+                    _tick_result_status_for_latency = str(result_status or "UNKNOWN")
                 finally:
+                    # A timeout/error MUST be included in measured tick p95;
+                    # never count only successful ticks or reuse the previous
+                    # iteration's result_status. This also records the Git SHA
+                    # and durable run scope required for identical-workload proof.
+                    elapsed_tick_sec = time_mod.monotonic() - tick_started_monotonic
+                    logger.info(
+                        "[KR_LATENCY][TICK_END] kind=%s index=%s total_elapsed_s=%.3f "
+                        "result_status=%s sha=%s run_id=%s",
+                        session_kind, tick_index, elapsed_tick_sec,
+                        _tick_result_status_for_latency,
+                        str(os.getenv("GITHUB_SHA") or "UNVERSIONED"),
+                        str(os.getenv("TRADER_RUN_ID") or "NO_RUN_ID"),
+                    )
+                    if elapsed_tick_sec > 180.0:
+                        logger.warning(
+                            "[KR_LATENCY][TICK_TARGET_MISS] kind=%s index=%s elapsed_s=%.3f "
+                            "limit_s=180.000 result_status=%s",
+                            session_kind, tick_index, elapsed_tick_sec,
+                            _tick_result_status_for_latency,
+                        )
                     clear_kr_tick_deadline()
                     os.environ.pop("KR_TICK_ORIGIN_MONOTONIC", None)
-                logger.info("[KR_LATENCY][TICK_END] kind=%s index=%s total_elapsed_s=%.3f result_status=%s",
-                            session_kind, tick_index, time_mod.monotonic() - tick_started_monotonic,
-                            str(locals().get("result_status") or "TIMEOUT_OR_FAILURE"))
                 last_tick_metrics = dict(metrics or {})
                 session_metrics["ticks_total"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
