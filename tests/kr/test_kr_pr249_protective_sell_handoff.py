@@ -157,14 +157,17 @@ def test_existing_durable_order_uses_portfolio_epoch_account_not_nonexistent_ord
     prove, _, _, _, kis, engine = proof_fixture
     schema = schema_for_engine(engine)
     epoch_id = str(uuid4())
+    trading_epoch_id = str(uuid4())
     with engine.begin() as conn:
         conn.execute(schema.portfolio_epochs.insert().values(
-            portfolio_epoch_id=epoch_id, env="practice",
+            portfolio_epoch_id=epoch_id, trading_epoch_id=trading_epoch_id,
+            env="practice",
             account_id="scoped-test-account", sid=1, mode=1,
             strategy="pb1_pullback_close", status="ACTIVE",
         ))
         conn.execute(schema.orders.insert().values(
             order_id=str(uuid4()), portfolio_epoch_id=epoch_id,
+            trading_epoch_id=trading_epoch_id,
             env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
             code="053800", market="J", side="BUY", ord_type="LIMIT", qty=1,
             client_order_key="pr249-proof-existing-kis-order", status="REJECTED",
@@ -181,4 +184,10 @@ def test_existing_durable_order_uses_portfolio_epoch_account_not_nonexistent_ord
         conn.execute(sa.update(schema.portfolio_epochs)
                      .where(schema.portfolio_epochs.c.portfolio_epoch_id == epoch_id)
                      .values(account_id="different-account"))
+    assert prove() == (False, "DURABLE_ORDER_ACCOUNT_IDENTITY_MISSING")
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.portfolio_epochs)
+                     .where(schema.portfolio_epochs.c.portfolio_epoch_id == epoch_id)
+                     .values(account_id="scoped-test-account",
+                             trading_epoch_id=str(uuid4())))
     assert prove() == (False, "DURABLE_ORDER_ACCOUNT_IDENTITY_MISSING")
