@@ -9,6 +9,7 @@ import pytest
 
 from trader.reconcile_kis import (
     _parse_date_time,
+    _parse_execution_time_with_source,
     _verified_kr_cumulative_buy_evidence,
     _verified_kr_cumulative_sell_evidence,
 )
@@ -230,3 +231,18 @@ def test_cumulative_same_quantity_with_changed_notional_fails_closed():
     assert len(stored) == 1
     assert stored[0]["qty"] == 17
     assert stored[0]["price"] == 68400.0
+
+
+def test_execution_timestamp_preferred_over_order_timestamp_with_provenance():
+    broker_row = {
+        "ord_dt": "20261022", "ord_tmd": "151810",
+        "ccld_dt": "20261022", "ccld_tmd": "151815",
+    }
+    execution, evidence_source = _parse_execution_time_with_source(broker_row)
+    assert execution.isoformat() == "2026-10-22T15:18:15+09:00"
+    assert evidence_source == "KIS_EXECUTION_TIMESTAMP"
+    order_proxy, proxy_source = _parse_execution_time_with_source(
+        {"ord_dt": "20261022", "ord_tmd": "151810"}
+    )
+    assert order_proxy.isoformat() == "2026-10-22T15:18:10+09:00"
+    assert proxy_source == "ORDER_TIME_PROXY"
