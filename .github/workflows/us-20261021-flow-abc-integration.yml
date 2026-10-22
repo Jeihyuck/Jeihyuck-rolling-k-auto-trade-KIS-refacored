@@ -62,6 +62,7 @@ jobs:
             trader/us/execution/reconcile.py \
             trader/us/execution/reconcile_shadow_worker.py \
             trader/us/execution/account_authority.py \
+            trader/us/execution/reservation_reconcile_worker.py \
             trader/us/runner/trade_tick_runner.py \
             trader/us/runner/trade_session_runner.py
       - name: Focused A-B-C runner/repository/worker regressions
