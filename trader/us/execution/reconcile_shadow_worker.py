@@ -25,7 +25,7 @@ _STOP = False
 
 def parse_mode(mode: str) -> str:
     normalized = str(mode or "LEGACY").strip().upper()
-    if normalized not in {"LEGACY", "SHADOW"}:
+    if normalized not in {"LEGACY", "SHADOW", "RESERVATION_ONLY"}:
         raise ValueError(
             "unsupported US_RECONCILE_WORKER_MODE; authoritative WORKER "
             "requires account fencing and reservations, not yet implemented"
