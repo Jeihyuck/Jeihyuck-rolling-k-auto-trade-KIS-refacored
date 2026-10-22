@@ -8278,6 +8278,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     session_end_dt.isoformat(),
                 )
                 tick_started_monotonic = time_mod.monotonic()
+                os.environ["KR_TICK_ORIGIN_MONOTONIC"] = f"{tick_started_monotonic:.9f}"
                 set_kr_tick_deadline(tick_deadline_monotonic)
                 try:
                     _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
@@ -8294,6 +8295,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     )
                 finally:
                     clear_kr_tick_deadline()
+                    os.environ.pop("KR_TICK_ORIGIN_MONOTONIC", None)
+                logger.info("[KR_LATENCY][TICK_END] kind=%s index=%s total_elapsed_s=%.3f result_status=%s",
+                            session_kind, tick_index, time_mod.monotonic() - tick_started_monotonic,
+                            str(locals().get("result_status") or "TIMEOUT_OR_FAILURE"))
                 last_tick_metrics = dict(metrics or {})
                 session_metrics["ticks_total"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
