@@ -106,3 +106,81 @@ def reconcile_proven_reservations_once(
     finally:
         authority.release_lease(lease=lease)
     return result
+
+
+def reservation_report_path(trade_date: str, session_run_id: str):
+    """A separate diagnostic file, never the immutable trading journal."""
+    from pathlib import Path
+    import re
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(trade_date)):
+        raise ValueError("reservation worker requires ISO US trade date")
+    from trader.us.execution.reconcile_shadow_worker import safe_scope_token
+    root = Path(os.getenv("US_RESERVATION_RECONCILE_DIR", "runtime/us/reconcile_reservations"))
+    return root / str(trade_date) / (safe_scope_token(session_run_id) + ".json")
+
+
+def run_reservation_loop(
+    *, trade_date: str, session_run_id: str, env: str,
+    interval_sec: float = 15.0, max_cycles: int = 0,
+) -> int:
+    """Session-owned reservation-only writer, no broker API credentials."""
+    import json
+    import signal
+    import time
+    from datetime import datetime, timezone
+    from trader.us.execution.reconcile_shadow_worker import save_diagnostic_atomic
+    path = reservation_report_path(trade_date, session_run_id)
+    state = {"stop": False}
+    signal.signal(signal.SIGTERM, lambda *_: state.__setitem__("stop", True))
+    signal.signal(signal.SIGINT, lambda *_: state.__setitem__("stop", True))
+    cycles = 0
+    while not state["stop"]:
+        try:
+            payload = reconcile_proven_reservations_once(
+                env=env, trade_date=trade_date,
+            )
+            payload["read_status"] = "OK" if payload["unresolved"] == 0 else "DEGRADED"
+        except Exception as exc:
+            payload = {
+                "mode": "RESERVATION_ONLY",
+                "write_authority": "FENCED_ACCOUNT_RESERVATIONS_ONLY",
+                "read_status": "ERROR",
+                "reason": type(exc).__name__,
+            }
+            logger.exception("[US_RESERVATION_WORKER][ERROR]")
+        payload.update({
+            "trade_date": trade_date,
+            "session_run_id": session_run_id,
+            "sampled_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        save_diagnostic_atomic(path, payload)
+        cycles += 1
+        if max_cycles and cycles >= max_cycles:
+            break
+        until = time.monotonic() + max(5.0, float(interval_sec))
+        while not state["stop"] and time.monotonic() < until:
+            time.sleep(min(0.5, until - time.monotonic()))
+    return 0
+
+
+def main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="US practice-only fenced reservation cleanup")
+    parser.add_argument("--trade-date", required=True)
+    parser.add_argument("--session-run-id", required=True)
+    parser.add_argument("--env", default="practice")
+    parser.add_argument("--interval-sec", type=float, default=15.0)
+    parser.add_argument("--max-cycles", type=int, default=0)
+    a = parser.parse_args()
+    if a.env != "practice":
+        parser.error("US reservation cleanup requires practice")
+    if os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") != "ENFORCE":
+        parser.error("US reservation cleanup is not armed")
+    return run_reservation_loop(
+        trade_date=a.trade_date, session_run_id=a.session_run_id,
+        env=a.env, interval_sec=a.interval_sec, max_cycles=a.max_cycles,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
