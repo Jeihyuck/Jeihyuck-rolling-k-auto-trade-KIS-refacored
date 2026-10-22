@@ -934,6 +934,24 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
                 summary_reason = guard.reason
                 completed = guard.completed
                 retryable = guard.retryable
+    # An accepted CLOSE order is not an economically settled SELL. Preserve
+    # the session's completed *execution* while reporting a separate ledger
+    # reconciliation warning; never let this status authorize re-submission.
+    close_consistency_warnings = pb1_result.get("consistency_warnings") or []
+    if isinstance(close_consistency_warnings, dict):
+        close_consistency_warnings = list(close_consistency_warnings.values())
+    if session == "close" and any(
+        "FILLED_WITHOUT_LEDGER_FILL" in str(w) or "BROKER_FILL_OBSERVED_LEDGER_UNAPPLIED" in str(w)
+        for w in close_consistency_warnings
+    ):
+        if status in {"OK", "SUCCESS"}:
+            status = "WARN"
+            summary_reason = "CLOSE_RECONCILIATION_PENDING"
+        logger.error(
+            "[KR_CLOSE][RECONCILIATION_PENDING] warnings=%s "
+            "action=PRESERVE_BROKER_EVIDENCE_NO_AUTOMATIC_RESUBMIT",
+            close_consistency_warnings,
+        )
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
     orders_intent = int(pb1_result.get("order_intents_created", pb1_result.get("order_candidates", 0)) or 0)
     orders_submitted = int(pb1_result.get("broker_submitted", pb1_result.get("api_submitted", 0)) or 0)
