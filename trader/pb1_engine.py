@@ -6127,11 +6127,29 @@ class PB1Engine:
             self.env,
             self._masked_account(),
         )
-        db_by_code = {str((row or {}).get("code") or "").zfill(6): dict(row or {}) for row in (positions or [])}
+        # Legacy account-sanity mode must not select an arbitrary lifecycle
+        # when a code has two OPEN rows or recycle a CLOSED one from history.
+        db_by_code: dict[str, dict] = {}
+        ambiguous: set[str] = set()
+        for original in positions or []:
+            candidate = dict(original or {})
+            if str(candidate.get("status") or "OPEN").upper() != "OPEN":
+                continue
+            code_key = str(candidate.get("code") or "").zfill(6)
+            if code_key in db_by_code and str(db_by_code[code_key].get("position_cycle_id")) != str(candidate.get("position_cycle_id")):
+                ambiguous.add(code_key)
+            else:
+                db_by_code[code_key] = candidate
         corrected_count = 0
         for row in holdings_rows or []:
             code = str(row.get("pdno") or row.get("code") or "").zfill(6)
             if not code:
+                continue
+            if code in ambiguous:
+                logger.error(
+                    "[POSITIONS][RECONCILE][BLOCK] code=%s reason=AMBIGUOUS_ACTIVE_CYCLE "
+                    "action=KEEP_BROKER_PROOF_NO_LEDGER_MUTATION", code,
+                )
                 continue
             kis_qty = int(float(row.get("hldg_qty") or row.get("qty") or 0) or 0)
             db_row = db_by_code.get(code) or {}
@@ -6162,6 +6180,8 @@ class PB1Engine:
                             "market": market,
                             "last_reconciled_at": now_kst(),
                         },
+                        position_cycle_id=str(db_row.get("position_cycle_id") or "") or None,
+                        portfolio_epoch_id=str(db_row.get("portfolio_epoch_id") or "") or None,
                     )
                 elif kis_qty > 0:
                     self.positions_repo.bootstrap_from_kis_holdings(
@@ -6173,7 +6193,7 @@ class PB1Engine:
                         account_id=get_account_key(env=self.env, kis=self.kis),
                     )
                 corrected_count += 1
-        refreshed = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        refreshed = self.positions_repo.list_active_positions_for_exit(self.env, self.STRATEGY_NAME)
         logger.info(
             "[POSITIONS][RECONCILE][OK] holdings=%s corrected=%s",
             len(holdings_rows or []),
