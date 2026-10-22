@@ -45,4 +45,15 @@ ALTER TABLE us_execution_account_reservations ENABLE ROW LEVEL SECURITY;
 -- via database-wide default privileges. RLS without policies protects rows,
 -- but the account coordinator must not be a public API surface at all.
 REVOKE ALL ON TABLE us_execution_authority_leases,
-  us_execution_account_reservations FROM PUBLIC, anon, authenticated;
+  us_execution_account_reservations FROM PUBLIC;
+-- Standard disposable PostgreSQL CI has no Supabase-specific roles.
+DO $stage123_roles$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN
+    EXECUTE 'REVOKE ALL ON TABLE us_execution_authority_leases, us_execution_account_reservations FROM anon';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN
+    EXECUTE 'REVOKE ALL ON TABLE us_execution_authority_leases, us_execution_account_reservations FROM authenticated';
+  END IF;
+END;
+$stage123_roles$;
