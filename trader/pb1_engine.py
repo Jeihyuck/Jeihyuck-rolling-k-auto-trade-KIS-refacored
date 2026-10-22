@@ -8205,7 +8205,35 @@ class PB1Engine:
             early_stop = PB1_EARLY_STOP_ENABLED
             early_n = int(os.getenv("PB1_EARLY_STOP_CANDIDATES", "12"))
             
-            for m in members_list:
+            # ENTRY signal/sizing/order logic is still serialized in the
+            # original candidate order. Only the next independent OHLCV read
+            # overlaps current-symbol feature computation, *after* protective
+            # SELL and KR_INFINITE owner handoff are already complete.
+            from trader.kr.exit_io_pipeline import ordered_exit_ohlcv
+            _entry_read_ahead = bool(trade_mode and os.getenv("KR_ENTRY_ORDERED_OHLCV_READAHEAD", "1") == "1")
+
+            def _read_candidate_bars(member: dict) -> tuple[pd.DataFrame, dict]:
+                _code = str(member.get("code") or "").zfill(6)
+                try:
+                    return self._fetch_daily(_code, days=need_days)
+                except Exception as _market_exc:
+                    logger.warning(
+                        "[KR_ENTRY][READAHEAD][DATA_FAILED] code=%s type=%s "
+                        "action=SKIP_ONLY_THIS_CANDIDATE",
+                        _code, type(_market_exc).__name__,
+                    )
+                    return pd.DataFrame(), {"source": "ohlcv_read_failed"}
+
+            _candidate_history = ordered_exit_ohlcv(
+                members_list,
+                needs_history=lambda row: not trade_mode or str(row.get("code") or "").zfill(6) in derived_map,
+                fetch=_read_candidate_bars,
+                empty=lambda: (pd.DataFrame(), {"source": "derived_contract_missing"}),
+                enabled=_entry_read_ahead,
+            )
+            logger.info("[KR_ENTRY][ORDERED_READAHEAD] enabled=%s candidate_count=%s workers=1",
+                        int(_entry_read_ahead), len(members_list))
+            for m, (df, meta) in _candidate_history:
                 # ✅ 조기 종료 체크 (충분한 후보 확보 시) - PB1_EARLY_STOP_ENABLED=0이면 절대 실행 안 됨
                 if early_stop and len(candidates) >= max(early_n, int(PB1_MIN_CANDIDATES or 1)):
                     reason = "EARLY_STOP_CANDIDATES_SUFFICIENT"
@@ -8230,7 +8258,6 @@ class PB1Engine:
                     if trade_mode and not derived_row:
                         continue
 
-                    df, meta = self._fetch_daily(code, days=need_days)
                     if df is None or df.empty or len(df) < required_candles:
                         if df is None or df.empty:
                             skip_reason = "data_empty"
