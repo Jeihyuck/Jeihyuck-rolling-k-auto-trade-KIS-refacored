@@ -8,6 +8,7 @@ execution evidence, including partial SELL.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -17,6 +18,8 @@ from typing import Any
 
 # Grounded in 2026-10-22 read-only Supabase original order records. They are
 # expected order identities, NOT proof of quantities or execution amounts.
+EXPECTED_ACCOUNT_DIGEST_PREFIX = "fef5d08b17e8"  # SHA256 prefix of durable portfolio_epochs.account_id
+
 TARGETS: dict[date, dict[tuple[str, str, str], int]] = {
     date(2026, 10, 21): {
         ("251970", "BUY", "0000013196"): 17,
@@ -86,6 +89,11 @@ def classify_original_kis_rows(
         observations = scoped.get((code, side, odno), [])
         valid = []
         for row in observations:
+            # Confirm order size too; matching a recycled ODNO from another
+            # account or a modified order must never qualify by execution qty.
+            requested_original = _decimal(_v(row, "ord_qty", "ord_qty_sum"))
+            if requested_original is None or requested_original != requested_qty:
+                continue
             quantity = _decimal(_v(row, "tot_ccld_qty"))
             amount = _decimal(_v(row, "tot_ccld_amt"))
             avg = _decimal(_v(row, "avg_prvs"))
@@ -138,8 +146,14 @@ def run_practice_readonly() -> list[dict[str, Any]]:
         if not os.getenv(required):
             raise RuntimeError("PR249_PRACTICE_READONLY_CREDENTIAL_UNAVAILABLE")
     from trader.kis_wrapper import KisAPI
+    from trader.account_state import get_account_key
     from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
     kis = KisAPI(kis_env="practice")
+    scope_digest = hashlib.sha256(
+        get_account_key(env="practice", kis=kis).encode("utf-8")
+    ).hexdigest()
+    if not scope_digest.startswith(EXPECTED_ACCOUNT_DIGEST_PREFIX):
+        raise RuntimeError("PR249_ORIGINAL_KIS_ACCOUNT_SCOPE_MISMATCH")
     # Read-only all-page historical inquiries. Absolutely no order or cancel.
     return [
         classify_original_kis_rows(
