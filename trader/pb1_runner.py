@@ -8019,7 +8019,21 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
     workflow_attempt = _parse_optional_int_env("GITHUB_RUN_ATTEMPT")
     event_name = str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() or "schedule"
-    git_sha = os.getenv("GITHUB_SHA")
+    # Ground measured PR249 latency in the code actually loaded by WSL.
+    # GitHub-specific GITHUB_SHA may be absent in the Windows Task/WSL path
+    # or may identify a stale parent environment after an auto-sync.
+    from trader.db.repos import _pb1_checkout_sha
+    _kr_latency_checkout_sha = _pb1_checkout_sha()
+    _declared_git_sha = str(os.getenv("GITHUB_SHA") or "").strip()
+    if _declared_git_sha and _kr_latency_checkout_sha and _declared_git_sha != _kr_latency_checkout_sha:
+        logger.warning(
+            "[KR_LATENCY][SHA_MISMATCH] declared_sha=%s running_checkout_sha=%s "
+            "action=USE_PINNED_CHECKOUT_FOR_TICK_EVIDENCE",
+            _declared_git_sha, _kr_latency_checkout_sha,
+        )
+    if not _kr_latency_checkout_sha:
+        logger.error("[KR_LATENCY][SHA_UNVERIFIED] reason=NO_PINNED_CHECKOUT_SHA proof=BLOCK")
+    git_sha = _kr_latency_checkout_sha or None
     exec_mode = resolve_mode(os.getenv("STRATEGY_MODE", "DIAG"))
     ctx = RunContext.new(
         account_env=env,
@@ -8306,7 +8320,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         "result_status=%s sha=%s run_id=%s tick_run_id=%s",
                         session_kind, tick_index, elapsed_tick_sec,
                         _tick_result_status_for_latency,
-                        str(os.getenv("GITHUB_SHA") or "UNVERSIONED"),
+                        str(_kr_latency_checkout_sha or "UNVERSIONED"),
                         str(os.getenv("TRADER_RUN_ID") or "NO_RUN_ID"),
                         str(getattr(ctx, "run_id", None) or "UNRESOLVED_TICK_RUN_ID"),
                     )
