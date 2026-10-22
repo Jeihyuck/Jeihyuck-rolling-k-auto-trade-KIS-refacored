@@ -1521,8 +1521,9 @@ def _verified_kr_cumulative_buy_evidence(
 
 def _kr_source_has_individual_sell_fills(
     *, fills_repo: FillsRepo, source_order: dict[str, Any], env: str,
+    side: str = "SELL",
 ) -> bool:
-    """Never duplicate previously stored per-execution fills with an aggregate."""
+    """Never duplicate individual executions with a cumulative BUY or SELL snapshot."""
     order_id = str(source_order.get("order_id") or "").strip()
     if not order_id:
         return True  # fail closed
@@ -1533,7 +1534,7 @@ def _kr_source_has_individual_sell_fills(
         ).where(sa.and_(
             schema.fills.c.env == env,
             schema.fills.c.order_id == uuid_value_for_url(str(fills_repo.engine.url), order_id),
-            schema.fills.c.side == "SELL",
+            schema.fills.c.side == side,
         ))).all()
     for item in rows:
         meta = _json_dict(item[0])
@@ -1708,6 +1709,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             broker_row, source_order=source_order, side=side,
             trade_date=order_time.date(), kis_odno=kis_odno, env=env,
         )
+        if cumulative_buy_evidence is not None and isinstance(
+            getattr(fills_repo, "engine", None), sa.engine.Engine
+        ):
+            if _kr_source_has_individual_sell_fills(
+                fills_repo=fills_repo, source_order=source_order,
+                env=env, side="BUY",
+            ):
+                logger.warning(
+                    "[RECONCILE][KIS_BUY_CUMULATIVE][INDIVIDUAL_FILLS_EXIST] "
+                    "code=%s action=KEEP_INDIVIDUAL_FILLS_NO_AGGREGATE", code,
+                )
+                cumulative_buy_evidence = None
         if strict_sell_targets is not None and cumulative_sell_evidence is None:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
         if cumulative_sell_evidence is not None:
