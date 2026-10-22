@@ -147,3 +147,38 @@ def test_engine_source_has_post_sell_buy_fence_and_owner_handoff():
     assert runner_source.index("prove_safe_protective_sell_handoff(") < runner_source.index("reconcile_kis(")
     assert "deferred_full_reconcile" in runner_source
     assert "and getattr(engine_runner, \"_kr_post_exit_reconcile_ok\", True)" in runner_source
+
+
+def test_existing_durable_order_uses_portfolio_epoch_account_not_nonexistent_order_account_id(proof_fixture):
+    """Actual current schema: account identity lives in portfolio_epochs."""
+    from uuid import uuid4
+    import sqlalchemy as sa
+
+    prove, _, _, _, kis, engine = proof_fixture
+    schema = schema_for_engine(engine)
+    epoch_id = str(uuid4())
+    with engine.begin() as conn:
+        conn.execute(schema.portfolio_epochs.insert().values(
+            portfolio_epoch_id=epoch_id, env="practice",
+            account_id="scoped-test-account", sid=1, mode=1,
+            strategy="pb1_pullback_close", status="ACTIVE",
+        ))
+        conn.execute(schema.orders.insert().values(
+            order_id=str(uuid4()), portfolio_epoch_id=epoch_id,
+            env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+            code="053800", market="J", side="BUY", ord_type="LIMIT", qty=1,
+            client_order_key="pr249-proof-existing-kis-order", status="REJECTED",
+            kis_odno="0000001234", response_json={"confirmed_fill_qty": 0},
+            created_at=NOW,
+        ))
+    kis.rows = [{
+        "pdno": "053800", "side": "BUY", "ord_dt": "20261022",
+        "ord_tmd": "093700", "odno": "0000001234", "ord_qty": "1",
+        "tot_ccld_qty": "0", "tot_ccld_amt": "0",
+    }]
+    assert prove() == (True, "EXACT_BROKER_LEDGER_PRETRADE_PROOF")
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.portfolio_epochs)
+                     .where(schema.portfolio_epochs.c.portfolio_epoch_id == epoch_id)
+                     .values(account_id="different-account"))
+    assert prove() == (False, "DURABLE_ORDER_ACCOUNT_IDENTITY_MISSING")
