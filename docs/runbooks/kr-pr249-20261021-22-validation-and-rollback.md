@@ -44,3 +44,58 @@ These source observations are **not** automatically fixed in Supabase by merging
 - If post-merge position binding cannot be proved, disable new affected-code submissions via the existing durable unresolved-order/owner gates; do **not** change policy or bypass protection for unrelated positions.
 - Restore prior code SHA only after reviewing live KIS order state and preserving execution evidence; rollback code must not erase economic activity already committed.
 - Monitor `CYCLE_BINDING_CONFLICT`, `KR_BUY_REPLAY_CLOSED_OR_FOREIGN_CYCLE`, `BROKER_FILL_OBSERVED_LEDGER_UNAPPLIED`, tick timeouts and CLOSE run lineage. 
+
+
+## 2026-10-22 independent blocker-closure commands (no orders, no DB writes)
+
+The two new files `scripts/kr/pr249_db_snapshot_readonly.sql` and
+`scripts/kr/pr249_source_backed_repair_plan.py` produce an exact 10-order
+reconciliation **review plan**, not an executable mutation.
+
+Run on the **authorized KIS PRACTICE** environment, after confirming the
+account and that all environment variables are already provisioned (never paste
+or print tokens, account numbers or database URLs into CI logs):
+
+```bash
+# Genuine KIS GET-only evidence for original October 21 and 22 orders.
+python -m scripts.kr.pr249_original_kis_readonly > /tmp/pr249-original-kis.json
+
+# Use a pre-configured READ-ONLY psql connection (PGHOST/PGUSER/PGDATABASE)
+# to the correct portfolio DB. The SQL is SELECT-only, explicitly scoped to
+# 10 orders, one portfolio epoch. Do NOT use an admin or superuser role.
+psql -XAt -f scripts/kr/pr249_db_snapshot_readonly.sql > /tmp/pr249-db.json
+
+# Computes dry-run quantity/notional and wrong-cycle exceptions.
+python -m scripts.kr.pr249_source_backed_repair_plan \
+  --kis /tmp/pr249-original-kis.json \
+  --db /tmp/pr249-db.json \
+  --out /tmp/pr249-repair-review.json
+```
+
+If any original KIS page, order, amount, account scope, or DB epoch conflicts,
+**STOP**. The comparison utility only checks evidence against the expected
+account-scoped snapshot format. A JSON field claiming KIS source provenance
+is **not a cryptographic proof**. Retain full evidence and independently
+check original account identity, authorization and source log chain before
+any production historical adjustment.
+
+For the actual latency gate, collect complete baseline and unchanged-workload
+candidate KR tick logs; include failures and missing broker ACK. Use
+`scripts/kr/pr249_latency_log_export.py` for each actual log set and then:
+
+```bash
+python -m scripts.kr.pr249_latency_acceptance /tmp/pr249-measured-merged.jsonl \
+  --expected-after-sha "$(git rev-parse HEAD)"
+```
+
+The PR head must match every candidate `after` tick, and there must be at least
+20 measured comparable ticks and 10 broker-ACKed protective SELL measurements
+per revision, p95 SELL submit <=60 seconds and complete tick <=180 seconds.
+No mock/CI-only benchmark can fulfill this gate. Running this against a
+working tree without authorized KIS practice and measured logs cannot
+establish MERGE READY.
+
+**Current operational evidence:** DB orders are still inconsistent for
+251970 BUY/Sell, 086450 BUY, 253590 SELL, 053800 cycle, and 144960 money;
+an authenticated original KIS GET was not executed from this repository PR.
+No historical fills/orders/positions/claims were updated.
