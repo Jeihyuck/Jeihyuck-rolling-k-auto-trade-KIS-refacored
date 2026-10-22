@@ -8033,6 +8033,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         )
     if not _kr_latency_checkout_sha:
         logger.error("[KR_LATENCY][SHA_UNVERIFIED] reason=NO_PINNED_CHECKOUT_SHA proof=BLOCK")
+    else:
+        # run_once creates the DB run row in this same process. Its revision
+        # must describe the same pinned checkout as the monotonic tick trace.
+        os.environ["GITHUB_SHA"] = _kr_latency_checkout_sha
     git_sha = _kr_latency_checkout_sha or None
     exec_mode = resolve_mode(os.getenv("STRATEGY_MODE", "DIAG"))
     ctx = RunContext.new(
