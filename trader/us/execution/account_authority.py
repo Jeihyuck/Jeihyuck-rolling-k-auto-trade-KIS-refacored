@@ -141,13 +141,17 @@ class AccountExecutionAuthority:
         with self.engine.begin() as conn:
             self._guard(conn, lease)  # row lock serializes every strategy
             old = conn.execute(text("""
-                SELECT strategy_owner,symbol,side,requested_qty,
+                SELECT env,account_fingerprint,trading_epoch_id,
+                       strategy_owner,symbol,side,requested_qty,
                        reserved_cash_usd,reserved_shares,state
                 FROM us_execution_account_reservations
                 WHERE action_key=:key FOR UPDATE
             """), {"key": action_key}).mappings().first()
             if old is not None:
-                if (str(old["strategy_owner"]) != strategy_owner
+                if (str(old["env"]) != self.scope["env"]
+                        or str(old["account_fingerprint"]) != self.scope["account"]
+                        or str(old["trading_epoch_id"]) != self.scope["epoch"]
+                        or str(old["strategy_owner"]) != strategy_owner
                         or str(old["symbol"]) != symbol.upper()
                         or str(old["side"]) != side
                         or int(old["requested_qty"]) != qty
