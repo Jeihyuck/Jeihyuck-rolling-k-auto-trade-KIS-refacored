@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
+import pytest
 from sqlalchemy.exc import IntegrityError
 
 from trader.db.repos import FillsRepo, OrdersRepo, PortfolioEpochsRepo, PositionsRepo, _ensure_active_epoch
@@ -38,6 +39,33 @@ def test_full_sell_then_rebuy_creates_new_clean_cycle():
         old = conn.execute(sa.select(schema_for_engine(engine).positions).where(
             schema_for_engine(engine).positions.c.position_cycle_id == first["position_cycle_id"])).mappings().one()
     assert old["status"] == "CLOSED" and old["closed_reason"] == "FULL_SELL"
+
+
+
+def test_oct21_historical_buy_retry_cannot_reinsert_closed_exact_cycle():
+    engine, repo = _repo()
+    _fill(repo, "BUY", 100.0)
+    closed_cycle = repo.get_position(
+        env="practice", strategy="pb1", sid=1, mode=1, code="000001",
+    )
+    _fill(repo, "SELL", 105.0)
+    with pytest.raises(RuntimeError, match="KR_BUY_REPLAY_CLOSED_OR_FOREIGN_CYCLE"):
+        repo.apply_fill(
+            env="practice", strategy="pb1", sid=1, mode=1,
+            code="000001", market="KOSPI", side="BUY", qty=1,
+            price=100.0, fee=0, tax=0,
+            filled_at=datetime.now(timezone.utc),
+            position_cycle_id=closed_cycle["position_cycle_id"],
+            portfolio_epoch_id=closed_cycle["portfolio_epoch_id"],
+        )
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        rows = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == closed_cycle["position_cycle_id"]
+        )).mappings().all()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "CLOSED"
+    assert rows[0]["qty"] == 0
 
 
 def test_add_buy_preserves_frozen_contract_and_tp_state_until_reentry():
