@@ -110,8 +110,8 @@ class AccountExecutionAuthority:
 
     def reserve(self, *, lease: Lease, action_key: str, strategy_owner: str,
                 symbol: str, side: str, qty: int, price_usd: Any,
-                broker_cash_usd: Any = None, broker_available_shares: int | None = None
-                ) -> dict:
+                broker_cash_usd: Any = None, broker_available_shares: int | None = None,
+                _conn: Any = None) -> dict:
         """Account-global held exposure, not independent per-strategy budgets.
 
         Caller must pass freshly queried account-wide broker quantities.
@@ -138,57 +138,84 @@ class AccountExecutionAuthority:
                 raise ReservationConflict("broker_position_evidence_invalid")
             cash = Decimal("0")
             shares = qty
-        with self.engine.begin() as conn:
-            self._guard(conn, lease)  # row lock serializes every strategy
-            old = conn.execute(text("""
-                SELECT env,account_fingerprint,trading_epoch_id,
-                       strategy_owner,symbol,side,requested_qty,
-                       reserved_cash_usd,reserved_shares,state
-                FROM us_execution_account_reservations
-                WHERE action_key=:key FOR UPDATE
-            """), {"key": action_key}).mappings().first()
-            if old is not None:
-                if (str(old["env"]) != self.scope["env"]
-                        or str(old["account_fingerprint"]) != self.scope["account"]
-                        or str(old["trading_epoch_id"]) != self.scope["epoch"]
-                        or str(old["strategy_owner"]) != strategy_owner
-                        or str(old["symbol"]) != symbol.upper()
-                        or str(old["side"]) != side
-                        or int(old["requested_qty"]) != qty
-                        or Decimal(str(old["reserved_cash_usd"])) != cash
-                        or int(old["reserved_shares"]) != shares):
-                    raise ReservationConflict("reservation_idempotency_collision")
-                if old["state"] not in {"RESERVED", "UNCERTAIN"}:
-                    raise ReservationConflict("terminal_action_key_cannot_be_reused")
-                return {"action_key": action_key, "state": old["state"],
-                        "idempotent": True, "fencing_token": lease.fencing_token}
-            held = conn.execute(text("""
-                SELECT COALESCE(SUM(reserved_cash_usd),0) AS cash,
-                       COALESCE(SUM(reserved_shares),0) AS shares
-                FROM us_execution_account_reservations
-                WHERE env=:env AND account_fingerprint=:account
-                  AND trading_epoch_id=:epoch
-                  AND state IN ('RESERVED','UNCERTAIN')
-                  AND side=:side
-                  AND (:side='BUY' OR symbol=:symbol)
-            """), {**self.scope, "side": side,
-                   "symbol": symbol.upper()}).mappings().one()
-            needed = cash + Decimal(str(held["cash"])) if side == "BUY" else shares + int(held["shares"])
-            if needed > total_capacity:
-                raise ReservationConflict("account_capacity_reserved")
-            conn.execute(text("""
-                INSERT INTO us_execution_account_reservations
-                  (action_key,env,account_fingerprint,trading_epoch_id,
-                   strategy_owner,symbol,side,requested_qty,reserved_cash_usd,
-                   reserved_shares,state,holder_id,fencing_token)
-                VALUES (:key,:env,:account,:epoch,:owner,:symbol,:side,
-                        :qty,:cash,:shares,'RESERVED',:holder,:token)
-            """), {**self.scope, "key": action_key, "owner": strategy_owner,
-                   "symbol": symbol.upper(), "side": side, "qty": qty,
-                   "cash": cash, "shares": shares, "holder": lease.holder_id,
-                   "token": lease.fencing_token})
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.reserve(
+                    lease=lease, action_key=action_key,
+                    strategy_owner=strategy_owner, symbol=symbol, side=side,
+                    qty=qty, price_usd=price_usd,
+                    broker_cash_usd=broker_cash_usd,
+                    broker_available_shares=broker_available_shares,
+                    _conn=conn,
+                )
+        conn = _conn
+        self._guard(conn, lease)  # row lock serializes every strategy
+        old = conn.execute(text("""
+            SELECT env,account_fingerprint,trading_epoch_id,
+                   strategy_owner,symbol,side,requested_qty,
+                   reserved_cash_usd,reserved_shares,state
+            FROM us_execution_account_reservations
+            WHERE action_key=:key FOR UPDATE
+        """), {"key": action_key}).mappings().first()
+        if old is not None:
+            if (str(old["env"]) != self.scope["env"]
+                    or str(old["account_fingerprint"]) != self.scope["account"]
+                    or str(old["trading_epoch_id"]) != self.scope["epoch"]
+                    or str(old["strategy_owner"]) != strategy_owner
+                    or str(old["symbol"]) != symbol.upper()
+                    or str(old["side"]) != side
+                    or int(old["requested_qty"]) != qty
+                    or Decimal(str(old["reserved_cash_usd"])) != cash
+                    or int(old["reserved_shares"]) != shares):
+                raise ReservationConflict("reservation_idempotency_collision")
+            if old["state"] not in {"RESERVED", "UNCERTAIN"}:
+                raise ReservationConflict("terminal_action_key_cannot_be_reused")
+            return {"action_key": action_key, "state": old["state"],
+                    "idempotent": True, "fencing_token": lease.fencing_token}
+        held = conn.execute(text("""
+            SELECT COALESCE(SUM(reserved_cash_usd),0) AS cash,
+                   COALESCE(SUM(reserved_shares),0) AS shares
+            FROM us_execution_account_reservations
+            WHERE env=:env AND account_fingerprint=:account
+              AND trading_epoch_id=:epoch
+              AND state IN ('RESERVED','UNCERTAIN')
+              AND side=:side
+              AND (:side='BUY' OR symbol=:symbol)
+        """), {**self.scope, "side": side,
+               "symbol": symbol.upper()}).mappings().one()
+        needed = cash + Decimal(str(held["cash"])) if side == "BUY" else shares + int(held["shares"])
+        if needed > total_capacity:
+            raise ReservationConflict("account_capacity_reserved")
+        conn.execute(text("""
+            INSERT INTO us_execution_account_reservations
+              (action_key,env,account_fingerprint,trading_epoch_id,
+               strategy_owner,symbol,side,requested_qty,reserved_cash_usd,
+               reserved_shares,state,holder_id,fencing_token)
+            VALUES (:key,:env,:account,:epoch,:owner,:symbol,:side,
+                    :qty,:cash,:shares,'RESERVED',:holder,:token)
+        """), {**self.scope, "key": action_key, "owner": strategy_owner,
+               "symbol": symbol.upper(), "side": side, "qty": qty,
+               "cash": cash, "shares": shares, "holder": lease.holder_id,
+               "token": lease.fencing_token})
         return {"action_key": action_key, "state": "RESERVED",
                 "idempotent": False, "fencing_token": lease.fencing_token}
+
+    def release_lease(self, *, lease: Lease) -> None:
+        """Release only the current holder's write lease, never its holds.
+
+        Broker-open and UNCERTAIN reservations survive process restarts and
+        subsequent fencing-token generations until KIS terminal reconciliation.
+        """
+        with self.engine.begin() as conn:
+            self._guard(conn, lease)
+            conn.execute(text("""
+                UPDATE us_execution_authority_leases
+                SET expires_at=clock_timestamp(),updated_at=clock_timestamp()
+                WHERE env=:env AND account_fingerprint=:account
+                  AND trading_epoch_id=:epoch AND holder_id=:holder
+                  AND fencing_token=:token
+            """), {**self.scope, "holder": lease.holder_id,
+                   "token": lease.fencing_token})
 
     def terminalize(self, *, lease: Lease, action_key: str,
                     terminal_evidence: str, filled: bool = False) -> bool:
