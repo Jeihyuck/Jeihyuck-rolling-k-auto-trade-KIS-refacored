@@ -203,6 +203,18 @@ def assert_fresh_reservation_worker(
     expected = hashlib.sha256((
         env + "|" + account_fingerprint + "|" + trading_epoch_id
     ).encode("utf-8")).hexdigest()
+    # A file from a recently-crashed child is NOT a healthy writer. The
+    # Session records the exact child PID before spawning any trading Tick.
+    try:
+        expected_pid = int(os.environ["US_RESERVATION_WORKER_PID"])
+        observed_pid = int(payload.get("worker_pid") or 0)
+        if expected_pid <= 0 or expected_pid != observed_pid:
+            raise ValueError("worker PID missing or stale")
+        os.kill(expected_pid, 0)
+    except (KeyError, ValueError, OSError) as exc:
+        raise AuthorityUnavailable(
+            "US_RESERVATION_WORKER_PID_NOT_RUNNING"
+        ) from exc
     if (
         payload.get("mode") != "RESERVATION_ONLY"
         or payload.get("write_authority") != "FENCED_ACCOUNT_RESERVATIONS_ONLY"
@@ -248,6 +260,7 @@ def run_reservation_loop(
             "trade_date": trade_date,
             "session_run_id": session_run_id,
             "sampled_at_utc": datetime.now(timezone.utc).isoformat(),
+            "worker_pid": os.getpid(),
         })
         save_diagnostic_atomic(path, payload)
         cycles += 1
