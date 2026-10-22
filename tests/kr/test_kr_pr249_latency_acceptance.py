@@ -63,3 +63,19 @@ def test_missing_result_status_never_counts_as_performance_pass():
     rows[-1].pop("result_status")
     with pytest.raises(ValueError, match="PR249_LATENCY_FAILED_TICK_NOT_ACCEPTABLE"):
         evaluate_latency(rows)
+
+
+
+def test_exact_pr_head_sha_must_match_measured_after_records():
+    rows = _records(165, 48)
+    for row in rows:
+        if row["revision"] == "after":
+            row["git_sha"] = "a" * 40
+    assert evaluate_latency(rows, expected_after_sha="a" * 40)["result"] == "PASS"
+    with pytest.raises(ValueError, match="PR249_LATENCY_AFTER_SHA_NOT_PR_HEAD"):
+        evaluate_latency(rows, expected_after_sha="b" * 40)
+
+
+def test_short_or_unverified_pr_head_is_not_an_acceptable_release_argument():
+    with pytest.raises(ValueError, match="PR249_LATENCY_INVALID_EXPECTED_PR_HEAD"):
+        evaluate_latency(_records(165, 48), expected_after_sha="abc123")
