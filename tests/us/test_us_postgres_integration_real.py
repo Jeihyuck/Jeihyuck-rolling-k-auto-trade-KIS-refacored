@@ -2276,3 +2276,80 @@ def test_account_reservation_only_terminalizes_after_exact_tqqq_broker_proof(
     assert replay["state"] == "RELEASED"
     assert replay["idempotent"]
     owner.release_lease(lease=next_lease)
+
+
+def test_fenced_reservation_worker_releases_only_proven_pre_http_aborts(
+    pg_engine, monkeypatch,
+):
+    """No stuck cash holds after an exact durable ABANDONED_PRE_SUBMIT."""
+    import hashlib
+    from pathlib import Path
+    from datetime import date
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.execution.account_authority import (
+        AccountExecutionAuthority, ReservationConflict,
+    )
+    from trader.us.execution.reservation_reconcile_worker import (
+        reconcile_proven_reservations_once,
+    )
+    from trader.us.db import repos
+
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    account = hashlib.sha256(b"pre-http-abort-isolation").hexdigest()
+    auth = AccountExecutionAuthority(
+        pg_engine, env="practice", account_fingerprint=account,
+        trading_epoch_id="pre-http-epoch",
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id="pre-http-epoch",
+        strategy_owner="US_STANDARD", lifecycle_id="pre-http-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    attempt = "pre-http-cancel-before-boundary"
+    cok = "US_STANDARD:pre-http-cycle:2026-10-20:BUY"
+    lease = auth.acquire_lease(holder_id="original-router")
+    with pg_engine.begin() as conn:
+        assert ledger.acquire(
+            identity, attempt_id=attempt, requested_qty=2,
+            client_order_key=cok, _conn=conn,
+        ).acquired
+        auth.reserve(
+            lease=lease, action_key=attempt, strategy_owner="US_STANDARD",
+            symbol="AMD", side="BUY", qty=2, price_usd="100",
+            broker_cash_usd="400", _conn=conn,
+        )
+    with pytest.raises(ReservationConflict, match="not_authoritatively_proven"):
+        auth.release_proven_pre_submit_abort(
+            lease=lease, attempt_id=attempt, client_order_key=cok,
+        )
+    ledger.release_before_submit(identity, attempt_id=attempt)
+    auth.release_lease(lease=lease)
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE")
+    monkeypatch.setattr(
+        repos, "_us_execution_claim_scope",
+        lambda: {
+            "env": "practice", "account_id": account,
+            "market": "US", "trading_epoch_id": "pre-http-epoch",
+        },
+    )
+    sweep = reconcile_proven_reservations_once(
+        env="practice", trade_date="2026-10-20",
+    )
+    assert sweep["released"] == 1 and sweep["unresolved"] == 0, sweep
+    with pg_engine.connect() as conn:
+        from sqlalchemy import text
+        state = conn.execute(text("""
+            SELECT state,terminal_evidence
+            FROM us_execution_account_reservations WHERE action_key=:id
+        """), {"id": attempt}).mappings().one()
+    assert state["state"] == "RELEASED"
+    assert state["terminal_evidence"] == "DURABLE_ABANDONED_PRE_SUBMIT"
