@@ -1,5 +1,6 @@
 """No-write shadow observer and session Worker-mode safety contract."""
 import json
+import os
 
 import pytest
 
