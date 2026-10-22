@@ -14573,7 +14573,7 @@ class PB1Engine:
         exit_ohlcv_iter = ordered_exit_ohlcv(
             pos_list,
             needs_history=lambda row: int(row.get("holding_days") or 0) > 0,
-            fetch=lambda row: self._fetch_exit_ohlcv(row["code"]),
+            fetch=lambda pos: self._fetch_exit_ohlcv(pos["code"]),
             empty=lambda: (pd.DataFrame(), {"source": "same_day_holdings_skip"}),
             enabled=read_ahead_enabled,
         )
