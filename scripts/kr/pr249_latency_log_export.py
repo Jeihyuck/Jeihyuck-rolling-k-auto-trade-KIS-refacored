@@ -42,7 +42,7 @@ def export_measured_ticks(lines: Iterable[str], *, revision: str, workload_id: s
             attrs = _fields(line)
             if attrs.get("ack_observed") == "1":
                 returned.add((attrs.get("run_id") or "", attrs.get("order_id") or ""))
-    if starts == 0 or not ends:
+    if starts == 0:
         raise ValueError("PR249_LATENCY_LOG_HAS_NO_MEASURED_TICKS")
     if len(ends) != starts:
         raise ValueError(f"PR249_LATENCY_MISSING_TICK_END:{starts}:{len(ends)}")
