@@ -34,6 +34,16 @@ def evaluate_latency(records: list[dict], *, min_ticks: int = 20, min_sells: int
             raise ValueError("PR249_LATENCY_INVALID_REVISION")
         if row.get("kind") != "measured" or not str(row.get("git_sha") or "").strip():
             raise ValueError("PR249_LATENCY_UNPROVEN_SAMPLE")
+        if rev == "after":
+            # A fast crash is not a successful fast trade tick. Protect the
+            # acceptance gate from a speed-up achieved by skipping work.
+            status = str(row.get("result_status") or "").upper()
+            if not status or status in {
+                "TIMEOUT_OR_FAILURE", "RECOVERABLE_DB_TIMEOUT",
+                "FATAL_RUNTIME", "FATAL_POSTPROCESS", "UNKNOWN",
+                "PARTIAL_SUCCESS_POSTPROCESS_FAILED", "DEGRADED_BUDGET",
+            } or status.startswith(("FATAL", "ERROR", "SKIP_KIS")):
+                raise ValueError("PR249_LATENCY_FAILED_TICK_NOT_ACCEPTABLE")
         wid = str(row.get("workload_id") or "").strip()
         tick = str(row.get("tick_id") or "").strip()
         if not wid or not tick:
