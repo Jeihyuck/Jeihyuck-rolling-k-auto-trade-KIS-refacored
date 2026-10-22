@@ -8209,7 +8209,7 @@ class PB1Engine:
             # original candidate order. Only the next independent OHLCV read
             # overlaps current-symbol feature computation, *after* protective
             # SELL and KR_INFINITE owner handoff are already complete.
-            from trader.kr.exit_io_pipeline import ordered_exit_ohlcv
+            from trader.kr.exit_io_pipeline import ordered_exit_ohlcv, ordered_bounded_entry_reads
             _entry_read_ahead = bool(trade_mode and os.getenv("KR_ENTRY_ORDERED_OHLCV_READAHEAD", "1") == "1")
 
             def _read_candidate_bars(member: dict) -> tuple[pd.DataFrame, dict]:
@@ -8224,15 +8224,25 @@ class PB1Engine:
                     )
                     return pd.DataFrame(), {"source": "ohlcv_read_failed"}
 
-            _candidate_history = ordered_exit_ohlcv(
-                members_list,
-                needs_history=lambda row: not trade_mode or str(row.get("code") or "").zfill(6) in derived_map,
-                fetch=_read_candidate_bars,
-                empty=lambda: (pd.DataFrame(), {"source": "derived_contract_missing"}),
-                enabled=_entry_read_ahead,
-            )
-            logger.info("[KR_ENTRY][ORDERED_READAHEAD] enabled=%s candidate_count=%s workers=1",
-                        int(_entry_read_ahead), len(members_list))
+            _entry_read_workers = max(1, min(4, int(os.getenv("KR_ENTRY_OHLCV_READ_WORKERS", "3") or "3")))
+            if _entry_read_ahead:
+                _candidate_history = ordered_bounded_entry_reads(
+                    members_list,
+                    needs_history=lambda row: str(row.get("code") or "").zfill(6) in derived_map,
+                    fetch=_read_candidate_bars,
+                    empty=lambda: (pd.DataFrame(), {"source": "derived_contract_missing"}),
+                    max_workers=_entry_read_workers,
+                )
+            else:
+                _candidate_history = ordered_exit_ohlcv(
+                    members_list,
+                    needs_history=lambda row: not trade_mode or str(row.get("code") or "").zfill(6) in derived_map,
+                    fetch=_read_candidate_bars,
+                    empty=lambda: (pd.DataFrame(), {"source": "derived_contract_missing"}),
+                    enabled=False,
+                )
+            logger.info("[KR_ENTRY][ORDERED_READAHEAD] enabled=%s candidate_count=%s workers=%s policy_order=SERIAL",
+                        int(_entry_read_ahead), len(members_list), _entry_read_workers if _entry_read_ahead else 1)
             for m, (df, meta) in _candidate_history:
                 # ✅ 조기 종료 체크 (충분한 후보 확보 시) - PB1_EARLY_STOP_ENABLED=0이면 절대 실행 안 됨
                 if early_stop and len(candidates) >= max(early_n, int(PB1_MIN_CANDIDATES or 1)):
