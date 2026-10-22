@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -25,8 +26,10 @@ def _p95(values: list[float]) -> float:
     return values[math.ceil(0.95 * len(values)) - 1]
 
 
-def evaluate_latency(records: list[dict], *, min_ticks: int = 20, min_sells: int = 10) -> dict:
+def evaluate_latency(records: list[dict], *, min_ticks: int = 20, min_sells: int = 10, expected_after_sha: str | None = None) -> dict:
     """Fail closed on missing/mismatched workload, unmatched SHA and fake runs."""
+    if expected_after_sha is not None and not re.fullmatch(r"[0-9a-f]{40}", expected_after_sha):
+        raise ValueError("PR249_LATENCY_INVALID_EXPECTED_PR_HEAD")
     groups = defaultdict(list)
     for row in records:
         rev = str(row.get("revision") or "")
@@ -71,6 +74,8 @@ def evaluate_latency(records: list[dict], *, min_ticks: int = 20, min_sells: int
         after_sha = {str(x["git_sha"]) for x in after}
         if len(before_sha) != 1 or len(after_sha) != 1 or before_sha == after_sha:
             raise ValueError(f"PR249_LATENCY_SHA_NOT_COMPARABLE:{wid}")
+        if expected_after_sha is not None and after_sha != {expected_after_sha}:
+            raise ValueError(f"PR249_LATENCY_AFTER_SHA_NOT_PR_HEAD:{wid}")
         before_sell = [float(x["first_protective_sell_submit_sec"]) for x in before if x.get("first_protective_sell_submit_sec") is not None]
         after_sell = [float(x["first_protective_sell_submit_sec"]) for x in after if x.get("first_protective_sell_submit_sec") is not None]
         if len(before_sell) < min_sells or len(after_sell) < min_sells:
@@ -100,12 +105,15 @@ def evaluate_latency(records: list[dict], *, min_ticks: int = 20, min_sells: int
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("jsonl", type=Path)
+    p.add_argument("--expected-after-sha", required=True,
+                   help="Exact full 40-character PR HEAD SHA; after samples must match")
     p.add_argument("--min-ticks", type=int, default=20)
     p.add_argument("--min-sells", type=int, default=10)
     args = p.parse_args()
     try:
         rows = [json.loads(line) for line in args.jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
-        outcome = evaluate_latency(rows, min_ticks=args.min_ticks, min_sells=args.min_sells)
+        outcome = evaluate_latency(rows, min_ticks=args.min_ticks, min_sells=args.min_sells,
+                                   expected_after_sha=args.expected_after_sha)
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"result": "BLOCK", "reason": str(exc)}))
         return 2
