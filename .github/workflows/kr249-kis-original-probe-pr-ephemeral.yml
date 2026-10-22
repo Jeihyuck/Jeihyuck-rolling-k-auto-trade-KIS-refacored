@@ -1,0 +1,64 @@
+name: KR249 ORIGINAL KIS PRACTICE READONLY PROBE
+on:
+  push:
+    branches:
+      - fix/kr-20261021-22-integrated-p0-p1
+    paths:
+      - '.github/workflows/kr249-kis-original-probe-pr-ephemeral.yml'
+permissions:
+  contents: read
+concurrency:
+  group: kr249-original-practice-once
+  cancel-in-progress: false
+jobs:
+  original-kis-evidence:
+    if: github.repository == 'Jeihyuck/Jeihyuck-rolling-k-auto-trade-KIS-refacored'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      STRATEGY_MODE: LIVE
+      KIS_HTTP_ENABLED: '1'
+      KIS_CCLD_FAIL_OPEN: '0'
+      KIS_CCLD_RETRY_MAX: '2'
+      DRY_RUN: '1'
+      NO_TRADE: '1'
+      DISABLE_REAL_TRADING: '1'
+      LIVE_TRADING_ENABLED: '0'
+      ALLOW_REAL_ORDER: '0'
+      US_ORDER_ARMED: '0'
+      KIS_ORDER_ALLOWED: '0'
+      PB1_KIS_ORDER_ALLOWED: '0'
+      PYTHONPATH: '.'
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Confirm repo, branch and practice-only
+        run: |
+          test "$GITHUB_REF_NAME" = 'fix/kr-20261021-22-integrated-p0-p1'
+          test "$KIS_ENV" = 'practice'
+          test "$STRATEGY_ENV" = 'practice'
+          test -n "$KIS_APP_KEY" && test -n "$KIS_APP_SECRET"
+          test -n "$CANO" && test -n "$ACNT_PRDT_CD"
+      - name: Install broker GET-only dependencies
+        run: python -m pip install --quiet -r requirements.txt
+      - name: Assert probe has no order/cancel/database writes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s = Path("scripts/kr/pr249_original_kis_readonly.py").read_text()
+          for disallowed in ("sell_stock_", "buy_stock_", "place_order(", "order_cash(", "cancel_order(", "apply_fill(", "mark_submitted(", "UPDATE public.", "DELETE FROM", "INSERT INTO"):
+              assert disallowed not in s, disallowed
+          assert 'run_practice_readonly()' in s
+          assert '_daily_ccld_all_pages_for_date' in s
+          PY
+      - name: Execute historical 2026-10-21/22 KIS GET-only evidence
+        run: python -m scripts.kr.pr249_original_kis_readonly
