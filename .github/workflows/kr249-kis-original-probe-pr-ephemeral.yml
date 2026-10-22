@@ -62,3 +62,37 @@ jobs:
           PY
       - name: Execute historical 2026-10-21/22 KIS GET-only evidence
         run: python -m scripts.kr.pr249_original_kis_readonly
+
+      - name: Read original-account current positions (no prices or account values printed)
+        run: |
+          python - <<'PY'
+          import hashlib, json, logging
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from trader.kis_wrapper import KisAPI
+          from trader.account_state import get_account_key
+          from scripts.kr.pr249_original_kis_readonly import EXPECTED_ACCOUNT_DIGEST_PREFIX
+          logging.disable(logging.CRITICAL)
+          kis = KisAPI(kis_env="practice")
+          assert kis.env == "practice"
+          digest = hashlib.sha256(get_account_key(env="practice", kis=kis).encode()).hexdigest()
+          assert digest.startswith(EXPECTED_ACCOUNT_DIGEST_PREFIX), "ACCOUNT_SCOPE_MISMATCH"
+          result = kis.inquire_balance_all(max_pages=20)
+          assert isinstance(result,dict) and not result.get("_diag_stub") and not result.get("_stub")
+          assert isinstance(result.get("output1"),list) and result.get("output2") is not None
+          wanted=("053800","251970","253590","086450","144960")
+          holding={c:0 for c in wanted}
+          for raw in result["output1"]:
+              code=str(raw.get("pdno") or "").replace("A","").zfill(6)
+              if code in holding:
+                  qty=int(raw.get("hldg_qty") or 0)
+                  assert qty >= 0
+                  holding[code] += qty
+          print(json.dumps({
+              "source":"KIS_PRACTICE_AUTHENTICATED_HOLDINGS_GET",
+              "verified_at_kst":datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+              "account_digest_prefix":digest[:12],
+              "pages_complete":True,
+              "holding_qty_by_code":holding,
+          },ensure_ascii=False))
+          PY
