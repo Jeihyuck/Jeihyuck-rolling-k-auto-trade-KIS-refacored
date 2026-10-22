@@ -1006,177 +1006,220 @@ def prepare_exit_position_snapshots(
     on_snapshot_ready=None,
 ) -> list[dict]:
     from trader.us.symbols import normalize_us_exchange
-    snapshots: list[dict] = []
-    for original_pos in positions:
-        _snapshot_start_mono = time.monotonic()
-        _quote_elapsed_ms = 0.0
-        _state_elapsed_ms = 0.0
-        pos = dict(original_pos or {})
+    from concurrent.futures import ThreadPoolExecutor
 
-        def _observe_snapshot_outcome(outcome: str, reason: str = "") -> None:
-            # Pure observation. Failure must not affect the exit/risk path.
-            try:
-                logger.info(
-                    "[US_EXIT][SNAPSHOT_OUTCOME] symbol=%s owner=%s lifecycle=%s "
-                    "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f",
-                    symbol, pos.get("strategy_owner") or pos.get("owner") or "",
-                    pos.get("position_lifecycle_id") or "",
-                    outcome, reason, (time.monotonic() - _snapshot_start_mono) * 1000.0,
-                    _quote_elapsed_ms, _state_elapsed_ms,
-                )
-            except Exception:
-                pass
-        symbol = pos.get("symbol", "")
-        raw_exchange = pos.get("exchange", "NASDAQ")
+    snapshots: list[dict] = []
+    # Quote IO can overlap only when the injected provider explicitly
+    # guarantees safe concurrent read calls. Risk/HWM writes and selected SELL
+    # arbitration remain sequential; disabled by default and practice only.
+    _pool = None
+    _quote_futures = {}
+    _quote_method = (
+        getattr(provider, "get_current_price", None)
+        or getattr(provider, "get_current_price_usd", None)
+    )
+    _prefetch_requested = (
+        os.getenv("US_EXIT_QUOTE_PREFETCH_ENABLED", "0") == "1"
+        and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
+        and bool(getattr(provider, "concurrent_price_reads_safe", False))
+        and callable(_quote_method)
+        and len(positions or []) > 1
+    )
+    if _prefetch_requested:
+        _workers = min(4, max(1, int(os.getenv("US_EXIT_QUOTE_PREFETCH_WORKERS", "3"))))
+        _pool = ThreadPoolExecutor(max_workers=_workers, thread_name_prefix="us-exit-quote")
         try:
-            exchange = normalize_us_exchange(raw_exchange)
-        except ValueError as exc:
-            logger.warning(
-                "[US_EXIT][EXCHANGE_NORMALIZE_FAILED] symbol=%s raw_exchange=%s error=%s, defaulting to NASDAQ",
-                symbol, raw_exchange, exc
-            )
-            exchange = "NASDAQ"
-        _quote_started_mono = time.monotonic()
-        try:
-            if hasattr(provider, "get_current_price"):
-                price_data = provider.get_current_price(symbol, exchange)
-                if isinstance(price_data, dict):
-                    quote_quality = str(price_data.get("quality") or "").lower()
-                    quote_stale = bool(
-                        price_data.get("stale")
-                        or price_data.get("suspect")
-                        or price_data.get("_stale_date")
-                        or quote_quality in {"stale", "suspect", "degraded"}
+            for _idx, _original in enumerate(positions or []):
+                _sym = str((_original or {}).get("symbol") or "")
+                try:
+                    _exch = normalize_us_exchange((_original or {}).get("exchange", "NASDAQ"))
+                except ValueError:
+                    _exch = "NASDAQ"
+                _quote_futures[_idx] = _pool.submit(_quote_method, _sym, _exch)
+        except Exception:
+            _pool.shutdown(wait=True, cancel_futures=True)
+            raise
+    try:
+        for _position_index, original_pos in enumerate(positions):
+            _snapshot_start_mono = time.monotonic()
+            _quote_elapsed_ms = 0.0
+            _state_elapsed_ms = 0.0
+            pos = dict(original_pos or {})
+
+            def _observe_snapshot_outcome(outcome: str, reason: str = "") -> None:
+                # Pure observation. Failure must not affect the exit/risk path.
+                try:
+                    logger.info(
+                        "[US_EXIT][SNAPSHOT_OUTCOME] symbol=%s owner=%s lifecycle=%s "
+                        "outcome=%s reason=%s total_ms=%.2f quote_ms=%.2f state_ms=%.2f",
+                        symbol, pos.get("strategy_owner") or pos.get("owner") or "",
+                        pos.get("position_lifecycle_id") or "",
+                        outcome, reason, (time.monotonic() - _snapshot_start_mono) * 1000.0,
+                        _quote_elapsed_ms, _state_elapsed_ms,
                     )
-                    if quote_stale:
-                        logger.warning(
-                            "[US_EXIT][QUOTE_STALE_BLOCK] symbol=%s exchange=%s source=%s quality=%s asof=%s action=skip_exit_state_mutation",
-                            symbol, exchange, price_data.get("source") or "unknown",
-                            quote_quality or "unknown", price_data.get("asof") or price_data.get("_stale_date") or price_data.get("asof_epoch"),
+                except Exception:
+                    pass
+            symbol = pos.get("symbol", "")
+            raw_exchange = pos.get("exchange", "NASDAQ")
+            try:
+                exchange = normalize_us_exchange(raw_exchange)
+            except ValueError as exc:
+                logger.warning(
+                    "[US_EXIT][EXCHANGE_NORMALIZE_FAILED] symbol=%s raw_exchange=%s error=%s, defaulting to NASDAQ",
+                    symbol, raw_exchange, exc
+                )
+                exchange = "NASDAQ"
+            _quote_started_mono = time.monotonic()
+            try:
+                if hasattr(provider, "get_current_price"):
+                    price_data = (
+                        _quote_futures[_position_index].result()
+                        if _pool is not None else provider.get_current_price(symbol, exchange)
+                    )
+                    if isinstance(price_data, dict):
+                        quote_quality = str(price_data.get("quality") or "").lower()
+                        quote_stale = bool(
+                            price_data.get("stale")
+                            or price_data.get("suspect")
+                            or price_data.get("_stale_date")
+                            or quote_quality in {"stale", "suspect", "degraded"}
                         )
-                        _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
-                        _observe_snapshot_outcome("SKIP", "quote_stale")
-                        continue
-                    current_price = float(price_data.get("last") or price_data.get("price") or 0)
-                else:
-                    current_price = float(price_data or 0)
-            elif hasattr(provider, "get_current_price_usd"):
-                current_price = float(provider.get_current_price_usd(symbol, exchange) or 0)
-            else:
-                current_price = float(pos.get("current_price") or pos.get("current_price_usd") or pos.get("last_price") or 0)
-        except Exception as exc:
-            logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
-            _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
-            _observe_snapshot_outcome("SKIP", "quote_exception")
-            continue
-        _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
-        if current_price <= 0:
-            logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
-            _observe_snapshot_outcome("SKIP", "price_nonpositive")
-            continue
-        _state_started_mono = time.monotonic()
-        entry_price_for_state = _resolve_position_entry_price(pos)
-        if entry_price_for_state > 0 and current_price > 0:
-            try:
-                from trader.us.db.repos import update_us_soft_stop_risk_state
-                from trader.us.entry_exit_contract import (
-                    contract_exit_config,
-                    us_entry_exit_contract_integrity_state,
-                )
-                integrity = us_entry_exit_contract_integrity_state(pos, pos.get("meta"))
-                if integrity == "INVALID":
-                    logger.error(
-                        "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=skip_soft_stop_state_mutation",
-                        symbol,
+                        if quote_stale:
+                            logger.warning(
+                                "[US_EXIT][QUOTE_STALE_BLOCK] symbol=%s exchange=%s source=%s quality=%s asof=%s action=skip_exit_state_mutation",
+                                symbol, exchange, price_data.get("source") or "unknown",
+                                quote_quality or "unknown", price_data.get("asof") or price_data.get("_stale_date") or price_data.get("asof_epoch"),
+                            )
+                            _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+                            _observe_snapshot_outcome("SKIP", "quote_stale")
+                            continue
+                        current_price = float(price_data.get("last") or price_data.get("price") or 0)
+                    else:
+                        current_price = float(price_data or 0)
+                elif hasattr(provider, "get_current_price_usd"):
+                    _value = (
+                        _quote_futures[_position_index].result()
+                        if _pool is not None else provider.get_current_price_usd(symbol, exchange)
                     )
-                    raise ValueError("invalid_entry_exit_contract")
-                frozen_risk_cfg = contract_exit_config(pos)
-                pnl_pct_for_state = (current_price - entry_price_for_state) / entry_price_for_state
-                risk_state = update_us_soft_stop_risk_state(
-                    symbol=symbol,
-                    trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
-                    pnl_pct=pnl_pct_for_state,
-                    current_price=current_price,
-                    now=now or datetime.now(),
-                    soft_stop_pct=float(
-                        frozen_risk_cfg.get("soft_stop", os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05"))
-                    ),
-                )
-                pos["risk_state"] = risk_state
-                pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
-                soft_exec = ((risk_state.get("state") or {}).get("soft_stop_execution") or {})
-                current_lifecycle = str(
-                    pos.get("position_lifecycle_id")
-                    or ((risk_state.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id")
-                    or ""
-                )
-                if (
-                    soft_exec
-                    and not str(soft_exec.get("position_lifecycle_id") or "").strip()
-                    and current_lifecycle
-                ):
-                    soft_exec = _recover_legacy_soft_stop_execution_lifecycle(
-                        pos, risk_state, dict(soft_exec), current_lifecycle,
+                    current_price = float(_value or 0)
+                else:
+                    current_price = float(pos.get("current_price") or pos.get("current_price_usd") or pos.get("last_price") or 0)
+            except Exception as exc:
+                logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
+                _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+                _observe_snapshot_outcome("SKIP", "quote_exception")
+                continue
+            _quote_elapsed_ms = (time.monotonic() - _quote_started_mono) * 1000.0
+            if current_price <= 0:
+                logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
+                _observe_snapshot_outcome("SKIP", "price_nonpositive")
+                continue
+            _state_started_mono = time.monotonic()
+            entry_price_for_state = _resolve_position_entry_price(pos)
+            if entry_price_for_state > 0 and current_price > 0:
+                try:
+                    from trader.us.db.repos import update_us_soft_stop_risk_state
+                    from trader.us.entry_exit_contract import (
+                        contract_exit_config,
+                        us_entry_exit_contract_integrity_state,
+                    )
+                    integrity = us_entry_exit_contract_integrity_state(pos, pos.get("meta"))
+                    if integrity == "INVALID":
+                        logger.error(
+                            "[US_RISK_STATE][ENTRY_CONTRACT_INTEGRITY_FAIL] symbol=%s action=skip_soft_stop_state_mutation",
+                            symbol,
+                        )
+                        raise ValueError("invalid_entry_exit_contract")
+                    frozen_risk_cfg = contract_exit_config(pos)
+                    pnl_pct_for_state = (current_price - entry_price_for_state) / entry_price_for_state
+                    risk_state = update_us_soft_stop_risk_state(
+                        symbol=symbol,
+                        trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
+                        pnl_pct=pnl_pct_for_state,
+                        current_price=current_price,
+                        now=now or datetime.now(),
+                        soft_stop_pct=float(
+                            frozen_risk_cfg.get("soft_stop", os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05"))
+                        ),
                     )
                     pos["risk_state"] = risk_state
-                soft_lifecycle = str(soft_exec.get("position_lifecycle_id") or "")
-                if current_lifecycle and soft_lifecycle == current_lifecycle:
-                    pos["soft_stop_triggered_today"] = bool(soft_exec.get("soft_stop_triggered_today"))
-                    pos["soft_stop_partial_done"] = bool(soft_exec.get("soft_stop_partial_done"))
-                    pos["first_soft_stop_at"] = soft_exec.get("first_soft_stop_at")
-                    pos["first_soft_stop_price"] = soft_exec.get("first_soft_stop_price")
-            except Exception as exc:
-                logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
-
-        if entry_price_for_state > 0 and current_price > 0:
-            try:
-                from trader.us.position_lifecycle_state import update_us_position_high_watermark
-                lifecycle_id = pos.get("position_lifecycle_id") or ((pos.get("risk_state") or {}).get("state") or {}).get("lifecycle", {}).get("lifecycle_id")
-                if lifecycle_id:
-                    high_state = update_us_position_high_watermark(
-                        symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
-                        current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
+                    pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
+                    soft_exec = ((risk_state.get("state") or {}).get("soft_stop_execution") or {})
+                    current_lifecycle = str(
+                        pos.get("position_lifecycle_id")
+                        or ((risk_state.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id")
+                        or ""
                     )
-                    pos["high_watermark"] = high_state.get("high_watermark")
-                    pos["max_price"] = high_state.get("high_watermark")
-                    pos["high_watermark_source"] = "us_position_risk_state"
-                    pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
-            except Exception as exc:
-                logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
-        if entry_price_for_state > 0:
-            pos["resolved_pnl_pct"] = (current_price - entry_price_for_state) / entry_price_for_state
-        pos["resolved_current_price"] = current_price
-        pos["current_price_usd"] = current_price
-        pos["current_price"] = current_price
-        pos["resolved_entry_price"] = entry_price_for_state
-        pos["resolved_exchange"] = exchange
-        if isinstance(original_pos, dict):
-            original_pos.update({
-                "risk_state": pos.get("risk_state", original_pos.get("risk_state")),
-                "soft_stop_breach_count": pos.get("soft_stop_breach_count", original_pos.get("soft_stop_breach_count")),
-                "high_watermark": pos.get("high_watermark", original_pos.get("high_watermark")),
-                "max_price": pos.get("max_price", original_pos.get("max_price")),
-                "high_watermark_source": pos.get("high_watermark_source", original_pos.get("high_watermark_source")),
-                "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
-                "resolved_current_price": current_price,
-                "current_price_usd": current_price,
-                "current_price": current_price,
-            })
-        _state_elapsed_ms = (time.monotonic() - _state_started_mono) * 1000.0
-        _observe_snapshot_outcome("READY")
-        # This observation happens after the existing per-symbol quote and
-        # risk-state work. It does not perform another evaluation or mutation.
-        logger.info(
-            "[US_EXIT][SNAPSHOT_READY] symbol=%s elapsed_ms=%.2f observed_at_utc=%s",
-            symbol, (time.monotonic() - _snapshot_start_mono) * 1000.0,
-            datetime.now(timezone.utc).isoformat(),
-        )
-        snapshots.append(pos)
-        if on_snapshot_ready is not None:
-            # Callback exceptions propagate to the caller, which must fail
-            # closed: it can no longer assume every snapshot was evaluated.
-            # Risk state has already been persisted once for this position.
-            on_snapshot_ready(pos)
+                    if (
+                        soft_exec
+                        and not str(soft_exec.get("position_lifecycle_id") or "").strip()
+                        and current_lifecycle
+                    ):
+                        soft_exec = _recover_legacy_soft_stop_execution_lifecycle(
+                            pos, risk_state, dict(soft_exec), current_lifecycle,
+                        )
+                        pos["risk_state"] = risk_state
+                    soft_lifecycle = str(soft_exec.get("position_lifecycle_id") or "")
+                    if current_lifecycle and soft_lifecycle == current_lifecycle:
+                        pos["soft_stop_triggered_today"] = bool(soft_exec.get("soft_stop_triggered_today"))
+                        pos["soft_stop_partial_done"] = bool(soft_exec.get("soft_stop_partial_done"))
+                        pos["first_soft_stop_at"] = soft_exec.get("first_soft_stop_at")
+                        pos["first_soft_stop_price"] = soft_exec.get("first_soft_stop_price")
+                except Exception as exc:
+                    logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+
+            if entry_price_for_state > 0 and current_price > 0:
+                try:
+                    from trader.us.position_lifecycle_state import update_us_position_high_watermark
+                    lifecycle_id = pos.get("position_lifecycle_id") or ((pos.get("risk_state") or {}).get("state") or {}).get("lifecycle", {}).get("lifecycle_id")
+                    if lifecycle_id:
+                        high_state = update_us_position_high_watermark(
+                            symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
+                            current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
+                        )
+                        pos["high_watermark"] = high_state.get("high_watermark")
+                        pos["max_price"] = high_state.get("high_watermark")
+                        pos["high_watermark_source"] = "us_position_risk_state"
+                        pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
+                except Exception as exc:
+                    logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+            if entry_price_for_state > 0:
+                pos["resolved_pnl_pct"] = (current_price - entry_price_for_state) / entry_price_for_state
+            pos["resolved_current_price"] = current_price
+            pos["current_price_usd"] = current_price
+            pos["current_price"] = current_price
+            pos["resolved_entry_price"] = entry_price_for_state
+            pos["resolved_exchange"] = exchange
+            if isinstance(original_pos, dict):
+                original_pos.update({
+                    "risk_state": pos.get("risk_state", original_pos.get("risk_state")),
+                    "soft_stop_breach_count": pos.get("soft_stop_breach_count", original_pos.get("soft_stop_breach_count")),
+                    "high_watermark": pos.get("high_watermark", original_pos.get("high_watermark")),
+                    "max_price": pos.get("max_price", original_pos.get("max_price")),
+                    "high_watermark_source": pos.get("high_watermark_source", original_pos.get("high_watermark_source")),
+                    "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
+                    "resolved_current_price": current_price,
+                    "current_price_usd": current_price,
+                    "current_price": current_price,
+                })
+            _state_elapsed_ms = (time.monotonic() - _state_started_mono) * 1000.0
+            _observe_snapshot_outcome("READY")
+            # This observation happens after the existing per-symbol quote and
+            # risk-state work. It does not perform another evaluation or mutation.
+            logger.info(
+                "[US_EXIT][SNAPSHOT_READY] symbol=%s elapsed_ms=%.2f observed_at_utc=%s",
+                symbol, (time.monotonic() - _snapshot_start_mono) * 1000.0,
+                datetime.now(timezone.utc).isoformat(),
+            )
+            snapshots.append(pos)
+            if on_snapshot_ready is not None:
+                # Callback exceptions propagate to the caller, which must fail
+                # closed: it can no longer assume every snapshot was evaluated.
+                # Risk state has already been persisted once for this position.
+                on_snapshot_ready(pos)
+    finally:
+        if _pool is not None:
+            _pool.shutdown(wait=True, cancel_futures=True)
     return snapshots
 
 
