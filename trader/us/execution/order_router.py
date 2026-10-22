@@ -1885,13 +1885,13 @@ def route_order(
             try:
                 with _outbox_engine.begin() as _outbox_conn:
                     claim = claim_execution_action(
-                    claim_identity,
-                    attempt_id=_outbox_attempt,
-                    requested_qty=qty,
-                    fresh_validation=True,
-                    client_order_key=str(order_key or ""),
-                    _conn=_outbox_conn,
-                )
+                        claim_identity,
+                        attempt_id=_outbox_attempt,
+                        requested_qty=qty,
+                        fresh_validation=True,
+                        client_order_key=str(order_key or ""),
+                        _conn=_outbox_conn,
+                    )
                     if claim.acquired:
                         if _account_reservation_required:
                             _account_authority.reserve(
