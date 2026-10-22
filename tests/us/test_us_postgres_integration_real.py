@@ -2156,3 +2156,107 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
         write_triplet(conn)
     assert counts() == (1, 1, 1)
     authority.release_lease(lease=lease)
+
+
+def test_account_reservation_only_terminalizes_after_exact_tqqq_broker_proof(
+    pg_engine, monkeypatch,
+):
+    """No cancellation request or ACK can release a reserved 3-share BUY."""
+    import hashlib
+    import json
+    from pathlib import Path
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.db import repos
+    from trader.us.execution.account_authority import (
+        AccountExecutionAuthority, ReservationConflict,
+    )
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    account = hashlib.sha256(b"terminal-proof-stage123").hexdigest()
+    owner = AccountExecutionAuthority(
+        pg_engine, env="practice", account_fingerprint=account,
+        trading_epoch_id="test-tqqq-epoch",
+    )
+    lease = owner.acquire_lease(holder_id="worker-test")
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id="test-tqqq-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="test-tqqq-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: ledger)
+    key = "TQQQ_INF_V3:test-tqqq-cycle:2026-10-20:BUY"
+    attempt = "verified-ttl-attempt"
+    assert ledger.acquire(
+        identity, attempt_id=attempt,
+        requested_qty=3, client_order_key=key,
+    ).acquired
+    ledger.record_observation(
+        identity, attempt_id=attempt, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    owner.reserve(
+        lease=lease, action_key=attempt, strategy_owner="TQQQ_INFINITE",
+        symbol="TQQQ", side="BUY", qty=3, price_usd="100",
+        broker_cash_usd="500",
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+              trade_date,client_order_key,symbol,exchange,side,
+              qty_requested,qty_filled,order_no,status,env,trading_epoch_id,meta
+            ) VALUES (
+              '2026-10-20',:key,'TQQQ','NASDAQ','BUY',
+              3,0,'0000038776','ACK','practice','test-tqqq-epoch',
+              CAST(:meta AS jsonb)
+            )
+        """), {"key": key, "meta": json.dumps({
+            "execution_action_key": identity.action_key,
+            "submit_attempt_id": attempt,
+            "strategy_owner": "TQQQ_INFINITE",
+        })})
+    with pytest.raises(ReservationConflict, match="terminal_attempt_proof_unverified"):
+        owner.terminalize_verified_attempt(
+            lease=lease, attempt_id=attempt,
+            client_order_key=key, trade_date="2026-10-20",
+        )
+    original_broker_row = {
+        "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+        "status": "CANCELLED", "requested_qty": 3,
+        "requested_qty_present": True,
+        "filled_qty": 0, "filled_qty_present": True,
+        "remaining_qty": 0, "remaining_qty_present": True,
+        "broker_open_qty": 0, "broker_open_qty_present": True,
+    }
+    proof = repos.apply_broker_order_observation(
+        trade_date="2026-10-20", client_order_key=key,
+        raw_order_no="0000038776", canonical_order_no="38776",
+        symbol="TQQQ", side="BUY", requested_qty=3, filled_qty=0,
+        remaining_qty=3, broker_status="CANCELLED",
+        evidence_type="TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        observed_at="2026-10-20T14:17:00+00:00",
+        raw_row=original_broker_row,
+    )
+    assert proof["status"] == "OK", proof
+    assert ledger.get(identity).action_state == "RETRYABLE"
+    resolved = owner.terminalize_verified_attempt(
+        lease=lease, attempt_id=attempt,
+        client_order_key=key, trade_date="2026-10-20",
+    )
+    assert resolved["state"] == "RELEASED"
+    assert not resolved["idempotent"]
+    replay = owner.terminalize_verified_attempt(
+        lease=lease, attempt_id=attempt,
+        client_order_key=key, trade_date="2026-10-20",
+    )
+    assert replay["idempotent"]
+    owner.release_lease(lease=lease)
