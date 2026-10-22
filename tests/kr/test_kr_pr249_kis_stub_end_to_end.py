@@ -102,6 +102,12 @@ def test_kis_daily_stub_reconcile_twice_preserves_partial_and_exact_cycle(
         reconcile_today(
             engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
         )
+    # Late cancellation acknowledges the 27 (or 7) unfilled remainder,
+    # but it cannot erase the prior partial execution or resubmit a SELL.
+    kis.row["ord_stat_cd"] = "CANCELLED"
+    reconcile_today(
+        engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
+    )
     schema = schema_for_engine(engine)
     with engine.connect() as conn:
         fills = conn.execute(sa.select(schema.fills).where(sa.and_(
@@ -111,7 +117,7 @@ def test_kis_daily_stub_reconcile_twice_preserves_partial_and_exact_cycle(
         position = conn.execute(sa.select(schema.positions).where(
             schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
         )).mappings().one()
-    assert kis.calls == 2
+    assert kis.calls == 3
     assert len(fills) == 1
     assert fills[0]["qty"] == cumulative
     assert fills[0]["price"] == pytest.approx(notional / cumulative)
