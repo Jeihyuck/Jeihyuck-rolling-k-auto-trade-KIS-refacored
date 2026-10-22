@@ -146,3 +146,37 @@ def test_non_practice_and_unverified_scope_rejected(authority):
             account_fingerprint="plain-account-number",
             trading_epoch_id="epoch",
         )
+
+
+def test_account_capacity_cannot_be_reused_across_overlapping_epochs(authority):
+    # Broker cash/available shares are ACCOUNT-global even when the
+    # Session changes trading epochs; an UNCERTAIN hold must survive.
+    old = authority.acquire_lease(holder_id="AM")
+    first = authority.reserve(
+        lease=old, action_key="am-buy", strategy_owner="US_STANDARD",
+        symbol="AMD", side="BUY", qty=4, price_usd="100",
+        broker_cash_usd="500",
+    )
+    assert first["state"] == "RESERVED"
+    authority.release_lease(lease=old)
+    next_epoch = AccountExecutionAuthority(
+        authority.engine, env="practice",
+        account_fingerprint=authority.scope["account"],
+        trading_epoch_id="next-epoch",
+    )
+    afternoon = next_epoch.acquire_lease(holder_id="AFTERNOON")
+    with pytest.raises(ReservationConflict, match="account_capacity_reserved"):
+        next_epoch.reserve(
+            lease=afternoon, action_key="afternoon-buy",
+            strategy_owner="TQQQ_INFINITE", symbol="TQQQ",
+            side="BUY", qty=2, price_usd="100",
+            broker_cash_usd="500",
+        )
+    second = next_epoch.reserve(
+        lease=afternoon, action_key="afternoon-buy-allowed",
+        strategy_owner="TQQQ_INFINITE", symbol="TQQQ",
+        side="BUY", qty=1, price_usd="100",
+        broker_cash_usd="500",
+    )
+    assert second["state"] == "RESERVED"
+    next_epoch.release_lease(lease=afternoon)
