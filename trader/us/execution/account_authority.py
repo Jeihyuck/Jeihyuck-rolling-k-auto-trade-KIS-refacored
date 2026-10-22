@@ -211,6 +211,56 @@ class AccountExecutionAuthority:
         return {"action_key": action_key, "state": "RESERVED",
                 "idempotent": False, "fencing_token": lease.fencing_token}
 
+    def assert_reserved_submit_authority(
+        self, *, attempt_id: str, client_order_key: str,
+        strategy_owner: str, symbol: str, side: str, qty: int,
+    ) -> None:
+        """Fail closed at the *native HTTP boundary*, not just order planning.
+
+        Acquire the account-wide advisory transaction lock so a changed
+        reservation/claim cannot be mistaken for an authorized submission.
+        No KIS call occurs here. An unresolved/terminalized reservation, stale
+        Attempt, or cross-account/owner identity cannot submit.
+        """
+        if not attempt_id or not client_order_key or not strategy_owner:
+            raise AuthorityUnavailable("US_SUBMIT_AUTHORITY_IDENTITY_MISSING")
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                SELECT pg_advisory_xact_lock(
+                  hashtextextended('US_ACCOUNT_RESERVE:' || :env || ':' || :account, 0)
+                )
+            """), self.scope)
+            row = conn.execute(text("""
+                SELECT r.state, r.strategy_owner, r.symbol, r.side,
+                       r.requested_qty,
+                       a.client_order_key, a.requested_qty AS attempt_qty,
+                       c.active_attempt_id, c.strategy_owner AS claim_owner,
+                       c.action_state
+                FROM us_execution_account_reservations r
+                JOIN us_execution_attempts a ON a.attempt_id=r.action_key
+                JOIN us_execution_claims c ON c.action_key=a.action_key
+                WHERE r.action_key=:attempt
+                  AND r.env=:env AND r.account_fingerprint=:account
+                  AND r.trading_epoch_id=:epoch
+                  AND c.env=:env AND c.account_id=:account
+                  AND c.trading_epoch_id=:epoch
+                FOR SHARE OF r, a, c
+            """), {**self.scope, "attempt": attempt_id}).mappings().one_or_none()
+            if (
+                row is None
+                or str(row["state"]) != "RESERVED"
+                or str(row["strategy_owner"]) != strategy_owner.upper()
+                or str(row["symbol"]) != symbol.upper()
+                or str(row["side"]) != side.upper()
+                or int(row["requested_qty"]) != int(qty)
+                or int(row["attempt_qty"]) != int(qty)
+                or str(row["client_order_key"]) != client_order_key
+                or str(row["active_attempt_id"]) != attempt_id
+                or str(row["claim_owner"]) != strategy_owner.upper()
+                or str(row["action_state"]) not in {"IN_FLIGHT", "OPEN"}
+            ):
+                raise AuthorityUnavailable("US_RESERVED_SUBMIT_AUTHORITY_STALE")
+
     def release_lease(self, *, lease: Lease) -> None:
         """Release only the current holder's write lease, never its holds.
 
