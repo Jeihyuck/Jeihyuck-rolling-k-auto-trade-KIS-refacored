@@ -2543,8 +2543,37 @@ def reconcile_kis(
             orders_count,
             fills_count,
         )
+    # All broker order observations, fills and claims are checked above.
+    # Skip historical import/meta repair ONLY on exact active-cycle parity;
+    # unknown/partial/stale proofs retain the old fail-closed recovery.
+    repair_fastpath = False
+    repair_fastpath_reason = "STALE_OR_UNPROVEN_BALANCE"
+    if (os.getenv("KR_EXACT_PARITY_HISTORICAL_REPAIR_FASTPATH", "1") == "1"
+            and not reset_mode and balance_snapshot is None):
+        try:
+            from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
+            _current_active = positions_repo.list_active_positions_for_exit(env, strategy)
+            _unresolved_for_fastpath = _has_unresolved_broker_activity(
+                engine=engine, orders_repo=orders_repo, env=env,
+                trade_date=tick_ts.date(),
+            )
+            repair_fastpath, repair_fastpath_reason = historical_repair_unnecessary(
+                holdings=holdings_rows, positions=_current_active,
+                reconcile_ok=bool(reconcile_result.get("ok", False)),
+                holdings_error=holdings_error,
+                order_or_fill_changes=fills_count,
+                unresolved=_unresolved_for_fastpath,
+                expected_strategy=strategy,
+            )
+        except Exception as _parity_exc:
+            repair_fastpath = False
+            repair_fastpath_reason = "PARITY_READ_FAILED"
+            logger.warning("[KR_RECONCILE][HISTORICAL_PARITY][FAIL_CLOSED] type=%s", type(_parity_exc).__name__)
+    logger.info("[KR_RECONCILE][HISTORICAL_PARITY] fastpath=%s reason=%s", int(repair_fastpath), repair_fastpath_reason)
     restored = 0
-    if reset_mode:
+    if repair_fastpath:
+        logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=EXACT_BROKER_ACTIVE_CYCLE_PARITY")
+    elif reset_mode:
         allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
         if holdings_rows and not allow_holdings:
             logger.warning(
@@ -2607,15 +2636,18 @@ def reconcile_kis(
     # [2026-05-21] entry meta 복원 (KIS holdings 복구 포지션 대상)
     meta_restored = 0
     try:
-        ledger_repo = LedgerEventsRepo(engine)
-        meta_restored = _restore_entry_meta_for_promoted_positions(
-            env=env,
-            strategy=strategy,
-            engine=engine,
-            orders_repo=orders_repo,
-            positions_repo=positions_repo,
-            ledger_repo=ledger_repo,
-        )
+        if repair_fastpath:
+            logger.info("[KR_RECONCILE][META_RESTORE][SKIP] reason=FROZEN_CONTRACT_ALREADY_VERIFIED")
+        else:
+            ledger_repo = LedgerEventsRepo(engine)
+            meta_restored = _restore_entry_meta_for_promoted_positions(
+                env=env,
+                strategy=strategy,
+                engine=engine,
+                orders_repo=orders_repo,
+                positions_repo=positions_repo,
+                ledger_repo=ledger_repo,
+            )
         if meta_restored:
             logger.info("[RECONCILE][META_RESTORE][DONE] env=%s count=%s", env, meta_restored)
     except Exception as _meta_exc:
@@ -2679,6 +2711,8 @@ def reconcile_kis(
             "filled_codes": refresh_codes,
             "holdings": len(holdings_rows),
             "restored_positions": restored,
+            "historical_repair_fastpath": repair_fastpath,
+            "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
             "reset_mode": reset_mode,
@@ -2696,6 +2730,8 @@ def reconcile_kis(
             "promoted_fills": int(promoted.get("fills") or 0),
             "filled_codes": refresh_codes,
             "restored_positions": restored,
+            "historical_repair_fastpath": repair_fastpath,
+            "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
             "reset_mode": reset_mode,
