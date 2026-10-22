@@ -1028,6 +1028,11 @@ def prepare_exit_position_snapshots(
         )
         and (callable(_quote_method) or callable(_isolated_quote_reader))
         and len(positions or []) > 1
+        and (
+            not callable(_isolated_quote_reader)
+            or type(provider).__module__ != "trader.us.data_provider"
+            or os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") == "1"
+        )
     )
     # One wall-clock budget for the entire quote batch (not one timeout per
     # symbol). Without it, a hung REST quote can stall every protected exit.
