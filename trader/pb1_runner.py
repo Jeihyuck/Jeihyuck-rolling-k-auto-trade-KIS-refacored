@@ -6522,10 +6522,15 @@ def run_once(
                     # balance. Mark as verified only while its source and
                     # timestamp satisfy the conservative freshness contract.
                     try:
-                        prechecked = datetime.fromisoformat(str(pre.get("checked_at_kst") or ""))
-                        now_verified = now_kst()
-                        age_sec = (now_verified - prechecked).total_seconds()
-                        if prechecked.tzinfo and pre.get("source") == "KIS" and 0 <= age_sec <= 20:
+                        try:
+                            prechecked = datetime.fromisoformat(str(pre.get("checked_at_kst") or ""))
+                        except (ValueError, TypeError):
+                            prechecked = None
+                        age_sec = (
+                            (now_kst() - prechecked).total_seconds()
+                            if prechecked is not None and prechecked.tzinfo else float("inf")
+                        )
+                        if prechecked is not None and pre.get("source") == "KIS" and 0 <= age_sec <= 20:
                             balance_snapshot_raw = dict(snapshot)
                             balance_snapshot_raw["_kr_verified_fresh_at_kst"] = prechecked.isoformat()
                         elif kis is not None:
@@ -6552,7 +6557,9 @@ def run_once(
                     balance_state = BALANCE_STATE_UNKNOWN
                 if balance_source != "KIS_FORCE_REFRESH_STALE_PRECHECK":
                     balance_source = str(pre.get("source") or "NONE")
-                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=%d", state, balance_source, int(bool(balance_snapshot_raw)))
+                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=%s snapshot=%d",
+                            state, balance_source, int(balance_source == "KIS_FORCE_REFRESH_STALE_PRECHECK"),
+                            int(bool(balance_snapshot_raw)))
                 if state != "OK":
                     logger.warning("[PB1][ENTRY_BLOCKED] reason=balance_unknown")
                     if bool(pre.get("exit_allowed")):
