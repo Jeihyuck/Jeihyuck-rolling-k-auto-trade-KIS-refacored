@@ -5,6 +5,10 @@ on:
     branches: [dual-agent]
     paths:
       - 'trader/us/**'
+      - 'scripts/wsl/run-us-am.sh'
+      - 'scripts/wsl/run-us-afternoon.sh'
+      - 'scripts/wsl/us-stage123-paper-defaults.sh'
+      - 'scripts/us_stage123_paper_preflight.py'
       - 'trader/execution_claims.py'
       - 'migrations/0056_us_execution_authority_reservations.sql'
       - 'tests/us/**'
@@ -54,7 +58,8 @@ jobs:
           python -m pip install psycopg2-binary
       - name: Static Python and importing integrated paths
         run: |
-          python -m py_compile \
+          bash -n scripts/wsl/us-stage123-paper-defaults.sh scripts/wsl/run-us-am.sh scripts/wsl/run-us-afternoon.sh
+          python -m py_compile scripts/us_stage123_paper_preflight.py \
             trader/execution_claims.py \
             trader/us/infinite/repository.py \
             trader/us/infinite/integration.py \
@@ -74,6 +79,7 @@ jobs:
             tests/us/test_us_20261021_tqqq_ttl_quantity_contract.py \
             tests/us/test_us_20261021_reconcile_shadow_worker.py \
             tests/us/test_us_20261022_account_authority.py \
+            tests/us/test_us_20261022_stage123_paper_default_on.py \
             tests/us/test_us_20261022_shared_kis_limiter.py \
             tests/us/test_us_early_hard_stop_tick_integration_20261016.py \
             tests/us/test_us_postgres_integration_real.py
