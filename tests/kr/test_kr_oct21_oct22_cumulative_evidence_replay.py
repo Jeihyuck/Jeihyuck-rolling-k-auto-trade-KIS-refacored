@@ -88,3 +88,41 @@ def test_no_cumulative_without_exact_durable_source_or_broker_notional():
         row, source_order=_source("BUY",17,"0000013196"), side="BUY",
         trade_date=date(2026,10,21), kis_odno="0000013196", env="practice",
     ) is None
+
+
+@pytest.mark.parametrize("sequence", [
+    ((15, 68400.0), (17, 68400.0), (15, 68400.0), (17, 68400.0)),
+    ((10, 68500.0), (52, 16080.384615384615), (10, 68500.0), (52, 16080.384615384615)),
+])
+def test_order_cumulative_fill_snapshot_is_monotonic_and_one_row(sequence):
+    """SQLite storage regression; PostgreSQL CI runs the independent cross-path tests."""
+    import uuid
+
+    import sqlalchemy as sa
+
+    from trader.db.repos import FillsRepo
+    from trader.db.schema import schema_for_engine
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    create_schema_with_active_test_epoch(engine)
+    repo = FillsRepo(engine)
+    order_id = str(uuid.uuid4())
+    for qty, price in sequence:
+        repo.upsert_fill(
+            env="practice", run_id=None, order_id=order_id,
+            kis_odno="0000013196", trade_id="KR_KIS_CUM:fixture:20261021:0000013196:251970:BUY",
+            code="251970", market="KOSPI", side="BUY", qty=qty, price=price,
+            fee=0.0, tax=0.0,
+            filled_at=datetime(2026, 10, 21, 9, 39, tzinfo=ZoneInfo("Asia/Seoul")),
+            raw_json={"tot_ccld_qty": qty},
+            fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+                            "fill_source": "daily_ccld_order_cumulative"},
+        )
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        rows = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).mappings().all()
+    assert len(rows) == 1
+    assert rows[0]["qty"] == max(q for q, _ in sequence)
