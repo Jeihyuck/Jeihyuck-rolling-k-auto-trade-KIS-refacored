@@ -209,7 +209,7 @@ def assert_fresh_reservation_worker(
         or payload.get("account_scope_fingerprint") != expected
         or payload.get("trade_date") != trade_date
         or payload.get("session_run_id") != session_run_id
-        or payload.get("read_status") not in {"OK", "DEGRADED"}
+        or payload.get("read_status") != "OK"
         or lag < 0 or lag > max_age_sec
     ):
         raise AuthorityUnavailable("US_RESERVATION_WORKER_HEALTH_STALE_OR_SCOPE_MISMATCH")
