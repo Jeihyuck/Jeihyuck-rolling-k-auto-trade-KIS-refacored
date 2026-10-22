@@ -2375,3 +2375,52 @@ def test_fenced_reservation_worker_releases_only_proven_pre_http_aborts(
         """), {"id": attempt}).mappings().one()
     assert state["state"] == "RELEASED"
     assert state["terminal_evidence"] == "DURABLE_ABANDONED_PRE_SUBMIT"
+
+
+
+def test_stage123_default_on_schema_preflight_requires_actual_rls_migration(pg_engine):
+    """Production activation must stop before orders on missing DDL or RLS.
+
+    All DDL here runs ONLY in disposable PBCORE_TEST_POSTGRES_URL.
+    """
+    from pathlib import Path
+    from sqlalchemy import text
+    from scripts.us_stage123_paper_preflight import validate_stage123_prerequisites
+
+    env = {
+        "KIS_ENV": "practice", "US_PAPER_TRADING_ENABLED": "1",
+        "DRY_RUN": "0", "US_OFFLINE": "0", "US_SIGNAL_ONLY": "0",
+        "US_STAGE123_PAPER_PROFILE": "ON",
+        "US_ATOMIC_CLAIM_OUTBOX_ENABLED": "1",
+        "US_ACCOUNT_RESERVATION_MODE": "ENFORCE",
+        "US_RECONCILE_WORKER_MODE": "RESERVATION_ONLY",
+        "US_SHARED_KIS_LIMITER_ENABLED": "1",
+        "US_EXIT_QUOTE_PREFETCH_ENABLED": "1",
+        "US_EARLY_HARD_STOP_PILOT_ENABLED": "1",
+        "US_EARLY_MULTI_HARD_STOP_ENABLED": "1",
+        "US_EARLY_SOFT_STOP_PILOT_ENABLED": "1",
+    }
+    scope = {"env": "practice", "account_id": "a" * 64,
+             "trading_epoch_id": "verified-us-epoch"}
+    with pg_engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS us_execution_account_reservations"))
+        conn.execute(text("DROP TABLE IF EXISTS us_execution_authority_leases"))
+    with pytest.raises(RuntimeError, match="migration_0056_missing"):
+        validate_stage123_prerequisites(engine=pg_engine, scope=scope, env=env)
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    assert validate_stage123_prerequisites(
+        engine=pg_engine, scope=scope, env=env,
+    )["status"] == "PASS"
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE us_execution_account_reservations DISABLE ROW LEVEL SECURITY"
+        ))
+    with pytest.raises(RuntimeError, match="migration_0056_missing_or_rls_off"):
+        validate_stage123_prerequisites(engine=pg_engine, scope=scope, env=env)
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE us_execution_account_reservations ENABLE ROW LEVEL SECURITY"
+        ))
