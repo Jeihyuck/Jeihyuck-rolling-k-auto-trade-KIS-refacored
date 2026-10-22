@@ -98,6 +98,15 @@ class AccountExecutionAuthority:
         return Lease(holder_id, int(token))
 
     def _guard(self, conn: Any, lease: Lease) -> None:
+        # One PostgreSQL transaction advisory lock PER BROKER ACCOUNT
+        # (not per strategy, date or epoch). Otherwise AM/Afternoon
+        # overlapping epochs could both reserve the same broker cash.
+        # Acquire before the lease row lock for consistent lock ordering.
+        conn.execute(text("""
+            SELECT pg_advisory_xact_lock(
+              hashtextextended('US_ACCOUNT_RESERVE:' || :env || ':' || :account, 0)
+            )
+        """), self.scope)
         token = conn.execute(text("""
             SELECT fencing_token FROM us_execution_authority_leases
             WHERE env=:env AND account_fingerprint=:account
@@ -178,7 +187,8 @@ class AccountExecutionAuthority:
                    COALESCE(SUM(reserved_shares),0) AS shares
             FROM us_execution_account_reservations
             WHERE env=:env AND account_fingerprint=:account
-              AND trading_epoch_id=:epoch
+              -- An active or UNKNOWN reservation in an earlier epoch still
+              -- consumes the same broker-account capacity until reconciled.
               AND state IN ('RESERVED','UNCERTAIN')
               AND side=:side
               AND (:side='BUY' OR symbol=:symbol)
