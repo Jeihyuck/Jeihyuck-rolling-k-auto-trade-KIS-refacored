@@ -4864,14 +4864,46 @@ class PB1Engine:
         balance_rows: Iterable[dict],
         ledger_positions: Iterable[dict] | None = None,
     ) -> list[HoldingContext]:
-        positions_by_code = {
-            str((row or {}).get("code") or "").zfill(6): dict(row or {})
-            for row in (ledger_positions or [])
-            if str((row or {}).get("code") or "").strip()
-        }
+        # Broker holdings have quantities, not a strategy policy. Never attach
+        # today's KIS quantity to a CLOSED cycle from a previous entry.
+        positions_by_code: dict[str, dict] = {}
+        ambiguous_codes: set[str] = set()
+        for original in ledger_positions or []:
+            candidate = dict(original or {})
+            code_key = str(candidate.get("code") or "").strip().zfill(6)
+            if not code_key or code_key == "000000":
+                continue
+            if str(candidate.get("status") or "OPEN").upper() != "OPEN":
+                continue
+            if int(candidate.get("qty") or 0) <= 0:
+                continue
+            previous = positions_by_code.get(code_key)
+            if previous is not None and (
+                str(previous.get("position_cycle_id") or "") != str(candidate.get("position_cycle_id") or "")
+                or str(previous.get("portfolio_epoch_id") or "") != str(candidate.get("portfolio_epoch_id") or "")
+                or str(previous.get("trading_epoch_id") or "") != str(candidate.get("trading_epoch_id") or "")
+            ):
+                ambiguous_codes.add(code_key)
+            else:
+                positions_by_code[code_key] = candidate
+        for code_key in ambiguous_codes:
+            # Preserve the KIS holding for audit, but do not choose a policy
+            # based on dict iteration order or create another imported cycle.
+            positions_by_code[code_key] = {
+                "code": code_key,
+                "status": "CYCLE_BINDING_CONFLICT",
+                "position_meta": {"lifecycle_blocked": True,
+                                  "binding_conflict": "AMBIGUOUS_ACTIVE_CYCLE"},
+            }
         for balance_row in balance_rows or []:
             code_key = str(balance_row.get("pdno") or balance_row.get("code") or "").zfill(6)
             current = positions_by_code.get(code_key)
+            if code_key in ambiguous_codes:
+                logger.error(
+                    "[LIFECYCLE][CYCLE_BINDING_CONFLICT] code=%s reason=AMBIGUOUS_ACTIVE_CYCLE action=BLOCK_EXIT",
+                    code_key,
+                )
+                continue
             if current and lifecycle_is_authoritative(current):
                 continue
             if not hasattr(self.positions_repo, "get_or_create_imported_cycle_for_kis_holding"):
@@ -12605,6 +12637,27 @@ class PB1Engine:
         if not avg:
             return None
         code = str(pos.get("code") or "").zfill(6)
+        _contract_meta = pos.get("position_meta") or {}
+        if not isinstance(_contract_meta, dict):
+            try:
+                _contract_meta = json.loads(_contract_meta)
+            except (TypeError, ValueError):
+                _contract_meta = {}
+        if (
+            str(pos.get("status") or "OPEN").upper() != "OPEN"
+            or pos.get("lifecycle_blocked")
+            or _contract_meta.get("lifecycle_blocked")
+        ):
+            logger.error(
+                "[LIFECYCLE][BLOCK_EXIT] code=%s cycle=%s status=%s reason=%s",
+                code, pos.get("position_cycle_id"), pos.get("status"),
+                _contract_meta.get("binding_conflict") or "INACTIVE_OR_UNPROVEN_CYCLE",
+            )
+            return {
+                "code": code, "exit_ok": False, "submitted": 0,
+                "submit_attempted": 0, "order_result": "ORDER_SKIPPED_CYCLE_BINDING",
+                "order_skip_reasons": ["CYCLE_BINDING_CONFLICT"],
+            }
         display_code = self._display_code(code)
         market = pos.get("market")
         mode = int(pos.get("mode") or 1)
@@ -17300,12 +17353,12 @@ class PB1Engine:
         logger.info("[PB1][POST_CAPITAL][START] phase=%s window=%s", self.phase, self.window_internal)
         with self._stage_timer("exit.positions_lookup"):
             try:
-                pos_cache_key = ("positions", self.env, self.STRATEGY_NAME)
+                pos_cache_key = ("exit_active_positions", self.env, self.STRATEGY_NAME)
                 if pos_cache_key in self._tick_db_cache:
                     logger.info("[PB1][DB_CACHE][HIT] key=%s", pos_cache_key)
                     positions = list(self._tick_db_cache[pos_cache_key])
                 else:
-                    positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+                    positions = self.positions_repo.list_active_positions_for_exit(self.env, self.STRATEGY_NAME)
                     self._tick_db_cache[pos_cache_key] = list(positions)
             except Exception as _pos_exc:
                 _krx_pos = str(os.getenv("PB1_MARKET_SCOPE") or os.getenv("EXCHANGE") or "").upper() in {"KRX", "KR"}
@@ -17350,8 +17403,8 @@ class PB1Engine:
             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
             with self._stage_timer("exit.positions_lookup"):
                 try:
-                    positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
-                    self._tick_db_cache[("positions", self.env, self.STRATEGY_NAME)] = list(positions)
+                    positions = self.positions_repo.list_active_positions_for_exit(self.env, self.STRATEGY_NAME)
+                    self._tick_db_cache[("exit_active_positions", self.env, self.STRATEGY_NAME)] = list(positions)
                 except Exception as _pos_exc2:
                     self._bump_warning("db_read_fail_open_count")
                     dispose_engine_safely(self.engine, reason=f"positions_lookup_bootstrap:{type(_pos_exc2).__name__}")
