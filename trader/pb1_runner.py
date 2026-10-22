@@ -6518,12 +6518,40 @@ def run_once(
                 if state == "OK" and snapshot:
                     balance_state = BALANCE_STATE_OK
                     balance_snapshot_raw = snapshot
+                    # PRECHECK is a snapshot, not a perpetual session-wide
+                    # balance. Mark as verified only while its source and
+                    # timestamp satisfy the conservative freshness contract.
+                    try:
+                        prechecked = datetime.fromisoformat(str(pre.get("checked_at_kst") or ""))
+                        now_verified = now_kst()
+                        age_sec = (now_verified - prechecked).total_seconds()
+                        if prechecked.tzinfo and pre.get("source") == "KIS" and 0 <= age_sec <= 20:
+                            balance_snapshot_raw = dict(snapshot)
+                            balance_snapshot_raw["_kr_verified_fresh_at_kst"] = prechecked.isoformat()
+                        elif kis is not None:
+                            logger.info("[KR_BALANCE][PRECHECK_STALE] age_sec=%.1f action=FORCE_FRESH_BROKER_BALANCE", age_sec)
+                            fresh = kis.get_balance_cached(force=True)
+                            if not isinstance(fresh, dict) or not isinstance(fresh.get("output1"), list) or not fresh.get("output2"):
+                                raise RuntimeError("KR_BALANCE_FRESH_RESPONSE_INCOMPLETE")
+                            balance_snapshot_raw = {**fresh, "_kr_verified_fresh_at_kst": now_kst().isoformat()}
+                            balance_source = "KIS_FORCE_REFRESH_STALE_PRECHECK"
+                            balance_state = BALANCE_STATE_OK
+                    except Exception as _balance_refresh_exc:
+                        # Never silently reuse an hours-old balance for new BUY
+                        # or claim order-safe reconciliation when it was stale.
+                        balance_state = BALANCE_STATE_UNKNOWN
+                        balance_snapshot_raw = None
+                        logger.error(
+                            "[KR_BALANCE][PRECHECK_REFRESH_FAILED] type=%s action=BLOCK_NEW_ENTRY_KEEP_PROTECTIVE_EXIT_GUARDS",
+                            type(_balance_refresh_exc).__name__,
+                        )
                 elif state == "OK":
                     state = "UNKNOWN_WITHOUT_SNAPSHOT"
                     balance_state = BALANCE_STATE_UNKNOWN
                 else:
                     balance_state = BALANCE_STATE_UNKNOWN
-                balance_source = str(pre.get("source") or "NONE")
+                if balance_source != "KIS_FORCE_REFRESH_STALE_PRECHECK":
+                    balance_source = str(pre.get("source") or "NONE")
                 logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=%d", state, balance_source, int(bool(balance_snapshot_raw)))
                 if state != "OK":
                     logger.warning("[PB1][ENTRY_BLOCKED] reason=balance_unknown")
