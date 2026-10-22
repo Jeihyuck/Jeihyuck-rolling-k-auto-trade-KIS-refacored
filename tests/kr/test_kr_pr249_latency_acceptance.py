@@ -15,6 +15,7 @@ def _records(after_tick, after_sell, *, before_tick=330, before_sell=110):
                 "tick_id": str(i), "git_sha": sha, "kind": "measured",
                 "tick_elapsed_sec": tick + i / 1000,
                 "first_protective_sell_submit_sec": sell + i / 1000,
+                "result_status": "OK",
             })
     return rows
 
@@ -47,4 +48,18 @@ def test_missing_evidence_cannot_claim_speedup(failure):
     else:
         rows = []
     with pytest.raises(ValueError, match=failure):
+        evaluate_latency(rows)
+
+
+def test_fast_failed_tick_never_counts_as_performance_pass():
+    rows = _records(165, 48)
+    rows[-1]["result_status"] = "RECOVERABLE_DB_TIMEOUT"
+    with pytest.raises(ValueError, match="PR249_LATENCY_FAILED_TICK_NOT_ACCEPTABLE"):
+        evaluate_latency(rows)
+
+
+def test_missing_result_status_never_counts_as_performance_pass():
+    rows = _records(165, 48)
+    rows[-1].pop("result_status")
+    with pytest.raises(ValueError, match="PR249_LATENCY_FAILED_TICK_NOT_ACCEPTABLE"):
         evaluate_latency(rows)
