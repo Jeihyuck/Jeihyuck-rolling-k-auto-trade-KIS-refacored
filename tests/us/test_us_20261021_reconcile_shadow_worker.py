@@ -130,6 +130,19 @@ def test_reservation_worker_is_brokerless_and_has_separate_health_file(
             "consumed": 0, "attempted": 1, "unresolved": 0,
             "write_authority": "FENCED_ACCOUNT_RESERVATIONS_ONLY",
         }
+    import hashlib
+    from trader.us.execution.account_authority import AuthorityUnavailable
+    _account = "a" * 64
+    _epoch = "test-epoch"
+    _expected_digest = hashlib.sha256(
+        ("practice|" + _account + "|" + _epoch).encode("utf-8")
+    ).hexdigest()
+    _old_fake = fake_sweep
+    def fake_sweep(**kwargs):
+        return {
+            **_old_fake(**kwargs),
+            "account_scope_fingerprint": _expected_digest,
+        }
     monkeypatch.setattr(
         reserve_worker, "reconcile_proven_reservations_once", fake_sweep,
     )
@@ -143,6 +156,17 @@ def test_reservation_worker_is_brokerless_and_has_separate_health_file(
     assert data["released"] == 1 and data["read_status"] == "OK"
     assert data["write_authority"] == "FENCED_ACCOUNT_RESERVATIONS_ONLY"
     assert len(list(tmp_path.rglob("*.json"))) == 1
+    reserve_worker.assert_fresh_reservation_worker(
+        trade_date="2026-10-20", session_run_id="R-123",
+        env="practice", account_fingerprint=_account,
+        trading_epoch_id=_epoch,
+    )
+    with pytest.raises(AuthorityUnavailable, match="SCOPE_MISMATCH"):
+        reserve_worker.assert_fresh_reservation_worker(
+            trade_date="2026-10-20", session_run_id="R-123",
+            env="practice", account_fingerprint="b" * 64,
+            trading_epoch_id=_epoch,
+        )
     with pytest.raises(ValueError, match="ISO"):
         reserve_worker.reservation_report_path("../secrets", "session")
 
