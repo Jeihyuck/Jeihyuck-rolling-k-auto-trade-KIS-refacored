@@ -9,6 +9,7 @@ from trader.us.execution import reconcile_shadow_worker as worker
 def test_shadow_only_explicit_mode_and_invalid_modes_fail_closed():
     assert worker.parse_mode("legacy") == "LEGACY"
     assert worker.parse_mode("SHADOW") == "SHADOW"
+    assert worker.parse_mode("RESERVATION_ONLY") == "RESERVATION_ONLY"
     with pytest.raises(ValueError, match="not yet implemented"):
         worker.parse_mode("WORKER")
     with pytest.raises(ValueError):
@@ -114,3 +115,44 @@ def test_session_runner_reaches_actual_worker_lifecycle():
     assert "_shadow_reconcile_child.terminate()" in source
     assert "_shadow_reconcile_child.wait(timeout=5)" in source
     assert 'parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))' in source
+
+
+def test_reservation_worker_is_brokerless_and_has_separate_health_file(
+    tmp_path, monkeypatch,
+):
+    from trader.us.execution import reservation_reconcile_worker as reserve_worker
+    monkeypatch.setenv("US_RESERVATION_RECONCILE_DIR", str(tmp_path))
+    calls = []
+    def fake_sweep(**kwargs):
+        calls.append(kwargs)
+        return {
+            "mode": "RESERVATION_ONLY", "released": 1,
+            "consumed": 0, "attempted": 1, "unresolved": 0,
+            "write_authority": "FENCED_ACCOUNT_RESERVATIONS_ONLY",
+        }
+    monkeypatch.setattr(
+        reserve_worker, "reconcile_proven_reservations_once", fake_sweep,
+    )
+    assert reserve_worker.run_reservation_loop(
+        trade_date="2026-10-20", session_run_id="R-123",
+        env="practice", max_cycles=1,
+    ) == 0
+    assert calls == [{"env": "practice", "trade_date": "2026-10-20"}]
+    report = reserve_worker.reservation_report_path("2026-10-20", "R-123")
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["released"] == 1 and data["read_status"] == "OK"
+    assert data["write_authority"] == "FENCED_ACCOUNT_RESERVATIONS_ONLY"
+    assert len(list(tmp_path.rglob("*.json"))) == 1
+    with pytest.raises(ValueError, match="ISO"):
+        reserve_worker.reservation_report_path("../secrets", "session")
+
+
+def test_reservation_worker_session_activation_is_explicitly_gated():
+    import inspect
+    from trader.us.runner.trade_session_runner import run_trade_session
+    source = inspect.getsource(run_trade_session)
+    assert "US_RESERVATION_WORKER_REQUIRES_ACCOUNT_ATOMIC_GATE" in source
+    assert "US_ACCOUNT_RESERVATION_MODE" in source
+    assert "US_ATOMIC_CLAIM_OUTBOX_ENABLED" in source
+    assert "trader.us.execution.reservation_reconcile_worker" in source
+    assert "_shadow_reconcile_child.terminate()" in source
