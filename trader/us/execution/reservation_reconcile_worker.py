@@ -49,8 +49,13 @@ def reconcile_proven_reservations_once(
     lease = authority.acquire_lease(
         holder_id="reservation-worker:" + uuid.uuid4().hex, ttl_seconds=30,
     )
+    import hashlib
+    _digest = hashlib.sha256((
+        scope["env"] + "|" + scope["account_id"] + "|" + scope["trading_epoch_id"]
+    ).encode("utf-8")).hexdigest()
     result = {"mode": "RESERVATION_ONLY", "attempted": 0,
               "released": 0, "consumed": 0, "unresolved": 0,
+              "account_scope_fingerprint": _digest,
               "write_authority": "FENCED_ACCOUNT_RESERVATIONS_ONLY"}
     try:
         with engine.connect() as conn:
@@ -117,6 +122,47 @@ def reservation_report_path(trade_date: str, session_run_id: str):
     from trader.us.execution.reconcile_shadow_worker import safe_scope_token
     root = Path(os.getenv("US_RESERVATION_RECONCILE_DIR", "runtime/us/reconcile_reservations"))
     return root / str(trade_date) / (safe_scope_token(session_run_id) + ".json")
+
+
+def assert_fresh_reservation_worker(
+    *, trade_date: str, session_run_id: str,
+    env: str, account_fingerprint: str, trading_epoch_id: str,
+    max_age_sec: float = 45.0,
+) -> None:
+    """Fail closed if the exactly scoped Session reservation worker is absent.
+
+    A recent file is liveness evidence only, NOT broker terminal proof or
+    permission to bypass strategy/Risk/Claim/HTTP checks.
+    """
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+    if env != "practice" or not session_run_id or not trading_epoch_id:
+        raise AuthorityUnavailable("US_RESERVATION_WORKER_SCOPE_MISSING")
+    path = reservation_report_path(trade_date, session_run_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        sampled_at = datetime.fromisoformat(
+            str(payload["sampled_at_utc"]).replace("Z", "+00:00")
+        )
+        if sampled_at.tzinfo is None:
+            raise ValueError("worker timestamp lacks timezone")
+        lag = (datetime.now(timezone.utc) - sampled_at.astimezone(timezone.utc)).total_seconds()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise AuthorityUnavailable("US_RESERVATION_WORKER_HEALTH_UNAVAILABLE") from exc
+    expected = hashlib.sha256((
+        env + "|" + account_fingerprint + "|" + trading_epoch_id
+    ).encode("utf-8")).hexdigest()
+    if (
+        payload.get("mode") != "RESERVATION_ONLY"
+        or payload.get("write_authority") != "FENCED_ACCOUNT_RESERVATIONS_ONLY"
+        or payload.get("account_scope_fingerprint") != expected
+        or payload.get("trade_date") != trade_date
+        or payload.get("session_run_id") != session_run_id
+        or payload.get("read_status") not in {"OK", "DEGRADED"}
+        or lag < 0 or lag > max_age_sec
+    ):
+        raise AuthorityUnavailable("US_RESERVATION_WORKER_HEALTH_STALE_OR_SCOPE_MISMATCH")
 
 
 def run_reservation_loop(
