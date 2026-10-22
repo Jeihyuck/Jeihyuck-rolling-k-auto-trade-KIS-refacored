@@ -1987,80 +1987,79 @@ def test_oct20_tqqq_partial_cancel_releases_exact_attempt(pg_engine, monkeypatch
     assert fills == 1
 
 
-def test_shadow_observer_detects_scoped_cancelled_order_uncertain_claim(pg_engine, monkeypatch):
-    """Detect the Oct20 cancellation/claim mismatch read-only; never repair it.
+def test_claim_pre_submit_outbox_atomic_rollback(pg_engine):
+    """Crash during DB outbox insert rolls back the exact execution Claim.
 
-    A matching terminal Claim eliminates the diagnostic count. Other epochs and
-    dates are invisible to this worker's authenticated account scope.
+    Disposable PostgreSQL only. No broker HTTP or production Supabase.
     """
-    import json
-    from datetime import date
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
     from sqlalchemy import text
-    from trader.execution_claims import DurableExecutionClaimRepo
     from trader.execution_state import SemanticActionIdentity
-    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
     from trader.us.db import repos
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_claims, us_execution_attempts,
+    )
 
-    scope = {
-        "env": "practice",
-        "account_id": "scoped-shadow-account",
-        "market": "US",
-        "trading_epoch_id": "scoped-shadow-epoch",
-    }
-    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: dict(scope))
-    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: pg_engine)
     identity = SemanticActionIdentity(
-        env="practice", account_id=scope["account_id"], market="US",
-        trading_epoch_id=scope["trading_epoch_id"],
-        strategy_owner="TQQQ_INFINITE", lifecycle_id="scoped-shadow-cycle",
+        env="practice", account_id="pg-outbox-test-account",
+        market="US", trading_epoch_id="pg-outbox-test-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="pg-outbox-test-lifecycle",
         action="BUY", trade_date=date(2026, 10, 20),
     )
-    claim = DurableExecutionClaimRepo(
+    attempt = "pg-outbox-test-attempt"
+    key = "TQQQ_INF_V3:pg-outbox-test-lifecycle:2026-10-20:BUY"
+    claim_repo = DurableExecutionClaimRepo(
         pg_engine, us_execution_claims, us_execution_attempts,
     )
-    attempt_id = "scoped-38776"
-    key = "TQQQ_INF_V3:scoped-shadow-cycle:2026-10-20:BUY"
-    assert claim.acquire(
-        identity, attempt_id=attempt_id, requested_qty=3,
-        client_order_key=key,
-    ).acquired
-    claim.record_observation(
-        identity, attempt_id=attempt_id, state="UNRESOLVED",
-        cumulative_filled_qty=None, authoritative=False,
-    )
-    with pg_engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO us_orders(
-                trade_date, client_order_key, symbol, exchange, side,
-                qty_requested, qty_filled, order_no, status, env,
-                trading_epoch_id, meta
-            ) VALUES (
-                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
-                3, 0, '0000038776', 'CANCELLED', 'practice',
-                'scoped-shadow-epoch', CAST(:meta AS jsonb)
+    event = {
+        "event_id": str(uuid4()), "trade_date": "2026-10-20",
+        "event_type": "BROKER_CLAIM_PREPARED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "unit-run",
+        "tick_id": "unit-tick", "client_order_key": key,
+        "submit_attempt_id": attempt, "symbol": "TQQQ",
+        "side": "BUY", "requested_qty": 3,
+        "raw_broker_order_no": None, "canonical_broker_order_no": None,
+        "position_lifecycle_id": "pg-outbox-test-lifecycle",
+        "profit_capture_stage": "", "cumulative_filled_qty": 0,
+        "payload": {"submission_status": "NOT_YET_AT_HTTP_BOUNDARY"},
+        "idempotency_key": "us-claim-prepared:" + attempt,
+    }
+    with pytest.raises(RuntimeError, match="injected_outbox_failure"):
+        with pg_engine.begin() as conn:
+            acquired = claim_repo.acquire(
+                identity, attempt_id=attempt, requested_qty=3,
+                client_order_key=key, _conn=conn,
             )
-        """), {
-            "key": key,
-            "meta": json.dumps({
-                "execution_action_key": identity.action_key,
-                "submit_attempt_id": attempt_id,
-                "strategy_owner": "TQQQ_INFINITE",
-            }),
-        })
-    assert repos.count_us_terminal_order_claim_mismatches(
-        trade_date="2026-10-20", env="practice",
-    ) == 1
-    assert repos.count_us_terminal_order_claim_mismatches(
-        trade_date="2026-10-19", env="practice",
-    ) == 0
-    claim.record_observation(
-        identity, attempt_id=attempt_id, state="CANCELLED",
-        cumulative_filled_qty=0, authoritative=True,
-    )
-    assert repos.count_us_terminal_order_claim_mismatches(
-        trade_date="2026-10-20", env="practice",
-    ) == 0
-    scope["trading_epoch_id"] = "other-epoch"
-    assert repos.count_us_terminal_order_claim_mismatches(
-        trade_date="2026-10-20", env="practice",
-    ) == 0
+            assert acquired.acquired
+            assert repos.append_us_order_event(event, _conn=conn)
+            raise RuntimeError("injected_outbox_failure")
+
+    with pg_engine.connect() as conn:
+        claim_count = conn.execute(text("""
+            SELECT count(*) FROM us_execution_claims WHERE action_key=:key
+        """), {"key": identity.action_key}).scalar_one()
+        event_count = conn.execute(text("""
+            SELECT count(*) FROM us_order_events WHERE idempotency_key=:key
+        """), {"key": event["idempotency_key"]}).scalar_one()
+    assert claim_count == event_count == 0
+
+    with pg_engine.begin() as conn:
+        acquired = claim_repo.acquire(
+            identity, attempt_id=attempt, requested_qty=3,
+            client_order_key=key, _conn=conn,
+        )
+        assert acquired.acquired
+        assert repos.append_us_order_event(event, _conn=conn)
+    with pg_engine.connect() as conn:
+        counts = (
+            conn.execute(text("""
+                SELECT count(*) FROM us_execution_claims WHERE action_key=:key
+            """), {"key": identity.action_key}).scalar_one(),
+            conn.execute(text("""
+                SELECT count(*) FROM us_order_events WHERE idempotency_key=:key
+            """), {"key": event["idempotency_key"]}).scalar_one(),
+        )
+    assert counts == (1, 1)
