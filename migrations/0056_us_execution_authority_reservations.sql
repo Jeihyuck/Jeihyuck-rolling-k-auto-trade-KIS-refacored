@@ -40,3 +40,9 @@ CREATE INDEX IF NOT EXISTS ix_us_execution_reservation_scope
 -- operate account-wide reservations. Deployment must separately audit grants.
 ALTER TABLE us_execution_authority_leases ENABLE ROW LEVEL SECURITY;
 ALTER TABLE us_execution_account_reservations ENABLE ROW LEVEL SECURITY;
+
+-- The Supabase public schema may grant SELECT/INSERT to anon/authenticated
+-- via database-wide default privileges. RLS without policies protects rows,
+-- but the account coordinator must not be a public API surface at all.
+REVOKE ALL ON TABLE us_execution_authority_leases,
+  us_execution_account_reservations FROM PUBLIC, anon, authenticated;
