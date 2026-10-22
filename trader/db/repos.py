@@ -5405,6 +5405,17 @@ class FillsRepo:
             "portfolio_epoch_id": portfolio_epoch_id,
             **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
+        # A broker order cumulative snapshot has a stable *evidence* identity,
+        # but its qty and notional increase as the order fills. Do not append
+        # a second fill for 10->52 or 15->17, and never regress on a stale
+        # snapshot arriving after a newer one. Individual fills are immutable.
+        order_cumulative = bool(
+            (fill_meta_json or {}).get("evidence_kind") == "KIS_ORDER_CUMULATIVE_EXECUTION"
+        )
+        if order_cumulative:
+            if not broker_fill_id or not order_id or qty <= 0 or price <= 0:
+                raise RuntimeError("KR_CUMULATIVE_FILL_MISSING_IDENTITY_OR_PRICE")
+            update_cols.update({"qty": qty, "price": price})
         with self.engine.begin() as conn:
             if active_epoch_id is not None:
                 collision_conditions = [
@@ -5442,6 +5453,7 @@ class FillsRepo:
                 stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
                     index_elements=conflict_cols,
                     set_=update_cols,
+                    **({"where": self._schema.fills.c.qty <= qty} if order_cumulative else {}),
                 ).returning(self._schema.fills.c.fill_id)
                 res = conn.execute(stmt)
                 fill_id = res.scalar()
@@ -5459,7 +5471,9 @@ class FillsRepo:
                     # Update existing row
                     where_conditions = [self._schema.fills.c[col] == payload[col] for col in conflict_cols]
                     conn.execute(
-                        sa.update(self._schema.fills).where(and_(*where_conditions)).values(**update_cols)
+                        sa.update(self._schema.fills).where(and_(*where_conditions)).where(
+                            self._schema.fills.c.qty <= qty if order_cumulative else sa.true()
+                        ).values(**update_cols)
                     )
                     existing = conn.execute(
                         select(self._schema.fills.c.fill_id).where(and_(*where_conditions))
