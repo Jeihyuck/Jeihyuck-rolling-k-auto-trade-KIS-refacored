@@ -450,6 +450,47 @@ def load_active_execution_claim_attempts() -> list[dict]:
     return _execution_claim_repo().active_attempts(**_us_execution_claim_scope())
 
 
+def count_us_terminal_order_claim_mismatches(*, trade_date: str, env: str) -> int:
+    """Read-only exact claim/order mismatches for shadow diagnostics.
+
+    The query is account/epoch/environment scoped and cannot mutate broker
+    orders, journal, positions, fills, or execution claims. Missing identity
+    fails closed: zero means a *successful* check, never a DB error.
+    """
+    scope = _us_execution_claim_scope()
+    if (str(env).lower() != "practice"
+            or scope["env"] != "practice"
+            or not scope["account_id"]
+            or not scope["trading_epoch_id"]):
+        raise RuntimeError("shadow_claim_scope_missing_or_nonpractice")
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("shadow_claim_db_unavailable")
+    with engine.connect() as conn:
+        count = conn.execute(text("""
+            SELECT COUNT(*)
+            FROM us_orders AS o
+            JOIN us_execution_claims AS c
+              ON c.action_key = o.meta->>'execution_action_key'
+             AND c.active_attempt_id = o.meta->>'submit_attempt_id'
+             AND c.trade_date = o.trade_date
+             AND c.env = o.env
+             AND c.trading_epoch_id = o.trading_epoch_id
+            WHERE o.trade_date = :trade_date
+              AND o.env = :env
+              AND o.trading_epoch_id = :epoch
+              AND o.status IN ('CANCELLED', 'FILLED', 'REJECTED', 'EXPIRED')
+              AND c.account_id = :account
+              AND c.market = 'US'
+              AND c.action_state IN ('UNCERTAIN', 'IN_FLIGHT')
+        """), {
+            "trade_date": trade_date, "env": scope["env"],
+            "epoch": scope["trading_epoch_id"],
+            "account": scope["account_id"],
+        }).scalar_one()
+    return int(count)
+
+
 def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
     """Expose unresolved and unattributed broker truth in close/report health."""
     from trader.us.execution.order_journal import load_order_events
