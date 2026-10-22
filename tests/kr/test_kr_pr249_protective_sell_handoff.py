@@ -142,7 +142,7 @@ def test_engine_source_has_post_sell_buy_fence_and_owner_handoff():
     from trader import pb1_runner
     engine_source=getsource(PB1Engine.run)
     runner_source=getsource(pb1_runner.run_once)
-    assert "self._kr_post_exit_reconcile_ok" in engine_source
+    assert 'getattr(self, "_kr_post_exit_reconcile_ok", True)' in engine_source
     assert "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED" in engine_source
     assert runner_source.index("prove_safe_protective_sell_handoff(") < runner_source.index("reconcile_kis(")
     assert "deferred_full_reconcile" in runner_source
