@@ -21,7 +21,7 @@ def wait_for_shared_slot(
     account_scope: str, *, min_interval_sec: float,
     sleep_with_budget: Callable[[float], bool],
     root: str | None = None,
-) -> None:
+) -> float:
     """Reserve the next KIS HTTP start window across OS processes.
 
     Caller still enforces its endpoint-level limiter. Holding this flock
@@ -76,3 +76,6 @@ def wait_for_shared_slot(
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+    # This is the under-lock reserved native HTTP START slot, not the
+    # caller's completion time (which can be reordered by OS scheduling).
+    return slot
