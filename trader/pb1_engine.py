@@ -17702,6 +17702,20 @@ class PB1Engine:
         _after_exit = getattr(self, "_kr_after_protective_exit", None)
         if callable(_after_exit):
             _after_exit()
+        if not getattr(self, "_kr_post_exit_reconcile_ok", True):
+            # In a proved SELL-first lane, any failure of later broker
+            # reconciliation must block ALL new entries.  The already
+            # submitted protective SELL receipt remains durable; do not
+            # roll it back or re-submit. This is not an exit policy change.
+            order_allowed = False
+            entry_allowed = False
+            skip_entry_scan = True
+            self.order_allowed = False
+            self.entry_block_reason = "KR_POST_EXIT_BROKER_RECONCILE_UNVERIFIED"
+            logger.error(
+                "[KR_RECONCILE_LANES][ENTRY_FENCE] reason=POST_EXIT_BROKER_PROOF_UNVERIFIED "
+                "pb1_buy=BLOCKED kr_infinite_buy=BLOCKED protective_sell=ALREADY_EVALUATED"
+            )
 
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")
