@@ -1,5 +1,52 @@
 # US Stage 1–2–3: pre-merge evidence and practice cutover (2026-10-22)
 
+## 2026-10-22 PAPER default-ON change (supersedes previous default-OFF instructions)
+
+Canonical `scripts/wsl/run-us-am.sh` and `run-us-afternoon.sh` now
+source `scripts/wsl/us-stage123-paper-defaults.sh` **before the session**.
+For KIS `practice`, `DRY_RUN=0`, `US_PAPER_TRADING_ENABLED=1`,
+TRADE mode, non-offline, non-signal-only sessions, the supported
+Stage 1/2/3 profile is **ON by default**:
+
+```text
+US_STAGE123_PAPER_PROFILE=ON
+US_ATOMIC_CLAIM_OUTBOX_ENABLED=1
+US_ACCOUNT_RESERVATION_MODE=ENFORCE
+US_RECONCILE_WORKER_MODE=RESERVATION_ONLY
+US_SHARED_KIS_LIMITER_ENABLED=1
+US_EXIT_QUOTE_PREFETCH_ENABLED=1
+US_EARLY_HARD_STOP_PILOT_ENABLED=1
+US_EARLY_MULTI_HARD_STOP_ENABLED=1
+US_EARLY_SOFT_STOP_PILOT_ENABLED=1
+```
+
+This is **real KIS PRACTICE order-capable** execution, not dry-run. The
+unsupported full-authority `WORKER` is **NOT** turned on; it is still
+not implemented. Protection for remaining SELL types continues through
+the pre-existing canonical priority merge. Individual explicit OFF
+overrides while profile ON fail **before starting trading**, never silently
+fall back to an inconsistent mixed mode.
+
+The account coordinator migration `0056` was installed on the connected
+Supabase project (2026-10-22) and two new public-schema tables were verified
+RLS-enabled, with all anon/authenticated table privileges revoked. This does
+not prove the actual WSL broker account/epoch matches that project; the
+non-mutating `scripts/us_stage123_paper_preflight.py` checks real WSL
+DB access, active epoch and schema on every AM/Afternoon start, and blocks
+orders if any prerequisite is absent.
+
+Emergency reversible rollout **without reverting the entire code PR**:
+set `US_STAGE123_PAPER_PROFILE=OFF` for BOTH AM/Afternoon scheduler tasks,
+and ensure no individual Stage123 feature flag remains explicitly ON in
+the inherited environment. This restores the legacy behavior for subsequent
+sessions. Never force-release unresolved Claims or reservations.
+
+`US_STAGE123_PAPER_PROFILE=ON` for live KIS, DRY_RUN, offline or signal-only
+is rejected. Real KIS live account restrictions are unchanged.
+
+---
+
+
 ## 0. Meaning of "ready"
 
 This document is **not** a declaration that the full dual-writer architecture has
@@ -94,7 +141,7 @@ not enabling more flags.
 
 ## 4. Feature rollout sequence — no implied activation
 
-All new features default OFF. Use a practice-only controlled session and
+Canonical WSL practice TRADE sessions default Stage123 features ON. Use a practice-only controlled session and
 a human-reviewed configuration change. Start with legacy reconciliation and
 disabled account enforcement; verify baseline real KIS **practice** submit
 and original-order ledger. Do not enable account reservations before
