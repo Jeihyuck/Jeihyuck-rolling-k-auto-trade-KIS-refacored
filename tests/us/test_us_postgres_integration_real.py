@@ -2165,7 +2165,13 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
             attempt_id=attempt, client_order_key=key,
             strategy_owner="US_STANDARD", symbol="TQQQ", side="BUY", qty=3,
         )
-    ledger.release_before_submit(identity, attempt_id=attempt)
+    # A lost HTTP response must NOT cause a second identical broker POST
+    # from the same Claim/Attempt. The initial boundary transitions Attempt
+    # to SUBMITTED; a second attempt must fail even while reservation remains.
+    ledger.record_observation(
+        identity, attempt_id=attempt, state="SUBMITTED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
     with pytest.raises(AuthorityUnavailable, match="STALE"):
         authority.assert_reserved_submit_authority(
             attempt_id=attempt, client_order_key=key,
