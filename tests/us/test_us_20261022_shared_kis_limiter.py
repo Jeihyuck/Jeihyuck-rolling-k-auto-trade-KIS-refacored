@@ -17,15 +17,14 @@ def _budget_sleep(delay):
 def test_shared_pacing_serializes_same_account_across_client_instances(tmp_path):
     scope = "hashed-synthetic-account"
     def reserve_slot(_):
-        wait_for_shared_slot(
+        return wait_for_shared_slot(
             scope, min_interval_sec=0.085,
             root=str(tmp_path), sleep_with_budget=_budget_sleep,
         )
-        return time.monotonic()
     with ThreadPoolExecutor(max_workers=3) as executor:
         completed = list(executor.map(reserve_slot, range(3)))
     ordered = sorted(completed)
-    # File lock reservation and monotonic times must serialize all callers.
+    # Assert reserved HTTP start times under the lock, not thread wakeup times.
     assert ordered[1] - ordered[0] >= 0.060, ordered
     assert ordered[2] - ordered[1] >= 0.060, ordered
     files = list(tmp_path.glob("*.slot"))
