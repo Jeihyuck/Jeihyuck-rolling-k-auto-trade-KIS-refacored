@@ -2083,6 +2083,24 @@ def route_order(
 
     def _mark_broker_submit_boundary() -> None:
         nonlocal _http_boundary_mono
+        if os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE":
+            # The planned hold may have been revoked by a different process
+            # after atomic creation. Re-check the exact account/owner/Attempt
+            # against durable state *just before* native KIS HTTP starts.
+            try:
+                _account_authority.assert_reserved_submit_authority(
+                    attempt_id=str(intent["submit_attempt_id"]),
+                    client_order_key=str(order_key or ""),
+                    strategy_owner=str(
+                        intent.get("strategy_owner")
+                        or lifecycle_meta.get("strategy_owner") or ""
+                    ).strip().upper(),
+                    symbol=symbol_upper, side=side, qty=qty,
+                )
+            except Exception as _reservation_exc:
+                raise KisUSPreSubmitError(
+                    "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP"
+                ) from _reservation_exc
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )
