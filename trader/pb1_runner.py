@@ -5947,6 +5947,19 @@ def run_once(
         return reconcile_ok_local, close_stale_ok_local
 
     if exit_reconcile_first:
+        # CLOSE bypasses the ordinary run registration below. Register the
+        # actual execution owner before broker reads and order submission.
+        close_run_id = str(os.getenv("TRADER_RUN_ID") or "").strip()
+        if not close_run_id:
+            raise RuntimeError("KR_CLOSE_DURABLE_RUN_ID_REQUIRED")
+        close_run_repo = RunsRepo(engine)
+        close_run_repo.upsert_run(
+            run_id=close_run_id, env=env_effective, strategy="pb1_pullback_close",
+            ts_start=now, run_window="close", phase="exit",
+            event_name=event_name_lower, dry_run=bool(dry_run),
+        )
+        ctx.run_id = close_run_id
+        logger.info("[KR_CLOSE][RUN_REGISTERED] run_id=%s strategy=pb1_pullback_close", close_run_id)
         logger.info(
             "[KR_CLOSE][PREPOLICY_RECONCILE] start remaining_s=%.1f continue_to_owner_policy=1",
             remaining_s,
@@ -6096,6 +6109,10 @@ def run_once(
                     "[KR_CLOSE][SELL_EVIDENCE_QUEUE][READ_FAIL] err_type=%s "
                     "action=RETAIN_PENDING_NO_RETRY", type(exc).__name__,
                 )
+        close_run_repo.finish_run(
+            close_run_id, status="OK",
+            notes="CLOSE_POLICY_ACK_ONLY_NOT_ECONOMIC_FILL",
+        )
         return [], True, {
             "buy_orders": 0,
             "sell_orders": accepted_policy_sells,
@@ -9271,6 +9288,17 @@ def main() -> int:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
+        # On CLOSE exceptions, mark any registered run terminal before
+        # writing the session summary; never create a placeholder here.
+        if _resolve_session_kind() == "close" and os.getenv("TRADER_RUN_ID"):
+            try:
+                RunsRepo(engine).finish_run(
+                    os.environ["TRADER_RUN_ID"],
+                    status="OK" if result_status == "OK_CLOSE_POLICY" else "ERROR",
+                    notes="CLOSE_ACK_SEPARATE_FROM_ECONOMIC_SETTLEMENT",
+                )
+            except Exception:
+                logger.exception("[KR_CLOSE][RUN_TERMINAL][FAIL] preserve_unresolved=1")
         os.environ["PB1_LAST_RESULT_STATUS"] = str(result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(main_exit_reason)
         normalized = normalize_session_result(
