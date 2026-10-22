@@ -1362,13 +1362,19 @@ def run_trade_session(
         skipped_slot_count = 0
         timeout_blocked_symbol_sides: set[tuple[str, str]] = set()
         timeout_entry_block = False
-        # Worker-mode authority is NOT released. The only non-legacy option
-        # is read-only SHADOW diagnostics in the actual session lifecycle.
+        # WORKER mode remains blocked: this child has authority to settle
+        # verified account reservations only, never KIS orders, fills or
+        # execution Claims. Default LEGACY remains unchanged.
         from trader.us.execution.reconcile_shadow_worker import parse_mode
         _reconcile_mode = parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))
-        if _reconcile_mode == "SHADOW":
+        if _reconcile_mode in {"SHADOW", "RESERVATION_ONLY"}:
             if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
-                raise RuntimeError("US_SHADOW_RECONCILE_PRACTICE_ONLY")
+                raise RuntimeError("US_RECONCILE_CHILD_PRACTICE_ONLY")
+            if _reconcile_mode == "RESERVATION_ONLY" and not (
+                os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
+                and os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") == "1"
+            ):
+                raise RuntimeError("US_RESERVATION_WORKER_REQUIRES_ACCOUNT_ATOMIC_GATE")
             _shadow_env = dict(os.environ)
             # Keep CANO/product identity for the SAME canonical hashed
             # account-scope derivation as the parent. They are never logged.
@@ -1379,11 +1385,15 @@ def run_trade_session(
             ):
                 _shadow_env.pop(_name, None)
             _shadow_env["US_OFFLINE"] = "1"
-            _shadow_env["US_RECONCILE_WORKER_MODE"] = "SHADOW"
+            _shadow_env["US_RECONCILE_WORKER_MODE"] = _reconcile_mode
             _shadow_reconcile_child = subprocess.Popen(
                 [
                     sys.executable, "-m",
-                    "trader.us.execution.reconcile_shadow_worker",
+                    (
+                        "trader.us.execution.reservation_reconcile_worker"
+                        if _reconcile_mode == "RESERVATION_ONLY"
+                        else "trader.us.execution.reconcile_shadow_worker"
+                    ),
                     "--trade-date", trade_date,
                     "--session-run-id", session_run_id,
                     "--env", "practice",
@@ -1394,9 +1404,10 @@ def run_trade_session(
                 env=_shadow_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             logger.info(
-                "[US_SHADOW_RECONCILE][STARTED] session=%s run=%s pid=%s "
-                "authority=READ_ONLY broker_access=NONE",
+                "[US_RECONCILE_CHILD][STARTED] session=%s run=%s pid=%s "
+                "authority=%s broker_access=NONE",
                 session, session_run_id, _shadow_reconcile_child.pid,
+                ("RESERVATIONS_ONLY" if _reconcile_mode == "RESERVATION_ONLY" else "READ_ONLY"),
             )
         try:
             while True:
@@ -1411,8 +1422,12 @@ def run_trade_session(
                     _shadow_reconcile_child = None
                 elif _shadow_reconcile_child is not None:
                     try:
-                        from trader.us.execution.reconcile_shadow_worker import observer_report_path
-                        _shadow_report_path = observer_report_path(trade_date, session_run_id)
+                        if _reconcile_mode == "RESERVATION_ONLY":
+                            from trader.us.execution.reservation_reconcile_worker import reservation_report_path
+                            _shadow_report_path = reservation_report_path(trade_date, session_run_id)
+                        else:
+                            from trader.us.execution.reconcile_shadow_worker import observer_report_path
+                            _shadow_report_path = observer_report_path(trade_date, session_run_id)
                         if _shadow_report_path.is_file():
                             _shadow_report = json.loads(
                                 _shadow_report_path.read_text(encoding="utf-8")
