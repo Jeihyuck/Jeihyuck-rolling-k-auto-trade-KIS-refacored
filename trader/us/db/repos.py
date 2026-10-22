@@ -378,10 +378,12 @@ def _execution_claim_repo():
 
 def claim_execution_action(identity: Any, *, attempt_id: str, requested_qty: int,
                            fresh_validation: bool = False,
-                           client_order_key: str | None = None):
+                           client_order_key: str | None = None,
+                           _conn: Any = None):
     return _execution_claim_repo().acquire(
         identity, attempt_id=attempt_id, requested_qty=requested_qty,
         fresh_validation=fresh_validation, client_order_key=client_order_key,
+        _conn=_conn,
     )
 
 
@@ -1167,50 +1169,56 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
     conn.execute(text(sql), params)
 
 
-def append_us_order_event(event: dict) -> bool:
+def append_us_order_event(event: dict, *, _conn: Any = None) -> bool:
     """Idempotently persist the authoritative order lifecycle event."""
     engine = _get_engine_or_none()
     if engine is None:
+        if _conn is not None:
+            raise RuntimeError("US_EXECUTION_EVENT_DB_UNAVAILABLE")
         return False
-    try:
-        with engine.begin() as conn:
-            trading_epoch_id = _active_us_epoch(conn)
-            payload = _parse_json_meta(event.get("payload") or {})
-            params = {**event}
-            if trading_epoch_id:
-                payload["trading_epoch_id"] = trading_epoch_id
-                params["trading_epoch_id"] = trading_epoch_id
-                sql = """
-                    INSERT INTO us_order_events
-                    (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,trading_epoch_id,
-                     client_order_key,submit_attempt_id,symbol,side,requested_qty,
-                     raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
-                     profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
-                    VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
-                     :session,:session_run_id,:tick_id,:trading_epoch_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
-                     :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
-                     :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
-                    ON CONFLICT (idempotency_key) DO NOTHING
-                """
-            else:
-                sql = """
-                    INSERT INTO us_order_events
-                    (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,
-                     client_order_key,submit_attempt_id,symbol,side,requested_qty,
-                     raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
-                     profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
-                    VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
-                     :session,:session_run_id,:tick_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
-                     :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
-                     :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
-                    ON CONFLICT (idempotency_key) DO NOTHING
-                """
-            params["payload"] = _json_param(payload)
-            conn.execute(text(sql), params)
-        return True
-    except Exception as exc:
-        logger.error("[US_ORDER_EVENT][DB_APPEND_FAILED] %s", exc)
-        return False
+    if _conn is None:
+        try:
+            with engine.begin() as conn:
+                return append_us_order_event(event, _conn=conn)
+        except Exception as exc:
+            logger.error("[US_ORDER_EVENT][DB_APPEND_FAILED] %s", exc)
+            return False
+    # Caller-owned transaction: failure MUST rollback Claim and DB outbox.
+    conn = _conn
+    trading_epoch_id = _active_us_epoch(conn)
+    payload = _parse_json_meta(event.get("payload") or {})
+    params = {**event}
+    if trading_epoch_id:
+        payload["trading_epoch_id"] = trading_epoch_id
+        params["trading_epoch_id"] = trading_epoch_id
+        sql = """
+            INSERT INTO us_order_events
+            (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,trading_epoch_id,
+             client_order_key,submit_attempt_id,symbol,side,requested_qty,
+             raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
+             profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
+            VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
+             :session,:session_run_id,:tick_id,:trading_epoch_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
+             :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
+             :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
+            ON CONFLICT (idempotency_key) DO NOTHING
+        """
+    else:
+        sql = """
+            INSERT INTO us_order_events
+            (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,
+             client_order_key,submit_attempt_id,symbol,side,requested_qty,
+             raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
+             profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
+            VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
+             :session,:session_run_id,:tick_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
+             :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
+             :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
+            ON CONFLICT (idempotency_key) DO NOTHING
+        """
+    params["payload"] = _json_param(payload)
+    conn.execute(text(sql), params)
+    return True
 
 
 def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> list[dict] | None:
