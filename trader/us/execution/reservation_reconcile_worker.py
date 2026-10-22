@@ -88,9 +88,42 @@ def reconcile_proven_reservations_once(
                 "epoch": scope["trading_epoch_id"],
                 "trade_date": trade_date, "limit": min(100, max(1, int(max_candidates))),
             }).mappings().all()
-        for row in rows:
+        # A Router can prove it never crossed HTTP and abandon the Attempt
+        # before us_orders exists. It has no broker terminal record; a second,
+        # strictly scoped path releases those durable *pre-submit* holds only.
+        with engine.connect() as conn:
+            pre_submit_aborts = conn.execute(text("""
+                SELECT r.action_key AS attempt_id, a.client_order_key,
+                       NULL::DATE AS source_trade_date,
+                       'ABANDONED_PRE_SUBMIT' AS attempt_state
+                FROM us_execution_account_reservations AS r
+                JOIN us_execution_attempts AS a ON a.attempt_id=r.action_key
+                JOIN us_execution_claims AS c ON c.action_key=a.action_key
+                WHERE r.env=:env AND r.account_fingerprint=:account
+                  AND r.trading_epoch_id=:epoch
+                  AND c.env=:env AND c.account_id=:account
+                  AND c.trading_epoch_id=:epoch
+                  AND r.state='RESERVED'
+                  AND a.authoritative IS TRUE
+                  AND a.attempt_state='ABANDONED_PRE_SUBMIT'
+                  AND c.active_attempt_id IS DISTINCT FROM a.attempt_id
+                  AND a.client_order_key IS NOT NULL
+                ORDER BY r.created_at LIMIT :limit
+            """), {
+                "env": "practice", "account": scope["account_id"],
+                "epoch": scope["trading_epoch_id"],
+                "limit": min(100, max(1, int(max_candidates))),
+            }).mappings().all()
+        for row in list(rows) + list(pre_submit_aborts):
             result["attempted"] += 1
             try:
+                if str(row.get("attempt_state") or "") == "ABANDONED_PRE_SUBMIT":
+                    authority.release_proven_pre_submit_abort(
+                        lease=lease, attempt_id=str(row["attempt_id"]),
+                        client_order_key=str(row["client_order_key"]),
+                    )
+                    result["released"] += 1
+                    continue
                 receipt = authority.terminalize_verified_attempt(
                     lease=lease, attempt_id=str(row["attempt_id"]),
                     client_order_key=str(row["client_order_key"]),
