@@ -10,9 +10,11 @@ import pytest
 
 
 @pytest.mark.parametrize("early_enabled", [False, True])
+@pytest.mark.parametrize("multi_enabled", [False, True])
 @pytest.mark.parametrize("route_status", ["ACK", "BROKER_SUBMIT_RESULT_UNKNOWN"])
+@pytest.mark.parametrize("soft_stop_mode", [False, True])
 def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
-    monkeypatch, early_enabled, route_status,
+    monkeypatch, early_enabled, multi_enabled, route_status, soft_stop_mode,
 ):
     from tests.us.test_us_exit_first_routing import _patch_tick_basics
     from trader.us.db import repos
@@ -23,6 +25,8 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     calls = []
     _patch_tick_basics(monkeypatch, calls)
     monkeypatch.setenv("US_EARLY_HARD_STOP_PILOT_ENABLED", "1" if early_enabled else "0")
+    monkeypatch.setenv("US_EARLY_MULTI_HARD_STOP_ENABLED", "1" if multi_enabled else "0")
+    monkeypatch.setenv("US_EARLY_SOFT_STOP_PILOT_ENABLED", "1" if soft_stop_mode else "0")
     monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0")
     monkeypatch.setenv("US_ENTRY_ENABLED", "0")
     monkeypatch.setenv("KIS_ENV", "practice")
@@ -46,6 +50,13 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
          "entry_price": 100.0, "current_price_usd": 101.0,
          "position_lifecycle_id": "B-LIFE"},
     ]
+    if multi_enabled:
+        positions.append({
+            "symbol": "CCC", "strategy_owner": "US_STANDARD",
+            "exchange": "NASDAQ", "qty": 2, "orderable_qty": 2,
+            "entry_price": 100.0, "current_price_usd": 101.0,
+            "position_lifecycle_id": "C-LIFE",
+        })
 
     class QuoteProvider:
         stats = {"daily_http_call_count": 0}
@@ -54,7 +65,10 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
 
         def get_current_price(self, symbol, exchange):
             calls.append(("quote_" + symbol, None, {}))
-            return {"last": "90.0" if symbol == "AAA" else "101.0"}
+            return {
+                "last": ("94.0" if soft_stop_mode else "90.0")
+                if symbol == "AAA" else ("90.0" if multi_enabled and symbol == "BBB" else "101.0")
+            }
 
         def get_orderable_cash(self, symbol, exchange, price):
             return 10000.0
@@ -66,7 +80,7 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     monkeypatch.setattr(
         "trader.us.execution.reconcile.reconcile_positions",
         lambda **kwargs: {
-            "status": "OK", "positions": positions, "position_count": 2,
+            "status": "OK", "positions": positions, "position_count": len(positions),
             "position_symbols": ["AAA", "BBB"], "authoritative_positions": True,
             "balance_fetch_status": "OK", "balance_parse_status": "OK",
             "preserve_previous_positions": False,
@@ -101,7 +115,7 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     state_updates = {"risk": [], "hwm": []}
     def update_risk(**kwargs):
         state_updates["risk"].append(kwargs["symbol"])
-        return {"soft_stop_breach_count": 0}
+        return {"soft_stop_breach_count": 2 if soft_stop_mode and kwargs["symbol"] == "AAA" else 0}
     def update_hwm(**kwargs):
         state_updates["hwm"].append(kwargs["symbol"])
         return {
@@ -158,14 +172,23 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
     events = [call[0] for call in calls]
     assert events.count("submit_AAA") == 1, events
     assert "quote_BBB" in events
-    if early_enabled:
+    if early_enabled and (not soft_stop_mode or multi_enabled):
         assert events.index("submit_AAA") < events.index("quote_BBB"), events
     else:
         assert events.index("quote_BBB") < events.index("submit_AAA"), events
-    assert result["exit_intents"] == 1
-    assert result["orders"][0]["status"] == route_status
+    assert result["exit_intents"] == (2 if multi_enabled else 1)
+    assert all(order["status"] == route_status for order in result["orders"])
+    if multi_enabled:
+        assert events.count("submit_BBB") == 1, events
+        if early_enabled:
+            assert events.index("submit_BBB") < events.index("quote_CCC"), events
+        else:
+            assert events.index("quote_CCC") < events.index("submit_BBB"), events
     # Safety-pass streaming may not repeat soft-stop ticks or high-watermarks.
     assert state_updates["risk"].count("AAA") == 1
     assert state_updates["risk"].count("BBB") == 1
     assert state_updates["hwm"].count("AAA") == 1
     assert state_updates["hwm"].count("BBB") == 1
+    if multi_enabled:
+        assert state_updates["risk"].count("CCC") == 1
+        assert state_updates["hwm"].count("CCC") == 1

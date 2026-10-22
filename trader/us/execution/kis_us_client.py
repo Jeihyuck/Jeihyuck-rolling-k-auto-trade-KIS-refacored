@@ -1377,6 +1377,25 @@ class KisUSClient:
                     f"rate-limit wait exceeds tick deadline path={path}"
                 )
         
+        # Optional cross-process, account-wide pacing. Endpoint clocks are
+        # local to each KIS client and cannot prevent a WSL Session + Worker
+        # from bursting the same account simultaneously.
+        if os.getenv("US_SHARED_KIS_LIMITER_ENABLED", "0") == "1":
+            try:
+                from trader.account_state import get_account_key
+                from trader.us.execution.shared_kis_limiter import wait_for_shared_slot
+                wait_for_shared_slot(
+                    get_account_key(env=self._env),
+                    min_interval_sec=max(
+                        min_sec,
+                        float(os.getenv("US_SHARED_KIS_HTTP_MIN_INTERVAL_SEC", "0.35")),
+                    ),
+                    sleep_with_budget=self._sleep_with_budget,
+                )
+            except Exception as exc:
+                raise KisUSTemporaryError(
+                    "account_scoped_shared_KIS_limiter_unavailable"
+                ) from exc
         self._last_request_time[endpoint_key] = time.time()
 
     def _is_temporary_error(self, err: Exception, data: dict | None = None) -> bool:

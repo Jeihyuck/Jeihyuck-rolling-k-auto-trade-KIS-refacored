@@ -1843,13 +1843,129 @@ def route_order(
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation
-        claim = claim_execution_action(
-            claim_identity,
-            attempt_id=intent["submit_attempt_id"],
-            requested_qty=qty,
-            fresh_validation=True,
-            client_order_key=str(order_key or ""),
+        # Stage A: persist the Claim and an immutable PRE-SUBMIT DB outbox
+        # marker atomically.  The existing fsync journal below still proves
+        # progression toward the HTTP boundary; this marker alone NEVER
+        # proves KIS submission, ACK, or fill.  Default OFF until cutover.
+        _atomic_claim_outbox = (
+            os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") == "1"
+            and account_env == "practice" and _native_kis
         )
+        if (
+            os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
+            and not _atomic_claim_outbox
+        ):
+            raise RuntimeError("US_RESERVATION_REQUIRES_ATOMIC_CLAIM_OUTBOX_PRACTICE_NATIVE")
+        if _atomic_claim_outbox:
+            from datetime import datetime as _utc_datetime, timezone as _utc_timezone
+            from uuid import uuid4 as _outbox_uuid4
+            from trader.us.db.repos import _get_engine_or_none, append_us_order_event
+            _outbox_engine = _get_engine_or_none()
+            if _outbox_engine is None:
+                raise RuntimeError("US_ATOMIC_CLAIM_OUTBOX_DB_UNAVAILABLE")
+            _outbox_attempt = str(intent["submit_attempt_id"])
+            _account_reservation_required = (
+                os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
+            )
+            _account_authority = None
+            _account_lease = None
+            if _account_reservation_required:
+                from trader.us.db.repos import _us_execution_claim_scope
+                from trader.us.execution.account_authority import AccountExecutionAuthority
+                _account_scope = _us_execution_claim_scope()
+                if os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") != "RESERVATION_ONLY":
+                    raise RuntimeError("US_RESERVATION_WORKER_MODE_NOT_ACTIVE")
+                from trader.us.execution.reservation_reconcile_worker import (
+                    assert_fresh_reservation_worker,
+                )
+                assert_fresh_reservation_worker(
+                    trade_date=str(trade_date),
+                    session_run_id=str(
+                        intent.get("session_run_id")
+                        or getattr(context, "session_run_id", "") or ""
+                    ),
+                    env=_account_scope["env"],
+                    account_fingerprint=_account_scope["account_id"],
+                    trading_epoch_id=_account_scope["trading_epoch_id"],
+                )
+                _account_authority = AccountExecutionAuthority(
+                    _outbox_engine,
+                    env=_account_scope["env"],
+                    account_fingerprint=_account_scope["account_id"],
+                    trading_epoch_id=_account_scope["trading_epoch_id"],
+                )
+                _account_lease = _account_authority.acquire_lease(
+                    holder_id="route:" + _outbox_attempt, ttl_seconds=30,
+                )
+            try:
+                with _outbox_engine.begin() as _outbox_conn:
+                    claim = claim_execution_action(
+                        claim_identity,
+                        attempt_id=_outbox_attempt,
+                        requested_qty=qty,
+                        fresh_validation=True,
+                        client_order_key=str(order_key or ""),
+                        _conn=_outbox_conn,
+                    )
+                    if claim.acquired:
+                        if _account_reservation_required:
+                            _account_authority.reserve(
+                                lease=_account_lease,
+                                action_key=_outbox_attempt,
+                                strategy_owner=str(
+                                    intent.get("strategy_owner")
+                                    or lifecycle_meta.get("strategy_owner") or ""
+                                ).strip().upper(),
+                                symbol=symbol_upper,
+                                side=side,
+                                qty=qty,
+                                price_usd=(
+                                    float(price)
+                                    * float(os.getenv("US_BROKER_ORDERABLE_CASH_SAFETY_BUFFER", "1.01"))
+                                    if side == "BUY" else float(price)
+                                ),
+                                broker_cash_usd=broker_cash if side == "BUY" else None,
+                                broker_available_shares=broker_orderable_qty if side == "SELL" else None,
+                                _conn=_outbox_conn,
+                            )
+                        _outbox_event = {
+                            "event_id": str(_outbox_uuid4()),
+                            "trade_date": str(trade_date),
+                            "event_type": "BROKER_CLAIM_PREPARED",
+                            "event_timestamp": _utc_datetime.now(_utc_timezone.utc).isoformat(),
+                            "session": str(intent.get("session") or getattr(context, "session", "") or ""),
+                            "session_run_id": str(intent.get("session_run_id") or getattr(context, "session_run_id", "") or ""),
+                            "tick_id": str(intent.get("tick_id") or getattr(context, "tick_id", "") or ""),
+                            "client_order_key": str(order_key or ""),
+                            "submit_attempt_id": _outbox_attempt,
+                            "symbol": symbol_upper,
+                            "side": side,
+                            "requested_qty": int(qty),
+                            "raw_broker_order_no": None,
+                            "canonical_broker_order_no": None,
+                            "position_lifecycle_id": str(intent.get("position_lifecycle_id") or lifecycle_meta.get("position_lifecycle_id") or ""),
+                            "profit_capture_stage": str(lifecycle_meta.get("profit_capture_stage") or ""),
+                            "cumulative_filled_qty": 0,
+                            "payload": {
+                                "execution_action_key": claim.action_key,
+                                "strategy_owner": str(intent.get("strategy_owner") or lifecycle_meta.get("strategy_owner") or ""),
+                                "submission_status": "NOT_YET_AT_HTTP_BOUNDARY",
+                            },
+                            "idempotency_key": "us-claim-prepared:" + _outbox_attempt,
+                        }
+                        if append_us_order_event(_outbox_event, _conn=_outbox_conn) is not True:
+                            raise RuntimeError("US_ATOMIC_CLAIM_OUTBOX_WRITE_FAILED")
+            finally:
+                if _account_lease is not None:
+                    _account_authority.release_lease(lease=_account_lease)
+        else:
+            claim = claim_execution_action(
+                claim_identity,
+                attempt_id=intent["submit_attempt_id"],
+                requested_qty=qty,
+                fresh_validation=True,
+                client_order_key=str(order_key or ""),
+            )
         if not claim.acquired:
             logger.error(
                 "[US_ORDER][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
@@ -1967,6 +2083,24 @@ def route_order(
 
     def _mark_broker_submit_boundary() -> None:
         nonlocal _http_boundary_mono
+        if os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE":
+            # The planned hold may have been revoked by a different process
+            # after atomic creation. Re-check the exact account/owner/Attempt
+            # against durable state *just before* native KIS HTTP starts.
+            try:
+                _account_authority.assert_reserved_submit_authority(
+                    attempt_id=str(intent["submit_attempt_id"]),
+                    client_order_key=str(order_key or ""),
+                    strategy_owner=str(
+                        intent.get("strategy_owner")
+                        or lifecycle_meta.get("strategy_owner") or ""
+                    ).strip().upper(),
+                    symbol=symbol_upper, side=side, qty=qty,
+                )
+            except Exception as _reservation_exc:
+                raise KisUSPreSubmitError(
+                    "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP"
+                ) from _reservation_exc
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )

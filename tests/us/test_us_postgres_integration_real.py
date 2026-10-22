@@ -1622,3 +1622,805 @@ def test_equal_qty_price_synthetic_broker_promotion_preserves_unique_tuple(pg_en
     assert fills[0]["meta"]["original_synthetic_evidence_type"]=="BALANCE_DELTA_SYNTHETIC"
     assert order["status"]=="FILLED"
     assert order["qty_filled"]==4
+
+
+def test_oct20_cancelled_tqqq_uncertain_claim_recovers_with_proven_semantic_qty(
+    pg_engine, monkeypatch, tmp_path,
+):
+    """Real PostgreSQL path: broker-open=0, action remaining=3, Claim RETRYABLE.
+
+    All test data are in the disposable CI PostgreSQL service; no real KIS or
+    operating database is touched.  This repros the mismatched Oct20 lifecycle.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    from trader.us.infinite.repository import InfiniteRepository
+    from trader.us.db import repos
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "us-journal"))
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda *_a, **_k: "pg-tqqq-epoch")
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id="pg-tqqq-account", market="US",
+        trading_epoch_id="pg-tqqq-epoch",
+        strategy_owner="TQQQ_INFINITE",
+        lifecycle_id="pg-tqqq-cycle",
+        action="TQQQ_INFINITE_BUY",
+        trade_date=date(2026, 10, 20),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    key = "TQQQ_INF_V3:pg-tqqq-cycle:2026-10-20:BUY"
+    attempt_id = "pg-tqqq-attempt-38776"
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt_id, requested_qty=3, client_order_key=key,
+    ).acquired
+    claim_repo.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    meta = {
+        "execution_action_key": identity.action_key,
+        "submit_attempt_id": attempt_id,
+        "tqqq_ttl_cancel_result": {
+            "rt_cd": "0", "msg_cd": "40630000",
+            "output": {"ODNO": "0000038961"},
+        },
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env,
+                trading_epoch_id, meta
+            ) VALUES (
+                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                3, 0, '0000038776', 'CANCELLED', 'practice',
+                'pg-tqqq-epoch', CAST(:meta AS jsonb)
+            )
+        """), {"key": key, "meta": json.dumps(meta)})
+
+    repo = InfiniteRepository(pg_engine)
+    rows = repo.load_cancelled_uncertain_buy_orders(symbol="TQQQ")
+    assert len(rows) == 1
+    assert claim_repo.get(identity).action_state == "UNCERTAIN"
+
+    observed = {
+        "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+        "status": "CANCELLED", "requested_qty": 3,
+        "requested_qty_present": True, "filled_qty": 0,
+        "filled_qty_present": True, "remaining_qty": 0,
+        "remaining_qty_present": True, "broker_open_qty": 0,
+        "broker_open_qty_present": True,
+        "evidence_type": "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        "observed_at": "2026-10-20T14:17:00+00:00",
+    }
+    updated = repo.apply_ttl_terminal_observation(rows[0], observed)
+    assert updated["status"] == "OK"
+    assert updated["authoritative"] is True
+    assert updated["semantic_action_remaining_qty"] == 3
+    assert updated["broker_open_qty"] == 0
+    snapshot = claim_repo.get(identity)
+    assert snapshot.action_state == "RETRYABLE"
+    assert snapshot.remaining_target_qty == 3
+    assert snapshot.active_attempt_id is None
+    with pg_engine.connect() as conn:
+        db_row = conn.execute(text("""
+            SELECT status, qty_filled, meta FROM us_orders
+            WHERE trade_date='2026-10-20' AND client_order_key=:key
+        """), {"key": key}).mappings().one()
+    assert db_row["status"] == "CANCELLED"
+    assert db_row["qty_filled"] == 0
+    assert db_row["meta"]["broker_open_qty"] == 0
+    assert db_row["meta"]["semantic_action_remaining_qty"] == 3
+    assert repo.load_cancelled_uncertain_buy_orders(symbol="TQQQ") == []
+
+
+def test_oct20_zero_fill_cancel_and_claim_update_are_one_pg_transaction(pg_engine, monkeypatch, tmp_path):
+    """One failure cannot create CANCELLED local order with UNCERTAIN Claim.
+
+    Real PostgreSQL fixture is disposable CI only. KIS is never called.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_attempts, us_execution_claims
+    from trader.us.db import repos
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    identity = SemanticActionIdentity(
+        env="practice", account_id="atomic-tqqq-account",
+        market="US", trading_epoch_id="atomic-tqqq-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="atomic-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    key = "TQQQ_INF_V3:atomic-cycle:2026-10-20:BUY"
+    attempt = "attempt-atomic-38776"
+    assert claim_repo.acquire(
+        identity, attempt_id=attempt, requested_qty=3, client_order_key=key,
+    ).acquired
+    claim_repo.record_observation(
+        identity, attempt_id=attempt, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders
+                (trade_date, client_order_key, symbol, exchange, side,
+                 qty_requested, qty_filled, order_no, status, env,
+                 trading_epoch_id, meta)
+            VALUES ('2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                    3, 0, '0000038776', 'ACK', 'practice',
+                    'atomic-tqqq-epoch', CAST(:meta AS jsonb))
+        """), {
+            "key": key, "meta": json.dumps({
+                "execution_action_key": identity.action_key,
+                "submit_attempt_id": attempt,
+                "strategy_owner": "TQQQ_INFINITE",
+            }),
+        })
+
+    evidence = {
+        "trade_date": "2026-10-20", "client_order_key": key,
+        "raw_order_no": "0000038776", "canonical_order_no": "38776",
+        "symbol": "TQQQ", "side": "BUY", "requested_qty": 3,
+        "filled_qty": 0, "remaining_qty": 3, "broker_open_qty": 0,
+        "broker_status": "CANCELLED",
+        "evidence_type": "TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        "raw_row": {
+            "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+            "status": "CANCELLED", "requested_qty": 3,
+            "requested_qty_present": True,
+            "filled_qty": 0, "filled_qty_present": True,
+            "remaining_qty": 0, "remaining_qty_present": True,
+            "broker_open_qty": 0, "broker_open_qty_present": True,
+        },
+    }
+
+    actual = repos.record_execution_action_observation_by_key
+    def failed_claim(*args, **kwargs):
+        assert kwargs.get("_conn") is not None
+        raise RuntimeError("injected_claim_db_failure")
+    monkeypatch.setattr(repos, "record_execution_action_observation_by_key", failed_claim)
+    failed = repos.apply_broker_order_observation(**evidence)
+    assert failed["status"] == "RECONCILE_UPDATE_FAILED"
+    assert failed["retry_order"] is False
+    assert failed["entry_fence"] is True
+    with pg_engine.connect() as conn:
+        state = conn.execute(text(
+            "SELECT status FROM us_orders WHERE client_order_key=:key"
+        ), {"key": key}).scalar_one()
+    assert state == "ACK", "order status must rollback with failed Claim write"
+    assert claim_repo.get(identity).action_state == "UNCERTAIN"
+
+    monkeypatch.setattr(repos, "record_execution_action_observation_by_key", actual)
+    success = repos.apply_broker_order_observation(**evidence)
+    assert success["status"] == "OK"
+    assert success["authoritative"] is True
+    assert success["order_status"] == "CANCELLED"
+    assert claim_repo.get(identity).action_state == "RETRYABLE"
+    with pg_engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, meta FROM us_orders WHERE client_order_key=:key"
+        ), {"key": key}).mappings().one()
+    assert row["status"] == "CANCELLED"
+    assert row["meta"]["broker_open_qty"] == 0
+    assert row["meta"]["semantic_action_remaining_qty"] == 3
+
+
+def test_oct20_actual_fill_claim_failure_rolls_back_pg_order_and_fill(
+    pg_engine, monkeypatch,
+):
+    """A failed Claim update must not commit KIS economic truth independently.
+
+    Covers both the normal engine.begin() call and a caller-owned transaction
+    in disposable PostgreSQL.  Never contacts KIS/operational Supabase.
+    """
+    import json
+    import pytest
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    key = "tqqq-pg-claim-atomic-fill-20261020"
+    broker_no = "0000039009"
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date, client_order_key, symbol, exchange, side,
+                qty_requested, qty_filled, order_no, status, env, meta
+            )
+            VALUES (
+                '2026-10-20', :key, 'TQQQ', 'NASDAQ', 'BUY',
+                3, 0, :order_no, 'ACK', 'practice', CAST(:meta AS jsonb)
+            )
+        """), {
+            "key": key, "order_no": broker_no,
+            "meta": json.dumps({
+                "execution_action_key": "claim-key-test",
+                "submit_attempt_id": "attempt-key-test",
+                "strategy_owner": "TQQQ_INFINITE",
+            }),
+        })
+
+    def injected_failure(*args, **kwargs):
+        assert kwargs.get("_conn") is not None
+        raise RuntimeError("injected_claim_failure_after_fill_write")
+
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation_by_key", injected_failure
+    )
+    observation = dict(
+        order_no=broker_no, client_order_key=key, symbol="TQQQ", side="BUY",
+        filled_qty=1, requested_qty=3, cumulative_filled_qty=1,
+        avg_price_usd=70.5, trade_date="2026-10-20",
+        source="fills_by_order_no", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+    )
+
+    # The repository owns the connection: failure is structured, never
+    # retried automatically, and writes from its transaction must roll back.
+    first = repos.mark_order_filled_by_reconcile(**observation)
+    assert first["status"] == "RECONCILE_UPDATE_FAILED"
+    assert first["entry_fence"] is True
+    assert first["retry_order"] is False
+    assert "US_ATOMIC_CLAIM_FILL_APPLY_FAILED" in first["error"]
+
+    def assert_no_economic_commit():
+        with pg_engine.connect() as conn:
+            order = conn.execute(text("""
+                SELECT status, qty_filled FROM us_orders
+                WHERE client_order_key=:key
+            """), {"key": key}).mappings().one()
+            fills = conn.execute(text("""
+                SELECT count(*) FROM us_fills
+                WHERE client_order_key=:key
+            """), {"key": key}).scalar_one()
+        assert order["status"] == "ACK"
+        assert order["qty_filled"] == 0
+        assert fills == 0
+
+    assert_no_economic_commit()
+
+    # A higher-level reconciler can supply its own transaction.  The nested
+    # function must RAISE so that the outer unit of work is also rolled back.
+    with pytest.raises(RuntimeError, match="US_ATOMIC_CLAIM_FILL_APPLY_FAILED"):
+        with pg_engine.begin() as conn:
+            repos.mark_order_filled_by_reconcile(**observation, _conn=conn)
+
+    assert_no_economic_commit()
+
+
+def test_oct20_tqqq_partial_cancel_releases_exact_attempt(pg_engine, monkeypatch):
+    """One of three TQQQ shares filled before cancel: preserve two as semantic
+    remainder, broker-open zero, and terminalize the immutable Attempt.
+    """
+    import json
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.db import repos
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id="partial-cancel-test-account",
+        market="US", trading_epoch_id="partial-cancel-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="partial-cycle",
+        action="TQQQ_INFINITE_BUY", trade_date=date(2026, 10, 20),
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: ledger)
+    key = "TQQQ_INF_V3:partial-cycle:2026-10-20:BUY"
+    attempt_id = "partial-cancel-38776"
+    assert ledger.acquire(
+        identity, attempt_id=attempt_id, requested_qty=3, client_order_key=key
+    ).acquired
+    ledger.record_observation(
+        identity, attempt_id=attempt_id, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,order_no,status,env,trading_epoch_id,meta
+            ) VALUES (
+                '2026-10-20',:key,'TQQQ','NASDAQ','BUY',
+                3,0,'0000038776','ACK','practice','partial-cancel-epoch',
+                CAST(:meta AS jsonb)
+            )
+        """), {"key": key, "meta": json.dumps({
+            "execution_action_key": identity.action_key,
+            "submit_attempt_id": attempt_id,
+            "strategy_owner": "TQQQ_INFINITE",
+        })})
+
+    row = {
+        "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+        "status": "CANCELLED", "requested_qty": 3,
+        "requested_qty_present": True,
+        "filled_qty": 1, "filled_qty_present": True,
+        "remaining_qty": 0, "remaining_qty_present": True,
+        "broker_open_qty": 0, "broker_open_qty_present": True,
+        "avg_price": 70.5,
+    }
+    result = repos.apply_broker_order_observation(
+        trade_date="2026-10-20", client_order_key=key,
+        raw_order_no="0000038776", canonical_order_no="38776",
+        symbol="TQQQ", side="BUY", requested_qty=3, filled_qty=1,
+        remaining_qty=2, broker_status="CANCELLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", raw_row=row,
+    )
+    assert result["status"] == "OK", result
+    assert result["order_status"] == "CANCELLED"
+    snap = ledger.get(identity)
+    assert snap.action_state == "PARTIALLY_SATISFIED"
+    assert snap.remaining_target_qty == 2
+    assert snap.cumulative_filled_qty == 1
+    assert snap.active_attempt_id is None
+    with pg_engine.connect() as conn:
+        order = conn.execute(text(
+            "SELECT status,qty_filled,meta FROM us_orders WHERE client_order_key=:key"
+        ), {"key": key}).mappings().one()
+        fills = conn.execute(text(
+            "SELECT COALESCE(SUM(qty),0) FROM us_fills WHERE client_order_key=:key"
+        ), {"key": key}).scalar_one()
+    assert order["status"] == "CANCELLED"
+    assert order["qty_filled"] == 1
+    assert order["meta"]["semantic_action_remaining_qty"] == 2
+    assert order["meta"]["broker_open_qty"] == 0
+    assert fills == 1
+
+
+def test_claim_pre_submit_outbox_atomic_rollback(pg_engine):
+    """Crash during DB outbox insert rolls back the exact execution Claim.
+
+    Disposable PostgreSQL only. No broker HTTP or production Supabase.
+    """
+    from datetime import date, datetime, timezone
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db import repos
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_claims, us_execution_attempts,
+    )
+
+    identity = SemanticActionIdentity(
+        env="practice", account_id="pg-outbox-test-account",
+        market="US", trading_epoch_id="pg-outbox-test-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="pg-outbox-test-lifecycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    attempt = "pg-outbox-test-attempt"
+    key = "TQQQ_INF_V3:pg-outbox-test-lifecycle:2026-10-20:BUY"
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    event = {
+        "event_id": str(uuid4()), "trade_date": "2026-10-20",
+        "event_type": "BROKER_CLAIM_PREPARED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "unit-run",
+        "tick_id": "unit-tick", "client_order_key": key,
+        "submit_attempt_id": attempt, "symbol": "TQQQ",
+        "side": "BUY", "requested_qty": 3,
+        "raw_broker_order_no": None, "canonical_broker_order_no": None,
+        "position_lifecycle_id": "pg-outbox-test-lifecycle",
+        "profit_capture_stage": "", "cumulative_filled_qty": 0,
+        "payload": {"submission_status": "NOT_YET_AT_HTTP_BOUNDARY"},
+        "idempotency_key": "us-claim-prepared:" + attempt,
+    }
+    with pytest.raises(RuntimeError, match="injected_outbox_failure"):
+        with pg_engine.begin() as conn:
+            acquired = claim_repo.acquire(
+                identity, attempt_id=attempt, requested_qty=3,
+                client_order_key=key, _conn=conn,
+            )
+            assert acquired.acquired
+            assert repos.append_us_order_event(event, _conn=conn)
+            raise RuntimeError("injected_outbox_failure")
+
+    with pg_engine.connect() as conn:
+        claim_count = conn.execute(text("""
+            SELECT count(*) FROM us_execution_claims WHERE action_key=:key
+        """), {"key": identity.action_key}).scalar_one()
+        event_count = conn.execute(text("""
+            SELECT count(*) FROM us_order_events WHERE idempotency_key=:key
+        """), {"key": event["idempotency_key"]}).scalar_one()
+    assert claim_count == event_count == 0
+
+    with pg_engine.begin() as conn:
+        acquired = claim_repo.acquire(
+            identity, attempt_id=attempt, requested_qty=3,
+            client_order_key=key, _conn=conn,
+        )
+        assert acquired.acquired
+        assert repos.append_us_order_event(event, _conn=conn)
+    with pg_engine.connect() as conn:
+        counts = (
+            conn.execute(text("""
+                SELECT count(*) FROM us_execution_claims WHERE action_key=:key
+            """), {"key": identity.action_key}).scalar_one(),
+            conn.execute(text("""
+                SELECT count(*) FROM us_order_events WHERE idempotency_key=:key
+            """), {"key": event["idempotency_key"]}).scalar_one(),
+        )
+    assert counts == (1, 1)
+
+
+def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
+    """Full Stage 1+3 DB preparation is one atomic write on PostgreSQL.
+
+    Three durable rows (Claim / account reservation / immutable pre-submit
+    outbox) are never partially visible after an exception, without KIS IO.
+    """
+    from datetime import date, datetime, timezone
+    import hashlib
+    from pathlib import Path
+    from uuid import uuid4
+    from sqlalchemy import text
+    from trader.execution_state import SemanticActionIdentity
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db import repos
+    from trader.us.db.execution_claim_schema import (
+        us_execution_claims, us_execution_attempts,
+    )
+    from trader.us.execution.account_authority import AccountExecutionAuthority
+
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    fingerprint = hashlib.sha256(b"stage-123-synthetic-test").hexdigest()
+    authority = AccountExecutionAuthority(
+        pg_engine, env="practice", account_fingerprint=fingerprint,
+        trading_epoch_id="stage123-epoch",
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=fingerprint,
+        market="US", trading_epoch_id="stage123-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="stage123-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    key = "TQQQ_INF_V3:stage123-cycle:2026-10-20:BUY"
+    attempt = "stage123-reserved-attempt"
+    event = {
+        "event_id": str(uuid4()), "trade_date": "2026-10-20",
+        "event_type": "BROKER_CLAIM_PREPARED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "synthetic",
+        "tick_id": "synthetic", "client_order_key": key,
+        "submit_attempt_id": attempt, "symbol": "TQQQ", "side": "BUY",
+        "requested_qty": 3, "raw_broker_order_no": None,
+        "canonical_broker_order_no": None,
+        "position_lifecycle_id": "stage123-cycle",
+        "profit_capture_stage": "", "cumulative_filled_qty": 0,
+        "payload": {"submission_status": "NOT_YET_AT_HTTP_BOUNDARY"},
+        "idempotency_key": "stage123:" + attempt,
+    }
+    lease = authority.acquire_lease(holder_id="stage123-router")
+    def write_triplet(conn):
+        assert ledger.acquire(
+            identity, attempt_id=attempt, requested_qty=3,
+            client_order_key=key, _conn=conn,
+        ).acquired
+        authority.reserve(
+            lease=lease, action_key=attempt,
+            strategy_owner="TQQQ_INFINITE",
+            symbol="TQQQ", side="BUY", qty=3,
+            price_usd="100", broker_cash_usd="500",
+            _conn=conn,
+        )
+        assert repos.append_us_order_event(event, _conn=conn)
+
+    with pytest.raises(RuntimeError, match="synthetic_crash"):
+        with pg_engine.begin() as conn:
+            write_triplet(conn)
+            raise RuntimeError("synthetic_crash")
+
+    def counts():
+        with pg_engine.connect() as conn:
+            return (
+                conn.execute(text(
+                    "SELECT count(*) FROM us_execution_claims WHERE action_key=:key"
+                ), {"key": identity.action_key}).scalar_one(),
+                conn.execute(text(
+                    "SELECT count(*) FROM us_execution_account_reservations WHERE action_key=:key"
+                ), {"key": attempt}).scalar_one(),
+                conn.execute(text(
+                    "SELECT count(*) FROM us_order_events WHERE idempotency_key=:key"
+                ), {"key": event["idempotency_key"]}).scalar_one(),
+            )
+    assert counts() == (0, 0, 0)
+    with pg_engine.begin() as conn:
+        write_triplet(conn)
+    assert counts() == (1, 1, 1)
+    authority.assert_reserved_submit_authority(
+        attempt_id=attempt, client_order_key=key,
+        strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+    )
+    from trader.us.execution.account_authority import AuthorityUnavailable
+    with pytest.raises(AuthorityUnavailable, match="STALE"):
+        authority.assert_reserved_submit_authority(
+            attempt_id=attempt, client_order_key=key,
+            strategy_owner="US_STANDARD", symbol="TQQQ", side="BUY", qty=3,
+        )
+    # A lost HTTP response must NOT cause a second identical broker POST
+    # from the same Claim/Attempt. The initial boundary transitions Attempt
+    # to SUBMITTED; a second attempt must fail even while reservation remains.
+    ledger.record_observation(
+        identity, attempt_id=attempt, state="SUBMITTED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    with pytest.raises(AuthorityUnavailable, match="STALE"):
+        authority.assert_reserved_submit_authority(
+            attempt_id=attempt, client_order_key=key,
+            strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+        )
+    authority.release_lease(lease=lease)
+
+
+def test_account_reservation_only_terminalizes_after_exact_tqqq_broker_proof(
+    pg_engine, monkeypatch,
+):
+    """No cancellation request or ACK can release a reserved 3-share BUY."""
+    import hashlib
+    import json
+    from pathlib import Path
+    from datetime import date
+    from sqlalchemy import text
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.db import repos
+    from trader.us.execution.account_authority import (
+        AccountExecutionAuthority, ReservationConflict,
+    )
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    account = hashlib.sha256(b"terminal-proof-stage123").hexdigest()
+    owner = AccountExecutionAuthority(
+        pg_engine, env="practice", account_fingerprint=account,
+        trading_epoch_id="test-tqqq-epoch",
+    )
+    lease = owner.acquire_lease(holder_id="worker-test")
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id="test-tqqq-epoch",
+        strategy_owner="TQQQ_INFINITE", lifecycle_id="test-tqqq-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: ledger)
+    key = "TQQQ_INF_V3:test-tqqq-cycle:2026-10-20:BUY"
+    attempt = "verified-ttl-attempt"
+    assert ledger.acquire(
+        identity, attempt_id=attempt,
+        requested_qty=3, client_order_key=key,
+    ).acquired
+    ledger.record_observation(
+        identity, attempt_id=attempt, state="UNRESOLVED",
+        cumulative_filled_qty=None, authoritative=False,
+    )
+    owner.reserve(
+        lease=lease, action_key=attempt, strategy_owner="TQQQ_INFINITE",
+        symbol="TQQQ", side="BUY", qty=3, price_usd="100",
+        broker_cash_usd="500",
+    )
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+              trade_date,client_order_key,symbol,exchange,side,
+              qty_requested,qty_filled,order_no,status,env,trading_epoch_id,meta
+            ) VALUES (
+              '2026-10-20',:key,'TQQQ','NASDAQ','BUY',
+              3,0,'0000038776','ACK','practice','test-tqqq-epoch',
+              CAST(:meta AS jsonb)
+            )
+        """), {"key": key, "meta": json.dumps({
+            "execution_action_key": identity.action_key,
+            "submit_attempt_id": attempt,
+            "strategy_owner": "TQQQ_INFINITE",
+        })})
+    with pytest.raises(ReservationConflict, match="terminal_attempt_proof_unverified"):
+        owner.terminalize_verified_attempt(
+            lease=lease, attempt_id=attempt,
+            client_order_key=key, trade_date="2026-10-20",
+        )
+    original_broker_row = {
+        "order_no": "0000038776", "symbol": "TQQQ", "side": "BUY",
+        "status": "CANCELLED", "requested_qty": 3,
+        "requested_qty_present": True,
+        "filled_qty": 0, "filled_qty_present": True,
+        "remaining_qty": 0, "remaining_qty_present": True,
+        "broker_open_qty": 0, "broker_open_qty_present": True,
+    }
+    proof = repos.apply_broker_order_observation(
+        trade_date="2026-10-20", client_order_key=key,
+        raw_order_no="0000038776", canonical_order_no="38776",
+        symbol="TQQQ", side="BUY", requested_qty=3, filled_qty=0,
+        remaining_qty=3, broker_status="CANCELLED",
+        evidence_type="TQQQ_TTL_CANCEL_ACK_ZERO_REMAINING",
+        observed_at="2026-10-20T14:17:00+00:00",
+        raw_row=original_broker_row,
+    )
+    assert proof["status"] == "OK", proof
+    assert ledger.get(identity).action_state == "RETRYABLE"
+    owner.release_lease(lease=lease)
+    # The standalone fenced worker may release this reservation only AFTER
+    # the exact original KIS cancel + durable Claim transition is stored.
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE")
+    monkeypatch.setattr(
+        repos, "_us_execution_claim_scope",
+        lambda: {
+            "env": "practice", "account_id": account,
+            "market": "US", "trading_epoch_id": "test-tqqq-epoch",
+        },
+    )
+    from trader.us.execution.reservation_reconcile_worker import (
+        reconcile_proven_reservations_once,
+    )
+    worker_result = reconcile_proven_reservations_once(
+        env="practice", trade_date="2026-10-20",
+    )
+    assert worker_result["attempted"] == 1, worker_result
+    assert worker_result["released"] == 1, worker_result
+    assert worker_result["unresolved"] == 0, worker_result
+    next_lease = owner.acquire_lease(holder_id="verify-after-worker")
+    replay = owner.terminalize_verified_attempt(
+        lease=next_lease, attempt_id=attempt,
+        client_order_key=key, trade_date="2026-10-20",
+    )
+    assert replay["state"] == "RELEASED"
+    assert replay["idempotent"]
+    owner.release_lease(lease=next_lease)
+
+
+def test_fenced_reservation_worker_releases_only_proven_pre_http_aborts(
+    pg_engine, monkeypatch,
+):
+    """No stuck cash holds after an exact durable ABANDONED_PRE_SUBMIT."""
+    import hashlib
+    from pathlib import Path
+    from datetime import date
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+    from trader.us.db.execution_claim_schema import us_execution_claims, us_execution_attempts
+    from trader.us.execution.account_authority import (
+        AccountExecutionAuthority, ReservationConflict,
+    )
+    from trader.us.execution.reservation_reconcile_worker import (
+        reconcile_proven_reservations_once,
+    )
+    from trader.us.db import repos
+
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    account = hashlib.sha256(b"pre-http-abort-isolation").hexdigest()
+    auth = AccountExecutionAuthority(
+        pg_engine, env="practice", account_fingerprint=account,
+        trading_epoch_id="pre-http-epoch",
+    )
+    ledger = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US",
+        trading_epoch_id="pre-http-epoch",
+        strategy_owner="US_STANDARD", lifecycle_id="pre-http-cycle",
+        action="BUY", trade_date=date(2026, 10, 20),
+    )
+    attempt = "pre-http-cancel-before-boundary"
+    cok = "US_STANDARD:pre-http-cycle:2026-10-20:BUY"
+    lease = auth.acquire_lease(holder_id="original-router")
+    with pg_engine.begin() as conn:
+        assert ledger.acquire(
+            identity, attempt_id=attempt, requested_qty=2,
+            client_order_key=cok, _conn=conn,
+        ).acquired
+        auth.reserve(
+            lease=lease, action_key=attempt, strategy_owner="US_STANDARD",
+            symbol="AMD", side="BUY", qty=2, price_usd="100",
+            broker_cash_usd="400", _conn=conn,
+        )
+    with pytest.raises(ReservationConflict, match="not_authoritatively_proven"):
+        auth.release_proven_pre_submit_abort(
+            lease=lease, attempt_id=attempt, client_order_key=cok,
+        )
+    ledger.release_before_submit(identity, attempt_id=attempt)
+    auth.release_lease(lease=lease)
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE")
+    monkeypatch.setattr(
+        repos, "_us_execution_claim_scope",
+        lambda: {
+            "env": "practice", "account_id": account,
+            "market": "US", "trading_epoch_id": "next-afternoon-epoch",
+        },
+    )
+    sweep = reconcile_proven_reservations_once(
+        env="practice", trade_date="2026-10-20",
+    )
+    assert sweep["released"] == 1 and sweep["unresolved"] == 0, sweep
+    with pg_engine.connect() as conn:
+        from sqlalchemy import text
+        state = conn.execute(text("""
+            SELECT state,terminal_evidence
+            FROM us_execution_account_reservations WHERE action_key=:id
+        """), {"id": attempt}).mappings().one()
+    assert state["state"] == "RELEASED"
+    assert state["terminal_evidence"] == "DURABLE_ABANDONED_PRE_SUBMIT"
+
+
+
+def test_stage123_default_on_schema_preflight_requires_actual_rls_migration(pg_engine):
+    """Production activation must stop before orders on missing DDL or RLS.
+
+    All DDL here runs ONLY in disposable PBCORE_TEST_POSTGRES_URL.
+    """
+    from pathlib import Path
+    from sqlalchemy import text
+    from scripts.us_stage123_paper_preflight import validate_stage123_prerequisites
+
+    env = {
+        "KIS_ENV": "practice", "US_PAPER_TRADING_ENABLED": "1",
+        "DRY_RUN": "0", "US_OFFLINE": "0", "US_SIGNAL_ONLY": "0",
+        "US_STAGE123_PAPER_PROFILE": "ON",
+        "US_ATOMIC_CLAIM_OUTBOX_ENABLED": "1",
+        "US_ACCOUNT_RESERVATION_MODE": "ENFORCE",
+        "US_RECONCILE_WORKER_MODE": "RESERVATION_ONLY",
+        "US_SHARED_KIS_LIMITER_ENABLED": "1",
+        "US_EXIT_QUOTE_PREFETCH_ENABLED": "1",
+        "US_EARLY_HARD_STOP_PILOT_ENABLED": "1",
+        "US_EARLY_MULTI_HARD_STOP_ENABLED": "1",
+        "US_EARLY_SOFT_STOP_PILOT_ENABLED": "1",
+    }
+    scope = {"env": "practice", "account_id": "a" * 64,
+             "trading_epoch_id": "verified-us-epoch"}
+    with pg_engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS us_execution_account_reservations"))
+        conn.execute(text("DROP TABLE IF EXISTS us_execution_authority_leases"))
+    with pytest.raises(RuntimeError, match="migration_0056_missing"):
+        validate_stage123_prerequisites(engine=pg_engine, scope=scope, env=env)
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql(Path(
+            "migrations/0056_us_execution_authority_reservations.sql"
+        ).read_text())
+    assert validate_stage123_prerequisites(
+        engine=pg_engine, scope=scope, env=env,
+    )["status"] == "PASS"
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE us_execution_account_reservations DISABLE ROW LEVEL SECURITY"
+        ))
+    with pytest.raises(RuntimeError, match="migration_0056_missing_or_rls_off"):
+        validate_stage123_prerequisites(engine=pg_engine, scope=scope, env=env)
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE us_execution_account_reservations ENABLE ROW LEVEL SECURITY"
+        ))

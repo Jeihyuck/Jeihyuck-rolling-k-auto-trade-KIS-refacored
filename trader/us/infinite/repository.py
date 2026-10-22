@@ -213,6 +213,42 @@ class InfiniteRepository:
             rows = conn.execute(text(sql), params).mappings().all()
         return [dict(row) for row in rows]
 
+    def load_cancelled_uncertain_buy_orders(
+        self, *, symbol: str = "TQQQ", limit: int = 5,
+    ) -> list[dict]:
+        """Find terminal local orders whose exact durable claim is still active.
+
+        A cancelled order drops out of the regular pending-order TTL scan.
+        Without this query a failed claim update can fence the sleeve forever.
+        This is read-only; no stale claim is released without fresh KIS proof.
+        """
+        if symbol.upper() != "TQQQ":
+            raise ValueError("cancelled claim recovery is TQQQ owner scoped")
+        with self.engine.connect() as conn:
+            epoch_id = self._epoch_id(conn)
+            sql = """
+                SELECT o.* FROM us_orders o
+                JOIN us_execution_claims a
+                  ON a.action_key = o.meta->>'execution_action_key'
+                 AND a.active_attempt_id = o.meta->>'submit_attempt_id'
+                 AND a.trade_date = o.trade_date
+                 AND a.env = o.env
+                 AND a.trading_epoch_id = o.trading_epoch_id
+                 AND a.strategy_owner = 'TQQQ_INFINITE'
+                 AND a.market = 'US'
+                WHERE o.symbol=:symbol AND o.side='BUY'
+                  AND o.status='CANCELLED'
+                  AND o.client_order_key LIKE 'TQQQ_INF_V3:%'
+                  AND a.action_state='UNCERTAIN'
+            """
+            params = {"symbol": symbol.upper(), "limit": min(max(1, int(limit)), 20)}
+            if epoch_id:
+                sql += " AND o.trading_epoch_id=:epoch_id"
+                params["epoch_id"] = epoch_id
+            sql += " ORDER BY o.updated_at ASC LIMIT :limit"
+            rows = conn.execute(text(sql), params).mappings().all()
+        return [dict(row) for row in rows]
+
     def mark_ttl_cancel_requested(self, order: dict, *, requested_at: datetime,
                                    cancel_result: dict | None = None) -> None:
         """Journal a cancel request without treating its acknowledgement as terminal."""
@@ -276,12 +312,31 @@ class InfiniteRepository:
         if status == "CANCELLED" and filled_raw in (None, ""):
             return {"status": "PENDING", "reason": "cancel_fill_qty_missing"}
         filled = int(float(filled_raw)) if filled_raw not in (None, "") else 0
+        # Two distinct quantities must not be conflated.  KIS reports
+        # remaining_qty as the *live broker order* leaves (zero after cancel);
+        # the semantic action can still need all requested shares.
         remaining_raw = observation.get("remaining_qty")
-        remaining = (
-            max(0, int(remaining_raw))
-            if remaining_raw not in (None, "")
-            else max(0, requested - filled)
-        )
+        if requested <= 0 or filled < 0 or filled > requested:
+            return {"status": "PENDING", "reason": "terminal_quantity_out_of_range"}
+        if status == "CANCELLED":
+            # Never infer a successful cancel merely because a field was absent.
+            if remaining_raw in (None, ""):
+                return {"status": "PENDING", "reason": "cancel_broker_remaining_missing"}
+            try:
+                broker_open_qty = int(remaining_raw)
+            except (TypeError, ValueError):
+                return {"status": "PENDING", "reason": "cancel_broker_remaining_invalid"}
+            if broker_open_qty != 0:
+                return {"status": "PENDING", "reason": "cancel_still_broker_open"}
+            # This argument is the semantic remaining quantity, *not* KIS open
+            # quantity.  The original KIS observation below preserves zero.
+            remaining = requested - filled
+        else:
+            remaining = (
+                max(0, int(remaining_raw))
+                if remaining_raw not in (None, "")
+                else max(0, requested - filled)
+            )
         terminal_evidence_type = str(
             observation.get("evidence_type") or "TQQQ_TTL_BROKER_REQUERY"
         )

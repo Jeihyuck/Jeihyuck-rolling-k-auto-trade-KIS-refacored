@@ -891,6 +891,7 @@ def run_trade_session(
     run_source = os.getenv("US_RUN_SOURCE", "OPERATOR_MANUAL")
     session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
     _unreaped_child_seen = False
+    _shadow_reconcile_child: subprocess.Popen | None = None
     final_status = "OK"
     final_reason = "session_end"
     last_stage = "session_start"
@@ -1361,8 +1362,106 @@ def run_trade_session(
         skipped_slot_count = 0
         timeout_blocked_symbol_sides: set[tuple[str, str]] = set()
         timeout_entry_block = False
+        # WORKER mode remains blocked: this child has authority to settle
+        # verified account reservations only, never KIS orders, fills or
+        # execution Claims. Default LEGACY remains unchanged.
+        from trader.us.execution.reconcile_shadow_worker import parse_mode
+        _reconcile_mode = parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))
+        if _reconcile_mode in {"SHADOW", "RESERVATION_ONLY"}:
+            if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
+                raise RuntimeError("US_RECONCILE_CHILD_PRACTICE_ONLY")
+            if _reconcile_mode == "RESERVATION_ONLY" and not (
+                os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
+                and os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") == "1"
+            ):
+                raise RuntimeError("US_RESERVATION_WORKER_REQUIRES_ACCOUNT_ATOMIC_GATE")
+            _shadow_env = dict(os.environ)
+            # Keep CANO/product identity for the SAME canonical hashed
+            # account-scope derivation as the parent. They are never logged.
+            # Strip API credentials so accidental KIS use remains impossible.
+            for _name in (
+                "KIS_APP_KEY", "KIS_APP_SECRET", "APP_KEY", "APP_SECRET",
+                "KIS_ACCESS_TOKEN", "KIS_REFRESH_TOKEN",
+            ):
+                _shadow_env.pop(_name, None)
+            _shadow_env["US_OFFLINE"] = "1"
+            _shadow_env["US_RECONCILE_WORKER_MODE"] = _reconcile_mode
+            _shadow_reconcile_child = subprocess.Popen(
+                [
+                    sys.executable, "-m",
+                    (
+                        "trader.us.execution.reservation_reconcile_worker"
+                        if _reconcile_mode == "RESERVATION_ONLY"
+                        else "trader.us.execution.reconcile_shadow_worker"
+                    ),
+                    "--trade-date", trade_date,
+                    "--session-run-id", session_run_id,
+                    "--env", "practice",
+                    "--interval-sec", str(
+                        max(5, int(os.getenv("US_SHADOW_RECONCILE_INTERVAL_SEC", "15")))
+                    ),
+                ],
+                env=_shadow_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if _reconcile_mode == "RESERVATION_ONLY":
+                os.environ["US_RESERVATION_WORKER_PID"] = str(_shadow_reconcile_child.pid)
+            logger.info(
+                "[US_RECONCILE_CHILD][STARTED] session=%s run=%s pid=%s "
+                "authority=%s broker_access=NONE",
+                session, session_run_id, _shadow_reconcile_child.pid,
+                ("RESERVATIONS_ONLY" if _reconcile_mode == "RESERVATION_ONLY" else "READ_ONLY"),
+            )
         try:
             while True:
+                if (_shadow_reconcile_child is not None
+                        and _shadow_reconcile_child.poll() is not None):
+                    logger.error(
+                        "[US_SHADOW_RECONCILE][EXITED] session=%s run=%s code=%s "
+                        "trading_authority=LEGACY_UNCHANGED",
+                        session, session_run_id,
+                        _shadow_reconcile_child.returncode,
+                    )
+                    _shadow_reconcile_child = None
+                    if _reconcile_mode == "RESERVATION_ONLY":
+                        os.environ.pop("US_RESERVATION_WORKER_PID", None)
+                elif _shadow_reconcile_child is not None:
+                    try:
+                        if _reconcile_mode == "RESERVATION_ONLY":
+                            from trader.us.execution.reservation_reconcile_worker import reservation_report_path
+                            _shadow_report_path = reservation_report_path(trade_date, session_run_id)
+                        else:
+                            from trader.us.execution.reconcile_shadow_worker import observer_report_path
+                            _shadow_report_path = observer_report_path(trade_date, session_run_id)
+                        if _shadow_report_path.is_file():
+                            _shadow_report = json.loads(
+                                _shadow_report_path.read_text(encoding="utf-8")
+                            )
+                            _sampled = dt.fromisoformat(
+                                str(_shadow_report.get("sampled_at_utc") or "").replace("Z", "+00:00")
+                            )
+                            _lag = max(
+                                0.0,
+                                dt.now(_sampled.tzinfo).timestamp() - _sampled.timestamp(),
+                            )
+                            _status = str(_shadow_report.get("read_status") or "ERROR")
+                            logger.info(
+                                "[US_SHADOW_RECONCILE][HEALTH] session=%s "
+                                "status=%s lag_sec=%.1f pending=%s active_claims=%s",
+                                session, _status, _lag,
+                                _shadow_report.get("pending_order_count"),
+                                _shadow_report.get("active_claim_count"),
+                            )
+                            if _status != "OK" or _lag > 60:
+                                logger.warning(
+                                    "[US_SHADOW_RECONCILE][DEGRADED] "
+                                    "status=%s lag_sec=%.1f trading_authority=LEGACY_UNCHANGED",
+                                    _status, _lag,
+                                )
+                    except Exception as _shadow_health_exc:
+                        logger.warning(
+                            "[US_SHADOW_RECONCILE][HEALTH_UNAVAILABLE] err=%s",
+                            _shadow_health_exc,
+                        )
                 if force_now:
                     tick_now_dt = simulated_now + timedelta(seconds=interval_sec * tick_count)
                     tick_force_now = tick_now_dt.isoformat()
@@ -2528,6 +2627,28 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        # Reap the *read-only* observer independently of Tick children.
+        # It never owns the order submission lock, so its lifecycle cannot
+        # clear an unverified live Tick or an unresolved execution Claim.
+        os.environ.pop("US_RESERVATION_WORKER_PID", None)
+        if _shadow_reconcile_child is not None:
+            try:
+                if _shadow_reconcile_child.poll() is None:
+                    _shadow_reconcile_child.terminate()
+                _shadow_reconcile_child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _shadow_reconcile_child.kill()
+                _shadow_reconcile_child.wait(timeout=5)
+            except Exception as _observer_stop_exc:
+                logger.error(
+                    "[US_SHADOW_RECONCILE][STOP_FAILED] run=%s err=%s",
+                    session_run_id, _observer_stop_exc,
+                )
+            else:
+                logger.info(
+                    "[US_SHADOW_RECONCILE][STOPPED] run=%s pid=%s",
+                    session_run_id, _shadow_reconcile_child.pid,
+                )
         from trader.us.utils.session_guard import read_us_session_child_unverified_fence
         try:
             _fence_record = read_us_session_child_unverified_fence(

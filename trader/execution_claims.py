@@ -115,6 +115,7 @@ class DurableExecutionClaimRepo:
         client_order_key: str | None = None,
         retry_action_prefix: str | None = None,
         allow_partial_retry: bool = False,
+        _conn: Any = None,
     ) -> ExecutionClaim:
         qty = int(requested_qty)
         if qty <= 0 or not str(attempt_id or "").strip():
@@ -143,55 +144,39 @@ class DurableExecutionClaimRepo:
             "updated_at": now,
             "claim_conflicts": 0,
         }
-        with self.engine.begin() as conn:
-            if conn.dialect.name == "postgresql":
-                scope = json.dumps(
-                    (
-                        identity.env.strip().lower(),
-                        identity.account_id.strip(),
-                        identity.market.strip().upper(),
-                        identity.trading_epoch_id.strip(),
-                        identity.strategy_owner.strip().upper(),
-                        identity.lifecycle_id.strip(),
-                    ),
-                    separators=(",", ":"),
+        if _conn is None:
+            with self.engine.begin() as conn:
+                return self.acquire(
+                    identity, attempt_id=attempt_id,
+                    requested_qty=requested_qty,
+                    fresh_validation=fresh_validation,
+                    client_order_key=client_order_key,
+                    retry_action_prefix=retry_action_prefix,
+                    allow_partial_retry=allow_partial_retry,
+                    _conn=conn,
                 )
-                lock_id = int.from_bytes(
-                    hashlib.sha256(scope.encode("utf-8")).digest()[:8],
-                    byteorder="big",
-                    signed=True,
-                )
-                conn.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_id)))
-            if retry_action_prefix:
-                prefix = str(retry_action_prefix).strip().upper()
-                retryable_sibling = conn.execute(
-                    sa.select(action.c.action_key)
-                    .where(
-                        action.c.action_key != key,
-                        action.c.env == identity.env.strip().lower(),
-                        action.c.account_id == identity.account_id.strip(),
-                        action.c.market == identity.market.strip().upper(),
-                        action.c.trading_epoch_id == identity.trading_epoch_id.strip(),
-                        action.c.strategy_owner == identity.strategy_owner.strip().upper(),
-                        action.c.lifecycle_id == identity.lifecycle_id.strip(),
-                        sa.or_(
-                            action.c.action == prefix,
-                            sa.func.substr(action.c.action, 1, len(prefix) + 1)
-                            == f"{prefix}:",
-                        ),
-                        action.c.action_state.in_(
-                            ("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")
-                        ),
-                        action.c.active_attempt_id.is_(None),
-                    )
-                    .limit(1)
-                ).scalar_one_or_none()
-                if retryable_sibling is not None:
-                    self._record_conflict(conn, str(retryable_sibling))
-                    return ExecutionClaim(
-                        False, key, reason="retryable_lifecycle_action_exists",
-                    )
-            active_sibling = conn.execute(
+        conn = _conn
+        if conn.dialect.name == "postgresql":
+            scope = json.dumps(
+                (
+                    identity.env.strip().lower(),
+                    identity.account_id.strip(),
+                    identity.market.strip().upper(),
+                    identity.trading_epoch_id.strip(),
+                    identity.strategy_owner.strip().upper(),
+                    identity.lifecycle_id.strip(),
+                ),
+                separators=(",", ":"),
+            )
+            lock_id = int.from_bytes(
+                hashlib.sha256(scope.encode("utf-8")).digest()[:8],
+                byteorder="big",
+                signed=True,
+            )
+            conn.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_id)))
+        if retry_action_prefix:
+            prefix = str(retry_action_prefix).strip().upper()
+            retryable_sibling = conn.execute(
                 sa.select(action.c.action_key)
                 .where(
                     action.c.action_key != key,
@@ -202,85 +187,112 @@ class DurableExecutionClaimRepo:
                     action.c.strategy_owner == identity.strategy_owner.strip().upper(),
                     action.c.lifecycle_id == identity.lifecycle_id.strip(),
                     sa.or_(
-                        action.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
-                        action.c.active_attempt_id.is_not(None),
+                        action.c.action == prefix,
+                        sa.func.substr(action.c.action, 1, len(prefix) + 1)
+                        == f"{prefix}:",
                     ),
+                    action.c.action_state.in_(
+                        ("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")
+                    ),
+                    action.c.active_attempt_id.is_(None),
                 )
                 .limit(1)
             ).scalar_one_or_none()
-            if active_sibling is not None:
-                self._record_conflict(conn, str(active_sibling))
+            if retryable_sibling is not None:
+                self._record_conflict(conn, str(retryable_sibling))
                 return ExecutionClaim(
-                    False, key, reason="unresolved_lifecycle_action",
+                    False, key, reason="retryable_lifecycle_action_exists",
                 )
-            insert_action = self._insert(conn, action, base)
-            created = conn.execute(
-                insert_action.on_conflict_do_nothing(index_elements=[action.c.action_key])
-                .returning(action.c.action_key)
-            ).scalar_one_or_none()
-            if created is not None:
-                self._insert_attempt(
-                    conn, attempt, key, attempt_id, 1, qty, client_order_key,
-                )
-                return ExecutionClaim(True, key, attempt_id)
-
-            row = conn.execute(
-                sa.select(action).where(action.c.action_key == key).with_for_update()
-            ).mappings().one_or_none()
-            if row is None:
-                raise RuntimeError("execution claim vanished during acquisition")
-            if row["active_attempt_id"]:
-                self._record_conflict(conn, key)
-                return ExecutionClaim(False, key, reason="unresolved_attempt_active")
-            if row["action_state"] not in {"OPEN", "RETRYABLE", "PARTIALLY_SATISFIED"}:
-                self._record_conflict(conn, key)
-                return ExecutionClaim(False, key, reason="action_not_retryable")
-            if not fresh_validation:
-                self._record_conflict(conn, key)
-                return ExecutionClaim(False, key, reason="fresh_validation_required")
-            remaining = row["remaining_target_qty"]
-            remaining_qty = None if remaining is None else int(remaining)
-            if (
-                remaining_qty is None
-                or qty > remaining_qty
-                or (not allow_partial_retry and qty != remaining_qty)
-            ):
-                self._record_conflict(conn, key)
-                return ExecutionClaim(False, key, reason="remaining_target_qty_mismatch")
-            attempt_no = int(conn.execute(
-                sa.select(sa.func.coalesce(sa.func.max(attempt.c.attempt_no), 0))
-                .where(attempt.c.action_key == key)
-            ).scalar_one()) + 1
-            claimed = conn.execute(
-                sa.update(action)
-                .where(
-                    action.c.action_key == key,
-                    action.c.active_attempt_id.is_(None),
-                    action.c.action_state.in_(("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")),
-                    (
-                        action.c.remaining_target_qty >= qty
-                        if allow_partial_retry
-                        else action.c.remaining_target_qty == qty
-                    ),
-                )
-                .values(
-                    active_attempt_id=attempt_id,
-                    action_state="IN_FLIGHT",
-                    filled_qty_before_attempt=row["cumulative_filled_qty"],
-                    cumulative_filled_qty=None,
-                    remaining_target_qty=None,
-                    trade_date=self._date(identity),
-                    updated_at=now,
-                )
-                .returning(action.c.action_key)
-            ).scalar_one_or_none()
-            if claimed is None:
-                self._record_conflict(conn, key)
-                return ExecutionClaim(False, key, reason="claim_race_lost")
+        active_sibling = conn.execute(
+            sa.select(action.c.action_key)
+            .where(
+                action.c.action_key != key,
+                action.c.env == identity.env.strip().lower(),
+                action.c.account_id == identity.account_id.strip(),
+                action.c.market == identity.market.strip().upper(),
+                action.c.trading_epoch_id == identity.trading_epoch_id.strip(),
+                action.c.strategy_owner == identity.strategy_owner.strip().upper(),
+                action.c.lifecycle_id == identity.lifecycle_id.strip(),
+                sa.or_(
+                    action.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
+                    action.c.active_attempt_id.is_not(None),
+                ),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if active_sibling is not None:
+            self._record_conflict(conn, str(active_sibling))
+            return ExecutionClaim(
+                False, key, reason="unresolved_lifecycle_action",
+            )
+        insert_action = self._insert(conn, action, base)
+        created = conn.execute(
+            insert_action.on_conflict_do_nothing(index_elements=[action.c.action_key])
+            .returning(action.c.action_key)
+        ).scalar_one_or_none()
+        if created is not None:
             self._insert_attempt(
-                conn, attempt, key, attempt_id, attempt_no, qty, client_order_key,
+                conn, attempt, key, attempt_id, 1, qty, client_order_key,
             )
             return ExecutionClaim(True, key, attempt_id)
+
+        row = conn.execute(
+            sa.select(action).where(action.c.action_key == key).with_for_update()
+        ).mappings().one_or_none()
+        if row is None:
+            raise RuntimeError("execution claim vanished during acquisition")
+        if row["active_attempt_id"]:
+            self._record_conflict(conn, key)
+            return ExecutionClaim(False, key, reason="unresolved_attempt_active")
+        if row["action_state"] not in {"OPEN", "RETRYABLE", "PARTIALLY_SATISFIED"}:
+            self._record_conflict(conn, key)
+            return ExecutionClaim(False, key, reason="action_not_retryable")
+        if not fresh_validation:
+            self._record_conflict(conn, key)
+            return ExecutionClaim(False, key, reason="fresh_validation_required")
+        remaining = row["remaining_target_qty"]
+        remaining_qty = None if remaining is None else int(remaining)
+        if (
+            remaining_qty is None
+            or qty > remaining_qty
+            or (not allow_partial_retry and qty != remaining_qty)
+        ):
+            self._record_conflict(conn, key)
+            return ExecutionClaim(False, key, reason="remaining_target_qty_mismatch")
+        attempt_no = int(conn.execute(
+            sa.select(sa.func.coalesce(sa.func.max(attempt.c.attempt_no), 0))
+            .where(attempt.c.action_key == key)
+        ).scalar_one()) + 1
+        claimed = conn.execute(
+            sa.update(action)
+            .where(
+                action.c.action_key == key,
+                action.c.active_attempt_id.is_(None),
+                action.c.action_state.in_(("OPEN", "RETRYABLE", "PARTIALLY_SATISFIED")),
+                (
+                    action.c.remaining_target_qty >= qty
+                    if allow_partial_retry
+                    else action.c.remaining_target_qty == qty
+                ),
+            )
+            .values(
+                active_attempt_id=attempt_id,
+                action_state="IN_FLIGHT",
+                filled_qty_before_attempt=row["cumulative_filled_qty"],
+                cumulative_filled_qty=None,
+                remaining_target_qty=None,
+                trade_date=self._date(identity),
+                updated_at=now,
+            )
+            .returning(action.c.action_key)
+        ).scalar_one_or_none()
+        if claimed is None:
+            self._record_conflict(conn, key)
+            return ExecutionClaim(False, key, reason="claim_race_lost")
+        self._insert_attempt(
+            conn, attempt, key, attempt_id, attempt_no, qty, client_order_key,
+        )
+        return ExecutionClaim(True, key, attempt_id)
 
     @staticmethod
     def _insert_attempt(
@@ -357,8 +369,7 @@ class DurableExecutionClaimRepo:
             .order_by(attempts.c.attempt_no.desc())
             .limit(1)
         ).scalar_one()
-        if str(latest_id) != str(attempt_id):
-            raise RuntimeError("observation for superseded submit attempt")
+        superseded = str(latest_id) != str(attempt_id)
         requested = int(attempt_row["requested_qty"])
         previous = attempt_row["cumulative_filled_qty"]
         if observed_qty is not None and observed_qty > requested:
@@ -372,13 +383,58 @@ class DurableExecutionClaimRepo:
         if state in {"CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL"}:
             state = "CANCELLED"
 
-        before = int(action_row["filled_qty_before_attempt"] or 0)
-        total = None if observed_qty is None else before + observed_qty
+        # Old ACK/OPEN observations must never resurrect a terminal attempt.
+        terminal_attempt = str(attempt_row["attempt_state"] or "") in {
+            "FILLED", "CANCELLED_ZERO_FILL", "CANCELLED_PARTIAL_FILL",
+            "REJECTED_EXPLICIT", "ABANDONED_PRE_SUBMIT",
+        }
+        prior_filled = None if previous is None else int(previous)
+        is_new_fill = (
+            observed_qty is not None
+            and (prior_filled is None or observed_qty > prior_filled)
+        )
+        if superseded:
+            # Keep the immutable Attempt and its fills, not its obsolete state
+            # transitions.  An old observation may only change economic truth
+            # when the broker has *authoritatively* increased cumulative fill.
+            if not (authoritative and is_new_fill and observed_qty > 0):
+                return self._snapshot(action_row)
+            if str(attempt_row["attempt_state"] or "") == "ABANDONED_PRE_SUBMIT":
+                raise RuntimeError("broker fill contradicts proven pre-submit abort")
+            if terminal_attempt:
+                attempt_state = str(attempt_row["attempt_state"])
+                if attempt_state.startswith("CANCELLED_"):
+                    attempt_state = "CANCELLED_PARTIAL_FILL"
+            else:
+                attempt_state = "FILLED" if observed_qty == requested else "PARTIALLY_FILLED"
+        else:
+            # A terminal observation cannot be regressed by a late ACK/OPEN.
+            if terminal_attempt and state in {
+                "CREATED", "SUBMITTED", "ACKED", "UNRESOLVED",
+                "RECONCILE_ERROR", "PARTIALLY_FILLED",
+            } and not (authoritative and is_new_fill and observed_qty > 0):
+                return self._snapshot(action_row)
+            attempt_state = state
+
+        # Every attempt is a separate broker order.  The historic
+        # filled_qty_before_attempt is a snapshot, NOT a live rollup; using
+        # it after a late old fill loses economic quantity.
+        previous_attempts = conn.execute(
+            sa.select(attempts.c.cumulative_filled_qty)
+            .where(
+                attempts.c.action_key == key,
+                attempts.c.attempt_id != str(attempt_id),
+            )
+        ).scalars().all()
+        known_other = sum(int(qty) for qty in previous_attempts if qty is not None)
+        total = None if observed_qty is None else known_other + observed_qty
         target = int(action_row["target_qty"])
-        remaining = None if total is None else max(0, target - total)
+        overfilled = total is not None and total > target
+        # Never hide an action overfill by max(0, target-total).  A fence is
+        # required until the original orders and reserves are reconciled.
+        remaining = None if total is None or overfilled else target - total
         action_state = "IN_FLIGHT"
         active_attempt_id: str | None = str(attempt_id)
-        attempt_state = state
         if state in {"CREATED", "SUBMITTED", "ACKED", "UNRESOLVED", "RECONCILE_ERROR"}:
             action_state = "UNCERTAIN" if state in {"UNRESOLVED", "RECONCILE_ERROR"} else "IN_FLIGHT"
         elif state == "PARTIALLY_FILLED":
@@ -404,13 +460,27 @@ class DurableExecutionClaimRepo:
             else:
                 action_state = "UNCERTAIN"
 
+        if superseded:
+            # Another Attempt might already have reached KIS.  Never release
+            # its live claim or auto-offset shares merely because an earlier
+            # order reported a delayed fill.
+            active_attempt_id = action_row["active_attempt_id"]
+            action_state = "UNCERTAIN" if active_attempt_id else (
+                "SATISFIED" if remaining == 0 else "UNCERTAIN"
+            )
+        if overfilled:
+            action_state = "UNCERTAIN"
+            active_attempt_id = action_row["active_attempt_id"]
+        if terminal_attempt and not superseded and state == "PARTIALLY_FILLED":
+            attempt_state = str(attempt_row["attempt_state"])
+
         conn.execute(
             sa.update(attempts)
             .where(attempts.c.attempt_id == str(attempt_id))
             .values(
                 cumulative_filled_qty=observed_qty,
                 attempt_state=attempt_state,
-                authoritative=bool(authoritative),
+                authoritative=bool(authoritative or attempt_row["authoritative"]),
                 updated_at=datetime.now(timezone.utc),
             )
         )
