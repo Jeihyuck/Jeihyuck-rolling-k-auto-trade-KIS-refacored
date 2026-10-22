@@ -1018,11 +1018,15 @@ def prepare_exit_position_snapshots(
         getattr(provider, "get_current_price", None)
         or getattr(provider, "get_current_price_usd", None)
     )
+    _isolated_quote_reader = getattr(provider, "get_isolated_exit_quote", None)
     _prefetch_requested = (
         os.getenv("US_EXIT_QUOTE_PREFETCH_ENABLED", "0") == "1"
         and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
-        and bool(getattr(provider, "concurrent_price_reads_safe", False))
-        and callable(_quote_method)
+        and (
+            bool(getattr(provider, "concurrent_price_reads_safe", False))
+            or callable(_isolated_quote_reader)
+        )
+        and (callable(_quote_method) or callable(_isolated_quote_reader))
         and len(positions or []) > 1
     )
     # One wall-clock budget for the entire quote batch (not one timeout per
@@ -1042,6 +1046,13 @@ def prepare_exit_position_snapshots(
         else:
             _prefetch_deadline = time.monotonic() + _budget
     if _prefetch_requested:
+        if callable(_isolated_quote_reader):
+            # Only the isolated quote implementation receives a shared
+            # deadline; it must use its own KIS client/cache and leave the
+            # main Tick-bound trading provider untouched.
+            _quote_method = lambda sym, exch: _isolated_quote_reader(
+                sym, exch, stage_deadline=_prefetch_deadline,
+            )
         _workers = min(4, max(1, int(os.getenv("US_EXIT_QUOTE_PREFETCH_WORKERS", "3"))))
         _pool = ThreadPoolExecutor(max_workers=_workers, thread_name_prefix="us-exit-quote")
         try:
