@@ -2338,7 +2338,7 @@ def test_fenced_reservation_worker_releases_only_proven_pre_http_aborts(
         repos, "_us_execution_claim_scope",
         lambda: {
             "env": "practice", "account_id": account,
-            "market": "US", "trading_epoch_id": "pre-http-epoch",
+            "market": "US", "trading_epoch_id": "next-afternoon-epoch",
         },
     )
     sweep = reconcile_proven_reservations_once(
