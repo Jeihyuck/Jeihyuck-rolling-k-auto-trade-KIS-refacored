@@ -55,12 +55,16 @@ def reconcile_proven_reservations_once(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT r.action_key AS attempt_id, a.client_order_key
+                SELECT r.action_key AS attempt_id, a.client_order_key,
+                       o.trade_date AS source_trade_date
                 FROM us_execution_account_reservations AS r
                 JOIN us_execution_attempts AS a
                   ON a.attempt_id=r.action_key
                 JOIN us_execution_claims AS c
                   ON c.action_key=a.action_key
+                JOIN us_orders AS o ON o.client_order_key=a.client_order_key
+                  AND o.env=r.env AND o.trading_epoch_id=r.trading_epoch_id
+                  AND o.meta->>'submit_attempt_id'=a.attempt_id
                 WHERE r.env=:env AND r.account_fingerprint=:account
                   AND r.trading_epoch_id=:epoch
                   AND c.env=:env AND c.account_id=:account
@@ -71,7 +75,7 @@ def reconcile_proven_reservations_once(
                     'FILLED','CANCELLED_ZERO_FILL','CANCELLED_PARTIAL_FILL'
                   )
                   AND a.client_order_key IS NOT NULL
-                  AND c.trade_date<=CAST(:trade_date AS DATE)
+                  AND o.trade_date<=CAST(:trade_date AS DATE)
                 ORDER BY r.created_at
                 LIMIT :limit
             """), {
@@ -85,7 +89,7 @@ def reconcile_proven_reservations_once(
                 receipt = authority.terminalize_verified_attempt(
                     lease=lease, attempt_id=str(row["attempt_id"]),
                     client_order_key=str(row["client_order_key"]),
-                    trade_date=trade_date,
+                    trade_date=str(row["source_trade_date"]),
                 )
                 if receipt["state"] == "RELEASED":
                     result["released"] += 1
