@@ -2155,6 +2155,22 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     with pg_engine.begin() as conn:
         write_triplet(conn)
     assert counts() == (1, 1, 1)
+    authority.assert_reserved_submit_authority(
+        attempt_id=attempt, client_order_key=key,
+        strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+    )
+    from trader.us.execution.account_authority import AuthorityUnavailable
+    with pytest.raises(AuthorityUnavailable, match="STALE"):
+        authority.assert_reserved_submit_authority(
+            attempt_id=attempt, client_order_key=key,
+            strategy_owner="US_STANDARD", symbol="TQQQ", side="BUY", qty=3,
+        )
+    ledger.release_before_submit(identity, attempt_id=attempt)
+    with pytest.raises(AuthorityUnavailable, match="STALE"):
+        authority.assert_reserved_submit_authority(
+            attempt_id=attempt, client_order_key=key,
+            strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+        )
     authority.release_lease(lease=lease)
 
 
