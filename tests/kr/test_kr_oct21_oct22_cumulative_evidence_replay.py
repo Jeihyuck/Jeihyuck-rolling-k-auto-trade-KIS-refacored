@@ -199,3 +199,34 @@ def test_partial_sell_cumulative_increase_and_stale_snapshot_never_double_applie
         repo.reconcile_sell_execution(
             **fields, confirmed_cumulative_qty=10, fill_price=16100.0,
         )
+
+
+def test_cumulative_same_quantity_with_changed_notional_fails_closed():
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.repos import FillsRepo
+    from trader.db.schema import schema_for_engine
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+
+    db = sa.create_engine("sqlite:///:memory:")
+    create_schema_with_active_test_epoch(db)
+    repo = FillsRepo(db)
+    args = dict(
+        env="practice", run_id=None, order_id=str(uuid.uuid4()),
+        kis_odno="0000013196", trade_id="KR_KIS_CUM:fixture:20261021:0000013196:251970:BUY",
+        code="251970", market="KOSPI", side="BUY",
+        qty=17, price=68400.0, fee=0.0, tax=0.0,
+        filled_at=datetime(2026, 10, 21, 9, 39, tzinfo=ZoneInfo("Asia/Seoul")),
+        raw_json={"tot_ccld_qty": 17, "tot_ccld_amt": 1162800},
+        fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+    )
+    repo.upsert_fill(**args)
+    with pytest.raises(RuntimeError, match="KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT"):
+        repo.upsert_fill(**{**args, "price": 69000.0})
+    with db.connect() as conn:
+        stored = conn.execute(sa.select(schema_for_engine(db).fills).where(
+            schema_for_engine(db).fills.c.kis_odno == "0000013196"
+        )).mappings().all()
+    assert len(stored) == 1
+    assert stored[0]["qty"] == 17
+    assert stored[0]["price"] == 68400.0
