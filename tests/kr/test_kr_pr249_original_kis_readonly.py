@@ -114,3 +114,60 @@ def test_kis_returned_order_quantity_mismatch_cannot_pass_by_od_no_alone():
     sell = next(item for item in evidence["results"] if item["code"] == "053800"
                 and item["side"] == "SELL")
     assert sell["status"] == "UNVERIFIED_OR_MISSING"
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://openapivts.koreainvestment.com:29443", True),
+    ("https://openapivts.koreainvestment.com:29443/", True),
+    ("http://openapivts.koreainvestment.com:29443", False),
+    ("https://openapi.koreainvestment.com:9443", False),
+    ("https://evilopenapivts.koreainvestment.com:29443", False),
+    ("https://openapivts.koreainvestment.com.evil.example:29443", False),
+    ("https://openapivts.koreainvestment.com:9443", False),
+    ("", False),
+])
+def test_practice_original_get_requires_exact_real_client_url(url, expected):
+    from scripts.kr.pr249_original_kis_readonly import _is_practice_kis_base_url
+    assert _is_practice_kis_base_url(url) is expected
+
+
+def test_readonly_probe_can_verify_practice_without_unused_rest_url(monkeypatch):
+    """Gate must not require optional KIS_REST_URL; no broker network calls."""
+    import hashlib
+    import settings
+    from scripts.kr import pr249_original_kis_readonly as probe
+
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.delenv("KIS_REST_URL", raising=False)
+    for name in ("KIS_APP_KEY", "KIS_APP_SECRET", "CANO", "ACNT_PRDT_CD"):
+        monkeypatch.setenv(name, "test-only")
+    monkeypatch.setattr(settings, "API_BASE_URL", "https://openapivts.koreainvestment.com:29443")
+    monkeypatch.setattr(settings, "KIS_ENV", "practice")
+
+    class FakeKis:
+        def __init__(self, *, kis_env):
+            self.env = kis_env
+
+    class StubHash:
+        def hexdigest(self):
+            return probe.EXPECTED_ACCOUNT_DIGEST_PREFIX + "0" * 52
+
+    monkeypatch.setattr(probe.hashlib, "sha256", lambda _raw: StubHash())
+
+    import trader.kis_wrapper
+    import trader.account_state
+    import trader.kr.runtime_integrity_20260929
+    monkeypatch.setattr(trader.kis_wrapper, "KisAPI", FakeKis)
+    monkeypatch.setattr(trader.account_state, "get_account_key", lambda **_: "synthetic-practice")
+    def valid_payload(_kis, day):
+        rows = []
+        for (code, side, odno), qty in probe.TARGETS[day].items():
+            rows.append({"pdno":code, "sll_buy_dvsn_cd":"01" if side=="SELL" else "02",
+                         "odno":odno,"ord_dt":day.strftime("%Y%m%d"),"ord_qty":str(qty),
+                         "tot_ccld_qty":"0","tot_ccld_amt":"0"})
+        return {"rt_cd":"0","_sep29_complete":True,"output1":rows}
+    monkeypatch.setattr(trader.kr.runtime_integrity_20260929, "_daily_ccld_all_pages_for_date",valid_payload)
+    result=probe.run_practice_readonly()
+    assert len(result)==2
+    assert all(row["verified"]==row["targets"] for row in result)
