@@ -3053,6 +3053,32 @@ def run_trade_tick(
     except Exception as _cluster_guard_exc:
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
 
+    # Restore previously CONFIRMED hard/persistent stop debt even after a
+    # process restart or when the current quote no longer breaches the stop.
+    # This uses the original PB1 intent constructor and canonical router;
+    # it never bypasses stale-TP, Claim, reservation or KIS broker fences.
+    if (
+        os.getenv("US_PROTECTIVE_STOP_LEDGER_MODE", "SHADOW").upper() == "ENFORCE"
+        and str(env).lower() == "practice"
+        and not offline and kis_order_allowed and not signal_only
+    ):
+        try:
+            from trader.us.protective_stop_obligation import (
+                load_pending_stop_obligations, replay_confirmed_protective_intents,
+            )
+            _debt_rows = load_pending_stop_obligations(env=env)
+            _replayed = replay_confirmed_protective_intents(
+                snapshots=locals().get("exit_snapshots", []) or [],
+                existing_intents=exit_intents, pending=_debt_rows, now=now,
+            )
+            if _replayed:
+                logger.warning("[US_PROTECTIVE_STOP][DEBT_REPLAY] count=%d", len(_replayed))
+                exit_intents.extend(_replayed)
+        except Exception as _debt_exc:
+            # Missing durable evidence must not silently authorize a new
+            # synthetic SELL. Original fresh signals remain separately fenced.
+            logger.error("[US_PROTECTIVE_STOP][DEBT_REPLAY_UNAVAILABLE] type=%s", type(_debt_exc).__name__)
+
     # Infinite evaluation/mutation is a strict no-op while disabled. Ownership
     # evidence is still read so an open/pending Infinite position cannot leak
     # into the legacy strategy after the kill switch is used.

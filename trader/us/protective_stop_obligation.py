@@ -118,10 +118,81 @@ def load_pending_stop_obligations(*, env: str="practice") -> list[dict]:
             raise StopObligationUnavailable("STOP_OBLIGATION_EPOCH_MISSING")
         rows=conn.execute(text("""
             SELECT account_id,symbol,lifecycle_id,stop_family,severity,target_qty,
-                   confirmed_filled_qty,obligation_state,first_signal_at,last_signal_at
+                   confirmed_filled_qty,obligation_state,first_signal_at,last_signal_at,
+                   soft_stop_pct,hard_stop_pct
             FROM us_protective_stop_obligations
             WHERE trading_epoch_id=:epoch AND env='practice'
               AND obligation_state<>'SATISFIED'
             ORDER BY severity DESC,first_signal_at
         """),{"epoch":epoch}).mappings().all()
     return [dict(x) for x in rows]
+
+
+def replay_confirmed_protective_intents(
+    *, snapshots: list[dict], existing_intents: list[dict],
+    pending: list[dict], now: datetime | None,
+) -> list[dict]:
+    """Rehydrate durable hard/persistent stop via existing PB1 -> canonical router.
+
+    This function does not inspect, cancel, or release broker orders. _make_exit_intent
+    and the normal router remain authoritative for pending TP, shared account
+    reservations, live quantity, risk, and KIS submission uncertainty.
+    """
+    from trader.us.stop_policy_revision import scope_for_position
+    from trader.us.entry_exit_contract import contract_exit_config
+    from trader.us.pb1.us_exit_engine import _make_exit_intent
+
+    existing_symbols = {
+        str(i.get("symbol") or "").upper() for i in existing_intents
+        if str(i.get("side") or "").upper() == "SELL"
+    }
+    by_scope = {}
+    for snapshot in snapshots:
+        symbol, life, account = scope_for_position(snapshot)
+        if symbol and life and account:
+            by_scope[(symbol,life,account)] = snapshot
+
+    emitted=[]
+    for debt in pending:
+        if int(debt.get("severity") or 0) < 2:
+            continue  # Only confirmed full-exit debt is eligible for replay.
+        symbol = str(debt.get("symbol") or "").upper()
+        if symbol in existing_symbols:
+            continue
+        key=(symbol,str(debt.get("lifecycle_id") or ""),str(debt.get("account_id") or ""))
+        pos=by_scope.get(key)
+        if not pos:
+            continue
+        try:
+            holding=int(pos.get("holding_qty") or pos.get("qty") or 0)
+            orderable=int(pos.get("orderable_qty") or 0)
+            current=float(pos.get("resolved_current_price") or pos.get("current_price") or 0)
+            entry=float(pos.get("resolved_entry_price") or pos.get("entry_price") or 0)
+        except (TypeError,ValueError):
+            continue
+        if holding<=0 or orderable<=0 or current<=0 or entry<=0:
+            # A blocked live broker quantity is not terminal evidence.
+            continue
+        severity=int(debt["severity"])
+        kind="hard_stop_loss" if severity==3 else "persistent_soft_stop_full_exit"
+        cfg=contract_exit_config(pos)
+        if not cfg:
+            continue  # unsigned/unknown contract cannot be replay authority
+        # The original confirmed stop threshold is immutable debt evidence.
+        cfg={**cfg,"hard_stop":float(debt.get("hard_stop_pct") or cfg["hard_stop"]),
+             "soft_stop":float(debt.get("soft_stop_pct") or cfg["soft_stop"])}
+        intent=_make_exit_intent(
+            symbol=symbol,exchange=str(pos.get("exchange") or "NASDAQ"),
+            qty=min(holding,orderable), current_price=current,entry_price=entry,
+            exit_type=kind,reason="persistent_durable_confirmed_exit",
+            unrealized_pnl_usd=(current-entry)*min(holding,orderable),
+            pnl_pct=(current-entry)/entry,
+            holding_qty=holding,orderable_qty=orderable,now=now,
+            policy_cfg=cfg,position_lifecycle_id=key[1],
+            meta_extra={"stop_obligation_replay":True,
+                        "stop_obligation_first_signal_at":str(debt.get("first_signal_at") or "")},
+        )
+        if intent:
+            emitted.append(intent)
+            existing_symbols.add(symbol)
+    return emitted
