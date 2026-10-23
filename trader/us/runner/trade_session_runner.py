@@ -1391,7 +1391,7 @@ def run_trade_session(
             _shadow_env["US_OFFLINE"] = "0" if _reconcile_mode == "WORKER" else "1"
             if _reconcile_mode == "WORKER":
                 import uuid as _stage4_uuid
-                os.environ["US_STAGE4_EXPECTED_GENERATION"] = _stage4_uuid.uuid4().hex
+                os.environ["US_STAGE4_EXPECTED_GENERATION"] = str(_stage4_uuid.uuid4())
                 _shadow_env["US_STAGE4_EXPECTED_GENERATION"] = os.environ["US_STAGE4_EXPECTED_GENERATION"]
             _shadow_env["US_RECONCILE_WORKER_MODE"] = _reconcile_mode
             _shadow_reconcile_child = subprocess.Popen(
