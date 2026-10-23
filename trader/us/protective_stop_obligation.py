@@ -196,3 +196,92 @@ def replay_confirmed_protective_intents(
             emitted.append(intent)
             existing_symbols.add(symbol)
     return emitted
+
+
+def validate_terminal_broker_proof(debt: dict, proof: dict) -> bool:
+    """Only fully reconciled KIS original-account zero position is terminal.
+
+    KIS cancel ACK, old CCNL OPEN, a local position snapshot, and a completed
+    REST request never satisfy this predicate. The caller must be the
+    authoritative broker reconciliation path; this helper cannot fetch proof.
+    """
+    if not isinstance(proof,dict) or not isinstance(debt,dict):
+        return False
+    if any(str(proof.get(k) or "") != str(debt.get(k) or "") for k in
+           ("account_id","symbol","lifecycle_id","trading_epoch_id")):
+        return False
+    if (str(proof.get("env") or "")!="practice" or
+            str(proof.get("strategy_owner") or "")!="US_STANDARD"):
+        return False
+    if (str(proof.get("position_source") or "")!="KIS_AUTHORITATIVE" or
+            str(proof.get("open_orders_source") or "")!="KIS_AUTHORITATIVE"):
+        return False
+    if proof.get("fills_reconciled") is not True or proof.get("claims_reconciled") is not True:
+        return False
+    if proof.get("broker_terminal_order_states") is not True:
+        return False
+    try:
+        balance_qty=int(proof["broker_holding_qty"])
+        open_sell_qty=int(proof["broker_open_sell_qty"])
+    except (KeyError,TypeError,ValueError):
+        return False
+    if balance_qty!=0 or open_sell_qty!=0:
+        return False
+    if not str(proof.get("broker_evidence_ref") or "").strip():
+        return False
+    observed=proof.get("observed_at")
+    try:
+        when=datetime.fromisoformat(str(observed).replace("Z","+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return when.tzinfo is not None
+
+
+def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> bool:
+    """Finalize stop debt from independent authoritative KIS recon evidence.
+
+    Never alter fills, original Claim/Attempt state, or reservations here.
+    Reject if any related TP/SELL claim remains in a non-terminal state.
+    """
+    import json
+    if not validate_terminal_broker_proof(debt,proof):
+        raise StopObligationUnavailable("STOP_OBLIGATION_TERMINAL_PROOF_UNVERIFIED")
+    from sqlalchemy import text
+    from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
+    engine=_get_engine_or_none()
+    if engine is None:
+        raise StopObligationUnavailable("STOP_OBLIGATION_DATABASE_UNAVAILABLE")
+    with engine.begin() as conn:
+        epoch=_active_us_epoch(conn)
+        if not epoch or str(epoch)!=str(debt["trading_epoch_id"]):
+            raise StopObligationUnavailable("STOP_OBLIGATION_EPOCH_CHANGED")
+        result=conn.execute(text("""
+            UPDATE us_protective_stop_obligations o
+               SET obligation_state='SATISFIED',
+                   terminal_proof=CAST(:proof AS jsonb),updated_at=now()
+             WHERE o.trading_epoch_id=:epoch
+               AND o.env='practice'
+               AND o.account_id=:account
+               AND o.strategy_owner='US_STANDARD'
+               AND o.symbol=:symbol
+               AND o.lifecycle_id=:lifecycle
+               AND o.obligation_state<>'SATISFIED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM us_execution_claims c
+                    WHERE c.trading_epoch_id=o.trading_epoch_id
+                      AND c.env=o.env AND c.account_id=o.account_id
+                      AND c.strategy_owner=o.strategy_owner
+                      AND c.lifecycle_id=o.lifecycle_id
+                      AND c.action_state IN ('IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED')
+               )
+            RETURNING o.lifecycle_id
+        """),{
+            "proof":json.dumps(proof,sort_keys=True,default=str),
+            "epoch":epoch,"account":debt["account_id"],
+            "symbol":debt["symbol"],"lifecycle":debt["lifecycle_id"],
+        })
+        committed=result.first() is not None
+    if not committed:
+        logger.warning("[US_PROTECTIVE_STOP][TERMINAL_BLOCKED] symbol=%s lifecycle=%s action=retain_debt",
+                       debt.get("symbol"),debt.get("lifecycle_id"))
+    return committed
