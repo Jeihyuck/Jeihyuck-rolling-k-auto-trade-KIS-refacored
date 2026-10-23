@@ -28,7 +28,7 @@ def test_both_proven_p95_below_threshold_with_twenty_distinct_orders_and_ticks()
 
 def test_repeated_same_order_key_and_nonprotective_owner_do_not_pad_sample():
     lines = ([selected(i) for i in range(19)] +
-             [selected(19, key="key0")] +
+             [selected(0, key="key0")] +
              [selected(20, owner="TQQQ_INFINITE")] +
              [selected(21, exit_type="profit_protect")] +
              ["[US_ORDER][PRE_IO_FAILURE] reason=expired"] +
