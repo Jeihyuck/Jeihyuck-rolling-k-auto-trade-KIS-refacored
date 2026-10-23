@@ -291,11 +291,19 @@ def request_protective_tp_cancel(
     reserve: Callable[[dict], bool] = reserve_cancel_request,
     apply_observation: Callable[..., dict] | None = None,
     unresolved_claim: Callable[..., bool] = has_unresolved_tp_claim,
+    read_only_terminal_reconcile: bool = False,
 ) -> list[dict]:
-    """One cancel request per tick at most, with independently verified order proof."""
-    if os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1":
+    """Reconcile independently broker-proven TP terminal states without a cancel.
+
+    Explicit read-only mode bypasses the *cancel-feature* gate solely for KIS
+    original-date GET and canonical terminal observation. It never reserves
+    a cancellation or invokes the broker cancel API. Existing callers retain
+    the original cancel-feature gate unless they explicitly opt in.
+    """
+    if (not read_only_terminal_reconcile
+            and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"):
         return []
-    if kis_client is None or provider is None:
+    if provider is None or (kis_client is None and not read_only_terminal_reconcile):
         # Do not fall through to a protective replacement when neither
         # broker-open truth nor cancellation outcome can be established.
         return [
@@ -427,6 +435,13 @@ def request_protective_tp_cancel(
                                 "status": "CANCEL_TERMINAL_RECONCILED" if accepted
                                           else "CANCEL_PENDING_RECONCILE_REQUIRED"})
                 break
+            if read_only_terminal_reconcile:
+                # An original-date OPEN/partial observation can never prove
+                # current cancelability, nor can it release a duplicate-SELL
+                # fence. The read-only worker may only settle terminal proof.
+                results.append({"symbol": symbol, "status": "FENCED",
+                                "reason": "read_only_terminal_proof_missing"})
+                continue
             if not broker_proves_open_tp_order(order, evidence):
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "broker_open_proof_missing"})
                 continue
