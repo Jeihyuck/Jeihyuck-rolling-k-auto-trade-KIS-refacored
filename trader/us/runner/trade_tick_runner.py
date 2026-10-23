@@ -2430,6 +2430,12 @@ def run_trade_tick(
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
             if _lc:
                 _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
+                # Preserve authoritative account/owner for exact stop revision
+                # and durable obligation scope, never infer from a ticker.
+                if str(_lc.get("account_id") or "").strip():
+                    _p["account_id"] = str(_lc["account_id"])
+                if str(_lc.get("strategy_owner") or "").upper() == STANDARD_OWNER:
+                    _p["strategy_owner"] = STANDARD_OWNER
                 _p["opened_trade_date"] = _lc.get("opened_trade_date")
                 _p["opened_at"] = _lc.get("opened_at")
                 _p["opened_at_source"] = _lc.get("opened_at_source")
