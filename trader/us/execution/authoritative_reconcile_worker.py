@@ -102,6 +102,10 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
     if not row or str(row["worker_state"])!="READY":
         raise RuntimeError("US_STAGE4_WRITER_NOT_READY")
     expected_generation=os.getenv("US_STAGE4_EXPECTED_GENERATION")
+    if os.getenv("US_RECONCILE_WORKER_MODE")=="WORKER":
+        if (os.getenv("US_STAGE4_WRITER_AUTHORIZED")!="1"
+                or os.getenv("US_PROTECTIVE_STOP_LEDGER_MODE")!="ENFORCE"):
+            raise RuntimeError("US_STAGE4_WRITER_POLICY_NOT_ARMED")
     if (os.getenv("US_RECONCILE_WORKER_MODE")=="WORKER"
             and not expected_generation):
         raise RuntimeError("US_STAGE4_WORKER_GENERATION_NOT_CONFIGURED")
@@ -240,7 +244,8 @@ def main() -> int:
             or os.getenv("US_STAGE4_WRITER_AUTHORIZED")!="1"
             or os.getenv("US_SHARED_KIS_LIMITER_ENABLED")!="1"
             or os.getenv("US_ACCOUNT_RESERVATION_MODE")!="ENFORCE"
-            or os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED")!="1"):
+            or os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED")!="1"
+            or os.getenv("US_PROTECTIVE_STOP_LEDGER_MODE")!="ENFORCE"):
         raise RuntimeError("US_STAGE4_WORKER_NOT_AUTHORIZED")
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
     from trader.us.data_provider import USDataProvider
