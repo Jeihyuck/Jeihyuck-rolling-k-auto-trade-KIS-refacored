@@ -23,6 +23,50 @@ from sqlalchemy import text
 
 logger=logging.getLogger(__name__)
 _STOP=False
+_RECOVERY_CURSOR=0
+
+
+def recover_stop_tp_conflicts_once(*, provider: Any,trade_date: str,
+                                   max_candidates: int=3) -> dict:
+    """Independent TP repair: original-date READ-ONLY query by default.
+
+    Cancel requests require both the existing cancel gate and explicit
+    operator authorization. A local OPEN row is NEVER actionable proof.
+    """
+    global _RECOVERY_CURSOR
+    from trader.us.protective_stop_obligation import load_pending_stop_obligations
+    from trader.us.execution.protective_stop_recovery_worker import recovery_candidates
+    from trader.us.protective_tp_recovery import request_protective_tp_cancel
+    debts=load_pending_stop_obligations(env="practice")
+    candidates=recovery_candidates(debts)
+    if not candidates:
+        return {"checked":0,"total":0,"cancel_authorized":False}
+    limit=min(4,max(1,int(max_candidates)))
+    selected=[
+        candidates[(_RECOVERY_CURSOR+j)%len(candidates)]
+        for j in range(min(limit,len(candidates)))
+    ]
+    _RECOVERY_CURSOR=(_RECOVERY_CURSOR+len(selected))%len(candidates)
+    cancel_authorized=(
+        os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED","0")=="1"
+        and os.getenv("US_STOP_RECOVERY_AUTHORIZED","0")=="1"
+    )
+    class _NoOrderSubmit:
+        def cancel_us_order(self,**kwargs):
+            raise RuntimeError("US_STAGE4_READ_ONLY_CANCEL_NOT_AUTHORIZED")
+    # For non-authorized runs, the cancel reservation cannot be acquired;
+    # terminal historical orders can still be authoritatively reconciled.
+    results=request_protective_tp_cancel(
+        intents=selected,provider=provider,
+        kis_client=provider._get_client() if cancel_authorized else _NoOrderSubmit(),
+        trade_date=trade_date,env="practice",
+        **({} if cancel_authorized else {"reserve":lambda order:False}),
+    )
+    return {"checked":len(selected),"total":len(candidates),
+            "cancel_authorized":cancel_authorized,
+            "statuses":[str(x.get("status") or "") for x in results]}
+
+
 
 
 def _stop(_signum,_frame):
@@ -113,6 +157,19 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS"}
             or ack_status not in {"OK","WARN"}):
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
+    # Neither TP repair nor terminal stop proof occupies the main order
+    # route. Any KIS ambiguity leaves its debt/Claim fenced for another cycle.
+    tp_recovery=recover_stop_tp_conflicts_once(
+        provider=provider,trade_date=trade_date,
+    )
+    from trader.us.execution.protective_stop_settlement_worker import (
+        settle_verified_stop_debts_once,
+    )
+    stop_settlement=settle_verified_stop_debts_once(
+        provider=provider,trade_date=trade_date,limit=2,
+    )
+    logger.info("[US_STAGE4][PROTECTIVE_RECOVERY] tp=%s settlement=%s",
+                tp_recovery,stop_settlement)
     return {
         "reconcile_status":ack_status,
         "replay_status":replay_status,

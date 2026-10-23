@@ -3142,6 +3142,7 @@ def run_trade_tick(
     # SELL in this tick; only terminal broker reconciliation may do that.
     if (
         os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
+        and os.getenv("US_RECONCILE_WORKER_MODE","LEGACY") != "WORKER"
         and kis_order_allowed and not signal_only
     ):
         try:
