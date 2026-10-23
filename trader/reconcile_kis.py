@@ -596,6 +596,40 @@ def _promote_open_buy_orders_from_holdings(
             )
             continue
 
+        # Fast negative proof for TERMINAL legacy recovery candidates. Today
+        # up to 128 old orders were each checking settlement cutover (DB I/O)
+        # even though their saved terminal holding quantity did not match the
+        # *current* KIS holding. Those candidates cannot be repaired by this
+        # algorithm. Reject them BEFORE the per-order cutover lookup; open and
+        # unresolved orders continue through the unchanged full safety path.
+        if status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
+            saved_pre = _to_int(response_json.get("pre_order_holding_qty"))
+            saved_post = _to_int(response_json.get("holding_qty"))
+            saved_filled = _to_int(response_json.get("confirmed_fill_qty"))
+            requested_qty = int(order.get("qty") or 0)
+            if (
+                response_json.get("promotion_source") != "kis_holdings"
+                or saved_pre is None or saved_post is None
+                or saved_filled is None or saved_filled <= 0
+                or saved_filled > requested_qty
+                or saved_post != (
+                    saved_pre + saved_filled if side == "BUY"
+                    else saved_pre - saved_filled
+                )
+            ):
+                logger.warning(
+                    "[RECONCILE][PROMOTE_RECOVERY][PROOF_INCOMPLETE] code=%s order_id=%s",
+                    code, order.get("order_id"),
+                )
+                continue
+            if holding_qty != saved_post or not order.get("created_at"):
+                logger.warning(
+                    "[RECONCILE][PROMOTE_RECOVERY][REVIEW_REQUIRED] "
+                    "code=%s reason=HISTORICAL_HOLDING_DRIFT",
+                    code,
+                )
+                continue
+
         # Once the shared KR writer is actually released for this account/epoch,
         # holdings-only inference must never fall through to the legacy economic
         # writer. Exact KIS executions will be handled by reconcile_today().
