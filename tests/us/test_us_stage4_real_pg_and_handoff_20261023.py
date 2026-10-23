@@ -45,11 +45,12 @@ def test_one_stage4_worker_owns_fills_replay_ack_reservations_and_stop_settlemen
         writer_generation=str(uuid.uuid4()),conn=object(),scope={},
     )
     assert sequence==["fills","persist_fills","journal","ack",
-                      "trend","soft","reservation","tp","stop"] or sequence==[
-                          "fills","persist_fills","journal","ack",
-                          "reservation","tp","stop","trend","soft"
-                      ]
+                      "trend","soft","reservation"]
     assert result["reconcile_status"]=="OK"
+    deferred=worker.run_deferred_recovery_once(provider=object(),
+                                                trade_date="2026-10-23")
+    assert sequence[-2:]==["tp","stop"]
+    assert deferred["settlement"]["settled"]==0
 
 
 @pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"),

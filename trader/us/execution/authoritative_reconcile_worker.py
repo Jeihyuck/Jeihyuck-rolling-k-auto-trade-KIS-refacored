@@ -175,19 +175,9 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS","WARN","PARTIAL","UNRESOLVED"}
             or ack_status not in {"OK","WARN"}):
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
-    # Neither TP repair nor terminal stop proof occupies the main order
-    # route. Any KIS ambiguity leaves its debt/Claim fenced for another cycle.
-    tp_recovery=recover_stop_tp_conflicts_once(
-        provider=provider,trade_date=trade_date,
-    )
-    from trader.us.execution.protective_stop_settlement_worker import (
-        settle_verified_stop_debts_once,
-    )
-    stop_settlement=settle_verified_stop_debts_once(
-        provider=provider,trade_date=trade_date,limit=2,
-    )
-    logger.info("[US_STAGE4][PROTECTIVE_RECOVERY] tp=%s settlement=%s",
-                tp_recovery,stop_settlement)
+    # Publish fresh critical-path proof first. Expensive original-date TP
+    # lookups and stop terminal cleanup are after that publication and can
+    # never delay this cycle's broker-evidence handoff to a clean SELL.
     return {
         "reconcile_status":ack_status,
         "replay_status":replay_status,
@@ -198,6 +188,23 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         ),
         "filled_rows":len(fills.get("fills") or []),
     }
+
+
+def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
+    """Only this authoritative process writes terminal claims.
+
+    Deferred KIS original-date queries do not block publishing the already
+    persisted Fill/ACK evidence. A slow deferred phase can still expire
+    the ready heartbeat, which safely fences later orders until refreshed.
+    """
+    tp=recover_stop_tp_conflicts_once(provider=provider,trade_date=trade_date)
+    from trader.us.execution.protective_stop_settlement_worker import (
+        settle_verified_stop_debts_once,
+    )
+    settled=settle_verified_stop_debts_once(
+        provider=provider,trade_date=trade_date,limit=2,
+    )
+    return {"tp":tp,"settlement":settled}
 
 
 def publish_health(conn: Any, *, scope: dict, generation: str,
@@ -288,6 +295,18 @@ def main() -> int:
                          "pending_order_count":result["pending_count"],
                          "active_claim_count":result["unresolved_count"]},
                     )
+                    # Slow historical broker inquiries are outside the main
+                    # Tick and after the READY evidence publication.
+                    try:
+                        deferred=run_deferred_recovery_once(
+                            provider=provider,trade_date=args.trade_date,
+                        )
+                        logger.info("[US_STAGE4][DEFERRED_RECOVERY] %s",deferred)
+                    except Exception as recovery_exc:
+                        # Keep the confirmed stop obligation and old TP fence.
+                        # Do not falsify earlier *confirmed* ACK/Fill proof.
+                        logger.exception("[US_STAGE4][DEFERRED_RECOVERY_FAILED] type=%s",
+                                         type(recovery_exc).__name__)
                 except Exception as exc:
                     logger.exception("[US_STAGE4][RECONCILE_FAILURE] type=%s",
                                      type(exc).__name__)
