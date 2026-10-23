@@ -452,6 +452,18 @@ def evaluate_exit(
             "position_lifecycle_id",
             str(position_lifecycle_id) if position_lifecycle_id else None,
         )
+        # Persist the confirmed stop BEFORE _make_exit_intent's pending-SELL
+        # suppression. A stale TP fence must not erase a verified stop signal.
+        from trader.us.protective_stop_obligation import record_confirmed_stop
+        record_confirmed_stop(
+            position,
+            exit_type=str(kwargs.get("exit_type") or ""),
+            target_qty=int(kwargs.get("qty") or 0),
+            pnl_pct=float(kwargs.get("pnl_pct") or 0.0),
+            signal_price=float(kwargs.get("current_price") or 0.0),
+            policy=cfg,
+            now=now,
+        )
         return _make_exit_intent(policy_cfg=cfg, **kwargs)
 
     symbol = position.get("symbol", "")
