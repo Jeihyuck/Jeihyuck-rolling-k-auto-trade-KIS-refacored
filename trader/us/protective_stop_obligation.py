@@ -108,7 +108,13 @@ def load_pending_stop_obligations(*, env: str="practice") -> list[dict]:
     if env.lower()!="practice":
         raise StopObligationUnavailable("STOP_OBLIGATION_ENV_FORBIDDEN")
     from sqlalchemy import text
+    from trader.account_state import get_account_key, resolve_env_name
     from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+    if resolve_env_name() != "practice":
+        raise StopObligationUnavailable("STOP_OBLIGATION_ACCOUNT_ENV_MISMATCH")
+    account = str(get_account_key(env="practice") or "").strip()
+    if not account:
+        raise StopObligationUnavailable("STOP_OBLIGATION_ACCOUNT_UNVERIFIED")
     engine=_get_engine_or_none()
     if engine is None:
         raise StopObligationUnavailable("STOP_OBLIGATION_DATABASE_UNAVAILABLE")
@@ -116,15 +122,23 @@ def load_pending_stop_obligations(*, env: str="practice") -> list[dict]:
         epoch=_active_us_epoch(conn)
         if not epoch:
             raise StopObligationUnavailable("STOP_OBLIGATION_EPOCH_MISSING")
+        # Unresolved stop debt is ACCOUNT+LIFECYCLE durable, not today-Epoch
+        # durable. An epoch rollover must not hide yesterday's stop loss.
+        # Hard cap and fail closed rather than truncate some protective debts.
         rows=conn.execute(text("""
-            SELECT account_id,symbol,lifecycle_id,stop_family,severity,target_qty,
+            SELECT trading_epoch_id,account_id,symbol,lifecycle_id,
+                   stop_family,severity,target_qty,
                    confirmed_filled_qty,obligation_state,first_signal_at,last_signal_at,
                    soft_stop_pct,hard_stop_pct
             FROM us_protective_stop_obligations
-            WHERE trading_epoch_id=:epoch AND env='practice'
+            WHERE account_id=:account AND env='practice'
+              AND strategy_owner='US_STANDARD'
               AND obligation_state<>'SATISFIED'
             ORDER BY severity DESC,first_signal_at
-        """),{"epoch":epoch}).mappings().all()
+            LIMIT 501
+        """),{"account":account}).mappings().all()
+    if len(rows)>500:
+        raise StopObligationUnavailable("STOP_OBLIGATION_INCOMPLETE_EPOCH_SCAN")
     return [dict(x) for x in rows]
 
 
@@ -260,8 +274,16 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
         raise StopObligationUnavailable("STOP_OBLIGATION_DATABASE_UNAVAILABLE")
     with engine.begin() as conn:
         epoch=_active_us_epoch(conn)
-        if not epoch or str(epoch)!=str(debt["trading_epoch_id"]):
-            raise StopObligationUnavailable("STOP_OBLIGATION_EPOCH_CHANGED")
+        if not epoch:
+            raise StopObligationUnavailable("STOP_OBLIGATION_ACTIVE_EPOCH_UNAVAILABLE")
+        from trader.account_state import get_account_key, resolve_env_name
+        if (resolve_env_name() != "practice"
+                or str(get_account_key(env="practice")) != str(debt["account_id"])):
+            raise StopObligationUnavailable("STOP_OBLIGATION_ACCOUNT_SCOPE_CHANGED")
+        # Original Epoch is part of the durable debt. It is expected to differ
+        # after an AM/Afternoon or account-generation rollover; terminal proof
+        # still must match that exact original epoch.
+        debt_epoch=str(debt["trading_epoch_id"])
         result=conn.execute(text("""
             UPDATE us_protective_stop_obligations o
                SET obligation_state='SATISFIED',
@@ -285,7 +307,7 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
             RETURNING o.lifecycle_id
         """),{
             "proof":json.dumps(proof,sort_keys=True,default=str),
-            "epoch":epoch,"account":debt["account_id"],
+            "epoch":debt_epoch,"account":debt["account_id"],
             "account_claim":hashlib.sha256(str(debt["account_id"]).encode("utf-8")).hexdigest(),
             "symbol":debt["symbol"],"lifecycle":debt["lifecycle_id"],
         })

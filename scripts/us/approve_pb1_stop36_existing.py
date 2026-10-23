@@ -69,6 +69,8 @@ def run(*, apply: bool, approval_ref: str, expected_count: int) -> dict:
             raise RuntimeError(f"STOP_REVISION_COUNT_CHANGED expected={expected_count} actual={len(eligible)}")
         if apply:
             for p in eligible:
+                params={"epoch":epoch,"account":p["account"],"symbol":p["symbol"],
+                        "life":p["lifecycle"],"sha":p["source_sha"],"approval":approval_ref}
                 conn.execute(text("""
                     INSERT INTO us_stop_policy_revisions
                     (trading_epoch_id,env,account_id,strategy_owner,symbol,lifecycle_id,
@@ -77,15 +79,24 @@ def run(*, apply: bool, approval_ref: str, expected_count: int) -> dict:
                     VALUES (:epoch,'practice',:account,'US_STANDARD',:symbol,:life,
                             'PB1_STOP_3_6_V1',:sha,0.03,0.06,:approval,TRUE,NOW())
                     ON CONFLICT DO NOTHING
-                """),{"epoch":epoch,"account":p["account"],"symbol":p["symbol"],
-                       "life":p["lifecycle"],"sha":p["source_sha"],"approval":approval_ref})
-            count=conn.execute(text("""
-                SELECT count(*) FROM us_stop_policy_revisions
-                WHERE trading_epoch_id=:epoch AND env='practice' AND active IS TRUE
-                  AND revision_code='PB1_STOP_3_6_V1'
-            """),{"epoch":epoch}).scalar()
-            if int(count or 0)<expected_count:
-                raise RuntimeError("STOP_REVISION_APPLIED_COUNT_MISMATCH")
+                """),params)
+                verified=conn.execute(text("""
+                    SELECT source_contract_sha256,soft_stop,hard_stop,active,approval_ref
+                    FROM us_stop_policy_revisions
+                    WHERE trading_epoch_id=:epoch AND env='practice'
+                      AND account_id=:account AND strategy_owner='US_STANDARD'
+                      AND symbol=:symbol AND lifecycle_id=:life
+                      AND revision_code='PB1_STOP_3_6_V1'
+                """),params).mappings().one()
+                if (str(verified["source_contract_sha256"])!=p["source_sha"]
+                        or float(verified["soft_stop"])!=0.03
+                        or float(verified["hard_stop"])!=0.06
+                        or verified["active"] is not True
+                        or str(verified["approval_ref"])!=approval_ref):
+                    raise RuntimeError(f"STOP_REVISION_CONFLICTING_APPROVAL:{p['symbol']}")
+            # Whole transaction rolls back if *any* individual row mismatches.
+            # A global count alone is not proof of exact policy application.
+
     return {"mode":"APPLIED" if apply else "DRY_RUN","eligible_count":len(eligible),
             "symbols":[p["symbol"] for p in eligible]}
 
