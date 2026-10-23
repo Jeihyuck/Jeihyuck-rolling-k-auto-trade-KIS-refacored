@@ -15,6 +15,7 @@ def test_recovery_candidates_only_confirmed_full_standard_debt():
     assert len(result)==1
     assert result[0]["symbol"]=="AMD"
     assert result[0]["strategy_owner"]=="US_STANDARD"
+    assert result[0]["account_id"]=="practice-a"
     assert result[0]["exit_type"]=="hard_stop_loss"
 
 
@@ -50,3 +51,29 @@ def test_worker_can_inject_recovery_but_does_not_directly_submit_sells(monkeypat
         trade_date="2026-10-22",execute_practice_cancel=True,
         pending=[{"symbol":"AMD","account_id":"a","lifecycle_id":"l","severity":3}])
     assert report["results"]==[{"symbol":"AMD","status":"FENCED","reason":"terminal_proof_missing"}]
+
+
+def test_account_mismatch_between_stop_debt_and_broker_order_claim_retains_fence(monkeypatch):
+    """Even a terminal-looking broker order cannot settle a different account's stop."""
+    from trader.us.protective_tp_recovery import request_protective_tp_cancel
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED","1")
+    intents=recovery_candidates([
+        {"symbol":"AMD","account_id":"practice-a","lifecycle_id":"amd-life","severity":3},
+    ])
+    order={
+        "id":"order-id", "symbol":"AMD","trade_date":"2026-10-06",
+        "side":"SELL","order_no":"0000035281","qty_requested":1,
+        "qty_filled":0,"client_order_key":"old-tp",
+        "claim_state":"IN_FLIGHT","claim_account_id":"practice-b",
+        "meta":{"strategy_owner":"US_STANDARD",
+                "position_lifecycle_id":"amd-life","profit_capture_stage":"tp1"},
+    }
+    class NoBroker:
+        def __getattr__(self, _):
+            raise AssertionError("account mismatch must block KIS operation")
+    result=request_protective_tp_cancel(
+        intents=intents,provider=NoBroker(),kis_client=NoBroker(),
+        trade_date="2026-10-22",env="practice",
+        find_open=lambda *a,**kw:[order],
+    )
+    assert result==[{"symbol":"AMD","status":"FENCED","reason":"account_identity_unverified"}]
