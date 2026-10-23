@@ -892,6 +892,7 @@ def run_trade_session(
     session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
     _unreaped_child_seen = False
     _shadow_reconcile_child: subprocess.Popen | None = None
+    _stage4_worker_log_stream = None
     final_status = "OK"
     final_reason = "session_end"
     last_stage = "session_start"
@@ -1391,9 +1392,23 @@ def run_trade_session(
             _shadow_env["US_OFFLINE"] = "0" if _reconcile_mode == "WORKER" else "1"
             if _reconcile_mode == "WORKER":
                 import uuid as _stage4_uuid
-                os.environ["US_STAGE4_EXPECTED_GENERATION"] = _stage4_uuid.uuid4().hex
+                os.environ["US_STAGE4_EXPECTED_GENERATION"] = str(_stage4_uuid.uuid4())
                 _shadow_env["US_STAGE4_EXPECTED_GENERATION"] = os.environ["US_STAGE4_EXPECTED_GENERATION"]
             _shadow_env["US_RECONCILE_WORKER_MODE"] = _reconcile_mode
+            if _reconcile_mode == "WORKER":
+                from trader.us.execution.reconcile_shadow_worker import safe_scope_token
+                _stage4_log_dir = Path("runtime/logs")
+                _stage4_log_dir.mkdir(parents=True, exist_ok=True)
+                _stage4_worker_log_path = _stage4_log_dir / (
+                    f"us-stage4-worker-{trade_date}-{safe_scope_token(session_run_id)}.log"
+                )
+                _stage4_worker_fd = os.open(
+                    str(_stage4_worker_log_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600,
+                )
+                _stage4_worker_log_stream = os.fdopen(
+                    _stage4_worker_fd, "a", buffering=1, encoding="utf-8",
+                )
             _shadow_reconcile_child = subprocess.Popen(
                 [
                     sys.executable, "-m",
@@ -1413,12 +1428,18 @@ def run_trade_session(
                         max(5, int(os.getenv("US_SHADOW_RECONCILE_INTERVAL_SEC", "15")))
                     ),
                 ],
-                env=_shadow_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=_shadow_env,
+                stdout=(_stage4_worker_log_stream if _reconcile_mode == "WORKER"
+                        else subprocess.DEVNULL),
+                stderr=(_stage4_worker_log_stream if _reconcile_mode == "WORKER"
+                        else subprocess.DEVNULL),
             )
             if _reconcile_mode == "RESERVATION_ONLY":
                 os.environ["US_RESERVATION_WORKER_PID"] = str(_shadow_reconcile_child.pid)
             elif _reconcile_mode == "WORKER":
                 os.environ["US_STAGE4_WORKER_ALIVE"] = "1"
+            if _reconcile_mode == "WORKER":
+                logger.info("[US_STAGE4][CHILD_LOG] path=%s", _stage4_worker_log_path)
             logger.info(
                 "[US_RECONCILE_CHILD][STARTED] session=%s run=%s pid=%s "
                 "authority=%s broker_access=NONE",
@@ -1433,9 +1454,11 @@ def run_trade_session(
                         and _shadow_reconcile_child.poll() is not None):
                     logger.error(
                         "[US_SHADOW_RECONCILE][EXITED] session=%s run=%s code=%s "
-                        "trading_authority=LEGACY_UNCHANGED",
+                        "trading_authority=%s",
                         session, session_run_id,
                         _shadow_reconcile_child.returncode,
+                        ("STAGE4_FENCED" if _reconcile_mode == "WORKER"
+                         else "LEGACY_UNCHANGED"),
                     )
                     _shadow_reconcile_child = None
                     if _reconcile_mode == "RESERVATION_ONLY":
@@ -2667,6 +2690,9 @@ def run_trade_session(
                     "[US_SHADOW_RECONCILE][STOPPED] run=%s pid=%s",
                     session_run_id, _shadow_reconcile_child.pid,
                 )
+        if _stage4_worker_log_stream is not None:
+            _stage4_worker_log_stream.close()
+            _stage4_worker_log_stream = None
         from trader.us.utils.session_guard import read_us_session_child_unverified_fence
         try:
             _fence_record = read_us_session_child_unverified_fence(

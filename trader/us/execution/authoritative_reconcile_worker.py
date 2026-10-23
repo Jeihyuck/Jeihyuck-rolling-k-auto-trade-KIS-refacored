@@ -112,8 +112,16 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
     if (os.getenv("US_RECONCILE_WORKER_MODE")=="WORKER"
             and not expected_generation):
         raise RuntimeError("US_STAGE4_WORKER_GENERATION_NOT_CONFIGURED")
-    if expected_generation and str(row["writer_generation"])!=expected_generation:
-        raise RuntimeError("US_STAGE4_WRITER_GENERATION_MISMATCH")
+    # PostgreSQL UUID columns render with hyphens; older session runners
+    # supplied UUID.hex without them. Compare UUID identity, not formatting.
+    # Malformed or missing DB evidence must fail closed.
+    if expected_generation:
+        try:
+            matches = uuid.UUID(str(row["writer_generation"])) == uuid.UUID(str(expected_generation))
+        except (ValueError, TypeError, AttributeError):
+            matches = False
+        if not matches:
+            raise RuntimeError("US_STAGE4_WRITER_GENERATION_MISMATCH")
     at=row.get("evidence_at")
     if not isinstance(at,datetime) or at.tzinfo is None:
         raise RuntimeError("US_STAGE4_WRITER_TIMESTAMP_UNVERIFIED")
@@ -249,6 +257,12 @@ def publish_health(conn: Any, *, scope: dict, generation: str,
 
 
 def main() -> int:
+    # The runner redirects this subprocess stderr to a mode-0600 WSL log.
+    # Without a handler, INFO readiness and deferred-repair trace is invisible.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     parser=argparse.ArgumentParser()
     parser.add_argument("--trade-date",required=True)
     parser.add_argument("--session-run-id",required=True)
