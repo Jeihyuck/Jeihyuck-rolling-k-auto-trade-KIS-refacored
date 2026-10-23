@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import math
+import logging
 from typing import Any
 
 import sqlalchemy as sa
@@ -22,6 +23,8 @@ from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
 from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
 from trader.reconcile_kis import _normalize_code, _parse_side, _parse_date_time
 from trader.time_utils import now_kst
+
+logger = logging.getLogger(__name__)
 
 
 def prove_safe_protective_sell_handoff(
@@ -145,4 +148,13 @@ def prove_safe_protective_sell_handoff(
                         return False, "ECONOMIC_NOTIONAL_WATERMARK_DRIFT"
         return True, "EXACT_BROKER_LEDGER_PRETRADE_PROOF"
     except Exception as exc:
+        # The previous type-only result hid the actual Oct23 ValueError site.
+        # Keep fail-closed FULL_PRE_EXIT_RECONCILE while retaining the traceback
+        # for a precise fix; never treat proof exceptions as authorization.
+        logger.warning(
+            "[KR_RECONCILE_LANES][PROOF_READ_FAILED] exception_type=%s "
+            "action=FULL_PRE_EXIT_RECONCILE",
+            type(exc).__name__,
+            exc_info=True,
+        )
         return False, f"PROOF_READ_FAILED_{type(exc).__name__}"
