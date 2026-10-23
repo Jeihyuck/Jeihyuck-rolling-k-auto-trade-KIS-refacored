@@ -5463,17 +5463,18 @@ class FillsRepo:
                         old_exact_amount = _exact_broker_cumulative_notional(
                             existing_fill.get("raw_json"), old_qty,
                         )
+                        from decimal import Decimal
                         old_amount = (
                             old_exact_amount if old_exact_amount is not None
-                            else old_qty * float(existing_fill.get("price") or 0.0)
+                            else Decimal(str(old_qty * float(existing_fill.get("price") or 0.0)))
                         )
                         new_amount = (
                             new_exact_amount if new_exact_amount is not None
-                            else int(qty) * float(price)
+                            else Decimal(str(int(qty) * float(price)))
                         )
-                        if qty == old_qty and abs(new_amount - old_amount) > 0.01:
+                        if qty == old_qty and abs(new_amount - old_amount) > Decimal("0.01"):
                             raise RuntimeError("KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT")
-                        if qty > old_qty and new_amount + 0.01 < old_amount:
+                        if qty > old_qty and new_amount + Decimal("0.01") < old_amount:
                             raise RuntimeError("KR_CUMULATIVE_FILL_NOTIONAL_REGRESSION")
                     if (
                         str(existing_fill.get("trading_epoch_id") or "")
