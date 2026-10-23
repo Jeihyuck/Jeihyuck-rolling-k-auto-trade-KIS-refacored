@@ -118,7 +118,8 @@ def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -
             SELECT o.id,o.trade_date,o.symbol,o.order_no,o.status,
                    o.qty_requested,o.qty_filled,o.client_order_key,
                    o.exchange,o.meta,o.trading_epoch_id,
-                   c.action_state AS claim_state
+                   c.action_state AS claim_state,
+                   c.account_id AS claim_account_id
             FROM us_orders o
             LEFT JOIN us_execution_claims c
               ON c.trading_epoch_id=o.trading_epoch_id
@@ -304,6 +305,12 @@ def request_protective_tp_cancel(
     results: list[dict] = []
     # Bind a broker TP reservation to the exact protective lifecycle, not merely
     # the ticker (which could have been closed and repurchased).
+    account_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("account_id") or (intent.get("meta") or {}).get("account_id") or "").strip()
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
     lifecycle_by_symbol = {
         str(intent.get("symbol") or "").upper():
             str(intent.get("position_lifecycle_id")
@@ -333,6 +340,14 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
+            expected_account = account_by_symbol.get(symbol) or ""
+            if expected_account and str(order.get("claim_account_id") or "") != expected_account:
+                # A stop-debt worker supplies an exact account identity, but
+                # local US order meta has no authoritative account column.
+                # Verify against the epoch/lifecycle execution claim instead.
+                results.append({"symbol":symbol, "status":"FENCED",
+                                "reason":"account_identity_unverified"})
+                continue
             stale_classification = classify_stale_tp_conflict(
                 order, current_trade_date=trade_date,
             )

@@ -40,8 +40,9 @@ def recovery_candidates(pending: list[dict]) -> list[dict]:
                 "hard_stop_loss" if severity>=3 else "persistent_soft_stop_full_exit"
             ),
             "strategy":"us_pb1_exit","strategy_owner":"US_STANDARD",
-            "position_lifecycle_id":life,
-            "meta":{"strategy_owner":"US_STANDARD","position_lifecycle_id":life},
+            "position_lifecycle_id":life,"account_id":account,
+            "meta":{"strategy_owner":"US_STANDARD","position_lifecycle_id":life,
+                    "account_id":account},
         })
     return results
 
