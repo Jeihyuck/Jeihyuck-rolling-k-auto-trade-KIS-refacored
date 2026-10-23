@@ -123,3 +123,52 @@ def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkey
     assert client.http_calls == 0
     assert events == ["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_PRE_IO"]
     assert not any(x.get("state") == "SUBMITTED" for x in observed)
+
+
+def test_stage4_health_accepts_uuid_hex_and_hyphenated_database_value(monkeypatch):
+    """Live writer historically generated .hex while PostgreSQL renders UUID."""
+    import uuid
+    from datetime import datetime, timezone
+    from trader.us.db import repos
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    writer_id = uuid.uuid4()
+    class Result:
+        def mappings(self): return self
+        def first(self):
+            return {
+                "evidence_at": datetime.now(timezone.utc),
+                "worker_state": "READY", "reconcile_status": "OK",
+                "replay_status": "OK", "pending_count": 0,
+                "unresolved_count": 0, "filled_rows": 0,
+                "writer_generation": writer_id,
+            }
+    class Connection:
+        def execute(self, *_args, **_kwargs): return Result()
+        def __enter__(self): return self
+        def __exit__(self, *_args): pass
+    class Engine:
+        def connect(self): return Connection()
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+        "env": "practice", "account_id": "a"*64,
+        "trading_epoch_id": "offline-epoch",
+    })
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+    monkeypatch.setenv("US_STAGE4_WRITER_AUTHORIZED", "1")
+    monkeypatch.setenv("US_PROTECTIVE_STOP_LEDGER_MODE", "ENFORCE")
+    monkeypatch.setenv("US_STAGE4_WORKER_ALIVE", "1")
+    monkeypatch.setenv("US_STAGE4_EXPECTED_GENERATION", writer_id.hex)
+    assert worker.read_worker_health()["worker_state"] == "READY"
+    monkeypatch.setenv("US_STAGE4_EXPECTED_GENERATION", str(uuid.uuid4()))
+    with pytest.raises(RuntimeError, match="GENERATION_MISMATCH"):
+        worker.read_worker_health()
+    monkeypatch.setenv("US_STAGE4_EXPECTED_GENERATION", "not-a-uuid")
+    with pytest.raises(RuntimeError, match="GENERATION_MISMATCH"):
+        worker.read_worker_health()
+
+
+def test_session_runner_uses_canonical_uuid_for_stage4_generation():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2]
+           / "trader/us/runner/trade_session_runner.py").read_text()
+    assert 'os.environ["US_STAGE4_EXPECTED_GENERATION"] = str(_stage4_uuid.uuid4())' in src
