@@ -53,8 +53,13 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
             WHERE env=:env AND account_fingerprint=:account AND trading_epoch_id=:epoch
         """),{"env":scope["env"],"account":scope["account_id"],
               "epoch":scope["trading_epoch_id"]}).mappings().first()
+    if os.getenv("US_STAGE4_WORKER_ALIVE") == "0":
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
     if not row or str(row["worker_state"])!="READY":
         raise RuntimeError("US_STAGE4_WRITER_NOT_READY")
+    expected_generation=os.getenv("US_STAGE4_EXPECTED_GENERATION")
+    if expected_generation and str(row["writer_generation"])!=expected_generation:
+        raise RuntimeError("US_STAGE4_WRITER_GENERATION_MISMATCH")
     at=row.get("evidence_at")
     if not isinstance(at,datetime) or at.tzinfo is None:
         raise RuntimeError("US_STAGE4_WRITER_TIMESTAMP_UNVERIFIED")
@@ -160,12 +165,13 @@ def main() -> int:
         raise RuntimeError("US_STAGE4_WORKER_SCOPE_UNVERIFIED")
     signal.signal(signal.SIGTERM,_stop)
     signal.signal(signal.SIGINT,_stop)
-    generation=str(uuid.uuid4())
+    generation=str(os.getenv("US_STAGE4_EXPECTED_GENERATION") or uuid.uuid4().hex)
     # Hold only the dedicated one-writer advisory lock. It is distinct from
     # the short-lived trade reservation leases, so it does not hold KIS HTTP.
     with engine.connect() as lease:
         granted=lease.execute(text("SELECT pg_try_advisory_lock(:key)"),
                               {"key":advisory_key(scope)}).scalar_one()
+        lease.commit()  # session advisory lock remains held, no idle DB TX
         if not granted:
             raise RuntimeError("US_STAGE4_DUPLICATE_WRITER")
         try:
@@ -181,6 +187,17 @@ def main() -> int:
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="READY",result=result)
+                    from trader.us.execution.reconcile_shadow_worker import (
+                        observer_report_path,save_diagnostic_atomic,
+                    )
+                    save_diagnostic_atomic(
+                        observer_report_path(args.trade_date,args.session_run_id),
+                        {"sampled_at_utc":datetime.now(timezone.utc).isoformat(),
+                         "read_status":"OK","worker_state":"READY",
+                         "writer_generation":generation,
+                         "pending_order_count":result["pending_count"],
+                         "active_claim_count":result["unresolved_count"]},
+                    )
                 except Exception as exc:
                     logger.exception("[US_STAGE4][RECONCILE_FAILURE] type=%s",
                                      type(exc).__name__)
@@ -195,6 +212,7 @@ def main() -> int:
                 publish_health(conn,scope=scope,generation=generation,state="STOPPED")
             lease.execute(text("SELECT pg_advisory_unlock(:key)"),
                           {"key":advisory_key(scope)})
+            lease.commit()
     return 0
 
 
