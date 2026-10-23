@@ -48,10 +48,21 @@ else
 fi
 
 # Configuration is one interdependent invariant, not eight independent switches.
+# The new Stage4 account writer is opt-in only with explicit protective
+# ledger enforcement. Never turn it on implicitly and never treat an
+# unauthorized WORKER configuration as legacy RESERVATION_ONLY.
 if [[ "${US_STAGE123_PAPER_PROFILE}" == "ON" ]]; then
+  _us_reconcile_mode_authorized=0
+  if [[ "${US_RECONCILE_WORKER_MODE}" == "RESERVATION_ONLY" ]]; then
+    _us_reconcile_mode_authorized=1
+  elif [[ "${US_RECONCILE_WORKER_MODE}" == "WORKER" &&
+          "${US_STAGE4_WRITER_AUTHORIZED:-0}" == "1" &&
+          "${US_PROTECTIVE_STOP_LEDGER_MODE:-SHADOW}" == "ENFORCE" ]]; then
+    _us_reconcile_mode_authorized=1
+  fi
   if [[ "${US_ATOMIC_CLAIM_OUTBOX_ENABLED}" != "1" ||
         "${US_ACCOUNT_RESERVATION_MODE}" != "ENFORCE" ||
-        "${US_RECONCILE_WORKER_MODE}" != "RESERVATION_ONLY" ||
+        "${_us_reconcile_mode_authorized}" != "1" ||
         "${US_SHARED_KIS_LIMITER_ENABLED}" != "1" ||
         "${US_EXIT_QUOTE_PREFETCH_ENABLED}" != "1" ||
         "${US_EARLY_HARD_STOP_PILOT_ENABLED}" != "1" ||
