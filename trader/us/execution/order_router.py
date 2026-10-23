@@ -2224,9 +2224,13 @@ def route_order(
             _signal_id = _trace_ids.get(symbol_upper) if isinstance(_trace_ids, dict) else None
             logger.info(
                 "[US_EXIT][SIGNAL_TO_BROKER_BOUNDARY] symbol=%s attempt=%s "
-                "signal_id=%s source=selected_intent_exact delay_ms=%.2f",
+                "signal_id=%s source=selected_intent_exact delay_ms=%.2f "
+                "owner=%s exit_type=%s order_key=%s",
                 symbol_upper, intent["submit_attempt_id"], _signal_id or "UNOBSERVED",
                 _delay_ms,
+                str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or "UNKNOWN"),
+                str(intent.get("exit_type") or (intent.get("meta") or {}).get("exit_type") or "UNKNOWN"),
+                str(order_key or "UNKNOWN"),
             )
             _metrics = getattr(context, "metrics", None)
             if isinstance(_metrics, dict):
