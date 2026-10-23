@@ -28,6 +28,11 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
 
     if resolve_env_name()!="practice":
         raise RuntimeError("STAGE4_STOP_SETTLEMENT_PRACTICE_ONLY")
+    # Never request an expensive broker balance merely to prove that no
+    # protective debts exist. This worker is invoked every Stage4 cycle.
+    debts=load_pending_stop_obligations(env="practice")
+    if not debts:
+        return {"checked":0,"settled":0,"blocked":0,"total_pending":0}
     account=str(get_account_key(env="practice"))
     broker_balance=reconcile_positions(provider=provider,trade_date=trade_date)
     if not (broker_balance.get("status")=="OK"
@@ -39,7 +44,6 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
         str(row.get("symbol") or "").upper():int(row.get("qty") or 0)
         for row in (broker_balance.get("positions") or [])
     }
-    debts=load_pending_stop_obligations(env="practice")
     engine=_get_engine_or_none()
     if engine is None:
         raise RuntimeError("STAGE4_STOP_SETTLEMENT_DB_UNAVAILABLE")
