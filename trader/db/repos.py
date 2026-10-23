@@ -5440,6 +5440,15 @@ class FillsRepo:
             _exact_broker_cumulative_notional(safe_raw_json, int(qty))
             if order_cumulative else None
         )
+        if new_exact_amount is not None:
+            from decimal import Decimal
+            supplied_notional = Decimal(str(qty)) * Decimal(str(price))
+            # A caller cannot pair a different average price with the same
+            # authoritative KIS amount and silently bypass the old conflict
+            # check. The supplied average is calculated from KIS notional;
+            # allow only sub-won decimal/float rounding, NOT a 1-KRW change.
+            if abs(supplied_notional - new_exact_amount) > Decimal("0.50"):
+                raise RuntimeError("KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT")
         with self.engine.begin() as conn:
             if active_epoch_id is not None:
                 collision_conditions = [
@@ -5493,24 +5502,33 @@ class FillsRepo:
                         != str(position_cycle_id)
                     ):
                         raise RuntimeError("KR_FILL_POSITION_CYCLE_COLLISION")
-            # Keep the SQL UPSERT fence as strict as the broker-authoritative
-            # Python check. Same-qty replays of the *same* exact KIS amount are
-            # allowed even when legacy PostgreSQL REAL has rounded the price.
-            cumulative_same_notional = (
-                sa.func.abs(self._schema.fills.c.price * self._schema.fills.c.qty - qty * price) <= 0.01
+            # Compare original broker notional inside the atomic SQL UPSERT
+            # predicate as well as the Python precheck.  Using REAL
+            # price*quantity here makes same-amount KIS replay fail for
+            # 053800 (12 x 90308.3359375 != broker 1083700).  It can also
+            # reject an increasing cumulative quantity with correctly
+            # increasing original notional.  This database fence must survive
+            # concurrent writers and must not weaken genuine mismatch checks.
+            old_notional_text = sa.func.coalesce(
+                self._schema.fills.c.raw_json["kis_response"]["tot_ccld_amt"].as_string(),
+                self._schema.fills.c.raw_json["tot_ccld_amt"].as_string(),
             )
-            if order_cumulative and new_exact_amount is not None:
-                exact_text = str(new_exact_amount)
-                cumulative_same_notional = sa.or_(
-                    cumulative_same_notional,
-                    sa.and_(
-                        self._schema.fills.c.qty == qty,
-                        sa.or_(
-                            self._schema.fills.c.raw_json["kis_response"]["tot_ccld_amt"].as_string() == exact_text,
-                            self._schema.fills.c.raw_json["tot_ccld_amt"].as_string() == exact_text,
-                        ),
-                    ),
-                )
+            old_broker_notional = sa.case(
+                (
+                    old_notional_text.isnot(None),
+                    sa.cast(old_notional_text, sa.Numeric(30, 8)),
+                ),
+                else_=self._schema.fills.c.qty * self._schema.fills.c.price,
+            )
+            new_broker_notional = (
+                new_exact_amount if new_exact_amount is not None else qty * price
+            )
+            cumulative_notional_nondecreasing = (
+                old_broker_notional <= new_broker_notional + 0.01
+            )
+            cumulative_same_notional = (
+                sa.func.abs(old_broker_notional - new_broker_notional) <= 0.01
+            )
             if conn.dialect.name == "postgresql":
                 # Use PostgreSQL-specific upsert with on_conflict_do_update
                 stmt = pg_insert(self._schema.fills).values(**payload).on_conflict_do_update(
@@ -5518,7 +5536,7 @@ class FillsRepo:
                     set_=update_cols,
                     **({"where": sa.and_(
                         self._schema.fills.c.qty <= qty,
-                        self._schema.fills.c.qty * self._schema.fills.c.price <= (qty * price) + 0.01,
+                        cumulative_notional_nondecreasing,
                         sa.or_(
                             self._schema.fills.c.qty < qty,
                             cumulative_same_notional,
@@ -5544,7 +5562,7 @@ class FillsRepo:
                         sa.update(self._schema.fills).where(and_(*where_conditions)).where(
                             sa.and_(
                                 self._schema.fills.c.qty <= qty,
-                                self._schema.fills.c.qty * self._schema.fills.c.price <= qty * price + 0.01,
+                                cumulative_notional_nondecreasing,
                                 sa.or_(
                                     self._schema.fills.c.qty < qty,
                                     cumulative_same_notional,
