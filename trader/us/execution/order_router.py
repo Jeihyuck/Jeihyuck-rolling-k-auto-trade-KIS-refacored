@@ -2096,6 +2096,24 @@ def route_order(
 
     def _mark_broker_submit_boundary() -> None:
         nonlocal _http_boundary_mono
+        # The first Stage4 check occurs before claim reservation. It is not
+        # sufficient: rate limiting, journal I/O and account leases may take
+        # time before the *actual* KIS POST boundary. Recheck broker evidence
+        # here, while a pre-HTTP failure is still provably safe to release.
+        if os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") == "WORKER":
+            try:
+                from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+                _latest_worker = read_worker_health(env=account_env)
+                if (_latest_worker.get("reconcile_status") not in {"OK", "WARN"}
+                        or _latest_worker.get("replay_status") not in {
+                            "OK", "RECOVERED", "NO_ACTIVE_CLAIMS",
+                            "WARN", "PARTIAL", "UNRESOLVED",
+                        }):
+                    raise RuntimeError("US_STAGE4_RECONCILE_NOT_VERIFIED")
+            except Exception as _stage4_exc:
+                raise KisUSPreSubmitError(
+                    "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
+                ) from _stage4_exc
         if os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE":
             # The planned hold may have been revoked by a different process
             # after atomic creation. Re-check the exact account/owner/Attempt
@@ -2114,6 +2132,11 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP"
                 ) from _reservation_exc
+        # The tick may be cancelled while KIS's own rate limiter waits or
+        # while a reservation/health query runs. Do not submit after its
+        # absolute deadline or after durable session authority has changed.
+        if context is not None and not context.broker_submit_allowed():
+            raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )
@@ -2252,6 +2275,9 @@ def route_order(
                 "paper_trading_not_enabled", "us_live_trading_disabled",
                 "disable_real_trading_enabled", "dry_run_enabled",
                 "CLAIM_OBSERVATION_FAILED_BEFORE_HTTP", "US_KIS_ORDER_ALLOWED=0",
+                "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
+                "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
+                "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
             )
             failure_code = next((code for code in guard_codes if code in str(exc)),
                                 "pre_http_setup_failed")
