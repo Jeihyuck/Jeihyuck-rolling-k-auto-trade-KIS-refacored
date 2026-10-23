@@ -88,6 +88,8 @@ def test_stage4_postgres_account_single_writer_and_health(monkeypatch):
             monkeypatch.setenv("US_RECONCILE_WORKER_MODE","WORKER")
             monkeypatch.setenv("US_STAGE4_EXPECTED_GENERATION",generation)
             monkeypatch.setenv("US_STAGE4_WORKER_ALIVE","1")
+            monkeypatch.setenv("US_STAGE4_WRITER_AUTHORIZED","1")
+            monkeypatch.setenv("US_PROTECTIVE_STOP_LEDGER_MODE","ENFORCE")
             actual=worker.read_worker_health(max_age_seconds=60)
             assert actual["worker_state"]=="READY"
             assert actual["filled_rows"]==1
