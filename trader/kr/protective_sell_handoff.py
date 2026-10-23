@@ -136,6 +136,24 @@ def prove_safe_protective_sell_handoff(
                 db_by_key[key] = order
             if set(db_by_key) != set(broker_rows):
                 return False, "BROKER_DURABLE_ORDER_SET_MISMATCH"
+            # Fetch economic fills in ONE account-scoped batch. Previously
+            # each broker row caused a separate DB roundtrip on the protective
+            # SELL proof hot path. Do not weaken per-order exact-quantity
+            # comparison: retain sum by durable order_id.
+            fills_qty_by_order: dict[str, int] = {}
+            if stored:
+                stored_order_ids = [order["order_id"] for order in stored]
+                fill_rows = conn.execute(sa.select(
+                    schema.fills.c.order_id, schema.fills.c.qty,
+                ).where(sa.and_(
+                    schema.fills.c.env == env,
+                    schema.fills.c.order_id.in_(stored_order_ids),
+                ))).all()
+                for order_id, fill_qty in fill_rows:
+                    key_id = str(order_id)
+                    fills_qty_by_order[key_id] = (
+                        fills_qty_by_order.get(key_id, 0) + int(fill_qty or 0)
+                    )
             for key, broker_row in broker_rows.items():
                 source = db_by_key[key]
                 requested = int(source.get("qty") or 0)
@@ -156,10 +174,7 @@ def prove_safe_protective_sell_handoff(
                     confirmed_qty = None
                 if confirmed_qty is None or confirmed_qty != observed:
                     return False, "ORDER_CUMULATIVE_WATERMARK_UNPROVEN"
-                fills = conn.execute(sa.select(schema.fills).where(
-                    schema.fills.c.order_id == source["order_id"]
-                )).mappings().all()
-                if sum(int(item.get("qty") or 0) for item in fills) != observed:
+                if fills_qty_by_order.get(str(source["order_id"]), 0) != observed:
                     return False, "ECONOMIC_FILL_QUANTITY_DRIFT"
                 if observed:
                     try:
