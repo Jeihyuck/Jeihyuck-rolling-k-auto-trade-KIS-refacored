@@ -2684,7 +2684,10 @@ def run_trade_tick(
                 and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
                 and not offline
                 and kis_order_allowed and not signal_only and exit_can_proceed
-                and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"
+                # Clean independent protective SELLs remain eligible even
+                # while another lifecycle's TP recovery worker is active.
+                # _suppress_pending_sell_exit_intents(strict=True) below owns
+                # same-symbol/epoch/account claim safety, never this global flag.
                 and not fills_contract_error and not fills_temp_error
                 and bool(recon.get("authoritative_positions"))
                 and str(recon.get("status") or "").upper() == "OK"
