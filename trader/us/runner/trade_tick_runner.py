@@ -2744,12 +2744,25 @@ def run_trade_tick(
                 and not fills_contract_error and not fills_temp_error
                 and bool(recon.get("authoritative_positions"))
                 and str(recon.get("status") or "").upper() == "OK"
-                and str(ack_recon.get("status") or "").upper() == "OK"
-                and int(ack_recon.get("unresolved_count") or 0) == 0
-                and isinstance(active_claim_recovery_result, dict)
-                and str(active_claim_recovery_result.get("status") or "").upper()
-                    in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
-                and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
+                # Legacy retains global ACK/replay cleanliness. Stage4
+                # isolates unrelated historical claims in the reconciler;
+                # the SAME lifecycle strict pending-SELL suppression and
+                # account-wide canonical reservation remain mandatory.
+                and (
+                    (
+                        str(ack_recon.get("status") or "").upper() == "OK"
+                        and int(ack_recon.get("unresolved_count") or 0) == 0
+                        and isinstance(active_claim_recovery_result, dict)
+                        and str(active_claim_recovery_result.get("status") or "").upper()
+                            in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
+                        and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
+                    )
+                    or (
+                        _stage4_mode
+                        and str(_stage4_health.get("worker_state") or "") == "READY"
+                        and str(_stage4_health.get("reconcile_status") or "") in {"OK","WARN"}
+                    )
+                )
                 and _exit_observer_supported
             )
             _pilot_safety_intents: list[dict] = []

@@ -130,6 +130,18 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     save=save_fills_with_result(fills.get("fills") or [],trade_date=trade_date)
     if save.get("status")!="OK":
         raise RuntimeError("US_STAGE4_FILLS_PERSIST_UNVERIFIED")
+    # Partial SOFT stops and trend stage acknowledgments are strategy-state
+    # transitions owned by this writer when the Tick no longer writes fills.
+    from trader.us.runner.trade_tick_runner import (
+        _mark_trend_stages_from_records,_mark_soft_stop_stages_from_records,
+    )
+    if fills.get("fills"):
+        _mark_trend_stages_from_records(
+            fills["fills"],trade_date=trade_date,status="FILLED",
+        )
+        _mark_soft_stop_stages_from_records(
+            fills["fills"],trade_date=trade_date,status="FILLED",
+        )
     replay=replay_order_journal(
         trade_date,session_run_id=session_run_id,
         tick_id="stage4-"+writer_generation,
@@ -139,6 +151,8 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     ack=reconcile_ack_orders_with_balance(
         provider=provider,trade_date=trade_date,env="practice",
     )
+    _mark_trend_stages_from_records(ack,trade_date=trade_date,status="FILLED")
+    _mark_soft_stop_stages_from_records(ack,trade_date=trade_date,status="FILLED")
     # This writer also owns previously verified account reservation cleanups;
     # the RESERVATION_ONLY child must not run in WORKER mode.
     from trader.us.execution.reservation_reconcile_worker import (
