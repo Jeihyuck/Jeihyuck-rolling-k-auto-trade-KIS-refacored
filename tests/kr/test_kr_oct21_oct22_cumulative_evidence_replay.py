@@ -372,3 +372,71 @@ def test_kr_oct23_same_broker_notional_replay_survives_postgres_real_rounding():
     with pytest.raises(RuntimeError, match="KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT"):
         repo.upsert_fill(**changed)
     db.dispose()
+
+
+def test_cumulative_atomic_fence_compares_original_notional_not_real_rounded_avg():
+    """An additional share with positive KRW notional cannot be rejected by
+    an earlier PostgreSQL REAL stored average rounding *up*.
+
+    This isolated SQLite fixture emulates PG REAL readback; the authoritative
+    SQL predicate is also exercised in the PostgreSQL acceptance workflow.
+    """
+    import struct
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.repos import FillsRepo
+    from trader.db.schema import schema_for_engine
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+
+    db = sa.create_engine("sqlite:///:memory:")
+    create_schema_with_active_test_epoch(db)
+    repo = FillsRepo(db)
+    schema = schema_for_engine(db)
+    order_id = str(uuid.uuid4())
+    trade_id = "KR_KIS_CUM:fixture:20261023:0000015000:053800:BUY"
+    row = {"tot_ccld_qty": "300", "tot_ccld_amt": "300000012"}
+    common = dict(
+        env="practice", run_id=None, order_id=order_id,
+        kis_odno="0000015000", trade_id=trade_id,
+        code="053800", market="KOSDAQ", side="BUY",
+        fee=0.0, tax=0.0,
+        filled_at=datetime(2026, 10, 23, 9, 36, tzinfo=ZoneInfo("Asia/Seoul")),
+        fill_meta_json={
+            "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+            "fill_source": "daily_ccld_order_cumulative",
+        },
+    )
+    first_price = 300000012 / 300
+    repo.upsert_fill(**common, qty=300, price=first_price,
+                     raw_json={"kis_response": row})
+    stored_real = struct.unpack("!f", struct.pack("!f", first_price))[0]
+    assert stored_real * 300 > 300000012 + 1  # legacy fence falsely rejects +1
+    with db.begin() as conn:
+        conn.execute(
+            sa.update(schema.fills)
+            .where(schema.fills.c.broker_fill_id == trade_id)
+            .values(price=stored_real)
+        )
+    next_row = {**row, "tot_ccld_qty": "301", "tot_ccld_amt": "300000013"}
+    repo.upsert_fill(
+        **common, qty=301, price=300000013 / 301,
+        raw_json={"kis_response": next_row},
+    )
+    with db.connect() as conn:
+        saved = conn.execute(
+            sa.select(schema.fills).where(schema.fills.c.broker_fill_id == trade_id)
+        ).mappings().one()
+    assert saved["qty"] == 301
+    assert saved["raw_json"]["kis_response"]["tot_ccld_amt"] == "300000013"
+
+    # Older snapshots cannot overwrite the authoritative newer evidence.
+    repo.upsert_fill(
+        **common, qty=300, price=first_price,
+        raw_json={"kis_response": row},
+    )
+    with db.connect() as conn:
+        saved = conn.execute(
+            sa.select(schema.fills).where(schema.fills.c.broker_fill_id == trade_id)
+        ).mappings().one()
+    assert saved["qty"] == 301
+    db.dispose()
