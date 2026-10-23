@@ -171,3 +171,28 @@ def test_settlement_without_debt_does_not_fetch_broker_balance(monkeypatch):
     assert settle_verified_stop_debts_once(
         provider=object(), trade_date="2026-10-23"
     ) == {"checked": 0, "settled": 0, "blocked": 0, "total_pending": 0}
+
+
+def test_stage4_never_arms_cancel_with_only_one_operator_flag(monkeypatch):
+    from trader.us import protective_stop_obligation as debt_mod
+    from trader.us.execution import protective_stop_recovery_worker as recovery_mod
+    from trader.us import protective_tp_recovery as tp
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")
+    monkeypatch.setenv("US_STOP_RECOVERY_AUTHORIZED", "0")
+    monkeypatch.setattr(debt_mod, "load_pending_stop_obligations",
+                        lambda **kwargs: [{"symbol": "AMD", "account_id": "practice-account",
+                                           "lifecycle_id": "life-1", "severity": 3}])
+    monkeypatch.setattr(recovery_mod, "recovery_candidates",
+                        lambda debts: [_intent()])
+    got = []
+    monkeypatch.setattr(tp, "request_protective_tp_cancel",
+                        lambda **kwargs: got.append(kwargs) or [])
+    class ReadOnlyProvider:
+        def _get_client(self):
+            raise AssertionError("read-only mode must not create a cancel client")
+    report = worker.recover_stop_tp_conflicts_once(
+        provider=ReadOnlyProvider(), trade_date="2026-10-23",
+    )
+    assert report["cancel_authorized"] is False
+    assert got[0]["read_only_terminal_reconcile"] is True
+    assert got[0]["reserve"]({"id": "anything"}) is False
