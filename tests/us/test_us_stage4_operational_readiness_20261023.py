@@ -68,7 +68,7 @@ def test_code_pin_must_be_exact_dual_agent_head(tmp_path, monkeypatch):
     class Output:
         def __init__(self, stdout): self.stdout = stdout
     def git_mock(command, **kwargs):
-        return Output("dual-agent\\n" if "branch" in command else "a"*40+"\\n")
+        return Output("dual-agent\n" if "branch" in command else "a"*40+"\n")
     monkeypatch.setattr(mod.subprocess, "run", git_mock)
     pin_dir = tmp_path / "runtime" / "code-pins"
     pin_dir.mkdir(parents=True)
