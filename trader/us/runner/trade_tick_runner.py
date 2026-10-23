@@ -4826,8 +4826,9 @@ def run_trade_tick(
             latency_metrics["market_state_ms"], latency_metrics["entry_engine_ms"],
             latency_metrics["tqqq_infinite_ms"], latency_metrics["slot_overrun_300s"],
         )
-    logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
-                tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
+    logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s session=%s run=%s",
+                tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"],
+                session, session_run_id)
     from trader.us.runner.status_contract import classify_runtime_integrity, is_permission_blocked_sell_route
     exit_route_orders = exit_route_result.get("orders", [])
     exit_route_statuses = {str(order.get("status") or "").upper() for order in exit_route_orders}
