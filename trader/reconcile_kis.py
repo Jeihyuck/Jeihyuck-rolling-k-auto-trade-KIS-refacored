@@ -528,11 +528,15 @@ def _promote_open_buy_orders_from_holdings(
     fills_repo: FillsRepo,
     positions_repo: PositionsRepo | None = None,
 ) -> dict[str, int]:
+    promotion_started = time.monotonic()
     qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
     promoted_orders = 0
     promoted_fills = 0
+    terminal_proof_pruned = 0
+    terminal_holding_pruned = 0
     promoted_codes: list[str] = []
     candidate_orders = list(orders_repo.get_open_orders(env) or [])
+    current_open_orders = len(candidate_orders)
     seen_order_ids = {
         str(row.get("order_id") or row.get("client_order_key") or "")
         for row in candidate_orders
@@ -617,12 +621,14 @@ def _promote_open_buy_orders_from_holdings(
                     else saved_pre - saved_filled
                 )
             ):
+                terminal_proof_pruned += 1
                 logger.warning(
                     "[RECONCILE][PROMOTE_RECOVERY][PROOF_INCOMPLETE] code=%s order_id=%s",
                     code, order.get("order_id"),
                 )
                 continue
             if holding_qty != saved_post or not order.get("created_at"):
+                terminal_holding_pruned += 1
                 logger.warning(
                     "[RECONCILE][PROMOTE_RECOVERY][REVIEW_REQUIRED] "
                     "code=%s reason=HISTORICAL_HOLDING_DRIFT",
@@ -1208,6 +1214,18 @@ def _promote_open_buy_orders_from_holdings(
             code,
             order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
         )
+    logger.info(
+        "[KR_RECONCILE][PROMOTION_LANE] elapsed_ms=%.1f open_candidates=%s "
+        "terminal_candidates=%s proof_pruned=%s holding_pruned=%s "
+        "promoted_orders=%s promoted_fills=%s",
+        1000.0 * (time.monotonic() - promotion_started),
+        current_open_orders,
+        max(0, len(candidate_orders) - current_open_orders),
+        terminal_proof_pruned,
+        terminal_holding_pruned,
+        promoted_orders,
+        promoted_fills,
+    )
     return {"orders": promoted_orders, "fills": promoted_fills, "codes": promoted_codes}
 
 
@@ -2557,6 +2575,7 @@ def reconcile_kis(
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
+    _kr_promotion_started = time.monotonic()
     promoted = _promote_open_buy_orders_from_holdings(
         env=env,
         strategy=strategy,
@@ -2566,6 +2585,10 @@ def reconcile_kis(
         orders_repo=orders_repo,
         fills_repo=fills_repo,
         positions_repo=positions_repo,
+    )
+    logger.info(
+        "[KR_RECONCILE][PROMOTION_AFTER_BROKER] elapsed_ms=%.1f",
+        1000.0 * (time.monotonic() - _kr_promotion_started),
     )
     orders_count += int(promoted.get("orders") or 0)
     fills_count += int(promoted.get("fills") or 0)
