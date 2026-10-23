@@ -46,8 +46,8 @@ class _Engine:
 def test_existing_revision_requires_exact_sha_even_if_upsert_did_nothing(monkeypatch):
     import trader.us.db.repos as repo
     engine=_Engine(mismatch=True)
-    monkeypatch.setattr(repo,"_get_engine_or_none",lambda:engine)
-    monkeypatch.setattr(repo,"_active_us_epoch",lambda conn:"epoch")
+    monkeypatch.setattr(approval,"_get_engine_or_none",lambda:engine)
+    monkeypatch.setattr(approval,"_active_us_epoch",lambda conn:"epoch")
     monkeypatch.setattr(approval,"eligible_rows",lambda conn,epoch:_eligible())
     with pytest.raises(RuntimeError,match="STOP_REVISION_CONFLICTING_APPROVAL:AMD"):
         approval.run(apply=True,approval_ref="approved-revision",expected_count=1)
@@ -56,8 +56,8 @@ def test_existing_revision_requires_exact_sha_even_if_upsert_did_nothing(monkeyp
 def test_approval_fails_on_position_count_change_before_any_insert(monkeypatch):
     import trader.us.db.repos as repo
     engine=_Engine()
-    monkeypatch.setattr(repo,"_get_engine_or_none",lambda:engine)
-    monkeypatch.setattr(repo,"_active_us_epoch",lambda conn:"epoch")
+    monkeypatch.setattr(approval,"_get_engine_or_none",lambda:engine)
+    monkeypatch.setattr(approval,"_active_us_epoch",lambda conn:"epoch")
     monkeypatch.setattr(approval,"eligible_rows",lambda conn,epoch:_eligible())
     with pytest.raises(RuntimeError,match="STOP_REVISION_COUNT_CHANGED"):
         approval.run(apply=True,approval_ref="approved-revision",expected_count=2)
@@ -67,8 +67,8 @@ def test_approval_fails_on_position_count_change_before_any_insert(monkeypatch):
 def test_approved_exact_revision_has_individual_result_proof(monkeypatch):
     import trader.us.db.repos as repo
     engine=_Engine()
-    monkeypatch.setattr(repo,"_get_engine_or_none",lambda:engine)
-    monkeypatch.setattr(repo,"_active_us_epoch",lambda conn:"epoch")
+    monkeypatch.setattr(approval,"_get_engine_or_none",lambda:engine)
+    monkeypatch.setattr(approval,"_active_us_epoch",lambda conn:"epoch")
     monkeypatch.setattr(approval,"eligible_rows",lambda conn,epoch:_eligible())
     result=approval.run(apply=True,approval_ref="approved-revision",expected_count=1)
     assert result["mode"]=="APPLIED"
