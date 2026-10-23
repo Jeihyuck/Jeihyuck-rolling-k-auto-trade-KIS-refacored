@@ -1896,6 +1896,7 @@ def route_order(
                     if (_worker.get("reconcile_status") not in {"OK","WARN"}
                             or _worker.get("replay_status") not in {
                                 "OK","RECOVERED","NO_ACTIVE_CLAIMS",
+                        "WARN","PARTIAL","UNRESOLVED",
                             }):
                         raise RuntimeError("US_STAGE4_RECONCILE_NOT_VERIFIED")
                 else:

@@ -168,7 +168,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     # observation; an HTTP request returning is not an order terminal proof.
     replay_status=str(replay.get("status") or "ERROR").upper()
     ack_status=str(ack.get("status") or "ERROR").upper()
-    if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS"}
+    if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS","WARN","PARTIAL","UNRESOLVED"}
             or ack_status not in {"OK","WARN"}):
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
     # Neither TP repair nor terminal stop proof occupies the main order

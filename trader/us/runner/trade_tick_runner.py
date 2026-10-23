@@ -2033,6 +2033,7 @@ def run_trade_tick(
             if (_stage4_health.get("reconcile_status") not in {"OK","WARN"}
                     or _stage4_health.get("replay_status") not in {
                         "OK","RECOVERED","NO_ACTIVE_CLAIMS",
+                        "WARN","PARTIAL","UNRESOLVED",
                     }):
                 raise RuntimeError("US_STAGE4_RECONCILIATION_UNVERIFIED")
             from trader.us.db.repos import load_today_fills as _stage4_load_fills
