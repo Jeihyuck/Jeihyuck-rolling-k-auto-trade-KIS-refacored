@@ -18,7 +18,7 @@ def test_one_stage4_worker_owns_fills_replay_ack_reservations_and_stop_settlemen
 
     sequence=[]
     def record(name,ret):
-        def wrapped(**kwargs):
+        def wrapped(*args, **kwargs):
             sequence.append(name)
             return ret
         return wrapped
