@@ -1557,11 +1557,13 @@ class KisUSClient:
                 
                 url = self._base_url + path
                 timeout = self._request_budget()
-                record_kis_http_call("POST", path)
                 if is_order_submit and self._before_order_http is not None:
                     callback = self._before_order_http
                     self._before_order_http = None
                     callback()
+                # A pre-HTTP callback may fence the attempt; a logged POST
+                # must not be fabricated when requests.post was never reached.
+                record_kis_http_call("POST", path)
                 http_attempted = True
                 resp = requests.post(url, headers=headers, json=body, timeout=timeout)
                 resp.raise_for_status()
