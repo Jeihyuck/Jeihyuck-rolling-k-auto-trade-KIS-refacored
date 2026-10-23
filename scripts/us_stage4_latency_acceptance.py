@@ -25,7 +25,10 @@ TICK = re.compile(
     r"tick=(?P<tick>\d+)\s+total_ms=(?P<ms>[\d.]+).*"
     r"session=(?P<session>\S+)\s+run=(?P<run>\S+)"
 )
-PROTECTIVE = frozenset({"hard_stop_loss", "soft_stop_loss"})
+PROTECTIVE = frozenset({
+    "hard_stop", "hard_stop_loss", "hard_stop_full_exit",
+    "soft_stop", "soft_stop_loss",
+})
 
 
 def nearest_rank_p95(values: list[float]) -> float | None:
