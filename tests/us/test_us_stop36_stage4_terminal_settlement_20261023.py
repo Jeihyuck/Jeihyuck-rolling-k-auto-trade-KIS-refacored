@@ -6,8 +6,15 @@ from trader.us.execution import protective_stop_settlement_worker as settlement
 def test_settlement_rejects_non_authoritative_balance(monkeypatch):
     import trader.account_state as state
     import trader.us.execution.reconcile as reconcile
+    import trader.us.protective_stop_obligation as stop
     monkeypatch.setattr(state,"resolve_env_name",lambda:"practice")
     monkeypatch.setattr(state,"get_account_key",lambda **kw:"practice:123:01")
+    # The real balance fail-close is required when outstanding debt exists.
+    # No-debt sessions rightly skip unrelated broker balance I/O.
+    monkeypatch.setattr(stop,"load_pending_stop_obligations",lambda **kw:[{
+        "account_id":"practice:123:01","trading_epoch_id":"epoch",
+        "symbol":"AMD","lifecycle_id":"life-1","severity":3,
+    }])
     monkeypatch.setattr(reconcile,"reconcile_positions",
                         lambda **kw:{"status":"TEMP_ERROR","authoritative_positions":False})
     with pytest.raises(RuntimeError,match="BALANCE_UNVERIFIED"):
