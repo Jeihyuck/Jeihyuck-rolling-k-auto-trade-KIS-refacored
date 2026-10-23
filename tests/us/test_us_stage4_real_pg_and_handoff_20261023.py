@@ -14,7 +14,12 @@ def test_one_stage4_worker_owns_fills_replay_ack_reservations_and_stop_settlemen
     from trader.us.execution import fills,order_journal,reconcile,reservation_reconcile_worker
     from trader.us.db import repos
     from trader.us.execution import protective_stop_settlement_worker as stop
+    from trader.us import protective_stop_obligation as stop_ledger
     from trader.us.runner import trade_tick_runner as tick
+    # The deferred recovery path runs only when an actual durable stop debt
+    # exists. Keep this ownership test on that path (no production gate bypass).
+    monkeypatch.setattr(stop_ledger, "load_pending_stop_obligations",
+                        lambda **kwargs: [{"symbol": "AMD", "severity": 3}])
 
     sequence=[]
     def record(name,ret):
