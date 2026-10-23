@@ -5524,7 +5524,9 @@ class FillsRepo:
                 new_exact_amount if new_exact_amount is not None else qty * price
             )
             cumulative_notional_nondecreasing = (
-                old_broker_notional <= new_broker_notional + 0.01
+                old_broker_notional <= (
+                    sa.literal(new_broker_notional) + sa.literal(0.01)
+                )
             )
             cumulative_same_notional = (
                 sa.func.abs(old_broker_notional - new_broker_notional) <= 0.01
