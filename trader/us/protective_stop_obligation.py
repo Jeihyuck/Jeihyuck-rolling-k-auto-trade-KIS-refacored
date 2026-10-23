@@ -250,6 +250,7 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
     Reject if any related TP/SELL claim remains in a non-terminal state.
     """
     import json
+    import hashlib
     if not validate_terminal_broker_proof(debt,proof):
         raise StopObligationUnavailable("STOP_OBLIGATION_TERMINAL_PROOF_UNVERIFIED")
     from sqlalchemy import text
@@ -275,7 +276,8 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
                AND NOT EXISTS (
                    SELECT 1 FROM us_execution_claims c
                     WHERE c.trading_epoch_id=o.trading_epoch_id
-                      AND c.env=o.env AND c.account_id=o.account_id
+                      AND c.env=o.env AND c.account_id=:account_claim
+                      AND c.market='US'
                       AND c.strategy_owner=o.strategy_owner
                       AND c.lifecycle_id=o.lifecycle_id
                       AND c.action_state IN ('IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED')
@@ -284,6 +286,7 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
         """),{
             "proof":json.dumps(proof,sort_keys=True,default=str),
             "epoch":epoch,"account":debt["account_id"],
+            "account_claim":hashlib.sha256(str(debt["account_id"]).encode("utf-8")).hexdigest(),
             "symbol":debt["symbol"],"lifecycle":debt["lifecycle_id"],
         })
         committed=result.first() is not None
