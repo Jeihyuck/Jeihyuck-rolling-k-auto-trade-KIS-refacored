@@ -7,12 +7,15 @@ import pytest
 from trader.us.execution import reconcile_shadow_worker as worker
 
 
-def test_shadow_only_explicit_mode_and_invalid_modes_fail_closed():
+def test_shadow_only_explicit_mode_and_invalid_modes_fail_closed(monkeypatch):
     assert worker.parse_mode("legacy") == "LEGACY"
     assert worker.parse_mode("SHADOW") == "SHADOW"
     assert worker.parse_mode("RESERVATION_ONLY") == "RESERVATION_ONLY"
-    with pytest.raises(ValueError, match="not yet implemented"):
+    monkeypatch.delenv("US_STAGE4_WRITER_AUTHORIZED", raising=False)
+    with pytest.raises(ValueError, match="explicit"):
         worker.parse_mode("WORKER")
+    monkeypatch.setenv("US_STAGE4_WRITER_AUTHORIZED","1")
+    assert worker.parse_mode("WORKER")=="WORKER"
     with pytest.raises(ValueError):
         worker.parse_mode("invalid")
     assert worker.safe_scope_token("../../private/account") == ".._.._private_account"
