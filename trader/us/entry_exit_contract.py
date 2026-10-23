@@ -164,8 +164,8 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
         "partial_exit_allowed": bool(merged.get("partial_exit_allowed", os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1")),
         "min_hold_minutes": int(merged.get("min_hold_minutes") or os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")),
         "swing": {
-            "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.08")),
-            "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05")),
+            "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.06")),
+            "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.03")),
             "trailing_activation_profit": float(os.getenv("US_TRAILING_ACTIVATION_PROFIT_PCT", "0.03")),
             "trailing_stop": float(os.getenv("US_TRAILING_STOP_PCT", "0.05")),
             "profit_protect": float(os.getenv("US_PROFIT_PROTECT_PCT", "0.15")),
