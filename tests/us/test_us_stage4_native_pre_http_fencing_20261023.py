@@ -90,6 +90,10 @@ def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkey
     monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    # A real router demands an immutable active epoch and canonical account
+    # identity before claim construction; supply fixed test-only values.
+    monkeypatch.setattr("trader.account_state.get_account_key",
+                        lambda **_kw: "offline-practice-account")
     monkeypatch.setattr(order_router, "canonical_order_risk_check",
                         lambda *_a, **_kw: None, raising=False)
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order",
@@ -109,7 +113,8 @@ def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkey
         "symbol": "MSFT", "exchange": "NASDAQ", "side": "BUY",
         "qty": 1, "limit_price": 100.0, "notional_usd": 100.0,
         "client_order_key": "stage4-post-callback-throttle",
-        "trade_date": "2026-09-01",
+        "trade_date": "2026-09-01", "trading_epoch_id": "offline-epoch",
+        "strategy_owner": "US_STANDARD", "position_action": "NEW_POSITION_BUY",
     }, kis_client=client, context=context)
     assert result["status"] == "BROKER_SUBMIT_PRE_IO_FAILED"
     assert "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP" in result["execution_integrity_error"]
