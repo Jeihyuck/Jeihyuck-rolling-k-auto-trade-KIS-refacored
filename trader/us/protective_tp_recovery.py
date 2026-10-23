@@ -118,7 +118,8 @@ def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -
             SELECT o.id,o.trade_date,o.symbol,o.order_no,o.status,
                    o.qty_requested,o.qty_filled,o.client_order_key,
                    o.exchange,o.meta,o.trading_epoch_id,
-                   c.action_state AS claim_state
+                   c.action_state AS claim_state,
+                   c.account_id AS claim_account_id
             FROM us_orders o
             LEFT JOIN us_execution_claims c
               ON c.trading_epoch_id=o.trading_epoch_id
@@ -304,6 +305,12 @@ def request_protective_tp_cancel(
     results: list[dict] = []
     # Bind a broker TP reservation to the exact protective lifecycle, not merely
     # the ticker (which could have been closed and repurchased).
+    account_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("account_id") or (intent.get("meta") or {}).get("account_id") or "").strip()
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
     lifecycle_by_symbol = {
         str(intent.get("symbol") or "").upper():
             str(intent.get("position_lifecycle_id")
@@ -333,6 +340,16 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
+            expected_account = account_by_symbol.get(symbol) or ""
+            if expected_account:
+                # Claim account_id is SHA256 of the canonical raw account key.
+                # Lifecycle risk-state identity remains the unhashed key.
+                import hashlib
+                claim_id = hashlib.sha256(expected_account.encode("utf-8")).hexdigest()
+                if str(order.get("claim_account_id") or "") != claim_id:
+                    results.append({"symbol":symbol, "status":"FENCED",
+                                    "reason":"account_identity_unverified"})
+                    continue
             stale_classification = classify_stale_tp_conflict(
                 order, current_trade_date=trade_date,
             )
@@ -358,23 +375,25 @@ def request_protective_tp_cancel(
             if order.get("claim_state") not in {"IN_FLIGHT", "UNCERTAIN", "PARTIALLY_SATISFIED"}:
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "tp_claim_unverified"})
                 continue
-            if stale_classification != "SAME_DAY_TP_CLAIM" and not meta.get(
-                "protective_tp_cancel_requested_at"
-            ):
-                # Old KIS CCNL OPEN is historical, not an actionable active
-                # order. Do not burn a REST inquiry/cancel on that stale date.
-                # Leave the execution claim fenced for authoritative repair.
-                results.append({
-                    "symbol": symbol, "status": "FENCED",
-                    "reason": "historical_open_not_current_cancel_proof",
-                    "stale_classification": stale_classification,
-                })
-                continue
+            # Historical CCNL OPEN is *not* current broker-open evidence.
+            # A READ-ONLY original-date inquiry can nevertheless prove the
+            # old order terminal. Perform it even without a cancel request;
+            # otherwise stale TP claims stay fenced indefinitely.
             evidence = provider.get_fills_by_order_no(
                 order_no=str(order["order_no"]), symbol=symbol,
                 trade_date=str(order["trade_date"]),
             )
-            if meta.get("protective_tp_cancel_requested_at"):
+            _terminal_proven = broker_proves_terminal_after_cancel(order, evidence)
+            if stale_classification != "SAME_DAY_TP_CLAIM" and not meta.get(
+                "protective_tp_cancel_requested_at"
+            ) and not _terminal_proven:
+                results.append({
+                    "symbol": symbol, "status": "FENCED",
+                    "reason": "historical_order_terminal_proof_missing",
+                    "stale_classification": stale_classification,
+                })
+                continue
+            if meta.get("protective_tp_cancel_requested_at") or _terminal_proven:
                 # Revisit the original trade date, even after the local session
                 # rolls forward. Never infer terminal status from the cancel ACK.
                 if not broker_proves_terminal_after_cancel(order, evidence):

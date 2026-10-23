@@ -1367,10 +1367,10 @@ def run_trade_session(
         # execution Claims. Default LEGACY remains unchanged.
         from trader.us.execution.reconcile_shadow_worker import parse_mode
         _reconcile_mode = parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))
-        if _reconcile_mode in {"SHADOW", "RESERVATION_ONLY"}:
+        if _reconcile_mode in {"SHADOW", "RESERVATION_ONLY", "WORKER"}:
             if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
                 raise RuntimeError("US_RECONCILE_CHILD_PRACTICE_ONLY")
-            if _reconcile_mode == "RESERVATION_ONLY" and not (
+            if _reconcile_mode in {"RESERVATION_ONLY", "WORKER"} and not (
                 os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
                 and os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") == "1"
             ):
@@ -1379,12 +1379,20 @@ def run_trade_session(
             # Keep CANO/product identity for the SAME canonical hashed
             # account-scope derivation as the parent. They are never logged.
             # Strip API credentials so accidental KIS use remains impossible.
-            for _name in (
-                "KIS_APP_KEY", "KIS_APP_SECRET", "APP_KEY", "APP_SECRET",
-                "KIS_ACCESS_TOKEN", "KIS_REFRESH_TOKEN",
-            ):
-                _shadow_env.pop(_name, None)
-            _shadow_env["US_OFFLINE"] = "1"
+            if _reconcile_mode != "WORKER":
+                for _name in (
+                    "KIS_APP_KEY", "KIS_APP_SECRET", "APP_KEY", "APP_SECRET",
+                    "KIS_ACCESS_TOKEN", "KIS_REFRESH_TOKEN",
+                ):
+                    _shadow_env.pop(_name, None)
+            # Stage4 writer needs read-only KIS evidence. No order APIs are
+            # called by authoritative_reconcile_worker; operational account
+            # permissions remain enforced by the canonical order router.
+            _shadow_env["US_OFFLINE"] = "0" if _reconcile_mode == "WORKER" else "1"
+            if _reconcile_mode == "WORKER":
+                import uuid as _stage4_uuid
+                os.environ["US_STAGE4_EXPECTED_GENERATION"] = _stage4_uuid.uuid4().hex
+                _shadow_env["US_STAGE4_EXPECTED_GENERATION"] = os.environ["US_STAGE4_EXPECTED_GENERATION"]
             _shadow_env["US_RECONCILE_WORKER_MODE"] = _reconcile_mode
             _shadow_reconcile_child = subprocess.Popen(
                 [
@@ -1392,7 +1400,11 @@ def run_trade_session(
                     (
                         "trader.us.execution.reservation_reconcile_worker"
                         if _reconcile_mode == "RESERVATION_ONLY"
-                        else "trader.us.execution.reconcile_shadow_worker"
+                        else (
+                            "trader.us.execution.authoritative_reconcile_worker"
+                            if _reconcile_mode == "WORKER"
+                            else "trader.us.execution.reconcile_shadow_worker"
+                        )
                     ),
                     "--trade-date", trade_date,
                     "--session-run-id", session_run_id,
@@ -1405,11 +1417,15 @@ def run_trade_session(
             )
             if _reconcile_mode == "RESERVATION_ONLY":
                 os.environ["US_RESERVATION_WORKER_PID"] = str(_shadow_reconcile_child.pid)
+            elif _reconcile_mode == "WORKER":
+                os.environ["US_STAGE4_WORKER_ALIVE"] = "1"
             logger.info(
                 "[US_RECONCILE_CHILD][STARTED] session=%s run=%s pid=%s "
                 "authority=%s broker_access=NONE",
                 session, session_run_id, _shadow_reconcile_child.pid,
-                ("RESERVATIONS_ONLY" if _reconcile_mode == "RESERVATION_ONLY" else "READ_ONLY"),
+                ("RESERVATIONS_ONLY" if _reconcile_mode == "RESERVATION_ONLY"
+                 else "KIS_READ_DB_WRITE_NO_ORDER" if _reconcile_mode == "WORKER"
+                 else "READ_ONLY"),
             )
         try:
             while True:
@@ -1424,6 +1440,8 @@ def run_trade_session(
                     _shadow_reconcile_child = None
                     if _reconcile_mode == "RESERVATION_ONLY":
                         os.environ.pop("US_RESERVATION_WORKER_PID", None)
+                    elif _reconcile_mode == "WORKER":
+                        os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
                 elif _shadow_reconcile_child is not None:
                     try:
                         if _reconcile_mode == "RESERVATION_ONLY":

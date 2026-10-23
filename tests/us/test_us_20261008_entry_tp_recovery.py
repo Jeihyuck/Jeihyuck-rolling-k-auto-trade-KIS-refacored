@@ -430,6 +430,7 @@ def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeyp
                 CREATE TEMP TABLE us_execution_claims (
                     trading_epoch_id TEXT,trade_date TEXT,env TEXT,market TEXT,
                     strategy_owner TEXT,lifecycle_id TEXT,action TEXT,
+                    account_id TEXT,
                     action_state TEXT)
             """)
             conn.execute(text("""

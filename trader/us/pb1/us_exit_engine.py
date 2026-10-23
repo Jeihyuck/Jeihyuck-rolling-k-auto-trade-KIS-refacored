@@ -4,8 +4,8 @@
 한국장 PB1의 청산 전략을 미국장용으로 이식.
 
 청산 종류:
-- hard_stop_loss:      -8% 하드 손절
-- soft_stop_loss:      -5% 소프트 손절(확인/부분매도)
+- hard_stop_loss:      -6% 하드 손절
+- soft_stop_loss:      -3% 소프트 손절(확인/부분매도)
 - profit_trailing_stop: 수익 경험 후 고점 대비 하락
 - profit_protect: 목표 수익 근접 시 이익 보호
 - giveback:       수익 반납 비율 초과
@@ -41,8 +41,8 @@ EXIT_SOFT_STOP_LOSS = "soft_stop_loss"
 EXIT_PROFIT_TRAILING_STOP = "profit_trailing_stop"
 EXIT_TIME_OR_MOMENTUM_EXIT = "time_or_momentum_exit"
 
-_HARD_STOP_PCT = float(os.getenv("US_HARD_STOP_PCT", "0.08"))       # 8% 하드 손절
-_SOFT_STOP_PCT = float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05"))  # 5% 소프트 손절
+_HARD_STOP_PCT = float(os.getenv("US_HARD_STOP_PCT", "0.06"))       # 8% 하드 손절
+_SOFT_STOP_PCT = float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.03"))  # 5% 소프트 손절
 _TRAILING_ACTIVATION_PROFIT_PCT = float(os.getenv("US_TRAILING_ACTIVATION_PROFIT_PCT", "0.03"))
 _TRAILING_STOP_PCT = float(os.getenv("US_TRAILING_STOP_PCT", "0.05")) # 수익 경험 후 5% trailing
 _PROFIT_PROTECT_PCT = float(os.getenv("US_PROFIT_PROTECT_PCT", "0.15")) # 15% 수익 보호
@@ -53,8 +53,8 @@ _TIME_STOP_DAYS = int(os.getenv("US_TIME_STOP_DAYS", "20"))           # 20일 �
 def _reload_env() -> dict:
     """환경변수 최신값 로드."""
     return {
-        "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.08")),
-        "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05")),
+        "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.06")),
+        "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.03")),
         "trailing_activation_profit": float(os.getenv("US_TRAILING_ACTIVATION_PROFIT_PCT", "0.03")),
         "trailing_stop": float(os.getenv("US_TRAILING_STOP_PCT", "0.05")),
         "profit_protect": float(os.getenv("US_PROFIT_PROTECT_PCT", "0.15")),
@@ -101,7 +101,12 @@ def soft_stop_repeat_allowed(position: dict, *, intraday_market_overlay: str = "
     current = float(position.get("current_price") or position.get("current_price_usd") or 0)
     first = float(position.get("first_soft_stop_price") or 0)
     entry = float(position.get("entry_price") or position.get("avg_cost") or 0)
-    hard_near = bool(entry > 0 and current <= entry * (1 - float(os.getenv("US_HARD_STOP_PCT", "0.08")) * 0.9))
+    # Repeat escalation must use the same immutable buy-time threshold as
+    # evaluate_exit(), not the current process default for legacy positions.
+    from trader.us.entry_exit_contract import contract_exit_config
+    frozen = contract_exit_config(position)
+    hard_stop_pct = float(frozen.get("hard_stop", os.getenv("US_HARD_STOP_PCT", "0.06")))
+    hard_near = bool(entry > 0 and current <= entry * (1 - hard_stop_pct * 0.9))
     extra_drop = bool(first > 0 and current <= first * 0.98)
     crash = str(intraday_market_overlay).upper() == "INTRADAY_MARKET_CRASH"
     if hard_near or extra_drop or close_session or crash:
@@ -447,6 +452,18 @@ def evaluate_exit(
             "position_lifecycle_id",
             str(position_lifecycle_id) if position_lifecycle_id else None,
         )
+        # Persist the confirmed stop BEFORE _make_exit_intent's pending-SELL
+        # suppression. A stale TP fence must not erase a verified stop signal.
+        from trader.us.protective_stop_obligation import record_confirmed_stop
+        record_confirmed_stop(
+            position,
+            exit_type=str(kwargs.get("exit_type") or ""),
+            target_qty=int(kwargs.get("qty") or 0),
+            pnl_pct=float(kwargs.get("pnl_pct") or 0.0),
+            signal_price=float(kwargs.get("current_price") or 0.0),
+            policy=cfg,
+            now=now,
+        )
         return _make_exit_intent(policy_cfg=cfg, **kwargs)
 
     symbol = position.get("symbol", "")
@@ -613,7 +630,7 @@ def evaluate_exit(
         )
         return None
 
-    # ── persistent soft stop: first partial 이후에도 -5%가 지속되면 전량 청산 ─────────
+    # ── persistent soft stop: first partial 이후에도 정책상 soft stop을 하회하면 잔량 청산 ─────────
     if pnl_pct <= -cfg["soft_stop"]:
         confirmed, breach_count, required_ticks = _soft_stop_confirmed(
             position,
@@ -664,7 +681,7 @@ def evaluate_exit(
             trail_high_price=max_price,
         )
 
-    # ── soft stop: 단일 -5% 틱 전량매도 금지, 확인 후 부분매도 ──────────────
+    # ── soft stop: 단일 soft-stop 위반 틱 전량매도 금지, 확인 후 부분매도 ──────────────
     if pnl_pct <= -cfg["soft_stop"]:
         confirmed, breach_count, required_ticks = _soft_stop_confirmed(
             position,
@@ -1008,6 +1025,10 @@ def prepare_exit_position_snapshots(
     from trader.us.symbols import normalize_us_exchange
     from concurrent.futures import ThreadPoolExecutor
 
+    # Exactly one scoped DB read for approved existing-position revisions.
+    # Never change or re-sign original entry/exit contracts.
+    from trader.us.stop_policy_revision import attach_approved_revisions
+    positions = attach_approved_revisions(positions)
     snapshots: list[dict] = []
     # Quote IO can overlap only when the injected provider explicitly
     # guarantees safe concurrent read calls. Risk/HWM writes and selected SELL
@@ -1175,8 +1196,10 @@ def prepare_exit_position_snapshots(
                         current_price=current_price,
                         now=now or datetime.now(),
                         soft_stop_pct=float(
-                            frozen_risk_cfg.get("soft_stop", os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05"))
+                            frozen_risk_cfg.get("soft_stop", os.getenv("US_SOFT_STOP_LOSS_PCT", "0.03"))
                         ),
+                        **({"policy_revision": "PB1_STOP_3_6_V1"}
+                           if pos.get("_verified_pb1_stop_revision") else {}),
                     )
                     pos["risk_state"] = risk_state
                     pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)

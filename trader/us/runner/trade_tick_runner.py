@@ -2018,8 +2018,38 @@ def run_trade_tick(
 
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
-    
-    if not offline:
+    _stage4_mode = (
+        os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY").upper() == "WORKER"
+        and not offline
+    )
+    _stage4_health: dict = {}
+    if _stage4_mode:
+        try:
+            from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+            _stage4_health=read_worker_health(
+                env=env,
+                max_age_seconds=float(os.getenv("US_STAGE4_HEALTH_MAX_AGE_SEC","30")),
+            )
+            if (_stage4_health.get("reconcile_status") not in {"OK","WARN"}
+                    or _stage4_health.get("replay_status") not in {
+                        "OK","RECOVERED","NO_ACTIVE_CLAIMS",
+                        "WARN","PARTIAL","UNRESOLVED",
+                    }):
+                raise RuntimeError("US_STAGE4_RECONCILIATION_UNVERIFIED")
+            from trader.us.db.repos import load_today_fills as _stage4_load_fills
+            fills_today=_stage4_load_fills(trade_date) or []
+            fills_result={"status":"SKIPPED_STAGE4_WORKER","fills":fills_today}
+            logger.info("[US_STAGE4][WORKER_EVIDENCE] generation=%s filled_rows=%d",
+                        _stage4_health.get("writer_generation"),len(fills_today))
+        except Exception as _stage4_exception:
+            logger.error("[US_STAGE4][BLOCK_ALL_ORDERS] reason=%s",
+                         type(_stage4_exception).__name__)
+            return {"status":"FAILED","reason":"stage4_worker_evidence_unavailable",
+                    "orders":[],"orders_sent":0,"errors":1,"session":session,
+                    "trade_date":trade_date,"block_new_entry":True,
+                    "exit_can_proceed":False}
+
+    if not offline and not _stage4_mode:
         from trader.us.db.repos import load_pending_ack_orders, load_today_fills
         try:
             _pending_orders_for_fill_poll = load_pending_ack_orders(trade_date, env=env)
@@ -2133,8 +2163,9 @@ def run_trade_tick(
         db_sold = set()
     sold_today = kis_sold | db_sold
 
+    # Main Tick cannot duplicate the Stage4 authoritative Fill writer.
     # fills DB 저장
-    if fills_today:
+    if fills_today and not _stage4_mode:
         _fill_persist_started = time.monotonic()
         try:
             from trader.us.db.repos import save_fills_with_result
@@ -2173,8 +2204,25 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_EXIT][SOFT_STOP_STATE][FILL_MARK_WARN] err=%s", exc)
 
-    # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
-    if not offline:
+    # Stage4 worker exclusively owns historical/ACK reconciliation writes.
+    if _stage4_mode:
+        ack_recon = {
+            "status":str(_stage4_health["reconcile_status"]),
+            "pending_count":int(_stage4_health["pending_count"]),
+            "unresolved_count":int(_stage4_health["unresolved_count"]),
+            "unresolved_error_count":int(_stage4_health["unresolved_count"]),
+            "open_order_pending_count":int(_stage4_health["pending_count"]),
+            "confirmed_count":0,"balance_reconcile_count":0,
+        }
+        active_claim_recovery_result={
+            "status":str(_stage4_health["replay_status"]),
+            "unresolved_count":int(_stage4_health["unresolved_count"]),
+        }
+        ack_recon["active_claim_recovery"]=active_claim_recovery_result
+        ack_recon_before_route=dict(ack_recon)
+        logger.info("[US_STAGE4][WRITER_SNAPSHOT] pending=%d unresolved=%d",
+                    ack_recon["pending_count"],ack_recon["unresolved_count"])
+    elif not offline:
         _order_reconcile_started = time.monotonic()
         _active_claim_replay_started = time.monotonic()
         try:
@@ -2430,6 +2478,12 @@ def run_trade_tick(
             _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
             if _lc:
                 _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
+                # Preserve authoritative account/owner for exact stop revision
+                # and durable obligation scope, never infer from a ticker.
+                if str(_lc.get("account_id") or "").strip():
+                    _p["account_id"] = str(_lc["account_id"])
+                if str(_lc.get("strategy_owner") or "").upper() == STANDARD_OWNER:
+                    _p["strategy_owner"] = STANDARD_OWNER
                 _p["opened_trade_date"] = _lc.get("opened_trade_date")
                 _p["opened_at"] = _lc.get("opened_at")
                 _p["opened_at_source"] = _lc.get("opened_at_source")
@@ -2684,16 +2738,32 @@ def run_trade_tick(
                 and os.getenv("KIS_ENV", "practice").strip().lower() == "practice"
                 and not offline
                 and kis_order_allowed and not signal_only and exit_can_proceed
-                and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") != "1"
+                # Clean independent protective SELLs remain eligible even
+                # while another lifecycle's TP recovery worker is active.
+                # _suppress_pending_sell_exit_intents(strict=True) below owns
+                # same-symbol/epoch/account claim safety, never this global flag.
                 and not fills_contract_error and not fills_temp_error
                 and bool(recon.get("authoritative_positions"))
                 and str(recon.get("status") or "").upper() == "OK"
-                and str(ack_recon.get("status") or "").upper() == "OK"
-                and int(ack_recon.get("unresolved_count") or 0) == 0
-                and isinstance(active_claim_recovery_result, dict)
-                and str(active_claim_recovery_result.get("status") or "").upper()
-                    in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
-                and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
+                # Legacy retains global ACK/replay cleanliness. Stage4
+                # isolates unrelated historical claims in the reconciler;
+                # the SAME lifecycle strict pending-SELL suppression and
+                # account-wide canonical reservation remain mandatory.
+                and (
+                    (
+                        str(ack_recon.get("status") or "").upper() == "OK"
+                        and int(ack_recon.get("unresolved_count") or 0) == 0
+                        and isinstance(active_claim_recovery_result, dict)
+                        and str(active_claim_recovery_result.get("status") or "").upper()
+                            in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
+                        and int(active_claim_recovery_result.get("unresolved_count") or 0) == 0
+                    )
+                    or (
+                        _stage4_mode
+                        and str(_stage4_health.get("worker_state") or "") == "READY"
+                        and str(_stage4_health.get("reconcile_status") or "") in {"OK","WARN"}
+                    )
+                )
                 and _exit_observer_supported
             )
             _pilot_safety_intents: list[dict] = []
@@ -3044,6 +3114,32 @@ def run_trade_tick(
     except Exception as _cluster_guard_exc:
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
 
+    # Restore previously CONFIRMED hard/persistent stop debt even after a
+    # process restart or when the current quote no longer breaches the stop.
+    # This uses the original PB1 intent constructor and canonical router;
+    # it never bypasses stale-TP, Claim, reservation or KIS broker fences.
+    if (
+        os.getenv("US_PROTECTIVE_STOP_LEDGER_MODE", "SHADOW").upper() == "ENFORCE"
+        and str(env).lower() == "practice"
+        and not offline and kis_order_allowed and not signal_only
+    ):
+        try:
+            from trader.us.protective_stop_obligation import (
+                load_pending_stop_obligations, replay_confirmed_protective_intents,
+            )
+            _debt_rows = load_pending_stop_obligations(env=env)
+            _replayed = replay_confirmed_protective_intents(
+                snapshots=locals().get("exit_snapshots", []) or [],
+                existing_intents=exit_intents, pending=_debt_rows, now=now,
+            )
+            if _replayed:
+                logger.warning("[US_PROTECTIVE_STOP][DEBT_REPLAY] count=%d", len(_replayed))
+                exit_intents.extend(_replayed)
+        except Exception as _debt_exc:
+            # Missing durable evidence must not silently authorize a new
+            # synthetic SELL. Original fresh signals remain separately fenced.
+            logger.error("[US_PROTECTIVE_STOP][DEBT_REPLAY_UNAVAILABLE] type=%s", type(_debt_exc).__name__)
+
     # Infinite evaluation/mutation is a strict no-op while disabled. Ownership
     # evidence is still read so an open/pending Infinite position cannot leak
     # into the legacy strategy after the kill switch is used.
@@ -3060,6 +3156,7 @@ def run_trade_tick(
     # SELL in this tick; only terminal broker reconciliation may do that.
     if (
         os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
+        and os.getenv("US_RECONCILE_WORKER_MODE","LEGACY") != "WORKER"
         and kis_order_allowed and not signal_only
     ):
         try:
@@ -4280,7 +4377,14 @@ def run_trade_tick(
     ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
 
     _post_route_reconcile_started = time.monotonic()
-    if not offline and ack_cnt > 0:
+    if _stage4_mode and ack_cnt > 0:
+        # A just-submitted ACK cannot be terminalized from an older snapshot.
+        ack_recon_after_route=dict(ack_recon_before_route)
+        ack_recon_after_route["status"]="ACK_PENDING_RECONCILE"
+        ack_recon_after_route["pending_count"]=(int(ack_recon_after_route.get("pending_count") or 0)+ack_cnt)
+        ack_recon_after_route["unresolved_count"]=(int(ack_recon_after_route.get("unresolved_count") or 0)+ack_cnt)
+        ack_recon=dict(ack_recon_after_route)
+    elif not offline and ack_cnt > 0:
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon_after_route = reconcile_ack_orders_with_balance(

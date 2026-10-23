@@ -18,6 +18,14 @@ def validate_stage123_prerequisites(*, engine=None, scope=None, env=None) -> dic
     e = os.environ if env is None else env
     if e.get("US_STAGE123_PAPER_PROFILE", "OFF") != "ON":
         return {"status": "SKIP", "reason": "profile_off"}
+    _reconcile_mode=e.get("US_RECONCILE_WORKER_MODE")
+    _stage4_mode=_reconcile_mode=="WORKER"
+    _worker_mode_authorized=(
+        _reconcile_mode=="RESERVATION_ONLY"
+        or (_stage4_mode
+            and e.get("US_STAGE4_WRITER_AUTHORIZED")=="1"
+            and e.get("US_PROTECTIVE_STOP_LEDGER_MODE")=="ENFORCE")
+    )
     if not (
         e.get("KIS_ENV") == "practice"
         and e.get("US_PAPER_TRADING_ENABLED") == "1"
@@ -26,7 +34,7 @@ def validate_stage123_prerequisites(*, engine=None, scope=None, env=None) -> dic
         and e.get("US_SIGNAL_ONLY", "0") != "1"
         and e.get("US_ATOMIC_CLAIM_OUTBOX_ENABLED") == "1"
         and e.get("US_ACCOUNT_RESERVATION_MODE") == "ENFORCE"
-        and e.get("US_RECONCILE_WORKER_MODE") == "RESERVATION_ONLY"
+        and _worker_mode_authorized
         and e.get("US_SHARED_KIS_LIMITER_ENABLED") == "1"
         and e.get("US_EXIT_QUOTE_PREFETCH_ENABLED") == "1"
         and e.get("US_EARLY_HARD_STOP_PILOT_ENABLED") == "1"
@@ -81,7 +89,28 @@ def validate_stage123_prerequisites(*, engine=None, scope=None, env=None) -> dic
         }
         if not must.issubset(have):
             raise RuntimeError("paper_stage123_migration_columns_incomplete")
-    return {"status": "PASS", "mode": "PAPER_ON", "broker_access": "NONE"}
+        if _stage4_mode:
+            # Stage4 must never start in WORKER mode when its durable
+            # protection/debt tables or the singleton health table are absent.
+            stage4=conn.execute(text("""
+                SELECT c.relname,c.relrowsecurity,c.relkind
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='public' AND c.relname IN (
+                    'us_stop_policy_revisions',
+                    'us_protective_stop_obligations',
+                    'us_stage4_reconcile_health'
+                )
+            """)).all()
+            expected={
+                'us_stop_policy_revisions',
+                'us_protective_stop_obligations',
+                'us_stage4_reconcile_health',
+            }
+            if ({name for name,_,_ in stage4}!=expected
+                    or any(not rls or kind!='r' for _,rls,kind in stage4)):
+                raise RuntimeError("paper_stage4_migrations_0057_0059_missing_or_rls_off")
+    return {"status": "PASS", "mode": "PAPER_ON_STAGE4" if _stage4_mode else "PAPER_ON",
+            "broker_access":"NONE"}
 
 
 def main() -> int:

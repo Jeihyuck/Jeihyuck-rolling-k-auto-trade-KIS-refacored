@@ -164,8 +164,8 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
         "partial_exit_allowed": bool(merged.get("partial_exit_allowed", os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1")),
         "min_hold_minutes": int(merged.get("min_hold_minutes") or os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")),
         "swing": {
-            "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.08")),
-            "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05")),
+            "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.06")),
+            "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.03")),
             "trailing_activation_profit": float(os.getenv("US_TRAILING_ACTIVATION_PROFIT_PCT", "0.03")),
             "trailing_stop": float(os.getenv("US_TRAILING_STOP_PCT", "0.05")),
             "profit_protect": float(os.getenv("US_PROFIT_PROTECT_PCT", "0.15")),
@@ -218,7 +218,16 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
 
 def contract_exit_config(position: dict) -> dict:
     contract = extract_us_entry_exit_contract(position, _dict(position).get("meta"))
-    return dict((contract.get("management") or {}).get("swing") or {}) if contract else {}
+    cfg = dict((contract.get("management") or {}).get("swing") or {}) if contract else {}
+    if not cfg:
+        return cfg
+    # Only the explicitly DB-verified, account/lifecycle/SHA-matched revision
+    # overrides the immutable buy-time stop thresholds; TP/trailing unchanged.
+    from trader.us.stop_policy_revision import validated_revision
+    approved = validated_revision(position)
+    if approved:
+        cfg.update(approved)
+    return cfg
 
 
 def contract_day_config(position: dict) -> dict:

@@ -2882,11 +2882,25 @@ def update_us_soft_stop_risk_state(
     current_price: float,
     now: datetime,
     soft_stop_pct: float,
+    policy_revision: str | None = None,
 ) -> dict:
     """Increment/reset and persist per-symbol soft-stop state."""
     key_symbol = _risk_state_key(symbol, trade_date)[1]
     previous = load_us_position_risk_state(key_symbol, trade_date)
     now_iso = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
+    previous_state = dict(previous.get("state") or {})
+    # A newly approved policy must restart its confirmation-tick sequence;
+    # counts accumulated at an older threshold are not valid evidence.
+    prior_revision = str(previous_state.get("soft_stop_policy_revision") or "")
+    revision_changed = bool(policy_revision and prior_revision != str(policy_revision))
+    previous_count = 0 if revision_changed else int(previous.get("soft_stop_breach_count") or 0)
+    if revision_changed:
+        previous = {**previous, "first_soft_stop_seen_at":None,
+                    "last_soft_stop_seen_at":None,
+                    "lowest_price_since_breach":None}
+        previous_state["soft_stop_policy_revision"] = str(policy_revision)
+        logger.warning("[US_RISK_STATE][SOFT_POLICY_REVISION_RESET] symbol=%s revision=%s old_revision=%s",
+                       key_symbol, policy_revision, prior_revision)
     if float(pnl_pct) <= -float(soft_stop_pct):
         previous_low = previous.get("lowest_price_since_breach")
         try:
@@ -2895,7 +2909,8 @@ def update_us_soft_stop_risk_state(
             lowest = float(current_price)
         state = {
             **previous,
-            "soft_stop_breach_count": int(previous.get("soft_stop_breach_count") or 0) + 1,
+            "state":previous_state,
+            "soft_stop_breach_count": previous_count + 1,
             "first_soft_stop_seen_at": previous.get("first_soft_stop_seen_at") or now_iso,
             "last_soft_stop_seen_at": now_iso,
             "lowest_price_since_breach": lowest,
@@ -2912,6 +2927,7 @@ def update_us_soft_stop_risk_state(
 
     state = {
         **previous,
+        "state":previous_state,
         "soft_stop_breach_count": 0,
         "first_soft_stop_seen_at": None,
         "last_soft_stop_seen_at": None,

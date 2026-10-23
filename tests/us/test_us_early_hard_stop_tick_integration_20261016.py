@@ -66,7 +66,9 @@ def test_tick_hard_stop_early_does_not_wait_for_unrelated_quote(
         def get_current_price(self, symbol, exchange):
             calls.append(("quote_" + symbol, None, {}))
             return {
-                "last": ("94.0" if soft_stop_mode else "90.0")
+                # A soft-only fixture must stay above the newly approved -6%
+                # HARD STOP; 94.0 now triggers a hard stop, not a soft stop.
+                "last": ("96.0" if soft_stop_mode else "90.0")
                 if symbol == "AAA" else ("90.0" if multi_enabled and symbol == "BBB" else "101.0")
             }
 
