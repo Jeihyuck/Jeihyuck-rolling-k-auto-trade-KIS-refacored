@@ -2018,8 +2018,37 @@ def run_trade_tick(
 
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
-    
-    if not offline:
+    _stage4_mode = (
+        os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY").upper() == "WORKER"
+        and not offline
+    )
+    _stage4_health: dict = {}
+    if _stage4_mode:
+        try:
+            from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+            _stage4_health=read_worker_health(
+                env=env,
+                max_age_seconds=float(os.getenv("US_STAGE4_HEALTH_MAX_AGE_SEC","30")),
+            )
+            if (_stage4_health.get("reconcile_status") not in {"OK","WARN"}
+                    or _stage4_health.get("replay_status") not in {
+                        "OK","RECOVERED","NO_ACTIVE_CLAIMS",
+                    }):
+                raise RuntimeError("US_STAGE4_RECONCILIATION_UNVERIFIED")
+            from trader.us.db.repos import load_today_fills as _stage4_load_fills
+            fills_today=_stage4_load_fills(trade_date) or []
+            fills_result={"status":"SKIPPED_STAGE4_WORKER","fills":fills_today}
+            logger.info("[US_STAGE4][WORKER_EVIDENCE] generation=%s filled_rows=%d",
+                        _stage4_health.get("writer_generation"),len(fills_today))
+        except Exception as _stage4_exception:
+            logger.error("[US_STAGE4][BLOCK_ALL_ORDERS] reason=%s",
+                         type(_stage4_exception).__name__)
+            return {"status":"FAILED","reason":"stage4_worker_evidence_unavailable",
+                    "orders":[],"orders_sent":0,"errors":1,"session":session,
+                    "trade_date":trade_date,"block_new_entry":True,
+                    "exit_can_proceed":False}
+
+    if not offline and not _stage4_mode:
         from trader.us.db.repos import load_pending_ack_orders, load_today_fills
         try:
             _pending_orders_for_fill_poll = load_pending_ack_orders(trade_date, env=env)
@@ -2133,8 +2162,9 @@ def run_trade_tick(
         db_sold = set()
     sold_today = kis_sold | db_sold
 
+    # Main Tick cannot duplicate the Stage4 authoritative Fill writer.
     # fills DB 저장
-    if fills_today:
+    if fills_today and not _stage4_mode:
         _fill_persist_started = time.monotonic()
         try:
             from trader.us.db.repos import save_fills_with_result
@@ -2173,8 +2203,25 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_EXIT][SOFT_STOP_STATE][FILL_MARK_WARN] err=%s", exc)
 
-    # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
-    if not offline:
+    # Stage4 worker exclusively owns historical/ACK reconciliation writes.
+    if _stage4_mode:
+        ack_recon = {
+            "status":str(_stage4_health["reconcile_status"]),
+            "pending_count":int(_stage4_health["pending_count"]),
+            "unresolved_count":int(_stage4_health["unresolved_count"]),
+            "unresolved_error_count":int(_stage4_health["unresolved_count"]),
+            "open_order_pending_count":int(_stage4_health["pending_count"]),
+            "confirmed_count":0,"balance_reconcile_count":0,
+        }
+        active_claim_recovery_result={
+            "status":str(_stage4_health["replay_status"]),
+            "unresolved_count":int(_stage4_health["unresolved_count"]),
+        }
+        ack_recon["active_claim_recovery"]=active_claim_recovery_result
+        ack_recon_before_route=dict(ack_recon)
+        logger.info("[US_STAGE4][WRITER_SNAPSHOT] pending=%d unresolved=%d",
+                    ack_recon["pending_count"],ack_recon["unresolved_count"])
+    elif not offline:
         _order_reconcile_started = time.monotonic()
         _active_claim_replay_started = time.monotonic()
         try:
@@ -4315,7 +4362,14 @@ def run_trade_tick(
     ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
 
     _post_route_reconcile_started = time.monotonic()
-    if not offline and ack_cnt > 0:
+    if _stage4_mode and ack_cnt > 0:
+        # A just-submitted ACK cannot be terminalized from an older snapshot.
+        ack_recon_after_route=dict(ack_recon_before_route)
+        ack_recon_after_route["status"]="ACK_PENDING_RECONCILE"
+        ack_recon_after_route["pending_count"]=(int(ack_recon_after_route.get("pending_count") or 0)+ack_cnt)
+        ack_recon_after_route["unresolved_count"]=(int(ack_recon_after_route.get("unresolved_count") or 0)+ack_cnt)
+        ack_recon=dict(ack_recon_after_route)
+    elif not offline and ack_cnt > 0:
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon_after_route = reconcile_ack_orders_with_balance(

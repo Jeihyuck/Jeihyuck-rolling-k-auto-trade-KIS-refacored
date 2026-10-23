@@ -58,6 +58,9 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
     if not row or str(row["worker_state"])!="READY":
         raise RuntimeError("US_STAGE4_WRITER_NOT_READY")
     expected_generation=os.getenv("US_STAGE4_EXPECTED_GENERATION")
+    if (os.getenv("US_RECONCILE_WORKER_MODE")=="WORKER"
+            and not expected_generation):
+        raise RuntimeError("US_STAGE4_WORKER_GENERATION_NOT_CONFIGURED")
     if expected_generation and str(row["writer_generation"])!=expected_generation:
         raise RuntimeError("US_STAGE4_WRITER_GENERATION_MISMATCH")
     at=row.get("evidence_at")
