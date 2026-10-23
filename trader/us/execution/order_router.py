@@ -1873,21 +1873,33 @@ def route_order(
                 from trader.us.db.repos import _us_execution_claim_scope
                 from trader.us.execution.account_authority import AccountExecutionAuthority
                 _account_scope = _us_execution_claim_scope()
-                if os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") != "RESERVATION_ONLY":
+                _mode=os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+                if _mode=="RESERVATION_ONLY":
+                    from trader.us.execution.reservation_reconcile_worker import (
+                        assert_fresh_reservation_worker,
+                    )
+                    assert_fresh_reservation_worker(
+                        trade_date=str(trade_date),
+                        session_run_id=str(
+                            intent.get("session_run_id")
+                            or getattr(context, "session_run_id", "") or ""
+                        ),
+                        env=_account_scope["env"],
+                        account_fingerprint=_account_scope["account_id"],
+                        trading_epoch_id=_account_scope["trading_epoch_id"],
+                    )
+                elif _mode=="WORKER":
+                    # Never trust a stale writer, an earlier execution epoch or
+                    # the wrong broker account at the actual submit boundary.
+                    from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+                    _worker=read_worker_health(env=_account_scope["env"])
+                    if (_worker.get("reconcile_status") not in {"OK","WARN"}
+                            or _worker.get("replay_status") not in {
+                                "OK","RECOVERED","NO_ACTIVE_CLAIMS",
+                            }):
+                        raise RuntimeError("US_STAGE4_RECONCILE_NOT_VERIFIED")
+                else:
                     raise RuntimeError("US_RESERVATION_WORKER_MODE_NOT_ACTIVE")
-                from trader.us.execution.reservation_reconcile_worker import (
-                    assert_fresh_reservation_worker,
-                )
-                assert_fresh_reservation_worker(
-                    trade_date=str(trade_date),
-                    session_run_id=str(
-                        intent.get("session_run_id")
-                        or getattr(context, "session_run_id", "") or ""
-                    ),
-                    env=_account_scope["env"],
-                    account_fingerprint=_account_scope["account_id"],
-                    trading_epoch_id=_account_scope["trading_epoch_id"],
-                )
                 _account_authority = AccountExecutionAuthority(
                     _outbox_engine,
                     env=_account_scope["env"],

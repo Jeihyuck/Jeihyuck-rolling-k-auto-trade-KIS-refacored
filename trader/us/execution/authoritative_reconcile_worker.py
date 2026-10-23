@@ -95,6 +95,17 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     ack=reconcile_ack_orders_with_balance(
         provider=provider,trade_date=trade_date,env="practice",
     )
+    # This writer also owns previously verified account reservation cleanups;
+    # the RESERVATION_ONLY child must not run in WORKER mode.
+    from trader.us.execution.reservation_reconcile_worker import (
+        reconcile_proven_reservations_once,
+    )
+    reservation=reconcile_proven_reservations_once(
+        env="practice",trade_date=trade_date,
+    )
+    if int(reservation.get("unresolved") or 0)>0:
+        logger.warning("[US_STAGE4][RESERVATION_DEFERRED] unresolved=%s",
+                       reservation.get("unresolved"))
     # Failed or partial historical recovery must remain visible as an unsafe
     # observation; an HTTP request returning is not an order terminal proof.
     replay_status=str(replay.get("status") or "ERROR").upper()
@@ -122,7 +133,7 @@ def publish_health(conn: Any, *, scope: dict, generation: str,
         (env,account_fingerprint,trading_epoch_id,writer_generation,worker_state,
          evidence_at,reconcile_status,replay_status,pending_count,
          unresolved_count,filled_rows,updated_at)
-        VALUES (:env,:account,:epoch,:generation,:state,
+        VALUES (:env,:account,:epoch,CAST(:generation AS uuid),:state,
                 CASE WHEN :state='READY' THEN NOW() ELSE NULL END,
                 :reconcile,:replay,:pending,:unresolved,:fills,NOW())
         ON CONFLICT (env,account_fingerprint,trading_epoch_id)
