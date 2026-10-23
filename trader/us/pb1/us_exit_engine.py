@@ -1198,6 +1198,8 @@ def prepare_exit_position_snapshots(
                         soft_stop_pct=float(
                             frozen_risk_cfg.get("soft_stop", os.getenv("US_SOFT_STOP_LOSS_PCT", "0.03"))
                         ),
+                        **({"policy_revision": "PB1_STOP_3_6_V1"}
+                           if pos.get("_verified_pb1_stop_revision") else {}),
                     )
                     pos["risk_state"] = risk_state
                     pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
