@@ -60,7 +60,8 @@ def test_successful_pre_http_callback_is_logged_before_exactly_one_post(monkeypa
     assert sequence == ["FENCE_PASS", "HTTP_AUDIT", "POST"]
 
 
-def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkeypatch):
+@pytest.mark.parametrize("gate_failure", ["expired_tick", "stale_stage4"])
+def test_late_boundary_fences_before_broker_http(monkeypatch, gate_failure):
     from trader.us.execution import order_router, order_journal
     from trader.us.db import repos
 
@@ -75,7 +76,8 @@ def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkey
         def clear_before_order_http(self): self.before_http = None
         def place_us_buy_order(self, *_args):
             # This is after the router's earlier check, just before HTTP.
-            context.deadline = time.monotonic() - 1
+            if gate_failure == "expired_tick":
+                context.deadline = time.monotonic() - 1
             self.before_http()
             self.http_calls += 1
             return {"output": {"ODNO": "NEVER"}}
@@ -87,7 +89,13 @@ def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkey
     )
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("DRY_RUN", "0")
-    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE",
+                       "WORKER" if gate_failure == "stale_stage4" else "LEGACY")
+    if gate_failure == "stale_stage4":
+        from trader.us.execution import authoritative_reconcile_worker as worker
+        def stale_health(**_kwargs):
+            raise RuntimeError("US_STAGE4_WRITER_STALE")
+        monkeypatch.setattr(worker, "read_worker_health", stale_health)
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
     # A real router demands an immutable active epoch and canonical account
@@ -117,7 +125,10 @@ def test_tick_deadline_expiring_during_client_throttle_aborts_before_http(monkey
         "strategy_owner": "US_STANDARD", "position_action": "NEW_POSITION_BUY",
     }, kis_client=client, context=context)
     assert result["status"] == "BROKER_SUBMIT_PRE_IO_FAILED"
-    assert "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP" in result["execution_integrity_error"]
+    expected = ("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP"
+                if gate_failure == "expired_tick"
+                else "US_STAGE4_WRITER_FENCED_BEFORE_HTTP")
+    assert expected in result["execution_integrity_error"]
     assert result["broker_submit"] is False
     assert result["requires_reconcile"] is False
     assert client.http_calls == 0
