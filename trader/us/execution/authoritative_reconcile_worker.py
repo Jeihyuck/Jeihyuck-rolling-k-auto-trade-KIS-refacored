@@ -257,6 +257,12 @@ def publish_health(conn: Any, *, scope: dict, generation: str,
 
 
 def main() -> int:
+    # The runner redirects this subprocess stderr to a mode-0600 WSL log.
+    # Without a handler, INFO readiness and deferred-repair trace is invisible.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     parser=argparse.ArgumentParser()
     parser.add_argument("--trade-date",required=True)
     parser.add_argument("--session-run-id",required=True)
