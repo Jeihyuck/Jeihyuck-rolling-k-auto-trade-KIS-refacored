@@ -341,13 +341,15 @@ def request_protective_tp_cancel(
                 continue
             order = orders[0]
             expected_account = account_by_symbol.get(symbol) or ""
-            if expected_account and str(order.get("claim_account_id") or "") != expected_account:
-                # A stop-debt worker supplies an exact account identity, but
-                # local US order meta has no authoritative account column.
-                # Verify against the epoch/lifecycle execution claim instead.
-                results.append({"symbol":symbol, "status":"FENCED",
-                                "reason":"account_identity_unverified"})
-                continue
+            if expected_account:
+                # Claim account_id is SHA256 of the canonical raw account key.
+                # Lifecycle risk-state identity remains the unhashed key.
+                import hashlib
+                claim_id = hashlib.sha256(expected_account.encode("utf-8")).hexdigest()
+                if str(order.get("claim_account_id") or "") != claim_id:
+                    results.append({"symbol":symbol, "status":"FENCED",
+                                    "reason":"account_identity_unverified"})
+                    continue
             stale_classification = classify_stale_tp_conflict(
                 order, current_trade_date=trade_date,
             )
