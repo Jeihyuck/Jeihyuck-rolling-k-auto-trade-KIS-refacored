@@ -60,7 +60,10 @@ def recover_stop_tp_conflicts_once(*, provider: Any,trade_date: str,
         intents=selected,provider=provider,
         kis_client=provider._get_client() if cancel_authorized else _NoOrderSubmit(),
         trade_date=trade_date,env="practice",
-        **({} if cancel_authorized else {"reserve":lambda order:False}),
+        **({} if cancel_authorized else {
+            "reserve":lambda order:False,
+            "read_only_terminal_reconcile":True,
+        }),
     )
     return {"checked":len(selected),"total":len(candidates),
             "cancel_authorized":cancel_authorized,
@@ -197,6 +200,13 @@ def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
     persisted Fill/ACK evidence. A slow deferred phase can still expire
     the ready heartbeat, which safely fences later orders until refreshed.
     """
+    # A zero-debt session must not repeatedly fetch the entire KIS balance
+    # or scan historical TP dates on the writer's critical reconciliation
+    # cadence. An actual stop signal persists a debt before suppression.
+    from trader.us.protective_stop_obligation import load_pending_stop_obligations
+    if not load_pending_stop_obligations(env="practice"):
+        return {"tp":{"checked":0,"total":0,"cancel_authorized":False},
+                "settlement":{"checked":0,"settled":0,"blocked":0,"total_pending":0}}
     tp=recover_stop_tp_conflicts_once(provider=provider,trade_date=trade_date)
     from trader.us.execution.protective_stop_settlement_worker import (
         settle_verified_stop_debts_once,
@@ -234,7 +244,7 @@ def publish_health(conn: Any, *, scope: dict, generation: str,
           "state":state,"reconcile":result.get("reconcile_status","ERROR"),
           "replay":result.get("replay_status","ERROR"),
           "pending":int(result.get("pending_count") or 0),
-          "unresolved":int(result.get("unresolved_count") or 1),
+          "unresolved":int(result["unresolved_count"]) if "unresolved_count" in result else 1,
           "fills":int(result.get("filled_rows") or 0)})
 
 
