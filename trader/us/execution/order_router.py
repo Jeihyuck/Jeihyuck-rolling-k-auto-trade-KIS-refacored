@@ -2144,6 +2144,10 @@ def route_order(
             raise KisUSPreSubmitError(
                 f"CLAIM_OBSERVATION_FAILED_BEFORE_HTTP: {observation_error}"
             )
+        # SUBMITTED persistence is DB I/O: a watchdog may expire during it.
+        # Fail closed after persistence as well as before it.
+        if context is not None and not context.broker_submit_allowed():
+            raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
