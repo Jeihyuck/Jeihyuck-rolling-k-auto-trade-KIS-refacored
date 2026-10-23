@@ -42,3 +42,28 @@ The logs explicitly show `US_STAGE123_PAPER_PROFILE=ON`, `US_RECONCILE_WORKER_MO
 5. Repeatable before/after monotonic trace to **native KIS HTTP**: p95 <=10s (N>=20 distinct SELLs), whole tick p95 <=60s (N>=20 comparable ticks). Count blocked/no-HTTP outcomes separately.
 
 This baseline file is not a PASS claim for any architecture/latency milestone.
+
+
+## Broker HTTP boundary sample audit (AM/Afternoon 2026-10-22)
+
+The archive also contains the **actual native HTTP boundary**, as logged
+by `order_router._mark_broker_submit_boundary()` before entering the KIS
+order API. Only the two ADM observations have an exact selected-signal ID:
+
+| Symbol | Selected signal to native HTTP (ms) | Tick start to native HTTP (ms) |
+|---|---:|---:|
+| ADM | 43,950.93 | 176,790.94 |
+| ADM | 41,690.31 | 174,398.77 |
+
+Additional `TICK_TO_BROKER_BOUNDARY` observations without a selected
+signal identity: AMGN **144,702.37 ms** and GILD **144,514.28 ms**.
+Do **not** treat those as complete signal-to-HTTP samples.
+
+There are **two** selected-intent signal-to-HTTP events in this archive,
+for a single symbol, and **four** tick-to-HTTP events. This does not meet
+the required **20 distinct protective SELL orders** and therefore does
+not establish a valid p95 protective SELL pass/fail for the new code.
+Both two exact observations exceed the ten-second **target** and show
+the baseline bottleneck remains material.
+
+None of these measurements were collected after the PR #250 fixes.
