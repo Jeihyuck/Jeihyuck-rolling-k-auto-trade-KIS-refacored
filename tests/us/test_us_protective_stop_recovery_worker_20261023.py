@@ -64,7 +64,7 @@ def test_account_mismatch_between_stop_debt_and_broker_order_claim_retains_fence
         "id":"order-id", "symbol":"AMD","trade_date":"2026-10-06",
         "side":"SELL","order_no":"0000035281","qty_requested":1,
         "qty_filled":0,"client_order_key":"old-tp",
-        "claim_state":"IN_FLIGHT","claim_account_id":"practice-b",
+        "claim_state":"IN_FLIGHT","claim_account_id":"wrong-account-hash",
         "meta":{"strategy_owner":"US_STANDARD",
                 "position_lifecycle_id":"amd-life","profit_capture_stage":"tp1"},
     }
@@ -77,3 +77,37 @@ def test_account_mismatch_between_stop_debt_and_broker_order_claim_retains_fence
         find_open=lambda *a,**kw:[order],
     )
     assert result==[{"symbol":"AMD","status":"FENCED","reason":"account_identity_unverified"}]
+
+
+def test_hashed_claim_account_matches_raw_lifecycle_identity(monkeypatch):
+    import hashlib
+    from trader.us.protective_tp_recovery import request_protective_tp_cancel
+    monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED","1")
+    intents=recovery_candidates([
+        {"symbol":"AMD","account_id":"practice-a","lifecycle_id":"amd-life","severity":3}
+    ])
+    order={
+        "id":"order-id","symbol":"AMD","trade_date":"2026-10-06",
+        "side":"SELL","order_no":"0000035281","qty_requested":1,
+        "qty_filled":0,"client_order_key":"old-tp",
+        "claim_state":"IN_FLIGHT",
+        "claim_account_id":hashlib.sha256(b"practice-a").hexdigest(),
+        "meta":{"strategy_owner":"US_STANDARD",
+                "position_lifecycle_id":"amd-life","profit_capture_stage":"tp1"},
+    }
+    class Provider:
+        def get_fills_by_order_no(self,**kwargs):
+            return {"order_no":"35281","status":"OPEN","requested_qty":1,
+                    "filled_qty":0,"remaining_qty":1,"filled_qty_present":True,
+                    "normalization_result":"normalized"}
+    class NoCancel:
+        def __getattr__(self,_):
+            raise AssertionError("Historical OPEN is not current cancel proof")
+    results=request_protective_tp_cancel(
+        intents=intents,provider=Provider(),kis_client=NoCancel(),
+        trade_date="2026-10-22",env="practice",
+        find_open=lambda *args,**kwargs:[order],
+    )
+    assert len(results)==1
+    assert results[0]["reason"]!="account_identity_unverified"
+    assert results[0]["status"]=="FENCED"
