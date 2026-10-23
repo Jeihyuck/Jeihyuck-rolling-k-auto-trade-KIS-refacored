@@ -2,8 +2,9 @@ def test_soft_stop_repeat_is_blocked_for_general_pb1():
     from trader.us.pb1.us_exit_engine import soft_stop_repeat_allowed
 
     allowed, reason = soft_stop_repeat_allowed({
-        "symbol": "TEST", "entry_price": 100.0, "current_price": 94.0,
-        "soft_stop_triggered_today": True, "first_soft_stop_price": 94.0,
+        # A new PB1 soft-stop is -3%, while 94.0 is already a -6% hard stop.
+        "symbol": "TEST", "entry_price": 100.0, "current_price": 96.0,
+        "soft_stop_triggered_today": True, "first_soft_stop_price": 96.0,
     })
 
     assert allowed is False
@@ -140,6 +141,10 @@ def test_oct5_confirmed_persistent_soft_stop_full_exit_survives_general_repeat_g
 
     from trader.us.pb1 import us_exit_engine
 
+    # This is a replay of Oct-05 legacy PB1 events. Their frozen contract
+    # predates the approved 3/6 revision and used soft 5% / hard 8%.
+    monkeypatch.setenv("US_SOFT_STOP_LOSS_PCT", "0.05")
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
     monkeypatch.setattr(
         us_exit_engine,
         "should_skip_exit_due_to_pending_sell",

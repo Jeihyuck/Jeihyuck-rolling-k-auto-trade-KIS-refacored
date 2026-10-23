@@ -125,6 +125,10 @@ def test_us_profit_capture_uses_frozen_buy_contract_after_env_change(monkeypatch
 
 
 def test_us_soft_stop_sell_ratio_is_frozen_at_buy(monkeypatch):
+    # Explicitly simulate a legacy 5/8 contract; 94.0 is a hard stop
+    # with new-policy 3/6 defaults and cannot test the frozen soft ratio.
+    monkeypatch.setenv("US_SOFT_STOP_LOSS_PCT", "0.05")
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
     monkeypatch.setenv("US_SOFT_STOP_SELL_RATIO", "0.40")
     contract = _contract()
     monkeypatch.setenv("US_SOFT_STOP_SELL_RATIO", "0.90")
@@ -670,6 +674,7 @@ def test_us_corrupted_day_contract_still_honors_day_hard_stop(monkeypatch):
 def test_us_soft_stop_confirmation_ticks_are_frozen_at_buy(monkeypatch):
     monkeypatch.setenv("US_SOFT_STOP_CONFIRM_TICKS", "5")
     monkeypatch.setenv("US_SOFT_STOP_LOSS_PCT", "0.05")
+    monkeypatch.setenv("US_HARD_STOP_PCT", "0.08")
     contract = _contract()
     monkeypatch.setenv("US_SOFT_STOP_CONFIRM_TICKS", "1")
 
