@@ -218,7 +218,16 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
 
 def contract_exit_config(position: dict) -> dict:
     contract = extract_us_entry_exit_contract(position, _dict(position).get("meta"))
-    return dict((contract.get("management") or {}).get("swing") or {}) if contract else {}
+    cfg = dict((contract.get("management") or {}).get("swing") or {}) if contract else {}
+    if not cfg:
+        return cfg
+    # Only the explicitly DB-verified, account/lifecycle/SHA-matched revision
+    # overrides the immutable buy-time stop thresholds; TP/trailing unchanged.
+    from trader.us.stop_policy_revision import validated_revision
+    approved = validated_revision(position)
+    if approved:
+        cfg.update(approved)
+    return cfg
 
 
 def contract_day_config(position: dict) -> dict:

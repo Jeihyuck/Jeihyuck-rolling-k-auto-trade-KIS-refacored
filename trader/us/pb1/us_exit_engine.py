@@ -1013,6 +1013,10 @@ def prepare_exit_position_snapshots(
     from trader.us.symbols import normalize_us_exchange
     from concurrent.futures import ThreadPoolExecutor
 
+    # Exactly one scoped DB read for approved existing-position revisions.
+    # Never change or re-sign original entry/exit contracts.
+    from trader.us.stop_policy_revision import attach_approved_revisions
+    positions = attach_approved_revisions(positions)
     snapshots: list[dict] = []
     # Quote IO can overlap only when the injected provider explicitly
     # guarantees safe concurrent read calls. Risk/HWM writes and selected SELL
