@@ -2228,8 +2228,8 @@ def route_order(
                 "owner=%s exit_type=%s order_key=%s",
                 symbol_upper, intent["submit_attempt_id"], _signal_id or "UNOBSERVED",
                 _delay_ms,
-                str(intent.get("strategy_owner") or (intent.get("meta") or {}).get("strategy_owner") or "UNKNOWN"),
-                str(intent.get("exit_type") or (intent.get("meta") or {}).get("exit_type") or "UNKNOWN"),
+                str(intent.get("strategy_owner") or lifecycle_meta.get("strategy_owner") or "UNKNOWN"),
+                str(intent.get("exit_type") or lifecycle_meta.get("exit_type") or "UNKNOWN"),
                 str(order_key or "UNKNOWN"),
             )
             _metrics = getattr(context, "metrics", None)
