@@ -60,7 +60,7 @@ def validated_revision(position: dict) -> dict:
     return {"soft_stop": soft, "hard_stop": hard}
 
 
-def load_approved_revisions(positions: list[dict], *, env: str | None = None) -> dict[tuple[str, str], dict]:
+def load_approved_revisions(positions: list[dict], *, env: str | None = None) -> dict[tuple[str, str, str], dict]:
     """One batch read; missing migration or uncertain scope never authorizes override."""
     from trader.us.entry_exit_contract import extract_us_entry_exit_contract
     from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
@@ -103,8 +103,8 @@ def load_approved_revisions(positions: list[dict], *, env: str | None = None) ->
     for row in rows:
         item = dict(row)
         key = (str(item["symbol"]).upper(),str(item["lifecycle_id"]),str(item["account_id"]))
-        if key in scopes and item.get("source_contract_sha256")==scopes[key] and (key[0],key[1]) not in results:
-            results[(key[0],key[1])] = {**item,"_db_verified":True}
+        if key in scopes and item.get("source_contract_sha256")==scopes[key] and key not in results:
+            results[key] = {**item,"_db_verified":True}
     return results
 
 
@@ -127,7 +127,7 @@ def attach_approved_revisions(positions: list[dict], *, env: str | None = None) 
     for item in positions:
         pos = dict(item)
         symbol, life, account = scope_for_position(pos)
-        rev = approved.get((symbol,life))
+        rev = approved.get((symbol,life,account))
         if rev and str(rev.get("account_id")) == account:
             pos["_verified_pb1_stop_revision"] = rev
         output.append(pos)

@@ -156,6 +156,10 @@ def replay_confirmed_protective_intents(
     for debt in pending:
         if int(debt.get("severity") or 0) < 2:
             continue  # Only confirmed full-exit debt is eligible for replay.
+        if str(debt.get("obligation_state") or "").upper() not in {
+            "PENDING","BLOCKED","RECONCILE_REQUIRED","SUBMITTED","PARTIAL","ESCALATED",
+        }:
+            continue  # Never re-submit a satisfied/invalid lifecycle.
         symbol = str(debt.get("symbol") or "").upper()
         if symbol in existing_symbols:
             continue
@@ -228,6 +232,8 @@ def validate_terminal_broker_proof(debt: dict, proof: dict) -> bool:
     if balance_qty!=0 or open_sell_qty!=0:
         return False
     if not str(proof.get("broker_evidence_ref") or "").strip():
+        return False
+    if isinstance(proof.get("broker_holding_qty"), bool) or isinstance(proof.get("broker_open_sell_qty"), bool):
         return False
     observed=proof.get("observed_at")
     try:

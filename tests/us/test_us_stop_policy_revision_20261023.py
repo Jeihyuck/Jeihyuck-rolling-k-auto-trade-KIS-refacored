@@ -79,7 +79,7 @@ def test_revision_batch_attachment_is_non_mutating_and_scoped(monkeypatch):
     p = _position(contract)
     monkeypatch.setattr(
         "trader.us.stop_policy_revision.load_approved_revisions",
-        lambda positions, **kwargs: {("AMD","amd-life"):_revision(contract)},
+        lambda positions, **kwargs: {("AMD","amd-life","practice-account"):_revision(contract)},
     )
     result = attach_approved_revisions([p])
     assert "_verified_pb1_stop_revision" not in p
