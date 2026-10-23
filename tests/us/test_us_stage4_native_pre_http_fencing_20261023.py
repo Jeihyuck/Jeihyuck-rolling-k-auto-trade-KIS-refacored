@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from trader.us.execution.kis_us_client import KisUSClient, KisUSPreSubmitError
 from trader.us.execution.tick_context import TickExecutionContext
@@ -15,13 +16,16 @@ from trader.us.execution.tick_context import TickExecutionContext
 
 def test_pre_http_rejection_is_not_counted_as_a_kis_http_attempt(monkeypatch):
     from trader.us.execution import kis_us_client as kis
+    monkeypatch.setenv("KIS_HTTP_BLOCK", "0")
+    monkeypatch.setenv("OFFLINE_MODE", "0")
+    monkeypatch.setenv("US_OFFLINE_MODE", "0")
     client = KisUSClient(offline=False)
     client._apply_rate_limit = lambda _path: None
     client._request_budget = lambda: 10.0
     order = []
     monkeypatch.setattr(kis, "record_kis_http_call",
                         lambda *_a, **_kw: order.append("HTTP_AUDIT"))
-    monkeypatch.setattr(kis.requests, "post",
+    monkeypatch.setattr(requests, "post",
                         lambda *_a, **_kw: order.append("POST") or
                         pytest.fail("real HTTP must never be invoked"))
     def reject():
@@ -36,6 +40,9 @@ def test_pre_http_rejection_is_not_counted_as_a_kis_http_attempt(monkeypatch):
 
 def test_successful_pre_http_callback_is_logged_before_exactly_one_post(monkeypatch):
     from trader.us.execution import kis_us_client as kis
+    monkeypatch.setenv("KIS_HTTP_BLOCK", "0")
+    monkeypatch.setenv("OFFLINE_MODE", "0")
+    monkeypatch.setenv("US_OFFLINE_MODE", "0")
     client = KisUSClient(offline=False)
     client._apply_rate_limit = lambda _path: None
     client._request_budget = lambda: 10.0
@@ -45,7 +52,7 @@ def test_successful_pre_http_callback_is_logged_before_exactly_one_post(monkeypa
     class Response:
         def raise_for_status(self): pass
         def json(self): return {"rt_cd": "0", "output": {"ODNO": "TEST-ONLY"}}
-    monkeypatch.setattr(kis.requests, "post",
+    monkeypatch.setattr(requests, "post",
                         lambda *_a, **_kw: sequence.append("POST") or Response())
     client.set_before_order_http(lambda: sequence.append("FENCE_PASS"))
     response = client._post("/uapi/overseas-stock/v1/trading/order", {}, {})
