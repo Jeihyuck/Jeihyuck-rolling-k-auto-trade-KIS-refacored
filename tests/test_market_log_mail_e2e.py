@@ -386,12 +386,12 @@ def test_us_stage4_worker_log_is_archived_with_redaction(tmp_path):
     worker_rel = f"runtime/logs/us-stage4-worker-{DATE}-test-afternoon.log"
     session = root / f"runtime/logs/us/{DATE}/afternoon/attempt-1.log"
     session.write_text(
-        f"[US_STAGE4][CHILD_LOG] path={worker_rel}\\n", encoding="utf-8",
+        f"[US_STAGE4][CHILD_LOG] path={worker_rel}\n", encoding="utf-8",
     )
     worker = root / worker_rel
     worker.parent.mkdir(parents=True, exist_ok=True)
     worker.write_text(
-        "US_STAGE4_RECONCILE_FAILURE KIS_APP_SECRET=never-mail-this\\n",
+        "US_STAGE4_RECONCILE_FAILURE KIS_APP_SECRET=never-mail-this\n",
         encoding="utf-8",
     )
     result, archive = run_mail(root, "us")
@@ -411,7 +411,7 @@ def test_us_missing_stage4_worker_log_is_reported_as_degraded(tmp_path):
     worker_rel = f"runtime/logs/us-stage4-worker-{DATE}-missing.log"
     session = root / f"runtime/logs/us/{DATE}/afternoon/attempt-1.log"
     session.write_text(
-        f"[US_STAGE4][CHILD_LOG] path={worker_rel}\\n", encoding="utf-8",
+        f"[US_STAGE4][CHILD_LOG] path={worker_rel}\n", encoding="utf-8",
     )
     result, archive = run_mail(root, "us")
     assert result.returncode == 0, result.stdout + result.stderr
