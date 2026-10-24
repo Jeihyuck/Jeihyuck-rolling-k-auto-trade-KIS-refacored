@@ -296,6 +296,16 @@ def main() -> int:
         if not granted:
             raise RuntimeError("US_STAGE4_DUPLICATE_WRITER")
         try:
+            # Publish a non-authorizing startup marker before KIS provider
+            # initialization or historical broker reads. Previously a child
+            # failing before its first successful reconcile left *zero* DB
+            # health rows, as observed on 2026-10-23. STARTING can never
+            # satisfy read_worker_health() or authorize a broker HTTP call.
+            with engine.begin() as conn:
+                publish_health(
+                    conn, scope=scope, generation=generation, state="STARTING",
+                )
+            logger.info("[US_STAGE4][WORKER_STARTING] generation=%s", generation)
             provider=USDataProvider(offline=False,env="practice")
             while not _STOP:
                 started=time.monotonic()
