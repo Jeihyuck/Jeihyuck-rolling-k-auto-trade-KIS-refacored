@@ -64,6 +64,7 @@ def test_stage4_waits_for_real_ready_evidence_before_first_tick():
 
 
 @pytest.mark.parametrize("status", [
+    {"worker_state": "STARTING", "reconcile_status": "OK", "replay_status": "OK"},
     {"worker_state": "FAILED", "reconcile_status": "OK", "replay_status": "OK"},
     {"worker_state": "READY", "reconcile_status": "ERROR", "replay_status": "OK"},
     {"worker_state": "READY", "reconcile_status": "OK", "replay_status": "ERROR"},
@@ -180,3 +181,14 @@ def test_close_claim_health_is_scoped_to_new_account_and_epoch(monkeypatch):
         "execution_claim_conflicts": 0,
     }
     assert captured == [scope]
+
+
+def test_authoritative_worker_publishes_non_authorizing_starting_before_kis():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "trader/us/execution/authoritative_reconcile_worker.py"
+    ).read_text(encoding="utf-8")
+    start = source.index('generation=generation, state="STARTING"')
+    provider = source.index('provider=USDataProvider(offline=False,env="practice")', start)
+    assert start < provider
+    assert 'str(row["worker_state"])!="READY"' in source
