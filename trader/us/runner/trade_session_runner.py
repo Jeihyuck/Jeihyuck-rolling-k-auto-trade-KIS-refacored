@@ -31,6 +31,54 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def wait_for_stage4_startup(
+    *, child, env: str, timeout_sec: float = 75.0,
+    poll_interval_sec: float = 1.0, read_health=None,
+    monotonic=None, sleep=None,
+) -> tuple[bool, str]:
+    """Bounded, read-only WORKER handoff before the first trading Tick.
+
+    Never fall back to LEGACY or submit an order to make the writer ready.
+    The Tick/router still revalidate the health and generation at every
+    protected broker-HTTP boundary after this initial handoff.
+    """
+    from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+
+    reader = read_health or read_worker_health
+    clock = monotonic or time_mod.monotonic
+    pause = sleep or time_mod.sleep
+    budget = max(0.0, min(120.0, float(timeout_sec)))
+    interval = max(0.01, float(poll_interval_sec))
+    deadline = clock() + budget
+    last_error = "US_STAGE4_WRITER_NOT_READY"
+    allowed_replay = {
+        "OK", "RECOVERED", "NO_ACTIVE_CLAIMS",
+        "WARN", "PARTIAL", "UNRESOLVED",
+    }
+    while True:
+        if child is None or child.poll() is not None:
+            return False, "US_STAGE4_WORKER_PROCESS_EXITED"
+        try:
+            health = reader(
+                env=env,
+                max_age_seconds=float(os.getenv("US_STAGE4_HEALTH_MAX_AGE_SEC", "30")),
+            )
+            if (
+                health.get("worker_state") == "READY"
+                and health.get("reconcile_status") in {"OK", "WARN"}
+                and health.get("replay_status") in allowed_replay
+            ):
+                return True, "READY"
+            last_error = "US_STAGE4_RECONCILIATION_UNVERIFIED"
+        except Exception as exc:
+            # Only diagnostic codes from the health reader, never credentials.
+            last_error = str(exc).splitlines()[0][:120] or type(exc).__name__
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False, "US_STAGE4_STARTUP_TIMEOUT:" + last_error
+        pause(min(interval, remaining))
+
+
 def _order_identities(row: dict) -> tuple[str, str, str]:
     meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
     return (
@@ -1448,8 +1496,32 @@ def run_trade_session(
                  else "KIS_READ_DB_WRITE_NO_ORDER" if _reconcile_mode == "WORKER"
                  else "READ_ONLY"),
             )
+        _stage4_startup_checked = False
         try:
             while True:
+                if _reconcile_mode == "WORKER" and not _stage4_startup_checked:
+                    _stage4_startup_at = time_mod.monotonic()
+                    _stage4_ready, _stage4_reason = wait_for_stage4_startup(
+                        child=_shadow_reconcile_child,
+                        env=env,
+                        timeout_sec=float(os.getenv("US_STAGE4_STARTUP_WAIT_SEC", "75")),
+                    )
+                    if not _stage4_ready:
+                        final_status = "FAILED"
+                        final_reason = "stage4_worker_startup_unverified"
+                        root_cause = _stage4_reason
+                        logger.error(
+                            "[US_STAGE4][STARTUP_BLOCK] reason=%s elapsed_sec=%.2f "
+                            "action=NO_TICK_NO_ORDER",
+                            _stage4_reason, time_mod.monotonic() - _stage4_startup_at,
+                        )
+                        break
+                    _stage4_startup_checked = True
+                    logger.info(
+                        "[US_STAGE4][STARTUP_READY] elapsed_sec=%.2f "
+                        "action=FIRST_TICK_ALLOWED_WITH_CONTINUOUS_FENCING",
+                        time_mod.monotonic() - _stage4_startup_at,
+                    )
                 if (_shadow_reconcile_child is not None
                         and _shadow_reconcile_child.poll() is not None):
                     logger.error(
