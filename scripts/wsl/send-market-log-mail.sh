@@ -332,6 +332,25 @@ fi
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
+# Stage4 WORKER logs are written outside runtime/logs/us/<date>/ by the
+# session runner. The Oct 23 archive omitted the child traceback entirely,
+# preventing diagnosis of an unready authoritative writer. Only collect
+# exact same-day paths emitted by our session runner; the existing archive
+# redactor scrubs these logs before mail delivery. Missing referenced logs
+# degrade evidence, but never suppress delivery or alter trading authority.
+if [[ "$MARKET" == us ]]; then
+  while IFS= read -r worker_path; do
+    [[ "$worker_path" == "runtime/logs/us-stage4-worker-${TRADE_DATE}-"* &&
+       "$worker_path" == *.log &&
+       "$worker_path" != *"/../"* ]] || continue
+    collect_path US_STAGE4_WORKER_LOG_MISSING "$worker_path"
+  done < <(
+    grep -h -oE 'path=runtime/logs/us-stage4-worker-[A-Za-z0-9._-]+\\.log' \
+      "$LOG_ROOT"/am/*.log "$LOG_ROOT"/afternoon/*.log 2>/dev/null \
+      | sed 's/^path=//' | sort -u
+  )
+fi
+
 MISSING_COUNT="$(wc -l < "$MISSING_LIST" | tr -d ' ')"
 INCLUDED_COUNT="$(wc -l < "$INCLUDED_LIST" | tr -d ' ')"
 EXPECTED_COUNT="$(wc -l < "$EXPECTED_LIST" | tr -d ' ')"
