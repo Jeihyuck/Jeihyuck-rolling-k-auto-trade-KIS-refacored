@@ -212,6 +212,16 @@ def _normalize_warning_counts(raw: dict[str, Any] | None) -> dict[str, int]:
     return counts
 
 
+def _count_kr_tick_attempt(session_metrics: dict[str, int]) -> None:
+    """Count a tick at entry, not only after run_once returns successfully.
+
+    A TickTimeoutError still consumes a full KR tick deadline and belongs in
+    ticks_total and whole-tick latency p95. The old post-return increment
+    silently dropped every recoverable watchdog timeout from session.json.
+    """
+    session_metrics["ticks_total"] = int(session_metrics.get("ticks_total", 0)) + 1
+
+
 def _merge_warning_counts(base: dict[str, int], incoming: dict[str, Any] | None) -> dict[str, int]:
     merged = dict(base)
     for key, value in _normalize_warning_counts(incoming).items():
@@ -8175,6 +8185,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         sell_orders = 0
         session_metrics: dict[str, int] = {
             "ticks_total": 0,
+            "ticks_completed": 0,
             "buy_orders": 0,
             "buy_orders_ack": 0,
             "sell_orders": 0,
@@ -8288,6 +8299,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             try:
                 tick_index += 1
                 ticks_total += 1
+                _count_kr_tick_attempt(session_metrics)
                 os.environ["PB1_LOOP_TICK_INDEX"] = str(tick_index)
                 logger.info(
                     "[PB1][TICK][CALL_RUN_ONCE] kind=%s now=%s session_end=%s",
@@ -8338,7 +8350,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     clear_kr_tick_deadline()
                     os.environ.pop("KR_TICK_ORIGIN_MONOTONIC", None)
                 last_tick_metrics = dict(metrics or {})
-                session_metrics["ticks_total"] += 1
+                session_metrics["ticks_completed"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
                 session_metrics["sell_orders"] += int(last_tick_metrics.get("sell_orders", 0) or 0)
                 tick_buy_ack = int(last_tick_metrics.get("buy_orders_ack", last_tick_metrics.get("accepted", 0)) or 0)
@@ -8718,6 +8730,16 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "status": status_for_marker,
             "exit_reason": exit_reason,
             "ticks_total": int(session_metrics.get("ticks_total", ticks_total) or 0),
+            "ticks_completed": int(session_metrics.get("ticks_completed", 0) or 0),
+            "ticks_degraded": int(ticks_degraded),
+            "ticks_fatal": int(ticks_fatal),
+            "ticks_timeout": int(session_warning_counts.get("timeout_count", 0)),
+            "warning_counts": dict(session_warning_counts),
+            "terminal_state": _resolve_session_terminal_state(
+                result_status=status_for_marker,
+                exit_reason=exit_reason,
+                warning_counts=session_warning_counts,
+            ),
             "sell_orders_ack": int(session_metrics.get("sell_orders_ack", sell_orders) or 0),
             "sell_orders": int(session_metrics.get("sell_orders", sell_orders) or 0),
             "buy_orders": int(session_metrics.get("buy_orders", buy_orders) or 0),

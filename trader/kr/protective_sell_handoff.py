@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import math
+import logging
 from typing import Any
 
 import sqlalchemy as sa
@@ -23,6 +24,8 @@ from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
 from trader.reconcile_kis import _normalize_code, _parse_side, _parse_date_time
 from trader.time_utils import now_kst
 
+logger = logging.getLogger(__name__)
+
 
 def prove_safe_protective_sell_handoff(
     *, engine: Any, kis: Any, env: str, strategy: str,
@@ -34,9 +37,20 @@ def prove_safe_protective_sell_handoff(
     if not isinstance(balance_snapshot, dict):
         return False, "NO_BROKER_BALANCE"
     try:
-        seen_at = datetime.fromisoformat(str(balance_snapshot.get("_kr_verified_fresh_at_kst") or ""))
+        # In the Oct23 practice logs the prior generic ValueError hid which
+        # proof input was malformed. A missing/invalid freshness mark is an
+        # *unproven* balance, not a valid shortcut authorization.
+        verified_mark = str(balance_snapshot.get("_kr_verified_fresh_at_kst") or "").strip()
+        if not verified_mark:
+            return False, "KIS_BALANCE_FRESHNESS_NOT_PROVEN"
+        try:
+            seen_at = datetime.fromisoformat(verified_mark)
+        except ValueError:
+            return False, "KIS_BALANCE_FRESHNESS_MALFORMED"
+        if seen_at.tzinfo is None:
+            return False, "KIS_BALANCE_FRESHNESS_UNZONED"
         age = (now_kst() - seen_at).total_seconds()
-        if not seen_at.tzinfo or not 0 <= age <= 20:
+        if not 0 <= age <= 20:
             return False, "STALE_KIS_BALANCE"
         if not isinstance(balance_snapshot.get("output1"), list):
             return False, "INVALID_KIS_HOLDINGS"
@@ -81,7 +95,11 @@ def prove_safe_protective_sell_handoff(
                 no = str(row.get("odno") or row.get("ODNO") or "").strip()
                 if not code or code == "000000" or side not in {"BUY", "SELL"} or not no:
                     return False, "KIS_ORDER_IDENTITY_MISSING"
-                if _parse_date_time(row).date() != trade_date:
+                try:
+                    parsed_broker_date = _parse_date_time(row).date()
+                except (TypeError, ValueError):
+                    return False, "KIS_ORDER_DATE_EVIDENCE_INVALID"
+                if parsed_broker_date != trade_date:
                     return False, "KIS_ORDER_DATE_MISMATCH"
                 key = (code, side, no)
                 if key in broker_rows:
@@ -118,31 +136,65 @@ def prove_safe_protective_sell_handoff(
                 db_by_key[key] = order
             if set(db_by_key) != set(broker_rows):
                 return False, "BROKER_DURABLE_ORDER_SET_MISMATCH"
+            # Fetch economic fills in ONE account-scoped batch. Previously
+            # each broker row caused a separate DB roundtrip on the protective
+            # SELL proof hot path. Do not weaken per-order exact-quantity
+            # comparison: retain sum by durable order_id.
+            fills_qty_by_order: dict[str, int] = {}
+            if stored:
+                stored_order_ids = [order["order_id"] for order in stored]
+                fill_rows = conn.execute(sa.select(
+                    schema.fills.c.order_id, schema.fills.c.qty,
+                ).where(sa.and_(
+                    schema.fills.c.env == env,
+                    schema.fills.c.order_id.in_(stored_order_ids),
+                ))).all()
+                for order_id, fill_qty in fill_rows:
+                    key_id = str(order_id)
+                    fills_qty_by_order[key_id] = (
+                        fills_qty_by_order.get(key_id, 0) + int(fill_qty or 0)
+                    )
             for key, broker_row in broker_rows.items():
                 source = db_by_key[key]
                 requested = int(source.get("qty") or 0)
-                observed = int(float(broker_row.get("tot_ccld_qty") or 0))
-                order_req = int(float(broker_row.get("ord_qty") or requested))
+                try:
+                    observed = int(float(broker_row.get("tot_ccld_qty") or 0))
+                    order_req = int(float(broker_row.get("ord_qty") or requested))
+                except (TypeError, ValueError, OverflowError):
+                    return False, "KIS_ORDER_QUANTITY_EVIDENCE_INVALID"
                 if requested <= 0 or order_req != requested or observed < 0 or observed > requested:
                     return False, "BROKER_ORDER_QUANTITY_CONFLICT"
                 response = source.get("response_json") or {}
                 if not isinstance(response, dict):
                     return False, "DURABLE_ORDER_RESPONSE_MALFORMED"
                 confirmed = response.get("confirmed_fill_qty")
-                if confirmed is None or int(confirmed) != observed:
+                try:
+                    confirmed_qty = int(confirmed) if confirmed is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    confirmed_qty = None
+                if confirmed_qty is None or confirmed_qty != observed:
                     return False, "ORDER_CUMULATIVE_WATERMARK_UNPROVEN"
-                fills = conn.execute(sa.select(schema.fills).where(
-                    schema.fills.c.order_id == source["order_id"]
-                )).mappings().all()
-                if sum(int(item.get("qty") or 0) for item in fills) != observed:
+                if fills_qty_by_order.get(str(source["order_id"]), 0) != observed:
                     return False, "ECONOMIC_FILL_QUANTITY_DRIFT"
                 if observed:
-                    broker_amt = float(broker_row.get("tot_ccld_amt") or 0)
-                    durable_amt = float(response.get("confirmed_fill_notional") or 0)
+                    try:
+                        broker_amt = float(broker_row.get("tot_ccld_amt") or 0)
+                        durable_amt = float(response.get("confirmed_fill_notional") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        return False, "BROKER_PRICE_EVIDENCE_INVALID"
                     if not math.isfinite(broker_amt) or broker_amt <= 0 or not math.isfinite(durable_amt):
                         return False, "BROKER_PRICE_EVIDENCE_UNPROVEN"
                     if abs(broker_amt - durable_amt) > 0.01:
                         return False, "ECONOMIC_NOTIONAL_WATERMARK_DRIFT"
         return True, "EXACT_BROKER_LEDGER_PRETRADE_PROOF"
     except Exception as exc:
+        # The previous type-only result hid the actual Oct23 ValueError site.
+        # Keep fail-closed FULL_PRE_EXIT_RECONCILE while retaining the traceback
+        # for a precise fix; never treat proof exceptions as authorization.
+        logger.warning(
+            "[KR_RECONCILE_LANES][PROOF_READ_FAILED] exception_type=%s "
+            "action=FULL_PRE_EXIT_RECONCILE",
+            type(exc).__name__,
+            exc_info=True,
+        )
         return False, f"PROOF_READ_FAILED_{type(exc).__name__}"
