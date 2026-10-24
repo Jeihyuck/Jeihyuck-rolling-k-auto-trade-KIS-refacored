@@ -345,7 +345,7 @@ if [[ "$MARKET" == us ]]; then
        "$worker_path" != *"/../"* ]] || continue
     collect_path US_STAGE4_WORKER_LOG_MISSING "$worker_path"
   done < <(
-    grep -h -oE 'path=runtime/logs/us-stage4-worker-[A-Za-z0-9._-]+\\.log' \
+    grep -h -oE 'path=runtime/logs/us-stage4-worker-[A-Za-z0-9._-]+\.log' \
       "$LOG_ROOT"/am/*.log "$LOG_ROOT"/afternoon/*.log 2>/dev/null \
       | sed 's/^path=//' | sort -u
   )
