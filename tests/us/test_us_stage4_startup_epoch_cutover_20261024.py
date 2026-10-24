@@ -153,3 +153,30 @@ def test_session_handoff_occurs_before_first_trading_tick_and_retains_http_fence
     assert 'final_reason = "stage4_worker_startup_unverified"' in source
     assert "action=NO_TICK_NO_ORDER" in source
     assert "FIRST_TICK_ALLOWED_WITH_CONTINUOUS_FENCING" in source
+
+
+def test_close_claim_health_is_scoped_to_new_account_and_epoch(monkeypatch):
+    """Old account/epoch conflicts must not leak into next day's new account."""
+    from trader.us.db import repos
+
+    scope = {
+        "env": "practice", "account_id": "new-account-fingerprint",
+        "market": "US", "trading_epoch_id": "new-epoch",
+    }
+    captured = []
+
+    class FakeClaims:
+        def health(self, **kwargs):
+            captured.append(kwargs)
+            return {
+                "unresolved_execution_actions": 0,
+                "execution_claim_conflicts": 0,
+            }
+
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: scope)
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: FakeClaims())
+    assert repos.load_execution_claim_health() == {
+        "unresolved_execution_actions": 0,
+        "execution_claim_conflicts": 0,
+    }
+    assert captured == [scope]
