@@ -18,6 +18,9 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
     shutil.copy2(ROOT / "scripts/notify/send_mail_attachment.py", root / "scripts/notify/send_mail_attachment.py")
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-trading-day.py", root / "scripts/wsl/check-nullim-trading-day.py")
     shutil.copy2(ROOT / "scripts/wsl/resolve-nullim-python.sh", root / "scripts/wsl/resolve-nullim-python.sh")
+    # Exercise the production redactor, not send-market-log-mail.sh's legacy
+    # fallback; Stage4 worker URLs must be scrubbed before attachment.
+    shutil.copy2(ROOT / "scripts/wsl/redact-log-archive.py", root / "scripts/wsl/redact-log-archive.py")
     (root / "trader").mkdir()
     shutil.copy2(ROOT / "trader/__init__.py", root / "trader/__init__.py")
     shutil.copy2(ROOT / "trader/time_utils.py", root / "trader/time_utils.py")
