@@ -8,6 +8,12 @@ SENSITIVE = {x.lower() for x in ("CANO ACNT_PRDT_CD APP_KEY APP_SECRET KIS_APP_K
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 SECRET = re.compile(r"(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|KRX_ID|KRX_PW|KRX_API_KEY|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,\"]+")
 ACCOUNT = re.compile(r"(?<![\d.])(\d{4})[- ]?\d{4}[- ]?(\d{2,6})(?![\d.])")
+# Stage4 worker tracebacks can contain SQLAlchemy/HTTP URLs with inline
+# user:password credentials. Mask those before archiving the child log.
+URL_USERINFO = re.compile(
+    r"(?i)\\b((?:postgres(?:ql)?|mysql|redis|rediss|amqps?|https?)://)"
+    r"[^\\s/@:]+:[^@\\s/]+@"
+)
 
 def redact_json(value):
     if isinstance(value, dict):
@@ -23,6 +29,7 @@ def redact_tree(root: Path) -> None:
             path.write_text(json.dumps(redact_json(data), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         elif path.suffix.lower() in {".log", ".txt", ".md"}:
             text = path.read_text(encoding="utf-8", errors="replace")
+            text = URL_USERINFO.sub(r"\1[REDACTED_CREDENTIALS]@", text)
             text = EMAIL.sub("[REDACTED_EMAIL]", SECRET.sub(r"\1[REDACTED]", text))
             path.write_text(ACCOUNT.sub(r"\1-****-\2", text), encoding="utf-8")
 
