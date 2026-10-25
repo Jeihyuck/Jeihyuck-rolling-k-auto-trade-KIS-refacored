@@ -130,6 +130,14 @@ deploy_preflight() {
   fi
   export PYTHONPATH="$actual"
   export TRADING_EPOCH_ENFORCE=1
+  # The KR-only practice account was funded with 100m KRW on 2026-10-25.
+  # Use the same contract at the WSL entry point as GitHub PREP/AM/PM/CLOSE.
+  # Do not touch US budgets or change real-account configuration.
+  if [[ "${market^^}" == "KR" && "${STRATEGY_ENV:-practice}" == "practice" && "${KIS_ENV:-practice}" == "practice" ]]; then
+    export PAPER_MAX_CAPITAL_KRW=100000000
+    export EXPECTED_PRACTICE_CAPITAL_KRW=100000000
+    echo "[KR_PRACTICE_CAPITAL] expected=100000000 budget_cap=100000000 source=kr_wsl_go_live"
+  fi
   local epoch_python="python"
   [[ -x .venv/bin/python ]] && epoch_python=".venv/bin/python"
   if [[ "${NULLIM_EPOCH_PREFLIGHT_SKIP:-0}" == "1" ]]; then
@@ -157,6 +165,22 @@ except Exception:
 PY
 )"
     echo "[DEPLOY][TRADING_EPOCH][OK] trading_epoch_id=$epoch_id"
+  fi
+  # For the *first* new-account trading date, generic ACTIVE epoch checking
+  # is insufficient: the old practice account also has an ACTIVE generation.
+  # Inspect the current credential-selected account, never auto-create an epoch
+  # or reassign old orders. Skip only for US or after the rollout date.
+  # PREFLIGHT_ONLY is a no-trade structural/scheduler probe. It should
+  # never need account DB credentials, and CI tests explicitly run it offline.
+  # Real PREP/AM/PM/CLOSE executions remain strictly gated on Oct 26.
+  if [[ "${market^^}" == "KR" && "$trade_date" == "2026-10-26" && "${NULLIM_PREFLIGHT_ONLY:-0}" != "1" ]]; then
+    if ! "$epoch_python" scripts/kr/check_20261026_new_practice_account.py; then
+      result=FAIL; reason=kr_new_practice_epoch_or_capital_not_proven
+      echo "[DEPLOY][KR_NEW_ACCOUNT][FAIL] reason=$reason action=BLOCK_TRADING"
+      _preflight_log
+      return 1
+    fi
+    echo "[DEPLOY][KR_NEW_ACCOUNT][OK] trade_date=$trade_date"
   fi
   echo "[DEPLOY][OK]"; _preflight_log
 }
