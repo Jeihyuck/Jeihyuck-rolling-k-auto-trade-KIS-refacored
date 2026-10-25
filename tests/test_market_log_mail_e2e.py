@@ -391,7 +391,8 @@ def test_us_stage4_worker_log_is_archived_with_redaction(tmp_path):
     worker = root / worker_rel
     worker.parent.mkdir(parents=True, exist_ok=True)
     worker.write_text(
-        "US_STAGE4_RECONCILE_FAILURE KIS_APP_SECRET=never-mail-this\n",
+        "US_STAGE4_RECONCILE_FAILURE KIS_APP_SECRET=never-mail-this\\n"
+        "DB_URL_TRACE postgresql://user:db-password-123@localhost:5432/trades\\n",
         encoding="utf-8",
     )
     result, archive = run_mail(root, "us")
@@ -402,6 +403,8 @@ def test_us_stage4_worker_log_is_archived_with_redaction(tmp_path):
         body = tf.extractfile("./" + worker_rel).read()
         assert b"US_STAGE4_RECONCILE_FAILURE" in body
         assert b"never-mail-this" not in body
+        assert b"db-password-123" not in body
+        assert b"DB_URL_TRACE" in body
         manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
         assert worker_rel in manifest["included_required_files"]
 
