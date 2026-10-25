@@ -34,6 +34,14 @@ def main() -> int:
     try:
         from datetime import date
         trading_day = date.fromisoformat(trade_str)
+        # The account's active epoch may exist while KIS_ENV accidentally
+        # still points to a *real* or previous-account API configuration.
+        # Never let the first-day KR practice gate validate only DB scope.
+        if trading_day == date(2026, 10, 26) and (
+            env != "practice"
+            or str(os.getenv("KIS_ENV") or "").strip().lower() != "practice"
+        ):
+            raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_ENV_NOT_PRACTICE")
         expected = int(str(os.getenv("EXPECTED_PRACTICE_CAPITAL_KRW") or "0").replace(",",""))
         maximum = int(str(os.getenv("PAPER_MAX_CAPITAL_KRW") or "0").replace(",",""))
         result = verify_kr_practice_first_day(
