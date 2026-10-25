@@ -91,3 +91,44 @@ as designed (EXPECTED safety gate), while the unready worker/session
 handoff is an IMPLEMENTATION BUG candidate pending the actual worker log;
 historical Claim terminality and close FAIL remain **NOT PROVEN** until
 original-date broker evidence is available.
+
+## Operator update — 2026-10-25 practice capital profile (not a code default)
+
+The operator confirmed **KR strategy capital KRW 100,000,000** and **US
+strategy capital KRW 300,000,000**. This is an account-specific WSL
+configuration requirement, **not** authorization to change shared defaults,
+position weights, strategy owners, risk gates or broker permissions.
+
+- New practice account: broker-flat check succeeded with zero KR/US holdings
+  and zero KR/US pending orders; explicit Trading Epoch creation succeeded;
+  read-only active Epoch verification returned `ACTIVE_TRADING_EPOCH_OK`.
+  Do **not** create another Epoch for the same account.
+- WSL `dual-agent` local base was `acb613ff`; all 16 KR/US Windows tasks
+  reported `Ready`, meaning **enabled**, not validated execution. The
+  prior instruction to keep tasks disabled is not currently satisfied:
+  prevent any automatic session until remaining gates pass.
+- Operator's current US `.env` already has
+  `US_PAPER_MAX_CAPITAL_KRW=300000000` and
+  `US_EXPECTED_PRACTICE_CAPITAL_KRW=300000000`.
+- KR `EXPECTED_PRACTICE_CAPITAL_KRW` and `PAPER_MAX_CAPITAL_KRW` were
+  absent from the process environment, so the KR configured fallback was
+  50,000,000. The operator must explicitly set both to `100000000` in
+  the actual WSL `.env` if the approved KR **strategy deployment limit**
+  is the full 100m. Do not conflate the broker account equity with a
+  deliberately smaller strategy deployment cap.
+- Confirm `US_ACCOUNT_EQUITY_USD` and US broker **orderable USD cash**
+  separately. The KR broker's 100m KRW domestic cash is not proof of US
+  orderable cash. The US 300m configured deployment cap must never
+  override broker cash, per-symbol weight, daily notional or other gates.
+- Verify the effective configuration **inside the actual WSL launch
+  environment**, not only in a plain Python shell. Compare the account's
+  expected practice capital, strategy deployment cap and current broker
+  balances; preserve a redacted result in the deployment evidence.
+- All four values are operator environment settings, never KIS secrets or
+  global repository defaults. Do not commit `.env` or its backups.
+
+Capital acceptance: KR 100m expected / 100m deployment; US 300m
+expected / 300m deployment; independent broker cash checks and
+owner-specific risk gates PASS. A passing capital profile does **not**
+waive Stage4 READY, first-Tick, original-date broker evidence, CI, or
+practice execution validation.
