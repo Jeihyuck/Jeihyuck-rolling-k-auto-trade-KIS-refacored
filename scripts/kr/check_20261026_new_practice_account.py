@@ -17,6 +17,7 @@ from trader.account_state import get_account_key, resolve_env_name
 from trader.db.engine import make_engine
 from trader.kr.new_paper_epoch_preflight import (
     KrPracticeReadinessError, verify_kr_practice_first_day,
+    verify_fresh_kr_practice_balance,
 )
 
 
@@ -47,29 +48,18 @@ def main() -> int:
             if result.get("status") != "KR_NEW_ACCOUNT_EPOCH_AND_100M_OK":
                 raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_DATE_NOT_APPLICABLE")
             from trader.kis_wrapper import KisAPI
-            from scripts.reset_practice_account_state import (
-                _extract_cash_krw, _extract_holdings_count, _is_stub_balance_snapshot,
-            )
+            # KisAPI combines page results into output1/output2 and drops
+            # rt_cd on success. A fresh API read with explicit error/stub
+            # detection is authoritative; cached or fabricated results are not.
             kis = KisAPI()
             if get_account_key(env=env, kis=kis) != get_account_key(env=env):
                 raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_IDENTITY_MISMATCH")
-            raw = kis.get_balance_cached(force=True)
-            snapshot = raw[0] if isinstance(raw, tuple) else raw
-            if (
-                not isinstance(snapshot, dict)
-                or _is_stub_balance_snapshot(snapshot)
-                or str(snapshot.get("rt_cd") or "") != "0"
-            ):
-                raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_BALANCE_NOT_PROVEN")
-            cash = _extract_cash_krw(snapshot)
-            holdings = _extract_holdings_count(snapshot)
-            if cash is None or abs(cash - expected) > max(1_000_000, int(expected * 0.01)):
-                raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_CASH_NOT_100M")
-            if holdings != 0:
-                raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_HOLDINGS_NOT_EMPTY")
-            result["kis_balance_status"] = "AUTHENTIC_PRACTICE_100M_CASH_NO_HOLDINGS"
-            result["kis_cash_krw"] = cash
-            result["kis_holdings_count"] = holdings
+            snapshot, source = kis.get_balance_cached(
+                force=True, return_source=True,
+            )
+            result.update(verify_fresh_kr_practice_balance(
+                snapshot, source=source, expected_capital_krw=expected,
+            ))
     except (KrPracticeReadinessError, ValueError, RuntimeError) as exc:
         # Never print raw account identifiers or credentials; the root cause
         # stays available through an unambiguous result code.
