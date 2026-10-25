@@ -42,7 +42,9 @@ def wait_for_stage4_startup(
     The Tick/router still revalidate the health and generation at every
     protected broker-HTTP boundary after this initial handoff.
     """
-    from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+    from trader.us.execution.authoritative_reconcile_worker import (
+        read_worker_health, stage4_diagnostic_code,
+    )
 
     reader = read_health or read_worker_health
     clock = monotonic or time_mod.monotonic
@@ -71,8 +73,9 @@ def wait_for_stage4_startup(
                 return True, "READY"
             last_error = "US_STAGE4_RECONCILIATION_UNVERIFIED"
         except Exception as exc:
-            # Only diagnostic codes from the health reader, never credentials.
-            last_error = str(exc).splitlines()[0][:120] or type(exc).__name__
+            # Preserve known Stage4 failure codes, never log arbitrary
+            # broker/DB exception messages (may contain credentials).
+            last_error = stage4_diagnostic_code(exc)
         remaining = deadline - clock()
         if remaining <= 0:
             return False, "US_STAGE4_STARTUP_TIMEOUT:" + last_error
