@@ -110,12 +110,13 @@ position weights, strategy owners, risk gates or broker permissions.
 - Operator's current US `.env` already has
   `US_PAPER_MAX_CAPITAL_KRW=300000000` and
   `US_EXPECTED_PRACTICE_CAPITAL_KRW=300000000`.
-- KR `EXPECTED_PRACTICE_CAPITAL_KRW` and `PAPER_MAX_CAPITAL_KRW` were
-  absent from the process environment, so the KR configured fallback was
-  50,000,000. The operator must explicitly set both to `100000000` in
-  the actual WSL `.env` if the approved KR **strategy deployment limit**
-  is the full 100m. Do not conflate the broker account equity with a
-  deliberately smaller strategy deployment cap.
+- KR `EXPECTED_PRACTICE_CAPITAL_KRW` and `PAPER_MAX_CAPITAL_KRW`
+  initially fell back to 50,000,000. The operator subsequently updated
+  the actual WSL `.env` and confirmed **`CAPITAL_PROFILE_PASS`** on
+  2026-10-25 23:42 KST with `source .env`: KR cap/expected both
+  100,000,000 and US cap/expected both 300,000,000.
+  This proves effective capital configuration only, not broker USD cash,
+  Stage4 readiness, KIS POST/ACK/fill or scheduled execution.
 - Confirm `US_ACCOUNT_EQUITY_USD` and US broker **orderable USD cash**
   separately. The KR broker's 100m KRW domestic cash is not proof of US
   orderable cash. The US 300m configured deployment cap must never
@@ -132,3 +133,18 @@ expected / 300m deployment; independent broker cash checks and
 owner-specific risk gates PASS. A passing capital profile does **not**
 waive Stage4 READY, first-Tick, original-date broker evidence, CI, or
 practice execution validation.
+
+## 2026-10-25 final review: Stage4 diagnostic confidentiality
+
+- Stage4 health exceptions are now converted to fixed `US_STAGE4_*`
+  diagnostic tokens. Unexpected DB/KIS exceptions produce only
+  `US_STAGE4_HEALTH_READ_ERROR`; never put raw connection errors in
+  session logs or persisted tick reasons.
+- The archive redactor also masks embedded `postgresql://user:pass@host`
+  and related credential-bearing connection URLs from worker logs.
+  Offline negative tests cover secret-bearing startup failures and
+  archived worker tracebacks.
+- The original 2026-10-23 child traceback was **not** in the archived
+  evidence. Its underlying operational root cause remains unverified.
+  The WSL worker's real log and account/epoch/generation-matched PostgreSQL
+  READY row are required before calling the Stage4 runtime issue resolved.
