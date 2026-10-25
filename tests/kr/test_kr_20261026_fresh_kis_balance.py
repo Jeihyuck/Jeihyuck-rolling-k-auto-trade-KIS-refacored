@@ -93,6 +93,9 @@ def test_insufficient_account_cash_blocks(cash):
 
 
 @pytest.mark.parametrize("holdings", [
+    [{"pdno": "005930"}],
+    [{"pdno": "005930", "hldg_qty": None}],
+    [{"pdno": "005930", "hldg_qty": ""}],
     [{"pdno": "005930", "hldg_qty": "2"}],
     [{"pdno": "005930", "hldg_qty": "NaN"}],
     [{"pdno": "005930", "hldg_qty": "bad"}],
@@ -120,3 +123,52 @@ def test_first_day_cli_fails_before_db_or_kis_when_mixed_practice_real_env(
     monkeypatch.setattr(check, "make_engine", lambda: pytest.fail("DB lookup forbidden"))
     assert check.main() == 2
     assert "KR_NEW_ACCOUNT_KIS_ENV_NOT_PRACTICE" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("rows,expected_exit", [
+    ([], 0),
+    (None, 2),
+    ("malformed", 2),
+    ([{"pdno": "005930"}], 2),
+    ([{"pdno": "005930", "hldg_qty": "1"}], 2),
+])
+def test_cli_uses_actual_wrapper_fresh_raw_balance_without_orders(
+    monkeypatch, capsys, rows, expected_exit,
+):
+    import json
+    import sys
+    from scripts.kr import check_20261026_new_practice_account as check
+    from trader import kis_wrapper
+
+    for key, value in {
+        "STRATEGY_ENV": "practice", "KIS_ENV": "practice",
+        "NULLIM_TRADE_DATE": "2026-10-26",
+        "PAPER_MAX_CAPITAL_KRW": "100000000",
+        "EXPECTED_PRACTICE_CAPITAL_KRW": "100000000",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("KIS_FORCE_500_BALANCE", raising=False)
+    monkeypatch.setattr(sys, "argv", ["check", "--verify-kis"])
+    monkeypatch.setattr(check, "make_engine", lambda: object())
+    monkeypatch.setattr(check, "get_account_key", lambda **kw: "practice:test:01")
+    monkeypatch.setattr(check, "verify_kr_practice_first_day", lambda *a, **kw: {
+        "status": "KR_NEW_ACCOUNT_EPOCH_AND_100M_OK",
+        "capital_krw": 100000000, "pb1_portfolio_epoch_count": 0,
+    })
+    # Bypass constructor credentials/token I/O; run the real wrapper method
+    # with an in-memory page aggregate. Any network call fails the test.
+    client = object.__new__(kis_wrapper.KisAPI)
+    client._balance_cache = _fresh_snapshot(output1=[{"hldg_qty": "99"}])
+    monkeypatch.setattr(client, "inquire_balance_all", lambda: _fresh_snapshot(output1=rows))
+    monkeypatch.setattr(kis_wrapper, "KisAPI", lambda: client)
+    import requests
+    monkeypatch.setattr(requests.sessions.Session, "request",
+                        lambda *a, **kw: pytest.fail("HTTP forbidden"))
+    assert check.main() == expected_exit
+    output = capsys.readouterr()
+    if expected_exit == 0:
+        result = json.loads(output.out)
+        assert result["kis_cash_krw"] == 100000000
+        assert result["kis_holdings_count"] == 0
+    else:
+        assert "action=BLOCK_TRADING" in output.err

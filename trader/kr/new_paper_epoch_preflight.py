@@ -109,7 +109,8 @@ def verify_fresh_kr_practice_balance(
     output1/output2 and does not return top-level rt_cd. Requiring that
     field incorrectly rejected a successful 2026-10-26 broker response.
     The caller MUST use get_balance_cached(force=True, return_source=True)
-    and require source='api'. Any explicit nonzero rt_cd is still rejected.
+    with return_raw=True and require source='api'. Any explicit nonzero
+    rt_cd is still rejected.
     """
     from decimal import Decimal, InvalidOperation
 
@@ -159,8 +160,11 @@ def verify_fresh_kr_practice_balance(
     for row in rows:
         if not isinstance(row, dict):
             raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_HOLDINGS_NOT_PROVEN")
+        raw_quantity = row.get("hldg_qty")
+        if raw_quantity is None or str(raw_quantity).strip() == "":
+            raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_HOLDINGS_NOT_PROVEN")
         try:
-            quantity = Decimal(str(row.get("hldg_qty") or "0").replace(",", "").strip())
+            quantity = Decimal(str(raw_quantity).replace(",", "").strip())
         except (InvalidOperation, ValueError):
             raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_HOLDINGS_NOT_PROVEN")
         if (

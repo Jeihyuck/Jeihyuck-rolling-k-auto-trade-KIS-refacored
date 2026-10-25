@@ -2,7 +2,9 @@
 """Read-only first trading day KR practice epoch gate.
 
 Called from shared deployment preflight after .env was read and the checkout
-was pinned. No token, broker HTTP, reset, epoch creation, or DB write.
+was pinned. Default mode performs DB reads only. --verify-kis additionally
+uses KIS authentication and a balance GET; neither mode submits orders,
+resets state, creates epochs, or writes to the database.
 """
 from __future__ import annotations
 
@@ -62,9 +64,11 @@ def main() -> int:
             kis = KisAPI()
             if get_account_key(env=env, kis=kis) != get_account_key(env=env):
                 raise KrPracticeReadinessError("KR_NEW_ACCOUNT_KIS_IDENTITY_MISMATCH")
-            snapshot, source = kis.get_balance_cached(
-                force=True, return_source=True,
+            _, source, snapshot = kis.get_balance_cached(
+                force=True, return_source=True, return_raw=True,
             )
+            # Validate the aggregate before compatibility normalization can
+            # coerce an invalid/missing holdings block into an empty list.
             result.update(verify_fresh_kr_practice_balance(
                 snapshot, source=source, expected_capital_krw=expected,
             ))

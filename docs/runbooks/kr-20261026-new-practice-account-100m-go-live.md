@@ -74,6 +74,13 @@ export KIS_HTTP_ENABLED=1
 PYTHONPATH="$PWD" "$MAIN/.venv/bin/python" scripts/kr/check_20261026_new_practice_account.py --verify-kis
 ```
 
+The verifier reads the fresh aggregate via `return_raw=True`, before the
+shared compatibility normalizer can replace malformed holdings with `[]`.
+Missing or blank holding quantities block verification; only an explicit
+empty holdings list or valid zero-quantity rows establish no holdings.
+The regression test runs the actual balance-cache method with an in-memory
+broker aggregate and forbids HTTP, including a stale-cache bypass check.
+
 If `KR_NEW_ACCOUNT_EPOCH_PROVENANCE_MISMATCH` occurs, WSL likely points to old practice account credentials. Stop and correct `.env` offline; do not create another epoch or blindly override DB keys.
 
 If KIS returns missing token/auth/balance or zero cash, **do not bypass** the readiness gate, fabricate a holding or disable HTTP safety. Correct the new KIS app-key/CANO-product mapping and retry a read-only balance check.
