@@ -45,4 +45,4 @@ jobs:
           bash -n scripts/wsl/run-kr-prep.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh
       - name: Assert 100m and new-account epoch isolation without KIS or orders
         run: |
-          python -m pytest -q tests/kr/test_kr_20261026_new_paper_preflight.py tests/kr/test_kr_20261026_capital_sources.py
+          python -m pytest -q tests/kr/test_kr_20261026_new_paper_preflight.py tests/kr/test_kr_20261026_capital_sources.py tests/kr/test_kr_20261026_fresh_kis_balance.py
