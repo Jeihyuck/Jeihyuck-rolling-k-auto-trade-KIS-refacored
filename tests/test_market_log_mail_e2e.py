@@ -391,8 +391,8 @@ def test_us_stage4_worker_log_is_archived_with_redaction(tmp_path):
     worker = root / worker_rel
     worker.parent.mkdir(parents=True, exist_ok=True)
     worker.write_text(
-        "US_STAGE4_RECONCILE_FAILURE KIS_APP_SECRET=never-mail-this\\n"
-        "DB_URL_TRACE postgresql://user:db-password-123@localhost:5432/trades\\n",
+        "US_STAGE4_RECONCILE_FAILURE KIS_APP_SECRET=never-mail-this\n"
+        "DB_URL_TRACE postgresql://user:db-password-123@localhost:5432/trades\n",
         encoding="utf-8",
     )
     result, archive = run_mail(root, "us")
