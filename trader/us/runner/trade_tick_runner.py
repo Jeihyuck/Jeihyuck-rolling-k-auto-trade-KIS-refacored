@@ -2046,7 +2046,8 @@ def run_trade_tick(
             # the worker was missing, stale, wrong-epoch or wrong-generation.
             # Preserve the fail-closed decision; expose the fixed diagnostic
             # code from the health reader without dumping broker credentials.
-            _stage4_code = str(_stage4_exception).splitlines()[0][:120]
+            from trader.us.execution.authoritative_reconcile_worker import stage4_diagnostic_code
+            _stage4_code = stage4_diagnostic_code(_stage4_exception)
             logger.error("[US_STAGE4][BLOCK_ALL_ORDERS] reason=%s code=%s",
                          type(_stage4_exception).__name__, _stage4_code)
             return {"status":"FAILED","reason":"stage4_worker_evidence_unavailable",
