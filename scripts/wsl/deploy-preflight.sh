@@ -170,7 +170,10 @@ PY
   # is insufficient: the old practice account also has an ACTIVE generation.
   # Inspect the current credential-selected account, never auto-create an epoch
   # or reassign old orders. Skip only for US or after the rollout date.
-  if [[ "${market^^}" == "KR" && "$trade_date" == "2026-10-26" ]]; then
+  # PREFLIGHT_ONLY is a no-trade structural/scheduler probe. It should
+  # never need account DB credentials, and CI tests explicitly run it offline.
+  # Real PREP/AM/PM/CLOSE executions remain strictly gated on Oct 26.
+  if [[ "${market^^}" == "KR" && "$trade_date" == "2026-10-26" && "${NULLIM_PREFLIGHT_ONLY:-0}" != "1" ]]; then
     if ! "$epoch_python" scripts/kr/check_20261026_new_practice_account.py; then
       result=FAIL; reason=kr_new_practice_epoch_or_capital_not_proven
       echo "[DEPLOY][KR_NEW_ACCOUNT][FAIL] reason=$reason action=BLOCK_TRADING"
