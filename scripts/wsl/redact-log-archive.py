@@ -11,8 +11,8 @@ ACCOUNT = re.compile(r"(?<![\d.])(\d{4})[- ]?\d{4}[- ]?(\d{2,6})(?![\d.])")
 # Stage4 worker tracebacks can contain SQLAlchemy/HTTP URLs with inline
 # user:password credentials. Mask those before archiving the child log.
 URL_USERINFO = re.compile(
-    r"(?i)\\b((?:postgres(?:ql)?|mysql|redis|rediss|amqps?|https?)://)"
-    r"[^\\s/@:]+:[^@\\s/]+@"
+    r"(?i)\b((?:postgres(?:ql)?|mysql|redis|rediss|amqps?|https?)://)"
+    r"[^\s/@:]+:[^@\s/]+@"
 )
 
 def redact_json(value):
