@@ -91,7 +91,7 @@ def stage4_diagnostic_code(exc: BaseException) -> str:
     account identifiers or API parameters. Their raw message must not be
     persisted in the session report or mailed as a health reason.
     """
-    message = str(exc).splitlines()[0].strip() if str(exc) else ""
+    message = str(exc).strip()
     if re.fullmatch(r"US_STAGE4_[A-Z0-9_]{1,80}", message):
         return message
     return "US_STAGE4_HEALTH_READ_ERROR"
