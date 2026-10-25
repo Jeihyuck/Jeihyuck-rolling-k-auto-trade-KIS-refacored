@@ -102,3 +102,21 @@ def test_nonempty_or_unknown_holdings_fail_closed(holdings):
         verify_fresh_kr_practice_balance(
             _fresh_snapshot(output1=holdings), source="api",
         )
+
+
+def test_first_day_cli_fails_before_db_or_kis_when_mixed_practice_real_env(
+    monkeypatch, capsys,
+):
+    """A valid DB epoch must never authorize a KIS_ENV=real broker client."""
+    import sys
+    from scripts.kr import check_20261026_new_practice_account as check
+
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("KIS_ENV", "real")
+    monkeypatch.setenv("NULLIM_TRADE_DATE", "2026-10-26")
+    monkeypatch.setenv("PAPER_MAX_CAPITAL_KRW", "100000000")
+    monkeypatch.setenv("EXPECTED_PRACTICE_CAPITAL_KRW", "100000000")
+    monkeypatch.setattr(sys, "argv", ["check_20261026_new_practice_account.py"])
+    monkeypatch.setattr(check, "make_engine", lambda: pytest.fail("DB lookup forbidden"))
+    assert check.main() == 2
+    assert "KR_NEW_ACCOUNT_KIS_ENV_NOT_PRACTICE" in capsys.readouterr().err
