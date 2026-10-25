@@ -58,6 +58,22 @@ Expected:
 - `AUTHENTIC_PRACTICE_100M_CASH_NO_HOLDINGS`
 - Cash within 1m KRW of 100m; zero holdings before initial trade
 
+If the read-only check was previously stopped by `KR_NEW_ACCOUNT_KIS_BALANCE_NOT_PROVEN` even though KIS logged `[BALANCE][PAGE_RECV] rt_cd=0` and `[BALANCE][RESP_SUMMARY] cash=100000000 rows=0`, that was the **PR #256 validator's false negative**. `KisAPI.inquire_balance_all()` combines KIS pages and intentionally omits top-level `rt_cd` from the returned output1/output2 snapshot. The validator now requires a **forced fresh API** source, rejects stub/cache/error responses, checks deposit `dnca_tot_amt` rather than pre-open `ord_psbl_cash=0`, and checks zero holdings. No KIS order gate is disabled.
+
+To refresh an existing detached pre-merge worktree and rerun **no-order** verification, use:
+
+```bash
+MAIN="$HOME/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
+git -C /tmp/nullim-kr256-check fetch origin pull/256/head
+git -C /tmp/nullim-kr256-check checkout --detach FETCH_HEAD
+cd /tmp/nullim-kr256-check
+export STRATEGY_ENV=practice KIS_ENV=practice
+export NULLIM_TRADE_DATE=2026-10-26
+export PAPER_MAX_CAPITAL_KRW=100000000 EXPECTED_PRACTICE_CAPITAL_KRW=100000000
+export KIS_HTTP_ENABLED=1
+PYTHONPATH="$PWD" "$MAIN/.venv/bin/python" scripts/kr/check_20261026_new_practice_account.py --verify-kis
+```
+
 If `KR_NEW_ACCOUNT_EPOCH_PROVENANCE_MISMATCH` occurs, WSL likely points to old practice account credentials. Stop and correct `.env` offline; do not create another epoch or blindly override DB keys.
 
 If KIS returns missing token/auth/balance or zero cash, **do not bypass** the readiness gate, fabricate a holding or disable HTTP safety. Correct the new KIS app-key/CANO-product mapping and retry a read-only balance check.
