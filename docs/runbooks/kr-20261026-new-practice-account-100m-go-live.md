@@ -32,6 +32,25 @@ export KIS_HTTP_ENABLED=1 PYTHONPATH=.
 python scripts/kr/check_20261026_new_practice_account.py --verify-kis
 ```
 
+**If PR #256 is not merged, its new script is absent from the normal `dual-agent` checkout.** For read-only pre-merge verification use an isolated worktree, but run it with the ORIGINAL checkout's populated Python virtual environment. Running plain `python` inside `/tmp` may use system Python without `sqlalchemy` and fail `ModuleNotFoundError`, which is NOT a KIS account or epoch error.
+
+```bash
+MAIN="$HOME/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
+cd "$MAIN"
+set -a; source .env; set +a
+git fetch origin pull/256/head
+git worktree add --detach /tmp/nullim-kr256-check FETCH_HEAD
+cd /tmp/nullim-kr256-check
+export STRATEGY_ENV=practice KIS_ENV=practice
+export NULLIM_TRADE_DATE=2026-10-26
+export PAPER_MAX_CAPITAL_KRW=100000000 EXPECTED_PRACTICE_CAPITAL_KRW=100000000
+export KIS_HTTP_ENABLED=1 PYTHONPATH="$PWD"
+"$MAIN/.venv/bin/python" -c 'import sqlalchemy; print("SQLAlchemy OK")'
+"$MAIN/.venv/bin/python" scripts/kr/check_20261026_new_practice_account.py --verify-kis
+```
+
+If `"$MAIN/.venv/bin/python"` does not exist, locate the Python interpreter that the existing WSL session uses and verify `import sqlalchemy` first. Do **not** `pip install` packages into the system interpreter or activate real trading as a workaround.
+
 This performs **only** database reads and a KIS balance read. It does not reset state, create an epoch, place a trade, or migrate schema.
 
 Expected:
