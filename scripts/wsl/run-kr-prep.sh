@@ -73,6 +73,14 @@ export EXCHANGE=KRX
 export PB1_MARKET_SCOPE=KRX
 export STRATEGY_ENV="${STRATEGY_ENV:-practice}"
 export KIS_ENV="${KIS_ENV:-practice}"
+# KIS practice capital is explicitly 100m KRW. .env is loaded again after
+# deploy preflight; reassert the KR-only contract here so stale 50m .env
+# values cannot override preflight. Real account capital remains unchanged.
+if [[ "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" ]]; then
+  export PAPER_MAX_CAPITAL_KRW=100000000
+  export EXPECTED_PRACTICE_CAPITAL_KRW=100000000
+  echo "[KR_CAPITAL][FINAL] expected=100000000 cap=100000000 session=${WSL_RUN_SESSION:-unknown}"
+fi
 export KR_ARTIFACT_STRICT="${KR_ARTIFACT_STRICT:-1}"
 export KR_BLOCK_LEGACY_ARTIFACT="${KR_BLOCK_LEGACY_ARTIFACT:-1}"
 export KR_QUARANTINE_STALE_ARTIFACT="${KR_QUARANTINE_STALE_ARTIFACT:-1}"
