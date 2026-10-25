@@ -1,0 +1,48 @@
+name: KR 2026-10-26 New Practice Account Readiness
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - '.github/workflows/trade-*.yml'
+      - '.github/workflows/unified-pipeline.yml'
+      - '.github/workflows/kr-20261026-new-account-ci.yml'
+      - 'scripts/wsl/deploy-preflight.sh'
+      - 'scripts/wsl/run-kr-*.sh'
+      - 'scripts/kr/check_20261026_new_practice_account.py'
+      - 'trader/kr/new_paper_epoch_preflight.py'
+      - 'tests/kr/test_kr_20261026_*.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  readiness-offline-no-orders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      KIS_HTTP_ENABLED: "0"
+      NO_TRADE: "1"
+      DRY_RUN: "1"
+      DISABLE_LIVE_TRADING: "1"
+      ALLOW_REAL_ORDER: "0"
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install repository requirements
+        run: python -m pip install -r requirements.txt
+      - name: Parse Python and WSL entrypoints
+        run: |
+          python -m py_compile trader/kr/new_paper_epoch_preflight.py scripts/kr/check_20261026_new_practice_account.py
+          bash -n scripts/wsl/deploy-preflight.sh
+          bash -n scripts/wsl/run-kr-prep.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh
+      - name: Assert 100m and new-account epoch isolation without KIS or orders
+        run: |
+          python -m pytest -q tests/kr/test_kr_20261026_new_paper_preflight.py tests/kr/test_kr_20261026_capital_sources.py
