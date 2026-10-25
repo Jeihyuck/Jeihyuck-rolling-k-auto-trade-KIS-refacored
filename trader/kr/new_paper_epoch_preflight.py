@@ -57,6 +57,11 @@ def verify_kr_practice_first_day(
         row = rows[0]
         epoch = str(row["trading_epoch_id"])
         started = row["started_at"]
+        if isinstance(started, str):
+            try:
+                started = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            except ValueError:
+                started = None
         if (
             str(row["reason"] or "") != KR_NEW_ACCOUNT_EPOCH_REASON
             or not isinstance(started, datetime)
