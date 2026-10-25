@@ -192,3 +192,37 @@ def test_authoritative_worker_publishes_non_authorizing_starting_before_kis():
     provider = source.index('provider=USDataProvider(offline=False,env="practice")', start)
     assert start < provider
     assert 'str(row["worker_state"])!="READY"' in source
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("US_STAGE4_WRITER_GENERATION_MISMATCH", "US_STAGE4_WRITER_GENERATION_MISMATCH"),
+    ("US_STAGE4_WRITER_NOT_READY", "US_STAGE4_WRITER_NOT_READY"),
+    ("KIS_APP_SECRET=supersecret", "US_STAGE4_HEALTH_READ_ERROR"),
+    ("US_STAGE4_WRITER_NOT_READY KIS_APP_SECRET=supersecret",
+     "US_STAGE4_HEALTH_READ_ERROR"),
+    ("DB failed postgresql://user:password@db.internal:5432/db",
+     "US_STAGE4_HEALTH_READ_ERROR"),
+    ("US_STAGE4_WRITER_NOT_READY\\npassword=supersecret",
+     "US_STAGE4_HEALTH_READ_ERROR"),
+])
+def test_stage4_untrusted_exception_does_not_leak(message, expected):
+    from trader.us.execution.authoritative_reconcile_worker import stage4_diagnostic_code
+
+    assert stage4_diagnostic_code(RuntimeError(message)) == expected
+
+
+def test_stage4_startup_failure_redacts_broker_and_database_error_messages():
+    clock = FakeClock()
+
+    def read_failed(**_kwargs):
+        raise RuntimeError("postgresql://user:supersecret@db.internal/db")
+
+    ready, reason = wait_for_stage4_startup(
+        child=Child(), env="practice", timeout_sec=1,
+        read_health=read_failed, monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert ready is False
+    assert reason == "US_STAGE4_STARTUP_TIMEOUT:US_STAGE4_HEALTH_READ_ERROR"
+    assert "supersecret" not in reason
+    assert "db.internal" not in reason
