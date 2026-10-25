@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import time
 import uuid
@@ -81,6 +82,19 @@ def advisory_key(scope: dict) -> int:
     payload="stage4:writer:"+str(scope["env"])+":"+str(scope["account_id"])
     raw=int.from_bytes(hashlib.sha256(payload.encode()).digest()[:8],"big")
     return raw-(1<<64) if raw>=(1<<63) else raw
+
+
+def stage4_diagnostic_code(exc: BaseException) -> str:
+    """Expose only fixed Stage4 diagnostic tokens, never exception payloads.
+
+    SQLAlchemy, KIS and OS exceptions may contain connection strings,
+    account identifiers or API parameters. Their raw message must not be
+    persisted in the session report or mailed as a health reason.
+    """
+    message = str(exc).splitlines()[0].strip() if str(exc) else ""
+    if re.fullmatch(r"US_STAGE4_[A-Z0-9_]{1,80}", message):
+        return message
+    return "US_STAGE4_HEALTH_READ_ERROR"
 
 
 def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> dict:
