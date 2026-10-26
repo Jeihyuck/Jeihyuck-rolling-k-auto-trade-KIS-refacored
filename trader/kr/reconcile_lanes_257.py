@@ -47,30 +47,14 @@ def _balance_holdings_quantities(snapshot: Any) -> tuple[tuple[str, int], ...] |
     return tuple(sorted((code, qty) for code, qty in seen.items() if qty > 0))
 
 
-def can_skip_post_exit_full_reconcile(
-    *, pre_exit_exact: bool, post_exit_exact: bool,
-    exit_pass_ok: bool, exit_summary: dict[str, Any] | None,
-    account_reset_mode: bool = False,
-    pre_exit_sell_only: bool = False,
-    pre_exit_balance: dict[str, Any] | None = None,
-    post_exit_balance: dict[str, Any] | None = None,
+def exit_pass_proves_zero_sell(
+    *, exit_pass_ok: bool, exit_summary: dict[str, Any] | None,
 ) -> tuple[bool, str]:
-    if account_reset_mode:
-        return False, "ACCOUNT_RESET_REQUIRES_FULL_RECONCILE"
-    if not post_exit_exact:
-        return False, "POST_EXIT_EXACT_BROKER_PROOF_REQUIRED"
-    if not pre_exit_exact:
-        # Strict narrow preflight proves account/epoch, zero pending
-        # PB1/KR_INFINITE claims and exact strategy holdings parity.
-        # The AFTER-exit exact broker proof supplies historical economic truth.
-        if not pre_exit_sell_only:
-            return False, "PRE_EXIT_SAFE_BROKER_PROOF_REQUIRED"
-        before = _balance_holdings_quantities(pre_exit_balance)
-        after = _balance_holdings_quantities(post_exit_balance)
-        if before is None or after is None:
-            return False, "PRE_POST_BROKER_BALANCE_MALFORMED"
-        if before != after:
-            return False, "PRE_POST_BROKER_BALANCE_CHANGED"
+    """Cheap offline-first test: never invoke full KIS proof for SELL activity.
+
+    Order submitted, attempted, blocked, filled or accepted: all require the
+    full economic reconciliation and fresh post-SELL balance before BUY.
+    """
     if not exit_pass_ok or not isinstance(exit_summary, dict):
         return False, "EXIT_PASS_NOT_PROVEN"
     try:
@@ -87,11 +71,39 @@ def can_skip_post_exit_full_reconcile(
         return False, "EXIT_SUMMARY_NEGATIVE"
     if checked < holdings or blocked or any((attempts, accepted, fills, submitted)):
         return False, "EXIT_ACTIVITY_REQUIRES_POST_RECONCILE"
+    return True, "EXIT_PASS_CLEAN_ZERO_SELL"
+
+
+def can_skip_post_exit_full_reconcile(
+    *, pre_exit_exact: bool, post_exit_exact: bool,
+    exit_pass_ok: bool, exit_summary: dict[str, Any] | None,
+    account_reset_mode: bool = False,
+    pre_exit_sell_only: bool = False,
+    pre_exit_balance: dict[str, Any] | None = None,
+    post_exit_balance: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    if account_reset_mode:
+        return False, "ACCOUNT_RESET_REQUIRES_FULL_RECONCILE"
+    if not post_exit_exact:
+        return False, "POST_EXIT_EXACT_BROKER_PROOF_REQUIRED"
+    if not pre_exit_exact:
+        if not pre_exit_sell_only:
+            return False, "PRE_EXIT_SAFE_BROKER_PROOF_REQUIRED"
+        before = _balance_holdings_quantities(pre_exit_balance)
+        after = _balance_holdings_quantities(post_exit_balance)
+        if before is None or after is None:
+            return False, "PRE_POST_BROKER_BALANCE_MALFORMED"
+        if before != after:
+            return False, "PRE_POST_BROKER_BALANCE_CHANGED"
+    clean, reason = exit_pass_proves_zero_sell(
+        exit_pass_ok=exit_pass_ok, exit_summary=exit_summary,
+    )
+    if not clean:
+        return False, reason
     return True, (
         "TWO_SIDED_EXACT_PROOF_NO_SELL_SKIP_HISTORICAL_RECOVERY"
         if pre_exit_exact else "SELL_ONLY_PLUS_POST_EXACT_NO_SELL_SKIP_HISTORICAL_RECOVERY"
     )
-
 
 
 def prove_no_kr_infinite_unresolved(

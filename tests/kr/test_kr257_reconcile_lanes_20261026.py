@@ -10,6 +10,7 @@ from trader.db.schema import schema_for_engine
 import trader.kr.protective_sell_handoff as proof
 from trader.kr.reconcile_lanes_257 import (
     can_skip_post_exit_full_reconcile, prove_no_kr_infinite_unresolved,
+    exit_pass_proves_zero_sell,
 )
 
 
@@ -186,6 +187,7 @@ def test_runner_preserves_sell_before_reconcile_and_post_sell_buy_fence():
     source = inspect.getsource(pb1_runner.run_once)
     assert source.index("prove_protective_sell_only_preflight(") < source.index("prove_safe_protective_sell_handoff(")
     assert "if ((pre_exit_exact_proof or sell_only_lane)" in source
+    assert "_zero_sell, _zero_sell_reason = exit_pass_proves_zero_sell(" in source
     assert "pre_exit_balance=balance_snapshot_raw" in source
     assert "post_exit_balance=_post_snapshot" in source
     assert source.index("prove_protective_sell_only_preflight(") < source.index("reconcile_kis(")
@@ -254,3 +256,18 @@ def test_cross_owner_proof_in_both_protective_sell_lanes():
     exact = inspect.getsource(proof.prove_safe_protective_sell_handoff)
     assert "prove_no_kr_infinite_unresolved(" in src
     assert "prove_no_kr_infinite_unresolved(" in exact
+
+
+
+def test_exit_activity_is_screened_before_expensive_post_kis_history():
+    clean = dict(holdings=1, checked=1, submit_attempt_count=0,
+                 accepted_sell_count=0, fill_confirmed_sell_count=0,
+                 submitted=0, blocked_count=0)
+    assert exit_pass_proves_zero_sell(exit_pass_ok=True, exit_summary=clean)[0]
+    for key in ("submit_attempt_count", "accepted_sell_count", "submitted",
+                "blocked_count", "fill_confirmed_sell_count"):
+        assert not exit_pass_proves_zero_sell(
+            exit_pass_ok=True, exit_summary={**clean, key: 1}
+        )[0]
+    assert not exit_pass_proves_zero_sell(exit_pass_ok=True, exit_summary={})[0]
+    assert not exit_pass_proves_zero_sell(exit_pass_ok=False, exit_summary=clean)[0]

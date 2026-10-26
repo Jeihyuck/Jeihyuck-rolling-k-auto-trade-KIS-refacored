@@ -171,6 +171,10 @@ def test_actual_runner_narrow_preflight_no_sell_skips_full_after_exact_broker_pr
 def test_actual_runner_fails_closed_to_full_reconcile(monkeypatch, reason, change):
     result, calls, proofs, kis, runner, _ = _call_real_runner_fragment(monkeypatch, **change)
     assert len(calls) == 1, reason
+    if reason in {"SELL_ATTEMPTED", "SELL_BLOCKED", "EXIT_PASS_INCOMPLETE"}:
+        assert len(proofs) == 0, "No wasted post-exit exact KIS read before FULL"
+        if reason != "SELL_ATTEMPTED":
+            assert kis.refreshes == 0
     assert result["status"] == "FULL_DONE"
     assert runner._kr_post_exit_reconcile_ok is True
 

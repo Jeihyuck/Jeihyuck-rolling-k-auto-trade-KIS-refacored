@@ -7444,11 +7444,16 @@ def run_once(
             if deferred_full_reconcile:
                 _post_started = time_mod.monotonic()
                 _skip_post_full = False
-                # Unlike the old unreachable branch, a narrow proven
-                # preflight CAN reach post-exit exact proof. It never itself
-                # grants permission to skip FULL reconcile or authorize BUY.
+                # Check exit activity BEFORE fetching costly broker history.
+                # Any submitted/attempted/blocked SELL goes straight to FULL
+                # reconciliation, not exact-proof PLUS FULL (double work).
+                from trader.kr.reconcile_lanes_257 import exit_pass_proves_zero_sell
+                _zero_sell, _zero_sell_reason = exit_pass_proves_zero_sell(
+                    exit_pass_ok=bool(getattr(engine_runner, "_kr_exit_pass_ok", False)),
+                    exit_summary=getattr(engine_runner, "_exit_summary_payload", None),
+                )
                 if ((pre_exit_exact_proof or sell_only_lane)
-                        and getattr(engine_runner, "_kr_exit_pass_ok", False)):
+                        and _zero_sell):
                     try:
                         from trader.account_state import account_reset_mode
                         from trader.kr.reconcile_lanes_257 import can_skip_post_exit_full_reconcile
