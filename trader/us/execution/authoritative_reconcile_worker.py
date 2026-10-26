@@ -131,6 +131,44 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
     return dict(row)
 
 
+
+
+def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "practice") -> bool:
+    """Mark only this account/epoch/generation STOPPED after the OS reaps its writer.
+
+    A different/new writer is never modified. This is process-liveness evidence,
+    not a statement that any broker order was filled, cancelled, or reconciled.
+    """
+    from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
+
+    scope = _us_execution_claim_scope()
+    if env != "practice" or scope.get("env") != "practice":
+        raise RuntimeError("US_STAGE4_WRITER_PRACTICE_ONLY")
+    if not scope.get("account_id") or not scope.get("trading_epoch_id"):
+        raise RuntimeError("US_STAGE4_WRITER_SCOPE_UNVERIFIED")
+    try:
+        generation = str(uuid.UUID(str(expected_generation)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RuntimeError("US_STAGE4_WORKER_GENERATION_NOT_CONFIGURED") from exc
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US_STAGE4_WRITER_DATABASE_UNAVAILABLE")
+    with engine.begin() as conn:
+        updated = conn.execute(text("""
+            UPDATE us_stage4_reconcile_health
+            SET worker_state='STOPPED', evidence_at=NULL, updated_at=NOW()
+            WHERE env=:env AND account_fingerprint=:account
+              AND trading_epoch_id=:epoch
+              AND writer_generation=CAST(:generation AS uuid)
+        """), {
+            "env": scope["env"],
+            "account": scope["account_id"],
+            "epoch": scope["trading_epoch_id"],
+            "generation": generation,
+        })
+        return updated.rowcount == 1
+
+
 def run_reconcile_once(*, provider: Any, trade_date: str,
                        session_run_id: str, writer_generation: str,
                        conn: Any, scope: dict) -> dict:
