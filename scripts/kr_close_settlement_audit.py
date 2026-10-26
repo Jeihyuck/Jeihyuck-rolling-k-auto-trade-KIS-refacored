@@ -23,6 +23,69 @@ def _number(value: Any) -> int:
         return 0
 
 
+
+def _broker_confirmed_nonexecution(order: dict, requested: int) -> int:
+    """Count only KIS-proven rejected/cancelled shares, never infer from status.
+
+    An order ACK, terminal DB state, or empty broker holdings is insufficient.
+    Verify that one native daily-ccld row identifies this exact SELL order,
+    accounts for every requested share, and has no live remaining quantity.
+    """
+    raw = order.get("response_json") or order.get("broker_confirmation") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return 0
+    if not isinstance(raw, dict):
+        return 0
+    row = raw.get("kis_row") or (
+        (raw.get("_reconcile_observation") or {}).get("kis_row")
+        if isinstance(raw.get("_reconcile_observation"), dict) else None
+    )
+    if not isinstance(row, dict):
+        # Root-level raw KIS daily-ccld rows are also acceptable.
+        row = raw
+    status = str(order.get("status") or "").upper()
+    terminal_statuses = {
+        "CANCELED", "CANCELLED", "REJECTED", "PARTIAL_CANCELED",
+        "PARTIALLY_CANCELED", "PARTIAL_CANCELLED", "RECONCILED",
+        "PARTIAL_FILLED",
+    }
+    if status not in terminal_statuses:
+        return 0
+    order_no = str(order.get("kis_odno") or "").strip()
+    row_no = str(row.get("odno") or "").strip()
+    if not order_no or not row_no or order_no.zfill(10) != row_no.zfill(10):
+        return 0
+    if str(row.get("sll_buy_dvsn_cd") or "") != "01":
+        return 0
+    if str(order.get("code") or "").zfill(6) != str(row.get("pdno") or "").zfill(6):
+        return 0
+    required = ("ord_qty", "tot_ccld_qty", "cncl_cfrm_qty", "rjct_qty", "rmn_qty")
+    if any(row.get(key) in (None, "") for key in required):
+        return 0
+    values = {}
+    for key in required:
+        try:
+            value = int(str(row[key]).strip())
+        except (ValueError, TypeError):
+            return 0
+        if value < 0:
+            return 0
+        values[key] = value
+    cancelled = values["cncl_cfrm_qty"]
+    rejected = values["rjct_qty"]
+    executed = values["tot_ccld_qty"]
+    if values["ord_qty"] != requested or values["rmn_qty"] != 0:
+        return 0
+    if not cancelled and not rejected:
+        return 0
+    if executed + cancelled + rejected != requested:
+        return 0
+    return cancelled + rejected
+
+
 def audit_sell_settlement(
     *, orders: list[dict], fills: list[dict], positions: list[dict],
 ) -> dict[str, Any]:
@@ -43,6 +106,10 @@ def audit_sell_settlement(
         inspected += 1
         order_id = str(order.get("order_id") or "")
         requested = _number(order.get("qty"))
+        broker_nonexecution = _broker_confirmed_nonexecution(order, requested)
+        # Only the KIS-confirmed unexecuted part is exempt from priced fills.
+        # A cancelled/rejected DB status alone can never hide executed shares.
+        required_priced_qty = requested - broker_nonexecution
         rows = by_order.get(order_id, [])
         # Per-order KIS cumulative snapshots must never be summed. Individual
         # trade executions can be summed only in their own evidence lane.
@@ -60,7 +127,7 @@ def audit_sell_settlement(
         position = pos_by_cycle.get(str(order.get("position_cycle_id") or ""), {})
         closed = str(position.get("status") or "").upper() == "CLOSED"
         pending_reason = str(position.get("closed_reason") or "").upper() == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING"
-        missing_qty = max(0, requested - durable_qty)
+        missing_qty = max(0, required_priced_qty - durable_qty)
         # An order status, even FILLED, cannot substitute for native priced fills.
         if missing_qty or pending_reason:
             gaps.append({
@@ -70,6 +137,8 @@ def audit_sell_settlement(
                 "kis_odno": order.get("kis_odno"),
                 "order_status": order.get("status"),
                 "requested_sell_qty": requested,
+                "broker_confirmed_nonexecution_qty": broker_nonexecution,
+                "required_priced_sell_qty": required_priced_qty,
                 "durable_priced_sell_qty": durable_qty,
                 "missing_priced_sell_qty": missing_qty,
                 "db_position_closed": closed,
@@ -116,7 +185,7 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
     # label as strategy owner or settlement authority.
     for row in orders:
         try:
-            raw = json.loads(row.pop("response_json") or "{}")
+            raw = json.loads(row.get("response_json") or "{}")
             row["name"] = raw.get("prdt_name") or row.get("code")
         except (ValueError, TypeError):
             row["name"] = row.get("code")
