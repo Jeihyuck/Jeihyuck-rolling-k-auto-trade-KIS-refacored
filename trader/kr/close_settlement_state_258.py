@@ -13,6 +13,7 @@ def assess_close_economic_settlement(
     *, accepted_policy_sells: int,
     postsubmit_reconcile_ok: bool,
     audit_report: dict[str, Any] | None,
+    audit_attempted: bool = False,
 ) -> dict[str, Any]:
     """Classify a close run using durable priced SELL fills, never ACK status."""
     accepted = max(0, int(accepted_policy_sells or 0))
@@ -28,7 +29,12 @@ def assess_close_economic_settlement(
     if accepted == 0 and audit_proven:
         state = "NO_NEW_SELL_PRICED_EVIDENCE_MATCHED"
     elif accepted == 0 and not report:
-        state = "NO_NEW_SELL_SETTLEMENT_UNCHECKED"
+        # A live audit that failed to return evidence is *not* an intentional
+        # dry-run skip. Do not silently report OK after the broker lookup fails.
+        state = (
+            "ECONOMIC_SETTLEMENT_PENDING" if audit_attempted
+            else "NO_NEW_SELL_SETTLEMENT_UNCHECKED"
+        )
     elif postsubmit_reconcile_ok and audit_proven:
         state = "ECONOMIC_SETTLED"
     else:
@@ -40,6 +46,7 @@ def assess_close_economic_settlement(
     return {
         "economic_settlement_state": state,
         "economic_settlement_pending": int(state == "ECONOMIC_SETTLEMENT_PENDING"),
+        "economic_audit_attempted": int(bool(audit_attempted)),
         "postsubmit_reconcile_ok": int(bool(postsubmit_reconcile_ok)),
         "native_priced_sell_gap_count": gap_count,
         "native_sell_orders_checked": checked,
