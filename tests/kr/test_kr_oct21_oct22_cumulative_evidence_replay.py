@@ -307,3 +307,136 @@ def test_two_independent_cumulative_writers_and_restart_keep_one_fill(tmp_path):
     assert len(records) == 1
     assert records[0]["qty"] == 17
     restarted.dispose()
+
+
+def test_kr_oct23_same_broker_notional_replay_survives_postgres_real_rounding():
+    """Regression: 053800 BUY 12 x REAL(90308.3359375) vs KIS 1,083,700.
+
+    A broker-identical replay must not raise SAME_QTY_NOTIONAL_CONFLICT;
+    genuine different broker cumulative amounts must still fail closed.
+    No broker network or operational DB is accessed.
+    """
+    import struct
+    import uuid
+    import sqlalchemy as sa
+
+    from trader.db.repos import FillsRepo
+    from trader.db.schema import schema_for_engine
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+
+    db = sa.create_engine("sqlite:///:memory:")
+    create_schema_with_active_test_epoch(db)
+    repo = FillsRepo(db)
+    row = {
+        "ord_dt": "20261023", "odno": "0000012427", "pdno": "053800",
+        "sll_buy_dvsn_cd": "02", "tot_ccld_qty": "12",
+        "tot_ccld_amt": "1083700", "avg_prvs": "90308",
+    }
+    args = dict(
+        env="practice", run_id=None, order_id=str(uuid.uuid4()),
+        kis_odno=row["odno"],
+        trade_id="KR_KIS_CUM:fixture:20261023:0000012427:053800:BUY",
+        code="053800", market="KOSDAQ", side="BUY",
+        qty=12, price=1083700.0 / 12, fee=0, tax=0,
+        filled_at=datetime(2026, 10, 23, 9, 36, 3, tzinfo=ZoneInfo("Asia/Seoul")),
+        raw_json={"kis_response": row},
+        fill_meta_json={
+            "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+            "fill_source": "daily_ccld_order_cumulative",
+        },
+    )
+    repo.upsert_fill(**args)
+    schema = schema_for_engine(db)
+    # SQLite ordinarily stores DOUBLE; emulate a REAL column readback exactly.
+    persisted_real = struct.unpack("!f", struct.pack("!f", args["price"]))[0]
+    assert abs(persisted_real * 12 - 1083700) > 0.01
+    with db.begin() as conn:
+        conn.execute(
+            sa.update(schema.fills)
+            .where(schema.fills.c.broker_fill_id == args["trade_id"])
+            .values(price=persisted_real)
+        )
+
+    repo.upsert_fill(**args)
+    with db.connect() as conn:
+        rows = conn.execute(
+            sa.select(schema.fills).where(schema.fills.c.broker_fill_id == args["trade_id"])
+        ).mappings().all()
+    assert len(rows) == 1
+    assert rows[0]["qty"] == 12
+
+    # Same quantity with a different authoritative KIS amount is NOT rounding.
+    changed = dict(args)
+    changed["raw_json"] = {"kis_response": {**row, "tot_ccld_amt": "1084700"}}
+    changed["price"] = 1084700.0 / 12
+    with pytest.raises(RuntimeError, match="KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT"):
+        repo.upsert_fill(**changed)
+    db.dispose()
+
+
+def test_cumulative_atomic_fence_compares_original_notional_not_real_rounded_avg():
+    """An additional share with positive KRW notional cannot be rejected by
+    an earlier PostgreSQL REAL stored average rounding *up*.
+
+    This isolated SQLite fixture emulates PG REAL readback; the authoritative
+    SQL predicate is also exercised in the PostgreSQL acceptance workflow.
+    """
+    import struct
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.repos import FillsRepo
+    from trader.db.schema import schema_for_engine
+    from tests.kr.execution_claim_fixtures import create_schema_with_active_test_epoch
+
+    db = sa.create_engine("sqlite:///:memory:")
+    create_schema_with_active_test_epoch(db)
+    repo = FillsRepo(db)
+    schema = schema_for_engine(db)
+    order_id = str(uuid.uuid4())
+    trade_id = "KR_KIS_CUM:fixture:20261023:0000015000:053800:BUY"
+    row = {"tot_ccld_qty": "300", "tot_ccld_amt": "300000012"}
+    common = dict(
+        env="practice", run_id=None, order_id=order_id,
+        kis_odno="0000015000", trade_id=trade_id,
+        code="053800", market="KOSDAQ", side="BUY",
+        fee=0.0, tax=0.0,
+        filled_at=datetime(2026, 10, 23, 9, 36, tzinfo=ZoneInfo("Asia/Seoul")),
+        fill_meta_json={
+            "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+            "fill_source": "daily_ccld_order_cumulative",
+        },
+    )
+    first_price = 300000012 / 300
+    repo.upsert_fill(**common, qty=300, price=first_price,
+                     raw_json={"kis_response": row})
+    stored_real = struct.unpack("!f", struct.pack("!f", first_price))[0]
+    assert stored_real * 300 > 300000012 + 1  # legacy fence falsely rejects +1
+    with db.begin() as conn:
+        conn.execute(
+            sa.update(schema.fills)
+            .where(schema.fills.c.broker_fill_id == trade_id)
+            .values(price=stored_real)
+        )
+    next_row = {**row, "tot_ccld_qty": "301", "tot_ccld_amt": "300000013"}
+    repo.upsert_fill(
+        **common, qty=301, price=300000013 / 301,
+        raw_json={"kis_response": next_row},
+    )
+    with db.connect() as conn:
+        saved = conn.execute(
+            sa.select(schema.fills).where(schema.fills.c.broker_fill_id == trade_id)
+        ).mappings().one()
+    assert saved["qty"] == 301
+    assert saved["raw_json"]["kis_response"]["tot_ccld_amt"] == "300000013"
+
+    # Older snapshots cannot overwrite the authoritative newer evidence.
+    repo.upsert_fill(
+        **common, qty=300, price=first_price,
+        raw_json={"kis_response": row},
+    )
+    with db.connect() as conn:
+        saved = conn.execute(
+            sa.select(schema.fills).where(schema.fills.c.broker_fill_id == trade_id)
+        ).mappings().one()
+    assert saved["qty"] == 301
+    db.dispose()
