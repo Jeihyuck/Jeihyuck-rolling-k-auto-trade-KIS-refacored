@@ -158,25 +158,29 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
     if not epoch or not day:
         raise ValueError("Trading epoch and local trade date are mandatory")
     from sqlalchemy import text
-    # All SQL is SELECT-only. An epoch is required to prevent matching an old
-    # practice account position with a new broker account's SELL.
+    # All SQL is SELECT-only. The exact trading epoch isolates the account;
+    # the date is an *as-of* cutoff, not a lower bound. Previous-day SELL gaps
+    # must remain visible until native economic settlement has been proven.
     with engine.connect() as conn:
         orders = [dict(x) for x in conn.execute(text("""
             SELECT order_id, code, side, status, qty, kis_odno,
                    position_cycle_id, response_json
             FROM public.orders
             WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
-              AND created_at >= :start_utc AND created_at < :end_utc
+              AND created_at < :end_utc
         """), {
             "env": env, "epoch": epoch,
-            "start_utc": __import__("datetime").datetime.combine(day, __import__("datetime").time.min, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=9))).astimezone(__import__("datetime").timezone.utc),
             "end_utc": __import__("datetime").datetime.combine(day + timedelta(days=1), __import__("datetime").time.min, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=9))).astimezone(__import__("datetime").timezone.utc),
         }).mappings()]
         fills = [dict(x) for x in conn.execute(text("""
             SELECT order_id, side, qty, price,
                    fill_meta_json ->> 'evidence_kind' AS evidence_kind
             FROM public.fills WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
-        """), {"env": env, "epoch": epoch}).mappings()]
+              AND filled_at < :end_utc
+        """), {
+            "env": env, "epoch": epoch,
+            "end_utc": __import__("datetime").datetime.combine(day + timedelta(days=1), __import__("datetime").time.min, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=9))).astimezone(__import__("datetime").timezone.utc),
+        }).mappings()]
         positions = [dict(x) for x in conn.execute(text("""
             SELECT code, position_cycle_id, status, qty, closed_reason
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
