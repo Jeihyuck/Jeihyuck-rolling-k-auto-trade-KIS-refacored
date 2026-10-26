@@ -6127,7 +6127,8 @@ def run_once(
             assess_close_economic_settlement, audit_close_priced_sell_evidence,
         )
         close_audit = None
-        if not parse_bool_any(dry_run, default=True):
+        close_audit_attempted = not parse_bool_any(dry_run, default=True)
+        if close_audit_attempted:
             try:
                 close_audit = audit_close_priced_sell_evidence(
                     engine=engine, env=env_effective, day=now_kst().date(),
@@ -6143,6 +6144,7 @@ def run_once(
             accepted_policy_sells=accepted_policy_sells,
             postsubmit_reconcile_ok=postsubmit_reconcile_ok,
             audit_report=close_audit,
+            audit_attempted=close_audit_attempted,
         )
         logger.warning(
             "[KR_CLOSE][ECONOMIC_SETTLEMENT][TERMINAL] state=%s "
