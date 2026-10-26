@@ -6873,21 +6873,25 @@ def run_once(
                     prove_protective_sell_only_preflight,
                 )
                 _preflight_started = time_mod.monotonic()
-                pre_exit_exact_proof, _handoff_reason = prove_safe_protective_sell_handoff(
+                # SELLS FIRST: the narrow proof uses a fresh KIS balance,
+                # durable claim/order health, current account/epoch, and owner
+                # position parity. It does NOT make the expensive dated
+                # full KIS order history query in the protected SELL hot path.
+                sell_only_lane, _handoff_reason = prove_protective_sell_only_preflight(
                     engine=engine, kis=kis, env=env_effective,
                     strategy="pb1_pullback_close", trade_date=trade_date,
                     balance_snapshot=balance_snapshot_raw,
                 )
-                deferred_full_reconcile = pre_exit_exact_proof
+                deferred_full_reconcile = sell_only_lane
                 if not deferred_full_reconcile:
-                    sell_only_lane, _sell_only_reason = prove_protective_sell_only_preflight(
+                    # Fallback is deliberately the original conservative
+                    # order-and-fill proof, then FULL reconcile if unresolved.
+                    pre_exit_exact_proof, _handoff_reason = prove_safe_protective_sell_handoff(
                         engine=engine, kis=kis, env=env_effective,
                         strategy="pb1_pullback_close", trade_date=trade_date,
                         balance_snapshot=balance_snapshot_raw,
                     )
-                    deferred_full_reconcile = sell_only_lane
-                    if sell_only_lane:
-                        _handoff_reason = _sell_only_reason
+                    deferred_full_reconcile = pre_exit_exact_proof
                 logger.info(
                     "[KR_RECONCILE_LANES][PRE_EXIT] deferred=%s exact=%s "
                     "sell_only=%s reason=%s elapsed_ms=%.1f owner=PB1 "

@@ -125,7 +125,9 @@ def test_proof_rejects_nonintegral_or_nonfinite_broker_quantity():
 def test_runner_preserves_sell_before_reconcile_and_post_sell_buy_fence():
     from trader import pb1_runner
     source = inspect.getsource(pb1_runner.run_once)
+    assert source.index("prove_protective_sell_only_preflight(") < source.index("prove_safe_protective_sell_handoff(")
     assert source.index("prove_protective_sell_only_preflight(") < source.index("reconcile_kis(")
+    assert source.index("if not deferred_full_reconcile:") < source.index("prove_safe_protective_sell_handoff(")
     assert "can_skip_post_exit_full_reconcile(" in source
     assert "BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS" in source
     assert '"submit_attempt_count"' in inspect.getsource(can_skip_post_exit_full_reconcile)

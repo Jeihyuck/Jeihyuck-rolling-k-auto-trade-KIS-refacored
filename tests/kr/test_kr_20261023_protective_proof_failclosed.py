@@ -62,6 +62,11 @@ def test_order_lookup_error_must_not_authorize_deferring_full_reconciliation(mon
             raise TimeoutError("simulated DB order lookup timeout")
 
     monkeypatch.setattr(gate, "OrdersRepo", StrictRepo)
+    monkeypatch.setattr(gate, "get_account_key", lambda **kwargs: "account-A")
+    monkeypatch.setattr(
+        "trader.kr.reconcile_lanes_257.prove_no_kr_infinite_unresolved",
+        lambda **kwargs: (True, "NO_PENDING_CURRENT_EPOCH"),
+    )
     deferred, reason = gate.prove_safe_protective_sell_handoff(
         engine=object(), kis=object(), env="practice",
         strategy="pb1_pullback_close",
