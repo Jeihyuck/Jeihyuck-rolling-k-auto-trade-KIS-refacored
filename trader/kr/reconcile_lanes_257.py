@@ -1,22 +1,76 @@
 """PR257 post-exit settlement policy: strict, read-only fastpath decision.
 
-No order is authorized by this gate. It only decides whether the expensive
-historical reconcile MAY be skipped when TWO independent exact KIS/ledger
-proofs bracket a tick that did not submit or attempt a PB1 protective SELL.
+No order is authorized by this gate. It only decides whether expensive
+historical reconciliation MAY be skipped for a SELL-free tick when a
+pre-exit narrow broker/account/epoch/owner proof, post-exit exact cumulative
+KIS/DB economic proof and identical pre/post broker holdings all exist.
+An exact pre-exit proof is still supported but is not required in the
+narrow-proof fast path. Any uncertainty runs normal full reconciliation.
 """
 from __future__ import annotations
 from typing import Any
+
+
+def _balance_holdings_quantities(snapshot: Any) -> tuple[tuple[str, int], ...] | None:
+    """Strict account-wide broker holding quantities for no-SELL parity.
+
+    Both snapshots must be independent KIS readings. Reject fractional,
+    negative, missing, duplicate and malformed quantities. Include the
+    reserved KR_INFINITE sleeve (122630) to prevent cross-owner drift.
+    """
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("output1"), list):
+        return None
+    from decimal import Decimal, InvalidOperation
+
+    seen: dict[str, int] = {}
+    for row in snapshot["output1"]:
+        if not isinstance(row, dict):
+            return None
+        raw_code = str(row.get("pdno") or row.get("code") or "").strip()
+        if raw_code.startswith("A"):
+            raw_code = raw_code[1:]
+        if not raw_code.isdigit() or len(raw_code) > 6:
+            return None
+        code = raw_code.zfill(6)
+        if code == "000000" or code in seen:
+            return None
+        raw_qty = row.get("hldg_qty")
+        if raw_qty is None:
+            return None
+        try:
+            value = Decimal(str(raw_qty))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        if not value.is_finite() or value < 0 or value != value.to_integral_value():
+            return None
+        seen[code] = int(value)
+    return tuple(sorted((code, qty) for code, qty in seen.items() if qty > 0))
 
 
 def can_skip_post_exit_full_reconcile(
     *, pre_exit_exact: bool, post_exit_exact: bool,
     exit_pass_ok: bool, exit_summary: dict[str, Any] | None,
     account_reset_mode: bool = False,
+    pre_exit_sell_only: bool = False,
+    pre_exit_balance: dict[str, Any] | None = None,
+    post_exit_balance: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     if account_reset_mode:
         return False, "ACCOUNT_RESET_REQUIRES_FULL_RECONCILE"
-    if not pre_exit_exact or not post_exit_exact:
-        return False, "TWO_SIDED_EXACT_BROKER_PROOF_REQUIRED"
+    if not post_exit_exact:
+        return False, "POST_EXIT_EXACT_BROKER_PROOF_REQUIRED"
+    if not pre_exit_exact:
+        # Strict narrow preflight proves account/epoch, zero pending
+        # PB1/KR_INFINITE claims and exact strategy holdings parity.
+        # The AFTER-exit exact broker proof supplies historical economic truth.
+        if not pre_exit_sell_only:
+            return False, "PRE_EXIT_SAFE_BROKER_PROOF_REQUIRED"
+        before = _balance_holdings_quantities(pre_exit_balance)
+        after = _balance_holdings_quantities(post_exit_balance)
+        if before is None or after is None:
+            return False, "PRE_POST_BROKER_BALANCE_MALFORMED"
+        if before != after:
+            return False, "PRE_POST_BROKER_BALANCE_CHANGED"
     if not exit_pass_ok or not isinstance(exit_summary, dict):
         return False, "EXIT_PASS_NOT_PROVEN"
     try:
@@ -33,7 +87,10 @@ def can_skip_post_exit_full_reconcile(
         return False, "EXIT_SUMMARY_NEGATIVE"
     if checked < holdings or blocked or any((attempts, accepted, fills, submitted)):
         return False, "EXIT_ACTIVITY_REQUIRES_POST_RECONCILE"
-    return True, "TWO_SIDED_EXACT_PROOF_NO_SELL_SKIP_HISTORICAL_RECOVERY"
+    return True, (
+        "TWO_SIDED_EXACT_PROOF_NO_SELL_SKIP_HISTORICAL_RECOVERY"
+        if pre_exit_exact else "SELL_ONLY_PLUS_POST_EXACT_NO_SELL_SKIP_HISTORICAL_RECOVERY"
+    )
 
 
 

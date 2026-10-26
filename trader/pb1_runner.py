@@ -7435,18 +7435,20 @@ def run_once(
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
-            # Protected SELL has been offered to every PB1 holder. For a
-            # clean, exact pretrade proof only, full economic reconciliation
-            # moves here. This executes before KR_INFINITE BUY and PB1 BUY,
-            # preserving identical post-reconciliation entry safety gates.
+            # PB1 protected SELLs have been offered. For either an exact
+            # pretrade proof OR a proven narrow SELL-only preflight, the
+            # post-exit KIS proof is obtained BEFORE any KR_INFINITE/PB1 BUY.
+            # No SELL, unchanged broker balances and post-exit exact economic
+            # evidence together permit skipping duplicated FULL reconciliation.
             engine_runner._kr_post_exit_reconcile_ok = True
             if deferred_full_reconcile:
                 _post_started = time_mod.monotonic()
                 _skip_post_full = False
-                # An exact proof on BOTH sides of an exit pass that attempted
-                # zero SELLs permits skipping only duplicate historical work.
-                # An early SELL-only proof NEVER grants the entry fastpath.
-                if pre_exit_exact_proof and getattr(engine_runner, "_kr_exit_pass_ok", False):
+                # Unlike the old unreachable branch, a narrow proven
+                # preflight CAN reach post-exit exact proof. It never itself
+                # grants permission to skip FULL reconcile or authorize BUY.
+                if ((pre_exit_exact_proof or sell_only_lane)
+                        and getattr(engine_runner, "_kr_exit_pass_ok", False)):
                     try:
                         from trader.account_state import account_reset_mode
                         from trader.kr.reconcile_lanes_257 import can_skip_post_exit_full_reconcile
@@ -7467,6 +7469,9 @@ def run_once(
                         )
                         _skip_post_full, _fast_reason = can_skip_post_exit_full_reconcile(
                             pre_exit_exact=pre_exit_exact_proof,
+                            pre_exit_sell_only=sell_only_lane,
+                            pre_exit_balance=balance_snapshot_raw,
+                            post_exit_balance=_post_snapshot,
                             post_exit_exact=_post_exact,
                             exit_pass_ok=bool(getattr(engine_runner, "_kr_exit_pass_ok", False)),
                             exit_summary=getattr(engine_runner, "_exit_summary_payload", None),
@@ -7493,9 +7498,17 @@ def run_once(
                     )
                     reconcile_result = {
                         "ok": True,
-                        "status": "TWO_SIDED_EXACT_PROOF_NO_SELL",
+                        "status": (
+                            "TWO_SIDED_EXACT_PROOF_NO_SELL"
+                            if pre_exit_exact_proof else
+                            "PRE_SELL_SAFE_POST_SELL_EXACT_NO_SELL"
+                        ),
                         "historical_repair_fastpath": True,
-                        "reason": "EXACT_BROKER_POSITION_AND_LEDGER_PARITY",
+                        "reason": (
+                            "EXACT_BROKER_POSITION_AND_LEDGER_PARITY"
+                            if pre_exit_exact_proof else
+                            "EXACT_POST_BROKER_ECONOMICS_UNCHANGED_ACCOUNT_HOLDINGS"
+                        ),
                     }
                     db_write_reasons.append("two_sided_exact_proof_skip_historical_reconcile")
                 else:
