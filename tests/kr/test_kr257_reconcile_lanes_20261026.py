@@ -8,7 +8,9 @@ import sqlalchemy as sa
 
 from trader.db.schema import schema_for_engine
 import trader.kr.protective_sell_handoff as proof
-from trader.kr.reconcile_lanes_257 import can_skip_post_exit_full_reconcile
+from trader.kr.reconcile_lanes_257 import (
+    can_skip_post_exit_full_reconcile, prove_no_kr_infinite_unresolved,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -27,6 +29,12 @@ def test_readonly_early_sell_proof_requires_active_account_epoch(monkeypatch):
     monkeypatch.setattr(proof, "now_kst", lambda: NOW)
     monkeypatch.setattr(proof, "get_account_key", lambda **kw: "account-A")
     monkeypatch.setattr("trader.account_state.account_reset_mode", lambda: False)
+    # Existing test validates PB1 position-cycle/portfolio association; a
+    # separate regression below exercises the real KR_INFINITE intent table.
+    monkeypatch.setattr(
+        "trader.kr.reconcile_lanes_257.prove_no_kr_infinite_unresolved",
+        lambda **kwargs: (True, "KR_INFINITE_NO_OPEN_ACTIVE_EPOCH_INTENTS"),
+    )
     engine = sa.create_engine("sqlite:///:memory:")
     tables = schema_for_engine(engine)
     tables.metadata.create_all(engine)
@@ -121,3 +129,64 @@ def test_runner_preserves_sell_before_reconcile_and_post_sell_buy_fence():
     assert "can_skip_post_exit_full_reconcile(" in source
     assert "BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS" in source
     assert '"submit_attempt_count"' in inspect.getsource(can_skip_post_exit_full_reconcile)
+
+
+
+def test_cross_owner_active_epoch_pending_intent_blocks_pb1_optimization(monkeypatch):
+    from sqlalchemy import text
+    monkeypatch.setattr(
+        "trader.db.trading_epoch.get_account_key", lambda **kwargs: "account-A",
+    )
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE trading_epochs(
+                trading_epoch_id TEXT, env TEXT, account_id TEXT,
+                status TEXT, started_at TEXT, created_at TEXT
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE kr_infinite_order_intents(
+                trading_epoch_id TEXT NOT NULL, status TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO trading_epochs VALUES
+            ('epoch-a', 'practice','account-A','ACTIVE','2026-10-26','2026-10-26'),
+            ('epoch-old', 'practice','account-A','ENDED','2026-10-22','2026-10-22')
+        """))
+        conn.execute(text("""
+            INSERT INTO kr_infinite_order_intents VALUES ('epoch-old', 'SUBMITTED')
+        """))
+    kwargs = {"engine": engine, "env": "practice", "account_id": "account-A"}
+    assert prove_no_kr_infinite_unresolved(**kwargs)[0] is True
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO kr_infinite_order_intents VALUES ('epoch-a', 'RECONCILE_PENDING')
+        """))
+    allowed, reason = prove_no_kr_infinite_unresolved(**kwargs)
+    assert not allowed and reason == "KR_INFINITE_UNRESOLVED_ORDERS"
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE kr_infinite_order_intents SET status='FILLED'
+            WHERE trading_epoch_id='epoch-a'
+        """))
+    assert prove_no_kr_infinite_unresolved(**kwargs)[0] is True
+    engine.dispose()
+
+
+def test_cross_owner_missing_epoch_table_fails_closed():
+    engine = sa.create_engine("sqlite:///:memory:")
+    allowed, reason = prove_no_kr_infinite_unresolved(
+        engine=engine, env="practice", account_id="account-A",
+    )
+    assert allowed is False
+    assert reason.startswith("KR_INFINITE_INTENT_READ_FAILED_")
+    engine.dispose()
+
+
+def test_cross_owner_proof_in_both_protective_sell_lanes():
+    src = inspect.getsource(proof.prove_protective_sell_only_preflight)
+    exact = inspect.getsource(proof.prove_safe_protective_sell_handoff)
+    assert "prove_no_kr_infinite_unresolved(" in src
+    assert "prove_no_kr_infinite_unresolved(" in exact

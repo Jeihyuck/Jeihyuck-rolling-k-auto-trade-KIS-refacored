@@ -83,6 +83,13 @@ def prove_protective_sell_only_preflight(
         from trader.account_state import account_reset_mode
         if account_reset_mode():
             return False, "ACCOUNT_RESET_MODE_REQUIRES_FULL_RECONCILE"
+        from trader.kr.reconcile_lanes_257 import prove_no_kr_infinite_unresolved
+        account_key = get_account_key(env=env, kis=kis)
+        other_owner_clean, other_reason = prove_no_kr_infinite_unresolved(
+            engine=engine, env=env, account_id=account_key,
+        )
+        if not other_owner_clean:
+            return False, other_reason
         orders = OrdersRepo(engine)
         if orders.get_open_orders(env, include_stale=True, fail_open=False):
             return False, "OPEN_OR_UNRESOLVED_ORDER"
@@ -154,6 +161,13 @@ def prove_safe_protective_sell_handoff(
         valid, freshness_reason = _fresh_balance_evidence(balance_snapshot)
         if not valid:
             return False, freshness_reason
+        from trader.kr.reconcile_lanes_257 import prove_no_kr_infinite_unresolved
+        account_key = get_account_key(env=env, kis=kis)
+        other_owner_clean, other_reason = prove_no_kr_infinite_unresolved(
+            engine=engine, env=env, account_id=account_key,
+        )
+        if not other_owner_clean:
+            return False, other_reason
         orders_repo = OrdersRepo(engine)
         # The global practice default can return [] on a DB timeout.
         # This proof authorizes deferring full reconciliation; an unknown
