@@ -2794,7 +2794,7 @@ def _compute_session_marker_payload(
     entry_done = entry_status_u in {"DONE", "OK", "OK_NO_TRADE", "SKIPPED_BY_POLICY"} and not entry_abort_reason
     completed = int(
         int(exit_code) == 0
-        and status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"}
+        and status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE", "OK_CLOSE_POLICY"}
         and entry_done
         and not fatal_error
     )
@@ -2880,7 +2880,9 @@ def normalize_session_result(
             retryable=1,
             exit_reason="ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
         )
-    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"})
+    # Close ACK is a finished *submission* session; economic truth is tracked
+    # independently and must not trigger duplicate close SELL retries.
+    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE", "OK_CLOSE_POLICY"})
     return NormalizedSessionResult(
         status=status_u,
         reason=str(reason or ""),
@@ -6061,6 +6063,7 @@ def run_once(
         # once more and persist ONLY execution details proved by that feed.
         # No order is created/retried here. A missing broker price must stay
         # unresolved; accepted KIS order IDs alone are not filled orders.
+        postsubmit_reconcile_ok = False
         if (
             accepted_policy_sells > 0
             and kis is not None
@@ -6081,6 +6084,7 @@ def run_once(
                     dry_run=False,
                 )
                 post_result = reconcile_today(engine=engine, kis=kis, ctx=post_ctx, require_authoritative=True) or {}
+                postsubmit_reconcile_ok = bool(post_result.get("ok")) and not bool(post_result.get("degraded"))
                 logger.info(
                     "[KR_CLOSE][POSTSUBMIT_RECONCILE] accepted=%s broker_rows=%s "
                     "fills_added=%s ok=%s ccld_status=%s degraded=%s "
@@ -6119,9 +6123,41 @@ def run_once(
                     "[KR_CLOSE][SELL_EVIDENCE_QUEUE][READ_FAIL] err_type=%s "
                     "action=RETAIN_PENDING_NO_RETRY", type(exc).__name__,
                 )
+        from trader.kr.close_settlement_state_258 import (
+            assess_close_economic_settlement, audit_close_priced_sell_evidence,
+        )
+        close_audit = None
+        close_audit_attempted = not parse_bool_any(dry_run, default=True)
+        if close_audit_attempted:
+            try:
+                close_audit = audit_close_priced_sell_evidence(
+                    engine=engine, env=env_effective, day=now_kst().date(),
+                )
+            except Exception as exc:
+                # Fail closed on unknown economic truth, but never resubmit SELL.
+                logger.error(
+                    "[KR_CLOSE][ECONOMIC_SETTLEMENT][AUDIT_FAIL] err_type=%s "
+                    "state=ECONOMIC_SETTLEMENT_PENDING action=NO_SELL_RETRY",
+                    type(exc).__name__, exc_info=True,
+                )
+        settlement_metrics = assess_close_economic_settlement(
+            accepted_policy_sells=accepted_policy_sells,
+            postsubmit_reconcile_ok=postsubmit_reconcile_ok,
+            audit_report=close_audit,
+            audit_attempted=close_audit_attempted,
+        )
+        logger.warning(
+            "[KR_CLOSE][ECONOMIC_SETTLEMENT][TERMINAL] state=%s "
+            "accepted_ack=%s postsubmit_ok=%s native_gap=%s "
+            "action=KEEP_ORDER_IDEMPOTENCY_NO_SELL_RETRY",
+            settlement_metrics["economic_settlement_state"],
+            accepted_policy_sells, int(postsubmit_reconcile_ok),
+            settlement_metrics["native_priced_sell_gap_count"],
+        )
         close_run_repo.finish_run(
-            close_run_id, status="OK",
-            notes="CLOSE_POLICY_ACK_ONLY_NOT_ECONOMIC_FILL",
+            close_run_id,
+            status="PENDING_SETTLEMENT" if settlement_metrics["economic_settlement_pending"] else "OK",
+            notes=settlement_metrics["economic_settlement_state"],
         )
         return [], True, {
             "buy_orders": 0,
@@ -6129,6 +6165,7 @@ def run_once(
             "sell_orders_ack": accepted_policy_sells,
             "policy_sell_candidates": len(policy_orders),
             "exit_evaluated_positions": evaluated_positions,
+            **settlement_metrics,
             "warning_counts": {},
         }, phase_for_log, "OK_CLOSE_POLICY"
 
@@ -7135,12 +7172,28 @@ def run_once(
                 "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
                 len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
             )
+            # This legacy close path has no post-submit economic proof.  An
+            # accepted KIS request is not a native priced fill, so preserve a
+            # visibly pending settlement state without issuing another SELL.
+            from trader.kr.close_settlement_state_258 import assess_close_economic_settlement
+            settlement_metrics = assess_close_economic_settlement(
+                accepted_policy_sells=accepted_policy_sells,
+                postsubmit_reconcile_ok=False,
+                audit_report=None,
+            )
+            if settlement_metrics["economic_settlement_pending"]:
+                logger.warning(
+                    "[KR_CLOSE][ECONOMIC_SETTLEMENT][TERMINAL] state=%s "
+                    "accepted_ack=%s action=NO_SELL_RETRY",
+                    settlement_metrics["economic_settlement_state"], accepted_policy_sells,
+                )
             return [], True, {
                 "buy_orders": 0,
                 "sell_orders": accepted_policy_sells,
                 "sell_orders_ack": accepted_policy_sells,
                 "policy_sell_candidates": len(policy_orders),
                 "exit_evaluated_positions": evaluated_positions,
+                **settlement_metrics,
                 "warning_counts": {},
             }, phase_for_log, "OK_CLOSE_POLICY"
 
@@ -9576,15 +9629,27 @@ def main() -> int:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
-        # On CLOSE exceptions, mark any registered run terminal before
-        # writing the session summary; never create a placeholder here.
+        # A successful broker ACK closes only the submission lifecycle.
+        # Preserve economic PENDING even in this outer finalizer; never
+        # overwrite the more precise state written by the close owner path.
         if _resolve_session_kind() == "close" and os.getenv("TRADER_RUN_ID"):
             try:
+                close_ack_ok = result_status == "OK_CLOSE_POLICY"
+                close_pending = bool(metrics.get("economic_settlement_pending", 1))
+                close_state = str(
+                    metrics.get("economic_settlement_state")
+                    or "ECONOMIC_SETTLEMENT_UNPROVEN"
+                )
                 RunsRepo(engine).finish_run(
                     os.environ["TRADER_RUN_ID"],
-                    status="OK" if result_status == "OK_CLOSE_POLICY" else "ERROR",
-                    notes="CLOSE_ACK_SEPARATE_FROM_ECONOMIC_SETTLEMENT",
+                    status=(
+                        "PENDING_SETTLEMENT" if close_ack_ok and close_pending
+                        else "OK" if close_ack_ok else "ERROR"
+                    ),
+                    notes=close_state,
                 )
+                if close_ack_ok:
+                    main_exit_reason = close_state
             except Exception:
                 logger.exception("[KR_CLOSE][RUN_TERMINAL][FAIL] preserve_unresolved=1")
         os.environ["PB1_LAST_RESULT_STATUS"] = str(result_status)
@@ -9617,6 +9682,11 @@ def main() -> int:
             "exit_reason": main_exit_reason,
             "sell_orders_ack": int(metrics.get("sell_orders_ack", metrics.get("sell_orders", 0)) or 0),
             "sell_orders": int(metrics.get("sell_orders", 0) or 0),
+            "economic_settlement_state": str(metrics.get("economic_settlement_state") or "NOT_CHECKED"),
+            "economic_settlement_pending": int(metrics.get("economic_settlement_pending", 0) or 0),
+            "native_priced_sell_gap_count": int(metrics.get("native_priced_sell_gap_count", -1)),
+            "postsubmit_reconcile_ok": int(metrics.get("postsubmit_reconcile_ok", 0) or 0),
+            "native_sell_orders_checked": int(metrics.get("native_sell_orders_checked", 0) or 0),
             "exit_evaluated_positions": int(metrics.get("exit_evaluated_positions", 0) or 0),
             "order_candidates": int(metrics.get("order_candidates", 0) or 0),
             "api_submitted": int(metrics.get("api_submitted", 0) or 0),

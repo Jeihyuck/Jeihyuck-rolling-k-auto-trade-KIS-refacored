@@ -1015,10 +1015,50 @@ def _horizon_to_exit_family(horizon: str) -> str:
     }.get(horizon, "SWING_STAGED_EXIT")
 
 
+def _frozen_pb1_horizon(pos: dict[str, Any]) -> str | None:
+    """Honor a provenance-backed EntryExitPlan before legacy same-day heuristics.
+
+    The frozen entry contract uses DAY_TRADE/SWING/CORE, whereas the PB1
+    exit router uses DAY_PROTECT/SWING_CARRY/CORE_CARRY.  Never guess
+    DAY_TRADE from the entry style or a mere SWING_BOOK container label.
+    """
+    import json as _json
+
+    def _mapping(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = _json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except (TypeError, ValueError):
+                return {}
+        return {}
+
+    meta = _mapping(pos.get("position_meta"))
+    plan = _mapping(pos.get("entry_exit_plan_json"))
+    if not plan:
+        plan = _mapping(meta.get("entry_exit_plan"))
+    entry_meta = _mapping(pos.get("entry_meta_json"))
+    mapping = {
+        "DAY_TRADE": "DAY_PROTECT",
+        "SWING": "SWING_CARRY",
+        "CORE": "CORE_CARRY",
+    }
+    for source in (plan, pos, entry_meta, meta):
+        frozen = str(source.get("trade_horizon") or "").strip().upper()
+        if frozen in mapping:
+            return mapping[frozen]
+    return None
+
+
 def _resolve_position_horizon(pos: dict[str, Any], now_kst_date: Any | None = None) -> str:
     """Resolve only proven horizons; POLICY_MISSING never falls back to SWING."""
     if _position_policy_missing_contract(pos):
         return "POLICY_MISSING"
+    frozen = _frozen_pb1_horizon(pos)
+    if frozen is not None:
+        return frozen
     meta = pos.get("position_meta") or {}
     if isinstance(meta, str):
         try:
@@ -1059,6 +1099,16 @@ def _resolve_position_book(pos: dict[str, Any]) -> str:
     """Resolve only a proven book; missing policy is an explicit sentinel."""
     if _position_policy_missing_contract(pos):
         return "POLICY_MISSING"
+    frozen = _frozen_pb1_horizon(pos)
+    if frozen is not None:
+        # A frozen DAY_TRADE policy is a DAY_BOOK even if a legacy container
+        # erroneously says SWING_BOOK.  The exit policy, not storage book,
+        # determines whether the -2% day-protection gate is active.
+        return {
+            "DAY_PROTECT": "DAY_BOOK",
+            "SWING_CARRY": "SWING_BOOK",
+            "CORE_CARRY": "CORE_BOOK",
+        }[frozen]
     import json as _json
     entry_meta = pos.get("entry_meta_json") or {}
     if isinstance(entry_meta, str):

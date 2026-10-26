@@ -405,5 +405,8 @@ def install_final_review_guards() -> None:
     # runtime, so replacing it here upgrades the active linker without touching
     # strategy decisions or the SELL atomic path.
     review._link_unowned_daily_fills_fixed = _link_buy_fills_retry_safe
+    # The last installed health guard must use only this account's active epoch.
+    from trader.kr.epoch_scoped_health_20261026 import health_after_reconcile
+    base._health_after_reconcile = health_after_reconcile
     _INSTALLED = True
     logger.info("[KR_BROKER_TRUTH][FINAL_REVIEW_GUARDS][INSTALLED]")

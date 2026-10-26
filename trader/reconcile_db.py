@@ -10,6 +10,8 @@ import sqlalchemy as sa
 
 from trader.runtime_paths import runtime_path
 from trader.db.schema import schema_for_engine
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
+from trader.account_state import get_account_key
 
 logger = logging.getLogger(__name__)
 RECONCILE_GUARD_FILE = runtime_path("runtime", "reconcile_guard.json")
@@ -170,6 +172,15 @@ def close_stale_positions_guarded(
         open_conditions.append(schema.positions.c.status == "OPEN")
 
     with engine.connect() as conn:
+        # Only the current trading epoch may be reconciled against this account.
+        active_epoch = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if active_epoch is not None:
+            open_conditions.append(schema.positions.c.trading_epoch_id == active_epoch)
+        elif trading_epoch_enforced():
+            raise RuntimeError("KR_STALE_POSITION_ACTIVE_EPOCH_REQUIRED")
         open_rows = [
             dict(row)
             for row in conn.execute(
@@ -213,6 +224,7 @@ def close_stale_positions_guarded(
                     schema.orders.c.env == env,
                     schema.orders.c.strategy == strategy,
                     schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"]),
+                    *([schema.orders.c.trading_epoch_id == active_epoch] if active_epoch is not None else []),
                 )
             )
         ).mappings().all()
@@ -328,6 +340,8 @@ def close_stale_positions_guarded(
                     schema.positions.c.code == code,
                     schema.positions.c.qty == db_qty_before,
                 ]
+                if active_epoch is not None:
+                    conditions.append(schema.positions.c.trading_epoch_id == active_epoch)
                 if has_status:
                     values["status"] = next_status
                     conditions.append(schema.positions.c.status == "OPEN")
