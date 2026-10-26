@@ -32,3 +32,107 @@ def test_cumulative_repeated_snapshots_are_not_double_counted():
         positions=[],
     )
     assert report["gap_count"] == 0
+
+
+def _confirmed_nonexecution_order(
+    *, order_id="original", code="293490", order_no="0000034710",
+    qty=170, executed=17, cancelled=153, rejected=0, status="CANCELLED",
+):
+    import json
+
+    broker_row = {
+        "odno": order_no,
+        "pdno": code,
+        "sll_buy_dvsn_cd": "01",
+        "ord_qty": str(qty),
+        "tot_ccld_qty": str(executed),
+        "cncl_cfrm_qty": str(cancelled),
+        "rjct_qty": str(rejected),
+        "rmn_qty": "0",
+    }
+    return dict(
+        order_id=order_id, code=code, side="SELL", qty=qty,
+        status=status, kis_odno=order_no,
+        response_json=json.dumps({"kis_row": broker_row}),
+    )
+
+
+def test_broker_confirmed_cancel_replacement_sells_do_not_create_false_gap():
+    original = _confirmed_nonexecution_order(
+        order_id="cancelled", qty=170, executed=0, cancelled=170,
+    )
+    replacement = dict(
+        order_id="replacement", code="293490", side="SELL", qty=170,
+        status="FILLED", kis_odno="0000034720",
+    )
+    report = audit_sell_settlement(
+        orders=[original, replacement],
+        fills=[dict(
+            order_id="replacement", code="293490", side="SELL", qty=170,
+            price=11288, evidence_kind="KIS_ORDER_CUMULATIVE_EXECUTION",
+        )],
+        positions=[],
+    )
+    assert report["sell_orders_checked"] == 2
+    assert report["gap_count"] == 0
+    assert report["status"] == "PRICED_SELL_EVIDENCE_MATCHED"
+
+
+def test_partially_filled_cancelled_order_requires_only_native_priced_executions():
+    order = _confirmed_nonexecution_order()
+    report = audit_sell_settlement(
+        orders=[order],
+        fills=[dict(
+            order_id="original", code="293490", side="SELL", qty=17,
+            price=11292, evidence_kind="KIS_ORDER_CUMULATIVE_EXECUTION",
+        )],
+        positions=[],
+    )
+    assert report["gap_count"] == 0
+    missing = audit_sell_settlement(orders=[order], fills=[], positions=[])
+    assert missing["gap_count"] == 1
+    assert missing["gaps"][0]["required_priced_sell_qty"] == 17
+    assert missing["gaps"][0]["broker_confirmed_nonexecution_qty"] == 153
+    assert missing["gaps"][0]["missing_priced_sell_qty"] == 17
+
+
+def test_broker_confirmed_full_rejection_requires_no_priced_execution():
+    rejected = _confirmed_nonexecution_order(
+        qty=30, code="425420", order_no="0000034718",
+        executed=0, cancelled=0, rejected=30, status="REJECTED",
+    )
+    report = audit_sell_settlement(orders=[rejected], fills=[], positions=[])
+    assert report["gap_count"] == 0
+
+
+def test_cancelled_or_rejected_label_alone_cannot_suppress_missing_fill():
+    for status in ("REJECTED", "CANCELLED", "PARTIAL_FILLED"):
+        order = dict(
+            order_id=status, code="293490", side="SELL", qty=170,
+            status=status, kis_odno="0000034710",
+            response_json='{"rt_cd":"0","output":{"ODNO":"0000034710"}}',
+        )
+        report = audit_sell_settlement(orders=[order], fills=[], positions=[])
+        assert report["gap_count"] == 1
+        assert report["gaps"][0]["missing_priced_sell_qty"] == 170
+
+
+def test_broker_nonexecution_proof_must_match_original_order_and_zero_remaining():
+    import json
+
+    valid = _confirmed_nonexecution_order()
+    for changed in (
+        {"odno": "0000039999"},
+        {"pdno": "012750"},
+        {"sll_buy_dvsn_cd": "02"},
+        {"ord_qty": "171"},
+        {"rmn_qty": "153"},
+        {"tot_ccld_qty": "18"},
+    ):
+        order = dict(valid)
+        broker_row = json.loads(order["response_json"])["kis_row"]
+        broker_row.update(changed)
+        order["response_json"] = json.dumps({"kis_row": broker_row})
+        report = audit_sell_settlement(orders=[order], fills=[], positions=[])
+        assert report["gap_count"] == 1, changed
+        assert report["gaps"][0]["missing_priced_sell_qty"] == 170, changed
