@@ -120,9 +120,11 @@ def audit_sell_settlement(
         ]
         individual = [
             _number(row.get("qty")) for row in rows
-            if str(row.get("evidence_kind") or "").upper() != "KIS_ORDER_CUMULATIVE_EXECUTION"
+            if str(row.get("evidence_kind") or "").upper() == "KIS_INDIVIDUAL_EXECUTION"
             and float(row.get("price") or 0) > 0
         ]
+        # Manual/unknown-price DB entries are not native KIS economic proof.
+        # Only native cumulative snapshots or individual KIS executions count.
         durable_qty = max(max(cumulative, default=0), sum(individual))
         position = pos_by_cycle.get(str(order.get("position_cycle_id") or ""), {})
         closed = str(position.get("status") or "").upper() == "CLOSED"
