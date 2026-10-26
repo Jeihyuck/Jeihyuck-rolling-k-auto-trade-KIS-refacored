@@ -2794,7 +2794,7 @@ def _compute_session_marker_payload(
     entry_done = entry_status_u in {"DONE", "OK", "OK_NO_TRADE", "SKIPPED_BY_POLICY"} and not entry_abort_reason
     completed = int(
         int(exit_code) == 0
-        and status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"}
+        and status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE", "OK_CLOSE_POLICY"}
         and entry_done
         and not fatal_error
     )
@@ -2880,7 +2880,9 @@ def normalize_session_result(
             retryable=1,
             exit_reason="ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
         )
-    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"})
+    # Close ACK is a finished *submission* session; economic truth is tracked
+    # independently and must not trigger duplicate close SELL retries.
+    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE", "OK_CLOSE_POLICY"})
     return NormalizedSessionResult(
         status=status_u,
         reason=str(reason or ""),
@@ -9625,15 +9627,27 @@ def main() -> int:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
-        # On CLOSE exceptions, mark any registered run terminal before
-        # writing the session summary; never create a placeholder here.
+        # A successful broker ACK closes only the submission lifecycle.
+        # Preserve economic PENDING even in this outer finalizer; never
+        # overwrite the more precise state written by the close owner path.
         if _resolve_session_kind() == "close" and os.getenv("TRADER_RUN_ID"):
             try:
+                close_ack_ok = result_status == "OK_CLOSE_POLICY"
+                close_pending = bool(metrics.get("economic_settlement_pending", 1))
+                close_state = str(
+                    metrics.get("economic_settlement_state")
+                    or "ECONOMIC_SETTLEMENT_UNPROVEN"
+                )
                 RunsRepo(engine).finish_run(
                     os.environ["TRADER_RUN_ID"],
-                    status="OK" if result_status == "OK_CLOSE_POLICY" else "ERROR",
-                    notes="CLOSE_ACK_SEPARATE_FROM_ECONOMIC_SETTLEMENT",
+                    status=(
+                        "PENDING_SETTLEMENT" if close_ack_ok and close_pending
+                        else "OK" if close_ack_ok else "ERROR"
+                    ),
+                    notes=close_state,
                 )
+                if close_ack_ok:
+                    main_exit_reason = close_state
             except Exception:
                 logger.exception("[KR_CLOSE][RUN_TERMINAL][FAIL] preserve_unresolved=1")
         os.environ["PB1_LAST_RESULT_STATUS"] = str(result_status)
@@ -9666,6 +9680,11 @@ def main() -> int:
             "exit_reason": main_exit_reason,
             "sell_orders_ack": int(metrics.get("sell_orders_ack", metrics.get("sell_orders", 0)) or 0),
             "sell_orders": int(metrics.get("sell_orders", 0) or 0),
+            "economic_settlement_state": str(metrics.get("economic_settlement_state") or "NOT_CHECKED"),
+            "economic_settlement_pending": int(metrics.get("economic_settlement_pending", 0) or 0),
+            "native_priced_sell_gap_count": int(metrics.get("native_priced_sell_gap_count", -1)),
+            "postsubmit_reconcile_ok": int(metrics.get("postsubmit_reconcile_ok", 0) or 0),
+            "native_sell_orders_checked": int(metrics.get("native_sell_orders_checked", 0) or 0),
             "exit_evaluated_positions": int(metrics.get("exit_evaluated_positions", 0) or 0),
             "order_candidates": int(metrics.get("order_candidates", 0) or 0),
             "api_submitted": int(metrics.get("api_submitted", 0) or 0),

@@ -52,3 +52,28 @@ def test_close_run_path_persists_pending_state_without_broker_retry():
     assert 'status="PENDING_SETTLEMENT" if settlement_metrics["economic_settlement_pending"] else "OK"' in source
     assert source.count("**settlement_metrics") >= 2
     assert "action=KEEP_ORDER_IDEMPOTENCY_NO_SELL_RETRY" in source
+
+
+def test_close_ack_session_complete_independent_of_economic_pending():
+    from trader.pb1_runner import normalize_session_result, _compute_session_marker_payload
+
+    normalized = normalize_session_result(
+        status="OK_CLOSE_POLICY", reason="ECONOMIC_SETTLEMENT_PENDING",
+    )
+    assert normalized.completed == 1 and normalized.retryable == 0
+    marker = _compute_session_marker_payload(
+        status=normalized.status, exit_reason=normalized.exit_reason,
+        exit_code=0, sell_orders_ack=4,
+        entry_status="DONE", entry_abort_reason=None,
+    )
+    assert marker["completed"] is True
+    assert marker["retryable"] is False
+    assert marker["sell_orders_ack"] == 4
+
+
+def test_close_finalizer_cannot_overwrite_economic_pending_run_status():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[2] / "trader" / "pb1_runner.py").read_text(encoding="utf-8")
+    assert '"PENDING_SETTLEMENT" if close_ack_ok and close_pending' in source
+    assert '"economic_settlement_state": str(metrics.get("economic_settlement_state")' in source
+    assert 'main_exit_reason = close_state' in source
