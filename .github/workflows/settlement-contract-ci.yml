@@ -65,5 +65,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest -q tests/test_shared_settlement_ledger.py tests/test_shared_settlement_postgres.py
+          python -m pytest -q tests/kr/test_kr_20261023_cumulative_postgres.py
           if [ -f tests/test_kr_us_settlement_shadow.py ]; then python -m pytest -q tests/test_kr_us_settlement_shadow.py; fi
           if [ -f tests/test_settlement_release_gates.py ]; then python -m pytest -q tests/test_settlement_release_gates.py; fi
