@@ -2042,9 +2042,12 @@ def run_trade_tick(
             logger.info("[US_STAGE4][WORKER_EVIDENCE] generation=%s filled_rows=%d",
                         _stage4_health.get("writer_generation"),len(fills_today))
         except Exception as _stage4_exception:
-            logger.error("[US_STAGE4][BLOCK_ALL_ORDERS] reason=%s",
-                         type(_stage4_exception).__name__)
+            from trader.us.execution.stage4_lifecycle import stage4_error_code
+            _stage4_code = stage4_error_code(_stage4_exception)
+            logger.error("[US_STAGE4][BLOCK_ALL_ORDERS] reason=%s error_code=%s",
+                         type(_stage4_exception).__name__, _stage4_code)
             return {"status":"FAILED","reason":"stage4_worker_evidence_unavailable",
+                    "stage4_error_code":_stage4_code,
                     "orders":[],"orders_sent":0,"errors":1,"session":session,
                     "trade_date":trade_date,"block_new_entry":True,
                     "exit_can_proceed":False}
