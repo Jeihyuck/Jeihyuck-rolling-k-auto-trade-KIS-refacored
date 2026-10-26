@@ -111,7 +111,7 @@ from trader.db.repos import (
     load_job_checkpoint,
     save_job_checkpoint,
 )
-from trader.execution_state import durable_order_metrics
+from trader.execution_state import BrokerBalanceSnapshot, durable_order_metrics
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
     run_nontrading_smoke_once,
@@ -7427,7 +7427,7 @@ def run_once(
         kr_inf_invoked = False
 
         def _kr_after_protective_exit():
-            nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result
+            nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result, balance_snapshot_raw
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
@@ -7480,6 +7480,13 @@ def run_once(
                                        type(_quick_exc).__name__, exc_info=True)
                         _skip_post_full = False
                 if _skip_post_full:
+                    # Exact proof includes a NEW broker balance; the separate
+                    # KR_INFINITE owner must never receive the now-stale
+                    # pre-exit balance when making its own entry decision.
+                    balance_snapshot_raw = _post_snapshot
+                    engine_runner._authoritative_balance = BrokerBalanceSnapshot.from_kis(
+                        _post_snapshot, source="api",
+                    )
                     reconcile_result = {
                         "ok": True,
                         "status": "TWO_SIDED_EXACT_PROOF_NO_SELL",
@@ -7506,6 +7513,34 @@ def run_once(
                         engine_runner._kr_post_exit_reconcile_ok = False
                         logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
                                          "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
+                # After an actually submitted protected SELL, a successful
+                # reconciliation does not by itself prove the *old*
+                # pre-exit buying balance is still valid. Refresh KIS balance
+                # for KR_INFINITE/PB1 entries or block BUY without rollback.
+                _exit_stats = getattr(engine_runner, "_exit_summary_payload", None) or {}
+                _had_sell_attempt = int(_exit_stats.get("submit_attempt_count") or 0) > 0
+                if (not _skip_post_full and _had_sell_attempt
+                        and engine_runner._kr_post_exit_reconcile_ok):
+                    try:
+                        _after_sell_balance = kis.get_balance_cached(force=True)
+                        if (not isinstance(_after_sell_balance, dict)
+                                or not isinstance(_after_sell_balance.get("output1"), list)
+                                or not _after_sell_balance.get("output2")):
+                            raise RuntimeError("AFTER_SELL_KIS_BALANCE_NOT_AUTHORITATIVE")
+                        balance_snapshot_raw = {
+                            **_after_sell_balance,
+                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
+                        }
+                        engine_runner._authoritative_balance = BrokerBalanceSnapshot.from_kis(
+                            _after_sell_balance, source="api",
+                        )
+                    except Exception as _balance_exc:
+                        engine_runner._kr_post_exit_reconcile_ok = False
+                        logger.error(
+                            "[KR_RECONCILE_LANES][POST_SELL_BALANCE][FAIL_CLOSED] "
+                            "error_type=%s action=BLOCK_NEW_BUY_KEEP_SELL_RECEIPTS",
+                            type(_balance_exc).__name__, exc_info=True,
+                        )
                 logger.info(
                     "[KR_RECONCILE_LANES][POST_EXIT][TOTAL] elapsed_ms=%.1f "
                     "skip_full=%s buy_allowed=%s",
