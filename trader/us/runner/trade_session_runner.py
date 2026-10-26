@@ -1449,7 +1449,37 @@ def run_trade_session(
                  else "READ_ONLY"),
             )
         try:
-            while True:
+            _stage4_startup_failed = False
+            if _reconcile_mode == "WORKER":
+                from trader.us.execution.stage4_lifecycle import (
+                    wait_for_stage4_ready, stage4_error_code,
+                )
+                try:
+                    _stage4_wait_started = time_mod.monotonic()
+                    _stage4_ready = wait_for_stage4_ready(
+                        _shadow_reconcile_child, env=env,
+                        timeout_sec=float(os.getenv("US_STAGE4_STARTUP_TIMEOUT_SEC", "75")),
+                        poll_sec=float(os.getenv("US_STAGE4_STARTUP_POLL_SEC", "0.5")),
+                    )
+                    logger.info(
+                        "[US_STAGE4][STARTUP_READY] elapsed_sec=%.2f "
+                        "reconcile_status=%s replay_status=%s filled_rows=%s",
+                        time_mod.monotonic() - _stage4_wait_started,
+                        _stage4_ready.get("reconcile_status"),
+                        _stage4_ready.get("replay_status"),
+                        _stage4_ready.get("filled_rows"),
+                    )
+                except Exception as _stage4_startup_exc:
+                    _stage4_startup_failed = True
+                    final_status = "FAILED"
+                    final_reason = "stage4_worker_startup_unavailable"
+                    root_cause = stage4_error_code(_stage4_startup_exc)
+                    logger.error(
+                        "[US_STAGE4][STARTUP_FAILED] code=%s action=FAIL_CLOSED "
+                        "orders_sent=0",
+                        root_cause,
+                    )
+            while not _stage4_startup_failed:
                 if (_shadow_reconcile_child is not None
                         and _shadow_reconcile_child.poll() is not None):
                     logger.error(
@@ -2672,28 +2702,68 @@ def run_trade_session(
         # It never owns the order submission lock, so its lifecycle cannot
         # clear an unverified live Tick or an unresolved execution Claim.
         os.environ.pop("US_RESERVATION_WORKER_PID", None)
+        _stage4_stop_unverified = False
         if _shadow_reconcile_child is not None:
             try:
-                if _shadow_reconcile_child.poll() is None:
-                    _shadow_reconcile_child.terminate()
-                _shadow_reconcile_child.wait(timeout=5)
+                if _reconcile_mode == "WORKER":
+                    from trader.us.execution.stage4_lifecycle import stop_stage4_worker
+                    _stage4_marked_stopped = stop_stage4_worker(
+                        _shadow_reconcile_child,
+                        expected_generation=os.getenv("US_STAGE4_EXPECTED_GENERATION", ""),
+                        terminate_timeout_sec=float(os.getenv("US_STAGE4_STOP_TIMEOUT_SEC", "5")),
+                        kill_timeout_sec=5.0,
+                    )
+                    if not _stage4_marked_stopped:
+                        logger.warning(
+                            "[US_STAGE4][STOP_ROW_UNCHANGED] reason=no_matching_generation"
+                        )
+                else:
+                    if _shadow_reconcile_child.poll() is None:
+                        _shadow_reconcile_child.terminate()
+                    _shadow_reconcile_child.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 _shadow_reconcile_child.kill()
                 _shadow_reconcile_child.wait(timeout=5)
             except Exception as _observer_stop_exc:
-                logger.error(
-                    "[US_SHADOW_RECONCILE][STOP_FAILED] run=%s err=%s",
-                    session_run_id, _observer_stop_exc,
-                )
+                if _reconcile_mode == "WORKER":
+                    from trader.us.execution.stage4_lifecycle import stage4_error_code
+                    _stop_code = stage4_error_code(_observer_stop_exc)
+                    logger.critical(
+                        "[US_STAGE4][STOP_FAILED] code=%s pid=%s",
+                        _stop_code, _shadow_reconcile_child.pid,
+                    )
+                    _stage4_stop_unverified = (
+                        _stop_code == "US_STAGE4_WORKER_STOP_UNVERIFIED"
+                    )
+                else:
+                    logger.error(
+                        "[US_SHADOW_RECONCILE][STOP_FAILED] run=%s err=%s",
+                        session_run_id, _observer_stop_exc,
+                    )
             else:
                 logger.info(
                     "[US_SHADOW_RECONCILE][STOPPED] run=%s pid=%s",
                     session_run_id, _shadow_reconcile_child.pid,
                 )
+            finally:
+                if _reconcile_mode == "WORKER":
+                    os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
+                    os.environ.pop("US_STAGE4_EXPECTED_GENERATION", None)
         if _stage4_worker_log_stream is not None:
             _stage4_worker_log_stream.close()
             _stage4_worker_log_stream = None
         from trader.us.utils.session_guard import read_us_session_child_unverified_fence
+        if _stage4_stop_unverified:
+            from trader.us.utils.session_guard import mark_us_session_child_unverified_fence
+            try:
+                mark_us_session_child_unverified_fence(
+                    trade_date, session, run_id=session_run_id,
+                    pid=int(_shadow_reconcile_child.pid),
+                    reason="stage4_worker_stop_unverified",
+                    env=env, account_scope=session_account_scope,
+                )
+            except Exception:
+                logger.exception("[US_STAGE4][STOP_FENCE_PERSIST_FAILED]")
         try:
             _fence_record = read_us_session_child_unverified_fence(
                 trade_date, session, env=env, account_scope=session_account_scope,
@@ -2702,7 +2772,7 @@ def run_trade_session(
             # Never release the authority lock after a broker scope mutation.
             logger.critical("[US_SESSION][BROKER_SCOPE_CHANGED][LOCK_HELD] reason=%s", exc)
             _fence_record = {"reason": str(exc)}
-        _child_fenced = _unreaped_child_seen or bool(_fence_record)
+        _child_fenced = _unreaped_child_seen or bool(_fence_record) or _stage4_stop_unverified
         if _child_fenced:
             final_status = "FAILED_CHILD_UNVERIFIED"
             final_reason = "tick_child_unreaped_broker_truth_unverified"
