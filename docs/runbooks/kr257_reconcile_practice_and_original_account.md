@@ -3,14 +3,42 @@
 **Branch:** `fix/kr-20261026-pr251-rebase-broker-truth-latency`.
 **Base:** latest `dual-agent`. **Status:** Draft; not deployed.
 
-## Current execution paths
+## Current execution paths — 2026-10-26 P1 review closure
 
-1. Pre-SELL **exact KIS order + DB + position proof** => offer SELL first.
-2. If exact daily history is incomplete but the **KIS fresh holding / no open order / no unresolved claim / owner cycle and portfolio epoch** proof is valid, offer SELL first in **SELL-only mode**. That never authorizes new BUY.
-3. After SELL pass: if **zero attempted/blocked SELLs, exit pass OK, second complete KIS order proof, fresh new KIS balance and account reset OFF**, the second proof can skip duplicate full reconciliation and refresh the shared broker balance for PB1 and KR_INFINITE. Every failed check uses the original post-exit reconcile path.
-4. If a SELL was attempted, full reconciliation and a fresh post-SELL balance are required before ANY new BUY. If not verified, protected SELL receipts remain durable and BUY is blocked. Unknown/partial ACK stays fenced.
+1. **Before PB1 protective SELL:** try the narrow, read-only KIS fresh
+   balance + PB1/KR_INFINITE no-pending-intent/claims + strategy owner +
+   active account/epoch holdings-parity proof. No dated full KIS order history
+   is queried in this normal SELL-first path. If it fails, retain the original
+   conservative exact/full pre-SELL reconcile fallback.
+2. Evaluate PB1 protective SELL first with its existing submit-time claim,
+   idempotency, quantity and broker checks. The -3%/-6% approved **practice
+   only** strategy policy is unchanged.
+3. **Before any new KR_INFINITE or PB1 BUY:** if the owner exit pass was
+   complete and recorded **zero submitted/attempted/blocked/accepted/filled
+   SELLs**, collect a fresh KIS post-exit balance and a complete dated
+   KIS+DB cumulative quantity/notional/account-scoped exact proof.
+4. Only for a confirmed narrow PRE proof (or exact PRE proof), a successful
+   POST exact proof, unchanged complete KIS account holdings quantities
+   **including KR_INFINITE 122630**, no account reset and zero SELL activity,
+   the original redundant FULL historic reconciliation may be skipped.
+   It is **not** authorized by the narrow preflight alone.
+5. If any proof fails, any SELL is attempted or blocked, the exit pass fails
+   or a balance changes, perform FULL post-SELL reconciliation and (for
+   attempted SELL) refresh KIS balance. Unknown ACK and pending orders remain
+   fenced; no BUY proceeds on unresolved economic evidence.
 
-**P1 fix (Oct 26): The independent economic reconciliation worker is DISABLED, including manual `--execute` invocation.** The previous start-time-only window check and worker-specific Postgres advisory lock did not exclude the trading Tick. This PR intentionally does NOT run an independent economic writer. The original-account read-only historical evidence probe remains available.
+The exact/full proof branch remains the fallback, not a silently optimistic
+authorization. **A P1 review identified that the previous branch could not
+skip FULL reconciliation after successful SELL-only preflight; this has been
+fixed and is checked by an offline regression which executes the real runner
+callback AST, not a separately reimplemented branch.** The additional
+zero-SELL pre-check avoids performing exact KIS history followed by FULL
+history on attempted/blocked SELL ticks.
+
+**Independent reconciliation worker is hard-disabled.** No manual `--execute`
+or approval setting can make it run until a shared Tick/worker single-writer
+lease, clock-boundary and crash/restart tests have been implemented. The
+separate original-account historical audit is read-only and remains available.
 
 ## Operator-only original account evidence audit
 
