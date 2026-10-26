@@ -39,6 +39,7 @@ def normalize_sell_reason_family(reason: Any) -> str:
         "KR_PROFIT_CAPTURE": "PROFIT_CAPTURE", "PROFIT_PROTECT_8PCT": "PROFIT_CAPTURE",
         "ABS_TP1_10PCT": "PROFIT_CAPTURE", "SWING_PROFIT_PROTECT_GIVEBACK": "PROFIT_CAPTURE",
         "MOMENTUM_PROFIT_PROTECT_GIVEBACK": "PROFIT_CAPTURE", "FORCE_CLOSE": "FORCE_EOD",
+        "KR_PB1_SOFT_STOP_3PCT": "SWING_STAGED_EXIT",
     }
     if value in aliases:
         return aliases[value]

@@ -13309,6 +13309,7 @@ class PB1Engine:
             final_reason = _blocked_reason or "SWING_SAME_DAY_GUARD_BLOCK"
             ordered_reasons = [final_reason]
 
+        _paper_stop36_signal = False
         _router_qty: int | None = None
         _router_full_exit = False
         _router_sell_pct = None
@@ -13368,6 +13369,69 @@ class PB1Engine:
                     regime=regime_str,
                 )
 
+            # Approved 2026-10-26 paper-only 3%/6% policy. This is the
+            # normal live PB1 exit planning path, not a shadow observation.
+            # Preserve the frozen R/TP contract and all downstream SELL
+            # order/claim/broker guards. No DAY/CORE/adopted/Infinite changes.
+            if (
+                self.env == "practice"
+                and self.STRATEGY_NAME == "pb1_pullback_close"
+                and os.getenv("KR_PB1_PAPER_STOP36_ENABLED", "1") == "1"
+                and _active_family == "SWING_STAGED_EXIT"
+                and exit_policy_family == "SWING_STAGED_EXIT"
+                and position_book == "SWING_BOOK"
+                and code != "122630"
+            ):
+                from trader.kr.paper_stop36_policy import evaluate_kr_pb1_paper_stop36
+                paper_decision = evaluate_kr_pb1_paper_stop36(
+                    pos, mark=float(mark or 0.0), env=self.env,
+                    strategy_owner=self.STRATEGY_NAME,
+                    tick_id=str(self.run_id or ""),
+                )
+                logger.info(
+                    "[KR_PAPER_STOP36][EVAL] code=%s eligible=%s reason=%s "
+                    "hard=%s soft=%s breach_count=%s qty=%s",
+                    display_code, int(paper_decision.eligible), paper_decision.reason,
+                    int(paper_decision.hard_touched),
+                    int(paper_decision.soft_confirmed),
+                    paper_decision.soft_breach_count, paper_decision.sell_qty,
+                )
+                if paper_decision.eligible:
+                    horizon_result = dict(horizon_result or {
+                        "exit_ok": False, "reason": "NO_SWING_EXIT",
+                        "qty": 0, "sell_pct": None,
+                    })
+                    prior_meta = dict(horizon_result.get("update_meta") or {})
+                    horizon_result["update_meta"] = {
+                        **prior_meta, **paper_decision.update_meta,
+                    }
+                    if paper_decision.hard_touched:
+                        horizon_result.update({
+                            "exit_ok": True, "reason": "EXIT_HARD_STOP",
+                            "qty": paper_decision.sell_qty,
+                            "sell_pct": None, "full_exit": True,
+                            "update_meta": {
+                                **prior_meta, **paper_decision.update_meta,
+                                "kr_paper_stop36_trigger": "HARD_6_OR_TIGHTER",
+                            },
+                        })
+                        stop_hit = True
+                        _paper_stop36_signal = True
+                    elif paper_decision.soft_confirmed and not horizon_result.get("exit_ok"):
+                        horizon_result.update({
+                            "exit_ok": True, "reason": "KR_PB1_SOFT_STOP_3PCT",
+                            "qty": paper_decision.sell_qty,
+                            "sell_pct": paper_decision.sell_pct, "full_exit": False,
+                            "update_meta": {
+                                **prior_meta, **paper_decision.update_meta,
+                                # Commit these only after broker-confirmed
+                                # claim settlement, never on signal.
+                                "kr_paper_stop36_soft_done": True,
+                                "kr_paper_stop36_soft_done_cycle": str(pos.get("position_cycle_id")),
+                            },
+                        })
+                        _paper_stop36_signal = True
+
             if horizon_result is not None:
                 _router_qty = int(horizon_result.get("qty", 0))
                 _router_full_exit = bool(horizon_result.get("full_exit", False))
@@ -13390,7 +13454,8 @@ class PB1Engine:
                 for completion_flag in (
                     "tp1_done", "tp2_done", "core_tp1_done",
                     "profit_protect_done", "abs_tp1_done",
-                    "giveback_protect_done",
+                    "giveback_protect_done", "kr_paper_stop36_soft_done",
+                    "kr_paper_stop36_soft_done_cycle",
                 ):
                     _meta_update.pop(completion_flag, None)
                 _meta_update["max_pnl_pct_since_entry"] = _max_pnl
@@ -13417,7 +13482,8 @@ class PB1Engine:
                 _router_full_exit = False
                 _router_sell_pct = None
 
-        signal_hit = bool(stop_hit or trail_hit or ma20_break or ma50_break or time_stop_hit or risk_off_hit)
+        signal_hit = bool(stop_hit or trail_hit or ma20_break or ma50_break or time_stop_hit or risk_off_hit
+                          or _paper_stop36_signal)
         eval_reason = final_reason if (signal_hit or _policy_missing_contract) else "NO_EXIT_SIGNAL"
 
         entry_exit_plan = pos.get("entry_exit_plan_json")

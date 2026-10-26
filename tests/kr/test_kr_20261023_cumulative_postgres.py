@@ -35,12 +35,20 @@ def pg_kr_real_engine():
         conn.execute(sa.text(f"CREATE SCHEMA {_TEST_SCHEMA}"))
     admin.dispose()
     engine = sa.create_engine(
-        url, connect_args={"options": f"-csearch_path={_TEST_SCHEMA},public"},
+        url, connect_args={"options": f"-csearch_path={_TEST_SCHEMA}"},
     )
     try:
         create_schema_with_active_test_epoch(engine)
         with engine.begin() as conn:
-            conn.execute(sa.text("ALTER TABLE fills ALTER COLUMN price TYPE REAL"))
+            columns = {
+                c["name"] for c in sa.inspect(conn).get_columns(
+                    "fills", schema=_TEST_SCHEMA
+                )
+            }
+            assert "price" in columns, "isolated test fixture did not create fills.price"
+            conn.execute(sa.text(
+                f"ALTER TABLE {_TEST_SCHEMA}.fills ALTER COLUMN price TYPE REAL"
+            ))
         yield engine
     finally:
         engine.dispose()
