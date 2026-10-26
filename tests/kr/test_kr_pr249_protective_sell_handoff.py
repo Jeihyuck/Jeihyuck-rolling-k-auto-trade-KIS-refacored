@@ -69,6 +69,13 @@ def proof_fixture(monkeypatch):
     fake_positions = FakePositionRepo()
     monkeypatch.setattr(gate, "PositionsRepo", lambda *_: fake_positions)
     monkeypatch.setattr(gate, "get_account_key", lambda **_: "scoped-test-account")
+    # Legacy isolated broker-order proof fixture predates the dedicated
+    # KR_INFINITE intent table. The new tests/kr/test_kr257_reconcile_lanes_
+    # suite separately proves this real cross-owner table gate.
+    monkeypatch.setattr(
+        "trader.kr.reconcile_lanes_257.prove_no_kr_infinite_unresolved",
+        lambda **kwargs: (True, "FIXTURE_KR_INFINITE_CLEAN"),
+    )
     engine = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(engine).metadata.create_all(engine)
     kis = KISReadOnly()

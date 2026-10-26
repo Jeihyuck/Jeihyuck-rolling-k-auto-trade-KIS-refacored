@@ -9,7 +9,8 @@ class _Orders:
         self.holding_baseline = holding_baseline
         self.submitted_qty = submitted_qty
 
-    def get_open_orders(self, env):
+    def get_open_orders(self, env, *, fail_open=None):
+        assert fail_open is False
         ts = datetime(2026, 9, 14, 1, 0, tzinfo=timezone.utc)
         return [{
             "side": "SELL",

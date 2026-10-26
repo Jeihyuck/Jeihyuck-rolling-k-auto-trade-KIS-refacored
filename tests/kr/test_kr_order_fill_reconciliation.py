@@ -33,7 +33,8 @@ class _Orders:
         self.status = status
         self.saved = []
 
-    def get_open_orders(self, _env):
+    def get_open_orders(self, _env, *, fail_open=None):
+        assert fail_open is False
         return [{"order_id": "o1", "side": "SELL", "status": self.status, "code": "010060",
                  "qty": 14, "ord_type": "MARKET", "client_order_key": "sell-1",
                  "request_json": {"pre_order_holding_qty": 21, "submitted_qty": 14},

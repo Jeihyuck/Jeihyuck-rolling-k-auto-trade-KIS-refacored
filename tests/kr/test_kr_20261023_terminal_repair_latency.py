@@ -12,7 +12,8 @@ class _TerminalOnlyOrders:
         self.terminal_orders = terminal_orders
         self.updates = []
 
-    def get_open_orders(self, env):
+    def get_open_orders(self, env, *, fail_open=None):
+        assert fail_open is False
         return []
 
     def list_recent_holdings_promoted_orders_for_repair(self, env, **kwargs):
