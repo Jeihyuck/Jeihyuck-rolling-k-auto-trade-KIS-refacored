@@ -194,7 +194,7 @@ def test_runner_preserves_sell_before_reconcile_and_post_sell_buy_fence():
     assert source.index("if not deferred_full_reconcile:") < source.index("prove_safe_protective_sell_handoff(")
     assert "can_skip_post_exit_full_reconcile(" in source
     assert "BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS" in source
-    assert '"submit_attempt_count"' in inspect.getsource(can_skip_post_exit_full_reconcile)
+    assert '"submit_attempt_count"' in inspect.getsource(exit_pass_proves_zero_sell)
 
 
 
