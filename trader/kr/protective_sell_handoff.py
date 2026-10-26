@@ -90,6 +90,8 @@ def prove_protective_sell_only_preflight(
         if not isinstance(health, dict) or health.get("available") is not True:
             return False, "CLAIM_HEALTH_NOT_AUTHORITATIVE"
         for name in ("in_flight", "uncertain", "unresolved"):
+            if name not in health:
+                return False, "UNRESOLVED_OR_INVALID_CLAIM_HEALTH"
             value = _valid_nonnegative_integral(health.get(name))
             if value is None or value:
                 return False, "UNRESOLVED_OR_INVALID_CLAIM_HEALTH"
