@@ -30,28 +30,37 @@ def p95(values: list[float]) -> float | None:
 
 
 def analyze_kr_latency_lines(lines: list[str], *, min_samples: int = 20) -> dict:
-    tick_elapsed: dict[str, float] = {}
-    status_by_tick: dict[str, str] = {}
-    sell_to_http: dict[str, float] = {}
+    # Date/session/tick prevents AM/PM & cross-day collisions.
+    tick_elapsed: dict[tuple[str, str, str], float] = {}
+    status_by_tick: dict[tuple[str, str, str], str] = {}
+    sell_to_http: dict[tuple[str, str, str], float] = {}
     observed_sha: set[str] = set()
     for line in lines:
+        dt = re.search(r"20\\d{2}-\\d{2}-\\d{2}", line)
+        day = dt.group(0) if dt else "NO_DATE"
+        km = re.search(r"\\bkind=([^\\s]+)", line)
+        kind = km.group(1) if km else "NO_SESSION"
         m = TICK.search(line)
         if m:
-            tick_elapsed[m.group(1)] = float(m.group(2))
-            status_by_tick[m.group(1)] = m.group(3)
+            key = (day, kind, m.group(1))
+            tick_elapsed[key] = float(m.group(2))
+            status_by_tick[key] = m.group(3)
             sha = SHA.search(line)
             if sha:
                 observed_sha.add(sha.group(1))
         m = SELL.search(line)
         if m:
-            index, seconds = m.group(2), float(m.group(1))
-            sell_to_http[index] = min(sell_to_http.get(index, seconds), seconds)
+            key = (day, kind, m.group(2))
+            seconds = float(m.group(1))
+            sell_to_http[key] = min(sell_to_http.get(key, seconds), seconds)
     tick_values = list(tick_elapsed.values())
-    sell_values = list(sell_to_http.values())
+    sell_values = [sec for key, sec in sell_to_http.items() if key in tick_elapsed]
     tick_p95 = p95(tick_values)
     sell_p95 = p95(sell_values)
+    mixed_sha = len(observed_sha) != 1 or "UNVERSIONED" in observed_sha
     return {
         "sources": sorted(observed_sha),
+        "same_deployed_sha_confirmed": not mixed_sha,
         "tick_attempts_including_timeout": len(tick_values),
         "tick_failure_or_timeout": sum(
             status not in {"OK", "OK_NO_TRADE", "OK_TRADE"}
@@ -61,10 +70,12 @@ def analyze_kr_latency_lines(lines: list[str], *, min_samples: int = 20) -> dict
         "protected_sell_native_http_p95_seconds": sell_p95,
         "all_tick_p95_seconds": tick_p95,
         "protected_sell_target_60s": (
+            "UNCOMPARABLE_SHA" if mixed_sha else
             "PASS" if len(sell_values) >= min_samples and sell_p95 <= 60
             else "FAIL" if len(sell_values) >= min_samples else "INSUFFICIENT_SAMPLES"
         ),
         "all_tick_target_180s": (
+            "UNCOMPARABLE_SHA" if mixed_sha else
             "PASS" if len(tick_values) >= min_samples and tick_p95 <= 180
             else "FAIL" if len(tick_values) >= min_samples else "INSUFFICIENT_SAMPLES"
         ),

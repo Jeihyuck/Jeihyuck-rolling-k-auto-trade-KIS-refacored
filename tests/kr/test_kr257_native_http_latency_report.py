@@ -11,7 +11,7 @@ def _tick(index, seconds, status="OK"):
 def _sell(index, seconds):
     return (f"2026-10-26 09:35 INFO [KR_LATENCY][NATIVE_HTTP_START] "
             f"side=SELL code=053800 tick_elapsed_s={seconds:.3f} "
-            f"tick_index={index} run_id=R{index}")
+            f"tick_index={index} kind=am run_id=R{index}")
 
 
 def test_no_p95_without_twenty_real_observations():
@@ -53,3 +53,20 @@ def test_actual_kis_request_logs_native_before_session_request():
     src = inspect.getsource(KisAPI._safe_request)
     assert src.index("[KR_LATENCY][NATIVE_HTTP_START]") < src.index("resp = self.session.request(")
     assert "KR_TICK_ORIGIN_MONOTONIC" in src
+
+
+def test_multiple_deployed_shas_cannot_claim_slo_pass():
+    lines = [_tick(i, 40) for i in range(1, 21)]
+    lines[0] = lines[0].replace("sha=abc123", "sha=def999")
+    lines += [_sell(i, 5) for i in range(1, 21)]
+    result = analyze_kr_latency_lines(lines)
+    assert result["same_deployed_sha_confirmed"] is False
+    assert result["protected_sell_target_60s"] == "UNCOMPARABLE_SHA"
+    assert result["all_tick_target_180s"] == "UNCOMPARABLE_SHA"
+
+
+def test_same_index_on_different_days_is_not_collapsed():
+    first = _tick(1, 20)
+    second = _tick(1, 22).replace("2026-10-26", "2026-10-27")
+    result = analyze_kr_latency_lines([first, second])
+    assert result["tick_attempts_including_timeout"] == 2

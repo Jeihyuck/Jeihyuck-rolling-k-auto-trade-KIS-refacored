@@ -1749,9 +1749,10 @@ class KisAPI:
                             )
                             logger.info(
                                 "[KR_LATENCY][NATIVE_HTTP_START] side=%s code=%s "
-                                "tick_elapsed_s=%.3f tick_index=%s run_id=%s",
+                                "tick_elapsed_s=%.3f tick_index=%s kind=%s run_id=%s",
                                 _side, _code, _elapsed,
                                 os.getenv("PB1_LOOP_TICK_INDEX") or "NO_LOOP",
+                                os.getenv("PB1_SESSION_KIND") or "NO_SESSION",
                                 os.getenv("TRADER_RUN_ID") or "NO_RUN_ID",
                             )
                 except Exception as _latency_exc:
