@@ -114,6 +114,65 @@ def test_two_sided_proof_only_skips_full_when_zero_submit_activity():
     )[0]
 
 
+def test_normal_sell_only_proof_can_skip_full_with_post_exact_and_identical_account():
+    clean = dict(holdings=1, checked=1, submit_attempt_count=0,
+                 accepted_sell_count=0, fill_confirmed_sell_count=0,
+                 submitted=0, blocked_count=0)
+    pre = _known_balance()
+    pre["output1"].append({"pdno": "122630", "hldg_qty": "7"})
+    post = {**pre, "output1": list(reversed(pre["output1"]))}
+    base = dict(
+        pre_exit_exact=False, pre_exit_sell_only=True,
+        pre_exit_balance=pre, post_exit_balance=post,
+        post_exit_exact=True, exit_pass_ok=True, exit_summary=clean,
+    )
+    assert can_skip_post_exit_full_reconcile(**base) == (
+        True, "SELL_ONLY_PLUS_POST_EXACT_NO_SELL_SKIP_HISTORICAL_RECOVERY"
+    )
+    assert not can_skip_post_exit_full_reconcile(
+        **{**base, "pre_exit_sell_only": False}
+    )[0]
+    assert not can_skip_post_exit_full_reconcile(
+        **{**base, "post_exit_exact": False}
+    )[0]
+    assert not can_skip_post_exit_full_reconcile(
+        **{**base, "post_exit_balance": {
+            **post, "output1": [{"pdno": "053800", "hldg_qty": "11"},
+                                 {"pdno": "122630", "hldg_qty": "7"}],
+        }}
+    )[0]
+    for k in ("submit_attempt_count", "blocked_count", "accepted_sell_count"):
+        assert not can_skip_post_exit_full_reconcile(
+            **{**base, "exit_summary": {**clean, k: 1}}
+        )[0]
+    assert not can_skip_post_exit_full_reconcile(
+        **{**base, "account_reset_mode": True}
+    )[0]
+
+
+def test_sell_only_proof_does_not_trust_malformed_or_duplicate_broker_holdings():
+    clean = dict(holdings=1, checked=1, submit_attempt_count=0,
+                 accepted_sell_count=0, fill_confirmed_sell_count=0,
+                 submitted=0, blocked_count=0)
+    base = dict(pre_exit_exact=False, pre_exit_sell_only=True,
+                post_exit_exact=True, exit_pass_ok=True, exit_summary=clean,
+                pre_exit_balance=_known_balance(), post_exit_balance=_known_balance())
+    for invalid in (
+        [{"pdno": "053800", "hldg_qty": "NaN"}],
+        [{"pdno": "053800", "hldg_qty": "12.5"}],
+        [{"pdno": "053800", "hldg_qty": "-1"}],
+        [{"pdno": "053800", "hldg_qty": "12"},
+         {"pdno": "053800", "hldg_qty": "12"}],
+        [{"pdno": "053800", "hldg_qty": None}],
+        [{"pdno": "", "hldg_qty": "12"}],
+    ):
+        assert not can_skip_post_exit_full_reconcile(
+            **{**base, "post_exit_balance": {
+                **_known_balance(), "output1": invalid
+            }}
+        )[0]
+
+
 def test_proof_rejects_nonintegral_or_nonfinite_broker_quantity():
     assert proof._valid_nonnegative_integral("3.1") is None
     assert proof._valid_nonnegative_integral("NaN") is None
@@ -126,6 +185,9 @@ def test_runner_preserves_sell_before_reconcile_and_post_sell_buy_fence():
     from trader import pb1_runner
     source = inspect.getsource(pb1_runner.run_once)
     assert source.index("prove_protective_sell_only_preflight(") < source.index("prove_safe_protective_sell_handoff(")
+    assert "if ((pre_exit_exact_proof or sell_only_lane)" in source
+    assert "pre_exit_balance=balance_snapshot_raw" in source
+    assert "post_exit_balance=_post_snapshot" in source
     assert source.index("prove_protective_sell_only_preflight(") < source.index("reconcile_kis(")
     assert source.index("if not deferred_full_reconcile:") < source.index("prove_safe_protective_sell_handoff(")
     assert "can_skip_post_exit_full_reconcile(" in source

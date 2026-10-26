@@ -44,4 +44,6 @@ jobs:
           python -m py_compile             trader/reconcile_kis.py trader/pb1_runner.py trader/pb1_engine.py             trader/kr/reconcile_lanes_257.py trader/kr/protective_sell_handoff.py             trader/kr/paper_stop36_policy.py
       - name: Offline four-blocker acceptance
         run: |
-          python -m pytest -q             tests/kr/test_kr257_strict_order_read_failclosed.py             tests/kr/test_kr257_reconcile_lanes_20261026.py             tests/kr/test_kr_20261023_protective_proof_failclosed.py             tests/kr/test_kr_pr249_protective_sell_handoff.py             tests/kr/test_kr_paper_stop36_live_20261026.py             tests/kr/test_kr257_paper_stop36_e2e.py
+          python -m pytest -q             tests/kr/test_kr257_strict_order_read_failclosed.py             tests/kr/test_kr257_reconcile_lanes_20261026.py             tests/kr/test_kr_20261023_protective_proof_failclosed.py             tests/kr/test_kr_pr249_protective_sell_handoff.py             tests/kr/test_kr_paper_stop36_live_20261026.py             tests/kr/test_kr257_paper_stop36_e2e.py \
+            tests/kr/test_kr257_offhours_reconcile_worker.py \
+            tests/kr/test_kr257_sell_first_runner_integration.py
