@@ -6,6 +6,7 @@ import pytest
 import sqlalchemy as sa
 
 from trader import reconcile_db as rd
+from trader.kr import broker_truth_pending_fill_fence as pending_fence
 
 
 @pytest.fixture
@@ -48,6 +49,11 @@ def epoch_db(monkeypatch):
             dict(order_id="old-order", env="practice", strategy="pb1_pullback_close",
                  code="293490", status="PARTIAL_FILLED", trading_epoch_id="old-epoch"),
         ])
+    # The installed pending-fill wrapper is tested independently.  Here its
+    # prerequisite is explicitly proven empty, so this test exercises the
+    # underlying epoch-scoped stale reconciler rather than failing on an
+    # intentionally minimal SQLite schema with no fills table.
+    monkeypatch.setattr(pending_fence, "_pending_fill_application_codes", lambda **_kw: set())
     monkeypatch.setattr(rd, "schema_for_engine", lambda _eng: SimpleNamespace(positions=positions, orders=orders))
     monkeypatch.setattr(rd, "get_account_key", lambda **kwargs: "practice:new")
     monkeypatch.setattr(rd, "trading_epoch_enforced", lambda: True)
