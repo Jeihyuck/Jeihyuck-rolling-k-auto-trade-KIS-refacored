@@ -14144,6 +14144,13 @@ class PB1Engine:
         client_key = effective_client_key
         exit_eval_payload["client_order_key"] = client_key
 
+        # An overlay/forced exit may supersede the planned -3% soft SELL.
+        # Never mark its one-shot policy completed from a DIFFERENT
+        # economic action even when that action later fills.
+        if str(exit_eval.primary_reason or "").upper() != "KR_PB1_SOFT_STOP_3PCT":
+            exit_execution_meta_update.pop("kr_paper_stop36_soft_done", None)
+            exit_execution_meta_update.pop("kr_paper_stop36_soft_done_cycle", None)
+
         exit_meta = {
             "exit_reason": exit_reason,
             "exit_stage": stage,
