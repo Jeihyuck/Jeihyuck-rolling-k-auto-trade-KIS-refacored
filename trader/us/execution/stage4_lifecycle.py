@@ -71,7 +71,7 @@ def wait_for_stage4_ready(
         except Exception as exc:
             code = stage4_error_code(exc)
             if code not in _RETRYABLE_STARTUP_CODES:
-                raise RuntimeError("US_STAGE4_STARTUP_FATAL") from exc
+                raise RuntimeError("US_STAGE4_STARTUP_FATAL_" + code) from exc
             last_code = code
 
         remaining = deadline - clock()
