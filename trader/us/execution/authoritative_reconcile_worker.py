@@ -376,8 +376,15 @@ def main() -> int:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="FAILED")
                 wait=max(0.0,max(5,args.interval_sec)-(time.monotonic()-started))
-                if wait:
-                    time.sleep(wait)
+                # Python sleep can resume after SIGTERM (PEP 475). Poll the
+                # stop flag so normal shutdown reaches publish_health(STOPPED)
+                # instead of waiting for the parent's five-second kill timer.
+                sleep_deadline=time.monotonic()+wait
+                while not _STOP:
+                    remaining=sleep_deadline-time.monotonic()
+                    if remaining<=0:
+                        break
+                    time.sleep(min(0.25,remaining))
         finally:
             with engine.begin() as conn:
                 publish_health(conn,scope=scope,generation=generation,state="STOPPED")
