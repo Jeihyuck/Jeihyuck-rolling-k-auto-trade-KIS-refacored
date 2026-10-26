@@ -77,3 +77,54 @@ def test_close_finalizer_cannot_overwrite_economic_pending_run_status():
     assert '"PENDING_SETTLEMENT" if close_ack_ok and close_pending' in source
     assert '"economic_settlement_state": str(metrics.get("economic_settlement_state")' in source
     assert 'main_exit_reason = close_state' in source
+
+
+def test_live_audit_failure_with_zero_new_sells_remains_pending():
+    # KIS already has no holdings, so the close owner sends no new SELLs.
+    # A failed DB/KIS audit must still surface historical unpriced SELL gaps.
+    state = assess_close_economic_settlement(
+        accepted_policy_sells=0,
+        postsubmit_reconcile_ok=False,
+        audit_report=None,
+        audit_attempted=True,
+    )
+    assert state["economic_settlement_state"] == "ECONOMIC_SETTLEMENT_PENDING"
+    assert state["economic_settlement_pending"] == 1
+    assert state["native_priced_sell_gap_count"] == -1
+    assert state["economic_audit_attempted"] == 1
+
+
+def test_intentional_dry_run_audit_skip_is_explicitly_unchecked_not_proven():
+    state = assess_close_economic_settlement(
+        accepted_policy_sells=0,
+        postsubmit_reconcile_ok=False,
+        audit_report=None,
+        audit_attempted=False,
+    )
+    assert state["economic_settlement_state"] == "NO_NEW_SELL_SETTLEMENT_UNCHECKED"
+    assert state["economic_settlement_pending"] == 0
+    assert state["economic_audit_attempted"] == 0
+
+
+def test_zero_new_sells_with_successful_native_priced_audit_can_be_proven():
+    state = assess_close_economic_settlement(
+        accepted_policy_sells=0,
+        postsubmit_reconcile_ok=False,
+        audit_report={
+            "status": "PRICED_SELL_EVIDENCE_MATCHED",
+            "gap_count": 0,
+            "sell_orders_checked": 4,
+        },
+        audit_attempted=True,
+    )
+    assert state["economic_settlement_state"] == "NO_NEW_SELL_PRICED_EVIDENCE_MATCHED"
+    assert state["economic_settlement_pending"] == 0
+
+
+def test_close_runtime_wires_audit_attempt_even_without_accepted_sell():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "trader" / "pb1_runner.py").read_text(encoding="utf-8")
+    assert "close_audit_attempted = not parse_bool_any(dry_run, default=True)" in source
+    assert "audit_attempted=close_audit_attempted" in source
+    assert "if close_audit_attempted:" in source
