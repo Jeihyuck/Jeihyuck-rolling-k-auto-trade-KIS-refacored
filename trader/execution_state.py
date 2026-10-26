@@ -125,6 +125,8 @@ def exit_stage_for_reason(reason: str | None, *, requested_sell_qty: int | None 
     if requested_sell_qty is not None and broker_qty_before is not None:
         if int(requested_sell_qty) >= int(broker_qty_before) > 0:
             return "FULL_EXIT"
+    if value == "KR_PB1_SOFT_STOP_3PCT":
+        return "KR_PAPER_SOFT_STOP_PARTIAL_1"
     partial = ((sell_pct is not None and 0 < float(sell_pct) < 1)
                or (requested_sell_qty is not None and broker_qty_before is not None
                    and 0 < int(requested_sell_qty) < int(broker_qty_before)))
@@ -152,6 +154,7 @@ def legal_next_exit_stage(previous: str, current: str) -> bool:
         ("TP2", "FULL_EXIT"),
         ("TP3", "FULL_EXIT"),
         ("PROFIT_PROTECT_PARTIAL_1", "FULL_EXIT"),
+        ("KR_PAPER_SOFT_STOP_PARTIAL_1", "FULL_EXIT"),
         ("DEFENSE_TRIM_1", "FULL_EXIT"),
     }
 

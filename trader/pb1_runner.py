@@ -111,7 +111,7 @@ from trader.db.repos import (
     load_job_checkpoint,
     save_job_checkpoint,
 )
-from trader.execution_state import durable_order_metrics
+from trader.execution_state import BrokerBalanceSnapshot, durable_order_metrics
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
     run_nontrading_smoke_once,
@@ -210,6 +210,16 @@ def _normalize_warning_counts(raw: dict[str, Any] | None) -> dict[str, int]:
         except Exception:
             counts[str(key)] = 0
     return counts
+
+
+def _count_kr_tick_attempt(session_metrics: dict[str, int]) -> None:
+    """Count a tick at entry, not only after run_once returns successfully.
+
+    A TickTimeoutError still consumes a full KR tick deadline and belongs in
+    ticks_total and whole-tick latency p95. The old post-return increment
+    silently dropped every recoverable watchdog timeout from session.json.
+    """
+    session_metrics["ticks_total"] = int(session_metrics.get("ticks_total", 0)) + 1
 
 
 def _merge_warning_counts(base: dict[str, int], incoming: dict[str, Any] | None) -> dict[str, int]:
@@ -6850,30 +6860,57 @@ def run_once(
         db_write_reasons.append("run_start")
         reconcile_result: dict | None = None
         deferred_full_reconcile = False
+        pre_exit_exact_proof = False
+        sell_only_lane = False
         if (
             kis is not None and not nontrading_eval_mode
             and os.getenv("KR_PROTECTIVE_SELL_RECONCILE_HANDOFF", "1") == "1"
             and _resolve_session_kind() in {"am", "pm", "morning", "afternoon"}
         ):
             try:
-                from trader.kr.protective_sell_handoff import prove_safe_protective_sell_handoff
-                deferred_full_reconcile, _handoff_reason = prove_safe_protective_sell_handoff(
+                from trader.kr.protective_sell_handoff import (
+                    prove_safe_protective_sell_handoff,
+                    prove_protective_sell_only_preflight,
+                )
+                _preflight_started = time_mod.monotonic()
+                # SELLS FIRST: the narrow proof uses a fresh KIS balance,
+                # durable claim/order health, current account/epoch, and owner
+                # position parity. It does NOT make the expensive dated
+                # full KIS order history query in the protected SELL hot path.
+                sell_only_lane, _handoff_reason = prove_protective_sell_only_preflight(
                     engine=engine, kis=kis, env=env_effective,
                     strategy="pb1_pullback_close", trade_date=trade_date,
                     balance_snapshot=balance_snapshot_raw,
                 )
+                deferred_full_reconcile = sell_only_lane
+                if not deferred_full_reconcile:
+                    # Fallback is deliberately the original conservative
+                    # order-and-fill proof, then FULL reconcile if unresolved.
+                    pre_exit_exact_proof, _handoff_reason = prove_safe_protective_sell_handoff(
+                        engine=engine, kis=kis, env=env_effective,
+                        strategy="pb1_pullback_close", trade_date=trade_date,
+                        balance_snapshot=balance_snapshot_raw,
+                    )
+                    deferred_full_reconcile = pre_exit_exact_proof
                 logger.info(
-                    "[KR_RECONCILE_LANES][PRE_EXIT] deferred=%s reason=%s "
-                    "owner=PB1 full_reconcile_requires_post_exit_before_buy=1",
-                    int(deferred_full_reconcile), _handoff_reason,
+                    "[KR_RECONCILE_LANES][PRE_EXIT] deferred=%s exact=%s "
+                    "sell_only=%s reason=%s elapsed_ms=%.1f owner=PB1 "
+                    "post_exit_reconcile_required_before_buy=1",
+                    int(deferred_full_reconcile), int(pre_exit_exact_proof),
+                    int(sell_only_lane), _handoff_reason,
+                    1000.0 * (time_mod.monotonic() - _preflight_started),
                 )
             except Exception as _handoff_exc:
                 deferred_full_reconcile = False
                 logger.warning("[KR_RECONCILE_LANES][PROOF_FAIL] type=%s action=FULL_PRE_EXIT_RECONCILE",
                                type(_handoff_exc).__name__)
         if deferred_full_reconcile:
-            reconcile_result = {"ok": True, "status": "PRE_EXIT_EXACT_PROOF",
-                                "deferred_to": "AFTER_PROTECTIVE_SELL_BEFORE_ANY_BUY"}
+            reconcile_result = {
+                "ok": bool(pre_exit_exact_proof),
+                "status": ("PRE_EXIT_EXACT_PROOF" if pre_exit_exact_proof
+                           else "SELL_ONLY_EARLY_LANE_NOT_BUY_AUTHORITY"),
+                "deferred_to": "AFTER_PROTECTIVE_SELL_BEFORE_ANY_BUY",
+            }
         if kis and not nontrading_eval_mode and not deferred_full_reconcile:
             try:
                 reconcile_result = reconcile_kis(
@@ -7394,34 +7431,145 @@ def run_once(
         kr_inf_invoked = False
 
         def _kr_after_protective_exit():
-            nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result
+            nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result, balance_snapshot_raw
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
-            # Protected SELL has been offered to every PB1 holder. For a
-            # clean, exact pretrade proof only, full economic reconciliation
-            # moves here. This executes before KR_INFINITE BUY and PB1 BUY,
-            # preserving identical post-reconciliation entry safety gates.
+            # PB1 protected SELLs have been offered. For either an exact
+            # pretrade proof OR a proven narrow SELL-only preflight, the
+            # post-exit KIS proof is obtained BEFORE any KR_INFINITE/PB1 BUY.
+            # No SELL, unchanged broker balances and post-exit exact economic
+            # evidence together permit skipping duplicated FULL reconciliation.
             engine_runner._kr_post_exit_reconcile_ok = True
             if deferred_full_reconcile:
-                try:
-                    reconcile_result = reconcile_kis(
-                        engine=engine, kis=kis, env=env_effective,
-                        run_id=run_record_id, strategy="pb1_pullback_close",
-                        tick_ts=now, balance_snapshot=balance_snapshot_raw,
-                        runtime_dir=str(runtime_root_dir),
+                _post_started = time_mod.monotonic()
+                _skip_post_full = False
+                # Check exit activity BEFORE fetching costly broker history.
+                # Any submitted/attempted/blocked SELL goes straight to FULL
+                # reconciliation, not exact-proof PLUS FULL (double work).
+                from trader.kr.reconcile_lanes_257 import exit_pass_proves_zero_sell
+                _zero_sell, _zero_sell_reason = exit_pass_proves_zero_sell(
+                    exit_pass_ok=bool(getattr(engine_runner, "_kr_exit_pass_ok", False)),
+                    exit_summary=getattr(engine_runner, "_exit_summary_payload", None),
+                )
+                if ((pre_exit_exact_proof or sell_only_lane)
+                        and _zero_sell):
+                    try:
+                        from trader.account_state import account_reset_mode
+                        from trader.kr.reconcile_lanes_257 import can_skip_post_exit_full_reconcile
+                        from trader.kr.protective_sell_handoff import prove_safe_protective_sell_handoff
+                        _post_snapshot = kis.get_balance_cached(force=True)
+                        if (not isinstance(_post_snapshot, dict)
+                                or not isinstance(_post_snapshot.get("output1"), list)
+                                or not _post_snapshot.get("output2")):
+                            raise RuntimeError("POST_EXIT_BROKER_BALANCE_NOT_AUTHORITATIVE")
+                        _post_snapshot = {
+                            **_post_snapshot,
+                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
+                        }
+                        _post_exact, _post_reason = prove_safe_protective_sell_handoff(
+                            engine=engine, kis=kis, env=env_effective,
+                            strategy="pb1_pullback_close", trade_date=trade_date,
+                            balance_snapshot=_post_snapshot,
+                        )
+                        _skip_post_full, _fast_reason = can_skip_post_exit_full_reconcile(
+                            pre_exit_exact=pre_exit_exact_proof,
+                            pre_exit_sell_only=sell_only_lane,
+                            pre_exit_balance=balance_snapshot_raw,
+                            post_exit_balance=_post_snapshot,
+                            post_exit_exact=_post_exact,
+                            exit_pass_ok=bool(getattr(engine_runner, "_kr_exit_pass_ok", False)),
+                            exit_summary=getattr(engine_runner, "_exit_summary_payload", None),
+                            account_reset_mode=account_reset_mode(),
+                        )
+                        logger.info(
+                            "[KR_RECONCILE_LANES][POST_EXIT_QUICK_PROOF] exact=%s skip_full=%s "
+                            "broker_reason=%s decision=%s elapsed_ms=%.1f",
+                            int(_post_exact), int(_skip_post_full), _post_reason,
+                            _fast_reason, 1000.0 * (time_mod.monotonic() - _post_started),
+                        )
+                    except Exception as _quick_exc:
+                        logger.warning("[KR_RECONCILE_LANES][POST_EXIT_QUICK_PROOF][FAIL_CLOSED] "
+                                       "type=%s action=FULL_POST_EXIT_RECONCILE",
+                                       type(_quick_exc).__name__, exc_info=True)
+                        _skip_post_full = False
+                if _skip_post_full:
+                    # Exact proof includes a NEW broker balance; the separate
+                    # KR_INFINITE owner must never receive the now-stale
+                    # pre-exit balance when making its own entry decision.
+                    balance_snapshot_raw = _post_snapshot
+                    engine_runner._authoritative_balance = BrokerBalanceSnapshot.from_kis(
+                        _post_snapshot, source="api",
                     )
-                    engine_runner._kr_post_exit_reconcile_ok = bool(reconcile_result.get("ok", False))
-                    if engine_runner._kr_post_exit_reconcile_ok:
-                        db_write_reasons.append("reconcile_after_protective_sell")
-                    else:
-                        logger.error("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] reason=%s "
-                                     "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS",
-                                     reconcile_result.get("degraded") or reconcile_result.get("reason"))
-                except Exception as _deferred_exc:
-                    engine_runner._kr_post_exit_reconcile_ok = False
-                    logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
-                                     "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
+                    reconcile_result = {
+                        "ok": True,
+                        "status": (
+                            "TWO_SIDED_EXACT_PROOF_NO_SELL"
+                            if pre_exit_exact_proof else
+                            "PRE_SELL_SAFE_POST_SELL_EXACT_NO_SELL"
+                        ),
+                        "historical_repair_fastpath": True,
+                        "reason": (
+                            "EXACT_BROKER_POSITION_AND_LEDGER_PARITY"
+                            if pre_exit_exact_proof else
+                            "EXACT_POST_BROKER_ECONOMICS_UNCHANGED_ACCOUNT_HOLDINGS"
+                        ),
+                    }
+                    db_write_reasons.append("two_sided_exact_proof_skip_historical_reconcile")
+                else:
+                    try:
+                        reconcile_result = reconcile_kis(
+                            engine=engine, kis=kis, env=env_effective,
+                            run_id=run_record_id, strategy="pb1_pullback_close",
+                            tick_ts=now, balance_snapshot=balance_snapshot_raw,
+                            runtime_dir=str(runtime_root_dir),
+                        )
+                        engine_runner._kr_post_exit_reconcile_ok = bool(reconcile_result.get("ok", False))
+                        if engine_runner._kr_post_exit_reconcile_ok:
+                            db_write_reasons.append("reconcile_after_protective_sell")
+                        else:
+                            logger.error("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] reason=%s "
+                                         "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS",
+                                         reconcile_result.get("degraded") or reconcile_result.get("reason"))
+                    except Exception as _deferred_exc:
+                        engine_runner._kr_post_exit_reconcile_ok = False
+                        logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
+                                         "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
+                # After an actually submitted protected SELL, a successful
+                # reconciliation does not by itself prove the *old*
+                # pre-exit buying balance is still valid. Refresh KIS balance
+                # for KR_INFINITE/PB1 entries or block BUY without rollback.
+                _exit_stats = getattr(engine_runner, "_exit_summary_payload", None) or {}
+                _had_sell_attempt = int(_exit_stats.get("submit_attempt_count") or 0) > 0
+                if (not _skip_post_full and _had_sell_attempt
+                        and engine_runner._kr_post_exit_reconcile_ok):
+                    try:
+                        _after_sell_balance = kis.get_balance_cached(force=True)
+                        if (not isinstance(_after_sell_balance, dict)
+                                or not isinstance(_after_sell_balance.get("output1"), list)
+                                or not _after_sell_balance.get("output2")):
+                            raise RuntimeError("AFTER_SELL_KIS_BALANCE_NOT_AUTHORITATIVE")
+                        balance_snapshot_raw = {
+                            **_after_sell_balance,
+                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
+                        }
+                        engine_runner._authoritative_balance = BrokerBalanceSnapshot.from_kis(
+                            _after_sell_balance, source="api",
+                        )
+                    except Exception as _balance_exc:
+                        engine_runner._kr_post_exit_reconcile_ok = False
+                        logger.error(
+                            "[KR_RECONCILE_LANES][POST_SELL_BALANCE][FAIL_CLOSED] "
+                            "error_type=%s action=BLOCK_NEW_BUY_KEEP_SELL_RECEIPTS",
+                            type(_balance_exc).__name__, exc_info=True,
+                        )
+                logger.info(
+                    "[KR_RECONCILE_LANES][POST_EXIT][TOTAL] elapsed_ms=%.1f "
+                    "skip_full=%s buy_allowed=%s",
+                    1000.0 * (time_mod.monotonic() - _post_started),
+                    int(_skip_post_full),
+                    int(bool(engine_runner._kr_post_exit_reconcile_ok)),
+                )
             try:
                 # Preserve the original 40-slot WS owner-first prewarm.  The
                 # early owner evaluation must not regress subscription timing.
@@ -8175,6 +8323,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         sell_orders = 0
         session_metrics: dict[str, int] = {
             "ticks_total": 0,
+            "ticks_completed": 0,
             "buy_orders": 0,
             "buy_orders_ack": 0,
             "sell_orders": 0,
@@ -8288,6 +8437,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             try:
                 tick_index += 1
                 ticks_total += 1
+                _count_kr_tick_attempt(session_metrics)
                 os.environ["PB1_LOOP_TICK_INDEX"] = str(tick_index)
                 logger.info(
                     "[PB1][TICK][CALL_RUN_ONCE] kind=%s now=%s session_end=%s",
@@ -8338,7 +8488,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     clear_kr_tick_deadline()
                     os.environ.pop("KR_TICK_ORIGIN_MONOTONIC", None)
                 last_tick_metrics = dict(metrics or {})
-                session_metrics["ticks_total"] += 1
+                session_metrics["ticks_completed"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
                 session_metrics["sell_orders"] += int(last_tick_metrics.get("sell_orders", 0) or 0)
                 tick_buy_ack = int(last_tick_metrics.get("buy_orders_ack", last_tick_metrics.get("accepted", 0)) or 0)
@@ -8718,6 +8868,16 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "status": status_for_marker,
             "exit_reason": exit_reason,
             "ticks_total": int(session_metrics.get("ticks_total", ticks_total) or 0),
+            "ticks_completed": int(session_metrics.get("ticks_completed", 0) or 0),
+            "ticks_degraded": int(ticks_degraded),
+            "ticks_fatal": int(ticks_fatal),
+            "ticks_timeout": int(session_warning_counts.get("timeout_count", 0)),
+            "warning_counts": dict(session_warning_counts),
+            "terminal_state": _resolve_session_terminal_state(
+                result_status=status_for_marker,
+                exit_reason=exit_reason,
+                warning_counts=session_warning_counts,
+            ),
             "sell_orders_ack": int(session_metrics.get("sell_orders_ack", sell_orders) or 0),
             "sell_orders": int(session_metrics.get("sell_orders", sell_orders) or 0),
             "buy_orders": int(session_metrics.get("buy_orders", buy_orders) or 0),

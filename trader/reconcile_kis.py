@@ -83,7 +83,10 @@ def _has_unresolved_broker_activity(*, engine, orders_repo: OrdersRepo, env: str
     """Fail closed when a recent broker submit has not reached terminal truth."""
     open_states = {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
     try:
-        rows = orders_repo.get_open_orders(env, trade_date=trade_date)
+        # Economic readiness must never reinterpret a DB timeout as no orders.
+        rows = orders_repo.get_open_orders(
+            env, trade_date=trade_date, fail_open=False,
+        )
         if any(str(row.get("status") or "").upper() in open_states for row in rows or []):
             return True
     except Exception as exc:
@@ -528,11 +531,19 @@ def _promote_open_buy_orders_from_holdings(
     fills_repo: FillsRepo,
     positions_repo: PositionsRepo | None = None,
 ) -> dict[str, int]:
+    promotion_started = time.monotonic()
     qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
     promoted_orders = 0
     promoted_fills = 0
+    terminal_proof_pruned = 0
+    terminal_holding_pruned = 0
     promoted_codes: list[str] = []
-    candidate_orders = list(orders_repo.get_open_orders(env) or [])
+    # A failed order read cannot be an empty promotion candidate list.
+    # Propagate to the caller so this tick stays RECONCILE_REQUIRED.
+    candidate_orders = list(
+        orders_repo.get_open_orders(env, fail_open=False) or []
+    )
+    current_open_orders = len(candidate_orders)
     seen_order_ids = {
         str(row.get("order_id") or row.get("client_order_key") or "")
         for row in candidate_orders
@@ -595,6 +606,42 @@ def _promote_open_buy_orders_from_holdings(
                 code, order.get("order_id"), status,
             )
             continue
+
+        # Fast negative proof for TERMINAL legacy recovery candidates. Today
+        # up to 128 old orders were each checking settlement cutover (DB I/O)
+        # even though their saved terminal holding quantity did not match the
+        # *current* KIS holding. Those candidates cannot be repaired by this
+        # algorithm. Reject them BEFORE the per-order cutover lookup; open and
+        # unresolved orders continue through the unchanged full safety path.
+        if status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
+            saved_pre = _to_int(response_json.get("pre_order_holding_qty"))
+            saved_post = _to_int(response_json.get("holding_qty"))
+            saved_filled = _to_int(response_json.get("confirmed_fill_qty"))
+            requested_qty = int(order.get("qty") or 0)
+            if (
+                response_json.get("promotion_source") != "kis_holdings"
+                or saved_pre is None or saved_post is None
+                or saved_filled is None or saved_filled <= 0
+                or saved_filled > requested_qty
+                or saved_post != (
+                    saved_pre + saved_filled if side == "BUY"
+                    else saved_pre - saved_filled
+                )
+            ):
+                terminal_proof_pruned += 1
+                logger.warning(
+                    "[RECONCILE][PROMOTE_RECOVERY][PROOF_INCOMPLETE] code=%s order_id=%s",
+                    code, order.get("order_id"),
+                )
+                continue
+            if holding_qty != saved_post or not order.get("created_at"):
+                terminal_holding_pruned += 1
+                logger.warning(
+                    "[RECONCILE][PROMOTE_RECOVERY][REVIEW_REQUIRED] "
+                    "code=%s reason=HISTORICAL_HOLDING_DRIFT",
+                    code,
+                )
+                continue
 
         # Once the shared KR writer is actually released for this account/epoch,
         # holdings-only inference must never fall through to the legacy economic
@@ -1174,6 +1221,18 @@ def _promote_open_buy_orders_from_holdings(
             code,
             order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
         )
+    logger.info(
+        "[KR_RECONCILE][PROMOTION_LANE] elapsed_ms=%.1f open_candidates=%s "
+        "terminal_candidates=%s proof_pruned=%s holding_pruned=%s "
+        "promoted_orders=%s promoted_fills=%s",
+        1000.0 * (time.monotonic() - promotion_started),
+        current_open_orders,
+        max(0, len(candidate_orders) - current_open_orders),
+        terminal_proof_pruned,
+        terminal_holding_pruned,
+        promoted_orders,
+        promoted_fills,
+    )
     return {"orders": promoted_orders, "fills": promoted_fills, "codes": promoted_codes}
 
 
@@ -2523,6 +2582,7 @@ def reconcile_kis(
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
+    _kr_promotion_started = time.monotonic()
     promoted = _promote_open_buy_orders_from_holdings(
         env=env,
         strategy=strategy,
@@ -2532,6 +2592,10 @@ def reconcile_kis(
         orders_repo=orders_repo,
         fills_repo=fills_repo,
         positions_repo=positions_repo,
+    )
+    logger.info(
+        "[KR_RECONCILE][PROMOTION_AFTER_BROKER] elapsed_ms=%.1f",
+        1000.0 * (time.monotonic() - _kr_promotion_started),
     )
     orders_count += int(promoted.get("orders") or 0)
     fills_count += int(promoted.get("fills") or 0)

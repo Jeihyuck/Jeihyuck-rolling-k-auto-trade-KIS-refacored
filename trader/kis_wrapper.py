@@ -1719,6 +1719,49 @@ class KisAPI:
                     "[KIS][FINAL_URL] %s %s tick_remaining=%.3f timeout=%s",
                     method, url, kr_tick_remaining_sec(stage_deadline), request_timeout,
                 )
+                # PR257: the true order HTTP boundary (not the earlier
+                # intent/ORDER_READY log). This contains no tokens/accounts.
+                # Existing loop watchdog already owns the monotonic origin.
+                try:
+                    if method.upper() == "POST" and is_order_endpoint(url):
+                        _origin = os.getenv("KR_TICK_ORIGIN_MONOTONIC", "").strip()
+                        if _origin:
+                            _body = kwargs.get("json")
+                            if not isinstance(_body, dict):
+                                try:
+                                    _raw = kwargs.get("data")
+                                    _body = json.loads(
+                                        _raw.decode("utf-8") if isinstance(_raw, bytes)
+                                        else _raw
+                                    ) if isinstance(_raw, (bytes, str)) else {}
+                                except (TypeError, ValueError, UnicodeError):
+                                    _body = {}
+                            try:
+                                _elapsed = max(0.0, time.monotonic() - float(_origin))
+                            except (TypeError, ValueError, OverflowError):
+                                _elapsed = -1.0
+                            _code = str((_body or {}).get("PDNO") or "").removeprefix("A").zfill(6)
+                            _sell_trs = {str(item) for item in _pick_tr(self.env, "ORDER_SELL")}
+                            _tr = str((kwargs.get("headers") or {}).get("tr_id") or "")
+                            _side = (
+                                "SELL" if (_body or {}).get("SLL_TYPE") or _tr in _sell_trs
+                                else "BUY" if (_body or {}).get("PDNO") else "UNKNOWN"
+                            )
+                            logger.info(
+                                "[KR_LATENCY][NATIVE_HTTP_START] side=%s code=%s "
+                                "tick_elapsed_s=%.3f tick_index=%s kind=%s run_id=%s",
+                                _side, _code, _elapsed,
+                                os.getenv("PB1_LOOP_TICK_INDEX") or "NO_LOOP",
+                                os.getenv("PB1_SESSION_KIND") or "NO_SESSION",
+                                os.getenv("TRADER_RUN_ID") or "NO_RUN_ID",
+                            )
+                except Exception as _latency_exc:
+                    # Telemetry failures must NEVER affect a live order.
+                    logger.warning(
+                        "[KR_LATENCY][NATIVE_HTTP_PROBE_FAILED] type=%s "
+                        "action=CONTINUE_ORIGINAL_BROKER_REQUEST",
+                        type(_latency_exc).__name__,
+                    )
                 resp = self.session.request(
                     method,
                     url,

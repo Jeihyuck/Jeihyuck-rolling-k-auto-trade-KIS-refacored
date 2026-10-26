@@ -77,7 +77,8 @@ def test_reconciliation_rejects_both_open_and_previously_promoted_lg_orders_with
             self.terminal_orders = terminal_orders or []
             self.upserts = []
 
-        def get_open_orders(self, *_args):
+        def get_open_orders(self, *_args, fail_open=None):
+            assert fail_open is False
             return self.open_orders
 
         def list_recent_holdings_promoted_orders_for_repair(self, *_args, **_kwargs):
@@ -193,7 +194,8 @@ def test_unresolved_sell_status_without_provider_response_markers_stays_fenced()
     assert _kr_sell_holdings_promotion_unproven(order, order["response_json"])
 
     class Orders:
-        def get_open_orders(self, env):
+        def get_open_orders(self, env, *, fail_open=None):
+            assert fail_open is False
             return [order]
 
         def list_recent_holdings_promoted_orders_for_repair(self, *args, **kwargs):
