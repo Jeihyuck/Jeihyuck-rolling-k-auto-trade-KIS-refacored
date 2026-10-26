@@ -83,7 +83,10 @@ def _has_unresolved_broker_activity(*, engine, orders_repo: OrdersRepo, env: str
     """Fail closed when a recent broker submit has not reached terminal truth."""
     open_states = {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
     try:
-        rows = orders_repo.get_open_orders(env, trade_date=trade_date)
+        # Economic readiness must never reinterpret a DB timeout as no orders.
+        rows = orders_repo.get_open_orders(
+            env, trade_date=trade_date, fail_open=False,
+        )
         if any(str(row.get("status") or "").upper() in open_states for row in rows or []):
             return True
     except Exception as exc:
@@ -535,7 +538,11 @@ def _promote_open_buy_orders_from_holdings(
     terminal_proof_pruned = 0
     terminal_holding_pruned = 0
     promoted_codes: list[str] = []
-    candidate_orders = list(orders_repo.get_open_orders(env) or [])
+    # A failed order read cannot be an empty promotion candidate list.
+    # Propagate to the caller so this tick stays RECONCILE_REQUIRED.
+    candidate_orders = list(
+        orders_repo.get_open_orders(env, fail_open=False) or []
+    )
     current_open_orders = len(candidate_orders)
     seen_order_ids = {
         str(row.get("order_id") or row.get("client_order_key") or "")
