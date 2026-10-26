@@ -136,3 +136,73 @@ def test_broker_nonexecution_proof_must_match_original_order_and_zero_remaining(
         report = audit_sell_settlement(orders=[order], fills=[], positions=[])
         assert report["gap_count"] == 1, changed
         assert report["gaps"][0]["missing_priced_sell_qty"] == 170, changed
+
+
+def test_same_epoch_prior_day_unpriced_sell_carries_into_next_day_audit():
+    """Oct26 missing native SELL economics cannot disappear on Oct27."""
+    from datetime import date, datetime
+    import sqlalchemy as sa
+
+    from scripts.kr_close_settlement_audit import load_snapshot
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.exec_driver_sql("ATTACH DATABASE ':memory:' AS public")
+    md = sa.MetaData()
+    orders = sa.Table(
+        "orders", md,
+        sa.Column("order_id", sa.String, primary_key=True),
+        sa.Column("env", sa.String), sa.Column("trading_epoch_id", sa.String),
+        sa.Column("code", sa.String), sa.Column("side", sa.String),
+        sa.Column("status", sa.String), sa.Column("qty", sa.Integer),
+        sa.Column("kis_odno", sa.String), sa.Column("position_cycle_id", sa.String),
+        sa.Column("response_json", sa.Text),
+        sa.Column("created_at", sa.DateTime),
+        schema="public",
+    )
+    sa.Table(
+        "fills", md, sa.Column("order_id", sa.String),
+        sa.Column("env", sa.String), sa.Column("trading_epoch_id", sa.String),
+        sa.Column("side", sa.String), sa.Column("qty", sa.Integer),
+        sa.Column("price", sa.Float), sa.Column("fill_meta_json", sa.JSON),
+        sa.Column("filled_at", sa.DateTime), schema="public",
+    )
+    sa.Table(
+        "positions", md, sa.Column("code", sa.String),
+        sa.Column("env", sa.String), sa.Column("trading_epoch_id", sa.String),
+        sa.Column("position_cycle_id", sa.String), sa.Column("status", sa.String),
+        sa.Column("qty", sa.Integer), sa.Column("closed_reason", sa.String),
+        schema="public",
+    )
+    md.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.insert(orders), [
+            {
+                "order_id": "missing-sell-oct26", "env": "practice",
+                "trading_epoch_id": "current", "code": "293490",
+                "side": "SELL", "status": "PARTIAL_FILLED", "qty": 170,
+                "kis_odno": "0000034710", "position_cycle_id": "cycle",
+                "response_json": "{}", "created_at": datetime(2026, 10, 26, 6, 16),
+            },
+            {
+                "order_id": "old-account-not-ours", "env": "practice",
+                "trading_epoch_id": "old", "code": "293490",
+                "side": "SELL", "status": "FILLED", "qty": 36,
+                "kis_odno": "0000020000", "position_cycle_id": "old",
+                "response_json": "{}", "created_at": datetime(2026, 10, 26, 6, 16),
+            },
+            {
+                "order_id": "future-order-excluded", "env": "practice",
+                "trading_epoch_id": "current", "code": "425420",
+                "side": "SELL", "status": "SUBMITTED", "qty": 30,
+                "kis_odno": "0000039999", "position_cycle_id": "next-day",
+                "response_json": "{}", "created_at": datetime(2026, 10, 28, 0, 0),
+            },
+        ])
+    snapshot = load_snapshot(
+        engine, env="practice", epoch="current", day=date(2026, 10, 27),
+    )
+    assert [row["order_id"] for row in snapshot["orders"]] == ["missing-sell-oct26"]
+    report = audit_sell_settlement(**snapshot)
+    assert report["gap_count"] == 1
+    assert report["gaps"][0]["missing_priced_sell_qty"] == 170
