@@ -13377,6 +13377,7 @@ class PB1Engine:
                 self.env == "practice"
                 and self.STRATEGY_NAME == "pb1_pullback_close"
                 and os.getenv("KR_PB1_PAPER_STOP36_ENABLED", "1") == "1"
+                and os.getenv("PB1_SWING_STAGED_EXIT_ENABLED", "1") == "1"
                 and _active_family == "SWING_STAGED_EXIT"
                 and exit_policy_family == "SWING_STAGED_EXIT"
                 and position_book == "SWING_BOOK"
@@ -13469,6 +13470,8 @@ class PB1Engine:
                         **(pos.get("position_meta") or {}),
                         **_meta_update,
                     }},
+                    position_cycle_id=str(pos.get("position_cycle_id") or "") or None,
+                    portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or "") or None,
                 )
                 # 기존 exit_policy/final_reason 오버라이드
                 if horizon_result.get("exit_ok", False):

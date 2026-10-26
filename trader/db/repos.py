@@ -3944,6 +3944,7 @@ class OrdersRepo:
         trade_date: date | str | None = None,
         include_stale: bool = False,
         max_age_minutes: int | None = None,
+        fail_open: bool | None = None,
     ) -> list[dict]:
         """
         Open order 조회 (code/side/trade_date 필터 지원).
@@ -4003,7 +4004,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
-            fail_open=_resolve_lookup_fail_open(env),
+            fail_open=(_resolve_lookup_fail_open(env) if fail_open is None else bool(fail_open)),
         )
 
     def has_open_order_for_code(

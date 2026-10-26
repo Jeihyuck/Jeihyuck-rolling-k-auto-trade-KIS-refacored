@@ -55,7 +55,10 @@ def prove_safe_protective_sell_handoff(
         if not isinstance(balance_snapshot.get("output1"), list):
             return False, "INVALID_KIS_HOLDINGS"
         orders_repo = OrdersRepo(engine)
-        if orders_repo.get_open_orders(env, include_stale=True):
+        # The global practice default can return [] on a DB timeout.
+        # This proof authorizes deferring full reconciliation; an unknown
+        # lookup is NEVER proof that broker-tracked orders are absent.
+        if orders_repo.get_open_orders(env, include_stale=True, fail_open=False):
             return False, "OPEN_OR_UNRESOLVED_ORDER"
         health = orders_repo.execution_claim_health(market="KR")
         if (not isinstance(health, dict) or health.get("available") is not True
