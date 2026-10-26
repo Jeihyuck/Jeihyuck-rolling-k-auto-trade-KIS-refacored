@@ -206,3 +206,33 @@ def test_same_epoch_prior_day_unpriced_sell_carries_into_next_day_audit():
     report = audit_sell_settlement(**snapshot)
     assert report["gap_count"] == 1
     assert report["gaps"][0]["missing_priced_sell_qty"] == 170
+
+
+def test_manual_priced_fill_does_not_replace_native_kis_economic_proof():
+    order = dict(order_id="manual-price", code="425420", side="SELL", qty=30)
+    manual = dict(
+        order_id="manual-price", side="SELL", qty=30, price=62273,
+        evidence_kind="MANUAL_MTS_PRICE",
+    )
+    report = audit_sell_settlement(
+        orders=[order], fills=[manual], positions=[],
+    )
+    assert report["status"] == "ECONOMIC_SETTLEMENT_PENDING"
+    assert report["gaps"][0]["missing_priced_sell_qty"] == 30
+
+
+def test_native_individual_kis_fills_are_summed_without_manual_fills():
+    order = dict(order_id="native-price", code="425420", side="SELL", qty=30)
+    fills = [
+        dict(order_id="native-price", side="SELL", qty=12, price=62270,
+             evidence_kind="KIS_INDIVIDUAL_EXECUTION"),
+        dict(order_id="native-price", side="SELL", qty=18, price=62275,
+             evidence_kind="KIS_INDIVIDUAL_EXECUTION"),
+        dict(order_id="native-price", side="SELL", qty=30, price=62273,
+             evidence_kind="MANUAL_MTS_PRICE"),
+    ]
+    report = audit_sell_settlement(orders=[order], fills=fills, positions=[])
+    assert report["gap_count"] == 0
+    missing = audit_sell_settlement(orders=[order], fills=fills[1:], positions=[])
+    assert missing["gap_count"] == 1
+    assert missing["gaps"][0]["missing_priced_sell_qty"] == 12
