@@ -1,0 +1,47 @@
+name: KR257 P0 Sell-First and Paper Stop Acceptance
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "trader/pb1_runner.py"
+      - "trader/pb1_engine.py"
+      - "trader/reconcile_kis.py"
+      - "trader/kr/reconcile_lanes_257.py"
+      - "trader/kr/protective_sell_handoff.py"
+      - "trader/kr/paper_stop36_policy.py"
+      - "tests/kr/test_kr257*.py"
+      - "tests/kr/test_kr_pr249_protective_sell_handoff.py"
+      - ".github/workflows/kr257-four-blockers-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  kr257-four-blockers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      MARKET: KR
+      REGION: KR
+      PB1_MARKET_SCOPE: KRX
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      DISABLE_LIVE_TRADING: "1"
+      PYTHONPATH: "."
+      KR_PB1_PAPER_STOP36_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-mock
+      - name: Byte-compile modified code
+        run: |
+          python -m py_compile             trader/reconcile_kis.py trader/pb1_runner.py trader/pb1_engine.py             trader/kr/reconcile_lanes_257.py trader/kr/protective_sell_handoff.py             trader/kr/paper_stop36_policy.py
+      - name: Offline four-blocker acceptance
+        run: |
+          python -m pytest -q             tests/kr/test_kr257_strict_order_read_failclosed.py             tests/kr/test_kr257_reconcile_lanes_20261026.py             tests/kr/test_kr_20261023_protective_proof_failclosed.py             tests/kr/test_kr_pr249_protective_sell_handoff.py             tests/kr/test_kr_paper_stop36_live_20261026.py             tests/kr/test_kr257_paper_stop36_e2e.py
