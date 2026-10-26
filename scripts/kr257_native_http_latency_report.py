@@ -36,9 +36,9 @@ def analyze_kr_latency_lines(lines: list[str], *, min_samples: int = 20) -> dict
     sell_to_http: dict[tuple[str, str, str], float] = {}
     observed_sha: set[str] = set()
     for line in lines:
-        dt = re.search(r"20\\d{2}-\\d{2}-\\d{2}", line)
+        dt = re.search(r"20\d{2}-\d{2}-\d{2}", line)
         day = dt.group(0) if dt else "NO_DATE"
-        km = re.search(r"\\bkind=([^\\s]+)", line)
+        km = re.search(r"\bkind=([^\s]+)", line)
         kind = km.group(1) if km else "NO_SESSION"
         m = TICK.search(line)
         if m:
