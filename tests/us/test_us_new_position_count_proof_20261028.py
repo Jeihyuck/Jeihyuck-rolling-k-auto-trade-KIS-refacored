@@ -13,9 +13,15 @@ def _fill(symbol, order, qty=1, **extra):
 
 
 def test_20261027_eight_new_positions_are_eight_not_report_default_zero():
-    symbols = ["DHR", "TMO", "GILD", "ABBV", "KO", "CL", "KR", "SYY"]
-    orders = [_audit(s, f"{i:06d}") for i, s in enumerate(symbols, 1)]
-    fills = [_fill(s, str(i)) for i, s in enumerate(symbols, 1)]
+    actual_20261027_buy_qty = {
+        "ABBV": 11, "CL": 37, "DHR": 14, "GILD": 22,
+        "KO": 36, "KR": 52, "SYY": 41, "TMO": 5,
+    }
+    orders = [_audit(symbol, f"{i:06d}") for i, symbol in enumerate(actual_20261027_buy_qty, 1)]
+    fills = [
+        _fill(symbol, str(i), qty)
+        for i, (symbol, qty) in enumerate(actual_20261027_buy_qty.items(), 1)
+    ]
     proof = verified_new_positions(orders, fills)
     assert proof["actual_new_positions"] == 8
     assert proof["status"] == "VERIFIED"
