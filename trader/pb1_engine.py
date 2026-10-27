@@ -4961,14 +4961,34 @@ class PB1Engine:
                 positions_by_code[code_key] = {"code": code_key, "position_meta": {"holding_age_unknown": True,
                     "trail_eligible": False, "lifecycle_blocked": True}}
                 continue
-            persisted, created = self.positions_repo.get_or_create_imported_cycle_for_kis_holding(
-                env=self.env, strategy=self.STRATEGY_NAME,
-                account_id=get_account_key(env=self.env, kis=self.kis), sid=int((current or {}).get("sid") or 1),
-                mode=int((current or {}).get("mode") or 1), code=code_key,
-                market=(current or {}).get("market") or balance_row.get("prdt_type_cd") or balance_row.get("market"),
-                qty=int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0)),
-                avg_price=float(balance_row.get("pchs_avg_pric") or balance_row.get("avg_price") or 0),
-            )
+            try:
+                persisted, created = self.positions_repo.get_or_create_imported_cycle_for_kis_holding(
+                    env=self.env, strategy=self.STRATEGY_NAME,
+                    account_id=get_account_key(env=self.env, kis=self.kis), sid=int((current or {}).get("sid") or 1),
+                    mode=int((current or {}).get("mode") or 1), code=code_key,
+                    market=(current or {}).get("market") or balance_row.get("prdt_type_cd") or balance_row.get("market"),
+                    qty=int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0)),
+                    avg_price=float(balance_row.get("pchs_avg_pric") or balance_row.get("avg_price") or 0),
+                )
+            except RuntimeError as exc:
+                if str(exc) != "KR_IMPORT_BLOCKED_LINKED_BUY_CONTRACT":
+                    raise
+                # Do not abort unrelated positions' protective SELL evaluation
+                # because one BUY lifecycle has not yet been reconciled. The
+                # affected holding remains explicit, blocked and non-tradable.
+                logger.error(
+                    "[LIFECYCLE][IMPORT_DEFER_EXACT_BUY] code=%s "
+                    "action=BLOCK_ONLY_THIS_CYCLE_CONTINUE_OTHER_EXITS", code_key,
+                )
+                positions_by_code[code_key] = {
+                    "code": code_key,
+                    "status": "CYCLE_BINDING_CONFLICT",
+                    "position_meta": {
+                        "lifecycle_blocked": True,
+                        "binding_conflict": "SOURCE_BUY_RECONCILIATION_REQUIRED",
+                    },
+                }
+                continue
             positions_by_code[code_key] = persisted
             log_tag = "IMPORT_PERSIST" if created else "IMPORT_REUSE"
             logger.info("[LIFECYCLE][%s] code=%s active_epoch_id=%s position_cycle_id=%s source=KIS_HOLDING reason=LEGACY_OR_UNPROVEN_CYCLE created=%s",
