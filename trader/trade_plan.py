@@ -21,6 +21,9 @@ STYLE_PLAN_MAPPING: dict[str, dict[str, Any]] = {
     "ENTRY_OPEN_PUSH": {"entry_thesis": "BREAKOUT_DAYTRADE", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
     "ENTRY_MOMENTUM": {"entry_thesis": "MOMENTUM_RECLAIM", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
     "ENTRY_MOMENTUM_CONTINUATION": {"entry_thesis": "MOMENTUM_RECLAIM", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
+    # Explicitly selected *new* trend-swing contracts; existing DAY styles stay DAY.
+    "ENTRY_MOMENTUM_SWING": {"entry_thesis": "MOMENTUM_TREND_SWING", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
+    "ENTRY_BREAKOUT_SWING": {"entry_thesis": "BREAKOUT_TREND_SWING", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
     "ENTRY_PULLBACK": {"entry_thesis": "PULLBACK_CONTINUATION", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
     "ENTRY_PULLBACK_OVERRIDE": {"entry_thesis": "PULLBACK_CONTINUATION", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
     "ENTRY_VCP": {"entry_thesis": "VCP_BREAKOUT", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
