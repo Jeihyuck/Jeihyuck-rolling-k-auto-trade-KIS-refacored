@@ -221,3 +221,31 @@ def test_subscription_nack_backoff_allows_later_symbol_first(monkeypatch):
         now_mono=retry_after + 0.01,
     )
     assert next_after_backoff == (("KR", "005930"), ("H0STCNT0", "005930"))
+
+
+def test_kr_websocket_retains_actual_cumulative_volume_and_exchange_clock():
+    # Official H0STCNT0 positions: 1=time, 12=single trade, 13=cumulative.
+    fields = ["005930", "095959", "70100", "2", "100", "0.14",
+              "70000", "69900", "70200", "69800", "70200", "70100", "25", "12345"]
+    fields += ["0"] * (46 - len(fields))
+    parsed = KisWebSocketPriceService.parse_kr_trade("^".join(fields))
+    assert parsed["acml_vol"] == 12345.0
+    assert parsed["stck_cntg_hour"] == "095959"
+
+    svc = KisWebSocketPriceService()
+    svc.put_quote(**parsed)
+    quote = svc.get_fresh_quote("KR", "005930", max_age_sec=5)
+    assert quote["acml_vol"] == 12345.0
+    assert quote["stck_cntg_hour"] == "095959"
+    assert quote["raw"]["source"] == "KIS_WEBSOCKET"
+
+
+def test_kr_price_only_websocket_has_no_fabricated_volume_fields():
+    fields = ["005930", "095959", "70100", "2", "100", "0.14",
+              "70000", "69900", "70200", "69800", "70200", "70100"]
+    parsed = KisWebSocketPriceService.parse_kr_trade("^".join(fields))
+    svc = KisWebSocketPriceService()
+    svc.put_quote(**parsed)
+    quote = svc.get_fresh_quote("KR", "005930", max_age_sec=5)
+    assert "acml_vol" not in quote
+    assert "stck_cntg_hour" not in quote

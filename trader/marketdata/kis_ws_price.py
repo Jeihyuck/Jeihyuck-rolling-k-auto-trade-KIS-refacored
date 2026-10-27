@@ -47,10 +47,12 @@ class RealtimeQuote:
     received_at: float
     source: str = "KIS_WEBSOCKET"
     exchange: str | None = None
+    acml_vol: float | None = None
+    stck_cntg_hour: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         age = max(0.0, time.time() - self.received_at)
-        return {
+        result = {
             "market": self.market,
             "symbol": self.symbol,
             "last": self.last,
@@ -70,6 +72,12 @@ class RealtimeQuote:
                 "age_sec": age,
             },
         }
+        if self.market == "KR":
+            if self.acml_vol is not None:
+                result["acml_vol"] = self.acml_vol
+            if self.stck_cntg_hour:
+                result["stck_cntg_hour"] = self.stck_cntg_hour
+        return result
 
 
 class KisWebSocketPriceService:
@@ -264,6 +272,8 @@ class KisWebSocketPriceService:
         ask: float | None = None,
         exchange: str | None = None,
         received_at: float | None = None,
+        acml_vol: float | None = None,
+        stck_cntg_hour: str | None = None,
     ) -> None:
         if not last or float(last) <= 0:
             return
@@ -276,6 +286,8 @@ class KisWebSocketPriceService:
             ask=float(ask) if ask not in (None, "") and float(ask) > 0 else None,
             received_at=float(received_at or time.time()),
             exchange=exchange,
+            acml_vol=float(acml_vol) if acml_vol is not None and float(acml_vol) > 0 else None,
+            stck_cntg_hour=str(stck_cntg_hour) if stck_cntg_hour else None,
         )
         with self._lock:
             self._quotes[(quote.market, quote.symbol)] = quote
@@ -709,13 +721,19 @@ class KisWebSocketPriceService:
         last = cls._number(fields[2])
         if not last:
             return None
-        return {
+        parsed = {
             "market": "KR",
             "symbol": fields[0],
             "last": last,
             "ask": cls._number(fields[10]),
             "bid": cls._number(fields[11]),
         }
+        # H0STCNT0: [1] exchange HHMMSS; [13] cumulative volume.
+        # Short legacy price-only records never synthesize volume proof.
+        if len(fields) >= 14:
+            parsed["stck_cntg_hour"] = str(fields[1])
+            parsed["acml_vol"] = cls._number(fields[13])
+        return parsed
 
     @classmethod
     def parse_us_trade(cls, raw: str) -> dict[str, Any] | None:

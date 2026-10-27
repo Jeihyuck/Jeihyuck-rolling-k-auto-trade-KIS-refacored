@@ -259,6 +259,7 @@ from trader.kr.regime import (
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
 from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
+from trader.kr.volume_proof import build_kr_volume_proof
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -10562,6 +10563,7 @@ class PB1Engine:
             "planned_value": float(qty * limit_price), "risk_pct": float(RISK_PER_TRADE_PCT),
             "score": float(features.get("score") or cf.score or 0.0), "pivot": features.get("pivot"),
             "trigger_ok": bool(trigger_ok), "trigger_info": trigger_info or {},
+            "volume_proof": dict(features.get("volume_proof") or {}),
             "price_source": price_source or features.get("price_source") or "unknown",
             "price_gate_blocked": bool(features.get("price_gate_blocked")),
             "created_at": now_kst().isoformat(),
@@ -10619,6 +10621,13 @@ class PB1Engine:
         if entry_style not in {"PULLBACK", "BREAKOUT", "MOMENTUM"}: reasons.append(f"entry_style_invalid:{entry_style}")
         if entry_family not in {"ENTRY_PULLBACK", "ENTRY_BREAKOUT", "ENTRY_MOMENTUM"}: reasons.append(f"entry_family_invalid:{entry_family}")
         if entry_style == "PULLBACK" and trigger_policy in {"", "NONE"}: reasons.append("pullback_trigger_policy_missing")
+        # Final BUY boundary covers candidate backfill and recovered plans too.
+        if str(plan.get("side") or "").upper() == "BUY" and _is_kr_stock_code(str(plan.get("code") or "")) and entry_style in {"MOMENTUM", "BREAKOUT"}:
+            proof = plan.get("volume_proof") if isinstance(plan.get("volume_proof"), dict) else {}
+            if proof.get("confirmation_state") != "VERIFIED":
+                reasons.append("KR_VOLUME_PROOF_NOT_VERIFIED")
+            if entry_style == "BREAKOUT" and (not bool(plan.get("trigger_ok")) or proof.get("breakout_volume_confirmed") is not True):
+                reasons.append("KR_BREAKOUT_NOT_VOLUME_CONFIRMED")
         if stage == "PB1-CLOSE" and str(plan.get("side")).upper() == "BUY":
             window = str(getattr(self, "window_internal", "") or "").lower()
             if window in {"morning", "am", "afternoon", "pm"}: reasons.append("intraday_buy_stage_must_not_be_close")
@@ -19697,6 +19706,43 @@ class PB1Engine:
                             entry_reason=entry_reason,
                         )
                         continue
+                    # KR PB1 standard owner only; KR_INFINITE and US are separate.
+                    selected_style = self._normalize_entry_reason(cf.features.get("entry_style_selected"))
+                    if selected_style in {"ENTRY_MOMENTUM", "ENTRY_BREAKOUT"} and _is_kr_stock_code(cf.code):
+                        tick_quote = getattr(self, "_tick_price_cache", {}).get((str(cf.code).zfill(6), "J"), {})
+                        proof = build_kr_volume_proof(
+                            bars=df, snapshot=tick_quote, trade_date=self._trade_date,
+                            observed_at=now_kst(), code=str(cf.code).zfill(6),
+                            market=str(cf.market), entry_style=selected_style,
+                            trigger_ok=bool(trigger_ok),
+                            trigger_info=trigger_info if isinstance(trigger_info, dict) else {},
+                            price_above_vwap=cf.features.get("above_vwap"),
+                            daily_source=str((meta or {}).get("source") or "UNKNOWN"),
+                        )
+                        cf.features["volume_proof"] = proof
+                        logger.info(
+                            "[KR][BUY][VOLUME_PROOF] code=%s style=%s state=%s reason=%s source=%s",
+                            cf.code, selected_style, proof["confirmation_state"],
+                            proof["failure_reason"], proof["source"],
+                        )
+                        if proof["confirmation_state"] != "VERIFIED":
+                            why = "KR_VOLUME_PROOF_" + str(proof.get("failure_reason") or "UNKNOWN").upper()
+                            self._record_drop(drop_reason_counter, drop_examples, why, cf.code)
+                            order_stage_counter[why] += 1
+                            self._log_order_skip(cf, [why], self._entry_stage_name())
+                            self._emit_buy_decision(
+                                cf, order_value=order_value, reasons=[why],
+                                entry_allowed=entry_allowed, entry_reason=entry_reason,
+                            )
+                            self._store_entry_evaluation(
+                                cf, setup_ok=setup_filters_ok,
+                                score_ok=cf.code in set(self._debug_score_cut_codes),
+                                risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                                sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
+                                buyable_ok=True, trigger_ok=trigger_ok,
+                                order_ready=False, reasons=[why],
+                            )
+                            continue
                     entry_price = last_price
                     pivot_val = cf.features.get("pivot")
                     tight_low = cf.features.get("tight_low")
