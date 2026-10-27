@@ -1478,12 +1478,22 @@ def run_trade_session(
                 if old is None or not old_generation:
                     raise RuntimeError("US_STAGE4_RESTART_PREVIOUS_IDENTITY_MISSING")
                 from trader.us.execution.stage4_lifecycle import stop_stage4_worker
-                if not stop_stage4_worker(
+                stopped = stop_stage4_worker(
                     old, expected_generation=old_generation,
                     terminate_timeout_sec=float(os.getenv("US_STAGE4_STOP_TIMEOUT_SEC", "5")),
                     kill_timeout_sec=5.0,
-                ):
-                    raise RuntimeError("US_STAGE4_RESTART_STOP_ROW_UNVERIFIED")
+                )
+                if not stopped:
+                    # The writer might have died BEFORE its first READY row.
+                    # Replacing it is safe only when the old OS child is
+                    # confirmed reaped and the exact scoped row is ABSENT.
+                    from trader.us.execution.authoritative_reconcile_worker import (
+                        confirm_stage4_health_row_absent,
+                    )
+                    if not confirm_stage4_health_row_absent(
+                        expected_generation=old_generation, env=env,
+                    ):
+                        raise RuntimeError("US_STAGE4_RESTART_STOP_ROW_UNVERIFIED")
                 from trader.us.execution.authoritative_reconcile_worker import stage4_process_start_ticks
                 import uuid as _stage4_new_uuid
                 new_generation = str(_stage4_new_uuid.uuid4())
