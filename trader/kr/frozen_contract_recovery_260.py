@@ -203,6 +203,12 @@ def restore_verified_imported_buy_contracts(
             plan = request["entry_exit_plan"]
             previous_meta = _as_json(pos.get("position_meta"))
             new_meta = dict(previous_meta)
+            # Claim and KIS holdings jointly prove a current-session BUY
+            # even if the exact fill timestamp has not been persisted.
+            # Do not synthesize a broker fill time.
+            new_meta["same_day_entry_proven"] = True
+            new_meta["same_day_entry_provenance"] = "ORDER_FILL_CURRENT_DAY"
+            new_meta["holding_age_unknown"] = False
             new_meta["frozen_contract_recovery"] = {
                 "source_buy_order_id": str(buy["order_id"]),
                 "old_imported_cycle": str(pos["position_cycle_id"]),
