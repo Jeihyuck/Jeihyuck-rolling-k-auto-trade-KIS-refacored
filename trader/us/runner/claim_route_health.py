@@ -56,6 +56,9 @@ def classify_claim_remainder_conflict(attempted_qty: int, evidence: dict) -> dic
         return {**base, "reason": "CLAIM_DB_PROOF_UNVERIFIED"}
     if evidence.get("active_attempt_exists"):
         return {**base, "reason": "ACTIVE_ATTEMPT_UNRESOLVED"}
+    if (str(evidence.get("action_state") or "") == "SATISFIED"
+            and evidence.get("remaining_target_qty") == 0):
+        return {**base, "reason": "PRIOR_BUY_ALREADY_SATISFIED_DO_NOT_REORDER"}
     if str(evidence.get("action_state") or "") not in {
         "OPEN", "RETRYABLE", "PARTIALLY_SATISFIED",
     }:
