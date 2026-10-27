@@ -398,7 +398,8 @@ def test_session_supervisor_requires_os_reaping_before_new_generation_and_no_tic
     assert 'US_STAGE4_MAX_RESTARTS' in source
     assert 'US_STAGE4_RESTART_AFTER_UNHEALTHY_SEC' in source
     assert 'generation_changed=1 orders_authorized=0' in source
-    assert 'if not stop_stage4_worker(' in source
+    assert 'stopped = stop_stage4_worker(' in source
+    assert 'confirm_stage4_health_row_absent(' in source
     assert 'new_generation = str(_stage4_new_uuid.uuid4())' in source
     assert 'old.args, env=new_env' in source
     assert '[US_STAGE4][PAUSED]' in source
@@ -415,3 +416,60 @@ def test_pre_http_uses_same_authoritative_process_identity_gate():
               "trader/us/execution/authoritative_reconcile_worker.py").read_text()
     assert src.count("read_worker_health(env=") >= 2
     assert reader.count("assert_stage4_worker_process_alive()") >= 2
+
+
+
+def test_stage4_pre_ready_crash_restarts_only_when_scoped_health_row_is_absent(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.db import repos
+
+    scope = {
+        "env": "practice", "account_id": "a" * 64,
+        "trading_epoch_id": str(uuid.uuid4()),
+    }
+    generation = str(uuid.uuid4())
+    holder = {"row": None}
+
+    class Rows:
+        def mappings(self):
+            return self
+        def first(self):
+            return holder["row"]
+
+    class Conn:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            return False
+        def execute(self, query, params):
+            sql = str(query)
+            assert "account_fingerprint=:account" in sql
+            assert "trading_epoch_id=:epoch" in sql
+            assert params["account"] == scope["account_id"]
+            return Rows()
+
+    class Engine:
+        def connect(self):
+            return Conn()
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: scope)
+
+    assert worker.confirm_stage4_health_row_absent(expected_generation=generation)
+    holder["row"] = {"writer_generation": str(uuid.uuid4())}
+    assert not worker.confirm_stage4_health_row_absent(expected_generation=generation)
+    holder["row"] = {"writer_generation": generation}
+    assert not worker.confirm_stage4_health_row_absent(expected_generation=generation)
+
+
+def test_stage4_restart_never_trusts_missing_database_or_bad_generation(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.db import repos
+    monkeypatch.setattr(repos, "_us_execution_claim_scope",
+                        lambda: {"env": "practice", "account_id": "a" * 64,
+                                 "trading_epoch_id": str(uuid.uuid4())})
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    with pytest.raises(RuntimeError, match="GENERATION_UNVERIFIED"):
+        worker.confirm_stage4_health_row_absent(expected_generation="not-a-uuid")
+    with pytest.raises(RuntimeError, match="DATABASE_UNAVAILABLE"):
+        worker.confirm_stage4_health_row_absent(expected_generation=str(uuid.uuid4()))
