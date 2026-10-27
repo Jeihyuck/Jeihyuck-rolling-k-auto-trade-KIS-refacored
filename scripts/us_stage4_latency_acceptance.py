@@ -32,7 +32,7 @@ PROTECTIVE = frozenset({
 
 
 STAGE4_READY_INTERVAL = re.compile(
-    r"\\[US_STAGE4\\]\\[READY_INTERVAL\\]\\s+interval_ms=(?P<ms>[\\d.]+)"
+    r"\[US_STAGE4\]\[READY_INTERVAL\]\s+interval_ms=(?P<ms>[\d.]+)"
 )
 
 
