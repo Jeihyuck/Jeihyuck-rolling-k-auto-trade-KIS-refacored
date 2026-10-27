@@ -19717,6 +19717,7 @@ class PB1Engine:
                             trigger_ok=bool(trigger_ok),
                             trigger_info=trigger_info if isinstance(trigger_info, dict) else {},
                             price_above_vwap=cf.features.get("above_vwap"),
+                            daily_source=str((meta or {}).get("source") or "UNKNOWN"),
                         )
                         cf.features["volume_proof"] = proof
                         logger.info(
