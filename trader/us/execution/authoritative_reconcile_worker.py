@@ -265,6 +265,24 @@ def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
 
 def publish_health(conn: Any, *, scope: dict, generation: str,
                    state: str, result: dict | None=None) -> None:
+    # Only READY supplies fresh reconciliation numbers.  FAILED/STOPPED are
+    # liveness transitions, not new KIS evidence: preserve the last verified
+    # pending/unresolved/fill counters and never invent ERROR/1 on shutdown.
+    # The generation predicate also prevents an old writer's finally block
+    # from overwriting a newer writer's READY row.
+    if state in {"FAILED", "STOPPED"}:
+        conn.execute(text("""
+            UPDATE us_stage4_reconcile_health
+               SET worker_state=:state, evidence_at=NULL, updated_at=NOW()
+             WHERE env=:env AND account_fingerprint=:account
+               AND trading_epoch_id=:epoch
+               AND writer_generation=CAST(:generation AS uuid)
+        """), {"env":scope["env"], "account":scope["account_id"],
+               "epoch":scope["trading_epoch_id"], "generation":generation,
+               "state":state})
+        return
+    if state != "READY":
+        raise ValueError("US_STAGE4_HEALTH_STATE_UNSUPPORTED")
     result=result or {}
     conn.execute(text("""
         INSERT INTO us_stage4_reconcile_health
