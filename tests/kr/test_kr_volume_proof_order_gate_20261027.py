@@ -70,3 +70,43 @@ def test_missing_daily_volume_does_not_synthesize_default():
     bars = _bars()
     bars.loc[bars.index[-1], "volume"] = None
     assert _proof(bars=bars)["confirmation_state"] == "UNKNOWN"
+
+
+def _order_plan(style: str, proof: dict):
+    return {
+        "code": "005930", "market": "J", "side": "BUY", "stage": "PB1-AM",
+        "entry_style": style, "entry_family": "ENTRY_" + style,
+        "entry_reason": "ENTRY_" + style, "trigger_policy": "BREAKOUT_TRIGGER" if style == "BREAKOUT" else "MOMENTUM_CONTINUATION",
+        "entry_price": 10000, "order_price": 10000, "limit_price": 10000,
+        "stop_price": 9500, "qty": 1, "trigger_ok": True, "volume_proof": proof,
+    }
+
+
+def test_final_buy_boundary_rejects_missing_volume_proof_even_with_all_other_gates():
+    from trader.pb1_engine import PB1Engine
+    engine = PB1Engine.__new__(PB1Engine)
+    ok, reasons = engine._validate_entry_plan(_order_plan("MOMENTUM", {}))
+    assert not ok
+    assert "KR_VOLUME_PROOF_NOT_VERIFIED" in reasons
+
+
+def test_final_buy_boundary_rejects_breakout_without_confirmed_volume():
+    from trader.pb1_engine import PB1Engine
+    engine = PB1Engine.__new__(PB1Engine)
+    good = _proof(entry_style="BREAKOUT", trigger_ok=True, trigger_info={"vol_ok": True})
+    plan = _order_plan("BREAKOUT", good)
+    ok, reasons = engine._validate_entry_plan(plan)
+    assert ok, reasons
+    plan["trigger_ok"] = False
+    ok, reasons = engine._validate_entry_plan(plan)
+    assert not ok
+    assert "KR_BREAKOUT_NOT_VOLUME_CONFIRMED" in reasons
+
+
+def test_final_buy_boundary_preserves_existing_pullback_policy():
+    from trader.pb1_engine import PB1Engine
+    engine = PB1Engine.__new__(PB1Engine)
+    plan = _order_plan("PULLBACK", {})
+    plan["trigger_policy"] = "PULLBACK_OVERRIDE"
+    ok, reasons = engine._validate_entry_plan(plan)
+    assert ok, reasons
