@@ -435,6 +435,9 @@ def verify_recovered_contract_invariants(*, engine, env: str, strategy: str) -> 
             entry = _as_json(pos.get("entry_meta_json"))
             if (pos.get("position_origin") != "SYSTEM"
                     or pos.get("exit_policy_family") != plan.get("exit_policy_family")
+                    or pos.get("trade_horizon") != plan.get("trade_horizon")
+                    or bool(pos.get("force_eod_close")) != bool(plan.get("force_eod_close"))
+                    or pos.get("eod_action") != plan.get("eod_action")
                     or str(entry.get("entry_contract_sha256") or "") != str(proof.get("entry_contract_sha256") or "")
                     or not plan.get("exit_policy_family")
                     or str(pos.get("position_cycle_id")) == str(proof.get("old_imported_cycle"))):
