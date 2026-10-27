@@ -507,8 +507,8 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
             "PARTIAL_UNVERIFIED" if sum(
                 1 for trade in trades
                 if trade.get("side") == "SELL" and (
-                    trade.get("lifecycle", {}).get("filled")
-                    or trade.get("lifecycle", {}).get("partially_filled")
+                    (trade.get("lifecycle") or {}).get("filled")
+                    or (trade.get("lifecycle") or {}).get("partially_filled")
                 ) and trade.get("pnl_source") == "UNKNOWN"
             ) else "VERIFIED"
         ),
