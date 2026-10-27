@@ -1759,7 +1759,9 @@ def _resolve_day_protect_exit(
     if not enabled:
         return {"exit_ok": False, "reason": "DAY_PROTECT_DISABLED"}
 
-    stop_loss_pct = float(_os.getenv("PB1_DAY_STOP_LOSS_PCT", "2.0"))
+    # PB1 DAY_TRADE momentum/breakout default: -3%. SWING -3/-6
+    # and KR_INFINITE averaging-down rules are independent.
+    stop_loss_pct = float(_os.getenv("PB1_DAY_STOP_LOSS_PCT", "3.0"))
     profit_arm_pct = float(_os.getenv("PB1_DAY_PROFIT_ARM_PCT", "1.5"))
     breakeven_pct = float(_os.getenv("PB1_DAY_BREAKEVEN_PROTECT_PCT", "0.2"))
     trail_arm_pct = float(_os.getenv("PB1_DAY_TRAIL_ARM_PCT", "2.0"))
