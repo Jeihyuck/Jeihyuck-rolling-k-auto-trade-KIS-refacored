@@ -49,3 +49,39 @@ def test_legacy_us_custom_plan_not_changed():
                                         "eod_action": "CARRY_IF_NO_EXIT_SIGNAL",
                                         "force_eod_close": False})
     assert p.trade_horizon == "SWING"
+
+
+@pytest.mark.parametrize("style", ["ENTRY_MOMENTUM_SWING", "ENTRY_BREAKOUT_SWING"])
+def test_explicit_new_trend_swing_contract_carries_only_when_no_exit_signal(style):
+    from trader.trade_plan import classify_close_action_from_plan
+    plan = build_entry_exit_plan(code="005930", market="J",
+                                 entry_style_selected=style,
+                                 entry_reason="ENTRY_MOMENTUM" if "MOMENTUM" in style else "ENTRY_BREAKOUT",
+                                 entry_price=10000, features={"stop_price": 9500})
+    assert plan.trade_horizon == "SWING"
+    assert plan.exit_policy_family == "SWING_STAGED_EXIT"
+    assert plan.eod_action == "CARRY_IF_NO_EXIT_SIGNAL"
+    assert plan.force_eod_close is False
+    assert classify_close_action_from_plan(plan.to_dict()) == ("CARRY", "SWING_CARRY")
+
+
+@pytest.mark.parametrize("style", ["ENTRY_MOMENTUM", "ENTRY_BREAKOUT"])
+def test_original_day_contract_still_eod_exits(style):
+    from trader.trade_plan import classify_close_action_from_plan
+    plan = build_entry_exit_plan(code="005930", market="J",
+                                 entry_style_selected=style,
+                                 entry_reason=style, entry_price=10000,
+                                 features={"stop_price": 9500})
+    assert classify_close_action_from_plan(plan.to_dict()) == ("FORCE_SELL", "EOD_FORCE_EXIT")
+
+
+def test_existing_frozen_position_horizon_not_promoted():
+    from trader.pb1_engine import _resolve_position_horizon
+    old = build_entry_exit_plan(code="005930", market="KR", entry_style_selected="MOMENTUM",
+                                entry_reason="MOMENTUM", entry_price=10000,
+                                features={"stop_price": 9700})
+    new = build_entry_exit_plan(code="005930", market="KR", entry_style_selected="ENTRY_MOMENTUM_SWING",
+                                entry_reason="MOMENTUM", entry_price=10000,
+                                features={"stop_price": 9700})
+    assert _resolve_position_horizon({"entry_exit_plan_json": old.to_dict()}) == "DAY_PROTECT"
+    assert _resolve_position_horizon({"entry_exit_plan_json": new.to_dict()}) == "SWING_CARRY"
