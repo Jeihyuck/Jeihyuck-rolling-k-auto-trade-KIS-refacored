@@ -1736,6 +1736,22 @@ def run_daily_report(
         report["kis_fill_order_count"] = len({(trade_date, str(f.get("order_no") or "").strip()) for f in actual if str(f.get("order_no") or "").strip()})
         report["kis_actual_fill_execution_count"] = len(actual)
         report["kis_actual_fill_order_count"] = report["kis_fill_order_count"]
+        # PR #267 (KR) lesson: an initialized zero is not authoritative proof
+        # of zero new positions. Count only exact broker BUY fill/order joins.
+        from trader.us.runner.new_position_count_proof import verified_new_positions
+        new_position_proof = verified_new_positions(
+            report.get("order_audit") or [], actual,
+        )
+        report["actual_new_positions"] = new_position_proof["actual_new_positions"]
+        report["actual_new_positions_proof"] = new_position_proof
+        if new_position_proof["status"] != "VERIFIED":
+            report["warnings"].append("NEW_POSITION_COUNT_UNVERIFIED")
+            logger.warning(
+                "[US_DAILY_REPORT][NEW_POSITION_COUNT_UNVERIFIED] "
+                "kis_buy_fills=%d unmatched=%d",
+                new_position_proof["kis_buy_fill_rows"],
+                new_position_proof["unmatched_buy_fill_rows"],
+            )
         report["balance_synthetic_confirmation_count"] = sum(1 for f in kis_fills if _fill_is_synthetic(f) and str(((f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}).get("fill_evidence_type") or "") == "BALANCE_DELTA_SYNTHETIC")
     if close_order_classification is not None:
         report["order_final_classification"] = close_order_classification.get("orders", [])
