@@ -21,7 +21,9 @@ DAY = date(2026, 10, 27)
 
 def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
                  broker_qty=None, bad_ack=False, duplicate=False,
-                 existing_source=False):
+                 existing_source=False, zero_broker_fill=False,
+                 wrong_broker_order=False, wrong_trade_date=False,
+                 wrong_broker_price=False):
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
@@ -65,7 +67,21 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
             client_order_key=request["client_order_key"],
             status="RECONCILED", kis_odno="0000011241",
             request_json=request,
-            response_json={"_kr_buy_entry_contract": {"entry_contract_sha256": ack}},
+            response_json={
+                "_kr_buy_entry_contract": {"entry_contract_sha256": ack},
+                "pdno": code,
+                "odno": "0000099999" if wrong_broker_order else "0000011241",
+                "ord_dt": "20261026" if wrong_trade_date else "20261027",
+                "sll_buy_dvsn_cd": "02",
+                "ord_qty": str(qty),
+                "tot_ccld_qty": "0" if zero_broker_fill else str(qty),
+                "rmn_qty": str(qty) if zero_broker_fill else "0",
+                "tot_ccld_amt": "0" if zero_broker_fill else str(qty * 61906),
+                "avg_prvs": "0" if zero_broker_fill else (
+                    "100" if wrong_broker_price else "61906"
+                ),
+                "cncl_yn": "N",
+            },
             created_at=now,
         ))
         c.execute(schema.positions.insert().values(
@@ -131,6 +147,10 @@ def test_verified_momentum_33shares_restored_once_with_exact_sha():
     {"bad_ack": True},
     {"duplicate": True},
     {"existing_source": True},
+    {"zero_broker_fill": True},  # Kakao Games: RECONCILED but 0 shares filled
+    {"wrong_broker_order": True},
+    {"wrong_trade_date": True},
+    {"wrong_broker_price": True},
 ])
 def test_unproven_or_ambiguous_buy_never_inherits_exit_contract(case):
     engine, schema, holdings, _cycle, _digest = fixture_case(**case)
