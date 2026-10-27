@@ -6919,6 +6919,26 @@ class PositionsRepo:
                 select(self._schema.positions).where(and_(*conditions))
             ).mappings().first()
             existing_row = dict(existing) if existing else {}
+            # Frozen BUY plan owns the exit family. Diagnostics, stale copies
+            # and reconciliation must not overwrite the protected policy field.
+            # Import/legacy rows without a source-contract hash are unaffected.
+            if "exit_policy_family" in values and existing_row:
+                frozen_plan = existing_row.get("entry_exit_plan_json") or {}
+                frozen_meta = existing_row.get("entry_meta_json") or {}
+                if isinstance(frozen_plan, dict) and isinstance(frozen_meta, dict):
+                    plan_family = str(frozen_plan.get("exit_policy_family") or "")
+                    source_hash = str(frozen_meta.get("entry_contract_sha256") or "")
+                    requested_family = str(values.get("exit_policy_family") or "")
+                    if (len(source_hash) == 64 and plan_family
+                            and plan_family != "POLICY_MISSING"
+                            and requested_family != plan_family):
+                        logger.error(
+                            "[KR_FROZEN_POLICY][UPDATE_BLOCK] code=%s cycle=%s "
+                            "requested=%s frozen=%s action=KEEP_FROZEN",
+                            code, existing_row.get("position_cycle_id"),
+                            requested_family, plan_family,
+                        )
+                        values.pop("exit_policy_family")
             if "entry_meta_json" in values:
                 values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
             if "last_exit_eval_json" in values:
