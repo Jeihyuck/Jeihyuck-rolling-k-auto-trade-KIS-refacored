@@ -3565,8 +3565,23 @@ def run_trade_tick(
         if effective_max_new_positions is not None:
             try:
                 effective_max_new_positions_int = int(effective_max_new_positions)
-                available_new_slots = min(available_new_slots, max(0, effective_max_new_positions_int))
+                from trader.us.runner.new_position_limit_scope import (
+                    explain_effective_new_position_limit,
+                )
+                new_position_limit_proof = explain_effective_new_position_limit(
+                    available_current_position_slots=available_new_slots,
+                    effective_max_new_positions=effective_max_new_positions_int,
+                )
+                available_new_slots = new_position_limit_proof["tick_new_slots_after_cap"]
                 allow_new_symbols = bool(allow_new_symbols and available_new_slots > 0)
+                logger.info(
+                    "[US_ENTRY][POSITION_LIMIT_SCOPE] applied_scope=%s "
+                    "configured_cap=%d tick_slots_after_cap=%d "
+                    "daily_cumulative_new_positions_proven=%s",
+                    new_position_limit_proof["applied_scope"],
+                    effective_max_new_positions_int, available_new_slots,
+                    new_position_limit_proof["daily_cumulative_new_positions_proven"],
+                )
                 logger.info(
                     "[US_ENTRY][UNDERFILLED_LIMIT] available_new_slots_before=%d effective_max_new_positions=%d available_new_slots_after=%d underfilled_tier=%s",
                     available_new_slots_before_underfilled_limit,
@@ -4950,6 +4965,9 @@ def run_trade_tick(
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,
         "effective_capital_scale": market_state_overlay.get("effective_capital_scale") if 'market_state_overlay' in locals() else None,
         "effective_max_new_positions": market_state_overlay.get("effective_max_new_positions") if 'market_state_overlay' in locals() else None,
+        "effective_max_new_positions_scope": "PER_TICK_AVAILABLE_CURRENT_POSITION_SLOTS",
+        "daily_new_position_cap_enforcement_verified": False,
+        "new_position_limit_proof": locals().get("new_position_limit_proof"),
         "underfilled_tier": market_state_overlay.get("underfilled_tier") if 'market_state_overlay' in locals() else None,
         "sector_cap_enforced": market_state_overlay.get("sector_cap_enforced") if 'market_state_overlay' in locals() else False,
         "market_state": market_state_overlay.get("market_state") if 'market_state_overlay' in locals() else "NORMAL",
