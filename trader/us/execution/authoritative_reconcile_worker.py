@@ -173,6 +173,35 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
 
 
 
+def confirm_stage4_health_row_absent(*, expected_generation: str,
+                                     env: str = "practice") -> bool:
+    """Allow fresh writer after OS reaping when predecessor died before READY.
+
+    An existing row (even STOPPED) or a DB error is NOT proof of absence.
+    Call only *after* the old subprocess has been reaped and could not be
+    generation-marked STOPPED. Never clears existing health evidence.
+    """
+    from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
+    scope = _us_execution_claim_scope()
+    if env != "practice" or scope.get("env") != env:
+        raise RuntimeError("US_STAGE4_RESTART_PRACTICE_ONLY")
+    try:
+        uuid.UUID(str(expected_generation))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("US_STAGE4_RESTART_GENERATION_UNVERIFIED") from exc
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US_STAGE4_RESTART_DATABASE_UNAVAILABLE")
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT writer_generation FROM us_stage4_reconcile_health
+             WHERE env=:env AND account_fingerprint=:account
+               AND trading_epoch_id=:epoch
+        """), {"env":scope["env"], "account":scope["account_id"],
+               "epoch":scope["trading_epoch_id"]}).mappings().first()
+    return row is None
+
+
 def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "practice") -> bool:
     """Mark only this account/epoch/generation STOPPED after the OS reaps its writer.
 
