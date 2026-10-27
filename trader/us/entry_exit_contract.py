@@ -16,6 +16,7 @@ US_ENTRY_EXIT_CONTRACT_VERSION = "us_entry_exit_contract_v2"
 _PROVENANCE_FIELDS = (
     "entry_reason", "entry_style_selected", "entry_style_raw", "entry_component", "entry_signal_type",
     "reasons", "filters_passed", "score_breakdown", "explanation_quality",
+    "entry_identity_proof",
     "rank_final30", "score_final", "trend_score", "theme_cluster", "sector",
     "industry", "market_state", "market_regime", "rotation_regime",
     "independent_entry_contract_v1", "pullback_pass", "pullback_completed_close", "momentum_pass", "standalone_momentum_score",
@@ -68,6 +69,40 @@ def _is_infinite_sleeve_context(*sources: Any) -> bool:
                 if str(context.get(field) or "").strip().upper() == "TQQQ_INFINITE":
                     return True
     return False
+
+
+
+def validate_us_new_buy_management_contract(intent: dict) -> str | None:
+    """Fail new US_STANDARD BUY if its explicit frozen exit policy conflicts.
+
+    No strategy mapping change: PB1 currently selects SWING_BOOK/SWING_CARRY
+    regardless of Pullback/Momentum entry. TQQQ/SELL/held adds are untouched.
+    """
+    data = _dict(intent)
+    meta = _dict(data.get("meta"))
+    owner = str(data.get("strategy_owner") or meta.get("strategy_owner") or "").upper()
+    if (str(data.get("side") or "").upper() != "BUY"
+            or str(data.get("symbol") or "").upper() == "TQQQ"
+            or owner != "US_STANDARD"
+            or str(data.get("position_action") or meta.get("position_action") or "")
+                != "NEW_POSITION_BUY"):
+        return None
+    for field in ("book", "horizon", "exit_policy"):
+        top = data.get(field)
+        nested = meta.get(field)
+        if top not in (None, "") and nested not in (None, "") and str(top) != str(nested):
+            return "US_ENTRY_EXIT_POLICY_CONFLICT"
+    contract = _dict(data.get("entry_exit_contract") or meta.get("entry_exit_contract"))
+    if contract:
+        # An invalid signed contract is not a safe source of management policy.
+        if not verify_us_entry_exit_contract(contract):
+            return "US_ENTRY_EXIT_POLICY_CONFLICT"
+        management = _dict(contract.get("management"))
+        for field in ("book", "horizon", "exit_policy"):
+            top = data.get(field)
+            if top not in (None, "") and str(top) != str(management.get(field) or ""):
+                return "US_ENTRY_EXIT_POLICY_CONFLICT"
+    return None
 
 
 def _sha(payload: dict) -> str:

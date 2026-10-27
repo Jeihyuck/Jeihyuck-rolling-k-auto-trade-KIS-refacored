@@ -1593,6 +1593,27 @@ def generate_entry_intents(
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
 
+        # Korean PB1 PR #264 lesson: preserve the selected entry identity
+        # separately from the triggering event and score breakdown. This is
+        # diagnostic only: no US PB1 entry threshold or SELL horizon changes.
+        from trader.us.pb1.entry_identity_proof import build_entry_identity_proof
+        identity_proof = build_entry_identity_proof(
+            entry_meta, intent=intent, observed_price=price,
+        )
+        intent["entry_identity_proof"] = identity_proof
+        durable_meta["entry_identity_proof"] = identity_proof
+        logger.info(
+            "[US_ENTRY][IDENTITY_PROOF] symbol=%s owner=%s selected=%s "
+            "selected_score=%s max_score=%s selected_below_max=%s "
+            "trigger_source=%s volume_status=%s",
+            symbol, identity_proof["strategy_owner"],
+            identity_proof["selected_style"], identity_proof["selected_score"],
+            identity_proof["max_component_score"],
+            identity_proof["selected_below_score_max"],
+            identity_proof["trigger_source"],
+            identity_proof["volume_proof_status"],
+        )
+
         if _stop_if_cancelled("before_order_preflight"):
             break
         if intent_acceptor is not None:

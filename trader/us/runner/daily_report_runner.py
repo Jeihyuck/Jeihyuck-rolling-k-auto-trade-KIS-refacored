@@ -68,11 +68,13 @@ def _fill_is_synthetic(fill: dict) -> bool:
                 or meta.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
 
 def _positive_float(value: object) -> float | None:
+    """A nonfinite KIS execution price is never proof of a valid fill."""
+    import math
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _order_lifecycle_truth(status: str, timeline: dict) -> dict[str, bool]:
@@ -98,14 +100,16 @@ def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dic
         _positive_float(meta.get("entry_price")), _positive_float(order.get("avg_price_usd")),
         _positive_float(order.get("reconciled_avg_price")), _positive_float(order.get("kis_avg_price")),
     ) if value is not None), None)
-    try:
-        gross = float(meta["gross_realized_pnl"]) if meta.get("gross_realized_pnl") is not None else None
-    except (TypeError, ValueError):
+    gross = _safe_number(meta.get("gross_realized_pnl"))
+    # A profit number alone cannot validate a filled SELL with missing broker
+    # price/quantity. Keep it unknown; never publish NaN/Infinity as profit.
+    if fill_price is None or filled_qty is None:
         gross = None
     if gross is None and fill_price is not None and filled_qty is not None and cost_basis is not None:
         gross = round((fill_price - cost_basis) * filled_qty, 6)
     return_rate = (fill_price / cost_basis) - 1 if fill_price is not None and cost_basis is not None else None
     filled_status = status in {"FILLED", "PARTIALLY_FILLED"}
+    missing_fill_price = filled_status and filled_qty is not None and fill_price is None
     missing_cost_basis = filled_status and fill_price is not None and filled_qty is not None and cost_basis is None
     missing_metadata = filled_status and not any((
         meta.get("reason"), meta.get("exit_reason"), meta.get("profit_capture_stage"),
@@ -114,15 +118,21 @@ def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dic
     return {"fill_price": fill_price, "filled_qty": filled_qty, "gross_realized_pnl": gross,
             "return_rate_at_fill": return_rate, "missing_metadata": missing_metadata,
             "missing_cost_basis": missing_cost_basis,
-            "error": "ERROR_MISSING_SELL_COST_BASIS" if missing_cost_basis else None}
+            "missing_fill_price": missing_fill_price,
+            "error": (
+                "ERROR_MISSING_SELL_FILL_PRICE" if missing_fill_price
+                else "ERROR_MISSING_SELL_COST_BASIS" if missing_cost_basis else None
+            )}
 
 
 def _safe_number(value: object) -> float | None:
+    import math
     try:
         if value in (None, ""):
             return None
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -493,6 +503,16 @@ def _build_trade_reason_pnl_summary(order_audit: list[dict], position_rows: list
         "buy_lot_attribution": "SYMBOL_CHRONOLOGICAL_FIFO",
         "realized_pnl_usd": round(realized_total, 4),
         "realized_trade_count_with_pnl": realized_known,
+        "realized_pnl_status": (
+            "PARTIAL_UNVERIFIED" if sum(
+                1 for trade in trades
+                if trade.get("side") == "SELL" and (
+                    (trade.get("lifecycle") or {}).get("filled")
+                    or (trade.get("lifecycle") or {}).get("partially_filled")
+                ) and trade.get("pnl_source") == "UNKNOWN"
+            ) else "VERIFIED"
+        ),
+        "realized_pnl_usd_is_verified_subtotal": True,
         "same_day_buy_lot_unrealized_pnl_usd": round(same_day_buy_lot_unrealized_total, 4),
         "same_day_buy_lot_cost_basis_usd": round(same_day_buy_lot_basis_total, 4),
         "same_day_buy_lot_unrealized_pnl_pct": round(same_day_buy_lot_pct, 4) if same_day_buy_lot_pct is not None else None,
@@ -1302,6 +1322,14 @@ def run_daily_report(
                             warning = f"ERROR_MISSING_SELL_METADATA symbol={order.get('symbol') or ''} client_order_key={order.get('client_order_key') or ''}"
                             report["warnings"].append(warning)
                             logger.error("[US_DAILY_REPORT][%s]", warning)
+                        if sell_pnl.get("missing_fill_price"):
+                            warning = f"ERROR_MISSING_SELL_FILL_PRICE symbol={order.get('symbol') or ''} client_order_key={order.get('client_order_key') or ''}"
+                            report["warnings"].append(warning)
+                            report.setdefault("errors", []).append(warning)
+                            report["report_consistency"] = worsen_consistency(
+                                report.get("report_consistency", "OK"), "REPORT_INCONSISTENT"
+                            )
+                            logger.error("[US_DAILY_REPORT][%s]", warning)
                         if sell_pnl.get("missing_cost_basis"):
                             warning = f"ERROR_MISSING_SELL_COST_BASIS symbol={order.get('symbol') or ''} client_order_key={order.get('client_order_key') or ''}"
                             report["warnings"].append(warning)
@@ -1736,6 +1764,22 @@ def run_daily_report(
         report["kis_fill_order_count"] = len({(trade_date, str(f.get("order_no") or "").strip()) for f in actual if str(f.get("order_no") or "").strip()})
         report["kis_actual_fill_execution_count"] = len(actual)
         report["kis_actual_fill_order_count"] = report["kis_fill_order_count"]
+        # PR #267 (KR) lesson: an initialized zero is not authoritative proof
+        # of zero new positions. Count only exact broker BUY fill/order joins.
+        from trader.us.runner.new_position_count_proof import verified_new_positions
+        new_position_proof = verified_new_positions(
+            report.get("order_audit") or [], actual,
+        )
+        report["actual_new_positions"] = new_position_proof["actual_new_positions"]
+        report["actual_new_positions_proof"] = new_position_proof
+        if new_position_proof["status"] != "VERIFIED":
+            report["warnings"].append("NEW_POSITION_COUNT_UNVERIFIED")
+            logger.warning(
+                "[US_DAILY_REPORT][NEW_POSITION_COUNT_UNVERIFIED] "
+                "kis_buy_fills=%d unmatched=%d",
+                new_position_proof["kis_buy_fill_rows"],
+                new_position_proof["unmatched_buy_fill_rows"],
+            )
         report["balance_synthetic_confirmation_count"] = sum(1 for f in kis_fills if _fill_is_synthetic(f) and str(((f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}).get("fill_evidence_type") or "") == "BALANCE_DELTA_SYNTHETIC")
     if close_order_classification is not None:
         report["order_final_classification"] = close_order_classification.get("orders", [])
@@ -1913,7 +1957,11 @@ def run_daily_report(
     _trade_pnl = report.get("trade_pnl_analysis") or {}
     md_lines.extend([
         "## Trade Reason & PnL",
-        f"- Realized PnL (gross): ${float(_trade_pnl.get('realized_pnl_usd') or 0):,.2f}",
+        (
+            f"- Realized PnL (gross): ${float(_trade_pnl.get('realized_pnl_usd') or 0):,.2f}"
+            if _trade_pnl.get("realized_pnl_status", "VERIFIED") == "VERIFIED"
+            else "- Realized PnL (gross): UNRESOLVED (known-fill subtotal reported in JSON)"
+        ),
         f"- Same-day BUY-lot EOD unrealized PnL: ${float(_trade_pnl.get('same_day_buy_lot_unrealized_pnl_usd') or 0):,.2f}",
         f"- Gross trade-day impact: ${float(_trade_pnl.get('gross_trade_day_impact_usd') or 0):,.2f}",
         "- Fees/taxes: excluded unless explicitly available in broker evidence",

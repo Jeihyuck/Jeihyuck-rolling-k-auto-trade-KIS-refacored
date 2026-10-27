@@ -3565,8 +3565,23 @@ def run_trade_tick(
         if effective_max_new_positions is not None:
             try:
                 effective_max_new_positions_int = int(effective_max_new_positions)
-                available_new_slots = min(available_new_slots, max(0, effective_max_new_positions_int))
+                from trader.us.runner.new_position_limit_scope import (
+                    explain_effective_new_position_limit,
+                )
+                new_position_limit_proof = explain_effective_new_position_limit(
+                    available_current_position_slots=available_new_slots,
+                    effective_max_new_positions=effective_max_new_positions_int,
+                )
+                available_new_slots = new_position_limit_proof["tick_new_slots_after_cap"]
                 allow_new_symbols = bool(allow_new_symbols and available_new_slots > 0)
+                logger.info(
+                    "[US_ENTRY][POSITION_LIMIT_SCOPE] applied_scope=%s "
+                    "configured_cap=%d tick_slots_after_cap=%d "
+                    "daily_cumulative_new_positions_proven=%s",
+                    new_position_limit_proof["applied_scope"],
+                    effective_max_new_positions_int, available_new_slots,
+                    new_position_limit_proof["daily_cumulative_new_positions_proven"],
+                )
                 logger.info(
                     "[US_ENTRY][UNDERFILLED_LIMIT] available_new_slots_before=%d effective_max_new_positions=%d available_new_slots_after=%d underfilled_tier=%s",
                     available_new_slots_before_underfilled_limit,
@@ -4411,6 +4426,21 @@ def run_trade_tick(
         time.monotonic() - _post_route_reconcile_started
     ) * 1000.0 if not offline and ack_cnt > 0 else 0.0
 
+    # Execution claim conflict is a safety fence, not a clean route result.
+    # Keep the protected broker gate unchanged, but expose the blocked attempt.
+    from trader.us.runner.claim_route_health import (
+        summarize_claim_fences, apply_claim_fence_tick_status,
+    )
+    claim_fence_health = summarize_claim_fences(orders)
+    claim_fenced_cnt = claim_fence_health["count"]
+    if claim_fenced_cnt:
+        logger.warning(
+            "[US_ORDER][CLAIM_FENCE_SUMMARY] count=%d requires_reconcile=%s "
+            "reasons=%s symbols=%s",
+            claim_fenced_cnt, claim_fence_health["requires_reconcile"],
+            claim_fence_health["reasons"], claim_fence_health["symbols"],
+        )
+
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
     blocked_sell_symbols: set[str] = set()
@@ -4426,7 +4456,7 @@ def run_trade_tick(
                 reason_key = reason_key.split("reason=")[1].split()[0]
             except Exception:
                 pass
-        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
+        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED", "ORDER_FENCED_UNRESOLVED_ACTION"}:
             block_reasons[reason_key] = block_reasons.get(reason_key, 0) + 1
             if side_o == "SELL" and symbol_o:
                 blocked_sell_symbols.add(symbol_o)
@@ -4503,7 +4533,7 @@ def run_trade_tick(
     # 최종 status 판정 (US 전용 status 체계)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
-    total_warnings = fills_warnings_count
+    total_warnings = fills_warnings_count + claim_fenced_cnt
     # Broker submission truth is authoritative across normal and degraded paths.
     orders_sent = routed_sent_total
     orders_failed = reject_cnt + err_cnt
@@ -4636,6 +4666,18 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    status = apply_claim_fence_tick_status(
+        status, claim_fence_count=claim_fenced_cnt,
+        orders_sent=orders_sent, entry_intents=entry_intents_count,
+        exit_intents=exit_intents_count,
+    )
+    if claim_fenced_cnt:
+        logger.warning(
+            "[US_TICK][CLAIM_FENCE_STATUS] status=%s count=%d "
+            "orders_sent=%d warnings=%d",
+            status, claim_fenced_cnt, orders_sent, total_warnings,
+        )
+
     sell_decisions_detail = [
         {"symbol": str((i or {}).get("symbol", "")).upper(), **(((i or {}).get("meta") or {}) if isinstance((i or {}).get("meta"), dict) else {})}
         for i in exit_intents if str((i or {}).get("side") or "").upper() == "SELL"
@@ -4921,7 +4963,11 @@ def run_trade_tick(
         "orders_rejected": reject_cnt,
         "orders_routed": routing_intents_total,
         "orders_error": err_cnt,
-        "orders_failed": orders_failed,
+        "orders_failed": orders_failed + claim_fenced_cnt,
+        "execution_claim_conflict_count": claim_fenced_cnt,
+        "execution_claim_conflict_requires_reconcile": claim_fence_health["requires_reconcile"],
+        "execution_claim_conflict_reasons": claim_fence_health["reasons"],
+        "total_warnings": total_warnings,
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
@@ -4950,6 +4996,9 @@ def run_trade_tick(
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,
         "effective_capital_scale": market_state_overlay.get("effective_capital_scale") if 'market_state_overlay' in locals() else None,
         "effective_max_new_positions": market_state_overlay.get("effective_max_new_positions") if 'market_state_overlay' in locals() else None,
+        "effective_max_new_positions_scope": "PER_TICK_AVAILABLE_CURRENT_POSITION_SLOTS",
+        "daily_new_position_cap_enforcement_verified": False,
+        "new_position_limit_proof": locals().get("new_position_limit_proof"),
         "underfilled_tier": market_state_overlay.get("underfilled_tier") if 'market_state_overlay' in locals() else None,
         "sector_cap_enforced": market_state_overlay.get("sector_cap_enforced") if 'market_state_overlay' in locals() else False,
         "market_state": market_state_overlay.get("market_state") if 'market_state_overlay' in locals() else "NORMAL",
