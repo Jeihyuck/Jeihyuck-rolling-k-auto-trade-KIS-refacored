@@ -332,6 +332,31 @@ fi
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
+# Stage4 subprocess logs sit OUTSIDE runtime/logs/us/$TRADE_DATE and were
+# absent from the 2026-10-26 mail despite AM/afternoon Stage4 failures.
+# Include them only when a session log proves the writer was started;
+# a LEGACY/non-WORKER session must not be spuriously marked DEGRADED.
+if [[ "$MARKET" == us ]]; then
+  for stage4_purpose in am afternoon; do
+    stage4_session_dir="$LOG_ROOT/$stage4_purpose"
+    if [[ -d "$stage4_session_dir" ]] && grep -lF '[US_STAGE4][CHILD_LOG]' "$stage4_session_dir"/*.log >/dev/null 2>&1; then
+      stage4_found=0
+      shopt -s nullglob
+      stage4_files=(runtime/logs/us-stage4-worker-"$TRADE_DATE"-"$stage4_purpose"-*.log)
+      shopt -u nullglob
+      for stage4_file in "${stage4_files[@]}"; do
+        [[ -f "$stage4_file" ]] || continue
+        collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$stage4_file"
+        stage4_found=1
+      done
+      if [[ "$stage4_found" == 0 ]]; then
+        stage4_expected="runtime/logs/us-stage4-worker-${TRADE_DATE}-${stage4_purpose}-*.log"
+        record_missing "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$stage4_expected"
+      fi
+    fi
+  done
+fi
+
 MISSING_COUNT="$(wc -l < "$MISSING_LIST" | tr -d ' ')"
 INCLUDED_COUNT="$(wc -l < "$INCLUDED_LIST" | tr -d ' ')"
 EXPECTED_COUNT="$(wc -l < "$EXPECTED_LIST" | tr -d ' ')"
