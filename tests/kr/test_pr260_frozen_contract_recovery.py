@@ -3,7 +3,8 @@
 No KIS orders or Supabase mutations. Reconciliation and position updates run
 against in-memory SQLite using the same schema and contract hash functions.
 """
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
+import hashlib
 from uuid import uuid4
 
 import pytest
@@ -17,13 +18,16 @@ from trader.kr.frozen_contract_recovery_260 import restore_verified_imported_buy
 
 
 DAY = date(2026, 10, 27)
+ACCOUNT_ID = "practice:dummy:01"
+ACCOUNT_HASH = hashlib.sha256(ACCOUNT_ID.encode()).hexdigest()
 
 
 def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
                  broker_qty=None, bad_ack=False, duplicate=False,
                  existing_source=False, zero_broker_fill=False,
                  wrong_broker_order=False, wrong_trade_date=False,
-                 wrong_broker_price=False):
+                 wrong_broker_price=False, extra_side=None,
+                 claim_account=None, nonzero_preorder=False):
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
@@ -46,7 +50,7 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
         "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
         "entry_exit_plan": plan,
         "entry_meta": {"entry_reason": "ENTRY_MOMENTUM"},
-        "pre_order_holding_qty": 0,
+        "pre_order_holding_qty": 4 if nonzero_preorder else 0,
         "requested_qty": qty,
         "submitted_qty": qty,
         "balance_snapshot_id": str(uuid4()),
@@ -61,6 +65,16 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
     base = dict(env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
                 code=code, portfolio_epoch_id=portfolio, trading_epoch_id=epoch)
     with engine.begin() as c:
+        c.execute(schema.trading_epochs.insert().values(
+            trading_epoch_id=epoch, env="practice", account_id=ACCOUNT_ID,
+            status="ACTIVE", reason="unit",
+        ))
+        c.execute(schema.portfolio_epochs.insert().values(
+            portfolio_epoch_id=portfolio, trading_epoch_id=epoch,
+            env="practice", account_id=ACCOUNT_ID,
+            sid=1, mode=1, strategy="pb1_pullback_close",
+            status="ACTIVE", reason="unit",
+        ))
         c.execute(schema.orders.insert().values(
             order_id=order_id, position_cycle_id=source_cycle, **base,
             side="BUY", ord_type="LIMIT", qty=qty,
@@ -91,6 +105,14 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
             exit_policy_family="POLICY_MISSING", policy_source="missing",
             entry_exit_plan_json={}, entry_meta_json={},
         ))
+        if extra_side:
+            c.execute(schema.orders.insert().values(
+                order_id=str(uuid4()), position_cycle_id=str(uuid4()), **base,
+                side=extra_side, ord_type="LIMIT", qty=2,
+                client_order_key="extra-"+extra_side+"-"+code,
+                status="RECONCILED", kis_odno="0000098765",
+                request_json={}, response_json={}, created_at=now,
+            ))
         if duplicate:
             c.execute(schema.positions.insert().values(
                 position_id=str(uuid4()), position_cycle_id=str(uuid4()), **base,
@@ -104,7 +126,8 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
                 qty=0, status="CLOSED", position_origin="SYSTEM",
             ))
         c.execute(schema.execution_claims.insert().values(
-            action_key="claim-"+code, env="practice", account_id="practice:dummy:01",
+            action_key="claim-"+code, env="practice",
+            account_id=claim_account if claim_account is not None else ACCOUNT_HASH,
             market="KR", trading_epoch_id=epoch, strategy_owner="PB1",
             lifecycle_id="PB1_ENTRY:pb1_pullback_close:KOSPI:1:"+code,
             action="BUY_ENTRY:PB1-AM", target_qty=qty,
@@ -116,10 +139,11 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
     return engine, schema, holdings, source_cycle, request["entry_contract_sha256"]
 
 
-def _run(engine, holdings, *, fresh=True):
+def _run(engine, holdings, *, fresh=True, on_date=DAY, account_id=ACCOUNT_ID):
     return restore_verified_imported_buy_contracts(
         engine=engine, env="practice", strategy="pb1_pullback_close",
-        trade_date=DAY, holdings_rows=holdings, fresh_balance_proven=fresh,
+        trade_date=on_date, holdings_rows=holdings, fresh_balance_proven=fresh,
+        account_id=account_id,
     )
 
 
@@ -151,6 +175,10 @@ def test_verified_momentum_33shares_restored_once_with_exact_sha():
     {"wrong_broker_order": True},
     {"wrong_trade_date": True},
     {"wrong_broker_price": True},
+    {"extra_side": "SELL"},  # no adoption after ANY sell attempt
+    {"extra_side": "BUY"},   # no adoption after another buy
+    {"nonzero_preorder": True},
+    {"claim_account": "different-account-hash"},
 ])
 def test_unproven_or_ambiguous_buy_never_inherits_exit_contract(case):
     engine, schema, holdings, _cycle, _digest = fixture_case(**case)
@@ -186,3 +214,59 @@ def test_position_diagnostics_cannot_overwrite_frozen_exit_family():
         row = c.execute(sa.select(schema.positions)).mappings().one()
     assert row["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
     assert row["max_price"] == 63000
+
+
+def test_previous_day_original_buy_restored_and_idempotent():
+    engine, schema, holdings, cycle, _ = fixture_case(code="012750", qty=21)
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 0
+    with engine.connect() as c:
+        row = c.execute(sa.select(schema.positions)).mappings().one()
+    assert row["position_cycle_id"] == cycle
+    audit = row["position_meta"]["frozen_contract_recovery"]
+    assert audit["source_trade_date"] == "2026-10-27"
+    assert audit["reconciled_trade_date"] == "2026-10-28"
+    assert row["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+
+
+def test_previous_day_broker_scope_and_lookback_fail_closed():
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=8)) == 0
+    assert _run(engine, holdings, account_id="practice:wrong-account") == 0
+    from trader.kr.frozen_contract_recovery_260 import verify_recovered_contract_invariants
+    assert verify_recovered_contract_invariants(
+        engine=engine, env="practice", strategy="pb1_pullback_close"
+    ) == 0
+
+
+def test_reconciliation_detects_post_recovery_policy_regression():
+    from trader.kr.frozen_contract_recovery_260 import verify_recovered_contract_invariants
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    assert verify_recovered_contract_invariants(
+        engine=engine, env="practice", strategy="pb1_pullback_close"
+    ) == 0
+    with engine.begin() as c:
+        c.execute(schema.positions.update().values(
+            exit_policy_family="POLICY_MISSING"
+        ))
+    assert verify_recovered_contract_invariants(
+        engine=engine, env="practice", strategy="pb1_pullback_close"
+    ) == 1
+
+
+def test_prior_day_recovery_never_changes_fill_or_economics():
+    engine, schema, holdings, _, _ = fixture_case()
+    with engine.connect() as c:
+        pre = c.execute(sa.select(
+            schema.positions.c.qty, schema.positions.c.total_cost,
+            schema.positions.c.realized_pnl,
+        )).one()
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    with engine.connect() as c:
+        post = c.execute(sa.select(
+            schema.positions.c.qty, schema.positions.c.total_cost,
+            schema.positions.c.realized_pnl,
+        )).one()
+        assert c.execute(sa.select(sa.func.count()).select_from(schema.fills)).scalar() == 0
+    assert tuple(post) == tuple(pre)
