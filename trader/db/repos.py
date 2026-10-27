@@ -6732,6 +6732,49 @@ class PositionsRepo:
                                          updated_at=func.now()))
                     return dict(candidate) | {"qty": int(qty), "avg_buy_price": float(avg_price)}, False
 
+            # A current-epoch broker holding cannot be imported into a fresh,
+            # unrelated cycle while an authoritative BUY order owns its
+            # provenance.  Import would discard the frozen exit plan/hash and
+            # turn a DAY_TRADE position into POLICY_MISSING.  Fail closed:
+            # reconciliation must apply the BUY using its original cycle.
+            linked_buy = conn.execute(
+                sa.select(
+                    self._schema.orders.c.order_id,
+                    self._schema.orders.c.position_cycle_id,
+                ).where(and_(
+                    self._schema.orders.c.env == env_n,
+                    self._schema.orders.c.strategy == strategy,
+                    self._schema.orders.c.sid == sid,
+                    self._schema.orders.c.mode == mode,
+                    self._schema.orders.c.code == code_n,
+                    self._schema.orders.c.side == "BUY",
+                    self._schema.orders.c.portfolio_epoch_id == epoch_id,
+                    self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                    self._schema.orders.c.position_cycle_id.is_not(None),
+                    self._schema.orders.c.kis_odno.is_not(None),
+                    self._schema.orders.c.status.in_((
+                        "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                        "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                    )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
+                )).order_by(self._schema.orders.c.created_at.desc()).limit(1)
+            ).mappings().first()
+            if linked_buy is not None:
+                logger.error(
+                    "[KR_IMPORT][BLOCK_CONTRACT_ORPHAN] code=%s buy_order=%s "
+                    "buy_cycle=%s action=DEFER_IMPORT_RECONCILE_EXACT_BUY",
+                    code_n, linked_buy["order_id"], linked_buy["position_cycle_id"],
+                )
+                raise RuntimeError("KR_IMPORT_BLOCKED_LINKED_BUY_CONTRACT")
+
             # Close every stale OPEN identity, including legacy epochs, without deleting history.
             stale_conditions = [
                 self._schema.positions.c.env == env_n,
@@ -6886,6 +6929,26 @@ class PositionsRepo:
                 select(self._schema.positions).where(and_(*conditions))
             ).mappings().first()
             existing_row = dict(existing) if existing else {}
+            # Frozen BUY plan owns the exit family. Diagnostics, stale copies
+            # and reconciliation must not overwrite the protected policy field.
+            # Import/legacy rows without a source-contract hash are unaffected.
+            if "exit_policy_family" in values and existing_row:
+                frozen_plan = existing_row.get("entry_exit_plan_json") or {}
+                frozen_meta = existing_row.get("entry_meta_json") or {}
+                if isinstance(frozen_plan, dict) and isinstance(frozen_meta, dict):
+                    plan_family = str(frozen_plan.get("exit_policy_family") or "")
+                    source_hash = str(frozen_meta.get("entry_contract_sha256") or "")
+                    requested_family = str(values.get("exit_policy_family") or "")
+                    if (len(source_hash) == 64 and plan_family
+                            and plan_family != "POLICY_MISSING"
+                            and requested_family != plan_family):
+                        logger.error(
+                            "[KR_FROZEN_POLICY][UPDATE_BLOCK] code=%s cycle=%s "
+                            "requested=%s frozen=%s action=KEEP_FROZEN",
+                            code, existing_row.get("position_cycle_id"),
+                            requested_family, plan_family,
+                        )
+                        values.pop("exit_policy_family")
             if "entry_meta_json" in values:
                 values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
             if "last_exit_eval_json" in values:
@@ -7774,6 +7837,40 @@ class PositionsRepo:
                 ).scalar()
                 if existing:
                     continue
+                # Startup bootstrap must not orphan a frozen PB1 BUY lifecycle.
+                same_epoch_buy = conn.execute(
+                    sa.select(self._schema.orders.c.order_id).where(and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.strategy == strategy,
+                        self._schema.orders.c.sid == sid,
+                        self._schema.orders.c.mode == mode,
+                        self._schema.orders.c.code == code,
+                        self._schema.orders.c.side == "BUY",
+                        self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                        self._schema.orders.c.portfolio_epoch_id == epoch_id,
+                        self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.kis_odno.is_not(None),
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                        )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
+                    )).limit(1)
+                ).scalar()
+                if same_epoch_buy:
+                    logger.error(
+                        "[KR_BOOTSTRAP][IMPORT_DEFER_EXACT_BUY] code=%s order_id=%s",
+                        code, same_epoch_buy,
+                    )
+                    continue
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
@@ -7846,6 +7943,44 @@ class PositionsRepo:
                     )
                 ).scalar()
                 if existing:
+                    continue
+                # An unsettled or reconciled broker BUY in this exact trading
+                # epoch has a frozen entry/exit contract. Never create a
+                # distinct IMPORTED cycle and erase that exit policy; the
+                # BUY-fill reconciliation lane owns the source lifecycle.
+                linked_buy = conn.execute(
+                    sa.select(self._schema.orders.c.order_id).where(and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.strategy == strategy,
+                        self._schema.orders.c.sid == sid,
+                        self._schema.orders.c.mode == mode,
+                        self._schema.orders.c.code == code,
+                        self._schema.orders.c.side == "BUY",
+                        self._schema.orders.c.portfolio_epoch_id == epoch_id,
+                        self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                        self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.kis_odno.is_not(None),
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                        )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
+                    )).order_by(self._schema.orders.c.created_at.desc()).limit(1)
+                ).scalar()
+                if linked_buy is not None:
+                    logger.error(
+                        "[RECONCILE][IMPORT_DEFER_EXACT_BUY] code=%s order_id=%s "
+                        "action=WAIT_BUY_FILL_LIFECYCLE",
+                        code, linked_buy,
+                    )
                     continue
                 # A symbol-only historical lookup cannot prove lifecycle ownership.
                 # Bootstrap a clean imported cycle and deliberately disable age/trail exits.
@@ -7972,6 +8107,39 @@ class PositionsRepo:
                     )
                     updated += 1
                 else:
+                    # This fallback has a different portfolio strategy key.
+                    # Never create an unbound imported position for an exact
+                    # current trading-epoch BUY owned by another sleeve.
+                    active_buy = conn.execute(
+                        sa.select(self._schema.orders.c.order_id).where(and_(
+                            self._schema.orders.c.env == env_n,
+                            self._schema.orders.c.code == code,
+                            self._schema.orders.c.side == "BUY",
+                            self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                            self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.kis_odno.is_not(None),
+                            self._schema.orders.c.status.in_((
+                                "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                                "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                            )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
+                        )).limit(1)
+                    ).scalar()
+                    if active_buy:
+                        logger.error(
+                            "[POSITIONS_UPSERT][IMPORT_DEFER_EXACT_BUY] code=%s order_id=%s",
+                            code, active_buy,
+                        )
+                        skipped += 1
+                        continue
                     conn.execute(
                         sa.insert(self._schema.positions).values(
                             position_id=_coerce_uuid(
