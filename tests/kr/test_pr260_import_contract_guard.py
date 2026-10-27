@@ -22,10 +22,14 @@ def test_imported_holding_guard_requires_linked_buy_cycle_and_epoch():
 
 
 def test_reconciler_never_symbol_backfills_imported_cycle():
-    source = inspect.getsource(_restore_entry_meta_for_promoted_positions)
+    # Other test modules may monkeypatch the imported callable; assert
+    # against the branch source rather than fragile runtime inspect().
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[2] /
+              "trader" / "reconcile_kis.py").read_text(encoding="utf-8")
     assert 'if position_origin in {"IMPORTED", "RECOVERY"}:' in source
-    assert 'VERIFIED_IMPORT_PRESERVE' in source
-    assert 'continue' in source.split(
+    assert "VERIFIED_IMPORT_PRESERVE" in source
+    assert "continue" in source.split(
         'if position_origin in {"IMPORTED", "RECOVERY"}:', 1
     )[1].split('# A SYSTEM position', 1)[0]
 
