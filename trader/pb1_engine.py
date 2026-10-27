@@ -261,7 +261,7 @@ from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
 from trader.kr.entry_identity_proof import entry_style_identity_proof
-from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency
+from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency, timed_ordered_exit_history
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -14833,8 +14833,16 @@ class PB1Engine:
             "max_data_workers=1 sell_policy_and_submit=SERIAL",
             int(read_ahead_enabled), len(pos_list),
         )
-        for pos, (df, meta) in exit_ohlcv_iter:
+        for _history_wait_sec, (pos, (df, meta)) in timed_ordered_exit_history(exit_ohlcv_iter):
             display_code = self._display_code(pos.get("code"))
+            if _history_wait_sec > 10.0:
+                logger.warning(
+                    "[KR][EXIT][HISTORY_WAIT] code=%s wait_sec=%.3f state=SLOW_OR_CRITICAL action=investigate",
+                    display_code, _history_wait_sec,
+                )
+            else:
+                logger.info("[KR][EXIT][HISTORY_WAIT] code=%s wait_sec=%.3f", display_code, _history_wait_sec)
+            _holding_eval_started = time.monotonic()
             logger.info(
                 "[PB1][POST_CAPITAL][EXIT_PASS][HOLDING] code=%s step=start qty=%s holding_days=%s",
                 display_code,
@@ -14855,6 +14863,14 @@ class PB1Engine:
             _exit_evaluation_started = time.monotonic()
             evaluation = self._plan_exit_event(pos, features, df, "close" if self.window_internal == "close" else "manage")
             _exit_evaluation_elapsed = time.monotonic() - _exit_evaluation_started
+            _total_since_history = time.monotonic() - _holding_eval_started + _history_wait_sec
+            _total_latency_state = classify_exit_evaluation_latency(_total_since_history)
+            if _total_latency_state in {"SLOW", "CRITICAL"}:
+                logger.warning(
+                    "[KR][EXIT][TOTAL_HOLDING_LATENCY] code=%s total_sec=%.3f history_wait_sec=%.3f "
+                    "state=%s action=investigate_no_risk_policy_change",
+                    display_code, _total_since_history, _history_wait_sec, _total_latency_state,
+                )
             _exit_latency_state = classify_exit_evaluation_latency(_exit_evaluation_elapsed)
             if _exit_latency_state in {"SLOW", "CRITICAL"}:
                 logger.warning("[KR][EXIT][EVAL_SUBMIT_LATENCY] code=%s elapsed_sec=%.3f state=%s ohlcv_source=%s action=investigate_no_policy_change",
