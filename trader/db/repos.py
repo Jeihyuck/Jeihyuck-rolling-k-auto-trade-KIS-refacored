@@ -54,6 +54,7 @@ from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 from trader.account_state import get_account_key
 from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
+from trader.kr.realized_pnl_truth import verified_sell_fill_price
 
 logger = logging.getLogger(__name__)
 
@@ -7306,11 +7307,14 @@ class PositionsRepo:
 
         pnl_qty_applied = 0
         next_realized_pnl = realized_pnl
-        broker_fill_price = (
-            float(fill_price)
-            if fill_price is not None and float(fill_price) > 0
-            else None
-        )
+        # A balance/ack proves quantity, never price. Reject NaN/Infinity.
+        broker_fill_price = verified_sell_fill_price(fill_price)
+        if fill_price is not None and broker_fill_price is None:
+            logger.error(
+                "[KR_SELL_RECONCILE][PRICE_PROOF_INVALID] code=%s order_id=%s "
+                "price_type=%s action=hold_realized_pnl_unresolved",
+                code, order_key, type(fill_price).__name__,
+            )
         prior_fill_price = float(state.get("fill_price") or 0.0)
         previously_accounted_notional = float(
             state.get("pnl_accounted_notional")
