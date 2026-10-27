@@ -31,6 +31,56 @@ PROTECTIVE = frozenset({
 })
 
 
+STAGE4_READY_INTERVAL = re.compile(
+    r"\[US_STAGE4\]\[READY_INTERVAL\]\s+interval_ms=(?P<ms>[\d.]+)"
+)
+
+
+def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
+                                    p95_limit_ms: float = 25000.,
+                                    p99_limit_ms: float = 30000.) -> dict:
+    """Stage4 continuity includes deferred work, not just reconciliation body.
+
+    A missing log, SQL failure, 30s+ interval, or too few samples never passes.
+    """
+    from trader.us.execution.stage4_phase_latency import latency_percentiles
+    values = []
+    reconcile_failures = 0
+    stale_events = 0
+    for line in lines:
+        if "[US_STAGE4][RECONCILE_FAILURE]" in line:
+            reconcile_failures += 1
+        if "[US_STAGE4][READY_INTERVAL_STALE_RISK]" in line:
+            stale_events += 1
+        match = STAGE4_READY_INTERVAL.search(line)
+        if match:
+            values.append(float(match.group("ms")))
+    pct = latency_percentiles(values)
+    blockers = []
+    if pct["count"] < min_samples:
+        blockers.append("STAGE4_READY_INTERVAL_SAMPLES_INSUFFICIENT")
+    if reconcile_failures:
+        blockers.append("STAGE4_RECONCILE_FAILURE_OBSERVED")
+    if stale_events or any(v >= 30000. for v in values):
+        blockers.append("STAGE4_WRITER_STALE_RISK")
+    if pct["p95_ms"] is not None and pct["p95_ms"] > p95_limit_ms:
+        blockers.append("STAGE4_READY_INTERVAL_P95_TOO_HIGH")
+    if pct["p99_ms"] is not None and pct["p99_ms"] > p99_limit_ms:
+        blockers.append("STAGE4_READY_INTERVAL_P99_TOO_HIGH")
+    return {
+        "status": "PASS" if not blockers else "NOT_PROVEN",
+        "source": "stage4_ready_interval_wsl_log",
+        "broker_ack_fill_proven": False,
+        "minimum_interval_samples": min_samples,
+        "reconcile_failure_count": reconcile_failures,
+        "stale_warning_count": stale_events,
+        "p95_limit_ms": p95_limit_ms,
+        "p99_limit_ms": p99_limit_ms,
+        "blockers": blockers,
+        **pct,
+    }
+
+
 def nearest_rank_p95(values: list[float]) -> float | None:
     if not values:
         return None
@@ -106,6 +156,8 @@ def evaluate_logs(lines, *, min_orders: int = 20, min_ticks: int = 20) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log_paths", nargs="+", type=Path)
+    parser.add_argument("--require-stage4-ready", action="store_true",
+                        help="Also fail unless >=20 verified Stage4 READY intervals meet 30s freshness")
     args = parser.parse_args()
     def rows():
         for path in args.log_paths:
@@ -113,7 +165,13 @@ def main() -> int:
                 raise FileNotFoundError(str(path))
             with path.open("r", encoding="utf-8", errors="replace") as f:
                 yield from f
-    result = evaluate_logs(rows())
+    lines = list(rows())
+    result = evaluate_logs(lines)
+    stage4_result = evaluate_stage4_ready_intervals(lines)
+    result["stage4_writer_ready_continuity"] = stage4_result
+    if args.require_stage4_ready and stage4_result["status"] != "PASS":
+        result["status"] = "NOT_PROVEN"
+        result["stage4_writer_acceptance_required"] = True
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["status"] == "PASS" else 2
 
