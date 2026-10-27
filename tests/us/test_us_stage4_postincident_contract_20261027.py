@@ -72,9 +72,13 @@ def test_ready_row_still_records_true_broker_evidence():
 def test_stage4_unexpected_child_exit_is_reaped_not_discarded():
     source = (Path(__file__).resolve().parents[2]
               / "trader/us/runner/trade_session_runner.py").read_text()
-    assert 'final_reason = "stage4_worker_exited"' in source
+    # Stage4 child death must be routed to the parent supervisor, NOT
+    # immediately end the entire AM/Afternoon session.
+    assert 'action=RETURN_TO_SUPERVISOR orders_authorized=0' in source
+    assert 'final_reason = "stage4_evidence_paused"' in source
     assert 'if _reconcile_mode == "WORKER":\n                        os.environ["US_STAGE4_WORKER_ALIVE"] = "0"' in source
-    assert 'stop_stage4_worker(' in source
+    assert 'stopped = stop_stage4_worker(' in source
+    assert 'stage4_restart_budget_exhausted' in source
     assert 'if _stage4_stop_unverified:' in source
 
 
