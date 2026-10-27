@@ -17,7 +17,7 @@ def test_exit_latency_rejects_invalid_times():
 
 def test_ordered_exit_history_wait_is_measured_without_lookahead_or_reordering():
     from trader.kr.exit_latency_evidence import timed_ordered_exit_history
-    ticks = iter([1., 1.4, 2., 13.])
+    ticks = iter([1., 1.4, 2., 13., 14.])
     def clock():
         return next(ticks)
     observed = list(timed_ordered_exit_history([("holding1", 1), ("holding2", 2)], clock=clock))
