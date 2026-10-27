@@ -78,3 +78,34 @@ def test_existing_latest_valid_prep_does_not_query_fallback(monkeypatch, tmp_pat
     monkeypatch.setattr(repos, "load_latest_completed_us_prep_status", unexpected)
     monkeypatch.setattr(repos, "load_locked_us_watchlist", lambda **k: _rows("r1"))
     assert prep_contract.check_us_prep_guard("2026-10-27")["source"] == "db"
+
+
+def test_session_cache_ignores_started_if_exact_prior_completed_rows(monkeypatch):
+    from trader.us.prep_effective import resolve_session_prep_cache
+    latest = {"status": "STARTED", "run_id": "aborted"}
+    completed = {"status": "OK", "run_id": "prior", "finished_at": "2026-10-27T21:00:00Z"}
+    chosen, source = resolve_session_prep_cache(latest, completed, _rows("prior"))
+    assert chosen["run_id"] == "prior"
+    assert source == "completed_same_run_proven"
+
+
+def test_session_cache_rejects_unproven_completed_run_and_missing_finish():
+    from trader.us.prep_effective import resolve_session_prep_cache
+    latest = {"status": "STARTED", "run_id": "aborted"}
+    completed = {"status": "OK", "run_id": "prior", "finished_at": "2026-10-27T21:00:00Z"}
+    chosen, source = resolve_session_prep_cache(latest, completed, _rows("other"))
+    assert chosen["status"] == "STARTED"
+    assert source == "unverified_incomplete"
+    chosen, source = resolve_session_prep_cache(
+        latest, {"status": "OK", "run_id": "prior"}, _rows("prior")
+    )
+    assert source == "unverified_incomplete"
+
+
+def test_session_cache_does_not_pretend_latest_bad_prep_is_completed():
+    from trader.us.prep_effective import resolve_session_prep_cache
+    chosen, status = resolve_session_prep_cache(
+        {"status": "ERROR", "run_id": "aborted"}, {}, _rows("aborted")
+    )
+    assert chosen["status"] == "ERROR"
+    assert status == "unverified_incomplete"
