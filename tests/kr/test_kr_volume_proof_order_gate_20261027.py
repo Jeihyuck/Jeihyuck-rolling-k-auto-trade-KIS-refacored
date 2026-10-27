@@ -110,3 +110,30 @@ def test_final_buy_boundary_preserves_existing_pullback_policy():
     plan["trigger_policy"] = "PULLBACK_OVERRIDE"
     ok, reasons = engine._validate_entry_plan(plan)
     assert ok, reasons
+
+
+def test_quote_explicit_session_must_match_trade_date():
+    good = _proof(snapshot={"trade_date": "20261027", "symbol": "005930",
+                            "acml_vol": 1200, "stck_cntg_hour": "095959"})
+    assert good["confirmation_state"] == "VERIFIED"
+    bad = _proof(snapshot={"trade_date": "20261026", "symbol": "005930",
+                           "acml_vol": 1200, "stck_cntg_hour": "095959"})
+    assert bad["confirmation_state"] == "FAILED"
+    assert bad["failure_reason"] == "kis_quote_trade_date_mismatch"
+
+
+def test_invalid_previous_cumulative_fails_closed_without_exception():
+    for value in ("not-a-number", float("nan"), -1, 0):
+        proof = _proof(previous_cumulative=value)
+        assert proof["confirmation_state"] == "FAILED"
+        assert proof["failure_reason"] == "previous_cumulative_invalid"
+
+
+def test_intraday_rvol_never_fabricated_without_historical_profile():
+    assert _proof()["relative_volume_at_time"] is None
+    p = _proof(expected_intraday_fraction=0.4)
+    assert p["confirmation_state"] == "VERIFIED"
+    assert p["relative_volume_at_time"] == 3.0
+    for fraction in (0, -0.1, 1.1, "bad", float("nan")):
+        p = _proof(expected_intraday_fraction=fraction)
+        assert p["confirmation_state"] == "FAILED"
