@@ -82,6 +82,47 @@ def wait_for_stage4_ready(
         sleeper(min(delay, remaining))
 
 
+
+def read_stage4_tick_health_with_bounded_retry(
+    *, env: str = "practice", max_age_seconds: float = 30.0,
+    retry_sec: float = 3.0, poll_sec: float = 0.25,
+    health_reader: Callable[..., dict] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Briefly recheck *unverified* writer proof; never allow an unsafe order.
+
+    Tick verification still fails closed. No sleep/wait happens once genuine
+    current writer proof is available; a real worker death, invalid safety
+    policy or unknown exception is not retried.
+    """
+    if env != "practice":
+        raise RuntimeError("US_STAGE4_TICK_PRACTICE_ONLY")
+    if health_reader is None:
+        from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+        health_reader = read_worker_health
+    deadline = clock() + max(0.0, min(float(retry_sec), 10.0))
+    delay = max(0.05, float(poll_sec))
+    last_code = "US_STAGE4_WRITER_NOT_READY"
+    while True:
+        try:
+            evidence = health_reader(env=env, max_age_seconds=max_age_seconds)
+            if (evidence.get("reconcile_status") not in _OK_RECONCILE
+                    or evidence.get("replay_status") not in _OK_REPLAY):
+                raise RuntimeError("US_STAGE4_RECONCILIATION_UNVERIFIED")
+            return evidence
+        except Exception as exc:
+            code = stage4_error_code(exc)
+            if code not in _RETRYABLE_STARTUP_CODES:
+                raise
+            last_code = code
+            remaining = deadline - clock()
+            if remaining <= 0:
+                logger.error("[US_STAGE4][TICK_HEALTH_RETRY_EXHAUSTED] last_code=%s", last_code)
+                raise RuntimeError("US_STAGE4_TICK_HEALTH_RETRY_EXHAUSTED") from exc
+            sleeper(min(delay, remaining))
+
+
 def stop_stage4_worker(
     child: Any, *, expected_generation: str,
     terminate_timeout_sec: float = 5.0, kill_timeout_sec: float = 5.0,
