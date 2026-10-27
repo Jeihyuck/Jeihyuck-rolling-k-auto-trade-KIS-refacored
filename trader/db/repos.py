@@ -7880,6 +7880,34 @@ class PositionsRepo:
                 ).scalar()
                 if existing:
                     continue
+                # An unsettled or reconciled broker BUY in this exact trading
+                # epoch has a frozen entry/exit contract. Never create a
+                # distinct IMPORTED cycle and erase that exit policy; the
+                # BUY-fill reconciliation lane owns the source lifecycle.
+                linked_buy = conn.execute(
+                    sa.select(self._schema.orders.c.order_id).where(and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.strategy == strategy,
+                        self._schema.orders.c.sid == sid,
+                        self._schema.orders.c.mode == mode,
+                        self._schema.orders.c.code == code,
+                        self._schema.orders.c.side == "BUY",
+                        self._schema.orders.c.portfolio_epoch_id == epoch_id,
+                        self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                        self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                        )),
+                    )).order_by(self._schema.orders.c.created_at.desc()).limit(1)
+                ).scalar()
+                if linked_buy is not None:
+                    logger.error(
+                        "[RECONCILE][IMPORT_DEFER_EXACT_BUY] code=%s order_id=%s "
+                        "action=WAIT_BUY_FILL_LIFECYCLE",
+                        code, linked_buy,
+                    )
+                    continue
                 # A symbol-only historical lookup cannot prove lifecycle ownership.
                 # Bootstrap a clean imported cycle and deliberately disable age/trail exits.
                 plan_values = _plan_position_values(None, missing=True)
