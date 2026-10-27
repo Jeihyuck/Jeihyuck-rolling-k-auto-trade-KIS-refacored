@@ -21,6 +21,9 @@ STYLE_PLAN_MAPPING: dict[str, dict[str, Any]] = {
     "ENTRY_OPEN_PUSH": {"entry_thesis": "BREAKOUT_DAYTRADE", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
     "ENTRY_MOMENTUM": {"entry_thesis": "MOMENTUM_RECLAIM", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
     "ENTRY_MOMENTUM_CONTINUATION": {"entry_thesis": "MOMENTUM_RECLAIM", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
+    # Explicitly selected *new* trend-swing contracts; existing DAY styles stay DAY.
+    "ENTRY_MOMENTUM_SWING": {"entry_thesis": "MOMENTUM_TREND_SWING", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
+    "ENTRY_BREAKOUT_SWING": {"entry_thesis": "BREAKOUT_TREND_SWING", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
     "ENTRY_PULLBACK": {"entry_thesis": "PULLBACK_CONTINUATION", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
     "ENTRY_PULLBACK_OVERRIDE": {"entry_thesis": "PULLBACK_CONTINUATION", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
     "ENTRY_VCP": {"entry_thesis": "VCP_BREAKOUT", "trade_horizon": "SWING", "exit_policy_family": "SWING_STAGED_EXIT", "eod_action": "CARRY_IF_NO_EXIT_SIGNAL", "force_eod_close": False},
@@ -167,6 +170,17 @@ def build_entry_exit_plan(*, code: str, market: str | None = None, entry_style_s
     price = float(entry_price or 0.0)
     if price <= 0:
         raise ValueError("entry_price must be positive")
+    # KR PB1 selected style is the frozen exit-owner contract, not a hint.
+    # Do not silently accept stale final30 horizon/eod metadata for a new BUY.
+    if str(market or "").strip().upper() in {"J", "KR", "KOSPI", "KOSDAQ", "KRX"}:
+        for key in ("trade_horizon", "exit_policy_family", "eod_action"):
+            explicit_value = str(_feature(features, key) or "").strip().upper()
+            if explicit_value and explicit_value != str(mapped[key]).upper():
+                raise ValueError(f"KR_ENTRY_EXIT_STYLE_CONFLICT style={style} field={key} expected={mapped[key]} actual={explicit_value}")
+        raw_force = _feature(features, "force_eod_close")
+        if raw_force is not None and raw_force != "":
+            if parse_plan_bool(raw_force, default=bool(mapped["force_eod_close"])) != bool(mapped["force_eod_close"]):
+                raise ValueError(f"KR_ENTRY_EXIT_STYLE_CONFLICT style={style} field=force_eod_close")
     base = dict(mapped)
     base["entry_thesis"] = str(_feature(features, "entry_thesis") or base["entry_thesis"]).strip().upper()
     base["trade_horizon"] = str(_feature(features, "trade_horizon") or base["trade_horizon"]).strip().upper()
