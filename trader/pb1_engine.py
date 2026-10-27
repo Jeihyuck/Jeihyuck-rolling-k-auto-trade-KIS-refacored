@@ -13012,6 +13012,29 @@ class PB1Engine:
                     meta_for_age = json.loads(meta_for_age)
                 except Exception:
                     meta_for_age = {}
+            # A recovered prior-day BUY has a verified original KIS order
+            # date but may have no exact fill timestamp. Use that *date* only
+            # for holding age; never invent a broker fill timestamp.
+            source_proof = meta_for_age.get("frozen_contract_recovery")
+            if isinstance(source_proof, dict) and (
+                source_proof.get("source_buy_order_id")
+                and len(str(source_proof.get("entry_contract_sha256") or "")) == 64
+            ):
+                source_date = to_kst_date(source_proof.get("source_trade_date"))
+                if source_date is not None and source_date <= self._now_kst.date():
+                    source_age = calc_position_age(source_date, self._now_kst.date(), df)
+                    trading_days_held = max(trading_days_held, source_age.days_held)
+                    days_held = max(days_held, source_age.days_held)
+                    calendar_days_held = max(
+                        calendar_days_held, (self._now_kst.date() - source_date).days
+                    )
+                    holding_bars = max(holding_bars, source_age.holding_bars)
+                    logger.info(
+                        "[KR_POSITION_AGE][VERIFIED_SOURCE_DATE] code=%s "
+                        "original_buy=%s trading_days=%s calendar_days=%s "
+                        "no_synthetic_fill_timestamp=1",
+                        display_code, source_date, trading_days_held, calendar_days_held,
+                    )
             current_day_buy_proven = bool(
                 meta_for_age.get("same_day_entry_proven")
                 or str(meta_for_age.get("same_day_entry_provenance") or "").upper() in {

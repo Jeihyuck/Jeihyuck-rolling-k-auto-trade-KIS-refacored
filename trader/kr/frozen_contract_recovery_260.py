@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+import hashlib
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -91,7 +92,7 @@ def _broker_buy_cumulative_verified(
         return False
 
 
-def _verified_buy(order: dict, position: dict, claim: dict, trade_date: date) -> dict | None:
+def _verified_buy(order: dict, position: dict, claim: dict, trade_date: date, account_hash: str) -> dict | None:
     """Validate frozen BUY evidence. Never infer a plan from a ticker alone."""
     if str(order.get("status") or "").upper() not in _BROKER_TERMINAL:
         return None
@@ -127,7 +128,9 @@ def _verified_buy(order: dict, position: dict, claim: dict, trade_date: date) ->
     if str(claim.get("trading_epoch_id")) != str(position.get("trading_epoch_id")):
         return None
     if (
-        claim.get("strategy_owner") != "PB1"
+        str(claim.get("account_id") or "") != account_hash
+        or claim.get("market") != "KR"
+        or claim.get("strategy_owner") != "PB1"
         or claim.get("action") != "BUY_ENTRY:PB1-AM"
         or str(claim.get("action_state")) != "SATISFIED"
         or str(claim.get("lifecycle_id") or "").split(":")[-1] != str(position.get("code"))
@@ -151,26 +154,61 @@ def _verified_buy(order: dict, position: dict, claim: dict, trade_date: date) ->
 def restore_verified_imported_buy_contracts(
     *, engine, env: str, strategy: str, trade_date: date,
     holdings_rows: list[dict], fresh_balance_proven: bool,
+    account_id: str, lookback_calendar_days: int = 7,
 ) -> int:
-    """Link a proven PB1 BUY to its exact SYSTEM cycle, without fake fills.
+    """Recover a prior-day PB1 BUY from *frozen* KIS order evidence.
 
-    No import recovery without fresh KIS holdings, a unique same-day frozen BUY
-    matching those holdings, and a fully satisfied same-epoch PB1 execution claim.
-    Idempotent: only IMPORTED/POLICY_MISSING rows are eligible, and source-cycle
-    collisions are rejected. Existing qty, cost and realized P&L are preserved.
+    The source order date, rather than the reconciliation run date, binds KIS
+    execution evidence and the matching claim. Preserve the entry contract;
+    never synthesize fills, quantities, P&L or a new SELL order.
+
+    Cross-session recovery requires fresh current account holdings, exact
+    portfolio/trading account+epoch, one unique original BUY, fully priced KIS
+    cumulative execution, a satisfied same-date claim, no later economic
+    activity, and a unique imported position. If any proof is absent it remains
+    POLICY_MISSING with a review log. Normal per-tick trading is unaffected.
     """
-    if not fresh_balance_proven:
+    if not fresh_balance_proven or env != "practice":
         return 0
+    if strategy != "pb1_pullback_close" or not account_id:
+        return 0
+    if not isinstance(trade_date, date) or not (1 <= lookback_calendar_days <= 7):
+        return 0
+
+    account_hash = hashlib.sha256(account_id.encode("utf-8")).hexdigest()
+    earliest_day = trade_date - timedelta(days=lookback_calendar_days)
     balances: dict[str, int] = {}
+    purchase_averages: dict[str, Decimal] = {}
     for holding in holdings_rows or []:
-        code = str(holding.get("pdno") or holding.get("code") or "").zfill(6)
-        qty = int(float(holding.get("hldg_qty") or holding.get("qty") or 0))
-        if qty <= 0:
+        if not isinstance(holding, dict):
+            return 0
+        code = str(holding.get("pdno") or holding.get("code") or "").removeprefix("A").zfill(6)
+        try:
+            quantity = Decimal(str(holding.get("hldg_qty") or holding.get("qty") or "0"))
+            if not quantity.is_finite() or quantity != int(quantity) or quantity < 0:
+                return 0
+            qty = int(quantity)
+        except (TypeError, ValueError, InvalidOperation):
+            return 0
+        if qty == 0:
+            # KIS may retain fully sold rows with purchase average 0. They
+            # cannot own a live position and must not veto other restorations.
             continue
-        if code in balances:
-            log.error("[KR_CONTRACT_RECOVERY][AMBIGUOUS_BROKER_HOLDINGS] code=%s", code)
+        if not code.isdigit() or len(code) != 6 or code in balances:
+            log.error("[KR_CONTRACT_RECOVERY][AMBIGUOUS_HOLDINGS] code=%s", code)
+            return 0
+        # Exact quantity alone cannot exclude an unrecorded manual sell+rebuy.
+        # Require fresh broker's purchase average to agree with original KIS
+        # cumulative BUY economics. Missing average is an explicit hard skip.
+        try:
+            raw_avg = holding.get("pchs_avg_pric") or holding.get("avg_price")
+            broker_avg = Decimal(str(raw_avg))
+            if not broker_avg.is_finite() or broker_avg <= 0:
+                return 0
+        except (InvalidOperation, ValueError, TypeError):
             return 0
         balances[code] = qty
+        purchase_averages[code] = broker_avg
 
     schema = schema_for_engine(engine)
     restored = 0
@@ -188,40 +226,138 @@ def restore_verified_imported_buy_contracts(
         for row in rows:
             pos = dict(row)
             code = str(pos["code"]).zfill(6)
-            if code == "122630":  # Exclusive KR_INFINITE owner, not PB1.
+            if code == "122630":  # KR_INFINITE sleeve: never adopt PB1.
                 continue
             if balances.get(code) != int(pos["qty"]):
                 log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=BROKER_QTY_MISMATCH", code)
                 continue
-            cycles = conn.execute(
-                sa.select(schema.positions.c.position_id).where(sa.and_(
+
+            portfolio_epoch = conn.execute(
+                sa.select(schema.portfolio_epochs).where(
+                    schema.portfolio_epochs.c.portfolio_epoch_id == pos["portfolio_epoch_id"]
+                )
+            ).mappings().first()
+            trading_epoch = conn.execute(
+                sa.select(schema.trading_epochs).where(
+                    schema.trading_epochs.c.trading_epoch_id == pos["trading_epoch_id"]
+                )
+            ).mappings().first()
+            if not portfolio_epoch or not trading_epoch or any([
+                portfolio_epoch["account_id"] != account_id,
+                trading_epoch["account_id"] != account_id,
+                portfolio_epoch["env"] != env,
+                trading_epoch["env"] != env,
+                portfolio_epoch["strategy"] != strategy,
+                portfolio_epoch["sid"] != pos["sid"],
+                portfolio_epoch["mode"] != pos["mode"],
+                str(portfolio_epoch["trading_epoch_id"]) != str(pos["trading_epoch_id"]),
+            ]):
+                log.error("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=ACCOUNT_OR_EPOCH_MISMATCH", code)
+                continue
+
+            # Account-wide uniqueness: otherwise a second sleeve or lifecycle
+            # may own part of the broker's aggregate share balance.
+            live_cycles = conn.execute(
+                sa.select(schema.positions.c.position_cycle_id).where(sa.and_(
                     schema.positions.c.env == env,
-                    schema.positions.c.strategy == strategy,
-                    schema.positions.c.code == code,
                     schema.positions.c.trading_epoch_id == pos["trading_epoch_id"],
+                    schema.positions.c.code == code,
                     schema.positions.c.status == "OPEN",
                     schema.positions.c.qty > 0,
                 ))
             ).all()
-            if len(cycles) != 1:
+            if len(live_cycles) != 1:
                 log.error("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=DUPLICATE_OPEN_CYCLE", code)
                 continue
-            buys = [dict(o) for o in conn.execute(
+
+            orders = [dict(o) for o in conn.execute(
                 sa.select(schema.orders).where(sa.and_(
-                    schema.orders.c.env == pos["env"],
-                    schema.orders.c.strategy == pos["strategy"],
+                    schema.orders.c.env == env,
+                    schema.orders.c.strategy == strategy,
                     schema.orders.c.sid == pos["sid"],
                     schema.orders.c.mode == pos["mode"],
                     schema.orders.c.code == code,
-                    schema.orders.c.side == "BUY",
                     schema.orders.c.trading_epoch_id == pos["trading_epoch_id"],
                     schema.orders.c.portfolio_epoch_id == pos["portfolio_epoch_id"],
-                ))
-            ).mappings().all() if _on_trade_date(o["created_at"], trade_date)]
+                )).order_by(schema.orders.c.created_at.asc())
+            ).mappings().all()]
+            # Require exactly one BUY in the original lifecycle; later or
+            # historical duplicate BUY/Sell attempts demand manual attribution.
+            buys = [o for o in orders if o["side"] == "BUY"]
             if len(buys) != 1:
-                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=BUY_ORDER_AMBIGUOUS count=%s", code, len(buys))
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=BUY_ORDER_AMBIGUOUS count=%s",
+                            code, len(buys))
                 continue
             buy = buys[0]
+            # Broker balance is account-wide. Detect orders from another
+            # sleeve or an earlier unrepresented lifecycle as ambiguity too.
+            other_account_orders = conn.execute(sa.select(
+                schema.orders.c.order_id
+            ).where(sa.and_(
+                schema.orders.c.env == env,
+                schema.orders.c.trading_epoch_id == pos["trading_epoch_id"],
+                schema.orders.c.code == code,
+                schema.orders.c.order_id != buy["order_id"],
+            )).limit(1)).first()
+            if other_account_orders:
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=CROSS_SLEEVE_ORDER_ACTIVITY", code)
+                continue
+            try:
+                original_kis = _as_json(buy.get("response_json"))
+                filled = Decimal(str(original_kis.get("tot_ccld_qty")))
+                paid = Decimal(str(original_kis.get("tot_ccld_amt")))
+                source_average = paid / filled
+                holding_average = purchase_averages[code]
+                imported_average = Decimal(str(pos.get("avg_buy_price")))
+                tolerance = max(Decimal("1"), source_average * Decimal("0.001"))
+                if not all(x.is_finite() for x in (filled, paid, source_average, imported_average)):
+                    continue
+                if (filled <= 0 or paid <= 0
+                        or abs(holding_average - source_average) > tolerance
+                        or abs(imported_average - source_average) > tolerance):
+                    log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=PURCHASE_AVERAGE_MISMATCH", code)
+                    continue
+            except (InvalidOperation, TypeError, ValueError, KeyError, ZeroDivisionError):
+                continue
+            bought_at = buy.get("created_at")
+            if bought_at is None:
+                continue
+            # Validate the date as Korea-local even when SQL stores UTC.
+            if getattr(bought_at, "tzinfo", None) is None:
+                from datetime import timezone
+                bought_at = bought_at.replace(tzinfo=timezone.utc)
+            bought_on = bought_at.astimezone(_KST).date()
+            if not earliest_day <= bought_on <= trade_date:
+                log.info("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=OUTSIDE_BOUNDED_LOOKBACK", code)
+                continue
+            if any(o["side"] == "SELL" for o in orders):
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=SELL_ORDER_PRESENT", code)
+                continue
+
+            # Imported lot is valid only when original BUY started from zero
+            # holdings. Subsequent additions/transfers cannot be inferred.
+            request = _as_json(buy.get("request_json"))
+            if str(request.get("pre_order_holding_qty")) != "0":
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=NONZERO_PREBUY_BALANCE", code)
+                continue
+
+            # Price/quantity-adjusting broker fills of *other* orders cannot
+            # be interpreted as belonging to this original frozen contract.
+            fills = conn.execute(sa.select(
+                schema.fills.c.side, schema.fills.c.order_id,
+                schema.fills.c.qty, schema.fills.c.filled_at,
+            ).where(sa.and_(
+                schema.fills.c.env == env,
+                schema.fills.c.trading_epoch_id == pos["trading_epoch_id"],
+                schema.fills.c.code == code,
+            ))).mappings().all()
+            unrelated = [f for f in fills if str(f.get("order_id")) != str(buy["order_id"])]
+            relevant = [f for f in fills if str(f.get("order_id")) == str(buy["order_id"])]
+            if (unrelated or any(f.get("side") != "BUY" for f in relevant)
+                    or (relevant and sum(int(f.get("qty") or 0) for f in relevant) != int(buy["qty"]))):
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=FILL_ACTIVITY_AMBIGUOUS", code)
+                continue
+
             original = conn.execute(
                 sa.select(schema.positions.c.position_id).where(
                     schema.positions.c.position_cycle_id == buy["position_cycle_id"]
@@ -230,43 +366,52 @@ def restore_verified_imported_buy_contracts(
             if original:
                 log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=SOURCE_CYCLE_ALREADY_EXISTS", code)
                 continue
+
             claims = [dict(c) for c in conn.execute(
                 sa.select(schema.execution_claims).where(sa.and_(
                     schema.execution_claims.c.env == env,
+                    schema.execution_claims.c.account_id == account_hash,
                     schema.execution_claims.c.strategy_owner == "PB1",
-                    schema.execution_claims.c.trade_date == trade_date,
+                    schema.execution_claims.c.trade_date == bought_on,
                     schema.execution_claims.c.trading_epoch_id == pos["trading_epoch_id"],
                     schema.execution_claims.c.action == "BUY_ENTRY:PB1-AM",
                 ))
-            ).mappings().all() if str(c["lifecycle_id"]).split(":")[-1] == code]
+            ).mappings().all() if str(c.get("lifecycle_id") or "").split(":")[-1] == code]
             if len(claims) != 1:
-                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=CLAIM_AMBIGUOUS count=%s", code, len(claims))
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=CLAIM_AMBIGUOUS count=%s",
+                            code, len(claims))
                 continue
-            request = _verified_buy(buy, pos, claims[0], trade_date)
-            if request is None:
-                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=CONTRACT_OR_CLAIM_INVALID", code)
+
+            verified_request = _verified_buy(buy, pos, claims[0], bought_on, account_hash)
+            if verified_request is None:
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=CONTRACT_OR_KIS_FILL_INVALID", code)
                 continue
-            plan = request["entry_exit_plan"]
+
+            plan = verified_request["entry_exit_plan"]
             previous_meta = _as_json(pos.get("position_meta"))
             new_meta = dict(previous_meta)
-            # Claim and KIS holdings jointly prove a current-session BUY
-            # even if the exact fill timestamp has not been persisted.
-            # Do not synthesize a broker fill time.
-            new_meta["same_day_entry_proven"] = True
-            new_meta["same_day_entry_provenance"] = "ORDER_FILL_CURRENT_DAY"
+            # The original KIS order date proves only the BUY's date. For
+            # prior-day lots do not fabricate same-day execution evidence.
+            new_meta["same_day_entry_proven"] = bought_on == trade_date
+            new_meta["same_day_entry_provenance"] = (
+                "ORDER_FILL_CURRENT_DAY" if bought_on == trade_date
+                else "ORDER_FILL_PRIOR_DAY"
+            )
             new_meta["holding_age_unknown"] = False
             new_meta["frozen_contract_recovery"] = {
                 "source_buy_order_id": str(buy["order_id"]),
                 "old_imported_cycle": str(pos["position_cycle_id"]),
-                "entry_contract_sha256": request["entry_contract_sha256"],
+                "entry_contract_sha256": verified_request["entry_contract_sha256"],
                 "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(plan),
-                "provenance": "KIS_ORDER_CUMULATIVE_PLUS_HOLDING_PLUS_SATISFIED_CLAIM",
+                "source_trade_date": bought_on.isoformat(),
+                "reconciled_trade_date": trade_date.isoformat(),
+                "provenance": "KIS_ORIGINAL_CUMULATIVE_PLUS_FRESH_HOLDINGS_PLUS_CLAIM",
             }
-            entry_meta = dict(_as_json(request.get("entry_meta")))
+            entry_meta = dict(_as_json(verified_request.get("entry_meta")))
             entry_meta.update({
-                "entry_contract_sha256": request["entry_contract_sha256"],
+                "entry_contract_sha256": verified_request["entry_contract_sha256"],
                 "source_buy_order_id": str(buy["order_id"]),
-                "source_buy_client_order_key": request.get("client_order_key"),
+                "source_buy_client_order_key": verified_request.get("client_order_key"),
                 "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(plan),
             })
             updates = {
@@ -295,10 +440,60 @@ def restore_verified_imported_buy_contracts(
                     schema.positions.c.position_cycle_id == pos["position_cycle_id"],
                     schema.positions.c.exit_policy_family == "POLICY_MISSING",
                     schema.positions.c.position_origin == "IMPORTED",
+                    schema.positions.c.qty == pos["qty"],
                 )).values(**updates)
             )
-            if int(result.rowcount or 0) == 1:
-                restored += 1
-                log.warning("[KR_CONTRACT_RECOVERY][RESTORED] code=%s source_order=%s original_cycle=%s",
-                            code, buy["order_id"], buy["position_cycle_id"])
+            if int(result.rowcount or 0) != 1:
+                raise RuntimeError("KR_CONTRACT_RECOVERY_CONCURRENT_MUTATION")
+            post = conn.execute(
+                sa.select(schema.positions).where(
+                    schema.positions.c.position_id == pos["position_id"]
+                )
+            ).mappings().one()
+            if (post["exit_policy_family"] != plan["exit_policy_family"]
+                    or post["position_origin"] != "SYSTEM"
+                    or str(post["position_cycle_id"]) != str(buy["position_cycle_id"])
+                    or _as_json(post["entry_meta_json"]).get("entry_contract_sha256")
+                       != verified_request["entry_contract_sha256"]
+                    or int(post["qty"]) != int(pos["qty"])):
+                raise RuntimeError("KR_CONTRACT_RECOVERY_POSTWRITE_INVARIANT_BROKEN")
+            restored += 1
+            log.warning(
+                "[KR_CONTRACT_RECOVERY][RESTORED] code=%s order=%s source_date=%s reconciled=%s",
+                code, buy["order_id"], bought_on, trade_date,
+            )
     return restored
+
+
+def verify_recovered_contract_invariants(*, engine, env: str, strategy: str) -> int:
+    """Read-only post-reconcile drift detection. Never rewrite frozen policy."""
+    schema = schema_for_engine(engine)
+    errors = 0
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(schema.positions).where(sa.and_(
+                schema.positions.c.env == env,
+                schema.positions.c.strategy == strategy,
+                schema.positions.c.status == "OPEN",
+            ))
+        ).mappings().all()
+        for pos in rows:
+            proof = _as_json(pos.get("position_meta")).get("frozen_contract_recovery")
+            if not isinstance(proof, dict):
+                continue
+            plan = _as_json(pos.get("entry_exit_plan_json"))
+            entry = _as_json(pos.get("entry_meta_json"))
+            if (pos.get("position_origin") != "SYSTEM"
+                    or pos.get("exit_policy_family") != plan.get("exit_policy_family")
+                    or pos.get("trade_horizon") != plan.get("trade_horizon")
+                    or bool(pos.get("force_eod_close")) != bool(plan.get("force_eod_close"))
+                    or pos.get("eod_action") != plan.get("eod_action")
+                    or str(entry.get("entry_contract_sha256") or "") != str(proof.get("entry_contract_sha256") or "")
+                    or not plan.get("exit_policy_family")
+                    or str(pos.get("position_cycle_id")) == str(proof.get("old_imported_cycle"))):
+                errors += 1
+                log.error(
+                    "[KR_CONTRACT_RECOVERY][INVARIANT_BROKEN] code=%s action=QUARANTINE_REVIEW_ONLY",
+                    pos["code"],
+                )
+    return errors
