@@ -332,3 +332,86 @@ def test_stage4_tick_preserves_order_fence_and_diagnostic_error_code():
     assert '"stage4_error_code":_stage4_code' in src
     assert '"exit_can_proceed":False' in src
     assert '"orders_sent":0' in src
+
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(),
+                    reason="Linux /proc process identity proof required")
+def test_stage4_worker_real_os_pid_birth_identity_fences_dead_and_reused_pid(monkeypatch):
+    import sys
+    from trader.us.execution import authoritative_reconcile_worker as worker
+
+    child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"])
+    try:
+        birth = worker.stage4_process_start_ticks(child.pid)
+        monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+        monkeypatch.setenv("US_STAGE4_PROCESS_PROOF_REQUIRED", "1")
+        monkeypatch.setenv("US_STAGE4_WORKER_PID", str(child.pid))
+        monkeypatch.setenv("US_STAGE4_WORKER_START_TICKS", birth)
+        worker.assert_stage4_worker_process_alive()
+
+        # A recycled PID cannot impersonate the expected writer.
+        monkeypatch.setenv("US_STAGE4_WORKER_START_TICKS", str(int(birth) + 1))
+        with pytest.raises(RuntimeError, match="US_STAGE4_WORKER_PROCESS_DEAD"):
+            worker.assert_stage4_worker_process_alive()
+
+        monkeypatch.setenv("US_STAGE4_WORKER_START_TICKS", birth)
+        child.terminate()
+        child.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="US_STAGE4_WORKER_PROCESS_DEAD"):
+            worker.assert_stage4_worker_process_alive()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_stage4_writer_required_pid_identity_missing_fails_closed(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+    monkeypatch.setenv("US_STAGE4_PROCESS_PROOF_REQUIRED", "1")
+    monkeypatch.delenv("US_STAGE4_WORKER_PID", raising=False)
+    monkeypatch.delenv("US_STAGE4_WORKER_START_TICKS", raising=False)
+    with pytest.raises(RuntimeError, match="US_STAGE4_WORKER_PROCESS_IDENTITY_MISSING"):
+        worker.assert_stage4_worker_process_alive()
+
+
+def test_stage4_worker_dead_is_restartable_in_parent_but_never_at_tick_order_gate():
+    from trader.us.execution import stage4_lifecycle as lifecycle
+    assert "US_STAGE4_WORKER_PROCESS_DEAD" in lifecycle._RETRYABLE_STARTUP_CODES
+    assert "US_STAGE4_WORKER_PROCESS_DEAD" not in lifecycle._RETRYABLE_TICK_CODES
+    clock = Clock()
+    with pytest.raises(RuntimeError, match="US_STAGE4_WORKER_PROCESS_DEAD"):
+        read_stage4_tick_health_with_bounded_retry(
+            health_reader=lambda **_: (_ for _ in ()).throw(
+                RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")),
+            clock=clock.read, sleeper=clock.sleep,
+        )
+    assert clock.now == 0
+
+
+def test_session_supervisor_requires_os_reaping_before_new_generation_and_no_tick_while_paused():
+    source = (Path(__file__).resolve().parents[2] /
+              "trader/us/runner/trade_session_runner.py").read_text()
+    assert 'US_STAGE4_PROCESS_PROOF_REQUIRED' in source
+    assert 'US_STAGE4_WORKER_START_TICKS' in source
+    assert 'US_STAGE4_MAX_RESTARTS' in source
+    assert 'US_STAGE4_RESTART_AFTER_UNHEALTHY_SEC' in source
+    assert 'generation_changed=1 orders_authorized=0' in source
+    assert 'if not stop_stage4_worker(' in source
+    assert 'new_generation = str(_stage4_new_uuid.uuid4())' in source
+    assert 'old.args, env=new_env' in source
+    assert '[US_STAGE4][PAUSED]' in source
+    assert 'orders_authorized=0 action=SUPERVISE' in source
+    assert 'action=RETURN_TO_SUPERVISOR orders_authorized=0' in source
+    assert 'stage4_restart_budget_exhausted' in source
+    assert 'stage4_evidence_unavailable_at_deadline' in source
+
+
+def test_pre_http_uses_same_authoritative_process_identity_gate():
+    src = (Path(__file__).resolve().parents[2] /
+           "trader/us/execution/order_router.py").read_text()
+    reader = (Path(__file__).resolve().parents[2] /
+              "trader/us/execution/authoritative_reconcile_worker.py").read_text()
+    assert src.count("read_worker_health(env=") >= 2
+    assert reader.count("assert_stage4_worker_process_alive()") >= 2
