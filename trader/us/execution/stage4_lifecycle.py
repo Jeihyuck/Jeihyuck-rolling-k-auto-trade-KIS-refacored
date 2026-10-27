@@ -19,7 +19,11 @@ _RETRYABLE_STARTUP_CODES = frozenset({
     "US_STAGE4_WRITER_DATABASE_UNAVAILABLE",
     "US_STAGE4_WRITER_TIMESTAMP_UNVERIFIED",
     "US_STAGE4_RECONCILIATION_UNVERIFIED",
+    # Fatal for an individual order/Tick; recoverable only by the parent
+    # supervising an actual OS child exit or a verified restart.
+    "US_STAGE4_WORKER_PROCESS_DEAD",
 })
+_RETRYABLE_TICK_CODES = _RETRYABLE_STARTUP_CODES - {"US_STAGE4_WORKER_PROCESS_DEAD"}
 _OK_RECONCILE = frozenset({"OK", "WARN"})
 _OK_REPLAY = frozenset({
     "OK", "RECOVERED", "NO_ACTIVE_CLAIMS", "WARN", "PARTIAL", "UNRESOLVED",
@@ -113,7 +117,7 @@ def read_stage4_tick_health_with_bounded_retry(
             return evidence
         except Exception as exc:
             code = stage4_error_code(exc)
-            if code not in _RETRYABLE_STARTUP_CODES:
+            if code not in _RETRYABLE_TICK_CODES:
                 raise
             last_code = code
             remaining = deadline - clock()
