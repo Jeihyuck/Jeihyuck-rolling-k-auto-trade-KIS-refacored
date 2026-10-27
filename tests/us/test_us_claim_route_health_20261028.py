@@ -45,3 +45,49 @@ def test_critical_protective_sell_status_never_masked():
             original, claim_fence_count=1, orders_sent=0,
             entry_intents=1, exit_intents=1,
         ) == original
+
+
+def test_exact_claim_42_to_41_diagnosis_is_safe_not_reorder():
+    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+    evidence = {
+        "status": "VERIFIED", "action_state": "RETRYABLE",
+        "target_qty": 41, "remaining_target_qty": 41,
+        "cumulative_filled_qty": 0, "active_attempt_exists": False,
+    }
+    result = classify_claim_remainder_conflict(42, evidence)
+    assert result["reason"] == "CLAIM_TARGET_VS_NEW_SIGNAL_MISMATCH"
+    assert result["persisted_remaining_qty"] == 41
+    assert result["safe_to_auto_retry"] is False
+
+
+def test_claim_active_or_unverified_never_authorizes_retry():
+    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+    for evidence in (
+        {"status": "UNVERIFIED"},
+        {"status": "VERIFIED", "action_state": "IN_FLIGHT",
+         "active_attempt_exists": True},
+    ):
+        result = classify_claim_remainder_conflict(41, evidence)
+        assert result["safe_to_auto_retry"] is False
+        assert result["action"] == "RECONCILE_KIS_AND_CLAIM_READ_ONLY"
+
+
+def test_equal_requested_remaining_still_needs_broker_truth():
+    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+    result = classify_claim_remainder_conflict(41, {
+        "status": "VERIFIED", "action_state": "OPEN",
+        "target_qty": 41, "remaining_target_qty": 41,
+        "cumulative_filled_qty": 0, "active_attempt_exists": False,
+    })
+    assert result["reason"] == "CLAIM_QTY_MATCH_REQUIRES_FRESH_BROKER_VALIDATION"
+    assert not result["safe_to_auto_retry"]
+
+
+def test_claim_target_minus_filled_must_match_remainder():
+    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+    result = classify_claim_remainder_conflict(41, {
+        "status": "VERIFIED", "action_state": "PARTIALLY_SATISFIED",
+        "target_qty": 42, "remaining_target_qty": 41,
+        "cumulative_filled_qty": 2, "active_attempt_exists": False,
+    })
+    assert result["reason"] == "CLAIM_QUANTITY_INVARIANT_BROKEN"
