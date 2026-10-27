@@ -2638,6 +2638,27 @@ def reconcile_kis(
             orders_count,
             fills_count,
         )
+    # P1: restore exact source BUY lifecycle before any historical holdings
+    # import or exit-policy evaluation. Only fresh KIS holdings + unique BUY
+    # order + broker-satisfied PB1 claim + verified SHA authorize recovery.
+    if not reset_mode and fresh_balance_proven:
+        try:
+            from trader.kr.frozen_contract_recovery_260 import restore_verified_imported_buy_contracts
+            recovered_contracts = restore_verified_imported_buy_contracts(
+                engine=engine, env=env, strategy=strategy,
+                trade_date=tick_ts.date(), holdings_rows=holdings_rows,
+                fresh_balance_proven=fresh_balance_proven,
+            )
+            if recovered_contracts:
+                logger.warning(
+                    "[KR_RECONCILE][FROZEN_BUY_CONTRACT][RECOVERED] count=%s",
+                    recovered_contracts,
+                )
+        except Exception as exc:
+            logger.exception(
+                "[KR_RECONCILE][FROZEN_BUY_CONTRACT][FAIL_CLOSED] type=%s",
+                type(exc).__name__,
+            )
     # All broker order observations, fills and claims are checked above.
     # Skip historical import/meta repair ONLY on exact active-cycle parity;
     # unknown/partial/stale proofs retain the old fail-closed recovery.
