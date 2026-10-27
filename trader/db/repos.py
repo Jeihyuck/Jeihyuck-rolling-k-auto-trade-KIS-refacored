@@ -7839,6 +7839,7 @@ class PositionsRepo:
                         self._schema.orders.c.trading_epoch_id == trading_epoch_id,
                         self._schema.orders.c.portfolio_epoch_id == epoch_id,
                         self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.kis_odno.is_not(None),
                         self._schema.orders.c.status.in_((
                             "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                             "FILLED", "RECONCILED", "UNRESOLVED_ACK",
@@ -7939,6 +7940,7 @@ class PositionsRepo:
                         self._schema.orders.c.portfolio_epoch_id == epoch_id,
                         self._schema.orders.c.trading_epoch_id == trading_epoch_id,
                         self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.kis_odno.is_not(None),
                         self._schema.orders.c.status.in_((
                             "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                             "FILLED", "RECONCILED", "UNRESOLVED_ACK",
@@ -8087,6 +8089,7 @@ class PositionsRepo:
                             self._schema.orders.c.side == "BUY",
                             self._schema.orders.c.trading_epoch_id == trading_epoch_id,
                             self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.kis_odno.is_not(None),
                             self._schema.orders.c.status.in_((
                                 "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                                 "FILLED", "RECONCILED", "UNRESOLVED_ACK",
