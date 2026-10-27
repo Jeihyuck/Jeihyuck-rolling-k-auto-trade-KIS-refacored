@@ -6732,6 +6732,39 @@ class PositionsRepo:
                                          updated_at=func.now()))
                     return dict(candidate) | {"qty": int(qty), "avg_buy_price": float(avg_price)}, False
 
+            # A current-epoch broker holding cannot be imported into a fresh,
+            # unrelated cycle while an authoritative BUY order owns its
+            # provenance.  Import would discard the frozen exit plan/hash and
+            # turn a DAY_TRADE position into POLICY_MISSING.  Fail closed:
+            # reconciliation must apply the BUY using its original cycle.
+            linked_buy = conn.execute(
+                sa.select(
+                    self._schema.orders.c.order_id,
+                    self._schema.orders.c.position_cycle_id,
+                ).where(and_(
+                    self._schema.orders.c.env == env_n,
+                    self._schema.orders.c.strategy == strategy,
+                    self._schema.orders.c.sid == sid,
+                    self._schema.orders.c.mode == mode,
+                    self._schema.orders.c.code == code_n,
+                    self._schema.orders.c.side == "BUY",
+                    self._schema.orders.c.portfolio_epoch_id == epoch_id,
+                    self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                    self._schema.orders.c.position_cycle_id.is_not(None),
+                    self._schema.orders.c.status.in_((
+                        "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                        "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                    )),
+                )).order_by(self._schema.orders.c.created_at.desc()).limit(1)
+            ).mappings().first()
+            if linked_buy is not None:
+                logger.error(
+                    "[KR_IMPORT][BLOCK_CONTRACT_ORPHAN] code=%s buy_order=%s "
+                    "buy_cycle=%s action=DEFER_IMPORT_RECONCILE_EXACT_BUY",
+                    code_n, linked_buy["order_id"], linked_buy["position_cycle_id"],
+                )
+                raise RuntimeError("KR_IMPORT_BLOCKED_LINKED_BUY_CONTRACT")
+
             # Close every stale OPEN identity, including legacy epochs, without deleting history.
             stale_conditions = [
                 self._schema.positions.c.env == env_n,
