@@ -34,3 +34,13 @@ def test_missing_contract_keeps_safe_sentinel():
     record = _plan_position_values(None, missing=True)
     assert record["exit_policy_family"] == "POLICY_MISSING"
     assert record["force_eod_close"] is False
+
+
+def test_restore_missing_holdings_defers_import_if_buy_contract_exists():
+    source = inspect.getsource(PositionsRepo.restore_missing_from_holdings)
+    assert 'IMPORT_DEFER_EXACT_BUY' in source
+    assert 'self._schema.orders.c.trading_epoch_id == trading_epoch_id' in source
+    assert 'self._schema.orders.c.portfolio_epoch_id == epoch_id' in source
+    assert source.index('IMPORT_DEFER_EXACT_BUY') < source.index(
+        'CREATE_IMPORTED_CYCLE_EXIT_BLOCKED'
+    )
