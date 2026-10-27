@@ -1455,6 +1455,63 @@ def run_trade_session(
                  else "READ_ONLY"),
             )
         try:
+            # Stage4 is a read-only broker evidence writer. The parent alone
+            # supervises it, and only after OS reaping + generation-scoped DB
+            # STOPPED may it launch a new generation. No strategy bypass.
+            _stage4_restart_count = 0
+            _stage4_paused_count = 0
+            _stage4_unhealthy_since = None
+            _stage4_supervisor_max_restarts = max(
+                0, min(3, int(os.getenv("US_STAGE4_MAX_RESTARTS", "2")))
+            )
+            _stage4_supervisor_probe_sec = max(
+                1.0, min(30.0, float(os.getenv("US_STAGE4_SUPERVISOR_PROBE_SEC", "8")))
+            )
+            _stage4_supervisor_restart_after_sec = max(
+                15.0, float(os.getenv("US_STAGE4_RESTART_AFTER_UNHEALTHY_SEC", "45"))
+            )
+
+            def _stage4_supervised_restart() -> None:
+                nonlocal _shadow_reconcile_child
+                old = _shadow_reconcile_child
+                old_generation = os.getenv("US_STAGE4_EXPECTED_GENERATION", "")
+                if old is None or not old_generation:
+                    raise RuntimeError("US_STAGE4_RESTART_PREVIOUS_IDENTITY_MISSING")
+                from trader.us.execution.stage4_lifecycle import stop_stage4_worker
+                if not stop_stage4_worker(
+                    old, expected_generation=old_generation,
+                    terminate_timeout_sec=float(os.getenv("US_STAGE4_STOP_TIMEOUT_SEC", "5")),
+                    kill_timeout_sec=5.0,
+                ):
+                    raise RuntimeError("US_STAGE4_RESTART_STOP_ROW_UNVERIFIED")
+                from trader.us.execution.authoritative_reconcile_worker import stage4_process_start_ticks
+                import uuid as _stage4_new_uuid
+                new_generation = str(_stage4_new_uuid.uuid4())
+                new_env = dict(_shadow_env)
+                new_env["US_STAGE4_EXPECTED_GENERATION"] = new_generation
+                # Do not hand a successor any inherited parent-side PID.
+                for key in ("US_STAGE4_WORKER_PID", "US_STAGE4_WORKER_START_TICKS",
+                            "US_STAGE4_PROCESS_PROOF_REQUIRED"):
+                    new_env.pop(key, None)
+                os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
+                new_child = subprocess.Popen(
+                    old.args, env=new_env, stdout=_stage4_worker_log_stream,
+                    stderr=_stage4_worker_log_stream,
+                )
+                # Publish process identity only after successful spawn.
+                _shadow_reconcile_child = new_child
+                _shadow_env.update(new_env)
+                os.environ["US_STAGE4_EXPECTED_GENERATION"] = new_generation
+                os.environ["US_STAGE4_WORKER_PID"] = str(new_child.pid)
+                os.environ["US_STAGE4_WORKER_START_TICKS"] = stage4_process_start_ticks(new_child.pid)
+                os.environ["US_STAGE4_PROCESS_PROOF_REQUIRED"] = "1"
+                os.environ["US_STAGE4_WORKER_ALIVE"] = "1"
+                logger.warning(
+                    "[US_STAGE4][RESTARTED] session=%s attempt=%d pid=%s"
+                    " generation_changed=1 orders_authorized=0",
+                    session, _stage4_restart_count, new_child.pid,
+                )
+
             _stage4_startup_failed = False
             if _reconcile_mode == "WORKER":
                 from trader.us.execution.stage4_lifecycle import (
@@ -1477,16 +1534,120 @@ def run_trade_session(
                         _stage4_ready.get("filled_rows"),
                     )
                 except Exception as _stage4_startup_exc:
-                    _stage4_startup_failed = True
-                    final_status = "FAILED"
-                    final_reason = "stage4_worker_startup_unavailable"
                     root_cause = stage4_error_code(_stage4_startup_exc)
+                    _stage4_unhealthy_since = time_mod.monotonic()
+                    # Offline/one-shot calls must remain bounded. Scheduled
+                    # practice sessions continue in PAUSED with ZERO orders.
+                    _stage4_startup_failed = bool(force_now or max_ticks > 0)
+                    if _stage4_startup_failed:
+                        final_status = "FAILED"
+                        final_reason = "stage4_worker_startup_unavailable"
+                    else:
+                        final_status = "COMPLETED_DEGRADED"
+                        final_reason = "stage4_startup_waiting_for_recovery"
                     logger.error(
                         "[US_STAGE4][STARTUP_FAILED] code=%s action=FAIL_CLOSED "
-                        "orders_sent=0",
-                        root_cause,
+                        "orders_sent=0 supervisor=%s",
+                        root_cause, "DISABLED_ONE_SHOT" if _stage4_startup_failed else "PAUSE_AND_RECOVER",
                     )
             while not _stage4_startup_failed:
+                if _reconcile_mode == "WORKER":
+                    from trader.us.execution.stage4_lifecycle import (
+                        wait_for_stage4_ready, stage4_error_code,
+                    )
+                    try:
+                        wait_for_stage4_ready(
+                            _shadow_reconcile_child, env=env,
+                            timeout_sec=_stage4_supervisor_probe_sec,
+                            poll_sec=0.5,
+                            health_max_age_seconds=float(
+                                os.getenv("US_STAGE4_HEALTH_MAX_AGE_SEC", "30")
+                            ),
+                        )
+                        if _stage4_unhealthy_since is not None:
+                            logger.warning(
+                                "[US_STAGE4][RECOVERED] session=%s paused_count=%d restarts=%d",
+                                session, _stage4_paused_count, _stage4_restart_count,
+                            )
+                            _stage4_unhealthy_since = None
+                            final_status = "COMPLETED_DEGRADED" if _stage4_paused_count else "OK"
+                            final_reason = "stage4_recovered"
+                    except Exception as _stage4_health_exc:
+                        code = stage4_error_code(_stage4_health_exc)
+                        # Abort on actual policy/authentication failures: waiting
+                        # cannot legitimately authorize a forbidden order.
+                        if code.startswith("US_STAGE4_STARTUP_FATAL_"):
+                            final_status = "FAILED"
+                            final_reason = "stage4_worker_policy_or_scope_unverified"
+                            root_cause = code
+                            logger.critical("[US_STAGE4][FATAL_POLICY] code=%s", code)
+                            break
+                        now = time_mod.monotonic()
+                        if _stage4_unhealthy_since is None:
+                            _stage4_unhealthy_since = now
+                        _stage4_paused_count += 1
+                        final_status = "COMPLETED_DEGRADED"
+                        final_reason = "stage4_evidence_paused"
+                        root_cause = code
+                        logger.warning(
+                            "[US_STAGE4][PAUSED] code=%s count=%d restarts=%d"
+                            " orders_authorized=0",
+                            code, _stage4_paused_count, _stage4_restart_count,
+                        )
+                        try:
+                            write_heartbeat_file(
+                                session, run_id, tick_count, phase="STAGE4_PAUSED",
+                                status="DEGRADED", reason=code,
+                            )
+                        except Exception:
+                            logger.exception("[US_STAGE4][PAUSED_HEARTBEAT_FAILED]")
+                        if not force_now and _now_ny(None) >= graceful_deadline:
+                            final_reason = "stage4_evidence_unavailable_at_deadline"
+                            break
+                        worker_exited = (
+                            _shadow_reconcile_child is None
+                            or _shadow_reconcile_child.poll() is not None
+                        )
+                        unhealthy_long = (
+                            now - _stage4_unhealthy_since
+                            >= _stage4_supervisor_restart_after_sec
+                        )
+                        if ((worker_exited or unhealthy_long)
+                                and _stage4_restart_count < _stage4_supervisor_max_restarts):
+                            _stage4_restart_count += 1
+                            try:
+                                _stage4_supervised_restart()
+                                _stage4_unhealthy_since = time_mod.monotonic()
+                            except Exception as _stage4_restart_exc:
+                                # Unverified OS child stop or DB generation
+                                # mismatch is not restartable. The finalizer
+                                # maintains the durable account-wide fence.
+                                final_status = "FAILED"
+                                final_reason = "stage4_restart_unverified"
+                                root_cause = stage4_error_code(_stage4_restart_exc)
+                                logger.critical(
+                                    "[US_STAGE4][RESTART_FAILED] code=%s action=STOP_ORDERS",
+                                    root_cause,
+                                )
+                                break
+                        elif worker_exited and _stage4_restart_count >= _stage4_supervisor_max_restarts:
+                            # A dead writer cannot spontaneously recover.
+                            final_status = "FAILED"
+                            final_reason = "stage4_restart_budget_exhausted"
+                            logger.critical(
+                                "[US_STAGE4][RESTART_EXHAUSTED] attempts=%d",
+                                _stage4_restart_count,
+                            )
+                            break
+                        if force_now or max_ticks > 0:
+                            final_status = "FAILED"
+                            final_reason = "stage4_unavailable_one_shot"
+                            break
+                        # Never run a Tick in the paused state, including
+                        # protective SELL. Orders remain fenced; recheck
+                        # broker truth until fresh authoritative READY exists.
+                        time_mod.sleep(1)
+                        continue
                 if (_shadow_reconcile_child is not None
                         and _shadow_reconcile_child.poll() is not None):
                     logger.error(
