@@ -247,7 +247,10 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     from trader.us.db.repos import save_fills_with_result
     from trader.us.execution.order_journal import replay_order_journal
     from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+    from trader.us.execution.stage4_phase_latency import Stage4PhaseTimer
+    phase = Stage4PhaseTimer()
     fills=get_fills_today(provider=provider,signal_only=False,trade_date=trade_date)
+    phase.mark("kis_fill_fetch")
     if fills.get("status")!="OK":
         raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
     # Every cycle still fetches current authoritative KIS evidence. Skip only
@@ -265,6 +268,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
             raise RuntimeError("US_STAGE4_FILLS_PERSIST_UNVERIFIED")
     else:
         logger.info("[US_STAGE4][FILL_SAVE_MEMO_HIT] count=%d verified_prior_save=1", len(broker_fills))
+    phase.mark("db_fill_persist_or_memo")
     # Partial SOFT stops and trend stage acknowledgments are strategy-state
     # transitions owned by this writer when the Tick no longer writes fills.
     from trader.us.runner.trade_tick_runner import (
@@ -283,9 +287,11 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         provider=provider,include_active_claims=True,
         active_claims_only=True,
     )
+    phase.mark("active_claim_replay")
     ack=reconcile_ack_orders_with_balance(
         provider=provider,trade_date=trade_date,env="practice",
     )
+    phase.mark("ack_reconcile")
     _mark_trend_stages_from_records(ack,trade_date=trade_date,status="FILLED")
     _mark_soft_stop_stages_from_records(ack,trade_date=trade_date,status="FILLED")
     # This writer also owns previously verified account reservation cleanups;
@@ -296,6 +302,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     reservation=reconcile_proven_reservations_once(
         env="practice",trade_date=trade_date,
     )
+    phase.mark("reservation_reconcile_and_stage_updates")
     if int(reservation.get("unresolved") or 0)>0:
         logger.warning("[US_STAGE4][RESERVATION_DEFERRED] unresolved=%s",
                        reservation.get("unresolved"))
@@ -306,6 +313,11 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS","WARN","PARTIAL","UNRESOLVED"}
             or ack_status not in {"OK","WARN"}):
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
+    metrics = phase.summary()
+    logger.info(
+        "[US_STAGE4][RECONCILE_PHASES] total_ms=%s phases_ms=%s",
+        metrics["total_ms"], metrics["phases_ms"],
+    )
     # Publish fresh critical-path proof first. Expensive original-date TP
     # lookups and stop terminal cleanup are after that publication and can
     # never delay this cycle's broker-evidence handoff to a clean SELL.
@@ -318,6 +330,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
             int(replay.get("unresolved_count") or 0),
         ),
         "filled_rows":len(fills.get("fills") or []),
+        "latency":metrics,
     }
 
 
