@@ -1439,9 +1439,19 @@ def run_trade_session(
             elif _reconcile_mode == "WORKER":
                 from trader.us.execution.authoritative_reconcile_worker import stage4_process_start_ticks
                 os.environ["US_STAGE4_WORKER_PID"] = str(_shadow_reconcile_child.pid)
-                os.environ["US_STAGE4_WORKER_START_TICKS"] = stage4_process_start_ticks(
-                    _shadow_reconcile_child.pid
-                )
+                try:
+                    os.environ["US_STAGE4_WORKER_START_TICKS"] = stage4_process_start_ticks(
+                        _shadow_reconcile_child.pid
+                    )
+                except RuntimeError:
+                    # A just-spawned child can exit before the parent first
+                    # reads /proc. Preserve a non-authorizing identity marker
+                    # so the supervised startup/restart path can reap it.
+                    os.environ["US_STAGE4_WORKER_START_TICKS"] = "UNVERIFIED"
+                    logger.warning(
+                        "[US_STAGE4][EARLY_CHILD_EXIT] pid=%s action=FAIL_CLOSED_SUPERVISOR",
+                        _shadow_reconcile_child.pid,
+                    )
                 os.environ["US_STAGE4_PROCESS_PROOF_REQUIRED"] = "1"
                 os.environ["US_STAGE4_WORKER_ALIVE"] = "1"
             if _reconcile_mode == "WORKER":
@@ -1513,7 +1523,16 @@ def run_trade_session(
                 _shadow_env.update(new_env)
                 os.environ["US_STAGE4_EXPECTED_GENERATION"] = new_generation
                 os.environ["US_STAGE4_WORKER_PID"] = str(new_child.pid)
-                os.environ["US_STAGE4_WORKER_START_TICKS"] = stage4_process_start_ticks(new_child.pid)
+                try:
+                    os.environ["US_STAGE4_WORKER_START_TICKS"] = stage4_process_start_ticks(
+                        new_child.pid
+                    )
+                except RuntimeError:
+                    os.environ["US_STAGE4_WORKER_START_TICKS"] = "UNVERIFIED"
+                    logger.warning(
+                        "[US_STAGE4][RESTART_CHILD_EXITED_EARLY] pid=%s action=PAUSE",
+                        new_child.pid,
+                    )
                 os.environ["US_STAGE4_PROCESS_PROOF_REQUIRED"] = "1"
                 os.environ["US_STAGE4_WORKER_ALIVE"] = "1"
                 logger.warning(
