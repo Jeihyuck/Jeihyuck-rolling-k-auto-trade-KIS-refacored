@@ -13760,7 +13760,9 @@ class PB1Engine:
         # persists the actual result rather than the initial SIGNAL_ONLY state.
         self._queue_exit_audit_update(
             sid=sid, mode=mode, code=code,
-            fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
+            # Frozen exit family is BUY-time authority; the exit audit may
+            # only persist diagnostics, never overwrite the contract.
+            fields={"last_exit_eval_json": exit_eval_payload},
         )
 
         logger.info(
