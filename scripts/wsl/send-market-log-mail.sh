@@ -332,6 +332,31 @@ fi
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
+# Stage4 subprocess logs sit OUTSIDE runtime/logs/us/$TRADE_DATE and were
+# absent from the 2026-10-26 mail despite AM/afternoon Stage4 failures.
+# Include them only when a session log proves the writer was started;
+# a LEGACY/non-WORKER session must not be spuriously marked DEGRADED.
+if [[ "$MARKET" == us ]]; then
+  for stage4_purpose in am afternoon; do
+    stage4_session_dir="$LOG_ROOT/$stage4_purpose"
+    if [[ -d "$stage4_session_dir" ]] && grep -lF '[US_STAGE4][CHILD_LOG]' "$stage4_session_dir"/*.log >/dev/null 2>&1; then
+      stage4_found=0
+      shopt -s nullglob
+      stage4_files=(runtime/logs/us-stage4-worker-"$TRADE_DATE"-"$stage4_purpose"-*.log)
+      shopt -u nullglob
+      for stage4_file in "${stage4_files[@]}"; do
+        [[ -f "$stage4_file" ]] || continue
+        collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$stage4_file"
+        stage4_found=1
+      done
+      if [[ "$stage4_found" == 0 ]]; then
+        stage4_expected="runtime/logs/us-stage4-worker-${TRADE_DATE}-${stage4_purpose}-*.log"
+        record_missing "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$stage4_expected"
+      fi
+    fi
+  done
+fi
+
 MISSING_COUNT="$(wc -l < "$MISSING_LIST" | tr -d ' ')"
 INCLUDED_COUNT="$(wc -l < "$INCLUDED_LIST" | tr -d ' ')"
 EXPECTED_COUNT="$(wc -l < "$EXPECTED_LIST" | tr -d ' ')"
@@ -402,6 +427,33 @@ data={
     'required_missing_count':len(missing),
     'mail_delivery_policy':'SEND_DEGRADED_WHEN_EVIDENCE_IS_INCOMPLETE',
 }
+# Report execution success separately from completeness of archived files.
+# A successful Close report does not negate FAILED AM/Afternoon trading.
+if market == 'us':
+    sessions = {}
+    for purpose in ('am', 'afternoon'):
+        report_path = Path(out).parent / 'reports' / 'us_daily' / trade / purpose / 'us_daily_report.json'
+        try:
+            report = json.loads(report_path.read_text(encoding='utf-8'))
+            sessions[purpose] = {
+                'final_status': str(report.get('final_status') or 'UNKNOWN'),
+                'reason': str(report.get('reason') or ''),
+                'ticks_total': int(report.get('ticks_total') or 0),
+                'orders_sent_total': int(report.get('orders_sent_total') or 0),
+            }
+        except (OSError, ValueError, TypeError):
+            sessions[purpose] = {'final_status': 'UNKNOWN', 'reason': 'REPORT_MISSING_OR_INVALID'}
+    close_path = Path(out).parent / 'reports' / 'us_daily' / trade / 'close' / 'us_daily_report.json'
+    try:
+        close = json.loads(close_path.read_text(encoding='utf-8'))
+        close_status = str(close.get('status') or 'UNKNOWN')
+    except (OSError, ValueError, TypeError):
+        close_status = 'UNKNOWN'
+    failed = any(v['final_status'].startswith('FAILED') for v in sessions.values())
+    unknown = any(v['final_status'] == 'UNKNOWN' for v in sessions.values())
+    data['daily_execution_status'] = 'FAILED' if failed else ('UNKNOWN' if unknown else 'COMPLETED')
+    data['execution_sessions'] = sessions
+    data['close_report_status'] = close_status
 Path(out).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 
@@ -531,13 +583,23 @@ PY
   exit 0
 fi
 
+DAILY_EXECUTION_STATUS="$(python3 - "$STAGE/mail_evidence_report.json" <<'PY_EXECUTION'
+import json,sys
+report=json.load(open(sys.argv[1],encoding='utf-8'))
+print(report.get('daily_execution_status','UNKNOWN'))
+PY_EXECUTION
+)"
+EXECUTION_FLAG=""
+if [[ "$MARKET" == us && "$DAILY_EXECUTION_STATUS" == FAILED ]]; then
+  EXECUTION_FLAG="[EXECUTION_FAILED]"
+fi
 if [[ "$EVIDENCE_STATUS" == DEGRADED ]]; then
-  SUBJECT="[NULLIM][${MARKET^^}][DEGRADED] $TRADE_DATE trading logs"
+  SUBJECT="[NULLIM][${MARKET^^}]${EXECUTION_FLAG}[DEGRADED] $TRADE_DATE trading logs"
   MISSING_SUMMARY="$(awk -F '\t' '{printf "%s%s:%s", (NR>1?", ":""), $1, $2}' "$MISSING_LIST")"
-  BODY="NULLIM ${MARKET^^} redacted log archive (DEGRADED). Missing evidence: ${MISSING_SUMMARY}"
+  BODY="NULLIM ${MARKET^^} redacted log archive (DEGRADED). execution_status=${DAILY_EXECUTION_STATUS}. Missing evidence: ${MISSING_SUMMARY}"
 else
-  SUBJECT="[NULLIM][${MARKET^^}] $TRADE_DATE trading logs"
-  BODY="NULLIM ${MARKET^^} verified redacted log archive"
+  SUBJECT="[NULLIM][${MARKET^^}]${EXECUTION_FLAG} $TRADE_DATE trading logs"
+  BODY="NULLIM ${MARKET^^} verified redacted log archive. execution_status=${DAILY_EXECUTION_STATUS}"
 fi
 
 mail_rc=1; attempt_count=0; message_id=""; unknown_after_send=0

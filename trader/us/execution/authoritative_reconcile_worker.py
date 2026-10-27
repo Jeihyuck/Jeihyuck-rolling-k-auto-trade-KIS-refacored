@@ -83,10 +83,48 @@ def advisory_key(scope: dict) -> int:
     return raw-(1<<64) if raw>=(1<<63) else raw
 
 
+def stage4_process_start_ticks(pid: int) -> str:
+    """Read Linux process birth identity; PID alone may be reused after a crash."""
+    if int(pid) <= 0:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+        # The command in (...) can contain spaces/parentheses; split AFTER
+        # the final ')'. Linux /proc stat field 22 is offset 19 from state.
+        rest = stat.rsplit(") ", 1)[1].split()
+        if len(rest) <= 19 or rest[0] in {"Z", "X", "x"}:
+            raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
+        return rest[19]
+    except (OSError, ValueError, IndexError) as exc:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD") from exc
+
+
+def assert_stage4_worker_process_alive() -> None:
+    """Fail closed in a Tick child *and* at the KIS pre-HTTP boundary.
+
+    The parent pins the exact PID+birth timestamp before Tick spawning.
+    This check does not trust the forked child's inherited ALIVE=1 flag.
+    """
+    if os.getenv("US_RECONCILE_WORKER_MODE") != "WORKER":
+        return
+    if os.getenv("US_STAGE4_PROCESS_PROOF_REQUIRED") != "1":
+        # Backward-compatible standalone tests/non-session evidence readers.
+        return
+    try:
+        pid = int(os.environ["US_STAGE4_WORKER_PID"])
+        expected = os.environ["US_STAGE4_WORKER_START_TICKS"]
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_IDENTITY_MISSING") from exc
+    if not expected or stage4_process_start_ticks(pid) != expected:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
+
+
 def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> dict:
     """Fail closed on stale, wrong-account, wrong-epoch or unready writer."""
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
     scope=_us_execution_claim_scope()
+    assert_stage4_worker_process_alive()
     if env!="practice" or scope.get("env")!="practice":
         raise RuntimeError("US_STAGE4_WRITER_PRACTICE_ONLY")
     engine=_get_engine_or_none()
@@ -128,7 +166,76 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
     lag=(datetime.now(timezone.utc)-at).total_seconds()
     if lag<0 or lag>max_age_seconds:
         raise RuntimeError("US_STAGE4_WRITER_STALE")
+    # The worker may die during the DB query; check the real PID again.
+    assert_stage4_worker_process_alive()
     return dict(row)
+
+
+
+
+def confirm_stage4_health_row_absent(*, expected_generation: str,
+                                     env: str = "practice") -> bool:
+    """Allow fresh writer after OS reaping when predecessor died before READY.
+
+    An existing row (even STOPPED) or a DB error is NOT proof of absence.
+    Call only *after* the old subprocess has been reaped and could not be
+    generation-marked STOPPED. Never clears existing health evidence.
+    """
+    from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
+    scope = _us_execution_claim_scope()
+    if env != "practice" or scope.get("env") != env:
+        raise RuntimeError("US_STAGE4_RESTART_PRACTICE_ONLY")
+    try:
+        uuid.UUID(str(expected_generation))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("US_STAGE4_RESTART_GENERATION_UNVERIFIED") from exc
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US_STAGE4_RESTART_DATABASE_UNAVAILABLE")
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT writer_generation FROM us_stage4_reconcile_health
+             WHERE env=:env AND account_fingerprint=:account
+               AND trading_epoch_id=:epoch
+        """), {"env":scope["env"], "account":scope["account_id"],
+               "epoch":scope["trading_epoch_id"]}).mappings().first()
+    return row is None
+
+
+def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "practice") -> bool:
+    """Mark only this account/epoch/generation STOPPED after the OS reaps its writer.
+
+    A different/new writer is never modified. This is process-liveness evidence,
+    not a statement that any broker order was filled, cancelled, or reconciled.
+    """
+    from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
+
+    scope = _us_execution_claim_scope()
+    if env != "practice" or scope.get("env") != "practice":
+        raise RuntimeError("US_STAGE4_WRITER_PRACTICE_ONLY")
+    if not scope.get("account_id") or not scope.get("trading_epoch_id"):
+        raise RuntimeError("US_STAGE4_WRITER_SCOPE_UNVERIFIED")
+    try:
+        generation = str(uuid.UUID(str(expected_generation)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RuntimeError("US_STAGE4_WORKER_GENERATION_NOT_CONFIGURED") from exc
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US_STAGE4_WRITER_DATABASE_UNAVAILABLE")
+    with engine.begin() as conn:
+        updated = conn.execute(text("""
+            UPDATE us_stage4_reconcile_health
+            SET worker_state='STOPPED', evidence_at=NULL, updated_at=NOW()
+            WHERE env=:env AND account_fingerprint=:account
+              AND trading_epoch_id=:epoch
+              AND writer_generation=CAST(:generation AS uuid)
+        """), {
+            "env": scope["env"],
+            "account": scope["account_id"],
+            "epoch": scope["trading_epoch_id"],
+            "generation": generation,
+        })
+        return updated.rowcount == 1
 
 
 def run_reconcile_once(*, provider: Any, trade_date: str,
@@ -227,6 +334,24 @@ def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
 
 def publish_health(conn: Any, *, scope: dict, generation: str,
                    state: str, result: dict | None=None) -> None:
+    # Only READY supplies fresh reconciliation numbers.  FAILED/STOPPED are
+    # liveness transitions, not new KIS evidence: preserve the last verified
+    # pending/unresolved/fill counters and never invent ERROR/1 on shutdown.
+    # The generation predicate also prevents an old writer's finally block
+    # from overwriting a newer writer's READY row.
+    if state in {"FAILED", "STOPPED"}:
+        conn.execute(text("""
+            UPDATE us_stage4_reconcile_health
+               SET worker_state=:state, evidence_at=NULL, updated_at=NOW()
+             WHERE env=:env AND account_fingerprint=:account
+               AND trading_epoch_id=:epoch
+               AND writer_generation=CAST(:generation AS uuid)
+        """), {"env":scope["env"], "account":scope["account_id"],
+               "epoch":scope["trading_epoch_id"], "generation":generation,
+               "state":state})
+        return
+    if state != "READY":
+        raise ValueError("US_STAGE4_HEALTH_STATE_UNSUPPORTED")
     result=result or {}
     conn.execute(text("""
         INSERT INTO us_stage4_reconcile_health
@@ -338,8 +463,15 @@ def main() -> int:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="FAILED")
                 wait=max(0.0,max(5,args.interval_sec)-(time.monotonic()-started))
-                if wait:
-                    time.sleep(wait)
+                # Python sleep can resume after SIGTERM (PEP 475). Poll the
+                # stop flag so normal shutdown reaches publish_health(STOPPED)
+                # instead of waiting for the parent's five-second kill timer.
+                sleep_deadline=time.monotonic()+wait
+                while not _STOP:
+                    remaining=sleep_deadline-time.monotonic()
+                    if remaining<=0:
+                        break
+                    time.sleep(min(0.25,remaining))
         finally:
             with engine.begin() as conn:
                 publish_health(conn,scope=scope,generation=generation,state="STOPPED")
