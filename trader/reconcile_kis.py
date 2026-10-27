@@ -1295,9 +1295,24 @@ def _restore_entry_meta_for_promoted_positions(
                 existing_entry_meta = {}
         existing_entry_meta = existing_entry_meta or {}
 
-        # Imported/recovery cycles intentionally have no historical policy
-        # provenance.  Never attach symbol-level legacy order/ledger metadata.
+        # Imported/recovery cycles have no inherited historical provenance.
+        # However a strictly verified, explicitly recovered frozen BUY contract
+        # must not be reset to POLICY_MISSING by the periodic metadata lane.
+        # This does NOT confer SYSTEM ownership or enable symbol-level fallback.
         if position_origin in {"IMPORTED", "RECOVERY"}:
+            recovered = existing_meta.get("contract_recovery_20261027")
+            frozen_hash = str(existing_entry_meta.get("entry_contract_sha256") or "")
+            frozen_plan = existing_entry_meta.get("exit_policy_family")
+            if (isinstance(recovered, dict)
+                    and recovered.get("source_buy_order_id")
+                    and len(frozen_hash) == 64
+                    and frozen_plan
+                    and recovered.get("imported_cycle_id") == position_cycle_id):
+                logger.info(
+                    "[RECONCILE][META_RESTORE][VERIFIED_IMPORT_PRESERVE] "
+                    "code=%s cycle=%s action=KEEP_FROZEN_POLICY",
+                    code, position_cycle_id,
+                )
             continue
 
         # A SYSTEM position can already contain same-lifecycle entry metadata
