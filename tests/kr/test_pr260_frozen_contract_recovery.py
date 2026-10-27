@@ -1,0 +1,168 @@
+"""Offline reproduction of the 2026-10-27 KR frozen BUY contract loss.
+
+No KIS orders or Supabase mutations. Reconciliation and position updates run
+against in-memory SQLite using the same schema and contract hash functions.
+"""
+from datetime import date, datetime, timezone
+from uuid import uuid4
+
+import pytest
+import sqlalchemy as sa
+
+from trader.db.repos import (
+    PositionsRepo, _kr_buy_entry_contract_hash, KR_BUY_ENTRY_CONTRACT_VERSION,
+)
+from trader.db.schema import schema_for_engine
+from trader.kr.frozen_contract_recovery_260 import restore_verified_imported_buy_contracts
+
+
+DAY = date(2026, 10, 27)
+
+
+def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
+                 broker_qty=None, bad_ack=False, duplicate=False,
+                 existing_source=False):
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    epoch, portfolio, source_cycle, imported_cycle = (str(uuid4()) for _ in range(4))
+    order_id = str(uuid4())
+    plan = {
+        "entry_reason": "ENTRY_MOMENTUM",
+        "entry_style_selected": "ENTRY_MOMENTUM",
+        "entry_thesis": "MOMENTUM_RECLAIM",
+        "exit_policy_family": "INTRADAY_PROFIT_PROTECT",
+        "trade_horizon": "DAY_TRADE",
+        "eod_action": "FORCE_EXIT",
+        "force_eod_close": True,
+        "policy_version": "pb1_entry_exit_plan_v1",
+        "policy_source": "style_mapping",
+        "time_plan": {"max_trading_days": 1},
+        "risk_plan": {"initial_stop": 55000, "risk_R": 5000},
+    }
+    request = {
+        "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
+        "entry_exit_plan": plan,
+        "entry_meta": {"entry_reason": "ENTRY_MOMENTUM"},
+        "pre_order_holding_qty": 0,
+        "requested_qty": qty,
+        "submitted_qty": qty,
+        "balance_snapshot_id": str(uuid4()),
+        "client_order_key": "pb1-20261027-"+code,
+        "position_cycle_id": source_cycle,
+        "portfolio_epoch_id": portfolio,
+        "trading_epoch_id": epoch,
+    }
+    request["entry_contract_sha256"] = _kr_buy_entry_contract_hash(request)
+    ack = "invalid_hash" if bad_ack else request["entry_contract_sha256"]
+    now = datetime(2026, 10, 27, 0, 32, tzinfo=timezone.utc)
+    base = dict(env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+                code=code, portfolio_epoch_id=portfolio, trading_epoch_id=epoch)
+    with engine.begin() as c:
+        c.execute(schema.orders.insert().values(
+            order_id=order_id, position_cycle_id=source_cycle, **base,
+            side="BUY", ord_type="LIMIT", qty=qty,
+            client_order_key=request["client_order_key"],
+            status="RECONCILED", kis_odno="0000011241",
+            request_json=request,
+            response_json={"_kr_buy_entry_contract": {"entry_contract_sha256": ack}},
+            created_at=now,
+        ))
+        c.execute(schema.positions.insert().values(
+            position_id=str(uuid4()), position_cycle_id=imported_cycle, **base,
+            qty=qty, avg_buy_price=61906, total_cost=qty*61906,
+            status="OPEN", position_origin="IMPORTED",
+            exit_policy_family="POLICY_MISSING", policy_source="missing",
+            entry_exit_plan_json={}, entry_meta_json={},
+        ))
+        if duplicate:
+            c.execute(schema.positions.insert().values(
+                position_id=str(uuid4()), position_cycle_id=str(uuid4()), **base,
+                qty=3, avg_buy_price=61906, total_cost=3*61906,
+                status="OPEN", position_origin="SYSTEM",
+                exit_policy_family="INTRADAY_PROFIT_PROTECT",
+            ))
+        if existing_source:
+            c.execute(schema.positions.insert().values(
+                position_id=str(uuid4()), position_cycle_id=source_cycle, **base,
+                qty=0, status="CLOSED", position_origin="SYSTEM",
+            ))
+        c.execute(schema.execution_claims.insert().values(
+            action_key="claim-"+code, env="practice", account_id="practice:dummy:01",
+            market="KR", trading_epoch_id=epoch, strategy_owner="PB1",
+            lifecycle_id="PB1_ENTRY:pb1_pullback_close:KOSPI:1:"+code,
+            action="BUY_ENTRY:PB1-AM", target_qty=qty,
+            cumulative_filled_qty=qty if claim_state=="SATISFIED" else 0,
+            remaining_target_qty=0 if claim_state=="SATISFIED" else qty,
+            action_state=claim_state, trade_date=DAY,
+        ))
+    holdings = [{"pdno": code, "hldg_qty": str(qty if broker_qty is None else broker_qty)}]
+    return engine, schema, holdings, source_cycle, request["entry_contract_sha256"]
+
+
+def _run(engine, holdings, *, fresh=True):
+    return restore_verified_imported_buy_contracts(
+        engine=engine, env="practice", strategy="pb1_pullback_close",
+        trade_date=DAY, holdings_rows=holdings, fresh_balance_proven=fresh,
+    )
+
+
+def test_verified_momentum_33shares_restored_once_with_exact_sha():
+    engine, schema, holdings, cycle, digest = fixture_case()
+    assert _run(engine, holdings) == 1
+    assert _run(engine, holdings) == 0
+    with engine.connect() as c:
+        rows = c.execute(sa.select(schema.positions)).mappings().all()
+    assert len(rows) == 1
+    pos = rows[0]
+    assert pos["qty"] == 33
+    assert pos["position_origin"] == "SYSTEM"
+    assert pos["position_cycle_id"] == cycle
+    assert pos["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+    assert pos["trade_horizon"] == "DAY_TRADE"
+    assert pos["force_eod_close"] is True
+    assert pos["entry_meta_json"]["entry_contract_sha256"] == digest
+    assert pos["position_meta"]["frozen_contract_recovery"]["old_imported_cycle"]
+
+
+@pytest.mark.parametrize("case", [
+    {"claim_state": "UNCERTAIN"},
+    {"broker_qty": 31},
+    {"bad_ack": True},
+    {"duplicate": True},
+    {"existing_source": True},
+])
+def test_unproven_or_ambiguous_buy_never_inherits_exit_contract(case):
+    engine, schema, holdings, _cycle, _digest = fixture_case(**case)
+    assert _run(engine, holdings) == 0
+    with engine.connect() as c:
+        rows = c.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_origin == "IMPORTED"
+        )).mappings().all()
+    assert len(rows) == 1
+    assert rows[0]["exit_policy_family"] == "POLICY_MISSING"
+
+
+def test_no_repair_without_fresh_broker_holdings():
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings, fresh=False) == 0
+
+
+def test_infinite_owner_not_reinterpreted_as_pb1():
+    engine, schema, holdings, _, _ = fixture_case(code="122630", qty=11)
+    assert _run(engine, holdings) == 0
+
+
+def test_position_diagnostics_cannot_overwrite_frozen_exit_family():
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings) == 1
+    repo = PositionsRepo(engine)
+    repo.update_position_fields(
+        env="practice", strategy="pb1_pullback_close", sid=1, mode=1,
+        code="028050",
+        fields={"exit_policy_family": "POLICY_MISSING", "max_price": 63000},
+    )
+    with engine.connect() as c:
+        row = c.execute(sa.select(schema.positions)).mappings().one()
+    assert row["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+    assert row["max_price"] == 63000
