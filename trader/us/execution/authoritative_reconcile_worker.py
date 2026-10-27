@@ -83,10 +83,48 @@ def advisory_key(scope: dict) -> int:
     return raw-(1<<64) if raw>=(1<<63) else raw
 
 
+def stage4_process_start_ticks(pid: int) -> str:
+    """Read Linux process birth identity; PID alone may be reused after a crash."""
+    if int(pid) <= 0:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+        # The command in (...) can contain spaces/parentheses; split AFTER
+        # the final ')'. Linux /proc stat field 22 is offset 19 from state.
+        rest = stat.rsplit(") ", 1)[1].split()
+        if len(rest) <= 19 or rest[0] in {"Z", "X", "x"}:
+            raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
+        return rest[19]
+    except (OSError, ValueError, IndexError) as exc:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD") from exc
+
+
+def assert_stage4_worker_process_alive() -> None:
+    """Fail closed in a Tick child *and* at the KIS pre-HTTP boundary.
+
+    The parent pins the exact PID+birth timestamp before Tick spawning.
+    This check does not trust the forked child's inherited ALIVE=1 flag.
+    """
+    if os.getenv("US_RECONCILE_WORKER_MODE") != "WORKER":
+        return
+    if os.getenv("US_STAGE4_PROCESS_PROOF_REQUIRED") != "1":
+        # Backward-compatible standalone tests/non-session evidence readers.
+        return
+    try:
+        pid = int(os.environ["US_STAGE4_WORKER_PID"])
+        expected = os.environ["US_STAGE4_WORKER_START_TICKS"]
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_IDENTITY_MISSING") from exc
+    if not expected or stage4_process_start_ticks(pid) != expected:
+        raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
+
+
 def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> dict:
     """Fail closed on stale, wrong-account, wrong-epoch or unready writer."""
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
     scope=_us_execution_claim_scope()
+    assert_stage4_worker_process_alive()
     if env!="practice" or scope.get("env")!="practice":
         raise RuntimeError("US_STAGE4_WRITER_PRACTICE_ONLY")
     engine=_get_engine_or_none()
@@ -128,6 +166,8 @@ def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> di
     lag=(datetime.now(timezone.utc)-at).total_seconds()
     if lag<0 or lag>max_age_seconds:
         raise RuntimeError("US_STAGE4_WRITER_STALE")
+    # The worker may die during the DB query; check the real PID again.
+    assert_stage4_worker_process_alive()
     return dict(row)
 
 
