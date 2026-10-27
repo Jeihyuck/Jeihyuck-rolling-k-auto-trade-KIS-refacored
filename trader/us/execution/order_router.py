@@ -63,6 +63,10 @@ def annotate_execution_quantity_provenance(intent: dict, *, strategy_requested_q
 
 def resolve_entry_metadata_contract_reason(intent: dict, *, required: bool = False) -> str | None:
     """Validate classification metadata without treating explicit OTHER as missing."""
+    from trader.us.entry_exit_contract import validate_us_new_buy_management_contract
+    management_conflict = validate_us_new_buy_management_contract(intent)
+    if management_conflict:
+        return management_conflict
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
     candidate_fields = ("theme_cluster", "classification_source", "position_state", "position_action")
     if not required and not any(
