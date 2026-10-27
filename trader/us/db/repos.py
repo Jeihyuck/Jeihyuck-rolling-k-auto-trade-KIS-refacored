@@ -5822,6 +5822,55 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
 
 
 
+
+def load_latest_completed_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
+    """Most recent *finished* effective PREP, ignoring newer aborted attempts.
+
+    This is only a fallback candidate. The caller must prove locked watchlist
+    provenance and must never grant BUY from an unrelated/unfinished run.
+    """
+    from trader.us.prep_effective import is_effective_prep_status
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {}
+    try:
+        with engine.begin() as conn:
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 5000))
+            _set_statement_timeout(conn, timeout_ms)
+            rows = conn.execute(text("""
+                SELECT run_id, status, trade_date, result, started_at, finished_at
+                  FROM us_agent_runs
+                 WHERE trade_date = :trade_date
+                   AND agent_name IN ('us_prep', 'us_prep_dual_agent')
+                   AND mode = 'prep'
+                   AND finished_at IS NOT NULL
+                   AND (status IN ('OK', 'OK_WITH_WARNINGS',
+                                   'RISK_OFF_ENTRY_BLOCKED',
+                                   'DEFENSE_CRASH_ENTRY_BLOCKED')
+                        OR status LIKE 'OK_WITH_WARNINGS_%')
+                 ORDER BY finished_at DESC, started_at DESC
+                 LIMIT 2
+            """), {"trade_date": trade_date}).mappings().all()
+        for source in rows:
+            row = dict(source)
+            if (str(row.get("trade_date") or "") == str(trade_date)
+                    and row.get("run_id") and row.get("finished_at")
+                    and is_effective_prep_status(row.get("status"))):
+                logger.info(
+                    "[US_PREP_STATUS][LATEST_COMPLETED] trade_date=%s run_id=%s status=%s",
+                    trade_date, row["run_id"], row["status"],
+                )
+                return row
+        return {}
+    except Exception as exc:
+        logger.error(
+            "[US_PREP_STATUS][LATEST_COMPLETED][ERROR] trade_date=%s type=%s",
+            trade_date, type(exc).__name__,
+        )
+        raise RuntimeError("US PREP latest completed lookup failed") from exc
+
+
 def load_us_prep_completion_for_run(
     trade_date: str, run_id: str, timeout_sec: int = 20,
 ) -> dict:
