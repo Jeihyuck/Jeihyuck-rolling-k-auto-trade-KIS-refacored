@@ -2646,8 +2646,10 @@ def reconcile_kis(
             from trader.kr.frozen_contract_recovery_260 import restore_verified_imported_buy_contracts
             recovered_contracts = restore_verified_imported_buy_contracts(
                 engine=engine, env=env, strategy=strategy,
-                trade_date=tick_ts.date(), holdings_rows=holdings_rows,
+                trade_date=tick_ts.astimezone(ZoneInfo("Asia/Seoul")).date(),
+                holdings_rows=holdings_rows,
                 fresh_balance_proven=fresh_balance_proven,
+                account_id=account_key,
             )
             if recovered_contracts:
                 logger.warning(
@@ -2866,12 +2868,26 @@ def reconcile_kis(
     # authoritative view so post-tick policy/health checks do not fall back to
     # the stale balance snapshot captured near the beginning of the tick.
     reconcile_result["_final_holdings_rows"] = list(holdings_rows)
+    # Read back frozen BUY contracts after the *entire* reconciliation pass.
+    # Never make a second unproven policy write; emit health evidence instead.
+    frozen_contract_violations = 0
+    try:
+        from trader.kr.frozen_contract_recovery_260 import verify_recovered_contract_invariants
+        frozen_contract_violations = verify_recovered_contract_invariants(
+            engine=engine, env=env, strategy=strategy,
+        )
+    except Exception as exc:
+        frozen_contract_violations = 1
+        logger.exception("[KR_CONTRACT_RECOVERY][POST_RECONCILE_VERIFY_FAILED] err=%s", exc)
+    reconcile_result["frozen_contract_invariant_violations"] = frozen_contract_violations
     execution_claim_health = _execution_claim_health(orders_repo, market="KR")
     observation_failure_count = int(reconcile_result.get("execution_claim_observation_failures") or 0)
     integrity_reason = _execution_claim_integrity_reason(
         execution_claim_health,
         observation_failures=observation_failure_count,
     )
+    if frozen_contract_violations:
+        integrity_reason = integrity_reason or "frozen_buy_contract_invariant_broken"
     if reconcile_result.get("unresolved_broker_activity"):
         integrity_reason = integrity_reason or "unresolved_broker_activity"
     if reconcile_result.get("guard_reason"):
