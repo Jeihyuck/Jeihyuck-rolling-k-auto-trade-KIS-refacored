@@ -91,3 +91,14 @@ def test_claim_target_minus_filled_must_match_remainder():
         "cumulative_filled_qty": 2, "active_attempt_exists": False,
     })
     assert result["reason"] == "CLAIM_QUANTITY_INVARIANT_BROKEN"
+
+
+def test_actual_20261027_syy_claim_finally_satisfied_41_never_reorders_42():
+    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+    result = classify_claim_remainder_conflict(42, {
+        "status": "VERIFIED", "action_state": "SATISFIED",
+        "target_qty": 41, "cumulative_filled_qty": 41,
+        "remaining_target_qty": 0, "active_attempt_exists": False,
+    })
+    assert result["reason"] == "PRIOR_BUY_ALREADY_SATISFIED_DO_NOT_REORDER"
+    assert result["safe_to_auto_retry"] is False
