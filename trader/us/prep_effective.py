@@ -53,6 +53,29 @@ def locked_rows_match_prep_run(
     return True
 
 
+
+def resolve_session_prep_cache(
+    latest_attempt: dict[str, Any] | None,
+    completed_candidate: dict[str, Any] | None,
+    locked_rows: Sequence[Any] | None,
+) -> tuple[dict[str, Any], str]:
+    """Choose only a completed, exact-run cache for order-capable Tick children.
+
+    Do not turn STARTED into OK or silently borrow rows from another PREP.
+    This function is data selection only: session/preflight permission remains
+    independently authoritative, including code SHA and EXIT_ONLY markers.
+    """
+    latest = dict(latest_attempt or {})
+    if is_effective_prep_status(latest.get("status")):
+        return latest, "latest_effective"
+    completed = dict(completed_candidate or {})
+    if (is_effective_prep_status(completed.get("status"))
+            and completed.get("finished_at") is not None
+            and locked_rows_match_prep_run(completed, locked_rows)):
+        return completed, "completed_same_run_proven"
+    return latest, "unverified_incomplete"
+
+
 def is_effective_prep_contract(
     contract: dict[str, Any] | None,
     rows: Sequence[Any] | None,
