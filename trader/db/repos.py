@@ -7827,6 +7827,30 @@ class PositionsRepo:
                 ).scalar()
                 if existing:
                     continue
+                # Startup bootstrap must not orphan a frozen PB1 BUY lifecycle.
+                same_epoch_buy = conn.execute(
+                    sa.select(self._schema.orders.c.order_id).where(and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.strategy == strategy,
+                        self._schema.orders.c.sid == sid,
+                        self._schema.orders.c.mode == mode,
+                        self._schema.orders.c.code == code,
+                        self._schema.orders.c.side == "BUY",
+                        self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                        self._schema.orders.c.portfolio_epoch_id == epoch_id,
+                        self._schema.orders.c.position_cycle_id.is_not(None),
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                        )),
+                    )).limit(1)
+                ).scalar()
+                if same_epoch_buy:
+                    logger.error(
+                        "[KR_BOOTSTRAP][IMPORT_DEFER_EXACT_BUY] code=%s order_id=%s",
+                        code, same_epoch_buy,
+                    )
+                    continue
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
@@ -8053,6 +8077,29 @@ class PositionsRepo:
                     )
                     updated += 1
                 else:
+                    # This fallback has a different portfolio strategy key.
+                    # Never create an unbound imported position for an exact
+                    # current trading-epoch BUY owned by another sleeve.
+                    active_buy = conn.execute(
+                        sa.select(self._schema.orders.c.order_id).where(and_(
+                            self._schema.orders.c.env == env_n,
+                            self._schema.orders.c.code == code,
+                            self._schema.orders.c.side == "BUY",
+                            self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                            self._schema.orders.c.position_cycle_id.is_not(None),
+                            self._schema.orders.c.status.in_((
+                                "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                                "FILLED", "RECONCILED", "UNRESOLVED_ACK",
+                            )),
+                        )).limit(1)
+                    ).scalar()
+                    if active_buy:
+                        logger.error(
+                            "[POSITIONS_UPSERT][IMPORT_DEFER_EXACT_BUY] code=%s order_id=%s",
+                            code, active_buy,
+                        )
+                        skipped += 1
+                        continue
                     conn.execute(
                         sa.insert(self._schema.positions).values(
                             position_id=_coerce_uuid(
