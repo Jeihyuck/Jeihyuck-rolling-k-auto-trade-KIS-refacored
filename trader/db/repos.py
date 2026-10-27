@@ -54,6 +54,7 @@ from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 from trader.account_state import get_account_key
 from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
+from trader.kr.realized_pnl_truth import verified_sell_fill_price, verified_finite_amount
 
 logger = logging.getLogger(__name__)
 
@@ -7241,8 +7242,10 @@ class PositionsRepo:
         row = dict(row)
 
         current_qty = int(row.get("qty") or 0)
-        avg_buy_price = float(row.get("avg_buy_price") or 0.0)
-        realized_pnl = float(row.get("realized_pnl") or 0.0)
+        avg_buy_price = verified_finite_amount(row.get("avg_buy_price") or 0.0, nonnegative=True)
+        realized_pnl = verified_finite_amount(row.get("realized_pnl") or 0.0)
+        if avg_buy_price is None or realized_pnl is None:
+            raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_POSITION_COST_OR_PNL")
         position_meta = _merge_json_dict(row.get("position_meta"), {})
         per_order = position_meta.get("sell_execution_reconcile")
         if not isinstance(per_order, dict):
@@ -7253,8 +7256,8 @@ class PositionsRepo:
         if str(row.get("status") or "").upper() == "CLOSED":
             if not state:
                 raise RuntimeError("KR_SELL_RECONCILE_CLOSED_UNATTRIBUTED")
-            avg_buy_price = float(state.get("cost_basis_at_sell") or 0.0)
-            if avg_buy_price <= 0:
+            avg_buy_price = verified_finite_amount(state.get("cost_basis_at_sell") or 0.0, nonnegative=True)
+            if avg_buy_price is None or avg_buy_price <= 0:
                 raise RuntimeError("KR_SELL_RECONCILE_CLOSED_COST_BASIS_MISSING")
         qty_accounted = max(0, int(state.get("qty_accounted") or 0))
         pnl_accounted_qty = max(0, int(state.get("pnl_accounted_qty") or 0))
@@ -7306,16 +7309,23 @@ class PositionsRepo:
 
         pnl_qty_applied = 0
         next_realized_pnl = realized_pnl
-        broker_fill_price = (
-            float(fill_price)
-            if fill_price is not None and float(fill_price) > 0
-            else None
-        )
-        prior_fill_price = float(state.get("fill_price") or 0.0)
-        previously_accounted_notional = float(
+        # A balance/ack proves quantity, never price. Reject NaN/Infinity.
+        broker_fill_price = verified_sell_fill_price(fill_price)
+        if fill_price is not None and broker_fill_price is None:
+            logger.error(
+                "[KR_SELL_RECONCILE][PRICE_PROOF_INVALID] code=%s order_id=%s "
+                "price_type=%s action=hold_realized_pnl_unresolved",
+                code, order_key, type(fill_price).__name__,
+            )
+        prior_fill_price = verified_finite_amount(state.get("fill_price") or 0.0, nonnegative=True)
+        if prior_fill_price is None:
+            raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_PRIOR_PRICE")
+        previously_accounted_notional = verified_finite_amount(
             state.get("pnl_accounted_notional")
-            or prior_fill_price * pnl_accounted_qty
+            or prior_fill_price * pnl_accounted_qty, nonnegative=True,
         )
+        if previously_accounted_notional is None:
+            raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_PRIOR_NOTIONAL")
         if broker_fill_price is not None:
             if avg_buy_price <= 0:
                 raise RuntimeError("KR_SELL_RECONCILE_COST_BASIS_MISSING")
@@ -7323,6 +7333,8 @@ class PositionsRepo:
             # execution average for this order. Never double-book proceeds
             # when a partial fill later becomes fully filled.
             new_proceeds = broker_fill_price * confirmed_qty
+            if verified_finite_amount(new_proceeds, nonnegative=True) is None:
+                raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_NEW_PROCEEDS")
             if pnl_accounted_qty == confirmed_qty and pnl_accounted_qty > 0:
                 if abs(new_proceeds - previously_accounted_notional) > 1e-5:
                     raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
@@ -7336,6 +7348,8 @@ class PositionsRepo:
                 )
                 pnl_accounted_qty = confirmed_qty
                 previously_accounted_notional = new_proceeds
+        if verified_finite_amount(next_realized_pnl) is None:
+            raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_RESULT_PNL")
 
         state.update({
             "confirmed_cumulative_qty": confirmed_qty,
@@ -7352,6 +7366,10 @@ class PositionsRepo:
                 if pnl_accounted_qty >= confirmed_qty
                 else "REALIZED_PNL_UNRESOLVED"
             ),
+            # This path accounts gross execution proceeds; without verified
+            # broker fees/tax, never label these proceeds as net PnL.
+            "realized_pnl_net_status": "FEES_TAX_UNVERIFIED",
+            "realized_pnl_value_basis": "GROSS_EX_FEES_TAX",
         })
         per_order = dict(per_order)
         per_order[order_key] = state
@@ -7370,6 +7388,8 @@ class PositionsRepo:
             {
                 "sell_execution_reconcile": per_order,
                 "realized_pnl_status": position_realized_status,
+                "sell_realized_pnl_value_basis": "GROSS_EX_FEES_TAX",
+                "sell_realized_pnl_net_status": "FEES_TAX_UNVERIFIED",
             },
         )
         values: dict[str, Any] = {
