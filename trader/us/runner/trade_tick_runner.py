@@ -2025,17 +2025,14 @@ def run_trade_tick(
     _stage4_health: dict = {}
     if _stage4_mode:
         try:
-            from trader.us.execution.authoritative_reconcile_worker import read_worker_health
-            _stage4_health=read_worker_health(
+            from trader.us.execution.stage4_lifecycle import (
+                read_stage4_tick_health_with_bounded_retry,
+            )
+            _stage4_health=read_stage4_tick_health_with_bounded_retry(
                 env=env,
                 max_age_seconds=float(os.getenv("US_STAGE4_HEALTH_MAX_AGE_SEC","30")),
+                retry_sec=float(os.getenv("US_STAGE4_TICK_HEALTH_RETRY_SEC","3")),
             )
-            if (_stage4_health.get("reconcile_status") not in {"OK","WARN"}
-                    or _stage4_health.get("replay_status") not in {
-                        "OK","RECOVERED","NO_ACTIVE_CLAIMS",
-                        "WARN","PARTIAL","UNRESOLVED",
-                    }):
-                raise RuntimeError("US_STAGE4_RECONCILIATION_UNVERIFIED")
             from trader.us.db.repos import load_today_fills as _stage4_load_fills
             fills_today=_stage4_load_fills(trade_date) or []
             fills_result={"status":"SKIPPED_STAGE4_WORKER","fills":fills_today}
