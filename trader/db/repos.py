@@ -6755,6 +6755,15 @@ class PositionsRepo:
                         "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                         "FILLED", "RECONCILED", "UNRESOLVED_ACK",
                     )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
                 )).order_by(self._schema.orders.c.created_at.desc()).limit(1)
             ).mappings().first()
             if linked_buy is not None:
@@ -7844,6 +7853,15 @@ class PositionsRepo:
                             "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                             "FILLED", "RECONCILED", "UNRESOLVED_ACK",
                         )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
                     )).limit(1)
                 ).scalar()
                 if same_epoch_buy:
@@ -7945,6 +7963,15 @@ class PositionsRepo:
                             "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                             "FILLED", "RECONCILED", "UNRESOLVED_ACK",
                         )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
                     )).order_by(self._schema.orders.c.created_at.desc()).limit(1)
                 ).scalar()
                 if linked_buy is not None:
@@ -8094,6 +8121,15 @@ class PositionsRepo:
                                 "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
                                 "FILLED", "RECONCILED", "UNRESOLVED_ACK",
                             )),
+                    sa.or_(
+                        self._schema.orders.c.status.in_((
+                            "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
+                            "UNRESOLVED_ACK",
+                        )),
+                        self._schema.orders.c.created_at >= now_kst().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                    ),
                         )).limit(1)
                     ).scalar()
                     if active_buy:
