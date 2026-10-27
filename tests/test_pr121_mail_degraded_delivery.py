@@ -319,3 +319,79 @@ def test_health_distinguishes_degraded_delivery_from_mail_failure(tmp_path):
     assert report["mail_complete"] is False
     assert report["mail_ok"] is False
     assert report["failure_reason"] == "DEGRADED_MAIL_EVIDENCE"
+
+
+
+def test_us_stage4_logs_are_included_and_redacted(tmp_path):
+    trade_date, run_date = "2026-09-10", "2026-09-11"
+    root = fixture_us_repo(tmp_path, trade_date)
+    for purpose in ("am", "afternoon"):
+        name = f"us-stage4-worker-{trade_date}-{purpose}-{trade_date}-local.log"
+        (root / f"runtime/logs/us/{trade_date}/{purpose}/attempt.log").write_text(
+            f"[US_STAGE4][CHILD_LOG] path=runtime/logs/{name}\n",
+            encoding="utf-8",
+        )
+        (root / "runtime/logs" / name).write_text(
+            "READY APP_SECRET=stage4-secret-should-be-redacted\n", encoding="utf-8",
+        )
+    result, archive = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        names = tf.getnames()
+        expected = [
+            f"./runtime/logs/us-stage4-worker-{trade_date}-{purpose}-{trade_date}-local.log"
+            for purpose in ("am", "afternoon")
+        ]
+        for member in expected:
+            assert member in names
+            assert b"stage4-secret-should-be-redacted" not in tf.extractfile(member).read()
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+    assert evidence["status"] == "OK"
+    assert evidence["required_missing_count"] == 0
+
+
+def test_us_missing_spawned_stage4_log_is_degraded_but_mail_delivered(tmp_path):
+    trade_date, run_date = "2026-09-10", "2026-09-11"
+    root = fixture_us_repo(tmp_path, trade_date)
+    (root / f"runtime/logs/us/{trade_date}/am/attempt.log").write_text(
+        f"[US_STAGE4][CHILD_LOG] path=runtime/logs/us-stage4-worker-{trade_date}-am-{trade_date}-local.log\n",
+        encoding="utf-8",
+    )
+    result, archive = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REQUIRED_STAGE4_WORKER_LOG_MISSING_am" in result.stderr
+    marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert marker["status"] == "DEGRADED"
+    assert marker["mail_sent"] is True
+    with tarfile.open(archive, "r:gz") as tf:
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+    assert evidence["status"] == "DEGRADED"
+    assert any(
+        item["code"] == "REQUIRED_STAGE4_WORKER_LOG_MISSING_am"
+        for item in evidence["missing_evidence"]
+    )
+
+
+def test_us_failed_sessions_not_masked_by_close_ok_in_mail(tmp_path):
+    trade_date, run_date = "2026-09-10", "2026-09-11"
+    root = fixture_us_repo(tmp_path, trade_date)
+    daily = root / f"reports/us_daily/{trade_date}"
+    for purpose in ("am", "afternoon"):
+        report = daily / purpose / "us_daily_report.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps({
+            "final_status": "FAILED", "reason": "stage4_worker_evidence_unavailable",
+            "ticks_total": 1, "orders_sent_total": 0,
+        }), encoding="utf-8")
+    close = daily / "close" / "us_daily_report.json"
+    close.parent.mkdir(parents=True, exist_ok=True)
+    close.write_text(json.dumps({"status": "OK"}), encoding="utf-8")
+    result, archive = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+    assert evidence["daily_execution_status"] == "FAILED"
+    assert evidence["close_report_status"] == "OK"
+    assert evidence["execution_sessions"]["am"]["final_status"] == "FAILED"
+    assert evidence["execution_sessions"]["afternoon"]["orders_sent_total"] == 0
+    assert "[EXECUTION_FAILED]" in (root / "smtp-args").read_text()
