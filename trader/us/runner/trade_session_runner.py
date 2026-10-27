@@ -1664,10 +1664,16 @@ def run_trade_session(
                     # the authoritative writer has exited unexpectedly.
                     if _reconcile_mode == "WORKER":
                         os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
-                        final_status = "FAILED"
-                        final_reason = "stage4_worker_exited"
-                        root_cause = "US_STAGE4_STARTUP_WORKER_EXITED"
-                        break
+                        if _stage4_unhealthy_since is None:
+                            _stage4_unhealthy_since = time_mod.monotonic()
+                        logger.warning(
+                            "[US_STAGE4][UNEXPECTED_EXIT] code=%s"
+                            " action=RETURN_TO_SUPERVISOR orders_authorized=0",
+                            _shadow_reconcile_child.returncode,
+                        )
+                        # Keep Popen for confirmed reaping. The next loop's
+                        # supervisor performs generation-fenced restart.
+                        continue
                     _shadow_reconcile_child = None
                     if _reconcile_mode == "RESERVATION_ONLY":
                         os.environ.pop("US_RESERVATION_WORKER_PID", None)
@@ -1901,6 +1907,31 @@ def run_trade_session(
                         block_reasons_total[reason] = block_reasons_total.get(reason, 0) + int(cnt or 0)
 
                     tick_status = tick_result.get("status", "ERROR")
+                    if (_reconcile_mode == "WORKER"
+                            and tick_result.get("reason") == "stage4_worker_evidence_unavailable"
+                            and not int(tick_result.get("orders_sent", 0) or 0)
+                            and not int(tick_result.get("orders_ack", 0) or 0)):
+                        # The Tick is proven to have aborted BEFORE planning or
+                        # submitting any order. Do not declare a whole-day
+                        # failure on a transient authoritative evidence gap.
+                        _stage4_paused_count += 1
+                        _stage4_unhealthy_since = time_mod.monotonic()
+                        final_status = "COMPLETED_DEGRADED"
+                        final_reason = "stage4_tick_waiting_for_evidence"
+                        root_cause = str(tick_result.get("stage4_error_code") or
+                                         "US_STAGE4_TICK_EVIDENCE_UNAVAILABLE")
+                        logger.warning(
+                            "[US_STAGE4][TICK_PAUSED] tick=%d code=%s"
+                            " orders_authorized=0 action=SUPERVISE",
+                            tick_count, root_cause,
+                        )
+                        if force_now or max_ticks > 0:
+                            final_status = "FAILED"
+                            break
+                        # Pacing prevents uncontrolled repeated child process
+                        # launches if parent and Tick disagree on health.
+                        time_mod.sleep(1.0)
+                        continue
                     from trader.us.runner.status_contract import classify_tick_status
                     classification = classify_tick_status(tick_result)
 
