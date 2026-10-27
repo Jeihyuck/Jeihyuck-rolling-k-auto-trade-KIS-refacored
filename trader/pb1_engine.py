@@ -7306,7 +7306,7 @@ class PB1Engine:
         original_style = str(entry_style_selected or "").upper()
         trend_decision = select_practice_trend_horizon(
             selected_style=original_style,
-            environment=str(self.env or ""),
+            environment=str(getattr(self, "env", "") or ""),
             enabled=os.getenv("PB1_KR_PRACTICE_TREND_SWING", "0") == "1",
             volume_proof=cf.features.get("volume_proof"),
             price=cf.features.get("current_price") or entry_price_for_plan,
