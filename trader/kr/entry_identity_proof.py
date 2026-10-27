@@ -27,3 +27,63 @@ def entry_style_identity_proof(*, selected_style: Any, trigger_ok: bool,
         "contract_eod_action": mapped["eod_action"],
         "contract_force_eod_close": mapped["force_eod_close"],
     }
+
+
+def select_practice_trend_horizon(
+    *, selected_style: Any, environment: str, enabled: bool,
+    volume_proof: dict[str, Any] | None, price: Any,
+    ma20: Any, ma50: Any, rs_percentile: Any,
+    pivot: Any = None, trigger_ok: bool = False,
+    explicit_day: bool = False,
+) -> dict[str, str]:
+    """Opt-in NEW KR practice BUY classification; never alter an existing holding.
+
+    The opt-in is deliberately separate from entry style, broker routing, and
+    final30 trigger identity. No historical replay or profit claim is implied.
+    """
+    import math
+
+    style_raw = str(selected_style or "").strip().upper()
+    style = ENTRY_STYLE_ALIAS.get(style_raw, style_raw)
+    result = {"state": "KEEP_EXISTING_DAY", "reason": "not_eligible",
+              "selected_style": style, "trade_horizon": "DAY_TRADE"}
+    if style not in {"ENTRY_MOMENTUM", "ENTRY_MOMENTUM_CONTINUATION", "ENTRY_BREAKOUT"}:
+        result["reason"] = "other_style_policy_unchanged"
+        return result
+    if not enabled:
+        result["reason"] = "opt_in_disabled"
+        return result
+    if str(environment or "").lower() != "practice":
+        result["reason"] = "practice_only"
+        return result
+    if explicit_day:
+        result["reason"] = "explicit_day_trade"
+        return result
+    if not isinstance(volume_proof, dict) or volume_proof.get("confirmation_state") != "VERIFIED":
+        result["reason"] = "volume_evidence_unverified"
+        return result
+
+    def positive(value: Any) -> float | None:
+        try:
+            number = float(value)
+            return number if math.isfinite(number) and number > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    last, m20, m50 = positive(price), positive(ma20), positive(ma50)
+    rs = positive(rs_percentile)
+    if rs is not None and rs <= 1:
+        rs *= 100
+    if (last is None or m20 is None or m50 is None or
+            rs is None or rs < 60 or not (last >= m20 >= m50)):
+        result["reason"] = "trend_or_rs_unverified"
+        return result
+    if style == "ENTRY_BREAKOUT":
+        pivot_price = positive(pivot)
+        if (not trigger_ok or not volume_proof.get("breakout_volume_confirmed")
+                or pivot_price is None or last < pivot_price):
+            result["reason"] = "breakout_pivot_or_volume_unverified"
+            return result
+    result.update(state="SWING_ELIGIBLE", reason="verified_practice_trend",
+                  trade_horizon="SWING")
+    return result
