@@ -52,13 +52,15 @@ def build_kr_volume_proof(
     trigger_info: dict[str, Any] | None = None,
     previous_cumulative: float | None = None,
     price_above_vwap: bool | None = None,
+    daily_source: str | None = None,
 ) -> dict[str, Any]:
     """Validate previous completed bars and a same-session KIS cumulative tick.
 
     observed_at is quote receipt time, not the exchange timestamp.
     """
     proof: dict[str, Any] = {
-        "source": "KIS_TICK_CACHE_AND_COMPLETED_OHLCV",
+        "source": "KIS_TICK_CACHE|DAILY_" + str(daily_source or "UNKNOWN"),
+        "daily_source": str(daily_source or "UNKNOWN"),
         "proof_date": None,
         "quote_as_of": None,
         "quote_received_at": observed_at.isoformat(),
@@ -126,6 +128,9 @@ def build_kr_volume_proof(
 
     quote = snapshot if isinstance(snapshot, dict) else {}
     raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+    quoted_code = str(quote.get("symbol") or quote.get("code") or "").strip().lstrip("A")
+    if quoted_code and quoted_code.zfill(6) != str(code).zfill(6):
+        return reject("quote_symbol_mismatch", failed=True)
     # stck_vol is not a substitute: it can represent a single trade.
     cumulative = _positive(quote.get("acml_vol") or raw.get("acml_vol"))
     if cumulative is None:
