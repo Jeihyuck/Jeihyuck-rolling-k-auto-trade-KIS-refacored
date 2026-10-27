@@ -13,6 +13,7 @@ import pytest
 
 from trader.us.execution.stage4_lifecycle import (
     stage4_error_code, stop_stage4_worker, wait_for_stage4_ready,
+    read_stage4_tick_health_with_bounded_retry,
 )
 
 
@@ -134,6 +135,49 @@ def test_stage4_reconcile_unverified_waits_until_new_safe_evidence():
         clock=timeline.read, sleeper=timeline.sleep,
     )["reconcile_status"] == "OK"
     assert timeline.now == 1
+
+
+def test_stage4_tick_recovers_only_after_authoritative_evidence_is_valid():
+    timeline = Clock()
+    states = iter([
+        "US_STAGE4_WRITER_NOT_READY",
+        "US_STAGE4_WRITER_STALE",
+        READY,
+    ])
+    def health(**kwargs):
+        assert kwargs["max_age_seconds"] == 30
+        state = next(states)
+        if isinstance(state, str):
+            raise RuntimeError(state)
+        return state
+    assert read_stage4_tick_health_with_bounded_retry(
+        health_reader=health, retry_sec=2.0, poll_sec=0.25,
+        clock=timeline.read, sleeper=timeline.sleep,
+    ) == READY
+    assert timeline.now == .5
+
+
+def test_stage4_tick_retry_exhausted_stays_fail_closed():
+    timeline = Clock()
+    def always_stale(**_):
+        raise RuntimeError("US_STAGE4_WRITER_STALE")
+    with pytest.raises(RuntimeError, match="US_STAGE4_TICK_HEALTH_RETRY_EXHAUSTED"):
+        read_stage4_tick_health_with_bounded_retry(
+            health_reader=always_stale, retry_sec=1.0, poll_sec=0.25,
+            clock=timeline.read, sleeper=timeline.sleep,
+        )
+    assert timeline.now == 1.0
+
+
+def test_stage4_tick_policy_not_armed_does_not_retry_or_bypass():
+    timeline = Clock()
+    with pytest.raises(RuntimeError, match="US_STAGE4_WRITER_POLICY_NOT_ARMED"):
+        read_stage4_tick_health_with_bounded_retry(
+            health_reader=lambda **_: (_ for _ in ()).throw(
+                RuntimeError("US_STAGE4_WRITER_POLICY_NOT_ARMED")),
+            retry_sec=3.0, clock=timeline.read, sleeper=timeline.sleep,
+        )
+    assert timeline.now == 0
 
 
 def test_stage4_startup_nonpractice_is_rejected_before_health_or_http():
