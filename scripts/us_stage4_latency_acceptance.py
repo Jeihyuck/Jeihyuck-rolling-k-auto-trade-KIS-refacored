@@ -43,7 +43,18 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
 
     A missing log, SQL failure, 30s+ interval, or too few samples never passes.
     """
-    from trader.us.execution.stage4_phase_latency import latency_percentiles
+    # Standalone WSL CLI must work with `python scripts/...` even if the
+    # repository root is not included in sys.path; only stdlib is imported.
+    def interval_percentiles(values_ms: list[float]) -> dict:
+        sorted_ms = sorted(v for v in values_ms if math.isfinite(v) and v >= 0)
+        if not sorted_ms:
+            return {"count": 0, "p50_ms": None, "p95_ms": None,
+                    "p99_ms": None, "max_ms": None}
+        def rank(q: float) -> float:
+            return round(sorted_ms[math.ceil(q * len(sorted_ms)) - 1], 3)
+        return {"count": len(sorted_ms), "p50_ms": rank(.50),
+                "p95_ms": rank(.95), "p99_ms": rank(.99),
+                "max_ms": round(sorted_ms[-1], 3)}
     values = []
     reconcile_failures = 0
     stale_events = 0
@@ -55,7 +66,7 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
         match = STAGE4_READY_INTERVAL.search(line)
         if match:
             values.append(float(match.group("ms")))
-    pct = latency_percentiles(values)
+    pct = interval_percentiles(values)
     blockers = []
     if pct["count"] < min_samples:
         blockers.append("STAGE4_READY_INTERVAL_SAMPLES_INSUFFICIENT")
