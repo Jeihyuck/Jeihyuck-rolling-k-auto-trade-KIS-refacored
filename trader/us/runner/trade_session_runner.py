@@ -1490,6 +1490,16 @@ def run_trade_session(
                         ("STAGE4_FENCED" if _reconcile_mode == "WORKER"
                          else "LEGACY_UNCHANGED"),
                     )
+                    # Preserve the Stage4 Popen reference until finally:
+                    # a dead worker still needs generation-scoped STOPPED
+                    # reconciliation.  Never start an order-capable Tick after
+                    # the authoritative writer has exited unexpectedly.
+                    if _reconcile_mode == "WORKER":
+                        os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
+                        final_status = "FAILED"
+                        final_reason = "stage4_worker_exited"
+                        root_cause = "US_STAGE4_STARTUP_WORKER_EXITED"
+                        break
                     _shadow_reconcile_child = None
                     if _reconcile_mode == "RESERVATION_ONLY":
                         os.environ.pop("US_RESERVATION_WORKER_PID", None)
