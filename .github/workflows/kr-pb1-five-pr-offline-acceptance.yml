@@ -15,6 +15,7 @@ on:
       - "trader/kr/entry_identity_proof.py"
       - "trader/kr/exit_latency_evidence.py"
       - "trader/kr/realized_pnl_truth.py"
+      - "trader/kr/settlement_audit.py"
       - "tests/kr/**"
       - ".github/workflows/kr-pb1-five-pr-offline-acceptance.yml"
   workflow_dispatch:
@@ -61,7 +62,8 @@ jobs:
         run: |
           python -m py_compile trader/pb1_engine.py trader/trade_plan.py trader/db/repos.py \
             trader/kr/volume_proof.py trader/kr/entry_identity_proof.py \
-            trader/kr/exit_latency_evidence.py trader/kr/realized_pnl_truth.py
+            trader/kr/exit_latency_evidence.py trader/kr/realized_pnl_truth.py \
+            trader/kr/settlement_audit.py
       - name: Five PR narrow contract tests
         run: |
           python -m pytest -q \
@@ -70,6 +72,7 @@ jobs:
             tests/kr/test_kr_frozen_horizon_contract_20261027.py \
             tests/kr/test_kr_exit_latency_evidence_20261027.py \
             tests/kr/test_kr_realized_pnl_truth_20261027.py \
+            tests/kr/test_kr_settlement_audit_20261027.py \
             tests/test_kis_ws_price.py
       - name: Existing KR and shared contract regressions
         run: |
