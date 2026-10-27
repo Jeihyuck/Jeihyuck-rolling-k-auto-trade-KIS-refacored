@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
@@ -50,6 +51,46 @@ def _on_trade_date(value, trade_date: date) -> bool:
     return value.astimezone(_KST).date() == trade_date
 
 
+def _broker_buy_cumulative_verified(
+    response: dict, *, code: str, order_number: str, quantity: int,
+    trade_date: date,
+) -> bool:
+    """Require an exact KIS cumulative execution, not ACK/RECONCILED alone.
+
+    The order-level KIS inquiry response must match the original BUY order,
+    show all requested shares executed, no remaining shares, and a priced
+    execution. A missing/zero/ambiguous broker observation is never promoted.
+    """
+    try:
+        if str(response.get("pdno") or "").removeprefix("A").zfill(6) != str(code).zfill(6):
+            return False
+        if str(response.get("odno") or "").zfill(10) != str(order_number).zfill(10):
+            return False
+        if str(response.get("ord_dt") or "").replace("-", "") != trade_date.strftime("%Y%m%d"):
+            return False
+        if str(response.get("sll_buy_dvsn_cd") or "") != "02":
+            return False
+        if str(response.get("cncl_yn") or "").upper() == "Y":
+            return False
+        requested = Decimal(str(response.get("ord_qty")))
+        executed = Decimal(str(response.get("tot_ccld_qty")))
+        remaining = Decimal(str(response.get("rmn_qty")))
+        notional = Decimal(str(response.get("tot_ccld_amt")))
+        average = Decimal(str(response.get("avg_prvs")))
+        if any(not number.is_finite() for number in
+               (requested, executed, remaining, notional, average)):
+            return False
+        if (requested != quantity or executed != quantity or remaining != 0
+                or quantity <= 0 or notional <= 0 or average <= 0):
+            return False
+        # KIS rounds average prices to whole KRW; validate against notional.
+        return abs(notional / executed - average) <= max(
+            Decimal("1"), average * Decimal("0.001")
+        )
+    except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
 def _verified_buy(order: dict, position: dict, claim: dict, trade_date: date) -> dict | None:
     """Validate frozen BUY evidence. Never infer a plan from a ticker alone."""
     if str(order.get("status") or "").upper() not in _BROKER_TERMINAL:
@@ -73,6 +114,11 @@ def _verified_buy(order: dict, position: dict, claim: dict, trade_date: date) ->
     frozen_hash = request.get("entry_contract_sha256")
     ack_hash = _as_json(response.get("_kr_buy_entry_contract")).get("entry_contract_sha256")
     if not frozen_hash or frozen_hash != ack_hash:
+        return None
+    if not _broker_buy_cumulative_verified(
+        response, code=str(order["code"]), order_number=str(order["kis_odno"]),
+        quantity=int(order["qty"]), trade_date=trade_date,
+    ):
         return None
     if str(request.get("position_cycle_id")) != str(order.get("position_cycle_id")):
         return None
@@ -214,7 +260,7 @@ def restore_verified_imported_buy_contracts(
                 "old_imported_cycle": str(pos["position_cycle_id"]),
                 "entry_contract_sha256": request["entry_contract_sha256"],
                 "entry_exit_plan_sha256": _kr_entry_exit_plan_sha256(plan),
-                "provenance": "KIS_HOLDING_PLUS_SATISFIED_PB1_CLAIM",
+                "provenance": "KIS_ORDER_CUMULATIVE_PLUS_HOLDING_PLUS_SATISFIED_CLAIM",
             }
             entry_meta = dict(_as_json(request.get("entry_meta")))
             entry_meta.update({
