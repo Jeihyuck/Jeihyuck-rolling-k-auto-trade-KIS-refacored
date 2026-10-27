@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import hashlib
-from datetime import date, timedelta, datetime, time
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -183,7 +183,6 @@ def restore_verified_imported_buy_contracts(
             return 0
         code = str(holding.get("pdno") or holding.get("code") or "").removeprefix("A").zfill(6)
         try:
-            from decimal import Decimal
             quantity = Decimal(str(holding.get("hldg_qty") or holding.get("qty") or "0"))
             if not quantity.is_finite() or quantity != int(quantity) or quantity < 0:
                 return 0
