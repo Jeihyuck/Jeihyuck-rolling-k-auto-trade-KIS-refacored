@@ -1,0 +1,80 @@
+name: KR PB1 Five PR Offline Acceptance
+on:
+  pull_request:
+    branches:
+      - dual-agent
+      - codex/kr-pb1-exit-latency-evidence-20261027
+      - codex/kr-pb1-frozen-horizon-consistency-20261027
+      - codex/kr-pb1-entry-evidence-contract-20261027
+      - codex/kr-volume-proof-order-gate-20261027-gpt6
+    paths:
+      - "trader/pb1_engine.py"
+      - "trader/trade_plan.py"
+      - "trader/db/repos.py"
+      - "trader/kr/volume_proof.py"
+      - "trader/kr/entry_identity_proof.py"
+      - "trader/kr/exit_latency_evidence.py"
+      - "trader/kr/realized_pnl_truth.py"
+      - "tests/kr/**"
+      - ".github/workflows/kr-pb1-five-pr-offline-acceptance.yml"
+  workflow_dispatch:
+
+jobs:
+  pb1-integration-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      MARKET: KR
+      REGION: KR
+      PB1_MARKET_SCOPE: KRX
+      PB1_KR_PRACTICE_TREND_SWING: "0"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      DISABLE_LIVE_TRADING: "1"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
+      PYTHONPATH: "."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install offline dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest pytest-mock psycopg2-binary
+      - name: Compile changed runtime modules
+        run: |
+          python -m py_compile trader/pb1_engine.py trader/trade_plan.py trader/db/repos.py \
+            trader/kr/volume_proof.py trader/kr/entry_identity_proof.py \
+            trader/kr/exit_latency_evidence.py trader/kr/realized_pnl_truth.py
+      - name: Five PR narrow contract tests
+        run: |
+          python -m pytest -q \
+            tests/kr/test_kr_volume_proof_order_gate_20261027.py \
+            tests/kr/test_kr_entry_identity_proof_20261027.py \
+            tests/kr/test_kr_frozen_horizon_contract_20261027.py \
+            tests/kr/test_kr_exit_latency_evidence_20261027.py \
+            tests/kr/test_kr_realized_pnl_truth_20261027.py \
+            tests/test_kis_ws_price.py
+      - name: Existing KR and shared contract regressions
+        run: |
+          python -m pytest -q tests/kr \
+            tests/test_reconcile_entry_exit_plan_restore.py \
+            tests/test_pb1_exit_signature.py \
+            tests/test_position_cycle_lifecycle.py \
+            tests/test_kr_final30_contract.py
