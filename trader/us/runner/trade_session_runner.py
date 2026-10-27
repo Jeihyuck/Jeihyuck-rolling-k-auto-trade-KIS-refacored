@@ -1460,6 +1460,7 @@ def run_trade_session(
                         _shadow_reconcile_child, env=env,
                         timeout_sec=float(os.getenv("US_STAGE4_STARTUP_TIMEOUT_SEC", "75")),
                         poll_sec=float(os.getenv("US_STAGE4_STARTUP_POLL_SEC", "0.5")),
+                        health_max_age_seconds=float(os.getenv("US_STAGE4_HEALTH_MAX_AGE_SEC", "30")),
                     )
                     logger.info(
                         "[US_STAGE4][STARTUP_READY] elapsed_sec=%.2f "
