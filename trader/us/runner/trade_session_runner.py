@@ -1437,6 +1437,12 @@ def run_trade_session(
             if _reconcile_mode == "RESERVATION_ONLY":
                 os.environ["US_RESERVATION_WORKER_PID"] = str(_shadow_reconcile_child.pid)
             elif _reconcile_mode == "WORKER":
+                from trader.us.execution.authoritative_reconcile_worker import stage4_process_start_ticks
+                os.environ["US_STAGE4_WORKER_PID"] = str(_shadow_reconcile_child.pid)
+                os.environ["US_STAGE4_WORKER_START_TICKS"] = stage4_process_start_ticks(
+                    _shadow_reconcile_child.pid
+                )
+                os.environ["US_STAGE4_PROCESS_PROOF_REQUIRED"] = "1"
                 os.environ["US_STAGE4_WORKER_ALIVE"] = "1"
             if _reconcile_mode == "WORKER":
                 logger.info("[US_STAGE4][CHILD_LOG] path=%s", _stage4_worker_log_path)
@@ -2759,7 +2765,11 @@ def run_trade_session(
             finally:
                 if _reconcile_mode == "WORKER":
                     os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
-                    os.environ.pop("US_STAGE4_EXPECTED_GENERATION", None)
+                    for _stage4_identity_key in (
+                        "US_STAGE4_EXPECTED_GENERATION", "US_STAGE4_WORKER_PID",
+                        "US_STAGE4_WORKER_START_TICKS", "US_STAGE4_PROCESS_PROOF_REQUIRED",
+                    ):
+                        os.environ.pop(_stage4_identity_key, None)
         if _stage4_worker_log_stream is not None:
             _stage4_worker_log_stream.close()
             _stage4_worker_log_stream = None
