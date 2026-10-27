@@ -313,3 +313,38 @@ def test_post_reconcile_detects_eod_flag_drift():
     assert verify_recovered_contract_invariants(
         engine=engine, env="practice", strategy="pb1_pullback_close"
     ) == 1
+
+
+
+def test_zero_quantity_holding_with_zero_price_does_not_veto_valid_recovery():
+    engine, schema, holdings, cycle, _ = fixture_case()
+    holdings.insert(0, {"pdno": "999999", "hldg_qty": "0", "pchs_avg_pric": "0"})
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    with engine.connect() as c:
+        pos = c.execute(sa.select(schema.positions)).mappings().one()
+    assert pos["position_cycle_id"] == cycle
+    assert pos["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+
+
+def test_prior_day_restore_preserves_real_holding_age_not_same_day():
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    with engine.connect() as c:
+        pos = c.execute(sa.select(schema.positions)).mappings().one()
+    meta = pos["position_meta"]
+    assert meta["same_day_entry_proven"] is False
+    assert meta["same_day_entry_provenance"] == "ORDER_FILL_PRIOR_DAY"
+    assert meta["frozen_contract_recovery"]["source_trade_date"] == "2026-10-27"
+    assert pos["entry_ts"] is None  # exact broker fill timestamp not fabricated
+    from trader.position_age import calc_position_age
+    age = calc_position_age(meta["frozen_contract_recovery"]["source_trade_date"], DAY + timedelta(days=1))
+    assert age.days_held == 1
+
+
+def test_current_day_restore_keeps_current_day_flag_only_for_current_day():
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings) == 1
+    with engine.connect() as c:
+        pos = c.execute(sa.select(schema.positions)).mappings().one()
+    assert pos["position_meta"]["same_day_entry_proven"] is True
+    assert pos["position_meta"]["same_day_entry_provenance"] == "ORDER_FILL_CURRENT_DAY"
