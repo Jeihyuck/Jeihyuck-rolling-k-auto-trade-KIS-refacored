@@ -260,6 +260,7 @@ from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON a
 from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
+from trader.kr.entry_identity_proof import entry_style_identity_proof
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -10564,6 +10565,7 @@ class PB1Engine:
             "score": float(features.get("score") or cf.score or 0.0), "pivot": features.get("pivot"),
             "trigger_ok": bool(trigger_ok), "trigger_info": trigger_info or {},
             "volume_proof": dict(features.get("volume_proof") or {}),
+            "entry_identity_proof": dict(features.get("entry_identity_proof") or {}),
             "price_source": price_source or features.get("price_source") or "unknown",
             "price_gate_blocked": bool(features.get("price_gate_blocked")),
             "created_at": now_kst().isoformat(),
@@ -19586,6 +19588,15 @@ class PB1Engine:
                     cf.features["final_entry_reason_code"] = final_entry_reason_code
                     cf.features["entry_decision_family"] = final_entry_reason_code
                     cf.features["entry_rule_version"] = "pb1_entry_reason_v1"
+                    cf.features["entry_identity_proof"] = entry_style_identity_proof(
+                        selected_style=cf.features.get("entry_style_selected"),
+                        trigger_ok=bool(trigger_ok), decision_family=final_entry_reason_code,
+                        trigger_policy=trigger_policy,
+                    )
+                    logger.info("[KR][ENTRY][STYLE_PROOF] code=%s selected=%s event=%s decision=%s horizon=%s",
+                                cf.code, cf.features["entry_identity_proof"].get("selected_style"),
+                                cf.features["entry_identity_proof"].get("trigger_event"),
+                                final_entry_reason_code, cf.features["entry_identity_proof"].get("contract_trade_horizon"))
                     cf.features["derived_as_of"] = engine_asof
                     cf.features["trace_id"] = f"{trace_id}:{cf.code}"
                     cf.features["setup_snapshot_json"] = {
