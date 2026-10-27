@@ -27,7 +27,8 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
                  existing_source=False, zero_broker_fill=False,
                  wrong_broker_order=False, wrong_trade_date=False,
                  wrong_broker_price=False, extra_side=None,
-                 claim_account=None, nonzero_preorder=False):
+                 claim_account=None, nonzero_preorder=False,
+                 broker_avg=61906, other_sleeve_order=False):
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
@@ -105,6 +106,17 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
             exit_policy_family="POLICY_MISSING", policy_source="missing",
             entry_exit_plan_json={}, entry_meta_json={},
         ))
+        if other_sleeve_order:
+            c.execute(schema.orders.insert().values(
+                order_id=str(uuid4()), position_cycle_id=str(uuid4()),
+                env="practice", strategy="KR_INFINITE",
+                sid=1, mode=1, code=code,
+                portfolio_epoch_id=portfolio, trading_epoch_id=epoch,
+                side="SELL", ord_type="LIMIT", qty=1,
+                client_order_key="other-sleeve-"+code,
+                status="CANCELLED", request_json={}, response_json={},
+                created_at=now,
+            ))
         if extra_side:
             c.execute(schema.orders.insert().values(
                 order_id=str(uuid4()), position_cycle_id=str(uuid4()), **base,
@@ -135,7 +147,8 @@ def fixture_case(*, code="028050", qty=33, claim_state="SATISFIED",
             remaining_target_qty=0 if claim_state=="SATISFIED" else qty,
             action_state=claim_state, trade_date=DAY,
         ))
-    holdings = [{"pdno": code, "hldg_qty": str(qty if broker_qty is None else broker_qty)}]
+    holdings = [{"pdno": code, "hldg_qty": str(qty if broker_qty is None else broker_qty),
+                 "pchs_avg_pric": str(broker_avg)}]
     return engine, schema, holdings, source_cycle, request["entry_contract_sha256"]
 
 
@@ -179,6 +192,8 @@ def test_verified_momentum_33shares_restored_once_with_exact_sha():
     {"extra_side": "BUY"},   # no adoption after another buy
     {"nonzero_preorder": True},
     {"claim_account": "different-account-hash"},
+    {"broker_avg": 100},
+    {"other_sleeve_order": True},
 ])
 def test_unproven_or_ambiguous_buy_never_inherits_exit_contract(case):
     engine, schema, holdings, _cycle, _digest = fixture_case(**case)
