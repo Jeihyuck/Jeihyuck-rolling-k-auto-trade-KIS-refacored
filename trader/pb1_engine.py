@@ -260,8 +260,8 @@ from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON a
 from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
-from trader.kr.entry_identity_proof import entry_style_identity_proof
-from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency
+from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon
+from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency, timed_ordered_exit_history
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -7300,6 +7300,45 @@ class PB1Engine:
             or identity.get("entry_reason")
             or entry_style_selected
         )
+        # A selected setup style is not itself a SWING mandate. Only a
+        # provenance-verified, explicit practice opt-in may create a new SWING
+        # contract; no existing positions or DAY contracts are rewritten.
+        original_style = str(entry_style_selected or "").upper()
+        trend_decision = select_practice_trend_horizon(
+            selected_style=original_style,
+            environment=str(self.env or ""),
+            enabled=os.getenv("PB1_KR_PRACTICE_TREND_SWING", "0") == "1",
+            volume_proof=cf.features.get("volume_proof"),
+            price=cf.features.get("current_price") or entry_price_for_plan,
+            ma20=cf.features.get("ma20"),
+            ma50=cf.features.get("ma50"),
+            rs_percentile=cf.features.get("rs_percentile") or cf.features.get("rs_pctile"),
+            pivot=cf.features.get("pivot") or cf.features.get("high20"),
+            trigger_ok=bool((getattr(cf, "entry_plan", None) or {}).get("trigger_ok")),
+            explicit_day=str(cf.features.get("entry_trade_intent") or "").strip().upper()
+                in {"DAY", "DAY_TRADE", "EVENT_DAY"},
+        )
+        # Existing explicit policy fields are authoritative; do not rewrite
+        # them to sneak a new SWING plan past KR_ENTRY_EXIT_STYLE_CONFLICT.
+        preexisting_contract_fields = {
+            name: cf.features.get(name)
+            for name in ("trade_horizon", "exit_policy_family", "eod_action", "force_eod_close")
+            if cf.features.get(name) is not None and cf.features.get(name) != ""
+        }
+        if (trend_decision["state"] == "SWING_ELIGIBLE"
+                and _is_kr_stock_code(cf.code)
+                and str(cf.market or "").upper() in {"J", "KR", "KRX", "KOSPI", "KOSDAQ"}
+                and not preexisting_contract_fields):
+            normal = self._normalize_entry_reason(original_style)
+            entry_style_selected = (
+                "ENTRY_MOMENTUM_SWING" if normal == "ENTRY_MOMENTUM"
+                else "ENTRY_BREAKOUT_SWING" if normal == "ENTRY_BREAKOUT"
+                else original_style
+            )
+        elif trend_decision["state"] == "SWING_ELIGIBLE" and preexisting_contract_fields:
+            trend_decision["state"] = "KEEP_EXISTING_DAY"
+            trend_decision["reason"] = "explicit_existing_contract_wins"
+        cf.features["entry_horizon_selection_proof"] = dict(trend_decision)
         try:
             plan = build_entry_exit_plan(
                 code=cf.code,
@@ -7343,6 +7382,7 @@ class PB1Engine:
             "entry_reason": plan_dict.get("entry_reason"),
             "entry_decision_family": cf.features.get("entry_decision_family"),
             "entry_trigger_policy": cf.features.get("entry_trigger_policy") or "NONE",
+            "entry_horizon_selection_proof": cf.features.get("entry_horizon_selection_proof"),
             "trade_horizon": plan_dict.get("trade_horizon"),
             "exit_policy_family": plan_dict.get("exit_policy_family"),
             "eod_action": plan_dict.get("eod_action"),
@@ -14833,8 +14873,16 @@ class PB1Engine:
             "max_data_workers=1 sell_policy_and_submit=SERIAL",
             int(read_ahead_enabled), len(pos_list),
         )
-        for pos, (df, meta) in exit_ohlcv_iter:
+        for _history_wait_sec, (pos, (df, meta)) in timed_ordered_exit_history(exit_ohlcv_iter):
             display_code = self._display_code(pos.get("code"))
+            if _history_wait_sec > 10.0:
+                logger.warning(
+                    "[KR][EXIT][HISTORY_WAIT] code=%s wait_sec=%.3f state=SLOW_OR_CRITICAL action=investigate",
+                    display_code, _history_wait_sec,
+                )
+            else:
+                logger.info("[KR][EXIT][HISTORY_WAIT] code=%s wait_sec=%.3f", display_code, _history_wait_sec)
+            _holding_eval_started = time.monotonic()
             logger.info(
                 "[PB1][POST_CAPITAL][EXIT_PASS][HOLDING] code=%s step=start qty=%s holding_days=%s",
                 display_code,
@@ -14855,6 +14903,14 @@ class PB1Engine:
             _exit_evaluation_started = time.monotonic()
             evaluation = self._plan_exit_event(pos, features, df, "close" if self.window_internal == "close" else "manage")
             _exit_evaluation_elapsed = time.monotonic() - _exit_evaluation_started
+            _total_since_history = time.monotonic() - _holding_eval_started + _history_wait_sec
+            _total_latency_state = classify_exit_evaluation_latency(_total_since_history)
+            if _total_latency_state in {"SLOW", "CRITICAL"}:
+                logger.warning(
+                    "[KR][EXIT][TOTAL_HOLDING_LATENCY] code=%s total_sec=%.3f history_wait_sec=%.3f "
+                    "state=%s action=investigate_no_risk_policy_change",
+                    display_code, _total_since_history, _history_wait_sec, _total_latency_state,
+                )
             _exit_latency_state = classify_exit_evaluation_latency(_exit_evaluation_elapsed)
             if _exit_latency_state in {"SLOW", "CRITICAL"}:
                 logger.warning("[KR][EXIT][EVAL_SUBMIT_LATENCY] code=%s elapsed_sec=%.3f state=%s ohlcv_source=%s action=investigate_no_policy_change",
