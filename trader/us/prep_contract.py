@@ -710,9 +710,28 @@ def _score_positive(row: dict) -> bool:
 
 def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     """파일 contract가 없을 때 DB fallback으로 prep guard를 수행."""
-    from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+    from trader.us.db.repos import (
+        load_latest_us_prep_status, load_latest_completed_us_prep_status,
+        load_locked_us_watchlist,
+    )
+    from trader.us.prep_effective import locked_rows_match_prep_run
 
     prep = load_latest_us_prep_status(trade_date, timeout_sec=20) or {}
+    latest_status = str(prep.get("status") or "UNKNOWN").upper()
+    selected_completed_fallback = False
+    # A newer STARTED/ERROR attempt is not authoritative completion and may
+    # not mask the prior finished same-day PREP. Never accept the older run
+    # without checking the DB watchlist belongs to that exact run_id.
+    if latest_status in {"STARTED", "ERROR", "FAILED", "INTERRUPTED"}:
+        completed = load_latest_completed_us_prep_status(trade_date, timeout_sec=20) or {}
+        if completed:
+            prep = completed
+            selected_completed_fallback = True
+            logger.warning(
+                "[US_PREP_GUARD][LATEST_INCOMPLETE_IGNORED] trade_date=%s "
+                "latest_status=%s selected_run_id=%s",
+                trade_date, latest_status, prep.get("run_id"),
+            )
     status = prep.get("status", "UNKNOWN")
     run_id = prep.get("run_id", "")
     result = prep.get("result") or {}
@@ -731,7 +750,7 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     )
     base_payload = {
         "contract": None,
-        "source": "db",
+        "source": "db_completed_fallback" if selected_completed_fallback else "db",
         "session_can_run": True,
         "entry_can_proceed": False,
         "exit_can_proceed": True,
@@ -777,6 +796,22 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
         allow_degraded=False,
         timeout_sec=20,
     ) or []
+
+    # DB fallback must not join an older completed run with rows from
+    # the newer interrupted attempt: that would manufacture a valid BUY proof.
+    if selected_completed_fallback and not locked_rows_match_prep_run(prep, rows):
+        logger.error(
+            "[US_PREP_GUARD][COMPLETED_RUN_WATCHLIST_MISMATCH] trade_date=%s run_id=%s",
+            trade_date, prep.get("run_id"),
+        )
+        return {
+            **base_payload,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "entry_can_proceed": False,
+            "reason": "PREP_DEGRADED_ENTRY_BLOCKED:completed_run_watchlist_mismatch",
+        }
 
     locked_count = len(rows)
     score_nonzero_count = sum(1 for r in rows if _score_positive(r))
