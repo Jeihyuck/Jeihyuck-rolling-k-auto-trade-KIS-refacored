@@ -438,6 +438,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM,_stop)
     signal.signal(signal.SIGINT,_stop)
     generation=str(os.getenv("US_STAGE4_EXPECTED_GENERATION") or uuid.uuid4().hex)
+    from trader.us.execution.stage4_phase_latency import RollingStage4Latency
+    ready_window = RollingStage4Latency(size=128)
+    last_ready_mono: float | None = None
     # Hold only the dedicated one-writer advisory lock. It is distinct from
     # the short-lived trade reservation leases, so it does not hold KIS HTTP.
     with engine.connect() as lease:
@@ -459,6 +462,25 @@ def main() -> int:
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="READY",result=result)
+                    ready_now = time.monotonic()
+                    if last_ready_mono is not None:
+                        interval_ms = max(0.0, (ready_now - last_ready_mono) * 1000.0)
+                        window = ready_window.observe(interval_ms)
+                        logger.info(
+                            "[US_STAGE4][READY_INTERVAL] interval_ms=%.1f "
+                            "count=%d p50_ms=%s p95_ms=%s p99_ms=%s max_ms=%s "
+                            "threshold_ms=30000",
+                            interval_ms, window["count"], window["p50_ms"],
+                            window["p95_ms"], window["p99_ms"],
+                            window["max_ms"],
+                        )
+                        if interval_ms >= 30000:
+                            logger.error(
+                                "[US_STAGE4][READY_INTERVAL_STALE_RISK] "
+                                "interval_ms=%.1f threshold_ms=30000",
+                                interval_ms,
+                            )
+                    last_ready_mono = ready_now
                     from trader.us.execution.reconcile_shadow_worker import (
                         observer_report_path,save_diagnostic_atomic,
                     )
