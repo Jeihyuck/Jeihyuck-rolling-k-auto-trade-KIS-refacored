@@ -1984,6 +1984,34 @@ def route_order(
                 client_order_key=str(order_key or ""),
             )
         if not claim.acquired:
+            claim_remainder_audit = None
+            if str(claim.reason or "") == "remaining_target_qty_mismatch":
+                try:
+                    from trader.us.db.repos import inspect_us_execution_claim_remainder
+                    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+                    claim_proof = inspect_us_execution_claim_remainder(
+                        action_key=claim.action_key, trade_date=str(trade_date),
+                        env=account_env,
+                    )
+                    claim_remainder_audit = classify_claim_remainder_conflict(
+                        qty, claim_proof,
+                    )
+                except Exception as claim_probe_exc:
+                    claim_remainder_audit = {
+                        "reason": "CLAIM_DB_PROOF_UNVERIFIED",
+                        "safe_to_auto_retry": False,
+                        "action": "RECONCILE_KIS_AND_CLAIM_READ_ONLY",
+                    }
+                    logger.warning(
+                        "[US_ORDER][EXECUTION_CLAIM][AUDIT_UNVERIFIED] type=%s",
+                        type(claim_probe_exc).__name__,
+                    )
+                logger.warning(
+                    "[US_ORDER][EXECUTION_CLAIM][REMAINDER_AUDIT] symbol=%s "
+                    "reason=%s attempted=%s remaining=%s auto_retry=0",
+                    symbol_upper, claim_remainder_audit.get("reason"),
+                    qty, claim_remainder_audit.get("persisted_remaining_qty"),
+                )
             logger.error(
                 "[US_ORDER][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
                 claim.action_key, claim.reason,
@@ -1992,6 +2020,7 @@ def route_order(
                 "status": "ORDER_FENCED_UNRESOLVED_ACTION",
                 "reason": claim.reason,
                 "execution_action_key": claim.action_key,
+                "claim_remainder_audit": claim_remainder_audit,
                 "broker_submit": False,
                 "retry_order": False,
                 "requires_reconcile": True,
