@@ -178,6 +178,7 @@ def restore_verified_imported_buy_contracts(
     account_hash = hashlib.sha256(account_id.encode("utf-8")).hexdigest()
     earliest_day = trade_date - timedelta(days=lookback_calendar_days)
     balances: dict[str, int] = {}
+    purchase_averages: dict[str, Decimal] = {}
     for holding in holdings_rows or []:
         if not isinstance(holding, dict):
             return 0
@@ -192,7 +193,18 @@ def restore_verified_imported_buy_contracts(
         if not code.isdigit() or len(code) != 6 or code in balances:
             log.error("[KR_CONTRACT_RECOVERY][AMBIGUOUS_HOLDINGS] code=%s", code)
             return 0
+        # Exact quantity alone cannot exclude an unrecorded manual sell+rebuy.
+        # Require fresh broker's purchase average to agree with original KIS
+        # cumulative BUY economics. Missing average is an explicit hard skip.
+        try:
+            raw_avg = holding.get("pchs_avg_pric") or holding.get("avg_price")
+            broker_avg = Decimal(str(raw_avg))
+            if not broker_avg.is_finite() or broker_avg <= 0:
+                return 0
+        except (InvalidOperation, ValueError, TypeError):
+            return 0
         balances[code] = qty
+        purchase_averages[code] = broker_avg
 
     schema = schema_for_engine(engine)
     restored = 0
@@ -273,6 +285,36 @@ def restore_verified_imported_buy_contracts(
                             code, len(buys))
                 continue
             buy = buys[0]
+            # Broker balance is account-wide. Detect orders from another
+            # sleeve or an earlier unrepresented lifecycle as ambiguity too.
+            other_account_orders = conn.execute(sa.select(
+                schema.orders.c.order_id
+            ).where(sa.and_(
+                schema.orders.c.env == env,
+                schema.orders.c.trading_epoch_id == pos["trading_epoch_id"],
+                schema.orders.c.code == code,
+                schema.orders.c.order_id != buy["order_id"],
+            )).limit(1)).first()
+            if other_account_orders:
+                log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=CROSS_SLEEVE_ORDER_ACTIVITY", code)
+                continue
+            try:
+                original_kis = _as_json(buy.get("response_json"))
+                filled = Decimal(str(original_kis.get("tot_ccld_qty")))
+                paid = Decimal(str(original_kis.get("tot_ccld_amt")))
+                source_average = paid / filled
+                holding_average = purchase_averages[code]
+                imported_average = Decimal(str(pos.get("avg_buy_price")))
+                tolerance = max(Decimal("1"), source_average * Decimal("0.001"))
+                if not all(x.is_finite() for x in (filled, paid, source_average, imported_average)):
+                    continue
+                if (filled <= 0 or paid <= 0
+                        or abs(holding_average - source_average) > tolerance
+                        or abs(imported_average - source_average) > tolerance):
+                    log.warning("[KR_CONTRACT_RECOVERY][SKIP] code=%s reason=PURCHASE_AVERAGE_MISMATCH", code)
+                    continue
+            except (InvalidOperation, TypeError, ValueError, KeyError, ZeroDivisionError):
+                continue
             bought_at = buy.get("created_at")
             if bought_at is None:
                 continue
