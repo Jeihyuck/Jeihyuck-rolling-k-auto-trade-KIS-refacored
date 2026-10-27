@@ -38,7 +38,8 @@ def stage4_error_code(exc: BaseException) -> str:
 
 def wait_for_stage4_ready(
     child: Any, *, env: str = "practice", timeout_sec: float = 75.0,
-    poll_sec: float = 0.5, health_reader: Callable[..., dict] | None = None,
+    poll_sec: float = 0.5, health_max_age_seconds: float = 30.0,
+    health_reader: Callable[..., dict] | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict:
@@ -61,7 +62,7 @@ def wait_for_stage4_ready(
         if child.poll() is not None:
             raise RuntimeError("US_STAGE4_STARTUP_WORKER_EXITED")
         try:
-            evidence = health_reader(env=env)
+            evidence = health_reader(env=env, max_age_seconds=health_max_age_seconds)
             if (evidence.get("reconcile_status") not in _OK_RECONCILE
                     or evidence.get("replay_status") not in _OK_REPLAY):
                 raise RuntimeError("US_STAGE4_RECONCILIATION_UNVERIFIED")
@@ -71,7 +72,7 @@ def wait_for_stage4_ready(
         except Exception as exc:
             code = stage4_error_code(exc)
             if code not in _RETRYABLE_STARTUP_CODES:
-                raise RuntimeError("US_STAGE4_STARTUP_FATAL_" + code) from exc
+                raise RuntimeError("US_STAGE4_STARTUP_FATAL_" + code.upper()) from exc
             last_code = code
 
         remaining = deadline - clock()
