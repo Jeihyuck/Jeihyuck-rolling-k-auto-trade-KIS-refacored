@@ -1315,6 +1315,22 @@ def _restore_entry_meta_for_promoted_positions(
                 )
             continue
 
+        # PR261: once the verified imported lot is rebound to its original
+        # SYSTEM BUY cycle, this legacy metadata repair lane is NOT the plan
+        # owner. In particular, its no-metadata fallback clears
+        # force_eod_close=False, which would violate frozen DAY_TRADE policy.
+        proof = existing_meta.get("frozen_contract_recovery")
+        if position_origin == "SYSTEM" and isinstance(proof, dict):
+            source_hash = str(proof.get("entry_contract_sha256") or "")
+            entry_hash = str(existing_entry_meta.get("entry_contract_sha256") or "")
+            if len(source_hash) == 64 and entry_hash == source_hash and proof.get("source_buy_order_id"):
+                logger.info(
+                    "[RECONCILE][META_RESTORE][FROZEN_BUY_SKIP] code=%s cycle=%s "
+                    "action=PRESERVE_ENTRY_EXIT_PLAN",
+                    code, position_cycle_id,
+                )
+                continue
+
         # A SYSTEM position can already contain same-lifecycle entry metadata
         # from an earlier reconcile/fill.  Do not skip it merely because
         # book/horizon exists: older code may have restored JSON metadata while
