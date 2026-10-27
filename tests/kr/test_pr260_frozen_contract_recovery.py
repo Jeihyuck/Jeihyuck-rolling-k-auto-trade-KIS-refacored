@@ -270,3 +270,31 @@ def test_prior_day_recovery_never_changes_fill_or_economics():
         )).one()
         assert c.execute(sa.select(sa.func.count()).select_from(schema.fills)).scalar() == 0
     assert tuple(post) == tuple(pre)
+
+
+def test_legacy_metadata_lane_cannot_clear_verified_eod_close():
+    from trader.reconcile_kis import _restore_entry_meta_for_promoted_positions
+    from trader.db.repos import OrdersRepo, LedgerEventsRepo
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    _restore_entry_meta_for_promoted_positions(
+        env="practice", strategy="pb1_pullback_close", engine=engine,
+        orders_repo=OrdersRepo(engine), positions_repo=PositionsRepo(engine),
+        ledger_repo=LedgerEventsRepo(engine),
+    )
+    with engine.connect() as c:
+        p = c.execute(sa.select(schema.positions)).mappings().one()
+    assert p["exit_policy_family"] == "INTRADAY_PROFIT_PROTECT"
+    assert p["trade_horizon"] == "DAY_TRADE"
+    assert p["force_eod_close"] is True
+
+
+def test_post_reconcile_detects_eod_flag_drift():
+    from trader.kr.frozen_contract_recovery_260 import verify_recovered_contract_invariants
+    engine, schema, holdings, _, _ = fixture_case()
+    assert _run(engine, holdings, on_date=DAY + timedelta(days=1)) == 1
+    with engine.begin() as c:
+        c.execute(schema.positions.update().values(force_eod_close=False))
+    assert verify_recovered_contract_invariants(
+        engine=engine, env="practice", strategy="pb1_pullback_close"
+    ) == 1
