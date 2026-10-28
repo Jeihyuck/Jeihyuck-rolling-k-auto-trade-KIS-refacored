@@ -51,6 +51,12 @@ def classify_claim_remainder_conflict(attempted_qty: int, evidence: dict) -> dic
         "safe_to_auto_retry": False,
         "broker_terminal_verified": False,
         "action": "RECONCILE_KIS_AND_CLAIM_READ_ONLY",
+        # Read-only attempt history is diagnostic. It must never override the
+        # current Claim remainder, broker original-order truth or new risk gate.
+        "recent_attempts": (
+            list(evidence.get("recent_attempts") or [])[:5]
+            if evidence.get("status") == "VERIFIED" else []
+        ),
     }
     if evidence.get("status") != "VERIFIED":
         return {**base, "reason": "CLAIM_DB_PROOF_UNVERIFIED"}
