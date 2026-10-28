@@ -54,6 +54,34 @@ def locked_rows_match_prep_run(
 
 
 
+
+def db_prep_entry_permission(status: object, result: dict[str, Any] | None) -> tuple[bool, str]:
+    """A completed PREP is not automatically a BUY-authorizing PREP.
+
+    The exit/close liveness contract may be valid while new entries remain
+    prohibited. Never equate trade_can_proceed=1 to entry_can_proceed=1.
+    """
+    data = result if isinstance(result, dict) else {}
+    normalized = str(status or "").strip().upper()
+    if normalized not in {"OK", "OK_WITH_WARNINGS"} and not normalized.startswith("OK_WITH_WARNINGS_"):
+        return False, "prep_completion_not_entry_eligible"
+    for key in ("entry_can_proceed", "exit_can_proceed", "trade_can_proceed",
+                "final30_trade_ready", "contract_ok", "allow_new_buy"):
+        value = data.get(key)
+        if value not in (1, True, "1", "true", "True"):
+            return False, f"db_entry_contract_{key}_not_proven"
+    if (data.get("contract_version") != "us_sector_rotation_v3"
+            or data.get("market_regime_version") != "us_leading_regime_v1"):
+        return False, "db_entry_contract_version_unverified"
+    if data.get("force_entry_block") in (1, True, "1", "true", "True"):
+        return False, "db_entry_force_block"
+    if str(data.get("trade_block_reason") or "ok").lower() not in {
+        "ok", "ok_crash_rebound_limited",
+    }:
+        return False, "db_entry_trade_block_reason"
+    return True, "ok_db_entry_contract_verified"
+
+
 def resolve_session_prep_cache(
     latest_attempt: dict[str, Any] | None,
     completed_candidate: dict[str, Any] | None,
