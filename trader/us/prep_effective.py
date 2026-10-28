@@ -104,6 +104,51 @@ def resolve_session_prep_cache(
     return latest, "unverified_incomplete"
 
 
+
+def authorize_recovered_prep_guard(
+    *,
+    candidate: dict[str, Any] | None,
+    locked_rows: Sequence[Any] | None,
+    fresh_guard: dict[str, Any] | None,
+    trade_date: str,
+    current_revision: str,
+    manifest_revision_verified: bool,
+) -> tuple[bool, str]:
+    """Never promote a cached PREP without a newly proven session guard.
+
+    An old STARTED cache, valid EXIT_ONLY record, mismatched selected watchlist,
+    unpinned code or preflight marker must never authorize a new BUY.
+    """
+    prep = candidate if isinstance(candidate, dict) else {}
+    guard = fresh_guard if isinstance(fresh_guard, dict) else {}
+    if not manifest_revision_verified or not current_revision or current_revision == "unknown":
+        return False, "run_manifest_revision_unverified"
+    if str(prep.get("trade_date") or trade_date) != trade_date:
+        return False, "recovery_prep_trade_date_mismatch"
+    if not is_effective_prep_status(prep.get("status")):
+        return False, "recovery_prep_not_completed"
+    if not locked_rows_match_prep_run(prep, locked_rows):
+        return False, "recovery_prep_watchlist_identity_unverified"
+    data = prep.get("result") if isinstance(prep.get("result"), dict) else {}
+    allowed, reason = db_prep_entry_permission(prep.get("status"), data)
+    if not allowed:
+        return False, reason
+    if guard.get("ok") is not True or guard.get("entry_can_proceed") is not True:
+        return False, "recovery_fresh_guard_not_entry_authorized"
+    if str(guard.get("guard_state") or "").upper() != "PREP_OK":
+        return False, "recovery_guard_state_not_prep_ok"
+    if not bool(guard.get("exit_can_proceed", False)):
+        return False, "recovery_exit_liveness_unverified"
+    if bool(guard.get("version_mismatch") or guard.get("run_revision_mismatch")):
+        return False, "recovery_run_revision_mismatch"
+    if str(data.get("run_revision") or data.get("git_commit_sha") or "") != current_revision:
+        return False, "recovery_candidate_revision_mismatch"
+    guard_contract = guard.get("contract") if isinstance(guard.get("contract"), dict) else {}
+    guard_run = str(guard_contract.get("run_id") or guard.get("run_id") or "").strip()
+    if not guard_run or guard_run != str(prep.get("run_id") or "").strip():
+        return False, "recovery_guard_candidate_run_mismatch"
+    return True, "recovered_prep_contract_and_guard_verified"
+
 def is_effective_prep_contract(
     contract: dict[str, Any] | None,
     rows: Sequence[Any] | None,
