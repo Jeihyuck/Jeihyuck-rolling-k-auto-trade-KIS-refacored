@@ -54,6 +54,34 @@ def locked_rows_match_prep_run(
 
 
 
+
+def db_prep_entry_permission(status: object, result: dict[str, Any] | None) -> tuple[bool, str]:
+    """A completed PREP is not automatically a BUY-authorizing PREP.
+
+    The exit/close liveness contract may be valid while new entries remain
+    prohibited. Never equate trade_can_proceed=1 to entry_can_proceed=1.
+    """
+    data = result if isinstance(result, dict) else {}
+    normalized = str(status or "").strip().upper()
+    if normalized not in {"OK", "OK_WITH_WARNINGS"} and not normalized.startswith("OK_WITH_WARNINGS_"):
+        return False, "prep_completion_not_entry_eligible"
+    for key in ("entry_can_proceed", "exit_can_proceed", "trade_can_proceed",
+                "final30_trade_ready", "contract_ok", "allow_new_buy"):
+        value = data.get(key)
+        if value not in (1, True, "1", "true", "True"):
+            return False, f"db_entry_contract_{key}_not_proven"
+    if (data.get("contract_version") != "us_sector_rotation_v3"
+            or data.get("market_regime_version") != "us_leading_regime_v1"):
+        return False, "db_entry_contract_version_unverified"
+    if data.get("force_entry_block") in (1, True, "1", "true", "True"):
+        return False, "db_entry_force_block"
+    if str(data.get("trade_block_reason") or "ok").lower() not in {
+        "ok", "ok_crash_rebound_limited",
+    }:
+        return False, "db_entry_trade_block_reason"
+    return True, "ok_db_entry_contract_verified"
+
+
 def resolve_session_prep_cache(
     latest_attempt: dict[str, Any] | None,
     completed_candidate: dict[str, Any] | None,
@@ -75,6 +103,51 @@ def resolve_session_prep_cache(
         return completed, "completed_same_run_proven"
     return latest, "unverified_incomplete"
 
+
+
+def authorize_recovered_prep_guard(
+    *,
+    candidate: dict[str, Any] | None,
+    locked_rows: Sequence[Any] | None,
+    fresh_guard: dict[str, Any] | None,
+    trade_date: str,
+    current_revision: str,
+    manifest_revision_verified: bool,
+) -> tuple[bool, str]:
+    """Never promote a cached PREP without a newly proven session guard.
+
+    An old STARTED cache, valid EXIT_ONLY record, mismatched selected watchlist,
+    unpinned code or preflight marker must never authorize a new BUY.
+    """
+    prep = candidate if isinstance(candidate, dict) else {}
+    guard = fresh_guard if isinstance(fresh_guard, dict) else {}
+    if not manifest_revision_verified or not current_revision or current_revision == "unknown":
+        return False, "run_manifest_revision_unverified"
+    if str(prep.get("trade_date") or trade_date) != trade_date:
+        return False, "recovery_prep_trade_date_mismatch"
+    if not is_effective_prep_status(prep.get("status")):
+        return False, "recovery_prep_not_completed"
+    if not locked_rows_match_prep_run(prep, locked_rows):
+        return False, "recovery_prep_watchlist_identity_unverified"
+    data = prep.get("result") if isinstance(prep.get("result"), dict) else {}
+    allowed, reason = db_prep_entry_permission(prep.get("status"), data)
+    if not allowed:
+        return False, reason
+    if guard.get("ok") is not True or guard.get("entry_can_proceed") is not True:
+        return False, "recovery_fresh_guard_not_entry_authorized"
+    if str(guard.get("guard_state") or "").upper() != "PREP_OK":
+        return False, "recovery_guard_state_not_prep_ok"
+    if not bool(guard.get("exit_can_proceed", False)):
+        return False, "recovery_exit_liveness_unverified"
+    if bool(guard.get("version_mismatch") or guard.get("run_revision_mismatch")):
+        return False, "recovery_run_revision_mismatch"
+    if str(data.get("run_revision") or data.get("git_commit_sha") or "") != current_revision:
+        return False, "recovery_candidate_revision_mismatch"
+    guard_contract = guard.get("contract") if isinstance(guard.get("contract"), dict) else {}
+    guard_run = str(guard_contract.get("run_id") or guard.get("run_id") or "").strip()
+    if not guard_run or guard_run != str(prep.get("run_id") or "").strip():
+        return False, "recovery_guard_candidate_run_mismatch"
+    return True, "recovered_prep_contract_and_guard_verified"
 
 def is_effective_prep_contract(
     contract: dict[str, Any] | None,
