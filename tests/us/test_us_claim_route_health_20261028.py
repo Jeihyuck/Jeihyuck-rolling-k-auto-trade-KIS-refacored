@@ -102,3 +102,49 @@ def test_actual_20261027_syy_claim_finally_satisfied_41_never_reorders_42():
     })
     assert result["reason"] == "PRIOR_BUY_ALREADY_SATISFIED_DO_NOT_REORDER"
     assert result["safe_to_auto_retry"] is False
+
+
+def test_syy_actual_20261027_aborted_41_before_later_filled_41_timeline():
+    """DB timeline: abort at 14:51 UTC; successful second 41 at 15:00 UTC.
+
+    A 42-signal fence between those actions must not be explained away as
+    'previous 41 was already filled' at the time of the fence.
+    """
+    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+    previous_attempts = [
+        {"attempt_no": 1, "requested_qty": 41,
+         "attempt_state": "ABANDONED_PRE_SUBMIT",
+         "created_at": "2026-10-27 14:51:55+00"},
+        {"attempt_no": 2, "requested_qty": 41,
+         "attempt_state": "FILLED",
+         "created_at": "2026-10-27 15:00:26+00"},
+    ]
+    during_fence = classify_claim_remainder_conflict(42, {
+        "status": "VERIFIED", "action_state": "OPEN",
+        "target_qty": 41, "cumulative_filled_qty": 0,
+        "remaining_target_qty": 41, "active_attempt_exists": False,
+        "recent_attempts": previous_attempts[:1],
+    })
+    assert during_fence["reason"] == "CLAIM_TARGET_VS_NEW_SIGNAL_MISMATCH"
+    assert during_fence["recent_attempts"][0]["attempt_state"] == "ABANDONED_PRE_SUBMIT"
+    assert during_fence["safe_to_auto_retry"] is False
+    # A later exact-target signal is not automatically submitted either;
+    # it still requires a fresh broker GET and independent risk authorization.
+    exact_target = classify_claim_remainder_conflict(41, {
+        "status": "VERIFIED", "action_state": "OPEN",
+        "target_qty": 41, "cumulative_filled_qty": 0,
+        "remaining_target_qty": 41, "active_attempt_exists": False,
+        "recent_attempts": previous_attempts[:1],
+    })
+    assert exact_target["reason"] == "CLAIM_QTY_MATCH_REQUIRES_FRESH_BROKER_VALIDATION"
+    assert exact_target["safe_to_auto_retry"] is False
+    terminal = classify_claim_remainder_conflict(42, {
+        "status": "VERIFIED", "action_state": "SATISFIED",
+        "target_qty": 41, "cumulative_filled_qty": 41,
+        "remaining_target_qty": 0, "active_attempt_exists": False,
+        "recent_attempts": previous_attempts,
+    })
+    assert terminal["reason"] == "PRIOR_BUY_ALREADY_SATISFIED_DO_NOT_REORDER"
+    assert [a["attempt_state"] for a in terminal["recent_attempts"]] == [
+        "ABANDONED_PRE_SUBMIT", "FILLED",
+    ]
