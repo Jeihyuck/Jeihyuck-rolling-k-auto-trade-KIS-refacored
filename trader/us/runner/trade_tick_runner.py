@@ -4411,6 +4411,21 @@ def run_trade_tick(
         time.monotonic() - _post_route_reconcile_started
     ) * 1000.0 if not offline and ack_cnt > 0 else 0.0
 
+    # Execution claim conflict is a safety fence, not a clean route result.
+    # Keep the protected broker gate unchanged, but expose the blocked attempt.
+    from trader.us.runner.claim_route_health import (
+        summarize_claim_fences, apply_claim_fence_tick_status,
+    )
+    claim_fence_health = summarize_claim_fences(orders)
+    claim_fenced_cnt = claim_fence_health["count"]
+    if claim_fenced_cnt:
+        logger.warning(
+            "[US_ORDER][CLAIM_FENCE_SUMMARY] count=%d requires_reconcile=%s "
+            "reasons=%s symbols=%s",
+            claim_fenced_cnt, claim_fence_health["requires_reconcile"],
+            claim_fence_health["reasons"], claim_fence_health["symbols"],
+        )
+
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
     blocked_sell_symbols: set[str] = set()
@@ -4426,7 +4441,7 @@ def run_trade_tick(
                 reason_key = reason_key.split("reason=")[1].split()[0]
             except Exception:
                 pass
-        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
+        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED", "ORDER_FENCED_UNRESOLVED_ACTION"}:
             block_reasons[reason_key] = block_reasons.get(reason_key, 0) + 1
             if side_o == "SELL" and symbol_o:
                 blocked_sell_symbols.add(symbol_o)
@@ -4503,7 +4518,7 @@ def run_trade_tick(
     # 최종 status 판정 (US 전용 status 체계)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
-    total_warnings = fills_warnings_count
+    total_warnings = fills_warnings_count + claim_fenced_cnt
     # Broker submission truth is authoritative across normal and degraded paths.
     orders_sent = routed_sent_total
     orders_failed = reject_cnt + err_cnt
@@ -4636,6 +4651,18 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    status = apply_claim_fence_tick_status(
+        status, claim_fence_count=claim_fenced_cnt,
+        orders_sent=orders_sent, entry_intents=entry_intents_count,
+        exit_intents=exit_intents_count,
+    )
+    if claim_fenced_cnt:
+        logger.warning(
+            "[US_TICK][CLAIM_FENCE_STATUS] status=%s count=%d "
+            "orders_sent=%d warnings=%d",
+            status, claim_fenced_cnt, orders_sent, total_warnings,
+        )
+
     sell_decisions_detail = [
         {"symbol": str((i or {}).get("symbol", "")).upper(), **(((i or {}).get("meta") or {}) if isinstance((i or {}).get("meta"), dict) else {})}
         for i in exit_intents if str((i or {}).get("side") or "").upper() == "SELL"
@@ -4921,7 +4948,11 @@ def run_trade_tick(
         "orders_rejected": reject_cnt,
         "orders_routed": routing_intents_total,
         "orders_error": err_cnt,
-        "orders_failed": orders_failed,
+        "orders_failed": orders_failed + claim_fenced_cnt,
+        "execution_claim_conflict_count": claim_fenced_cnt,
+        "execution_claim_conflict_requires_reconcile": claim_fence_health["requires_reconcile"],
+        "execution_claim_conflict_reasons": claim_fence_health["reasons"],
+        "total_warnings": total_warnings,
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,

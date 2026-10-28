@@ -429,6 +429,73 @@ def release_execution_action_before_submit(identity: Any, *, attempt_id: str) ->
     _execution_claim_repo().release_before_submit(identity, attempt_id=attempt_id)
 
 
+
+def inspect_us_execution_claim_remainder(*, action_key: str, trade_date: str,
+                                         env: str = "practice") -> dict:
+    """Read only exact account/epoch/action Claim evidence after a quantity fence.
+
+    This never releases/reclaims a Claim or infers KIS order terminal truth.
+    A DB failure raises; a missing row is NOT proof that resubmission is safe.
+    """
+    scope = _us_execution_claim_scope()
+    if (env != "practice" or scope.get("env") != "practice"
+            or not scope.get("account_id") or not scope.get("trading_epoch_id")
+            or not str(action_key or "").strip() or not str(trade_date or "").strip()):
+        raise RuntimeError("US_CLAIM_REMAINDER_SCOPE_UNVERIFIED")
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("US_CLAIM_REMAINDER_DB_UNAVAILABLE")
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT action_state, target_qty, cumulative_filled_qty,
+                   remaining_target_qty, active_attempt_id
+              FROM us_execution_claims
+             WHERE action_key=:action_key AND trade_date=:trade_date
+               AND env=:env AND account_id=:account AND market='US'
+               AND trading_epoch_id=:epoch
+        """), {
+            "action_key": str(action_key).strip(),
+            "trade_date": str(trade_date).strip(),
+            "env": scope["env"], "account": scope["account_id"],
+            "epoch": scope["trading_epoch_id"],
+        }).mappings().all()
+        # Historical attempt states explain a pre-submit abort followed by a
+        # valid same-target retry. They do NOT prove current broker terminality
+        # and can never authorize resubmission on their own.
+        history = []
+        if len(row) == 1:
+            history = conn.execute(text("""
+                SELECT attempt_no,requested_qty,cumulative_filled_qty,
+                       attempt_state,authoritative,created_at
+                FROM us_execution_attempts
+                WHERE action_key=:action_key
+                ORDER BY attempt_no DESC
+                LIMIT 5
+            """), {"action_key": str(action_key).strip()}).mappings().all()
+    if len(row) != 1:
+        return {"status": "UNVERIFIED", "reason": "exact_claim_not_unique"}
+    result = dict(row[0])
+    return {
+        "status": "VERIFIED",
+        "action_state": str(result.get("action_state") or ""),
+        "target_qty": result.get("target_qty"),
+        "remaining_target_qty": result.get("remaining_target_qty"),
+        "cumulative_filled_qty": result.get("cumulative_filled_qty"),
+        "active_attempt_exists": bool(result.get("active_attempt_id")),
+        "recent_attempts": [
+            {"attempt_no": rec.get("attempt_no"),
+             "requested_qty": rec.get("requested_qty"),
+             "cumulative_filled_qty": rec.get("cumulative_filled_qty"),
+             "attempt_state": str(rec.get("attempt_state") or ""),
+             "authoritative": bool(rec.get("authoritative")),
+             "created_at": str(rec.get("created_at") or "")}
+            for rec in reversed(history)
+        ],
+        "broker_terminal_verified": False,
+        "automatic_retry_authorized": False,
+    }
+
+
 def load_execution_claim_health() -> dict[str, int]:
     return _execution_claim_repo().health(**_us_execution_claim_scope())
 
