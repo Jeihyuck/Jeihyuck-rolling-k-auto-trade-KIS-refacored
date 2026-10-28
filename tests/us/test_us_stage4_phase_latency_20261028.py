@@ -40,3 +40,42 @@ def test_stage4_ready_window_bounded_and_bad_samples_rejected():
     assert result["p50_ms"] == 300.
     assert result["p99_ms"] == 400.
     assert window.observe(float("nan")) == result
+
+
+def test_stage4_deferred_stop_repairs_are_one_phase_one_candidate_per_cycle(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us import protective_stop_obligation as obligations
+    from trader.us.execution import protective_stop_settlement_worker as settlement
+    monkeypatch.setattr(worker, "_DEFERRED_PHASE_CURSOR", 0)
+    monkeypatch.setattr(obligations, "load_pending_stop_obligations",
+                        lambda **kw: [{"symbol": "KO"}])
+    observed = []
+    def tp(**kwargs):
+        observed.append(("tp", kwargs.get("max_candidates")))
+        return {"checked": 1}
+    def settle(**kwargs):
+        observed.append(("settlement", kwargs.get("limit")))
+        return {"checked": 1, "settled": 0, "blocked": 1}
+    monkeypatch.setattr(worker, "recover_stop_tp_conflicts_once", tp)
+    monkeypatch.setattr(settlement, "settle_verified_stop_debts_once", settle)
+    first = worker.run_deferred_recovery_once(provider=object(), trade_date="2026-10-27")
+    assert first["phase"] == "tp"
+    assert observed == [("tp", 1)]
+    second = worker.run_deferred_recovery_once(provider=object(), trade_date="2026-10-27")
+    assert second["phase"] == "settlement"
+    assert observed == [("tp", 1), ("settlement", 1)]
+    third = worker.run_deferred_recovery_once(provider=object(), trade_date="2026-10-27")
+    assert third["phase"] == "tp"
+    assert observed[-1] == ("tp", 1)
+
+
+def test_stage4_deferred_no_debt_never_invokes_kis_recovery(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us import protective_stop_obligation as obligations
+    monkeypatch.setattr(obligations, "load_pending_stop_obligations", lambda **kw: [])
+    def forbid(**kwargs):
+        raise AssertionError("No historical KIS inquiries without real debt")
+    monkeypatch.setattr(worker, "recover_stop_tp_conflicts_once", forbid)
+    assert worker.run_deferred_recovery_once(
+        provider=object(), trade_date="2026-10-27"
+    )["phase"] == "no_debt"
