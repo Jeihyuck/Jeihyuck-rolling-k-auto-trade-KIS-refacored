@@ -798,23 +798,6 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
         timeout_sec=20,
     ) or []
 
-    # Every DB-backed BUY must prove its locked watchlist came from the
-    # exact completed run, not merely the same trade_date. This is required
-    # even when the latest attempt itself reports OK.
-    if not locked_rows_match_prep_run(prep, rows):
-        logger.error(
-            "[US_PREP_GUARD][COMPLETED_RUN_WATCHLIST_MISMATCH] trade_date=%s run_id=%s",
-            trade_date, prep.get("run_id"),
-        )
-        return {
-            **base_payload,
-            "ok": True,
-            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
-            "trade_can_proceed": True,
-            "entry_can_proceed": False,
-            "reason": "PREP_DEGRADED_ENTRY_BLOCKED:completed_run_watchlist_mismatch",
-        }
-
     locked_count = len(rows)
     score_nonzero_count = sum(1 for r in rows if _score_positive(r))
     count_payload = {**base_payload, "locked_count": locked_count, "final30_scored_count": locked_count, "score_nonzero_count": score_nonzero_count}
@@ -844,6 +827,23 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
             "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
             "trade_can_proceed": True,
             "reason": f"PREP_DEGRADED_ENTRY_BLOCKED:db_score_contract_failed:{score_nonzero_count}!={locked_count}",
+        }
+
+    # Every DB-backed BUY must prove its locked watchlist came from the
+    # exact completed run, not merely the same trade_date. This is required
+    # even when the latest attempt itself reports OK.
+    if not locked_rows_match_prep_run(prep, rows):
+        logger.error(
+            "[US_PREP_GUARD][COMPLETED_RUN_WATCHLIST_MISMATCH] trade_date=%s run_id=%s",
+            trade_date, prep.get("run_id"),
+        )
+        return {
+            **base_payload,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "entry_can_proceed": False,
+            "reason": "PREP_DEGRADED_ENTRY_BLOCKED:completed_run_watchlist_mismatch",
         }
 
     # The day may be EXIT_ONLY despite a complete, valid watchlist. Never
