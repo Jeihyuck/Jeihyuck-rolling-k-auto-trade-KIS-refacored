@@ -1805,13 +1805,16 @@ def run_trade_session(
                         )
                         break
 
-                # Re-query only when the cached attempt remains incomplete.
-                # Allows a recovery PREP to become visible without restarting
-                # AM, while keeping the *original* preflight/session order
-                # permission authoritative and never mixing different run IDs.
+                # A recovered PREP can be selected at the next Tick boundary.
+                # If the original session guard blocked BUY, a brand-new
+                # same-run preflight + pinned revision proof is mandatory
+                # before entry can resume. An EXIT_ONLY marker is never bypassed.
+                _prep_cache_incomplete = str((prep_status_cache or {}).get("status") or "").upper() in {
+                    "STARTED", "ERROR", "FAILED", "INTERRUPTED", "UNKNOWN_DB_DEGRADED",
+                }
+                _prep_entry_blocked = not bool(prep_guard_result.get("entry_can_proceed", False))
                 if (session in {"am", "afternoon"}
-                        and str((prep_status_cache or {}).get("status") or "").upper()
-                        in {"STARTED", "ERROR", "FAILED", "INTERRUPTED", "UNKNOWN_DB_DEGRADED"}
+                        and (_prep_cache_incomplete or _prep_entry_blocked)
                         and tick_count % 2 == 0):
                     try:
                         from trader.us.db.repos import (
@@ -1859,6 +1862,43 @@ def run_trade_session(
                                 _selected_prep.get("run_id"), _selected_prep.get("status"),
                                 prep_guard_result.get("entry_can_proceed", False),
                             )
+                            if _prep_entry_blocked:
+                                from trader.us.prep_contract import check_us_prep_guard
+                                from trader.us.prep_effective import authorize_recovered_prep_guard
+                                from trader.us.run_manifest import verify_run_revision
+                                _new_guard = check_us_prep_guard(trade_date, session=session)
+                                _manifest = verify_run_revision(trade_date, current_revision)
+                                _allowed_recovery, _recovery_reason = authorize_recovered_prep_guard(
+                                    candidate=_selected_prep,
+                                    locked_rows=_fresh_rows,
+                                    fresh_guard=_new_guard,
+                                    trade_date=trade_date,
+                                    current_revision=current_revision,
+                                    manifest_revision_verified=bool(_manifest.get("ok")),
+                                )
+                                if _allowed_recovery:
+                                    prep_guard_result = {
+                                        **_new_guard,
+                                        "prep_run_id": str(_selected_prep.get("run_id") or ""),
+                                        "prep_revision": current_revision,
+                                        "session_revision": current_revision,
+                                        "run_revision_mismatch": False,
+                                        "version_mismatch": False,
+                                    }
+                                    logger.warning(
+                                        "[US_SESSION][PREP_GUARD][ENTRY_RECOVERED] "
+                                        "trade_date=%s run_id=%s revision_verified=1 "
+                                        "entry=ALLOW exit=ALLOW",
+                                        trade_date, _selected_prep.get("run_id"),
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[US_SESSION][PREP_GUARD][RECOVERY_ENTRY_BLOCKED] "
+                                        "trade_date=%s run_id=%s reason=%s "
+                                        "entry=BLOCK exit=ALLOW",
+                                        trade_date, _selected_prep.get("run_id"),
+                                        _recovery_reason,
+                                    )
                     except Exception as _refresh_exc:
                         logger.warning(
                             "[US_SESSION][PREP_CACHE][REFRESH_FAILED] type=%s "
