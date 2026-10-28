@@ -1864,8 +1864,25 @@ def run_trade_session(
                             )
                             if _prep_entry_blocked:
                                 from trader.us.prep_contract import check_us_prep_guard
-                                from trader.us.prep_effective import authorize_recovered_prep_guard
+                                from trader.us.prep_effective import (
+                                    authorize_recovered_prep_guard,
+                                    clear_recovered_us_prep_preflight_marker,
+                                )
                                 from trader.us.run_manifest import verify_run_revision
+                                _marker_recovered, _marker_reason = (
+                                    clear_recovered_us_prep_preflight_marker(
+                                        trade_date=trade_date,
+                                        expected_run_id=str(_selected_prep.get("run_id") or ""),
+                                        current_revision=current_revision,
+                                    )
+                                )
+                                if _marker_reason not in {"no_preflight_marker",
+                                                           "preflight_marker_cleared_after_full_source_proof"}:
+                                    logger.warning(
+                                        "[US_SESSION][PREFLIGHT_RECOVERY][FENCED] "
+                                        "trade_date=%s reason=%s",
+                                        trade_date, _marker_reason,
+                                    )
                                 _new_guard = check_us_prep_guard(trade_date, session=session)
                                 _manifest = verify_run_revision(trade_date, current_revision)
                                 _allowed_recovery, _recovery_reason = authorize_recovered_prep_guard(
