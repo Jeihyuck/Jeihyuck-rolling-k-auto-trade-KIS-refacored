@@ -175,3 +175,52 @@ def test_invalid_regime_version_never_promoted_to_buy(monkeypatch, tmp_path):
     result = prep_contract.check_us_prep_guard("2026-10-27")
     assert not result["entry_can_proceed"]
     assert "version_unverified" in result["reason"]
+
+
+def test_am_reprep_promotes_entry_only_with_fresh_guard_and_revision_pin():
+    from trader.us.prep_effective import authorize_recovered_prep_guard
+    prep = _completed("finished")
+    prep["trade_date"] = "2026-10-27"
+    prep["result"]["run_revision"] = "sha-pinned"
+    guard = {
+        "ok": True, "guard_state": "PREP_OK",
+        "entry_can_proceed": True, "exit_can_proceed": True,
+        "contract": {"run_id": "finished"},
+    }
+    kwargs = dict(candidate=prep, locked_rows=_rows("finished"),
+                  fresh_guard=guard, trade_date="2026-10-27",
+                  current_revision="sha-pinned",
+                  manifest_revision_verified=True)
+    allow, reason = authorize_recovered_prep_guard(**kwargs)
+    assert allow is True
+    assert reason == "recovered_prep_contract_and_guard_verified"
+    for overrides in (
+        {"manifest_revision_verified": False},
+        {"current_revision": "wrong-sha"},
+        {"locked_rows": _rows("interrupted")},
+        {"fresh_guard": {**guard, "guard_state": "PREFLIGHT_EXIT_ONLY",
+                         "entry_can_proceed": False}},
+        {"fresh_guard": {**guard, "contract": {"run_id": "other"}}},
+        {"fresh_guard": {**guard, "version_mismatch": True}},
+    ):
+        rejected = {**kwargs, **overrides}
+        allow, reason = authorize_recovered_prep_guard(**rejected)
+        assert allow is False, reason
+
+
+def test_am_reprep_never_promotes_defensive_completed_exit_only():
+    from trader.us.prep_effective import authorize_recovered_prep_guard
+    prep = _completed("defense", "DEFENSE_CRASH_ENTRY_BLOCKED", entry=0)
+    prep["result"]["run_revision"] = "sha-pinned"
+    allow, reason = authorize_recovered_prep_guard(
+        candidate=prep, locked_rows=_rows("defense"),
+        fresh_guard={
+            "ok": True, "entry_can_proceed": False,
+            "exit_can_proceed": True, "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "contract": {"run_id": "defense"},
+        },
+        trade_date="2026-10-27", current_revision="sha-pinned",
+        manifest_revision_verified=True,
+    )
+    assert not allow
+    assert reason == "prep_completion_not_entry_eligible"
