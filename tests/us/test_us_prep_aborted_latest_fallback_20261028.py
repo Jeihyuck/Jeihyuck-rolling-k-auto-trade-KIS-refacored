@@ -224,3 +224,72 @@ def test_am_reprep_never_promotes_defensive_completed_exit_only():
     )
     assert not allow
     assert reason == "prep_completion_not_entry_eligible"
+
+
+def test_auto_clear_only_original_prep_missing_preflight_marker(monkeypatch, tmp_path):
+    import json
+    import trader.us.prep_effective as effective
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "runtime/health/us-prep-missing-2026-10-27.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({
+        "trade_date": "2026-10-27", "status": "EXIT_ONLY",
+        "reason": "prep_missing_after_preflight_recovery",
+        "entry_can_proceed": 0, "exit_can_proceed": 1,
+        "close_can_proceed": 1,
+    }))
+    monkeypatch.setattr("trader.us.run_manifest.verify_run_revision",
+                        lambda *args: {"ok": True})
+    monkeypatch.setattr(effective, "check_effective_prep_sources",
+                        lambda *a: {"ok": True, "run_id": "same"})
+    success, reason = effective.clear_recovered_us_prep_preflight_marker(
+        trade_date="2026-10-27", expected_run_id="same",
+        current_revision="pinned",
+    )
+    assert success
+    assert reason == "preflight_marker_cleared_after_full_source_proof"
+    assert not marker.exists()
+
+
+def test_preflight_marker_stays_if_artifact_does_not_match_db(monkeypatch, tmp_path):
+    import json
+    import trader.us.prep_effective as effective
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "runtime/health/us-prep-missing-2026-10-27.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({
+        "trade_date": "2026-10-27", "status": "EXIT_ONLY",
+        "reason": "prep_missing_after_preflight_recovery",
+        "entry_can_proceed": 0, "exit_can_proceed": 1,
+        "close_can_proceed": 1,
+    }))
+    monkeypatch.setattr("trader.us.run_manifest.verify_run_revision",
+                        lambda *args: {"ok": True})
+    monkeypatch.setattr(effective, "check_effective_prep_sources",
+                        lambda *a: {"ok": True, "run_id": "another_run"})
+    success, reason = effective.clear_recovered_us_prep_preflight_marker(
+        trade_date="2026-10-27", expected_run_id="completed",
+        current_revision="pinned",
+    )
+    assert not success
+    assert reason == "preflight_recovery_artifact_db_run_unverified"
+    assert marker.exists()
+
+
+def test_manual_or_invalid_preflight_marker_never_auto_cleared(monkeypatch, tmp_path):
+    import json
+    import trader.us.prep_effective as effective
+    monkeypatch.chdir(tmp_path)
+    marker = tmp_path / "runtime/health/us-prep-missing-2026-10-27.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({
+        "trade_date": "2026-10-27", "status": "EXIT_ONLY",
+        "reason": "manual_operator_entry_block",
+        "entry_can_proceed": 0, "exit_can_proceed": 1, "close_can_proceed": 1,
+    }))
+    success, reason = effective.clear_recovered_us_prep_preflight_marker(
+        trade_date="2026-10-27", expected_run_id="same", current_revision="pinned",
+    )
+    assert not success
+    assert reason == "preflight_marker_not_auto_recoverable"
+    assert marker.exists()
