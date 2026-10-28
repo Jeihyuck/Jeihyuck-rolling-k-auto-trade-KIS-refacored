@@ -149,6 +149,62 @@ def authorize_recovered_prep_guard(
         return False, "recovery_guard_candidate_run_mismatch"
     return True, "recovered_prep_contract_and_guard_verified"
 
+
+def clear_recovered_us_prep_preflight_marker(
+    *, trade_date: str, expected_run_id: str, current_revision: str,
+) -> tuple[bool, str]:
+    """Re-run the original preflight proof before clearing its EXIT_ONLY marker.
+
+    Only the automated `prep_missing_after_preflight_recovery` marker can be
+    retired. Operator/invalid-schema markers remain untouched. No new BUY
+    permission is returned: the session must re-read the authoritative guard.
+    """
+    import json
+    from pathlib import Path
+    from trader.us.run_manifest import verify_run_revision
+
+    path = Path("runtime/health") / f"us-prep-missing-{trade_date}.json"
+    if not path.exists():
+        return True, "no_preflight_marker"
+    try:
+        raw = path.read_bytes()
+        identity = path.stat()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return False, "preflight_marker_unreadable"
+    expected_marker = {
+        "trade_date": trade_date,
+        "status": "EXIT_ONLY",
+        "reason": "prep_missing_after_preflight_recovery",
+        "entry_can_proceed": 0,
+        "exit_can_proceed": 1,
+        "close_can_proceed": 1,
+    }
+    if (not isinstance(payload, dict)
+            or any(type(payload.get(k)) is not type(v) or payload.get(k) != v
+                   for k, v in expected_marker.items())):
+        return False, "preflight_marker_not_auto_recoverable"
+    if not expected_run_id or not current_revision or current_revision == "unknown":
+        return False, "preflight_recovery_identity_missing"
+    if verify_run_revision(trade_date, current_revision).get("ok") is not True:
+        return False, "preflight_recovery_revision_unverified"
+    # This is the same source checker invoked by the canonical WSL preflight.
+    # It verifies actual artifact + DB completed run + scored locked watchlist.
+    proof = check_effective_prep_sources(trade_date)
+    if proof.get("ok") is not True or str(proof.get("run_id") or "") != expected_run_id:
+        return False, "preflight_recovery_artifact_db_run_unverified"
+    try:
+        current = path.stat()
+        if (current.st_ino, current.st_mtime_ns, current.st_size) != (
+                identity.st_ino, identity.st_mtime_ns, identity.st_size):
+            return False, "preflight_marker_changed_during_recovery"
+        if path.read_bytes() != raw:
+            return False, "preflight_marker_content_changed"
+        path.unlink()
+    except OSError:
+        return False, "preflight_marker_cleanup_failed"
+    return True, "preflight_marker_cleared_after_full_source_proof"
+
 def is_effective_prep_contract(
     contract: dict[str, Any] | None,
     rows: Sequence[Any] | None,
@@ -217,5 +273,6 @@ def check_effective_prep_sources(trade_date: str, *, min_rows: int = 10) -> dict
         and locked_rows_match_prep_run(prep, locked_rows)
     )
     return {**result, "ok": bool(ok), "reason": "ok" if ok else "db_live_contract_invalid",
+            "run_id": run_id if ok else None,
             "status": contract.get("status"), "artifact_count": len(artifact_rows),
             "locked_count": len(locked_rows), "provenance_ok": provenance.get("ok") is True}
