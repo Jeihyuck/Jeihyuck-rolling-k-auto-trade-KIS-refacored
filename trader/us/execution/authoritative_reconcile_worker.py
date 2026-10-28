@@ -24,6 +24,7 @@ from sqlalchemy import text
 logger=logging.getLogger(__name__)
 _STOP=False
 _RECOVERY_CURSOR=0
+_DEFERRED_PHASE_CURSOR=0
 _STAGE4_FILL_MEMOS: dict[str, Any] = {}
 
 
@@ -335,27 +336,37 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
 
 
 def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
-    """Only this authoritative process writes terminal claims.
+    """Bound deferred stop repair to one historical phase per writer cycle.
 
-    Deferred KIS original-date queries do not block publishing the already
-    persisted Fill/ACK evidence. A slow deferred phase can still expire
-    the ready heartbeat, which safely fences later orders until refreshed.
+    The previous implementation processed 3 TP candidates *and* up to 2
+    settlement debts (including a fresh KIS balance and original-date orders)
+    in one 10-second writer cadence, starving the next READY heartbeat.
+    Preserve the same authoritative writer, evidence checks and fail-closed
+    SELL fences. One historical KIS call can still be slow; READY interval
+    acceptance measures and rejects that residual risk.
     """
-    # A zero-debt session must not repeatedly fetch the entire KIS balance
-    # or scan historical TP dates on the writer's critical reconciliation
-    # cadence. An actual stop signal persists a debt before suppression.
+    global _DEFERRED_PHASE_CURSOR
     from trader.us.protective_stop_obligation import load_pending_stop_obligations
     if not load_pending_stop_obligations(env="practice"):
         return {"tp":{"checked":0,"total":0,"cancel_authorized":False},
-                "settlement":{"checked":0,"settled":0,"blocked":0,"total_pending":0}}
-    tp=recover_stop_tp_conflicts_once(provider=provider,trade_date=trade_date)
+                "settlement":{"checked":0,"settled":0,"blocked":0,"total_pending":0},
+                "phase":"no_debt"}
+    phase = "tp" if (_DEFERRED_PHASE_CURSOR % 2 == 0) else "settlement"
+    _DEFERRED_PHASE_CURSOR += 1
+    if phase == "tp":
+        tp = recover_stop_tp_conflicts_once(
+            provider=provider,trade_date=trade_date,max_candidates=1,
+        )
+        return {"tp":tp,"settlement":{"status":"DEFERRED_NEXT_CYCLE"},
+                "phase":"tp"}
     from trader.us.execution.protective_stop_settlement_worker import (
         settle_verified_stop_debts_once,
     )
     settled=settle_verified_stop_debts_once(
-        provider=provider,trade_date=trade_date,limit=2,
+        provider=provider,trade_date=trade_date,limit=1,
     )
-    return {"tp":tp,"settlement":settled}
+    return {"tp":{"status":"DEFERRED_NEXT_CYCLE"},"settlement":settled,
+            "phase":"settlement"}
 
 
 def publish_health(conn: Any, *, scope: dict, generation: str,
