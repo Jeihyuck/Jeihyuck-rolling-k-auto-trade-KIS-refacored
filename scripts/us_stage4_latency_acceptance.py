@@ -58,11 +58,21 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
     values = []
     reconcile_failures = 0
     stale_events = 0
+    startup_timeouts = 0
+    tick_health_exhausted = 0
+    order_fences = 0
     for line in lines:
         if "[US_STAGE4][RECONCILE_FAILURE]" in line:
             reconcile_failures += 1
-        if "[US_STAGE4][READY_INTERVAL_STALE_RISK]" in line:
+        if ("[US_STAGE4][READY_INTERVAL_STALE_RISK]" in line
+                or "US_STAGE4_WRITER_STALE" in line):
             stale_events += 1
+        if "[US_STAGE4][STARTUP_TIMEOUT]" in line:
+            startup_timeouts += 1
+        if "[US_STAGE4][TICK_HEALTH_RETRY_EXHAUSTED]" in line:
+            tick_health_exhausted += 1
+        if "[US_STAGE4][BLOCK_ALL_ORDERS]" in line:
+            order_fences += 1
         match = STAGE4_READY_INTERVAL.search(line)
         if match:
             values.append(float(match.group("ms")))
@@ -74,6 +84,12 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
         blockers.append("STAGE4_RECONCILE_FAILURE_OBSERVED")
     if stale_events or any(v >= 30000. for v in values):
         blockers.append("STAGE4_WRITER_STALE_RISK")
+    if startup_timeouts:
+        blockers.append("STAGE4_STARTUP_TIMEOUT_OBSERVED")
+    if tick_health_exhausted:
+        blockers.append("STAGE4_TICK_HEALTH_RETRY_EXHAUSTED_OBSERVED")
+    if order_fences:
+        blockers.append("STAGE4_BLOCK_ALL_ORDERS_OBSERVED")
     if pct["p95_ms"] is not None and pct["p95_ms"] > p95_limit_ms:
         blockers.append("STAGE4_READY_INTERVAL_P95_TOO_HIGH")
     if pct["p99_ms"] is not None and pct["p99_ms"] > p99_limit_ms:
@@ -85,6 +101,9 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
         "minimum_interval_samples": min_samples,
         "reconcile_failure_count": reconcile_failures,
         "stale_warning_count": stale_events,
+        "startup_timeout_count": startup_timeouts,
+        "tick_health_retry_exhausted_count": tick_health_exhausted,
+        "block_all_orders_count": order_fences,
         "p95_limit_ms": p95_limit_ms,
         "p99_limit_ms": p99_limit_ms,
         "blockers": blockers,
@@ -167,8 +186,11 @@ def evaluate_logs(lines, *, min_orders: int = 20, min_ticks: int = 20) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log_paths", nargs="+", type=Path)
-    parser.add_argument("--require-stage4-ready", action="store_true",
-                        help="Also fail unless >=20 verified Stage4 READY intervals meet 30s freshness")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--require-stage4-ready", action="store_true",
+                      help="Require BOTH existing protective-SELL/Tick and Stage4 continuity proofs")
+    mode.add_argument("--stage4-only", action="store_true",
+                      help="Check Stage4 READY continuity independently of SELL sample counts")
     args = parser.parse_args()
     def rows():
         for path in args.log_paths:
@@ -180,7 +202,13 @@ def main() -> int:
     result = evaluate_logs(lines)
     stage4_result = evaluate_stage4_ready_intervals(lines)
     result["stage4_writer_ready_continuity"] = stage4_result
-    if args.require_stage4_ready and stage4_result["status"] != "PASS":
+    if args.stage4_only:
+        # Many healthy sessions have no protective SELL orders. Requiring 20
+        # SELL samples would incorrectly make independent Stage4 verification
+        # impossible. A Stage4 PASS never proves protective SELL or KIS fills.
+        result["status"] = stage4_result["status"]
+        result["stage4_writer_acceptance_only"] = True
+    elif args.require_stage4_ready and stage4_result["status"] != "PASS":
         result["status"] = "NOT_PROVEN"
         result["stage4_writer_acceptance_required"] = True
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
