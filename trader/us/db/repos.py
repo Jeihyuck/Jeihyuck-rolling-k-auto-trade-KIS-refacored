@@ -458,6 +458,19 @@ def inspect_us_execution_claim_remainder(*, action_key: str, trade_date: str,
             "env": scope["env"], "account": scope["account_id"],
             "epoch": scope["trading_epoch_id"],
         }).mappings().all()
+        # Historical attempt states explain a pre-submit abort followed by a
+        # valid same-target retry. They do NOT prove current broker terminality
+        # and can never authorize resubmission on their own.
+        history = []
+        if len(row) == 1:
+            history = conn.execute(text("""
+                SELECT attempt_no,requested_qty,cumulative_filled_qty,
+                       attempt_state,authoritative,created_at
+                FROM us_execution_attempts
+                WHERE action_key=:action_key
+                ORDER BY attempt_no DESC
+                LIMIT 5
+            """), {"action_key": str(action_key).strip()}).mappings().all()
     if len(row) != 1:
         return {"status": "UNVERIFIED", "reason": "exact_claim_not_unique"}
     result = dict(row[0])
@@ -468,6 +481,15 @@ def inspect_us_execution_claim_remainder(*, action_key: str, trade_date: str,
         "remaining_target_qty": result.get("remaining_target_qty"),
         "cumulative_filled_qty": result.get("cumulative_filled_qty"),
         "active_attempt_exists": bool(result.get("active_attempt_id")),
+        "recent_attempts": [
+            {"attempt_no": rec.get("attempt_no"),
+             "requested_qty": rec.get("requested_qty"),
+             "cumulative_filled_qty": rec.get("cumulative_filled_qty"),
+             "attempt_state": str(rec.get("attempt_state") or ""),
+             "authoritative": bool(rec.get("authoritative")),
+             "created_at": str(rec.get("created_at") or "")}
+            for rec in reversed(history)
+        ],
         "broker_terminal_verified": False,
         "automatic_retry_authorized": False,
     }
