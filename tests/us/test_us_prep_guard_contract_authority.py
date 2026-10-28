@@ -107,10 +107,12 @@ def test_db_fallback_trade_can_proceed_allows_cluster_incomplete(monkeypatch):
     )
     monkeypatch.setattr(
         "trader.us.db.repos.load_locked_us_watchlist",
-        lambda **kwargs: [{"symbol": f"T{i}", "score_final": 1.0} for i in range(25)],
+        lambda **kwargs: [{"symbol": f"T{i}", "score_final": 1.0, "run_id": "run-1"} for i in range(25)],
     )
     guard = pc.check_us_prep_guard("2026-07-10")
     assert guard["ok"] is True
     assert guard["source"] == "db"
-    assert guard["reason"] == "ok_db_fallback"
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert "entry_can_proceed_not_proven" in guard["reason"]
     assert guard["final30_scored_count"] == 25
