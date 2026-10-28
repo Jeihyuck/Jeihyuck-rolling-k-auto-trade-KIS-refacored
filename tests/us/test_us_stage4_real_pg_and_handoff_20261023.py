@@ -52,10 +52,16 @@ def test_one_stage4_worker_owns_fills_replay_ack_reservations_and_stop_settlemen
     assert sequence==["fills","persist_fills","journal","ack",
                       "trend","soft","reservation"]
     assert result["reconcile_status"]=="OK"
+    monkeypatch.setattr(worker, "_DEFERRED_PHASE_CURSOR", 0)
     deferred=worker.run_deferred_recovery_once(provider=object(),
                                                 trade_date="2026-10-23")
-    assert sequence[-2:]==["tp","stop"]
-    assert deferred["settlement"]["settled"]==0
+    assert sequence[-1:] == ["tp"]
+    assert deferred["phase"] == "tp"
+    deferred=worker.run_deferred_recovery_once(provider=object(),
+                                                trade_date="2026-10-23")
+    assert sequence[-2:] == ["tp", "stop"]
+    assert deferred["phase"] == "settlement"
+    assert deferred["settlement"]["settled"] == 0
 
 
 @pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"),

@@ -24,6 +24,7 @@ from sqlalchemy import text
 logger=logging.getLogger(__name__)
 _STOP=False
 _RECOVERY_CURSOR=0
+_DEFERRED_PHASE_CURSOR=0
 _STAGE4_FILL_MEMOS: dict[str, Any] = {}
 
 
@@ -247,7 +248,10 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     from trader.us.db.repos import save_fills_with_result
     from trader.us.execution.order_journal import replay_order_journal
     from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+    from trader.us.execution.stage4_phase_latency import Stage4PhaseTimer
+    phase = Stage4PhaseTimer()
     fills=get_fills_today(provider=provider,signal_only=False,trade_date=trade_date)
+    phase.mark("kis_fill_fetch")
     if fills.get("status")!="OK":
         raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
     # Every cycle still fetches current authoritative KIS evidence. Skip only
@@ -265,6 +269,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
             raise RuntimeError("US_STAGE4_FILLS_PERSIST_UNVERIFIED")
     else:
         logger.info("[US_STAGE4][FILL_SAVE_MEMO_HIT] count=%d verified_prior_save=1", len(broker_fills))
+    phase.mark("db_fill_persist_or_memo")
     # Partial SOFT stops and trend stage acknowledgments are strategy-state
     # transitions owned by this writer when the Tick no longer writes fills.
     from trader.us.runner.trade_tick_runner import (
@@ -283,9 +288,11 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         provider=provider,include_active_claims=True,
         active_claims_only=True,
     )
+    phase.mark("active_claim_replay")
     ack=reconcile_ack_orders_with_balance(
         provider=provider,trade_date=trade_date,env="practice",
     )
+    phase.mark("ack_reconcile")
     _mark_trend_stages_from_records(ack,trade_date=trade_date,status="FILLED")
     _mark_soft_stop_stages_from_records(ack,trade_date=trade_date,status="FILLED")
     # This writer also owns previously verified account reservation cleanups;
@@ -296,6 +303,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     reservation=reconcile_proven_reservations_once(
         env="practice",trade_date=trade_date,
     )
+    phase.mark("reservation_reconcile_and_stage_updates")
     if int(reservation.get("unresolved") or 0)>0:
         logger.warning("[US_STAGE4][RESERVATION_DEFERRED] unresolved=%s",
                        reservation.get("unresolved"))
@@ -306,6 +314,11 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS","WARN","PARTIAL","UNRESOLVED"}
             or ack_status not in {"OK","WARN"}):
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
+    metrics = phase.summary()
+    logger.info(
+        "[US_STAGE4][RECONCILE_PHASES] total_ms=%s phases_ms=%s",
+        metrics["total_ms"], metrics["phases_ms"],
+    )
     # Publish fresh critical-path proof first. Expensive original-date TP
     # lookups and stop terminal cleanup are after that publication and can
     # never delay this cycle's broker-evidence handoff to a clean SELL.
@@ -318,31 +331,42 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
             int(replay.get("unresolved_count") or 0),
         ),
         "filled_rows":len(fills.get("fills") or []),
+        "latency":metrics,
     }
 
 
 def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
-    """Only this authoritative process writes terminal claims.
+    """Bound deferred stop repair to one historical phase per writer cycle.
 
-    Deferred KIS original-date queries do not block publishing the already
-    persisted Fill/ACK evidence. A slow deferred phase can still expire
-    the ready heartbeat, which safely fences later orders until refreshed.
+    The previous implementation processed 3 TP candidates *and* up to 2
+    settlement debts (including a fresh KIS balance and original-date orders)
+    in one 10-second writer cadence, starving the next READY heartbeat.
+    Preserve the same authoritative writer, evidence checks and fail-closed
+    SELL fences. One historical KIS call can still be slow; READY interval
+    acceptance measures and rejects that residual risk.
     """
-    # A zero-debt session must not repeatedly fetch the entire KIS balance
-    # or scan historical TP dates on the writer's critical reconciliation
-    # cadence. An actual stop signal persists a debt before suppression.
+    global _DEFERRED_PHASE_CURSOR
     from trader.us.protective_stop_obligation import load_pending_stop_obligations
     if not load_pending_stop_obligations(env="practice"):
         return {"tp":{"checked":0,"total":0,"cancel_authorized":False},
-                "settlement":{"checked":0,"settled":0,"blocked":0,"total_pending":0}}
-    tp=recover_stop_tp_conflicts_once(provider=provider,trade_date=trade_date)
+                "settlement":{"checked":0,"settled":0,"blocked":0,"total_pending":0},
+                "phase":"no_debt"}
+    phase = "tp" if (_DEFERRED_PHASE_CURSOR % 2 == 0) else "settlement"
+    _DEFERRED_PHASE_CURSOR += 1
+    if phase == "tp":
+        tp = recover_stop_tp_conflicts_once(
+            provider=provider,trade_date=trade_date,max_candidates=1,
+        )
+        return {"tp":tp,"settlement":{"status":"DEFERRED_NEXT_CYCLE"},
+                "phase":"tp"}
     from trader.us.execution.protective_stop_settlement_worker import (
         settle_verified_stop_debts_once,
     )
     settled=settle_verified_stop_debts_once(
-        provider=provider,trade_date=trade_date,limit=2,
+        provider=provider,trade_date=trade_date,limit=1,
     )
-    return {"tp":tp,"settlement":settled}
+    return {"tp":{"status":"DEFERRED_NEXT_CYCLE"},"settlement":settled,
+            "phase":"settlement"}
 
 
 def publish_health(conn: Any, *, scope: dict, generation: str,
@@ -425,6 +449,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM,_stop)
     signal.signal(signal.SIGINT,_stop)
     generation=str(os.getenv("US_STAGE4_EXPECTED_GENERATION") or uuid.uuid4().hex)
+    from trader.us.execution.stage4_phase_latency import RollingStage4Latency
+    ready_window = RollingStage4Latency(size=128)
+    last_ready_mono: float | None = None
     # Hold only the dedicated one-writer advisory lock. It is distinct from
     # the short-lived trade reservation leases, so it does not hold KIS HTTP.
     with engine.connect() as lease:
@@ -446,6 +473,25 @@ def main() -> int:
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="READY",result=result)
+                    ready_now = time.monotonic()
+                    if last_ready_mono is not None:
+                        interval_ms = max(0.0, (ready_now - last_ready_mono) * 1000.0)
+                        window = ready_window.observe(interval_ms)
+                        logger.info(
+                            "[US_STAGE4][READY_INTERVAL] interval_ms=%.1f "
+                            "count=%d p50_ms=%s p95_ms=%s p99_ms=%s max_ms=%s "
+                            "threshold_ms=30000",
+                            interval_ms, window["count"], window["p50_ms"],
+                            window["p95_ms"], window["p99_ms"],
+                            window["max_ms"],
+                        )
+                        if interval_ms >= 30000:
+                            logger.error(
+                                "[US_STAGE4][READY_INTERVAL_STALE_RISK] "
+                                "interval_ms=%.1f threshold_ms=30000",
+                                interval_ms,
+                            )
+                    last_ready_mono = ready_now
                     from trader.us.execution.reconcile_shadow_worker import (
                         observer_report_path,save_diagnostic_atomic,
                     )
