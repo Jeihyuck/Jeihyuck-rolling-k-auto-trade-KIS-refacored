@@ -260,6 +260,7 @@ from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON a
 from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
+from trader.kr.entry_timing_shadow import observe_kr_timing_shadow
 from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon
 from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency, timed_ordered_exit_history
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
@@ -19820,6 +19821,45 @@ class PB1Engine:
                                 order_ready=False, reasons=[why],
                             )
                             continue
+                    # KR standard PB1 only. Opt-in observation without changing BUY/SELL.
+                    # Collect opening snapshots during the existing 09:00-09:30
+                    # submission block; the timestamp gate remains authoritative.
+                    if (
+                        os.getenv("KR_PB1_ENTRY_TIMING_SHADOW_ENABLED", "0") == "1"
+                        and _is_kr_stock_code(cf.code)
+                    ):
+                        try:
+                            _timing_quote = getattr(self, "_tick_price_cache", {}).get(
+                                (str(cf.code).zfill(6), "J"), {}
+                            )
+                            _timing_shadow = observe_kr_timing_shadow(
+                                code=str(cf.code).zfill(6),
+                                env=self.env,
+                                account_scope=get_account_key(env=self.env),
+                                observed_at=now_kst(),
+                                price=last_price,
+                                selected_style=selected_style,
+                                quote=_timing_quote,
+                                trigger_ok=bool(trigger_ok),
+                                volume_proof=cf.features.get("volume_proof"),
+                                setup_ok=bool(setup_filters_ok),
+                            )
+                            cf.features["entry_timing_shadow"] = _timing_shadow
+                            logger.info(
+                                "[KR][ENTRY][TIMING_SHADOW] code=%s style=%s state=%s "
+                                "reason=%s opening_samples=%s quote_fresh=%s "
+                                "enforced=0 live_order_unchanged=1",
+                                cf.code, selected_style,
+                                _timing_shadow.get("state"), _timing_shadow.get("reason"),
+                                _timing_shadow.get("opening_samples"),
+                                int(bool(_timing_shadow.get("quote_fresh"))),
+                            )
+                        except Exception as _timing_exc:
+                            logger.warning(
+                                "[KR][ENTRY][TIMING_SHADOW][UNAVAILABLE] code=%s "
+                                "reason=%s action=UNCHANGED_ORDER_FLOW",
+                                cf.code, type(_timing_exc).__name__,
+                            )
                     entry_price = last_price
                     pivot_val = cf.features.get("pivot")
                     tight_low = cf.features.get("tight_low")
