@@ -1365,6 +1365,72 @@ def _evaluate_exit_intents_from_snapshots(
             except Exception as exc:
                 logger.warning("[US_EXIT][ENTRY_CONTRACT][AUDIT_WARN] symbol=%s err=%s", symbol, exc)
 
+            # Link a SELL to the immutable BUY decision belonging to THIS
+            # verified position contract, never the latest symbol snapshot.
+            # Missing/legacy evidence must never delay a protective SELL.
+            try:
+                from trader.us.decision_evidence_5w1h import (
+                    build_exit_evidence_from_entry, verify_decision_evidence,
+                )
+                _contract = contract if "contract" in locals() else {}
+                _provenance = (_contract.get("entry_provenance") or {}) if isinstance(_contract, dict) else {}
+                _entry_evidence = _provenance.get("entry_decision_evidence_5w1h")
+                _expected_hash = _provenance.get("entry_decision_evidence_sha256")
+                _position_cycle = str(
+                    pos.get("position_lifecycle_id")
+                    or (pos.get("meta") or {}).get("position_lifecycle_id") or ""
+                )
+                if (
+                    isinstance(_entry_evidence, dict)
+                    and verify_decision_evidence(_entry_evidence)
+                    and _entry_evidence.get("sha256") == _expected_hash
+                    and _position_cycle
+                    and _entry_evidence["what"]["position_lifecycle_id"] == _position_cycle
+                ):
+                    _exit_evidence = build_exit_evidence_from_entry(
+                        entry_evidence=_entry_evidence,
+                        decision_id="US_STANDARD:SELL:" + str(intent.get("client_order_key") or ""),
+                        decision_at=str((intent.get("meta") or {}).get("decision_ts_et") or ""),
+                        decision_reason=str(intent.get("exit_reason_detail") or intent.get("exit_reason") or "UNKNOWN"),
+                        current_facts={
+                            "entry_price": pos.get("entry_price") or pos.get("avg_price"),
+                            "current_price": current_price,
+                            "return_rate_at_decision": (intent.get("meta") or {}).get("return_rate_at_decision"),
+                            "exit_type": intent.get("exit_type"),
+                            "exit_trigger": intent.get("exit_trigger"),
+                        },
+                        changed_since_entry={
+                            "pnl_pct": (intent.get("meta") or {}).get("return_rate_at_decision"),
+                            "trail_drawdown_pct": (intent.get("meta") or {}).get("trail_drawdown_pct"),
+                        },
+                        sizing={
+                            "qty": intent.get("qty"),
+                            "limit_price": intent.get("limit_price"),
+                            "holding_qty": (intent.get("meta") or {}).get("holding_qty"),
+                            "orderable_qty": (intent.get("meta") or {}).get("orderable_qty"),
+                        },
+                        market_context={"market_regime": pos.get("market_regime")},
+                    )
+                    intent.setdefault("meta", {})["exit_decision_evidence_5w1h"] = _exit_evidence
+                    intent["exit_decision_id"] = _exit_evidence["what"]["decision_id"]
+                    intent["source_entry_decision_sha256"] = _entry_evidence["sha256"]
+                    logger.info(
+                        "[US_EXIT][DECISION_EVIDENCE_LINKED] symbol=%s lifecycle=%s entry_hash=%s exit_hash=%s",
+                        symbol, _position_cycle, _entry_evidence["sha256"], _exit_evidence["sha256"],
+                    )
+                else:
+                    intent.setdefault("meta", {})["exit_decision_evidence_status"] = "UNVERIFIED_ENTRY_LINK"
+                    logger.warning(
+                        "[US_EXIT][DECISION_EVIDENCE_UNVERIFIED] symbol=%s action=SELL_CONTINUES",
+                        symbol,
+                    )
+            except Exception as exc:
+                intent.setdefault("meta", {})["exit_decision_evidence_status"] = "UNAVAILABLE"
+                logger.warning(
+                    "[US_EXIT][DECISION_EVIDENCE_ERROR] symbol=%s type=%s action=SELL_CONTINUES",
+                    symbol, type(exc).__name__,
+                )
+
             # True per-position signal time: called inside the evaluation loop
             # only after the selected intent is fully populated. Observer failure
             # cannot prevent order evaluation or change risk-state mutations.
