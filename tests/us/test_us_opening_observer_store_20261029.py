@@ -161,3 +161,32 @@ def test_observer_preserves_all_standard_prep_exchange_aliases_without_cross_own
         ("ELV", "NYSE"), ("PG", "NYSE"), ("MCK", "NASDAQ"),
         ("MDLZ", "NASDAQ"),
     ]
+
+
+def test_afternoon_reader_preserves_full_original_opening_window(tmp_path):
+    from trader.us.entry_timing.opportunity import opening_coverage
+    path = store_path(env="practice", account_scope="A:epoch",
+                      trade_date="2026-10-28", base=tmp_path)
+    db = open_store(path)
+    start = datetime(2026, 10, 28, 9, 30, tzinfo=NY)
+    rows = [
+        {
+            "xymd": "20261028",
+            "xhms": (start + timedelta(minutes=i)).strftime("%H%M%S"),
+            "open": "100", "high": "101", "low": "99",
+            "last": "100.5", "evol": "100", "eamt": "10050",
+        } for i in range(240)
+    ]
+    assert persist_bars(db, trade_date="2026-10-28", symbol="ELV",
+                        owner="US_STANDARD", native_rows=rows,
+                        now_et=datetime(2026, 10, 28, 13, 45, tzinfo=NY)) == 240
+    all_bars = load_bars(db, trade_date="2026-10-28", symbol="ELV")
+    assert len(all_bars) == 240
+    assert opening_coverage(all_bars, "2026-10-28")["observed_1m"] == 30
+    # A short caller-specific view may omit the open, but the production
+    # reader must retain all original evidence for afternoon evaluation.
+    assert opening_coverage(
+        load_bars(db, trade_date="2026-10-28", symbol="ELV", limit=120),
+        "2026-10-28",
+    )["observed_1m"] == 0
+    db.close()
