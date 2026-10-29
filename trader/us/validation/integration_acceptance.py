@@ -80,12 +80,15 @@ def evaluate_evidence_bundle(bundle: dict, *, expected_code_sha: str,
             "reference": bool(str(proof.get("source_reference") or "").strip()),
         }
         if key == "stage4_20_ready_intervals_pass":
-            checks["stage4_continuity"] = (
-                int(payload.get("ready_intervals") or 0) >= 20
-                and float(payload.get("p95_sec") or 1e9) <= 25
-                and float(payload.get("p99_sec") or 1e9) <= 30
-                and int(payload.get("stale_gaps", -1)) == 0
-            )
+            try:
+                checks["stage4_continuity"] = (
+                    int(payload.get("ready_intervals") or 0) >= 20
+                    and float(payload.get("p95_sec", 1e9)) <= 25
+                    and float(payload.get("p99_sec", 1e9)) <= 30
+                    and int(payload.get("stale_gaps", -1)) == 0
+                )
+            except (ValueError, TypeError, OverflowError):
+                checks["stage4_continuity"] = False
         if key == "close_reconcile_pass":
             checks["close_truth"] = (
                 payload.get("report_consistency") == "OK"
