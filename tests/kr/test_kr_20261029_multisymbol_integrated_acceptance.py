@@ -29,18 +29,22 @@ KST = ZoneInfo("Asia/Seoul")
 # Symbols are data, not hardcoded trading policy; these tests submit no orders.
 CODES = ["005930","459580","009150","133690","360750","379810","379800","402340","006400","028050","353200","066570","096770","010170","036540","033780","011200","458730","253590","144960","126340","086450","059090","012750","041510","251970","121600","035760","093320","079940"]
 assert len(CODES) == len(set(CODES)) == 30
+KOSDAQ_CODES = set(["010170","036540","253590","144960","126340","086450","059090","041510","251970","121600","035760","093320","079940"])
+assert len(KOSDAQ_CODES) == 13 and KOSDAQ_CODES <= set(CODES)
 
 
 def _make_contract(code: str, style: str = "ENTRY_MOMENTUM"):
     holding, order = _fixtures(style=style)
+    market = "KOSDAQ" if code in KOSDAQ_CODES else "KOSPI"
     order["code"] = code
+    order["market"] = market
     order["kis_odno"] = f"{int(code):010d}"
     order["client_order_key"] = "multisymbol-" + code + "-" + uuid4().hex
     request = order["request_json"]
     request["client_order_key"] = order["client_order_key"]
     request["entry_exit_plan"] = build_entry_exit_plan(
         code=code,
-        market="KOSDAQ",
+        market=market,
         entry_style_selected=style,
         entry_reason=style,
         entry_price=26050,
@@ -128,9 +132,10 @@ def test_physical_postgres_text_json_upsert_isolated_across_thirty_symbols(kr_mi
     fills = FillsRepo(engine)
     orders = OrdersRepo(engine)
     for i, code in enumerate(CODES):
+        market = "KOSDAQ" if code in KOSDAQ_CODES else "KOSPI"
         order_id, created = orders.create_intent_idempotent(
             env="practice", run_id=None, strategy="pb1_pullback_close",
-            sid=1, mode=1, code=code, market="KOSDAQ",
+            sid=1, mode=1, code=code, market=market,
             side="BUY", ord_type="LIMIT", qty=i + 1, limit_price=26050,
             stage="PB1-AM", client_order_key="ms-pg-" + uuid4().hex,
             request_json={}, status="ACKED",
@@ -143,7 +148,7 @@ def test_physical_postgres_text_json_upsert_isolated_across_thirty_symbols(kr_mi
             env="practice", run_id=None, order_id=order_id,
             kis_odno=broker_order,
             trade_id=f"KR_KIS_CUM:practice:20261029:{broker_order}:{code}:BUY",
-            code=code, market="KOSDAQ", side="BUY",
+            code=code, market=market, side="BUY",
             qty=i + 1, price=26050, fee=0, tax=0,
             filled_at=datetime(2026, 10, 29, 0, 31, tzinfo=timezone.utc),
             raw_json={"kis_response": {
