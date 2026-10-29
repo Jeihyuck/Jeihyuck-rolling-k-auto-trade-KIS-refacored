@@ -104,7 +104,7 @@ def _decision(state: str, reason: str, *, style: str, facts: dict,
 def evaluate_price_opportunity(
     *, style: str, trade_date: str, now_et: datetime,
     verified_bars: list[dict], quote: dict,
-    prep: dict | None = None, min_opening_bars: int = 24,
+    prep: dict | None = None, min_opening_bars: int = 30,
     min_rr: float = 1.5, max_stop_distance: float = 0.025,
     max_spread: float = 0.003, max_chase: float = 0.008,
 ) -> dict:
@@ -206,9 +206,13 @@ def evaluate_price_opportunity(
         pullback_depth = (opening_high - local_trough) / opening_high if opening_high else 0
         facts["intraday_pullback_depth"] = round(pullback_depth, 5)
         if not recovered or pullback_depth < 0.005:
+            # Distinguish a watched setup from an actual completed-bar
+            # confirmation; a falling knife never becomes READY.
+            facts["phase"] = "PULLBACK" if pullback_depth >= 0.005 else "WATCH"
             return _decision("WAIT", "reversal_not_confirmed", style=style, facts=facts, price=fresh_price)
         if style == "ENTRY_MOMENTUM":
             facts["momentum_subtype"] = "PULLBACK_RECLAIM"
+        facts["phase"] = "CONFIRM"
         target = opening_high
 
     stop = min(b["low"] for b in tail[-3:])
@@ -231,6 +235,7 @@ def evaluate_price_opportunity(
     if ceiling < ask:
         return _decision("WAIT", "entry_ceiling_below_ask", style=style, facts=facts,
                          price=fresh_price, stop_reference=stop, target_reference=target, rr=rr)
+    facts["phase"] = "READY"
     return _decision("READY", "confirmed_rebound_or_breakout_with_price_room",
                      style=style, facts=facts, price=fresh_price,
                      max_entry_price=round(ceiling, 4),
