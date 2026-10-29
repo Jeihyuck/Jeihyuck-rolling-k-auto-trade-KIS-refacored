@@ -1192,6 +1192,26 @@ def generate_entry_intents(
             entry_meta["vcp_live_breakout_verified"] = True
             entry_meta["vcp_live_volume"] = live_evidence["tvol"]
             entry_meta["vcp_live_quote_source"] = live_evidence["source"]
+            # The existing VCP broker proof is authoritative for VCP shadow:
+            # update the earlier pre-LIVE observation without new I/O.
+            try:
+                from trader.us.entry_timing_shadow import evaluate_entry_timing_shadow
+                _timing_shadow = evaluate_entry_timing_shadow(
+                    owner="US_STANDARD", style="ENTRY_VCP", prep_eligible=True,
+                    live_facts={
+                        "quote_fresh": True,
+                        "quote_reason": "vcp_verified_live_broker_pivot_volume",
+                        "vcp_live_breakout_verified": True,
+                    },
+                )
+                if diagnostics is not None:
+                    diagnostics.setdefault("entry_timing_shadow", []).append({
+                        "symbol": symbol, "decision": _timing_shadow["timing_state"],
+                        "reason": "vcp_live_broker_proof", "replaces_pre_vcp": True,
+                    })
+            except Exception as _shadow_exc:
+                logger.warning("[US_ENTRY][VCP_TIMING_SHADOW_WARN] symbol=%s error=%s",
+                               symbol, type(_shadow_exc).__name__)
             logger.info(
                 "[US_ENTRY][VCP_LIVE_PROOF] symbol=%s price=%.4f "
                 "cum_volume=%.0f avg_volume20=%.0f pivot=%.4f",
