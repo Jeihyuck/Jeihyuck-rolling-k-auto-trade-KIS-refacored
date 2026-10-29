@@ -2262,6 +2262,19 @@ def route_order(
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
         if _http_boundary_mono is not None:
+            # Native KIS call duration, NOT ACK/fill proof; process-local only.
+            _elapsed_http_ms = (time.monotonic() - _http_boundary_mono) * 1000.0
+            _timing_metrics = getattr(context, "metrics", None)
+            if isinstance(_timing_metrics, dict):
+                _timing_calls = _timing_metrics.setdefault("broker_http_by_attempt_ms", {})
+                if isinstance(_timing_calls, dict) and (
+                    len(_timing_calls) < 128 or str(intent["submit_attempt_id"]) in _timing_calls
+                ):
+                    _timing_calls[str(intent["submit_attempt_id"])] = _elapsed_http_ms
+                else:
+                    _timing_metrics["broker_http_telemetry_dropped_count"] = (
+                        int(_timing_metrics.get("broker_http_telemetry_dropped_count", 0)) + 1
+                    )
             logger.info(
                 "[US_ORDER][BROKER_CALL_RETURNED] symbol=%s side=%s attempt=%s elapsed_ms=%.2f",
                 symbol_upper, side, intent["submit_attempt_id"],
