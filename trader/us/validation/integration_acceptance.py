@@ -84,7 +84,7 @@ def evaluate_evidence_bundle(bundle: dict, *, expected_code_sha: str,
                 int(payload.get("ready_intervals") or 0) >= 20
                 and float(payload.get("p95_sec") or 1e9) <= 25
                 and float(payload.get("p99_sec") or 1e9) <= 30
-                and int(payload.get("stale_gaps") or -1) == 0
+                and int(payload.get("stale_gaps", -1)) == 0
             )
         if key == "close_reconcile_pass":
             checks["close_truth"] = (
