@@ -387,7 +387,10 @@ def publish_health(conn: Any, *, scope: dict, generation: str,
                "epoch":scope["trading_epoch_id"], "generation":generation,
                "state":state})
         return
-    if state != "READY":
+    # STARTING is non-authorizing. It replaces a prior generation's READY
+    # with evidence_at=NULL before the first KIS request. Requires migration
+    # 0060 (worker_state check); deployment must apply the schema first.
+    if state not in {"READY", "STARTING"}:
         raise ValueError("US_STAGE4_HEALTH_STATE_UNSUPPORTED")
     result=result or {}
     conn.execute(text("""
@@ -461,6 +464,13 @@ def main() -> int:
         if not granted:
             raise RuntimeError("US_STAGE4_DUPLICATE_WRITER")
         try:
+            # Publish a strictly non-authorizing identity before KIS provider
+            # initialization. Crash during provider startup is now visible in
+            # account+epoch+generation-scoped PostgreSQL health, not inferred
+            # from missing READY. The heartbeat reader only accepts READY.
+            with engine.begin() as conn:
+                publish_health(conn, scope=scope, generation=generation, state="STARTING")
+            logger.info("[US_STAGE4][WORKER_STARTING] generation=%s", generation)
             provider=USDataProvider(offline=False,env="practice")
             while not _STOP:
                 started=time.monotonic()
