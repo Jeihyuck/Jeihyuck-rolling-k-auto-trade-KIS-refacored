@@ -3229,6 +3229,38 @@ def run_trade_tick(
         i for i in exit_intents
         if str(i.get("symbol") or "").upper() not in _early_pilot_attempted_symbols
     ]
+    # Enrich all US_STANDARD SELL families (profit, trail, cluster, defense)
+    # using already loaded positions; never delay or block protective SELL
+    # with new DB/HTTP requests. Unknown legacy evidence stays UNKNOWN.
+    try:
+        from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+        _sell_positions_by_symbol = {
+            str(_p.get("symbol") or "").upper(): _p
+            for _p in current_positions if isinstance(_p, dict)
+        }
+        _sell_proof_status = {}
+        for _sell_intent in _late_exit_intents:
+            if str(_sell_intent.get("side") or "").upper() != "SELL":
+                continue
+            _sell_symbol = str(_sell_intent.get("symbol") or "").upper()
+            try:
+                _status = attach_standard_sell_evidence(
+                    _sell_intent, _sell_positions_by_symbol.get(_sell_symbol),
+                    decision_at=(now.isoformat() if now is not None
+                                 else datetime.now(timezone.utc).isoformat()),
+                    code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                )
+            except Exception as _audit_exc:
+                _status = "AUDIT_UNAVAILABLE"
+                logger.warning("[US_EXIT][5W1H][WARN] symbol=%s error=%s action=SELL_CONTINUES",
+                               _sell_symbol, type(_audit_exc).__name__)
+            _sell_proof_status[_sell_symbol] = _status
+        if _sell_proof_status:
+            logger.info("[US_EXIT][5W1H][SUMMARY] statuses=%s", _sell_proof_status)
+    except Exception as _audit_module_exc:
+        logger.warning("[US_EXIT][5W1H][UNAVAILABLE] error=%s action=SELL_CONTINUES",
+                       type(_audit_module_exc).__name__)
+
     exit_route_result = route_exit_orders_immediately(
         _late_exit_intents,
         buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
