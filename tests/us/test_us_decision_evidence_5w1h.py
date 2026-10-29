@@ -134,3 +134,33 @@ def test_attach_rejects_wrong_lifecycle_without_blocking_sell():
         code_sha="sha-exit",
     ) == "LIFECYCLE_MISMATCH"
     assert "exit_decision_evidence_5w1h" not in intent["meta"]
+
+def test_prior_sell_proof_must_match_current_entry_even_if_hash_valid():
+    from trader.us.decision_evidence_5w1h import (
+        attach_standard_sell_evidence, build_exit_evidence_from_entry, verify_exit_entry_link,
+    )
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    buy = build_decision_evidence(**BASE)
+    old_buy = build_decision_evidence(**{
+        **BASE, "decision_id": "old-buy", "position_lifecycle_id": "old-cycle"
+    })
+    stale = build_exit_evidence_from_entry(
+        entry_evidence=old_buy, decision_id="stale-sell",
+        decision_at="2026-10-29T14:00:00Z", decision_reason="EXIT_STOP",
+        current_facts={}, changed_since_entry={}, sizing={}, market_context={},
+    )
+    contract = build_us_entry_exit_contract({
+        "symbol": "ELV", "strategy_owner": "US_STANDARD",
+        "meta": {"entry_decision_evidence_5w1h": buy,
+                 "entry_decision_evidence_sha256": buy["sha256"]},
+    })
+    pos = {"symbol": "ELV", "position_lifecycle_id": "cycle-1",
+           "meta": {"entry_exit_contract": contract}}
+    intent = {"symbol": "ELV", "side": "SELL", "qty": 8,
+              "client_order_key": "current-sell", "meta": {
+                  "exit_decision_evidence_5w1h": stale,
+              }}
+    assert attach_standard_sell_evidence(
+        intent, pos, decision_at="2026-10-29T15:00:00Z", code_sha="current",
+    ) == "VERIFIED"
+    assert verify_exit_entry_link(intent["meta"]["exit_decision_evidence_5w1h"], buy)
