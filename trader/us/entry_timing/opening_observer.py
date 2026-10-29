@@ -176,9 +176,8 @@ def run_observer(*, env: str, trade_date: str, scope: str,
     from trader.marketdata.us_ws_collector import get_quote, subscribe_many
     db = open_store(store_path(env=env, account_scope=scope, trade_date=trade_date))
     client = KisUSClient(env="practice", offline=False)
-    if os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
-        for i in range(0, len(pairs), 16):
-            subscribe_many(pairs[i:i + 16], env=env, timeout_sec=0.5)
+    ws_on = os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1"
+    next_subscription_refresh = 0.0
     interval = max(6.0, float(min_interval_sec))
     start = time.monotonic()
     next_poll = 0.0
@@ -195,6 +194,12 @@ def run_observer(*, env: str, trade_date: str, scope: str,
             if time.monotonic() < next_poll:
                 time.sleep(min(1.0, next_poll - time.monotonic()))
                 continue
+            # Collector starts asynchronously; subscription warmup must
+            # retry after readiness/reconnect, not fire once and disappear.
+            if ws_on and time.monotonic() >= next_subscription_refresh:
+                for _i in range(0, len(pairs), 16):
+                    subscribe_many(pairs[_i:_i + 16], env=env, timeout_sec=0.3)
+                next_subscription_refresh = time.monotonic() + 30.0
             symbol, exchange = pairs[pointer % len(pairs)]
             pointer += 1
             next_poll = time.monotonic() + interval
