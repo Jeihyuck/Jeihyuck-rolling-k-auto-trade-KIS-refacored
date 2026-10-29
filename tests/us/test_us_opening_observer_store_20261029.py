@@ -190,3 +190,48 @@ def test_afternoon_reader_preserves_full_original_opening_window(tmp_path):
         "2026-10-28",
     )["observed_1m"] == 0
     db.close()
+
+
+def test_observer_sqlite_replay_is_read_only_and_never_fabricates_missing_quote(tmp_path, monkeypatch):
+    from scripts.us_entry_opportunity_sqlite_replay import replay_observer_db
+    import trader.us.entry_timing.opening_observer as observer
+    date = "2026-10-28"
+    path = store_path(env="practice", account_scope="acct:epoch",
+                      trade_date=date, base=tmp_path)
+    db = open_store(path)
+    begin = datetime(2026, 10, 28, 9, 30, tzinfo=NY)
+    rows = []
+    for i in range(35):
+        at = begin + timedelta(minutes=i)
+        close = 100 - 0.18 * i if i < 30 else 95.1 + 0.3 * (i - 30)
+        rows.append({
+            "xymd": "20261028", "xhms": at.strftime("%H%M%S"),
+            "open": str(close - 0.10), "high": str(close + 0.15),
+            "low": str(close - 0.25), "last": str(close),
+            "evol": "200", "eamt": str(close * 200),
+        })
+    assert persist_bars(
+        db, trade_date=date, symbol="ELV", owner="US_STANDARD",
+        native_rows=rows, now_et=begin + timedelta(minutes=36),
+    ) == 35
+    at = begin + timedelta(minutes=34, seconds=30)
+    epoch = at.timestamp()
+    monkeypatch.setattr(observer.time, "time", lambda: epoch)
+    assert persist_ws_sample(
+        db, trade_date=date, symbol="ELV",
+        quote={"received_at": epoch, "last": 96.05, "bid": 96.00,
+               "ask": 96.05, "collector_generation": "g1"},
+    )
+    db.close()
+    before = path.stat().st_mtime_ns
+    result = replay_observer_db(
+        path, trade_date=date, symbol="ELV",
+        style="ENTRY_PULLBACK", original_fill_price=99.0,
+    )
+    assert result["verified_native_1m_rows"] == 35
+    assert result["historical_ws_quote_samples"] == 1
+    assert result["first_ready"]["state"] == "READY"
+    assert result["baseline_comparison"]["same_time_executable_fill_not_proven"]
+    assert result["realized_pnl"] is None
+    assert result["forward_60m"]["status"] == "UNKNOWN_MISSING_FUTURE_BARS"
+    assert path.stat().st_mtime_ns == before
