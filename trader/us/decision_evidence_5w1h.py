@@ -169,3 +169,62 @@ def summarize_order_evidence(meta: dict, *, side: str) -> dict:
         if declared and declared != record["sha256"]:
             result["status"] = "INVALID_DECLARED_DIGEST"
     return result
+
+def attach_standard_sell_evidence(
+    intent: dict, position: dict, *, decision_at: str, code_sha: str,
+) -> str:
+    """Attach proof from the *exact* signed position; never authorize a SELL.
+
+    Missing/invalid historical evidence returns a status and does not interfere
+    with protected exit routing. No DB queries, HTTP calls, or retries.
+    """
+    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+    symbol = str(intent.get("symbol") or "").strip().upper()
+    if str(intent.get("side") or "").upper() != "SELL" or symbol == "TQQQ":
+        return "NOT_APPLICABLE"
+    if not isinstance(position, dict) or str(position.get("symbol") or "").upper() != symbol:
+        return "POSITION_NOT_MATCHED"
+    pos_meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    owner = str(position.get("strategy_owner") or pos_meta.get("strategy_owner") or "US_STANDARD").upper()
+    if owner != "US_STANDARD":
+        return "OWNER_NOT_STANDARD"
+    intent_meta = intent.setdefault("meta", {})
+    prior = intent_meta.get("exit_decision_evidence_5w1h")
+    if isinstance(prior, dict) and verify_decision_evidence(prior):
+        return "ALREADY_VERIFIED"
+    contract = extract_us_entry_exit_contract(position, pos_meta)
+    provenance = contract.get("entry_provenance") or {}
+    entry = provenance.get("entry_decision_evidence_5w1h")
+    expected = provenance.get("entry_decision_evidence_sha256")
+    if not isinstance(entry, dict) or not verify_decision_evidence(entry) or expected != entry.get("sha256"):
+        intent_meta["exit_decision_evidence_status"] = "ENTRY_PROOF_MISSING_OR_INVALID"
+        return "ENTRY_PROOF_MISSING_OR_INVALID"
+    cycle = str(position.get("position_lifecycle_id") or pos_meta.get("position_lifecycle_id") or "")
+    intent_cycle = str(intent.get("position_lifecycle_id") or intent_meta.get("position_lifecycle_id") or "")
+    if (not cycle or entry["what"]["position_lifecycle_id"] != cycle
+            or (intent_cycle and intent_cycle != cycle)):
+        intent_meta["exit_decision_evidence_status"] = "LIFECYCLE_MISMATCH"
+        return "LIFECYCLE_MISMATCH"
+    reason = str(intent.get("exit_reason_detail") or intent.get("exit_reason") or
+                 intent.get("exit_type") or intent.get("reason") or "UNKNOWN")
+    ev = build_exit_evidence_from_entry(
+        entry_evidence=entry,
+        decision_id="US_STANDARD:SELL:" + str(intent.get("client_order_key") or
+                                             intent.get("submit_attempt_id") or "UNKNOWN"),
+        decision_at=decision_at, decision_reason=reason,
+        current_facts={
+            "entry_price": intent_meta.get("entry_price"),
+            "decision_price": intent_meta.get("decision_price"),
+            "exit_type": intent.get("exit_type"),
+        },
+        changed_since_entry={"pnl_pct": intent_meta.get("return_rate_at_decision")},
+        sizing={"qty": intent.get("qty"), "limit_price": intent.get("limit_price"),
+                "holding_qty": intent_meta.get("holding_qty")},
+        market_context={"market_regime": position.get("market_regime")},
+        execution_code_sha=code_sha,
+    )
+    intent_meta["exit_decision_evidence_5w1h"] = ev
+    intent_meta["exit_decision_evidence_status"] = "VERIFIED"
+    intent["exit_decision_id"] = ev["what"]["decision_id"]
+    intent["source_entry_decision_sha256"] = entry["sha256"]
+    return "VERIFIED"
