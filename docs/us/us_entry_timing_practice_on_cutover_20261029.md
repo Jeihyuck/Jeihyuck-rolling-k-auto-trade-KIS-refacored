@@ -21,11 +21,12 @@ US_WS_COLLECTOR_ENABLED=1
 US_OPENING_OBSERVER_INTERVAL_SEC=10
 ```
 
-Already-defined values are **not overwritten**: an explicit operator
-`SHADOW`, `OFF`, `0` or disconnect remains authoritative and is reported
-as `[US_ENTRY_TIMING][OVERRIDE]` rather than silently represented as ON.
-If `.env` overrides any of these settings, inspect and change the override
-before claiming an ENFORCE session. This helper neither changes the order
+Legacy `.env` `SHADOW` is **upgraded to `ENFORCE`** in canonical
+practice TRADE sessions, with `[US_ENTRY_TIMING][UPGRADE]` evidence. Explicit
+`OFF` (emergency rollback) and `0` overrides of approval/observer/WS remain
+protected and are disclosed as `[US_ENTRY_TIMING][OVERRIDE]`: they are not
+silently represented as ON. Inspect such overrides before claiming an
+ENFORCE session. This helper neither changes the order
 permission resolver nor touches the trading account, scheduler, database,
 TQQQ Infinite/VCP owners, existing position ADD or protective SELL paths.
 An observer process is read-only and forcibly disarmed from broker orders.
