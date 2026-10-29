@@ -3535,6 +3535,17 @@ class OrdersRepo:
         position_cycle_id = str(position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url))
         order_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
         safe_request_json = json_sanitize(request_json or {})
+        # KR standard PB1 is a durable strategy owner, not the BUY style.
+        # Persist the exact owner on new orders so broker settlement and
+        # later cycle recovery do not have to infer it from a signal label.
+        if (
+            str(strategy or "").strip().lower() == "pb1_pullback_close"
+            and str(market or "").strip().upper() in {"J", "KR", "KRX", "KOSPI", "KOSDAQ"}
+        ):
+            existing_owner = str(safe_request_json.get("strategy_owner") or "").strip().upper()
+            if existing_owner not in {"", "PB1", "KR_STANDARD"}:
+                raise RuntimeError("KR_ORDER_STRATEGY_OWNER_CONFLICT")
+            safe_request_json["strategy_owner"] = "PB1"
         enforce_buy_contract = bool(
             str(side or "").upper() == "BUY"
             and safe_request_json.get("enforce_entry_contract") is True
