@@ -25,12 +25,6 @@ def _source_profile(overrides=None):
         "DRY_RUN": "0", "US_RUN_MODE": "TRADE",
     }
     env.update(overrides or {})
-    statement = (
-        'source "$1"; for k in US_ENTRY_OPPORTUNITY_MODE '
-        'US_ENTRY_OPPORTUNITY_APPROVED US_OPENING_OBSERVER_ENABLED '
-        'US_OPENING_OBSERVER_BAR_FETCH_ENABLED US_WS_COLLECTOR_ENABLED; '
-        'do eval "printf \'%s\\n\' \\\"\\$\\{\\$k-UNSET\\}\\\""; done'
-    )
     # Use bash indirect expansion rather than eval when reading the sourced flags.
     statement = (
         'source "$1"; for k in US_ENTRY_OPPORTUNITY_MODE '
