@@ -231,3 +231,20 @@ def test_protective_sell_and_tqqq_buys_never_wait_for_generic_entry_quote():
         assert pre_submit_timing_check(
             intent, now_epoch=100, fresh_ws_quote=None,
         ) == (True, "NOT_APPLICABLE")
+
+def test_offline_replay_does_not_invent_missing_executions():
+    from scripts.us_entry_opportunity_replay import replay
+    native = sample_native_rows()
+    instant = datetime(2026, 10, 28, 10, 5, tzinfo=NY)
+    payload = {
+        "trade_date": DAY, "style": "ENTRY_PULLBACK",
+        "native_bars": native, "original_fill_price": 99.0,
+        "snapshots": [{
+            "at_et": instant.isoformat(), "quote": sample_quote(),
+        }],
+    }
+    report = replay(payload)
+    assert report["first_ready"]["state"] == "READY"
+    assert report["timing_effectiveness"] == "NOT_ESTABLISHED"
+    assert report["baseline_comparison"]["entry_price_delta_pct"] < 0
+    assert report["forward_60m"]["status"] == "UNKNOWN_MISSING_FUTURE_BARS"
