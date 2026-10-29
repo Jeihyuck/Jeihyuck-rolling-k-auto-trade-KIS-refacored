@@ -36,8 +36,9 @@ def _observation(order, request):
         requested_qty=79, cumulative_qty=79,
         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
         evidence_digest="immutable-daily-ccld:20261029:0000012345",
+        # Cumulative order proof is an aggregate, not a single execution.
+        # The settlement core rejects execution_qty for KIS_ORDER_CUMULATIVE_ACTUAL.
         execution_price=26050,
-        execution_qty=79,
     )
 
 
