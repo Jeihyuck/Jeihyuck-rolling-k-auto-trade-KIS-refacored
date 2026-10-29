@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
 VERSION = "us_decision_evidence_5w1h_v1"
@@ -12,6 +14,12 @@ ALLOWED_SIDES = {"BUY", "SELL"}
 def _clean(value: Any) -> Any:
     if value is None or isinstance(value, (bool, str, int)):
         return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("nonfinite_decision_evidence")
+        return str(value)
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("nonfinite_decision_evidence")
