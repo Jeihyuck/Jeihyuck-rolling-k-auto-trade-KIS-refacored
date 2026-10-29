@@ -20,6 +20,14 @@ def read_samples(path: str) -> tuple[list[dict], int]:
         for line in f:
             if not line.strip():
                 continue
+            # Accept either pure JSONL or actual US Tick text logs. Ignore
+            # unrelated log lines rather than classifying normal log noise
+            # as malformed latency evidence.
+            marker = "[US_TICK][PHASE_EVIDENCE_JSON] payload="
+            if marker in line:
+                line = line.split(marker, 1)[1]
+            elif not line.lstrip().startswith("{"):
+                continue
             try:
                 parsed = json.loads(line)
                 if not isinstance(parsed, dict):
