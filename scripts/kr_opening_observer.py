@@ -62,11 +62,28 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 quote = {}
             raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
             vwap = quote.get("wghn_avrg_stck_prc") or raw.get("wghn_avrg_stck_prc")
+            # Native weighted-average price is evidence only when its quote
+            # timestamp/date can be checked. A cached/WS value with no
+            # native clock MUST NOT be labeled fresh by assumption.
+            from datetime import timedelta
+            quote_day = str(quote.get("stck_bsop_date") or raw.get("stck_bsop_date") or "").replace("-", "")
+            quote_clock = str(quote.get("stck_cntg_hour") or raw.get("stck_cntg_hour") or "").strip().zfill(6)
+            verified_vwap = False
+            if (quote_day == observed_at.strftime("%Y%m%d")
+                    and len(quote_clock) == 6 and quote_clock.isdigit()):
+                try:
+                    quote_time = datetime.strptime(
+                        quote_day + quote_clock, "%Y%m%d%H%M%S"
+                    ).replace(tzinfo=KST)
+                    age = (now_kst() - quote_time).total_seconds()
+                    verified_vwap = -10 <= age <= 120
+                except ValueError:
+                    verified_vwap = False
             result = save_opening_proof(
                 env="practice", account_scope=scope, code=code,
                 now=now_kst(), raw_bars=data,
-                vwap=vwap,
-                vwap_source="KIS_NATIVE_WEIGHTED_AVG" if vwap is not None else "UNKNOWN",
+                vwap=vwap if verified_vwap else None,
+                vwap_source="KIS_NATIVE_WEIGHTED_AVG" if verified_vwap else "UNKNOWN",
             )
             if result["bars"] > 0:
                 done += 1
