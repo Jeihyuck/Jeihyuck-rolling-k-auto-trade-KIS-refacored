@@ -1595,12 +1595,25 @@ def generate_entry_intents(
 
         # Decision evidence is an audit sidecar, never a broker permission gate.
         # Missing deployment SHA or questionable inputs must not delay BUY/SELL.
-        if position_action == "NEW_POSITION_BUY":
+        if position_action in {"NEW_POSITION_BUY", "ADD_TO_EXISTING_BUY"}:
             try:
                 from trader.us.decision_evidence_5w1h import build_decision_evidence
                 from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
                 _code_sha = str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN")
                 _decision_at = (now or datetime.now().astimezone()).isoformat()
+                # ADD_BUY is a new purchase decision, but retains the parent
+                # position's *existing* frozen exit management contract.
+                _parent_entry = {}
+                if position_action == "ADD_TO_EXISTING_BUY":
+                    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+                    _parent_contract = extract_us_entry_exit_contract(
+                        held_snapshot, held_snapshot.get("meta"),
+                    )
+                    _parent_entry = (_parent_contract.get("entry_provenance") or {}).get(
+                        "entry_decision_evidence_5w1h"
+                    ) or {}
+                _parent_id = (_parent_entry.get("what") or {}).get("decision_id")
+                _parent_hash = _parent_entry.get("sha256")
                 _evidence = build_decision_evidence(
                     decision_id=f"US_STANDARD:{trade_date_for_key}:{client_order_key}",
                     side="BUY", strategy_owner="US_STANDARD", symbol=symbol,
@@ -1626,6 +1639,8 @@ def generate_entry_intents(
                     },
                     sizing={"qty": qty, "limit_price": limit_price,
                             "notional_usd": notional, "position_action": position_action},
+                    entry_decision_id=_parent_id,
+                    entry_evidence_hash=_parent_hash,
                 )
                 durable_meta["entry_decision_evidence_5w1h"] = _evidence
                 durable_meta["entry_decision_evidence_sha256"] = _evidence["sha256"]
