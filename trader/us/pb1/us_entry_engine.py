@@ -1170,15 +1170,16 @@ def generate_entry_intents(
                     if _scope:
                         from trader.us.entry_timing.opening_observer import store_path, load_bars
                         import sqlite3
+                        from contextlib import closing
                         _store = store_path(
                             env="practice", account_scope=_scope,
                             trade_date=_resolve_us_trade_date(now),
                         )
                         if _store.is_file():
-                            with sqlite3.connect(
+                            with closing(sqlite3.connect(
                                 "file:" + str(_store.resolve()) + "?mode=ro",
                                 uri=True, timeout=0.12,
-                            ) as _read_conn:
+                            )) as _read_conn:
                                 _observed_bars = load_bars(
                                     _read_conn, trade_date=_resolve_us_trade_date(now),
                                     symbol=symbol, owner="US_STANDARD", limit=120,
