@@ -304,15 +304,39 @@ def effective_mode(environ: dict | None = None) -> str:
     return "ENFORCE"
 
 
+def _submission_binding(intent: dict, proof: dict) -> str:
+    """Bind age, approval mode, side, symbol, and order identity to the signal.
+
+    A decision's content hash alone cannot prevent a stale timestamp being
+    manually refreshed in intent metadata before the native HTTP boundary.
+    """
+    fields = {
+        "signal_sha256": proof.get("evidence_sha256"),
+        "mode": proof.get("mode"),
+        "decision_epoch": proof.get("decision_epoch"),
+        "max_age_sec": proof.get("max_age_sec"),
+        "symbol": intent.get("symbol"),
+        "side": intent.get("side"),
+        "strategy_owner": intent.get("strategy_owner"),
+        "position_action": intent.get("position_action"),
+        "client_order_key": intent.get("client_order_key"),
+        "position_lifecycle_id": intent.get("position_lifecycle_id"),
+    }
+    raw = json.dumps(fields, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 def attach_opportunity_proof(intent: dict, decision: dict, *, mode: str,
                              decision_epoch: float) -> None:
-    """Freeze the exact observed signal before order sizing/route."""
+    """Freeze both original decision and submission-bound timing identity."""
     if not isinstance(intent.get("meta"), dict):
         intent["meta"] = {}
-    intent["meta"]["us_entry_opportunity_v1"] = {
+    proof = {
         **decision, "mode": mode, "decision_epoch": float(decision_epoch),
         "max_age_sec": 120.0,
     }
+    proof["submission_binding_sha256"] = _submission_binding(intent, proof)
+    intent["meta"]["us_entry_opportunity_v1"] = proof
 
 
 def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: dict | None,
@@ -330,8 +354,14 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     proof = meta.get("us_entry_opportunity_v1")
     if not isinstance(proof, dict) or proof.get("mode") != "ENFORCE":
         return False, "TIMING_PROOF_MISSING"
+    try:
+        if proof.get("submission_binding_sha256") != _submission_binding(intent, proof):
+            return False, "TIMING_BINDING_INVALID"
+    except (ValueError, TypeError, OverflowError):
+        return False, "TIMING_BINDING_INVALID"
     signed = {k: v for k, v in proof.items()
-              if k not in {"mode", "decision_epoch", "max_age_sec", "evidence_sha256"}}
+              if k not in {"mode", "decision_epoch", "max_age_sec",
+                           "evidence_sha256", "submission_binding_sha256"}}
     try:
         digest = hashlib.sha256(
             json.dumps(signed, sort_keys=True, separators=(",", ":"),
