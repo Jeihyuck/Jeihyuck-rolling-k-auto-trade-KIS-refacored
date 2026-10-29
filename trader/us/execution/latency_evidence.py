@@ -45,3 +45,40 @@ def latency_summary(samples: list[dict], *, ready_stale_seconds: float = 30.0) -
                                  if phase == "stage4_ready_interval" else None),
         }
     return out
+
+# Tick-stage metrics already exist in trade_tick_runner; preserve their own
+# non-overlapping names instead of pretending they are per-order timestamps.
+TICK_PHASE_MAP = {
+    "tick_total": "tick_total_ms",
+    "cash_fetch": "cash_fetch_ms",
+    "fill_fetch": "fill_fetch_stage_ms",
+    "fill_persist": "fill_persist_ms",
+    "exit_eval": "exit_engine_ms",
+    "entry_eval": "entry_engine_ms",
+    "order_route": "order_route_ms",
+    "post_route_reconcile": "post_route_reconcile_ms",
+}
+TICK_PHASES = tuple(TICK_PHASE_MAP)
+
+def observed_tick_sample(metrics: dict) -> dict:
+    """Create a real metrics-based sample; absent stages remain absent."""
+    out = {}
+    for target, source in TICK_PHASE_MAP.items():
+        value = metrics.get(source)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (ValueError, TypeError):
+            continue
+        if math.isfinite(numeric) and numeric >= 0:
+            out[target] = round(numeric / 1000.0, 6)
+    # KIS call returns are not broker ACKs/fills. Keep separate timing field.
+    call_attempts = metrics.get("broker_http_by_attempt_ms")
+    if isinstance(call_attempts, dict):
+        out["broker_http_by_attempt_sec"] = {
+            str(k): round(float(v) / 1000.0, 6)
+            for k, v in list(call_attempts.items())[:128]
+            if isinstance(v, (int, float)) and math.isfinite(float(v)) and v >= 0
+        }
+    return out
