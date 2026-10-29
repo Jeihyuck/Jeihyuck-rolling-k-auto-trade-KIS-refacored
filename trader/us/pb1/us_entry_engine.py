@@ -1184,7 +1184,7 @@ def generate_entry_intents(
                             )) as _read_conn:
                                 _observed_bars = load_bars(
                                     _read_conn, trade_date=_resolve_us_trade_date(now),
-                                    symbol=symbol, owner="US_STANDARD", limit=120,
+                                    symbol=symbol, owner="US_STANDARD", limit=450,
                                 )
                     _opportunity_quote = current if isinstance(current, dict) else {}
                     # Collector IPC is bounded and read-only, unlike a new
