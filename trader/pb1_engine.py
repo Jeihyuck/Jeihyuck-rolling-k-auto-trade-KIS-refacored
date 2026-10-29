@@ -260,7 +260,9 @@ from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON a
 from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
-from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon
+from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon, kr_practice_trend_swing_enabled
+from trader.kr.entry_timing_shadow import observe_kr_timing_shadow
+from trader.kr.opening_bar_contract import evaluate_proof_for_candidate, STYLES as KR_TIMING_STYLES
 from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency, timed_ordered_exit_history
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
@@ -5756,6 +5758,61 @@ class PB1Engine:
                 blocking_stage="submit",
                 context={"code": display_code, "buy_start": buy_start, "stage": stage},
             )
+        # Separate intraday timing from yesterday's Final30/setup:
+        # SHADOW only by default; ENFORCE requires explicit practice approval.
+        # Never block protective SELL, other owner sleeves, existing ADDs or
+        # an independently approved PB1-CLOSE entry policy here.
+        _timing_mode = str(os.getenv("KR_PB1_ENTRY_TIMING_MODE", "SHADOW")).strip().upper()
+        _timing_style = str(
+            (cf.features or {}).get("entry_style_selected")
+            or (cf.features or {}).get("entry_setup_family")
+            or ""
+        ).strip().upper()
+        if _timing_style in {"MOMENTUM", "PULLBACK", "BREAKOUT"}:
+            _timing_style = "ENTRY_" + _timing_style
+        _timing_eligible = (
+            str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
+            and str(getattr(self, "env", "")).lower() == "practice"
+            and not allow_add_to_existing
+            and str(stage or "").upper() != "PB1-CLOSE"
+            and _is_kr_stock_code(cf.code)
+            and _timing_style in KR_TIMING_STYLES
+        )
+        if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
+            _timing = evaluate_proof_for_candidate(
+                env=self.env,
+                account_scope=get_account_key(env=self.env),
+                code=str(cf.code).zfill(6),
+                now=now_kst(),
+                style=_timing_style,
+                setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
+                trigger_ok=bool((cf.features or {}).get("trigger_ok")),
+                pivot=(cf.features or {}).get("pivot"),
+                order_price=float(order_price or 0.0),
+            )
+            logger.info(
+                "[KR][ENTRY][PRICE_AWARE_TIMING] code=%s style=%s mode=%s state=%s "
+                "reason=%s max_price=%s enforced=%s source=COMPLETED_KIS_1M",
+                cf.code, _timing_style, _timing_mode,
+                _timing.get("state"), _timing.get("reason"),
+                _timing.get("max_entry_price"),
+                int(_timing_mode == "ENFORCE"
+                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"),
+            )
+            if (_timing_mode == "ENFORCE"
+                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+                _max_price = _timing.get("max_entry_price")
+                if (_timing.get("state") != "READY_SHADOW"
+                        or _max_price is None
+                        or float(order_price or 0) <= 0
+                        or float(order_price) > float(_max_price)):
+                    return UnifiedGateDecision(
+                        ok=False,
+                        reason_codes=["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"],
+                        blocking_stage="pre_submit_timing",
+                        context={"code": cf.code, "timing_state": _timing.get("state"),
+                                 "timing_reason": _timing.get("reason")},
+                    )
         gate_snapshot = getattr(self, "_buyable_gate_context", {}).get(str(cf.code or "").zfill(6), {}) if hasattr(self, "_buyable_gate_context") else {}
         existing_order = None
         if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
@@ -7304,10 +7361,21 @@ class PB1Engine:
         # provenance-verified, explicit practice opt-in may create a new SWING
         # contract; no existing positions or DAY contracts are rewritten.
         original_style = str(entry_style_selected or "").upper()
+        _kr_swing_env = str(getattr(self, "env", "") or "").strip().lower()
+        _kr_swing_config = os.environ.get("PB1_KR_PRACTICE_TREND_SWING")
+        _kr_swing_on = kr_practice_trend_swing_enabled(environment=_kr_swing_env)
+        logger.info(
+            "[KR][ENTRY][TREND_SWING_CONFIG] env=%s default=ON_PRACTICE "
+            "enabled=%s source=%s explicit_value=%s style=%s",
+            _kr_swing_env, int(_kr_swing_on),
+            "environment_override" if _kr_swing_config is not None else "practice_default",
+            _kr_swing_config if _kr_swing_config is not None else "<unset>",
+            original_style,
+        )
         trend_decision = select_practice_trend_horizon(
             selected_style=original_style,
-            environment=str(getattr(self, "env", "") or ""),
-            enabled=os.getenv("PB1_KR_PRACTICE_TREND_SWING", "0") == "1",
+            environment=_kr_swing_env,
+            enabled=_kr_swing_on,
             volume_proof=cf.features.get("volume_proof"),
             price=cf.features.get("current_price") or entry_price_for_plan,
             ma20=cf.features.get("ma20"),
@@ -19820,6 +19888,45 @@ class PB1Engine:
                                 order_ready=False, reasons=[why],
                             )
                             continue
+                    # KR standard PB1 only. Opt-in observation without changing BUY/SELL.
+                    # Collect opening snapshots during the existing 09:00-09:30
+                    # submission block; the timestamp gate remains authoritative.
+                    if (
+                        os.getenv("KR_PB1_ENTRY_TIMING_SHADOW_ENABLED", "0") == "1"
+                        and _is_kr_stock_code(cf.code)
+                    ):
+                        try:
+                            _timing_quote = getattr(self, "_tick_price_cache", {}).get(
+                                (str(cf.code).zfill(6), "J"), {}
+                            )
+                            _timing_shadow = observe_kr_timing_shadow(
+                                code=str(cf.code).zfill(6),
+                                env=self.env,
+                                account_scope=get_account_key(env=self.env),
+                                observed_at=now_kst(),
+                                price=last_price,
+                                selected_style=selected_style,
+                                quote=_timing_quote,
+                                trigger_ok=bool(trigger_ok),
+                                volume_proof=cf.features.get("volume_proof"),
+                                setup_ok=bool(setup_filters_ok),
+                            )
+                            cf.features["entry_timing_shadow"] = _timing_shadow
+                            logger.info(
+                                "[KR][ENTRY][TIMING_SHADOW] code=%s style=%s state=%s "
+                                "reason=%s opening_samples=%s quote_fresh=%s "
+                                "enforced=0 live_order_unchanged=1",
+                                cf.code, selected_style,
+                                _timing_shadow.get("state"), _timing_shadow.get("reason"),
+                                _timing_shadow.get("opening_samples"),
+                                int(bool(_timing_shadow.get("quote_fresh"))),
+                            )
+                        except Exception as _timing_exc:
+                            logger.warning(
+                                "[KR][ENTRY][TIMING_SHADOW][UNAVAILABLE] code=%s "
+                                "reason=%s action=UNCHANGED_ORDER_FLOW",
+                                cf.code, type(_timing_exc).__name__,
+                            )
                     entry_price = last_price
                     pivot_val = cf.features.get("pivot")
                     tight_low = cf.features.get("tight_low")
