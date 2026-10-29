@@ -49,3 +49,17 @@ def test_future_and_expired_quotes_are_not_proof():
         evidence = derive_quote_freshness({"source": "KIS_LIVE", "last": 100,
                                            "asof_epoch": timestamp}, now_epoch=1000)
         assert not evidence["quote_fresh"]
+
+def test_real_ws_collector_freshness_requires_connection_generation():
+    from trader.us.entry_timing_shadow import derive_quote_freshness
+    quote = {"source": "KIS_WEBSOCKET_COLLECTOR", "last": 100.0,
+             "asof_epoch": 998.0, "quality": "fresh"}
+    result = derive_quote_freshness(quote, now_epoch=1000.0)
+    assert result["quote_fresh"] is False
+    assert result["quote_reason"] == "collector_generation_missing"
+    quote["collector_generation"] = "gen-1"
+    assert derive_quote_freshness(quote, now_epoch=1000.0)["quote_fresh"] is True
+    assert derive_quote_freshness({
+        "source": "KIS_WEBSOCKET", "last": 100, "asof_epoch": 999,
+        "quality": "fresh",
+    }, now_epoch=1000)["quote_fresh"] is True
