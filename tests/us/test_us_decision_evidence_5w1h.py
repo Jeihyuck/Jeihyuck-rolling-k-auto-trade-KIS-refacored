@@ -89,3 +89,48 @@ def test_read_only_report_marks_verified_missing_and_tampered():
 def test_report_legacy_missing_sell_evidence_not_fabricated():
     from trader.us.decision_evidence_5w1h import summarize_order_evidence
     assert summarize_order_evidence({"exit_reason": "hard_stop"}, side="SELL")["status"] == "MISSING"
+
+def test_all_standard_sell_families_receive_the_exact_buy_contract_when_available():
+    from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    buy = build_decision_evidence(**BASE)
+    contract = build_us_entry_exit_contract({
+        "symbol": "ELV", "strategy_owner": "US_STANDARD",
+        "meta": {"entry_decision_evidence_5w1h": buy,
+                 "entry_decision_evidence_sha256": buy["sha256"]},
+    })
+    position = {
+        "symbol": "ELV", "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": "cycle-1", "meta": {"entry_exit_contract": contract},
+    }
+    for kind in ("hard_stop", "TAKE_PROFIT_TP1", "defense_trim"):
+        intent = {
+            "symbol": "ELV", "side": "SELL", "qty": 2, "limit_price": 390.0,
+            "client_order_key": "sell-" + kind, "exit_type": kind,
+            "position_lifecycle_id": "cycle-1", "meta": {"decision_price": 391.0},
+        }
+        result = attach_standard_sell_evidence(
+            intent, position, decision_at="2026-10-29T14:00:00Z",
+            code_sha="exit-execution-pin",
+        )
+        assert result == "VERIFIED"
+        assert intent["meta"]["exit_decision_evidence_5w1h"]["entry_link"]["evidence_hash"] == buy["sha256"]
+
+def test_attach_rejects_wrong_lifecycle_without_blocking_sell():
+    from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    buy = build_decision_evidence(**BASE)
+    contract = build_us_entry_exit_contract({
+        "symbol": "ELV", "strategy_owner": "US_STANDARD",
+        "meta": {"entry_decision_evidence_5w1h": buy,
+                 "entry_decision_evidence_sha256": buy["sha256"]},
+    })
+    intent = {"symbol": "ELV", "side": "SELL", "qty": 2,
+              "client_order_key": "sell-other", "meta": {}}
+    pos = {"symbol": "ELV", "position_lifecycle_id": "other-cycle",
+           "meta": {"entry_exit_contract": contract}}
+    assert attach_standard_sell_evidence(
+        intent, pos, decision_at="2026-10-29T14:00:00Z",
+        code_sha="sha-exit",
+    ) == "LIFECYCLE_MISMATCH"
+    assert "exit_decision_evidence_5w1h" not in intent["meta"]
