@@ -380,6 +380,39 @@ class KisUSClient:
                 return stale_payload
             raise
 
+    def get_us_intraday_1m_bars(self, symbol: str, exchange: str, *, count: int = 120) -> list[dict]:
+        """READ-ONLY KIS overseas 1-minute bars; never place an order.
+
+        Official KIS overseas-stock minute quotation:
+        HHDFS76950200 /uapi/overseas-price/v1/quotations/inquire-time-itemchartprice.
+        Returns raw exchange-local rows. Caller MUST discard incomplete/current
+        minute bars, wrong trade dates, and missing OHLCV before timing signals.
+        """
+        self._assert_not_offline("get_us_intraday_1m_bars")
+        path = "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice"
+        headers = self._build_headers("HHDFS76950200")
+        params = {
+            "AUTH": "", "EXCD": self._resolve_quote_excd(exchange),
+            "SYMB": str(symbol or "").strip().upper(),
+            "NMIN": "1", "PINC": "0", "NEXT": "", "NREC": str(max(1, min(120, int(count)))),
+            "FILL": "", "KEYB": "",
+        }
+        if not params["SYMB"]:
+            raise ValueError("missing_intraday_symbol")
+        result = self._get(path, headers=headers, params=params)
+        if not isinstance(result, dict) or (
+            result.get("rt_cd") is not None and str(result.get("rt_cd")) != "0"
+        ):
+            raise KisUSClientError("KIS_US_1M_BAR_RESPONSE_UNVERIFIED")
+        rows = result.get("output2")
+        if not isinstance(rows, list):
+            raise KisUSClientError("KIS_US_1M_BAR_ROWS_MISSING")
+        # Each row keeps its KIS exchange timestamp and native OHLCV.
+        # Do not infer minute turnover/VWAP from current-price snapshots.
+        logger.info("[US_ENTRY][MINUTE_BARS] symbol=%s rows=%d source=KIS_OVERSEAS_1M",
+                    params["SYMB"], len(rows))
+        return rows
+
     def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """해외주식 기간별 시세 (일봉)."""
         self._assert_not_offline("get_us_daily_price")
