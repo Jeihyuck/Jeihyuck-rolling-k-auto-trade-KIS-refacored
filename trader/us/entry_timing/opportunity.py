@@ -123,6 +123,15 @@ def evaluate_price_opportunity(
                    }}
     if style not in FAMILIES:
         return _decision("NOT_APPLICABLE", "non_standard_or_vcp", style=style, facts=facts)
+    if not (
+        isinstance(min_opening_bars, int) and min_opening_bars == 30
+        and all(math.isfinite(v) for v in (min_rr, max_stop_distance, max_spread, max_chase))
+        and min_rr >= 1.0
+        and 0 < max_stop_distance <= 0.10
+        and 0 < max_spread <= 0.03
+        and 0 < max_chase <= 0.05
+    ):
+        return _decision("WAIT", "trial_policy_parameters_invalid", style=style, facts=facts)
     if now_et.tzinfo is None:
         return _decision("WAIT", "timezone_missing", style=style, facts=facts)
     now_et = now_et.astimezone(NY)
