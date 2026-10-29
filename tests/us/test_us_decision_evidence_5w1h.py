@@ -64,3 +64,28 @@ def test_exit_links_specific_position_cycle_and_detects_other_entry():
             decision_at="2026-10-29T14:00:00Z", decision_reason="EXIT_STOP",
             current_facts={}, changed_since_entry={}, sizing={}, market_context={},
         )
+
+def test_read_only_report_marks_verified_missing_and_tampered():
+    from trader.us.decision_evidence_5w1h import summarize_order_evidence
+    original = build_decision_evidence(**BASE)
+    report = summarize_order_evidence(
+        {"entry_decision_evidence_5w1h": original,
+         "entry_decision_evidence_sha256": original["sha256"]}, side="BUY"
+    )
+    assert report["status"] == "VERIFIED"
+    assert report["decision_reason"] == "ENTRY_PULLBACK"
+    assert report["facts"]["intraday_reversal_proven"] is None
+    assert summarize_order_evidence({}, side="BUY")["status"] == "MISSING"
+    invalid = copy.deepcopy(original)
+    invalid["why"]["facts"]["pullback_pct"] = 0.12
+    assert summarize_order_evidence(
+        {"entry_decision_evidence_5w1h": invalid}, side="BUY"
+    )["status"] == "INVALID"
+    assert summarize_order_evidence(
+        {"entry_decision_evidence_5w1h": original,
+         "entry_decision_evidence_sha256": "other"}, side="BUY"
+    )["status"] == "INVALID_DECLARED_DIGEST"
+
+def test_report_legacy_missing_sell_evidence_not_fabricated():
+    from trader.us.decision_evidence_5w1h import summarize_order_evidence
+    assert summarize_order_evidence({"exit_reason": "hard_stop"}, side="SELL")["status"] == "MISSING"
