@@ -261,6 +261,7 @@ from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
 from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon
+from trader.kr.opening_bar_contract import evaluate_proof_for_candidate, STYLES as KR_TIMING_STYLES
 from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency, timed_ordered_exit_history
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
@@ -5756,6 +5757,61 @@ class PB1Engine:
                 blocking_stage="submit",
                 context={"code": display_code, "buy_start": buy_start, "stage": stage},
             )
+        # Separate intraday timing from yesterday's Final30/setup:
+        # SHADOW only by default; ENFORCE requires explicit practice approval.
+        # Never block protective SELL, other owner sleeves, existing ADDs or
+        # an independently approved PB1-CLOSE entry policy here.
+        _timing_mode = str(os.getenv("KR_PB1_ENTRY_TIMING_MODE", "SHADOW")).strip().upper()
+        _timing_style = str(
+            (cf.features or {}).get("entry_style_selected")
+            or (cf.features or {}).get("entry_setup_family")
+            or ""
+        ).strip().upper()
+        if _timing_style in {"MOMENTUM", "PULLBACK", "BREAKOUT"}:
+            _timing_style = "ENTRY_" + _timing_style
+        _timing_eligible = (
+            str(getattr(self, "STRATEGY_NAME", "")) == "pb1_pullback_close"
+            and str(getattr(self, "env", "")).lower() == "practice"
+            and not allow_add_to_existing
+            and str(stage or "").upper() != "PB1-CLOSE"
+            and _is_kr_stock_code(cf.code)
+            and _timing_style in KR_TIMING_STYLES
+        )
+        if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
+            _timing = evaluate_proof_for_candidate(
+                env=self.env,
+                account_scope=get_account_key(env=self.env),
+                code=str(cf.code).zfill(6),
+                now=now_kst(),
+                style=_timing_style,
+                setup_ok=bool((cf.features or {}).get("setup_ok", cf.setup_ok)),
+                trigger_ok=bool((cf.features or {}).get("trigger_ok")),
+                pivot=(cf.features or {}).get("pivot"),
+                order_price=float(order_price or 0.0),
+            )
+            logger.info(
+                "[KR][ENTRY][PRICE_AWARE_TIMING] code=%s style=%s mode=%s state=%s "
+                "reason=%s max_price=%s enforced=%s source=COMPLETED_KIS_1M",
+                cf.code, _timing_style, _timing_mode,
+                _timing.get("state"), _timing.get("reason"),
+                _timing.get("max_entry_price"),
+                int(_timing_mode == "ENFORCE"
+                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"),
+            )
+            if (_timing_mode == "ENFORCE"
+                    and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") == "1"):
+                _max_price = _timing.get("max_entry_price")
+                if (_timing.get("state") != "READY_SHADOW"
+                        or _max_price is None
+                        or float(order_price or 0) <= 0
+                        or float(order_price) > float(_max_price)):
+                    return UnifiedGateDecision(
+                        ok=False,
+                        reason_codes=["KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH"],
+                        blocking_stage="pre_submit_timing",
+                        context={"code": cf.code, "timing_state": _timing.get("state"),
+                                 "timing_reason": _timing.get("reason")},
+                    )
         gate_snapshot = getattr(self, "_buyable_gate_context", {}).get(str(cf.code or "").zfill(6), {}) if hasattr(self, "_buyable_gate_context") else {}
         existing_order = None
         if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
