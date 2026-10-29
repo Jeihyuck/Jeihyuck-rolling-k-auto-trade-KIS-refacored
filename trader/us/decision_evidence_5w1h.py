@@ -198,8 +198,6 @@ def attach_standard_sell_evidence(
         return "OWNER_NOT_STANDARD"
     intent_meta = intent.setdefault("meta", {})
     prior = intent_meta.get("exit_decision_evidence_5w1h")
-    if isinstance(prior, dict) and verify_decision_evidence(prior):
-        return "ALREADY_VERIFIED"
     contract = extract_us_entry_exit_contract(position, pos_meta)
     provenance = contract.get("entry_provenance") or {}
     entry = provenance.get("entry_decision_evidence_5w1h")
@@ -213,6 +211,12 @@ def attach_standard_sell_evidence(
             or (intent_cycle and intent_cycle != cycle)):
         intent_meta["exit_decision_evidence_status"] = "LIFECYCLE_MISMATCH"
         return "LIFECYCLE_MISMATCH"
+    # A self-consistent signed SELL from a different lifecycle is still wrong.
+    if isinstance(prior, dict) and verify_decision_evidence(prior):
+        if verify_exit_entry_link(prior, entry):
+            return "ALREADY_VERIFIED"
+        intent_meta.pop("exit_decision_evidence_5w1h", None)
+        intent_meta["exit_decision_evidence_status"] = "REPLACED_STALE_SELL_PROOF"
     reason = str(intent.get("exit_reason_detail") or intent.get("exit_reason") or
                  intent.get("exit_type") or intent.get("reason") or "UNKNOWN")
     ev = build_exit_evidence_from_entry(
