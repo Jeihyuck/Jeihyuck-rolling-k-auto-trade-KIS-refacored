@@ -148,6 +148,23 @@ def evaluate_price_opportunity(
     if coverage["observed_1m"] < min_opening_bars:
         return _decision("WAIT", "opening_minute_bars_insufficient", style=style, facts=facts)
 
+    # Native KIS minute turnover/volume only. Sparse last-price samples,
+    # missing turnover, or anomalous value units do not produce fake VWAP.
+    _open_bars = [
+        b for b in verified_bars
+        if "T09:30:00" <= b["time_et"][10:19] < "T10:00:00"
+    ]
+    _volume = sum(b["volume"] for b in _open_bars)
+    _have_amount = (len(_open_bars) >= min_opening_bars
+                    and all(b.get("turnover") is not None for b in _open_bars))
+    _vwap = (sum(b["turnover"] for b in _open_bars) / _volume
+             if _have_amount and _volume > 0 else None)
+    _mid = sum(b["close"] for b in _open_bars) / len(_open_bars) if _open_bars else None
+    if _vwap is not None and _mid is not None and not (0.75 <= _vwap / _mid <= 1.25):
+        _vwap = None
+    facts["opening_vwap"] = round(_vwap, 6) if _vwap is not None else None
+    facts["vwap_provenance"] = "KIS_NATIVE_MINUTE_AMOUNT_AND_VOLUME" if _vwap is not None else "UNKNOWN"
+
     fresh_price = finite(quote.get("last"))
     age = finite(quote.get("age_sec"))
     source = str(quote.get("source") or "").upper()
