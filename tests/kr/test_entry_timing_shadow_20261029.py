@@ -52,8 +52,8 @@ def test_clock_passage_does_not_create_timing_proof():
         volume_proof={"confirmation_state": "VERIFIED",
                       "relative_volume_at_time": 2.0},
     )
-    assert decision["state"] == "WAIT"
-    assert decision["reason"] == "AWAIT_POST_OPENING_QUOTE"
+    assert decision["state"] == "UNKNOWN"
+    assert decision["reason"] == "QUOTE_STALE_OR_MISSING"
 
 
 def test_no_opening_coverage_means_wait_not_ready():
