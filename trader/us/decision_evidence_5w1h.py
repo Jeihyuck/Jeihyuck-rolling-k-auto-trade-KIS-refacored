@@ -85,7 +85,7 @@ def verify_decision_evidence(record: dict) -> bool:
 def build_exit_evidence_from_entry(
     *, entry_evidence: dict, decision_id: str, decision_at: str,
     decision_reason: str, current_facts: dict, changed_since_entry: dict,
-    sizing: dict, market_context: dict,
+    sizing: dict, market_context: dict, execution_code_sha: str | None = None,
 ) -> dict:
     """Bind SELL evidence to an exactly verified BUY lifecycle and original digest.
 
@@ -102,7 +102,7 @@ def build_exit_evidence_from_entry(
         decision_id=decision_id, side="SELL",
         strategy_owner=who["strategy_owner"], symbol=what["symbol"],
         decision_at=decision_at, policy_version=who["policy_version"],
-        code_sha=who["code_sha"],
+        code_sha=execution_code_sha or who["code_sha"],
         position_lifecycle_id=what["position_lifecycle_id"],
         decision_reason=decision_reason,
         facts=current_facts, thresholds={},
