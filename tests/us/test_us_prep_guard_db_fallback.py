@@ -9,6 +9,7 @@ def _make_rows(n: int = 30) -> list[dict]:
     return [
         {
             "symbol": f"SYM{i}",
+            "run_id": "r1",
             "score_final": float(i + 1),
             "score": float(i + 1),
         }
@@ -109,7 +110,7 @@ def test_db_fallback_fail_when_score_nonzero_zero(monkeypatch):
         lambda trade_date, timeout_sec=20: {"status": "OK", "run_id": "r1"},
     )
     # score=0인 rows
-    zero_rows = [{"symbol": f"SYM{i}", "score": 0.0} for i in range(30)]
+    zero_rows = [{"symbol": f"SYM{i}", "score": 0.0, "run_id": "r1"} for i in range(30)]
     monkeypatch.setattr(
         repos_mod,
         "load_locked_us_watchlist",

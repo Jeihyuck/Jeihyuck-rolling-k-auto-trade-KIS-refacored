@@ -710,9 +710,28 @@ def _score_positive(row: dict) -> bool:
 
 def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     """파일 contract가 없을 때 DB fallback으로 prep guard를 수행."""
-    from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+    from trader.us.db.repos import (
+        load_latest_us_prep_status, load_latest_completed_us_prep_status,
+        load_locked_us_watchlist,
+    )
+    from trader.us.prep_effective import locked_rows_match_prep_run, db_prep_entry_permission
 
     prep = load_latest_us_prep_status(trade_date, timeout_sec=20) or {}
+    latest_status = str(prep.get("status") or "UNKNOWN").upper()
+    selected_completed_fallback = False
+    # A newer STARTED/ERROR attempt is not authoritative completion and may
+    # not mask the prior finished same-day PREP. Never accept the older run
+    # without checking the DB watchlist belongs to that exact run_id.
+    if latest_status in {"STARTED", "ERROR", "FAILED", "INTERRUPTED"}:
+        completed = load_latest_completed_us_prep_status(trade_date, timeout_sec=20) or {}
+        if completed:
+            prep = completed
+            selected_completed_fallback = True
+            logger.warning(
+                "[US_PREP_GUARD][LATEST_INCOMPLETE_IGNORED] trade_date=%s "
+                "latest_status=%s selected_run_id=%s",
+                trade_date, latest_status, prep.get("run_id"),
+            )
     status = prep.get("status", "UNKNOWN")
     run_id = prep.get("run_id", "")
     result = prep.get("result") or {}
@@ -731,7 +750,7 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     )
     base_payload = {
         "contract": None,
-        "source": "db",
+        "source": "db_completed_fallback" if selected_completed_fallback else "db",
         "session_can_run": True,
         "entry_can_proceed": False,
         "exit_can_proceed": True,
@@ -739,6 +758,7 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
         "new_buy_budget": 0,
         "prep_status": status,
         "run_id": run_id,
+        "run_revision": result.get("run_revision") or result.get("git_commit_sha"),
         "trade_block_reason": result.get("trade_block_reason", "ok"),
         "underfilled_tier": result.get("underfilled_tier"),
         "effective_capital_scale": result.get("effective_capital_scale"),
@@ -807,6 +827,43 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
             "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
             "trade_can_proceed": True,
             "reason": f"PREP_DEGRADED_ENTRY_BLOCKED:db_score_contract_failed:{score_nonzero_count}!={locked_count}",
+        }
+
+    # Every DB-backed BUY must prove its locked watchlist came from the
+    # exact completed run, not merely the same trade_date. This is required
+    # even when the latest attempt itself reports OK.
+    if not locked_rows_match_prep_run(prep, rows):
+        logger.error(
+            "[US_PREP_GUARD][COMPLETED_RUN_WATCHLIST_MISMATCH] trade_date=%s run_id=%s",
+            trade_date, prep.get("run_id"),
+        )
+        return {
+            **base_payload,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "entry_can_proceed": False,
+            "reason": "PREP_DEGRADED_ENTRY_BLOCKED:completed_run_watchlist_mismatch",
+        }
+
+    # The day may be EXIT_ONLY despite a complete, valid watchlist. Never
+    # authorize BUY from trade_can_proceed (which also covers SELL and CLOSE).
+    entry_authorized, entry_reason = db_prep_entry_permission(status, result)
+    if not entry_authorized:
+        logger.warning(
+            "[US_PREP_GUARD][DB_ENTRY_BLOCK] date=%s run_id=%s reason=%s "
+            "exit_can_proceed=1",
+            trade_date, run_id, entry_reason,
+        )
+        return {
+            **count_payload,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "reason": f"PREP_DEGRADED_ENTRY_BLOCKED:{entry_reason}",
         }
 
     logger.info(

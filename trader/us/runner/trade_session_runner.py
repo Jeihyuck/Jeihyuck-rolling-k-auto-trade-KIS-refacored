@@ -1319,6 +1319,35 @@ def run_trade_session(
                             locked_watchlist_cache = []
                             watchlist_cache_source = "artifact_failed"
                             logger.warning("[US_SESSION][WATCHLIST_CACHE][FALLBACK_FAIL] trade_date=%s error=%s", trade_date, fb_exc)
+                # A later interrupted re-PREP cannot mask the prior finished
+                # run. Validate completed-run rows before handing cache to Tick.
+                if str((prep_status_cache or {}).get("status") or "").upper() in {
+                    "STARTED", "ERROR", "FAILED", "INTERRUPTED",
+                }:
+                    from trader.us.db.repos import load_latest_completed_us_prep_status
+                    from trader.us.prep_effective import resolve_session_prep_cache
+                    try:
+                        completed = load_latest_completed_us_prep_status(
+                            trade_date, timeout_sec=db_timeout_sec,
+                        )
+                        chosen, resolution = resolve_session_prep_cache(
+                            prep_status_cache, completed, locked_watchlist_cache,
+                        )
+                        if resolution == "completed_same_run_proven":
+                            prep_status_cache = chosen
+                            prep_cache_source = "verified_completed_same_run_cache"
+                            logger.warning(
+                                "[US_SESSION][PREP_CACHE][RECOVERED_COMPLETED] "
+                                "trade_date=%s run_id=%s",
+                                trade_date, chosen.get("run_id"),
+                            )
+                    except Exception as prep_recovery_exc:
+                        logger.warning(
+                            "[US_SESSION][PREP_CACHE][RECOVERY_UNVERIFIED] "
+                            "trade_date=%s error_type=%s action=keep_entry_fenced",
+                            trade_date, type(prep_recovery_exc).__name__,
+                        )
+
                 logger.info(
                     "[US_SESSION][ENTRY_CACHE][READY] prep_source=%s prep_status=%s watchlist_source=%s watchlist_count=%d",
                     prep_cache_source, (prep_status_cache or {}).get("status"), watchlist_cache_source, len(locked_watchlist_cache or []),
@@ -1775,6 +1804,124 @@ def run_trade_session(
                             session, tick_count,
                         )
                         break
+
+                # A recovered PREP can be selected at the next Tick boundary.
+                # If the original session guard blocked BUY, a brand-new
+                # same-run preflight + pinned revision proof is mandatory
+                # before entry can resume. An EXIT_ONLY marker is never bypassed.
+                _prep_cache_incomplete = str((prep_status_cache or {}).get("status") or "").upper() in {
+                    "STARTED", "ERROR", "FAILED", "INTERRUPTED", "UNKNOWN_DB_DEGRADED",
+                }
+                _prep_entry_blocked = not bool(prep_guard_result.get("entry_can_proceed", False))
+                if (session in {"am", "afternoon"}
+                        and (_prep_cache_incomplete or _prep_entry_blocked)
+                        and tick_count % 2 == 0):
+                    try:
+                        from trader.us.db.repos import (
+                            load_latest_us_prep_status,
+                            load_latest_completed_us_prep_status,
+                            load_locked_us_watchlist,
+                        )
+                        from trader.us.prep_effective import (
+                            is_effective_prep_status, locked_rows_match_prep_run,
+                            resolve_session_prep_cache,
+                        )
+                        _cache_timeout = max(1, int(os.getenv(
+                            "US_SESSION_PREP_CACHE_TIMEOUT_SEC", "5",
+                        )))
+                        _live_attempt = load_latest_us_prep_status(
+                            trade_date, timeout_sec=_cache_timeout,
+                        ) or {}
+                        _fresh_rows = load_locked_us_watchlist(
+                            trade_date,
+                            int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10")),
+                            os.getenv("US_ALLOW_DEGRADED_IN_TRADE", "0") == "1",
+                            _cache_timeout,
+                        ) or []
+                        if (is_effective_prep_status(_live_attempt.get("status"))
+                                and locked_rows_match_prep_run(_live_attempt, _fresh_rows)):
+                            _selected_prep, _resolution = _live_attempt, "fresh_completed_same_run"
+                        else:
+                            _completed = load_latest_completed_us_prep_status(
+                                trade_date, timeout_sec=_cache_timeout,
+                            )
+                            _selected_prep, _resolution = resolve_session_prep_cache(
+                                _live_attempt, _completed, _fresh_rows,
+                            )
+                            if (_resolution == "latest_effective"
+                                    and not locked_rows_match_prep_run(_selected_prep, _fresh_rows)):
+                                _resolution = "unverified_incomplete"
+                        if _resolution in {"fresh_completed_same_run", "completed_same_run_proven"}:
+                            prep_status_cache = _selected_prep
+                            locked_watchlist_cache = _fresh_rows
+                            prep_cache_source = "db_verified_refresh"
+                            watchlist_cache_source = "db_verified_refresh"
+                            logger.warning(
+                                "[US_SESSION][PREP_CACHE][REFRESHED] run_id=%s status=%s "
+                                "session_guard_entry_allowed=%s",
+                                _selected_prep.get("run_id"), _selected_prep.get("status"),
+                                prep_guard_result.get("entry_can_proceed", False),
+                            )
+                            if _prep_entry_blocked:
+                                from trader.us.prep_contract import check_us_prep_guard
+                                from trader.us.prep_effective import (
+                                    authorize_recovered_prep_guard,
+                                    clear_recovered_us_prep_preflight_marker,
+                                )
+                                from trader.us.run_manifest import verify_run_revision
+                                _marker_recovered, _marker_reason = (
+                                    clear_recovered_us_prep_preflight_marker(
+                                        trade_date=trade_date,
+                                        expected_run_id=str(_selected_prep.get("run_id") or ""),
+                                        current_revision=current_revision,
+                                    )
+                                )
+                                if _marker_reason not in {"no_preflight_marker",
+                                                           "preflight_marker_cleared_after_full_source_proof"}:
+                                    logger.warning(
+                                        "[US_SESSION][PREFLIGHT_RECOVERY][FENCED] "
+                                        "trade_date=%s reason=%s",
+                                        trade_date, _marker_reason,
+                                    )
+                                _new_guard = check_us_prep_guard(trade_date, session=session)
+                                _manifest = verify_run_revision(trade_date, current_revision)
+                                _allowed_recovery, _recovery_reason = authorize_recovered_prep_guard(
+                                    candidate=_selected_prep,
+                                    locked_rows=_fresh_rows,
+                                    fresh_guard=_new_guard,
+                                    trade_date=trade_date,
+                                    current_revision=current_revision,
+                                    manifest_revision_verified=bool(_manifest.get("ok")),
+                                )
+                                if _allowed_recovery:
+                                    prep_guard_result = {
+                                        **_new_guard,
+                                        "prep_run_id": str(_selected_prep.get("run_id") or ""),
+                                        "prep_revision": current_revision,
+                                        "session_revision": current_revision,
+                                        "run_revision_mismatch": False,
+                                        "version_mismatch": False,
+                                    }
+                                    logger.warning(
+                                        "[US_SESSION][PREP_GUARD][ENTRY_RECOVERED] "
+                                        "trade_date=%s run_id=%s revision_verified=1 "
+                                        "entry=ALLOW exit=ALLOW",
+                                        trade_date, _selected_prep.get("run_id"),
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[US_SESSION][PREP_GUARD][RECOVERY_ENTRY_BLOCKED] "
+                                        "trade_date=%s run_id=%s reason=%s "
+                                        "entry=BLOCK exit=ALLOW",
+                                        trade_date, _selected_prep.get("run_id"),
+                                        _recovery_reason,
+                                    )
+                    except Exception as _refresh_exc:
+                        logger.warning(
+                            "[US_SESSION][PREP_CACHE][REFRESH_FAILED] type=%s "
+                            "action=retain_prior_order_permission",
+                            type(_refresh_exc).__name__,
+                        )
 
                 tick_count += 1
                 tick_id = f"{session_run_id}:{tick_count}"

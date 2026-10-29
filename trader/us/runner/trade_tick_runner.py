@@ -3229,6 +3229,38 @@ def run_trade_tick(
         i for i in exit_intents
         if str(i.get("symbol") or "").upper() not in _early_pilot_attempted_symbols
     ]
+    # Enrich all US_STANDARD SELL families (profit, trail, cluster, defense)
+    # using already loaded positions; never delay or block protective SELL
+    # with new DB/HTTP requests. Unknown legacy evidence stays UNKNOWN.
+    try:
+        from trader.us.decision_evidence_5w1h import attach_standard_sell_evidence
+        _sell_positions_by_symbol = {
+            str(_p.get("symbol") or "").upper(): _p
+            for _p in current_positions if isinstance(_p, dict)
+        }
+        _sell_proof_status = {}
+        for _sell_intent in _late_exit_intents:
+            if str(_sell_intent.get("side") or "").upper() != "SELL":
+                continue
+            _sell_symbol = str(_sell_intent.get("symbol") or "").upper()
+            try:
+                _status = attach_standard_sell_evidence(
+                    _sell_intent, _sell_positions_by_symbol.get(_sell_symbol),
+                    decision_at=(now.isoformat() if now is not None
+                                 else datetime.now(timezone.utc).isoformat()),
+                    code_sha=str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN"),
+                )
+            except Exception as _audit_exc:
+                _status = "AUDIT_UNAVAILABLE"
+                logger.warning("[US_EXIT][5W1H][WARN] symbol=%s error=%s action=SELL_CONTINUES",
+                               _sell_symbol, type(_audit_exc).__name__)
+            _sell_proof_status[_sell_symbol] = _status
+        if _sell_proof_status:
+            logger.info("[US_EXIT][5W1H][SUMMARY] statuses=%s", _sell_proof_status)
+    except Exception as _audit_module_exc:
+        logger.warning("[US_EXIT][5W1H][UNAVAILABLE] error=%s action=SELL_CONTINUES",
+                       type(_audit_module_exc).__name__)
+
     exit_route_result = route_exit_orders_immediately(
         _late_exit_intents,
         buy_daily_notional=0.0,  # SELL-only risk path; BUY value loaded after routing.
@@ -3565,8 +3597,23 @@ def run_trade_tick(
         if effective_max_new_positions is not None:
             try:
                 effective_max_new_positions_int = int(effective_max_new_positions)
-                available_new_slots = min(available_new_slots, max(0, effective_max_new_positions_int))
+                from trader.us.runner.new_position_limit_scope import (
+                    explain_effective_new_position_limit,
+                )
+                new_position_limit_proof = explain_effective_new_position_limit(
+                    available_current_position_slots=available_new_slots,
+                    effective_max_new_positions=effective_max_new_positions_int,
+                )
+                available_new_slots = new_position_limit_proof["tick_new_slots_after_cap"]
                 allow_new_symbols = bool(allow_new_symbols and available_new_slots > 0)
+                logger.info(
+                    "[US_ENTRY][POSITION_LIMIT_SCOPE] applied_scope=%s "
+                    "configured_cap=%d tick_slots_after_cap=%d "
+                    "daily_cumulative_new_positions_proven=%s",
+                    new_position_limit_proof["applied_scope"],
+                    effective_max_new_positions_int, available_new_slots,
+                    new_position_limit_proof["daily_cumulative_new_positions_proven"],
+                )
                 logger.info(
                     "[US_ENTRY][UNDERFILLED_LIMIT] available_new_slots_before=%d effective_max_new_positions=%d available_new_slots_after=%d underfilled_tier=%s",
                     available_new_slots_before_underfilled_limit,
@@ -4411,6 +4458,21 @@ def run_trade_tick(
         time.monotonic() - _post_route_reconcile_started
     ) * 1000.0 if not offline and ack_cnt > 0 else 0.0
 
+    # Execution claim conflict is a safety fence, not a clean route result.
+    # Keep the protected broker gate unchanged, but expose the blocked attempt.
+    from trader.us.runner.claim_route_health import (
+        summarize_claim_fences, apply_claim_fence_tick_status,
+    )
+    claim_fence_health = summarize_claim_fences(orders)
+    claim_fenced_cnt = claim_fence_health["count"]
+    if claim_fenced_cnt:
+        logger.warning(
+            "[US_ORDER][CLAIM_FENCE_SUMMARY] count=%d requires_reconcile=%s "
+            "reasons=%s symbols=%s",
+            claim_fenced_cnt, claim_fence_health["requires_reconcile"],
+            claim_fence_health["reasons"], claim_fence_health["symbols"],
+        )
+
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
     blocked_sell_symbols: set[str] = set()
@@ -4426,7 +4488,7 @@ def run_trade_tick(
                 reason_key = reason_key.split("reason=")[1].split()[0]
             except Exception:
                 pass
-        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
+        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED", "ORDER_FENCED_UNRESOLVED_ACTION"}:
             block_reasons[reason_key] = block_reasons.get(reason_key, 0) + 1
             if side_o == "SELL" and symbol_o:
                 blocked_sell_symbols.add(symbol_o)
@@ -4503,7 +4565,7 @@ def run_trade_tick(
     # 최종 status 판정 (US 전용 status 체계)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
-    total_warnings = fills_warnings_count
+    total_warnings = fills_warnings_count + claim_fenced_cnt
     # Broker submission truth is authoritative across normal and degraded paths.
     orders_sent = routed_sent_total
     orders_failed = reject_cnt + err_cnt
@@ -4636,6 +4698,18 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    status = apply_claim_fence_tick_status(
+        status, claim_fence_count=claim_fenced_cnt,
+        orders_sent=orders_sent, entry_intents=entry_intents_count,
+        exit_intents=exit_intents_count,
+    )
+    if claim_fenced_cnt:
+        logger.warning(
+            "[US_TICK][CLAIM_FENCE_STATUS] status=%s count=%d "
+            "orders_sent=%d warnings=%d",
+            status, claim_fenced_cnt, orders_sent, total_warnings,
+        )
+
     sell_decisions_detail = [
         {"symbol": str((i or {}).get("symbol", "")).upper(), **(((i or {}).get("meta") or {}) if isinstance((i or {}).get("meta"), dict) else {})}
         for i in exit_intents if str((i or {}).get("side") or "").upper() == "SELL"
@@ -4807,6 +4881,19 @@ def run_trade_tick(
         latency_metrics["pre_entry_accounted_ms"]
     ), 3)
     latency_metrics["slot_overrun_300s"] = int(tick_total_ms > 300000)
+    # Persist read-only measured phase telemetry into the returned Tick
+    # diagnostics and the existing log stream. Never add broker I/O here.
+    try:
+        from trader.us.execution.latency_evidence import observed_tick_sample
+        _observed = observed_tick_sample({
+            **tick_context.metrics, "tick_total_ms": tick_total_ms,
+        })
+        latency_metrics["measured_phase_evidence"] = _observed
+        logger.info("[US_TICK][PHASE_EVIDENCE_JSON] payload=%s",
+                    json.dumps(_observed, sort_keys=True, allow_nan=False))
+    except Exception as _phase_exc:
+        logger.warning("[US_TICK][PHASE_EVIDENCE_UNAVAILABLE] error_type=%s",
+                       type(_phase_exc).__name__)
     latency_log = logger.warning if unaccounted_ms > 2000 else logger.info
     latency_log(
         "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
@@ -4921,7 +5008,11 @@ def run_trade_tick(
         "orders_rejected": reject_cnt,
         "orders_routed": routing_intents_total,
         "orders_error": err_cnt,
-        "orders_failed": orders_failed,
+        "orders_failed": orders_failed + claim_fenced_cnt,
+        "execution_claim_conflict_count": claim_fenced_cnt,
+        "execution_claim_conflict_requires_reconcile": claim_fence_health["requires_reconcile"],
+        "execution_claim_conflict_reasons": claim_fence_health["reasons"],
+        "total_warnings": total_warnings,
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
@@ -4950,6 +5041,9 @@ def run_trade_tick(
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,
         "effective_capital_scale": market_state_overlay.get("effective_capital_scale") if 'market_state_overlay' in locals() else None,
         "effective_max_new_positions": market_state_overlay.get("effective_max_new_positions") if 'market_state_overlay' in locals() else None,
+        "effective_max_new_positions_scope": "PER_TICK_AVAILABLE_CURRENT_POSITION_SLOTS",
+        "daily_new_position_cap_enforcement_verified": False,
+        "new_position_limit_proof": locals().get("new_position_limit_proof"),
         "underfilled_tier": market_state_overlay.get("underfilled_tier") if 'market_state_overlay' in locals() else None,
         "sector_cap_enforced": market_state_overlay.get("sector_cap_enforced") if 'market_state_overlay' in locals() else False,
         "market_state": market_state_overlay.get("market_state") if 'market_state_overlay' in locals() else "NORMAL",

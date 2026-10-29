@@ -63,6 +63,10 @@ def annotate_execution_quantity_provenance(intent: dict, *, strategy_requested_q
 
 def resolve_entry_metadata_contract_reason(intent: dict, *, required: bool = False) -> str | None:
     """Validate classification metadata without treating explicit OTHER as missing."""
+    from trader.us.entry_exit_contract import validate_us_new_buy_management_contract
+    management_conflict = validate_us_new_buy_management_contract(intent)
+    if management_conflict:
+        return management_conflict
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
     candidate_fields = ("theme_cluster", "classification_source", "position_state", "position_action")
     if not required and not any(
@@ -1980,6 +1984,34 @@ def route_order(
                 client_order_key=str(order_key or ""),
             )
         if not claim.acquired:
+            claim_remainder_audit = None
+            if str(claim.reason or "") == "remaining_target_qty_mismatch":
+                try:
+                    from trader.us.db.repos import inspect_us_execution_claim_remainder
+                    from trader.us.runner.claim_route_health import classify_claim_remainder_conflict
+                    claim_proof = inspect_us_execution_claim_remainder(
+                        action_key=claim.action_key, trade_date=str(trade_date),
+                        env=account_env,
+                    )
+                    claim_remainder_audit = classify_claim_remainder_conflict(
+                        qty, claim_proof,
+                    )
+                except Exception as claim_probe_exc:
+                    claim_remainder_audit = {
+                        "reason": "CLAIM_DB_PROOF_UNVERIFIED",
+                        "safe_to_auto_retry": False,
+                        "action": "RECONCILE_KIS_AND_CLAIM_READ_ONLY",
+                    }
+                    logger.warning(
+                        "[US_ORDER][EXECUTION_CLAIM][AUDIT_UNVERIFIED] type=%s",
+                        type(claim_probe_exc).__name__,
+                    )
+                logger.warning(
+                    "[US_ORDER][EXECUTION_CLAIM][REMAINDER_AUDIT] symbol=%s "
+                    "reason=%s attempted=%s remaining=%s auto_retry=0",
+                    symbol_upper, claim_remainder_audit.get("reason"),
+                    qty, claim_remainder_audit.get("persisted_remaining_qty"),
+                )
             logger.error(
                 "[US_ORDER][EXECUTION_CLAIM][BLOCK] action_key=%s reason=%s",
                 claim.action_key, claim.reason,
@@ -1988,6 +2020,7 @@ def route_order(
                 "status": "ORDER_FENCED_UNRESOLVED_ACTION",
                 "reason": claim.reason,
                 "execution_action_key": claim.action_key,
+                "claim_remainder_audit": claim_remainder_audit,
                 "broker_submit": False,
                 "retry_order": False,
                 "requires_reconcile": True,
@@ -2262,6 +2295,19 @@ def route_order(
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
         if _http_boundary_mono is not None:
+            # Native KIS call duration, NOT ACK/fill proof; process-local only.
+            _elapsed_http_ms = (time.monotonic() - _http_boundary_mono) * 1000.0
+            _timing_metrics = getattr(context, "metrics", None)
+            if isinstance(_timing_metrics, dict):
+                _timing_calls = _timing_metrics.setdefault("broker_http_by_attempt_ms", {})
+                if isinstance(_timing_calls, dict) and (
+                    len(_timing_calls) < 128 or str(intent["submit_attempt_id"]) in _timing_calls
+                ):
+                    _timing_calls[str(intent["submit_attempt_id"])] = _elapsed_http_ms
+                else:
+                    _timing_metrics["broker_http_telemetry_dropped_count"] = (
+                        int(_timing_metrics.get("broker_http_telemetry_dropped_count", 0)) + 1
+                    )
             logger.info(
                 "[US_ORDER][BROKER_CALL_RETURNED] symbol=%s side=%s attempt=%s elapsed_ms=%.2f",
                 symbol_upper, side, intent["submit_attempt_id"],
