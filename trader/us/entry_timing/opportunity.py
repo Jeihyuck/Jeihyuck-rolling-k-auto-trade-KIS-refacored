@@ -347,6 +347,7 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     The full entry/risk router remains authoritative for order permission.
     """
     if (str(intent.get("side") or "").upper() != "BUY"
+            or str(intent.get("symbol") or "").strip().upper() == "TQQQ"
             or str(intent.get("position_action") or "") != "NEW_POSITION_BUY"
             or str(intent.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"):
         return True, "NOT_APPLICABLE"
