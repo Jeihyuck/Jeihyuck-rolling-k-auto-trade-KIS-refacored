@@ -3535,6 +3535,17 @@ class OrdersRepo:
         position_cycle_id = str(position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url))
         order_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
         safe_request_json = json_sanitize(request_json or {})
+        # KR standard PB1 is a durable strategy owner, not the BUY style.
+        # Persist the exact owner on new orders so broker settlement and
+        # later cycle recovery do not have to infer it from a signal label.
+        if (
+            str(strategy or "").strip().lower() == "pb1_pullback_close"
+            and str(market or "").strip().upper() in {"J", "KR", "KRX", "KOSPI", "KOSDAQ"}
+        ):
+            existing_owner = str(safe_request_json.get("strategy_owner") or "").strip().upper()
+            if existing_owner not in {"", "PB1", "KR_STANDARD"}:
+                raise RuntimeError("KR_ORDER_STRATEGY_OWNER_CONFLICT")
+            safe_request_json["strategy_owner"] = "PB1"
         enforce_buy_contract = bool(
             str(side or "").upper() == "BUY"
             and safe_request_json.get("enforce_entry_contract") is True
@@ -4992,6 +5003,51 @@ class OrdersRepo:
         return False, None
 
 
+    def list_kr_close_recovery_buy_orders(
+        self, env: str, strategy: str, codes: Iterable[str], trade_date: date,
+    ) -> list[dict]:
+        """Read exact current-day, broker-reconciled BUY contract candidates.
+
+        Do not use a latest-BUY code-only lookup: previous positions/epochs or
+        a later unrelated BUY must never donate DAY/SWING policy to a holding.
+        The caller must independently verify original KIS execution and current
+        KIS balance before any close-policy decision.
+        """
+        symbols = sorted({str(c or "").zfill(6) for c in codes if str(c or "").strip()})
+        if not symbols or str(strategy) != "pb1_pullback_close":
+            return []
+        from zoneinfo import ZoneInfo
+        trade_day = trade_date if isinstance(trade_date, date) else date.fromisoformat(str(trade_date))
+        first = datetime.combine(trade_day, datetime.min.time()).replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        last = first + timedelta(days=1)
+        conditions = [
+            self._schema.orders.c.env == _norm_env(env),
+            self._schema.orders.c.strategy == "pb1_pullback_close",
+            self._schema.orders.c.side == "BUY",
+            self._schema.orders.c.code.in_(symbols),
+            self._schema.orders.c.status == "RECONCILED",
+            self._schema.orders.c.created_at >= first,
+            self._schema.orders.c.created_at < last,
+        ]
+        active_epoch = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if active_epoch is not None:
+            conditions.append(self._schema.orders.c.trading_epoch_id == active_epoch)
+        statement = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(self._schema.orders.c.created_at.desc())
+            .limit(max(1, len(symbols) * 8))
+        )
+        # Conservative close-policy proof: a failed DB read is NOT an empty
+        # source of truth that authorizes a new SELL.
+        return self._read_mappings_with_guard(
+            statement, op_name="orders.list_kr_close_recovery_buy_orders",
+            fail_open=False,
+        )
+
     def find_latest_buy_entry_exit_plan(self, env: str, strategy: str, code: str, *, lookback: int | None = None) -> dict | None:
         lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
         conditions = [
@@ -5429,6 +5485,14 @@ class FillsRepo:
             """
             from decimal import Decimal, InvalidOperation
 
+            # Physical Supabase public.fills.raw_json is TEXT, although our
+            # SQLAlchemy schema declares JSON. A read may return serialized
+            # source JSON; retain exact broker notional for same-qty replay.
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    raw = {}
             raw = raw if isinstance(raw, dict) else {}
             row = raw.get("kis_response") if isinstance(raw.get("kis_response"), dict) else raw
             try:
@@ -5511,9 +5575,18 @@ class FillsRepo:
             # reject an increasing cumulative quantity with correctly
             # increasing original notional.  This database fence must survive
             # concurrent writers and must not weaken genuine mismatch checks.
+            # In the actual 2026-10-29 Supabase schema this column is
+            # physically TEXT (not JSONB). SQLAlchemy JSON indexing alone
+            # generates TEXT -> TEXT and aborts all cumulative fill upserts.
+            # Cast to JSONB on PostgreSQL before extracting broker notional;
+            # SQLite keeps its existing JSON1-based expression unchanged.
+            raw_proof_expr = self._schema.fills.c.raw_json
+            if conn.dialect.name == "postgresql":
+                from sqlalchemy.dialects.postgresql import JSONB
+                raw_proof_expr = sa.cast(raw_proof_expr, JSONB)
             old_notional_text = sa.func.coalesce(
-                self._schema.fills.c.raw_json["kis_response"]["tot_ccld_amt"].as_string(),
-                self._schema.fills.c.raw_json["tot_ccld_amt"].as_string(),
+                raw_proof_expr["kis_response"]["tot_ccld_amt"].as_string(),
+                raw_proof_expr["tot_ccld_amt"].as_string(),
             )
             old_broker_notional = sa.case(
                 (

@@ -1021,6 +1021,103 @@ def _extract_tagged_close_metadata(
     return {}, "metadata_missing"
 
 
+def _verified_kr_close_broker_buy_contract(
+    holding: dict[str, Any], order: dict[str, Any], trade_date: date,
+) -> dict[str, Any] | None:
+    """Reconstruct only a same-day, single-cycle, broker-confirmed BUY plan.
+
+    Intended for post-KIS fill-persistence failure. Price/owner/cycle/date
+    ambiguity is NOT an authorization to sell. Never infer a DAY_TRADE plan
+    from the entry style, code-only history or SWING_BOOK storage tags.
+    """
+    from decimal import Decimal, InvalidOperation
+    from trader.db.repos import _assert_kr_buy_entry_contract
+    from trader.trade_plan import validate_entry_exit_plan
+
+    code, held_qty = _holding_code_qty(holding)
+    if not code or held_qty <= 0:
+        return None
+    if (str(order.get("code") or "").zfill(6) != code
+            or str(order.get("strategy") or "") != "pb1_pullback_close"
+            or str(order.get("side") or "").upper() != "BUY"
+            or str(order.get("status") or "").upper() != "RECONCILED"):
+        return None
+    request = _parse_meta_json(order.get("request_json"))
+    if request.get("enforce_entry_contract") is not True:
+        return None
+    try:
+        _assert_kr_buy_entry_contract(request)
+    except (RuntimeError, ValueError, TypeError):
+        return None
+    for field in ("position_cycle_id", "portfolio_epoch_id", "trading_epoch_id", "client_order_key"):
+        if not order.get(field) or str(order[field]) != str(request.get(field) or ""):
+            return None
+    if int(request.get("pre_order_holding_qty") or -1) != 0:
+        # No single-entry proof for an add or an existing account holding.
+        # Note: int(0 or -1) loses zero; handle zero explicitly below.
+        if request.get("pre_order_holding_qty") not in (0, "0"):
+            return None
+    if request.get("pre_order_holding_qty") not in (0, "0"):
+        return None
+    original = _parse_meta_json(request.get("_reconcile_observation")).get("kis_row")
+    if not isinstance(original, dict):
+        return None
+    if (str(original.get("pdno") or "").zfill(6) != code
+            or str(original.get("odno") or "").strip() != str(order.get("kis_odno") or "").strip()
+            or str(original.get("ord_dt") or "") != trade_date.strftime("%Y%m%d")
+            or str(original.get("sll_buy_dvsn_cd") or "") != "02"
+            or str(original.get("cncl_yn") or "N").upper() != "N"):
+        return None
+    try:
+        original_qty = int(original.get("tot_ccld_qty"))
+        requested_qty = int(request.get("requested_qty"))
+        submitted_qty = int(request.get("submitted_qty"))
+        available_qty = int(holding.get("ord_psbl_qty"))
+        kis_cost = Decimal(str(holding.get("pchs_amt")))
+        original_cost = Decimal(str(original.get("tot_ccld_amt")))
+        average = Decimal(str(holding.get("pchs_avg_pric")))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    if not (
+        original_qty > 0
+        and requested_qty == submitted_qty == original_qty == held_qty == available_qty
+        and kis_cost.is_finite() and original_cost.is_finite() and average.is_finite()
+        and kis_cost > 0 and original_cost > 0 and average > 0
+        and abs(kis_cost - original_cost) <= Decimal("0.50")
+        and abs(kis_cost - average * held_qty) <= Decimal("1.00")
+    ):
+        return None
+    plan = _parse_meta_json(request.get("entry_exit_plan"))
+    try:
+        validate_entry_exit_plan(plan)
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        return None
+    if str(plan.get("code") or "").zfill(6) != code:
+        return None
+    for field in ("entry_style_selected", "trade_horizon", "exit_policy_family", "eod_action"):
+        if not plan.get(field):
+            return None
+    # Do not synthesize a storage position or fill: only return a policy
+    # candidate anchored to the durable order identity and KIS cost/qty.
+    return {
+        "code": code, "qty": held_qty, "market": order.get("market") or "KRX",
+        "sid": order.get("sid") or 1, "mode": order.get("mode") or 1,
+        "position_cycle_id": order["position_cycle_id"],
+        "portfolio_epoch_id": order["portfolio_epoch_id"],
+        "trading_epoch_id": order["trading_epoch_id"],
+        "recovery_kind": "BROKER_VERIFIED_CURRENT_DAY_BUY_CONTRACT",
+        "fill_meta_json": {
+            "entry_exit_plan": plan,
+            "entry_style_selected": plan.get("entry_style_selected"),
+            "trade_horizon": plan["trade_horizon"],
+            "exit_policy_family": plan["exit_policy_family"],
+            "eod_action": plan["eod_action"],
+            "force_eod_close": plan.get("force_eod_close"),
+            "position_book": "DAY_BOOK" if plan["trade_horizon"] == "DAY_TRADE" else "SWING_BOOK",
+        },
+    }
+
+
 def build_kr_close_policy_orders_from_tagged_positions(
     kis_holdings: list[dict[str, Any]] | None,
     db_positions: list[dict[str, Any]] | None = None,
@@ -1118,8 +1215,57 @@ def _load_kr_close_tagged_metadata(
             rows = fills_repo.list_today_fills(env, side="BUY", code=code) or []
             if rows:
                 latest_by_code[code] = dict(rows[0] or {})
-    # Missing cycle-proven metadata remains POLICY_MISSING.  A code-only order
-    # or fill from a prior lifecycle is never restored onto a current holding.
+    # If reconciliation failed to persist a BUY fill/position, recover the
+    # *original same-day broker-confirmed* entry contract as read-only proof.
+    # Unknown, partial, cross-cycle or noncurrent original BUY -> HOLD.
+    current_day = now_kst().date()
+    missing_codes = [
+        c for c in codes
+        if c not in {str(p.get("code") or "").zfill(6) for p in db_positions}
+        and c not in latest_by_code
+    ]
+    if missing_codes and orders_repo is not None and hasattr(orders_repo, "list_kr_close_recovery_buy_orders"):
+        try:
+            rows = list(orders_repo.list_kr_close_recovery_buy_orders(
+                env=env, strategy=strategy, codes=missing_codes, trade_date=current_day,
+            ) or [])
+        except Exception as exc:
+            logger.error("[KR_CLOSE][BUY_CONTRACT_RECOVERY] action=HOLD reason=ORDER_READ_FAILED type=%s", type(exc).__name__)
+            rows = []
+        by_code: dict[str, list[dict]] = {}
+        for row in rows:
+            row_code = str((row or {}).get("code") or "").zfill(6)
+            if row_code in missing_codes:
+                by_code.setdefault(row_code, []).append(dict(row))
+        for holding in holdings or []:
+            code, held_qty = _holding_code_qty(holding)
+            if code not in missing_codes or held_qty <= 0:
+                continue
+            candidates = by_code.get(code, [])
+            if len(candidates) != 1:
+                logger.warning(
+                    "[KR_CLOSE][BUY_CONTRACT_RECOVERY] code=%s action=HOLD "
+                    "reason=%s candidate_count=%s",
+                    code, "AMBIGUOUS_BUY_ORDERS" if candidates else "ORDER_MISSING",
+                    len(candidates),
+                )
+                continue
+            restored = _verified_kr_close_broker_buy_contract(
+                holding, candidates[0], current_day,
+            )
+            if restored is None:
+                logger.warning(
+                    "[KR_CLOSE][BUY_CONTRACT_RECOVERY] code=%s action=HOLD "
+                    "reason=BROKER_OR_CONTRACT_PROOF_FAILED", code,
+                )
+                continue
+            latest_by_code[code] = restored
+            logger.warning(
+                "[KR_CLOSE][BUY_CONTRACT_RECOVERY] code=%s action=PROVEN_CONTRACT_RESTORE "
+                "cycle=%s horizon=%s source=KIS_ORIGINAL_BUY_AND_CURRENT_BALANCE",
+                code, restored.get("position_cycle_id"),
+                restored.get("fill_meta_json", {}).get("trade_horizon"),
+            )
     latest_buy_fills = list(latest_by_code.values())
     logger.info(
         "[KR_CLOSE][POLICY][DB_METADATA] holdings=%s db_positions=%s latest_buy_fills=%s codes=%s",
@@ -1373,6 +1519,11 @@ def run_kr_close_policy_from_tagged_positions(
         for row in db_positions
         if str((row or {}).get("code") or "").strip()
     }
+    # Verified order contracts may supply policy without a DB position
+    # when the original KIS fill had failed to persist. Keep its exact cycle.
+    for row in latest_buy_fills:
+        if row.get("recovery_kind") == "BROKER_VERIFIED_CURRENT_DAY_BUY_CONTRACT":
+            position_by_code.setdefault(str(row.get("code") or "").zfill(6), dict(row))
     for policy_order in policy_orders:
         position = position_by_code.get(str(policy_order.get("code") or "").zfill(6), {})
         policy_order.update({
