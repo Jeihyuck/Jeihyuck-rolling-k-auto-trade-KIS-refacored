@@ -14,6 +14,11 @@ import sys
 from sqlalchemy import text
 
 
+def stage4_starting_constraint_supported(definition: str | None) -> bool:
+    """Inspect the canonical worker_state CHECK without changing DB data."""
+    return isinstance(definition, str) and "'STARTING'" in definition
+
+
 def validate_stage123_prerequisites(*, engine=None, scope=None, env=None) -> dict:
     e = os.environ if env is None else env
     if e.get("US_STAGE123_PAPER_PROFILE", "OFF") != "ON":
@@ -109,6 +114,18 @@ def validate_stage123_prerequisites(*, engine=None, scope=None, env=None) -> dic
             if ({name for name,_,_ in stage4}!=expected
                     or any(not rls or kind!='r' for _,rls,kind in stage4)):
                 raise RuntimeError("paper_stage4_migrations_0057_0059_missing_or_rls_off")
+            # A Stage4 STARTING boot marker is written before the first
+            # broker GET. Historical migration 0059 permits only READY,
+            # FAILED and STOPPED: without 0060, preflight would pass but the
+            # first worker write would fail (possibly blocking every Tick).
+            state_check = conn.execute(text("""
+                SELECT pg_get_constraintdef(c.oid)
+                  FROM pg_constraint c
+                 WHERE c.conrelid='public.us_stage4_reconcile_health'::regclass
+                   AND c.conname='us_stage4_reconcile_health_worker_state_check'
+            """)).scalar_one_or_none()
+            if not stage4_starting_constraint_supported(state_check):
+                raise RuntimeError("paper_stage4_migration_0060_starting_state_missing")
     return {"status": "PASS", "mode": "PAPER_ON_STAGE4" if _stage4_mode else "PAPER_ON",
             "broker_access":"NONE"}
 
