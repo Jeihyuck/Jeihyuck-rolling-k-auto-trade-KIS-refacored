@@ -62,8 +62,15 @@ def derive_quote_freshness(quote: dict | None, *, now_epoch: float, max_age_sec:
         return {"quote_fresh": False, "quote_reason": "quote_stale_or_suspect"}
     if str(quote.get("quality") or "").lower() in {"stale", "suspect", "degraded"}:
         return {"quote_fresh": False, "quote_reason": "quote_quality_invalid"}
-    if str(quote.get("source") or "").upper() not in {"KIS_LIVE", "KIS_CACHE"}:
+    source = str(quote.get("source") or "").upper()
+    if source not in {
+        "KIS_LIVE", "KIS_CACHE", "KIS_WEBSOCKET", "KIS_WEBSOCKET_COLLECTOR",
+    }:
         return {"quote_fresh": False, "quote_reason": "unverified_quote_source"}
+    if source == "KIS_WEBSOCKET_COLLECTOR" and not quote.get("collector_generation"):
+        # The collector generation is required to reject stale fork/cache
+        # snapshots across WS reconnects; quote age alone is not enough.
+        return {"quote_fresh": False, "quote_reason": "collector_generation_missing"}
     try:
         ts = float(quote.get("asof_epoch"))
         last = float(quote.get("last"))
