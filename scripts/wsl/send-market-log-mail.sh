@@ -338,9 +338,9 @@ for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "
 if [[ "$MARKET" == us ]]; then
   for stage4_purpose in am afternoon; do
     while IFS= read -r worker_path; do
-      [[ "$worker_path" == "runtime/logs/us-stage4-worker-\${TRADE_DATE}-"* &&
+      [[ "$worker_path" == "runtime/logs/us-stage4-worker-${TRADE_DATE}-"* &&
          "$worker_path" == *.log && "$worker_path" != *"/../"* ]] || continue
-      collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_\${stage4_purpose}" "$worker_path"
+      collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$worker_path"
     done < <(
       grep -hF '[US_STAGE4][CHILD_LOG]' \
         "$LOG_ROOT/$stage4_purpose"/*.log 2>/dev/null \
