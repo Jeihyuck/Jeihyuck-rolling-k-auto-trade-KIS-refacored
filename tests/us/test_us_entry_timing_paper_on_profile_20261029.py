@@ -53,10 +53,11 @@ def test_canonical_wsl_trade_has_active_not_shadow_timing():
     assert "[US_ENTRY_TIMING][PROFILE]" in result.stdout
 
 
-def test_operator_override_not_silently_promoted_or_hidden():
+def test_legacy_shadow_is_explicitly_upgraded_without_overriding_safety_off():
     flags, result = _source_profile({"US_ENTRY_OPPORTUNITY_MODE": "SHADOW"})
-    assert flags["US_ENTRY_OPPORTUNITY_MODE"] == "SHADOW"
-    assert "[US_ENTRY_TIMING][OVERRIDE]" in result.stderr
+    assert flags["US_ENTRY_OPPORTUNITY_MODE"] == "ENFORCE"
+    assert "[US_ENTRY_TIMING][UPGRADE]" in result.stdout
+    assert effective_mode({"KIS_ENV": "practice", **flags}) == "ENFORCE"
     flags, result = _source_profile({"US_ENTRY_OPPORTUNITY_APPROVED": "0"})
     assert flags["US_ENTRY_OPPORTUNITY_APPROVED"] == "0"
     assert effective_mode({"KIS_ENV": "practice", **flags}) == "ENFORCE_NOT_APPROVED"
