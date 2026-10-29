@@ -96,13 +96,13 @@ def persist_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
 
 
 def load_bars(db: sqlite3.Connection, *, trade_date: str, symbol: str,
-              owner: str = "US_STANDARD", limit: int = 120) -> list[dict]:
+              owner: str = "US_STANDARD", limit: int = 450) -> list[dict]:
     if owner != "US_STANDARD" or symbol.upper() == "TQQQ":
         return []
     rows = db.execute(
         "SELECT row_json FROM verified_bars WHERE trade_date=? AND symbol=? "
         "AND owner=? AND source='KIS_OVERSEAS_1M' ORDER BY minute_et DESC LIMIT ?",
-        (trade_date, symbol.upper(), owner, max(1, min(240, limit))),
+        (trade_date, symbol.upper(), owner, max(1, min(450, limit))),
     ).fetchall()
     return [json.loads(row[0]) for row in reversed(rows)]
 
