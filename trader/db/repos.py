@@ -5429,6 +5429,14 @@ class FillsRepo:
             """
             from decimal import Decimal, InvalidOperation
 
+            # Physical Supabase public.fills.raw_json is TEXT, although our
+            # SQLAlchemy schema declares JSON. A read may return serialized
+            # source JSON; retain exact broker notional for same-qty replay.
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    raw = {}
             raw = raw if isinstance(raw, dict) else {}
             row = raw.get("kis_response") if isinstance(raw.get("kis_response"), dict) else raw
             try:
@@ -5511,9 +5519,18 @@ class FillsRepo:
             # reject an increasing cumulative quantity with correctly
             # increasing original notional.  This database fence must survive
             # concurrent writers and must not weaken genuine mismatch checks.
+            # In the actual 2026-10-29 Supabase schema this column is
+            # physically TEXT (not JSONB). SQLAlchemy JSON indexing alone
+            # generates TEXT -> TEXT and aborts all cumulative fill upserts.
+            # Cast to JSONB on PostgreSQL before extracting broker notional;
+            # SQLite keeps its existing JSON1-based expression unchanged.
+            raw_proof_expr = self._schema.fills.c.raw_json
+            if conn.dialect.name == "postgresql":
+                from sqlalchemy.dialects.postgresql import JSONB
+                raw_proof_expr = sa.cast(raw_proof_expr, JSONB)
             old_notional_text = sa.func.coalesce(
-                self._schema.fills.c.raw_json["kis_response"]["tot_ccld_amt"].as_string(),
-                self._schema.fills.c.raw_json["tot_ccld_amt"].as_string(),
+                raw_proof_expr["kis_response"]["tot_ccld_amt"].as_string(),
+                raw_proof_expr["tot_ccld_amt"].as_string(),
             )
             old_broker_notional = sa.case(
                 (
