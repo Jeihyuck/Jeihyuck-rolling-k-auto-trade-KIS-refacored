@@ -1333,7 +1333,7 @@ def run_trade_session(
         # submit any BUY/SELL order or seize the broker order lock.
         _timing_mode = str(os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW")).upper()
         if (
-            session == "am" and not offline and str(env).lower() == "practice"
+            session in {"am", "afternoon"} and not offline and str(env).lower() == "practice"
             and os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
             and _timing_mode in {"SHADOW", "ENFORCE"}
             and locked_watchlist_cache
@@ -1406,9 +1406,9 @@ def run_trade_session(
                     stderr=_opening_observer_log_stream, close_fds=True,
                 )
                 logger.info(
-                    "[US_OPENING_OBSERVER][START] pid=%s symbols=%d mode=%s "
+                    "[US_OPENING_OBSERVER][START] pid=%s session=%s symbols=%d mode=%s "
                     "read_only=1 entry_gate_unmodified=1",
-                    _opening_observer_child.pid, len(_obs_rows), _timing_mode,
+                    _opening_observer_child.pid, session, len(_obs_rows), _timing_mode,
                 )
             except Exception as _obs_exc:
                 logger.warning(
