@@ -1036,6 +1036,8 @@ def generate_entry_intents(
             position_state = "HELD" if (current_position_symbols and symbol_upper_for_capacity in {str(s).upper().strip() for s in current_position_symbols}) else "NOT_HELD"
         if position_state == "HELD":
             held_candidates_evaluated_for_add += 1
+        # Never reuse a previous symbol's live quote in timing observations.
+        current = None
         # Price lookup (필요한 경우)
         if existing_price is None:
             if _stop_if_cancelled("before_current_price_lookup"):
@@ -1083,6 +1085,64 @@ def generate_entry_intents(
         else:
             # 이미 price가 있음 (runtime calculation)
             price = existing_price
+
+        # Read-only timing observation on all new candidates, including those
+        # subsequently skipped for sizing/risk. No additional broker I/O.
+        _timing_shadow = None
+        if position_state != "HELD":
+            try:
+                from trader.us.entry_timing_shadow import (
+                    evaluate_entry_timing_shadow, derive_quote_freshness,
+                )
+                _now_epoch = now.timestamp() if now is not None else datetime.now().timestamp()
+                _quote = current if isinstance(current, dict) else (
+                    (entry_meta or {}).get("live_quote")
+                    or (entry_meta or {}).get("current_quote")
+                )
+                _freshness = derive_quote_freshness(_quote, now_epoch=_now_epoch)
+                _style = str(
+                    (entry_meta or {}).get("entry_style_selected")
+                    or (entry_meta or {}).get("entry_style") or ""
+                ).upper()
+                if _style and not _style.startswith("ENTRY_"):
+                    _style = "ENTRY_" + _style
+                # PREP daily evidence is not a live 5-minute timing confirmation.
+                _proof = (entry_meta or {}).get("intraday_timing_evidence")
+                _proof_valid = bool(
+                    isinstance(_proof, dict)
+                    and derive_quote_freshness(
+                        {"source": _proof.get("source"),
+                         "asof_epoch": _proof.get("observed_at_epoch"),
+                         "last": _proof.get("observed_price")},
+                        now_epoch=_now_epoch,
+                    ).get("quote_fresh")
+                )
+                _facts = {
+                    "quote_fresh": bool(_freshness.get("quote_fresh")),
+                    "quote_reason": _freshness.get("quote_reason"),
+                    "support_reaction_confirmed": _proof.get("support_reaction_confirmed") if _proof_valid else None,
+                    "intraday_continuation_confirmed": _proof.get("intraday_continuation_confirmed") if _proof_valid else None,
+                    "volume_confirmation": _proof.get("volume_confirmation") if _proof_valid else None,
+                    "pivot_breakout_confirmed": _proof.get("pivot_breakout_confirmed") if _proof_valid else None,
+                    "vcp_live_breakout_verified": (entry_meta or {}).get("vcp_live_breakout_verified"),
+                }
+                _timing_shadow = evaluate_entry_timing_shadow(
+                    owner="US_STANDARD", style=_style, prep_eligible=True,
+                    live_facts=_facts,
+                )
+                if diagnostics is not None:
+                    diagnostics.setdefault("entry_timing_shadow", []).append({
+                        "symbol": symbol, "decision": _timing_shadow["timing_state"],
+                        "reason": _timing_shadow["reason"],
+                    })
+                logger.info(
+                    "[US_ENTRY][TIMING_SHADOW] symbol=%s family=%s state=%s reason=%s quote=%s",
+                    symbol, _style, _timing_shadow["timing_state"],
+                    _timing_shadow["reason"], _facts["quote_reason"],
+                )
+            except (TypeError, ValueError, ImportError) as exc:
+                logger.warning("[US_ENTRY][TIMING_SHADOW_UNAVAILABLE] symbol=%s type=%s",
+                               symbol, type(exc).__name__)
 
         position_state_for_order = position_state or (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
@@ -1132,6 +1192,26 @@ def generate_entry_intents(
             entry_meta["vcp_live_breakout_verified"] = True
             entry_meta["vcp_live_volume"] = live_evidence["tvol"]
             entry_meta["vcp_live_quote_source"] = live_evidence["source"]
+            # The existing VCP broker proof is authoritative for VCP shadow:
+            # update the earlier pre-LIVE observation without new I/O.
+            try:
+                from trader.us.entry_timing_shadow import evaluate_entry_timing_shadow
+                _timing_shadow = evaluate_entry_timing_shadow(
+                    owner="US_STANDARD", style="ENTRY_VCP", prep_eligible=True,
+                    live_facts={
+                        "quote_fresh": True,
+                        "quote_reason": "vcp_verified_live_broker_pivot_volume",
+                        "vcp_live_breakout_verified": True,
+                    },
+                )
+                if diagnostics is not None:
+                    diagnostics.setdefault("entry_timing_shadow", []).append({
+                        "symbol": symbol, "decision": _timing_shadow["timing_state"],
+                        "reason": "vcp_live_broker_proof", "replaces_pre_vcp": True,
+                    })
+            except Exception as _shadow_exc:
+                logger.warning("[US_ENTRY][VCP_TIMING_SHADOW_WARN] symbol=%s error=%s",
+                               symbol, type(_shadow_exc).__name__)
             logger.info(
                 "[US_ENTRY][VCP_LIVE_PROOF] symbol=%s price=%.4f "
                 "cum_volume=%.0f avg_volume20=%.0f pivot=%.4f",
@@ -1592,6 +1672,10 @@ def generate_entry_intents(
         ):
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
+
+        # Shadow observation was produced earlier; attaching it cannot affect BUY.
+        if position_action == "NEW_POSITION_BUY" and _timing_shadow is not None:
+            intent.setdefault("meta", {})["entry_timing_shadow_v1"] = _timing_shadow
 
         if _stop_if_cancelled("before_order_preflight"):
             break
