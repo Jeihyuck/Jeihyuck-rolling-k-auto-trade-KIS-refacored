@@ -1158,12 +1158,11 @@ def generate_entry_intents(
                     effective_mode, evaluate_price_opportunity,
                 )
                 _opportunity_mode = effective_mode()
-                _family = str(
+                from trader.us.pb1.us_explain import normalize_us_entry_style
+                _family = normalize_us_entry_style(
                     (entry_meta or {}).get("entry_style_selected")
-                    or (entry_meta or {}).get("entry_style") or ""
-                ).upper()
-                if _family and not _family.startswith("ENTRY_"):
-                    _family = "ENTRY_" + _family
+                    or (entry_meta or {}).get("entry_style")
+                )
                 if _family in {"ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT"} and _opportunity_mode != "OFF":
                     _observed_bars = []
                     _scope = str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip()
@@ -1247,6 +1246,10 @@ def generate_entry_intents(
                         price = _live_value
                 elif _opportunity_mode == "ENFORCE_NOT_APPROVED":
                     track_skip(symbol, "ENTRY_TIMING_POLICY_NOT_APPROVED")
+                    continue
+                elif _opportunity_mode == "ENFORCE" and _family != "ENTRY_VCP":
+                    # Unknown/new signal family must not bypass a policy gate.
+                    track_skip(symbol, "ENTRY_TIMING_FAMILY_UNSUPPORTED", {"family": _family})
                     continue
             except Exception as _opp_exc:
                 logger.warning(
