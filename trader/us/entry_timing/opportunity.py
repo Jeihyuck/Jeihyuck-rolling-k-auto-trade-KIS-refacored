@@ -313,4 +313,12 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
         return False, "TIMING_WS_QUOTE_STALE"
     if ask > cap + 1e-6 or (ask - bid) / ((ask + bid) / 2) > 0.003:
         return False, "TIMING_BROKER_PRICE_MOVED"
+    decision_price = finite(proof.get("decision_price"))
+    stop_ref = finite(proof.get("structural_stop_reference"))
+    if (decision_price is None or decision_price <= 0
+            or abs(last / decision_price - 1.0) > 0.004
+            or (stop_ref is not None and last <= stop_ref)):
+        # A new sharp downswing invalidates a previously valid rebound,
+        # even when the ask still fits the old maximum entry price.
+        return False, "TIMING_REBOUND_INVALIDATED"
     return True, "TIMING_FRESH_PRICE_CONFIRMED"
