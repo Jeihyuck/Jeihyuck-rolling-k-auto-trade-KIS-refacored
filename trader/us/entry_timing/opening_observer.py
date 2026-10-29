@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -51,10 +52,16 @@ def open_store(path: Path) -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS quote_samples (
         trade_date TEXT NOT NULL, symbol TEXT NOT NULL, owner TEXT NOT NULL,
         received_epoch REAL NOT NULL, last REAL NOT NULL, source TEXT NOT NULL,
-        generation TEXT NOT NULL,
+        generation TEXT NOT NULL, bid REAL, ask REAL,
         PRIMARY KEY (trade_date,symbol,owner,received_epoch,source,generation)
     );
     """)
+    # Backward-compatible upgrade of an observer created by an earlier
+    # candidate SHA. Never overwrite or invent historical quote prices.
+    existing = {row[1] for row in db.execute("PRAGMA table_info(quote_samples)")}
+    for column in ("bid", "ask"):
+        if column not in existing:
+            db.execute(f"ALTER TABLE quote_samples ADD COLUMN {column} REAL")
     db.commit()
     return db
 
@@ -110,15 +117,26 @@ def persist_ws_sample(db: sqlite3.Connection, *, trade_date: str,
         last = float(quote["last"])
         generation = str(quote["collector_generation"])
         if (not generation or received <= 0 or last <= 0 or
+                not math.isfinite(last) or not math.isfinite(received) or
                 abs(time.time() - received) > 15):
             return False
+        bid_raw, ask_raw = quote.get("bid"), quote.get("ask")
+        try:
+            bid, ask = float(bid_raw), float(ask_raw)
+            if not (math.isfinite(bid) and math.isfinite(ask)
+                    and 0 < bid <= ask):
+                bid, ask = None, None
+        except (TypeError, ValueError, OverflowError):
+            bid, ask = None, None
     except (TypeError, KeyError, ValueError, OverflowError):
         return False
     with db:
         db.execute(
-            "INSERT OR IGNORE INTO quote_samples VALUES (?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO quote_samples "
+            "(trade_date,symbol,owner,received_epoch,last,source,generation,bid,ask) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (trade_date, symbol.upper(), owner, received, last,
-             "KIS_WEBSOCKET_COLLECTOR", generation),
+             "KIS_WEBSOCKET_COLLECTOR", generation, bid, ask),
         )
     return True
 
@@ -129,7 +147,7 @@ def load_latest_ws_quote(db: sqlite3.Connection, *, trade_date: str,
     if owner != "US_STANDARD" or symbol.upper() == "TQQQ":
         return {}
     row = db.execute(
-        "SELECT received_epoch,last,generation FROM quote_samples "
+        "SELECT received_epoch,last,generation,bid,ask FROM quote_samples "
         "WHERE trade_date=? AND symbol=? AND owner=? "
         "ORDER BY received_epoch DESC LIMIT 1",
         (trade_date, symbol.upper(), owner),
@@ -141,8 +159,32 @@ def load_latest_ws_quote(db: sqlite3.Connection, *, trade_date: str,
         return {}
     # Bid and ask are not invented. The entry engine needs current KIS bid/ask.
     return {"last": float(row[1]), "age_sec": age,
+            "bid": float(row[3]) if row[3] is not None else None,
+            "ask": float(row[4]) if row[4] is not None else None,
+            "received_at": float(row[0]),
             "source": "KIS_WEBSOCKET_COLLECTOR",
             "collector_generation": row[2]}
+
+
+def load_quote_samples(db: sqlite3.Connection, *, trade_date: str,
+                       symbol: str, owner: str = "US_STANDARD",
+                       limit: int = 3000) -> list[dict]:
+    """Return historical WS last/bid/ask as actually observed, never inferred."""
+    if owner != "US_STANDARD" or symbol.upper() == "TQQQ":
+        return []
+    rows = db.execute(
+        "SELECT received_epoch,last,bid,ask,generation FROM quote_samples "
+        "WHERE trade_date=? AND symbol=? AND owner=? "
+        "ORDER BY received_epoch DESC LIMIT ?",
+        (trade_date, symbol.upper(), owner, max(1, min(10000, limit))),
+    ).fetchall()
+    return [
+        {"received_at": float(row[0]), "last": float(row[1]),
+         "bid": float(row[2]) if row[2] is not None else None,
+         "ask": float(row[3]) if row[3] is not None else None,
+         "collector_generation": row[4], "source": "KIS_WEBSOCKET_COLLECTOR"}
+        for row in reversed(rows)
+    ]
 
 
 def standard_entry_pairs(watchlist: list[dict], limit: int = 30) -> list[tuple[str, str]]:
