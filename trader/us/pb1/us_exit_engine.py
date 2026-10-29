@@ -1372,7 +1372,8 @@ def _evaluate_exit_intents_from_snapshots(
                 from trader.us.decision_evidence_5w1h import (
                     build_exit_evidence_from_entry, verify_decision_evidence,
                 )
-                _contract = contract if "contract" in locals() else {}
+                from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+                _contract = extract_us_entry_exit_contract(pos, pos.get("meta"))
                 _provenance = (_contract.get("entry_provenance") or {}) if isinstance(_contract, dict) else {}
                 _entry_evidence = _provenance.get("entry_decision_evidence_5w1h")
                 _expected_hash = _provenance.get("entry_decision_evidence_sha256")
