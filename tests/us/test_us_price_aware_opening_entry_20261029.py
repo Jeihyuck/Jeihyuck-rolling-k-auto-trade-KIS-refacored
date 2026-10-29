@@ -290,3 +290,37 @@ def test_max_entry_price_satisfies_rr_and_stop_distance_at_final_limit():
     risk_at_order_limit = (ceiling - stop) / ceiling
     assert rr_at_order_limit >= 1.5 - 1e-8
     assert risk_at_order_limit <= 0.025 + 1e-8
+
+def test_stale_approved_signal_cannot_be_refreshed_by_mutating_timestamp_or_order_key():
+    decision = evaluate_price_opportunity(
+        style="ENTRY_PULLBACK", trade_date=DAY,
+        now_et=datetime(2026, 10, 28, 10, 5, tzinfo=NY),
+        verified_bars=sample_bars(), quote=sample_quote(),
+    )
+    epoch = datetime(2026, 10, 28, 10, 5, tzinfo=NY).timestamp()
+    intent = {
+        "symbol": "ELV", "side": "BUY", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY", "client_order_key": "k1",
+        "position_lifecycle_id": "cycle-1",
+        "limit_price": decision["max_entry_price"], "meta": {},
+    }
+    attach_opportunity_proof(intent, decision, mode="ENFORCE", decision_epoch=epoch)
+    quote = {"received_at": epoch + 3, "last": 96.05, "bid": 96.0, "ask": 96.05}
+    assert pre_submit_timing_check(
+        intent, now_epoch=epoch + 3, fresh_ws_quote=quote,
+    )[0] is True
+    changed_epoch = copy.deepcopy(intent)
+    changed_epoch["meta"]["us_entry_opportunity_v1"]["decision_epoch"] += 60
+    assert pre_submit_timing_check(
+        changed_epoch, now_epoch=epoch + 3, fresh_ws_quote=quote,
+    )[1] == "TIMING_BINDING_INVALID"
+    changed_key = copy.deepcopy(intent)
+    changed_key["client_order_key"] = "wrong-order"
+    assert pre_submit_timing_check(
+        changed_key, now_epoch=epoch + 3, fresh_ws_quote=quote,
+    )[1] == "TIMING_BINDING_INVALID"
+    changed_mode = copy.deepcopy(intent)
+    changed_mode["meta"]["us_entry_opportunity_v1"]["mode"] = "SHADOW"
+    assert pre_submit_timing_check(
+        changed_mode, now_epoch=epoch + 3, fresh_ws_quote=quote,
+    )[0] is False
