@@ -248,3 +248,26 @@ def test_offline_replay_does_not_invent_missing_executions():
     assert report["timing_effectiveness"] == "NOT_ESTABLISHED"
     assert report["baseline_comparison"]["entry_price_delta_pct"] < 0
     assert report["forward_60m"]["status"] == "UNKNOWN_MISSING_FUTURE_BARS"
+
+def test_frozen_position_contract_retains_exact_price_opportunity_evidence():
+    from trader.us.entry_exit_contract import (
+        build_us_entry_exit_contract, verify_us_entry_exit_contract,
+    )
+    observed = evaluate_price_opportunity(
+        style="ENTRY_PULLBACK", trade_date=DAY,
+        now_et=datetime(2026, 10, 28, 10, 5, tzinfo=NY),
+        verified_bars=sample_bars(), quote=sample_quote(),
+    )
+    meta = {}
+    intent = {"meta": meta, "symbol": "ELV", "strategy_owner": "US_STANDARD",
+              "entry_style_selected": "ENTRY_PULLBACK"}
+    attach_opportunity_proof(
+        intent, observed, mode="SHADOW",
+        decision_epoch=datetime(2026, 10, 28, 10, 5, tzinfo=NY).timestamp(),
+    )
+    contract = build_us_entry_exit_contract(intent)
+    assert verify_us_entry_exit_contract(contract)
+    assert (
+        contract["entry_provenance"]["us_entry_opportunity_v1"]["evidence_sha256"]
+        == observed["evidence_sha256"]
+    )
