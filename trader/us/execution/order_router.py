@@ -2176,6 +2176,7 @@ def route_order(
         # collector IPC read; NO KIS HTTP round-trip and NO impact on SELL.
         if (
             side == "BUY"
+            and symbol_upper != "TQQQ"
             and str(intent.get("position_action") or "") == "NEW_POSITION_BUY"
             and str(intent.get("strategy_owner") or "US_STANDARD").upper() == "US_STANDARD"
             and os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW").upper() == "ENFORCE"
