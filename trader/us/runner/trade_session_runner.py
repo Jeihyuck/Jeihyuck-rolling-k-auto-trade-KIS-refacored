@@ -1379,6 +1379,17 @@ def run_trade_session(
                 _opening_observer_log_stream = os.fdopen(
                     _obs_log_fd, "a", encoding="utf-8", buffering=1
                 )
+                # Start the existing isolated read-only WS collector early
+                # so opening observer subscriptions are possible before 10:00.
+                if os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
+                    try:
+                        from trader.marketdata.us_ws_collector import ensure_started
+                        ensure_started(env=env, offline=False)
+                    except Exception as _collector_early_exc:
+                        logger.warning(
+                            "[US_OPENING_OBSERVER][COLLECTOR_NOT_READY] type=%s",
+                            type(_collector_early_exc).__name__,
+                        )
                 _obs_env = {
                     **os.environ, "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
                     "US_KIS_ORDER_ALLOWED": "0", "KIS_ENV": "practice",
