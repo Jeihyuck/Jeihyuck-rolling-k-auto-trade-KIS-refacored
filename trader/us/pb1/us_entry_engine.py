@@ -1158,6 +1158,9 @@ def generate_entry_intents(
                     effective_mode, evaluate_price_opportunity,
                 )
                 _opportunity_mode = effective_mode()
+                if _opportunity_mode == "ENFORCE_NOT_APPROVED":
+                    track_skip(symbol, "ENTRY_TIMING_POLICY_NOT_APPROVED")
+                    continue
                 from trader.us.pb1.us_explain import normalize_us_entry_style
                 _family = normalize_us_entry_style(
                     (entry_meta or {}).get("entry_style_selected")
