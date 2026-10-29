@@ -128,3 +128,44 @@ def verify_exit_entry_link(exit_evidence: dict, entry_evidence: dict) -> bool:
         and left["position_lifecycle_id"] == right["position_lifecycle_id"]
         and exit_evidence["who"]["strategy_owner"] == entry_evidence["who"]["strategy_owner"]
     )
+
+def summarize_order_evidence(meta: dict, *, side: str) -> dict:
+    """Report-only verified evidence. Never turn missing fields into proof.
+
+    SELL additionally requires the exact matched original BUY link when
+    available. Legacy orders remain visibly UNVERIFIED, not silently green.
+    """
+    if not isinstance(meta, dict):
+        meta = {}
+    side = str(side or "").upper()
+    if side not in ALLOWED_SIDES:
+        return {"status": "INVALID_SIDE", "evidence_hash": None}
+    key = "entry_decision_evidence_5w1h" if side == "BUY" else "exit_decision_evidence_5w1h"
+    record = meta.get(key)
+    if side == "BUY" and not isinstance(record, dict):
+        contract = meta.get("entry_exit_contract") or {}
+        if isinstance(contract, dict):
+            record = (contract.get("entry_provenance") or {}).get(key)
+    if not isinstance(record, dict):
+        return {"status": "MISSING", "evidence_hash": None}
+    if not verify_decision_evidence(record) or (record.get("what") or {}).get("side") != side:
+        return {"status": "INVALID", "evidence_hash": None}
+    result = {
+        "status": "VERIFIED",
+        "evidence_hash": record["sha256"],
+        "decision_id": record["what"]["decision_id"],
+        "strategy_owner": record["who"]["strategy_owner"],
+        "decision_reason": record["why"]["decision_reason"],
+        "when": record["when"]["decision_at"],
+        "market_context": record["where"]["market_context"],
+        "facts": record["why"]["facts"],
+        "thresholds": record["why"]["thresholds"],
+        "changed_since_entry": record["why"]["changed_since_entry"],
+        "sizing": record["how"]["sizing"],
+        "entry_link": record["entry_link"],
+    }
+    if side == "BUY":
+        declared = meta.get("entry_decision_evidence_sha256")
+        if declared and declared != record["sha256"]:
+            result["status"] = "INVALID_DECLARED_DIGEST"
+    return result
