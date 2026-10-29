@@ -4992,6 +4992,51 @@ class OrdersRepo:
         return False, None
 
 
+    def list_kr_close_recovery_buy_orders(
+        self, env: str, strategy: str, codes: Iterable[str], trade_date: date,
+    ) -> list[dict]:
+        """Read exact current-day, broker-reconciled BUY contract candidates.
+
+        Do not use a latest-BUY code-only lookup: previous positions/epochs or
+        a later unrelated BUY must never donate DAY/SWING policy to a holding.
+        The caller must independently verify original KIS execution and current
+        KIS balance before any close-policy decision.
+        """
+        symbols = sorted({str(c or "").zfill(6) for c in codes if str(c or "").strip()})
+        if not symbols or str(strategy) != "pb1_pullback_close":
+            return []
+        from zoneinfo import ZoneInfo
+        trade_day = trade_date if isinstance(trade_date, date) else date.fromisoformat(str(trade_date))
+        first = datetime.combine(trade_day, datetime.min.time()).replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        last = first + timedelta(days=1)
+        conditions = [
+            self._schema.orders.c.env == _norm_env(env),
+            self._schema.orders.c.strategy == "pb1_pullback_close",
+            self._schema.orders.c.side == "BUY",
+            self._schema.orders.c.code.in_(symbols),
+            self._schema.orders.c.status == "RECONCILED",
+            self._schema.orders.c.created_at >= first,
+            self._schema.orders.c.created_at < last,
+        ]
+        active_epoch = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=trading_epoch_enforced(),
+        )
+        if active_epoch is not None:
+            conditions.append(self._schema.orders.c.trading_epoch_id == active_epoch)
+        statement = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(self._schema.orders.c.created_at.desc())
+            .limit(max(1, len(symbols) * 8))
+        )
+        # Conservative close-policy proof: a failed DB read is NOT an empty
+        # source of truth that authorizes a new SELL.
+        return self._read_mappings_with_guard(
+            statement, op_name="orders.list_kr_close_recovery_buy_orders",
+            fail_open=False,
+        )
+
     def find_latest_buy_entry_exit_plan(self, env: str, strategy: str, code: str, *, lookback: int | None = None) -> dict | None:
         lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
         conditions = [
