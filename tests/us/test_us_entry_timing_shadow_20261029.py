@@ -31,3 +31,21 @@ def test_pullback_does_not_require_vwap():
                       live_facts={"quote_fresh": True, "support_reaction_confirmed": True,
                                   "above_vwap": False})
     assert record["timing_state"] == "BUY_READY"
+
+def test_derived_freshness_requires_actual_timestamped_kis_quote():
+    from trader.us.entry_timing_shadow import derive_quote_freshness
+    assert not derive_quote_freshness({"source": "KIS_CACHE", "last": 100,
+                                       "age_sec": 0}, now_epoch=1000)["quote_fresh"]
+    assert not derive_quote_freshness({"source": "PREP", "last": 100,
+                                       "asof_epoch": 999}, now_epoch=1000)["quote_fresh"]
+    fresh = derive_quote_freshness({"source": "KIS_LIVE", "last": 100,
+                                   "asof_epoch": 998}, now_epoch=1000)
+    assert fresh["quote_fresh"] is True
+    assert fresh["age_sec"] == 2.0
+
+def test_future_and_expired_quotes_are_not_proof():
+    from trader.us.entry_timing_shadow import derive_quote_freshness
+    for timestamp in [900, 1005]:
+        evidence = derive_quote_freshness({"source": "KIS_LIVE", "last": 100,
+                                           "asof_epoch": timestamp}, now_epoch=1000)
+        assert not evidence["quote_fresh"]
