@@ -4,7 +4,8 @@ import math
 from statistics import median
 
 PHASES = ("signal_to_intent", "intent_to_risk", "risk_to_submit",
-          "submit_to_ack", "ack_to_fill", "fill_to_persist", "stage4_ready_interval")
+          "submit_to_ack", "ack_to_fill", "fill_to_persist", "stage4_ready_interval",
+          "broker_http")
 
 def percentile(values: list[float], fraction: float) -> float | None:
     vals = sorted(float(x) for x in values)
@@ -18,10 +19,24 @@ def percentile(values: list[float], fraction: float) -> float | None:
 def latency_summary(samples: list[dict], *, ready_stale_seconds: float = 30.0) -> dict:
     """Analyze elapsed *monotonic* phase durations in seconds; never count missing as zero."""
     out = {"sample_count": len(samples), "phases": {}, "invalid_count": 0}
-    for phase in PHASES:
+    for phase in PHASES + TICK_PHASES:
         numbers = []
         missing = 0
         for sample in samples:
+            if phase == "broker_http":
+                nested = sample.get("broker_http_by_attempt_sec")
+                if isinstance(nested, dict):
+                    for val in nested.values():
+                        try:
+                            duration = float(val)
+                        except (ValueError, TypeError):
+                            out["invalid_count"] += 1
+                            continue
+                        if math.isfinite(duration) and duration >= 0:
+                            numbers.append(duration)
+                        else:
+                            out["invalid_count"] += 1
+                    continue
             val = sample.get(phase)
             if val is None:
                 missing += 1
