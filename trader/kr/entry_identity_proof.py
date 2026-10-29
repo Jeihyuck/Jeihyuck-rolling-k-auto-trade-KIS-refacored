@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any
+import os
 
 from trader.trade_plan import ENTRY_STYLE_ALIAS, STYLE_PLAN_MAPPING
 
@@ -27,6 +28,20 @@ def entry_style_identity_proof(*, selected_style: Any, trigger_ok: bool,
         "contract_eod_action": mapped["eod_action"],
         "contract_force_eod_close": mapped["force_eod_close"],
     }
+
+
+def kr_practice_trend_swing_enabled(*, environment: str) -> bool:
+    """Enable verified NEW PB1 trend-swing entries in paper by default.
+
+    Real accounts are always excluded. An explicit environment value '0'
+    overrides the paper default, preserving the operational kill switch.
+    This gate never rewrites a previously frozen position's exit contract.
+    """
+    env = str(environment or "").strip().lower()
+    return (
+        env == "practice"
+        and os.getenv("PB1_KR_PRACTICE_TREND_SWING", "1").strip() == "1"
+    )
 
 
 def select_practice_trend_horizon(

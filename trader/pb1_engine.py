@@ -260,7 +260,7 @@ from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON a
 from trader.kr.account_risk import evaluate_kr_account_risk
 from trader.kr.regime_runtime import atomic_json_write, calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.kr.volume_proof import build_kr_volume_proof
-from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon
+from trader.kr.entry_identity_proof import entry_style_identity_proof, select_practice_trend_horizon, kr_practice_trend_swing_enabled
 from trader.kr.exit_latency_evidence import classify_exit_evaluation_latency, timed_ordered_exit_history
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
@@ -7304,10 +7304,21 @@ class PB1Engine:
         # provenance-verified, explicit practice opt-in may create a new SWING
         # contract; no existing positions or DAY contracts are rewritten.
         original_style = str(entry_style_selected or "").upper()
+        _kr_swing_env = str(getattr(self, "env", "") or "").strip().lower()
+        _kr_swing_config = os.environ.get("PB1_KR_PRACTICE_TREND_SWING")
+        _kr_swing_on = kr_practice_trend_swing_enabled(environment=_kr_swing_env)
+        logger.info(
+            "[KR][ENTRY][TREND_SWING_CONFIG] env=%s default=ON_PRACTICE "
+            "enabled=%s source=%s explicit_value=%s style=%s",
+            _kr_swing_env, int(_kr_swing_on),
+            "environment_override" if _kr_swing_config is not None else "practice_default",
+            _kr_swing_config if _kr_swing_config is not None else "<unset>",
+            original_style,
+        )
         trend_decision = select_practice_trend_horizon(
             selected_style=original_style,
-            environment=str(getattr(self, "env", "") or ""),
-            enabled=os.getenv("PB1_KR_PRACTICE_TREND_SWING", "0") == "1",
+            environment=_kr_swing_env,
+            enabled=_kr_swing_on,
             volume_proof=cf.features.get("volume_proof"),
             price=cf.features.get("current_price") or entry_price_for_plan,
             ma20=cf.features.get("ma20"),
