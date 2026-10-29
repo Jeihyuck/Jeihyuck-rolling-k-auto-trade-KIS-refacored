@@ -1340,7 +1340,13 @@ def run_trade_session(
         ):
             try:
                 import hashlib as _opening_hashlib
-                _obs_scope = str(session_account_scope)
+                # Prevent a practice-account reset/trading-epoch switch
+                # from borrowing the prior opening-window price history.
+                from trader.db.trading_epoch import active_trading_epoch_id
+                _obs_epoch = active_trading_epoch_id(env="practice", required=True)
+                if not _obs_epoch:
+                    raise RuntimeError("US_OPENING_OBSERVER_EPOCH_UNVERIFIED")
+                _obs_scope = str(session_account_scope) + ":" + str(_obs_epoch)
                 os.environ["US_ENTRY_WINDOW_SCOPE"] = _obs_scope
                 _obs_key = _opening_hashlib.sha256(
                     (str(env) + ":" + _obs_scope).encode()
