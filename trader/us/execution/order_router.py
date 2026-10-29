@@ -2137,6 +2137,47 @@ def route_order(
         # absolute deadline or after durable session authority has changed.
         if context is not None and not context.broker_submit_allowed():
             raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
+        # Price-aware BUY gate has a SECOND check at the native KIS HTTP
+        # boundary. Never use old 10:00 confirmation after 10:05, and never
+        # submit above the signed maximum entry price. Only one bounded
+        # collector IPC read; NO KIS HTTP round-trip and NO impact on SELL.
+        if (
+            side == "BUY"
+            and str(intent.get("position_action") or "") == "NEW_POSITION_BUY"
+            and str(intent.get("strategy_owner") or "US_STANDARD").upper() == "US_STANDARD"
+            and os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW").upper() == "ENFORCE"
+        ):
+            from trader.us.entry_timing.opportunity import (
+                effective_mode, pre_submit_timing_check,
+            )
+            if effective_mode() != "ENFORCE":
+                raise KisUSPreSubmitError("US_ENTRY_TIMING_POLICY_NOT_APPROVED")
+            _timing_quote = None
+            if os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
+                try:
+                    from trader.marketdata.us_ws_collector import get_quote
+                    _timing_quote = get_quote(
+                        symbol_upper, exchange, env=account_env,
+                        max_age_sec=5, timeout_sec=0.12,
+                    )
+                except (OSError, ValueError, RuntimeError) as _quote_exc:
+                    logger.warning(
+                        "[US_ORDER][TIMING_WS_UNAVAILABLE] symbol=%s error_type=%s",
+                        symbol_upper, type(_quote_exc).__name__,
+                    )
+            _timing_pass, _timing_reason = pre_submit_timing_check(
+                intent, now_epoch=time.time(), fresh_ws_quote=_timing_quote,
+            )
+            if not _timing_pass:
+                logger.warning(
+                    "[US_ORDER][TIMING_PRE_HTTP_BLOCK] symbol=%s reason=%s broker_submit=0",
+                    symbol_upper, _timing_reason,
+                )
+                raise KisUSPreSubmitError("US_ENTRY_" + _timing_reason)
+            logger.info(
+                "[US_ORDER][TIMING_PRE_HTTP_PASS] symbol=%s order_limit=%s",
+                symbol_upper, intent.get("limit_price"),
+            )
         observation_error = _record_claim_observation(
             "SUBMITTED", None, authoritative=False,
         )
@@ -2286,6 +2327,12 @@ def route_order(
                 "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
                 "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
+                "US_ENTRY_TIMING_POLICY_NOT_APPROVED",
+                "US_ENTRY_TIMING_PROOF_MISSING", "US_ENTRY_TIMING_PROOF_INVALID",
+                "US_ENTRY_TIMING_SIGNAL_EXPIRED",
+                "US_ENTRY_TIMING_PRICE_CAP_VIOLATED",
+                "US_ENTRY_TIMING_WS_QUOTE_MISSING", "US_ENTRY_TIMING_WS_QUOTE_STALE",
+                "US_ENTRY_TIMING_BROKER_PRICE_MOVED",
             )
             failure_code = next((code for code in guard_codes if code in str(exc)),
                                 "pre_http_setup_failed")
