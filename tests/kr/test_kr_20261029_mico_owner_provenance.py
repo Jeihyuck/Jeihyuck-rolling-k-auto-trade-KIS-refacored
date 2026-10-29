@@ -34,7 +34,7 @@ def _observation(order, request):
         order=order, request_json=request,
         broker_trade_date=date(2026, 10, 29),
         requested_qty=79, cumulative_qty=79,
-        evidence_type="KIS_EXECUTION_CUMULATIVE",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
         evidence_digest="immutable-daily-ccld:20261029:0000012345",
         execution_price=26050,
         execution_qty=79,
