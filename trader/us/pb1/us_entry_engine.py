@@ -1593,6 +1593,64 @@ def generate_entry_intents(
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
 
+        # Decision evidence is an audit sidecar, never a broker permission gate.
+        # Missing deployment SHA or questionable inputs must not delay BUY/SELL.
+        if position_action in {"NEW_POSITION_BUY", "ADD_TO_EXISTING_BUY"}:
+            try:
+                from trader.us.decision_evidence_5w1h import build_decision_evidence
+                from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
+                _code_sha = str(os.getenv("US_PINNED_CODE_SHA") or os.getenv("GITHUB_SHA") or "UNKNOWN")
+                _decision_at = (now or datetime.now().astimezone()).isoformat()
+                # ADD_BUY is a new purchase decision, but retains the parent
+                # position's *existing* frozen exit management contract.
+                _parent_entry = {}
+                if position_action == "ADD_TO_EXISTING_BUY":
+                    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+                    _parent_contract = extract_us_entry_exit_contract(
+                        held_snapshot, held_snapshot.get("meta"),
+                    )
+                    _parent_entry = (_parent_contract.get("entry_provenance") or {}).get(
+                        "entry_decision_evidence_5w1h"
+                    ) or {}
+                _parent_id = (_parent_entry.get("what") or {}).get("decision_id")
+                _parent_hash = _parent_entry.get("sha256")
+                _evidence = build_decision_evidence(
+                    decision_id=f"US_STANDARD:{trade_date_for_key}:{client_order_key}",
+                    side="BUY", strategy_owner="US_STANDARD", symbol=symbol,
+                    decision_at=_decision_at,
+                    policy_version=US_ENTRY_EXIT_CONTRACT_VERSION, code_sha=_code_sha,
+                    position_lifecycle_id=position_lifecycle_id,
+                    decision_reason=str(durable_meta.get("entry_reason") or "UNKNOWN"),
+                    facts={
+                        "entry_style": intent.get("entry_style_selected") or intent.get("entry_style"),
+                        "score_final": intent.get("score_final"),
+                        "trend_score": intent.get("trend_score"),
+                        "entry_signal_evidence": durable_meta.get("entry_signal_evidence"),
+                        "momentum_pass": durable_meta.get("momentum_pass"),
+                        "pullback_pass": durable_meta.get("pullback_pass"),
+                        "breakout_pass": durable_meta.get("breakout_pass"),
+                        "vcp_pass": durable_meta.get("vcp_pass"),
+                        "intraday_timing_confirmed": None,
+                    },
+                    thresholds={"min_score": float(os.getenv("US_MIN_ENTRY_SCORE", "0.05"))},
+                    market_context={
+                        "market_state": intent.get("market_state"),
+                        "market_regime": intent.get("market_regime"),
+                    },
+                    sizing={"qty": qty, "limit_price": limit_price,
+                            "notional_usd": notional, "position_action": position_action},
+                    entry_decision_id=_parent_id,
+                    entry_evidence_hash=_parent_hash,
+                )
+                durable_meta["entry_decision_evidence_5w1h"] = _evidence
+                durable_meta["entry_decision_evidence_sha256"] = _evidence["sha256"]
+                intent["entry_decision_id"] = _evidence["what"]["decision_id"]
+            except (TypeError, ValueError, ImportError) as exc:
+                logger.warning(
+                    "[US_ENTRY][DECISION_EVIDENCE_UNAVAILABLE] symbol=%s error_type=%s",
+                    symbol, type(exc).__name__,
+                )
+
         if _stop_if_cancelled("before_order_preflight"):
             break
         if intent_acceptor is not None:
