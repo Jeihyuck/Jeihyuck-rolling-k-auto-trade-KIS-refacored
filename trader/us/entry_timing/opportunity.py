@@ -126,6 +126,18 @@ def evaluate_price_opportunity(
     if now_et.tzinfo is None:
         return _decision("WAIT", "timezone_missing", style=style, facts=facts)
     now_et = now_et.astimezone(NY)
+    # The observation sidecar may have advanced while the Tick was working.
+    # Ignore bars that did not exist at the Tick's own decision timestamp.
+    _asof_bars = []
+    for _bar in verified_bars:
+        try:
+            _bar_at = datetime.fromisoformat(str(_bar["time_et"])).astimezone(NY)
+        except (KeyError, ValueError, TypeError):
+            continue
+        if _bar_at.date().isoformat() == trade_date and _bar_at + timedelta(minutes=1) <= now_et:
+            _asof_bars.append(_bar)
+    verified_bars = sorted(_asof_bars, key=lambda b: b["time_et"])
+    facts["bar_count"] = len(verified_bars)
     if now_et.date().isoformat() != trade_date:
         return _decision("WAIT", "trade_date_mismatch", style=style, facts=facts)
     if (now_et.hour, now_et.minute) < (10, 0):
