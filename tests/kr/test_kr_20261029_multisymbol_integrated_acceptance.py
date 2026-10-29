@@ -25,7 +25,9 @@ from tests.kr.test_kr_20261029_mico_broker_proven_day_close import (
 from tests.kr.test_kr_20261029_mico_fill_text_json_postgres import kr_mico_text_engine
 
 KST = ZoneInfo("Asia/Seoul")
-CODES = ["059090"] + [f"{i:06d}" for i in range(10001, 10030)]
+# Frozen 2026-10-28 practice Final30 as recorded in pb1_watchlist_final_scored.
+# Symbols are data, not hardcoded trading policy; these tests submit no orders.
+CODES = ["005930","459580","009150","133690","360750","379810","379800","402340","006400","028050","353200","066570","096770","010170","036540","033780","011200","458730","253590","144960","126340","086450","059090","012750","041510","251970","121600","035760","093320","079940"]
 assert len(CODES) == len(set(CODES)) == 30
 
 
