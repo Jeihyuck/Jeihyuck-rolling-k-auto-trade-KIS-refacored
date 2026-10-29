@@ -271,3 +271,22 @@ def test_frozen_position_contract_retains_exact_price_opportunity_evidence():
         contract["entry_provenance"]["us_entry_opportunity_v1"]["evidence_sha256"]
         == observed["evidence_sha256"]
     )
+
+def test_max_entry_price_satisfies_rr_and_stop_distance_at_final_limit():
+    bars = sample_bars()
+    stop = min(x["low"] for x in bars[-3:])
+    ask = sample_quote()["ask"]
+    target = ask + 1.6 * (ask - stop)
+    decision = evaluate_price_opportunity(
+        style="ENTRY_BREAKOUT", trade_date=DAY,
+        now_et=datetime(2026, 10, 28, 10, 5, tzinfo=NY),
+        verified_bars=bars, quote=sample_quote(),
+        prep={"breakout_pivot_price": 95.5,
+              "timing_target_reference": target},
+    )
+    assert decision["state"] == "READY", decision
+    ceiling = decision["max_entry_price"]
+    rr_at_order_limit = (target - ceiling) / (ceiling - stop)
+    risk_at_order_limit = (ceiling - stop) / ceiling
+    assert rr_at_order_limit >= 1.5 - 1e-8
+    assert risk_at_order_limit <= 0.025 + 1e-8
