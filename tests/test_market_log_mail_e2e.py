@@ -403,7 +403,7 @@ def test_stage4_referenced_worker_log_archived_and_redacted(tmp_path):
         assert b"no-secret-mail" not in data
         assert b"db-password-123" not in data
         manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
-        assert worker_rel in str(manifest["included_evidence"])
+        assert worker_rel in manifest["included_required_files"]
 
 
 def test_stage4_missing_referenced_log_degrades_but_does_not_cancel_mail(tmp_path):
@@ -416,5 +416,5 @@ def test_stage4_missing_referenced_log_degrades_but_does_not_cancel_mail(tmp_pat
     with tarfile.open(archive, "r:gz") as tf:
         manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
         assert manifest["required_missing_count"] >= 1
-        assert manifest["status"] in {"DEGRADED", "DRY_RUN"}
-        assert {"code": "US_STAGE4_WORKER_LOG_MISSING", "path": worker_rel} in manifest["missing_evidence"]
+        assert manifest["evidence_status"] == "DEGRADED"
+        assert {"code": "REQUIRED_STAGE4_WORKER_LOG_MISSING_am", "path": worker_rel} in manifest["missing_evidence"]
