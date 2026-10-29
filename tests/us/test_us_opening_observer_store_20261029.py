@@ -99,3 +99,19 @@ def test_broker_minute_endpoint_is_read_only_and_bounded(monkeypatch):
     assert calls["params"]["NREC"] == "120"
     assert calls["path"].endswith("inquire-time-itemchartprice")
     assert calls["params"]["NEXT"] == ""
+
+def test_observer_preserves_all_standard_prep_exchange_aliases_without_cross_owner():
+    from trader.us.entry_timing.opening_observer import standard_entry_pairs
+    pairs = standard_entry_pairs([
+        {"symbol": "ELV", "exchange": "NYS", "strategy_owner": "US_STANDARD"},
+        {"symbol": "PG", "exchange": "NYSE", "strategy_owner": "US_STANDARD"},
+        {"symbol": "MCK", "exchange": "NASD", "strategy_owner": "US_STANDARD"},
+        {"symbol": "MDLZ", "exchange": "NAS", "strategy_owner": "US_STANDARD"},
+        {"symbol": "TQQQ", "exchange": "NASDAQ", "strategy_owner": "TQQQ_INFINITE"},
+        {"symbol": "XYZ", "exchange": "NAS", "strategy_owner": "OTHER_SLEEVE"},
+        {"symbol": "ELV", "exchange": "NYSE"},
+    ])
+    assert pairs == [
+        ("ELV", "NYSE"), ("PG", "NYSE"), ("MCK", "NASDAQ"),
+        ("MDLZ", "NASDAQ"),
+    ]
