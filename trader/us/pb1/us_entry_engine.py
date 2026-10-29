@@ -1593,6 +1593,38 @@ def generate_entry_intents(
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
 
+        # Independent timing observation: no extra KIS I/O and no order authority.
+        # Cached PREP prices without observed quote freshness stay UNKNOWN/WAIT.
+        if position_action == "NEW_POSITION_BUY":
+            try:
+                from trader.us.entry_timing_shadow import evaluate_entry_timing_shadow
+                _style = str(intent.get("entry_style_selected") or intent.get("entry_style") or "").upper()
+                if not _style.startswith("ENTRY_"):
+                    _style = "ENTRY_" + _style
+                _fresh = bool(
+                    existing_price is None and isinstance(current, dict)
+                    and not _quote_is_stale(current)
+                    and str(current.get("source") or "").upper() in {"KIS_LIVE", "KIS_CACHE"}
+                )
+                _facts = {
+                    "quote_fresh": _fresh,
+                    "support_reaction_confirmed": (entry_meta or {}).get("support_reaction_confirmed"),
+                    "intraday_continuation_confirmed": (entry_meta or {}).get("intraday_continuation_confirmed"),
+                    "volume_confirmation": (entry_meta or {}).get("volume_confirmation"),
+                    "pivot_breakout_confirmed": (entry_meta or {}).get("pivot_breakout_confirmed"),
+                    "vcp_live_breakout_verified": (entry_meta or {}).get("vcp_live_breakout_verified"),
+                }
+                _shadow = evaluate_entry_timing_shadow(
+                    owner="US_STANDARD", style=_style, prep_eligible=True,
+                    live_facts=_facts,
+                )
+                intent.setdefault("meta", {})["entry_timing_shadow_v1"] = _shadow
+                logger.info("[US_ENTRY][TIMING_SHADOW] symbol=%s family=%s state=%s reason=%s",
+                            symbol, _style, _shadow["timing_state"], _shadow["reason"])
+            except (TypeError, ValueError, ImportError) as exc:
+                logger.warning("[US_ENTRY][TIMING_SHADOW_UNAVAILABLE] symbol=%s type=%s",
+                               symbol, type(exc).__name__)
+
         if _stop_if_cancelled("before_order_preflight"):
             break
         if intent_acceptor is not None:
