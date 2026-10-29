@@ -49,3 +49,30 @@ def evaluate_entry_timing_shadow(
     else:
         result.update(timing_state="BUY_READY", reason="shadow_timing_confirmed")
     return result
+
+def derive_quote_freshness(quote: dict | None, *, now_epoch: float, max_age_sec: float = 15.0) -> dict:
+    """Require an actual timestamp and trusted broker quote provenance.
+
+    An old PREP cached_price cannot masquerade as a live quote because its
+    score, existence, or age_sec string alone is never a freshness proof.
+    """
+    if not isinstance(quote, dict):
+        return {"quote_fresh": False, "quote_reason": "missing_live_quote"}
+    if quote.get("stale") or quote.get("suspect") or quote.get("_stale_date"):
+        return {"quote_fresh": False, "quote_reason": "quote_stale_or_suspect"}
+    if str(quote.get("quality") or "").lower() in {"stale", "suspect", "degraded"}:
+        return {"quote_fresh": False, "quote_reason": "quote_quality_invalid"}
+    if str(quote.get("source") or "").upper() not in {"KIS_LIVE", "KIS_CACHE"}:
+        return {"quote_fresh": False, "quote_reason": "unverified_quote_source"}
+    try:
+        ts = float(quote.get("asof_epoch"))
+        last = float(quote.get("last"))
+        age = float(now_epoch) - ts
+    except (TypeError, ValueError, OverflowError):
+        return {"quote_fresh": False, "quote_reason": "quote_timestamp_or_price_missing"}
+    import math
+    if not all(math.isfinite(x) for x in (ts, last, age)) or last <= 0:
+        return {"quote_fresh": False, "quote_reason": "quote_timestamp_or_price_invalid"}
+    if age < -2.0 or age > max_age_sec:
+        return {"quote_fresh": False, "quote_reason": "quote_age_out_of_bounds"}
+    return {"quote_fresh": True, "quote_reason": "broker_timestamp_verified", "age_sec": round(age, 3)}
