@@ -892,6 +892,8 @@ def run_trade_session(
     session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
     _unreaped_child_seen = False
     _shadow_reconcile_child: subprocess.Popen | None = None
+    _opening_observer_child: subprocess.Popen | None = None
+    _opening_observer_log_stream = None
     _stage4_worker_log_stream = None
     final_status = "OK"
     final_reason = "session_end"
@@ -1354,6 +1356,94 @@ def run_trade_session(
                 )
             except Exception as exc:
                 logger.warning("[US_SESSION][ENTRY_CACHE][SKIP] trade_date=%s error=%s", trade_date, exc)
+
+        # Independent, READ-ONLY KIS 1m bar observer; starts even while
+        # opening BUY permission is blocked. It is not a Tick child and cannot
+        # submit any BUY/SELL order or seize the broker order lock.
+        _timing_mode = str(os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW")).upper()
+        if (
+            session == "am" and not offline and str(env).lower() == "practice"
+            and os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
+            and _timing_mode in {"SHADOW", "ENFORCE"}
+            and locked_watchlist_cache
+        ):
+            try:
+                import hashlib as _opening_hashlib
+                # Prevent a practice-account reset/trading-epoch switch
+                # from borrowing the prior opening-window price history.
+                from trader.db.trading_epoch import active_trading_epoch_id
+                _obs_epoch = active_trading_epoch_id(env="practice", required=True)
+                if not _obs_epoch:
+                    raise RuntimeError("US_OPENING_OBSERVER_EPOCH_UNVERIFIED")
+                _obs_scope = str(session_account_scope) + ":" + str(_obs_epoch)
+                os.environ["US_ENTRY_WINDOW_SCOPE"] = _obs_scope
+                _obs_key = _opening_hashlib.sha256(
+                    (str(env) + ":" + _obs_scope).encode()
+                ).hexdigest()[:20]
+                _obs_dir = Path("runtime/private")
+                _obs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                _obs_file = _obs_dir / (
+                    "us-opening-watchlist-" + _obs_key + "-" + trade_date + ".json"
+                )
+                _obs_temp = _obs_file.with_suffix(".tmp")
+                _obs_rows = [
+                    {"symbol": str(row.get("symbol") or "").upper(),
+                     "exchange": str(row.get("exchange") or "").upper()}
+                    for row in locked_watchlist_cache[:30] if isinstance(row, dict)
+                ]
+                _obs_fd = os.open(
+                    str(_obs_temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(_obs_fd, "w", encoding="utf-8") as _obs_handle:
+                    json.dump(_obs_rows, _obs_handle)
+                _obs_temp.replace(_obs_file)
+                _obs_log_dir = Path("runtime/logs")
+                _obs_log_dir.mkdir(parents=True, exist_ok=True)
+                _obs_log_path = _obs_log_dir / (
+                    "us-opening-observer-" + trade_date + "-" + _obs_key + ".log"
+                )
+                _obs_log_fd = os.open(
+                    str(_obs_log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600
+                )
+                _opening_observer_log_stream = os.fdopen(
+                    _obs_log_fd, "a", encoding="utf-8", buffering=1
+                )
+                # Start the existing isolated read-only WS collector early
+                # so opening observer subscriptions are possible before 10:00.
+                if os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
+                    try:
+                        from trader.marketdata.us_ws_collector import ensure_started
+                        ensure_started(env=env, offline=False)
+                    except Exception as _collector_early_exc:
+                        logger.warning(
+                            "[US_OPENING_OBSERVER][COLLECTOR_NOT_READY] type=%s",
+                            type(_collector_early_exc).__name__,
+                        )
+                _obs_env = {
+                    **os.environ, "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
+                    "US_KIS_ORDER_ALLOWED": "0", "KIS_ENV": "practice",
+                }
+                _opening_observer_child = subprocess.Popen(
+                    [
+                        sys.executable, "-m", "trader.us.entry_timing.opening_observer",
+                        "--env", "practice", "--trade-date", trade_date,
+                        "--scope", _obs_scope, "--parent-pid", str(os.getpid()),
+                        "--watchlist-file", str(_obs_file),
+                    ],
+                    env=_obs_env, stdin=subprocess.DEVNULL,
+                    stdout=_opening_observer_log_stream,
+                    stderr=_opening_observer_log_stream, close_fds=True,
+                )
+                logger.info(
+                    "[US_OPENING_OBSERVER][START] pid=%s symbols=%d mode=%s "
+                    "read_only=1 entry_gate_unmodified=1",
+                    _opening_observer_child.pid, len(_obs_rows), _timing_mode,
+                )
+            except Exception as _obs_exc:
+                logger.warning(
+                    "[US_OPENING_OBSERVER][START_FAILED] type=%s action=CONTINUE_SELL",
+                    type(_obs_exc).__name__,
+                )
 
         # Child processes are ephemeral. The parent owns only immutable,
         # quality-checked completed-day context, never live quotes or positions.
@@ -3083,6 +3173,26 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        # Market-data observer is isolated from the SELL execution authority.
+        if _opening_observer_child is not None:
+            try:
+                if _opening_observer_child.poll() is None:
+                    _opening_observer_child.terminate()
+                _opening_observer_child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _opening_observer_child.kill()
+                _opening_observer_child.wait(timeout=2)
+            except Exception as _obs_stop_exc:
+                logger.warning(
+                    "[US_OPENING_OBSERVER][STOP_UNAVAILABLE] type=%s",
+                    type(_obs_stop_exc).__name__,
+                )
+            else:
+                logger.info("[US_OPENING_OBSERVER][STOPPED] pid=%s",
+                            _opening_observer_child.pid)
+        if _opening_observer_log_stream is not None:
+            _opening_observer_log_stream.close()
+        os.environ.pop("US_ENTRY_WINDOW_SCOPE", None)
         # Reap the *read-only* observer independently of Tick children.
         # It never owns the order submission lock, so its lifecycle cannot
         # clear an unverified live Tick or an unresolved execution Claim.
