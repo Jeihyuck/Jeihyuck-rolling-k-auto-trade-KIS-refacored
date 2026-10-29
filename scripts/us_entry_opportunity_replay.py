@@ -55,8 +55,24 @@ def replay(payload: dict) -> dict:
     }
     if ready is None:
         return result
-    # A forward MAE/MFE is observational, not a realized trade or PnL.
+    # Baseline comparison is available from the observed READY quote even
+    # when no later bars exist. Do not claim a fill or realized profit.
     instant, entry_decision = ready
+    entry = float(entry_decision["decision_price"])
+    baseline = payload.get("original_fill_price")
+    if baseline is not None:
+        try:
+            baseline = float(baseline)
+        except (TypeError, ValueError, OverflowError):
+            baseline = None
+        if baseline is not None and 0 < baseline < float("inf"):
+            result["baseline_comparison"] = {
+                "original_fill_price": baseline,
+                "first_ready_quote_price": entry,
+                "entry_price_delta_pct": round(100 * (entry / baseline - 1), 4),
+                "missed_opportunity_risk": "UNMEASURED",
+            }
+    # A forward MAE/MFE is observational, not a realized trade or PnL.
     forward = normalize_bars(
         raw, trade_date=trade_date, now_et=instant + timedelta(minutes=61)
     )
@@ -75,16 +91,6 @@ def replay(payload: dict) -> dict:
         "last_close_return_pct": round(100 * (future[-1]["close"] / entry - 1), 4),
         "trade_pnl": None, "fees_and_slippage": None,
     }
-    baseline = payload.get("original_fill_price")
-    if baseline is not None:
-        baseline = float(baseline)
-        if baseline > 0:
-            result["baseline_comparison"] = {
-                "original_fill_price": baseline,
-                "first_ready_quote_price": entry,
-                "entry_price_delta_pct": round(100 * (entry / baseline - 1), 4),
-                "missed_opportunity_risk": "UNMEASURED",
-            }
     return result
 
 
