@@ -1338,6 +1338,16 @@ def run_daily_report(
                                 report.get("report_consistency", "OK"), "REPORT_INCONSISTENT"
                             )
                             logger.error("[US_DAILY_REPORT][%s]", warning)
+                        # Report-only: evidence verification never alters broker truth.
+                        try:
+                            from trader.us.decision_evidence_5w1h import summarize_order_evidence
+                            _decision_evidence = summarize_order_evidence(meta, side=side)
+                        except Exception as _evidence_exc:
+                            _decision_evidence = {"status": "UNAVAILABLE", "evidence_hash": None}
+                            logger.warning(
+                                "[US_DAILY_REPORT][DECISION_EVIDENCE_ERROR] symbol=%s type=%s",
+                                order.get("symbol"), type(_evidence_exc).__name__,
+                            )
                         report.setdefault("order_audit", []).append({
                             "symbol": order.get("symbol"), "side": side,
                             "strategy_owner": meta.get("strategy_owner") or order.get("strategy_owner"),
@@ -1385,6 +1395,9 @@ def run_daily_report(
                             )},
                             "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
                             "canonical_order_no": meta.get("order_no_norm"),
+                            "decision_evidence_5w1h": _decision_evidence,
+                            "decision_evidence_status": _decision_evidence.get("status"),
+                            "decision_evidence_sha256": _decision_evidence.get("evidence_hash"),
                             "client_order_key": order.get("client_order_key"),
                             "submit_attempt_id": meta.get("submit_attempt_id"),
                             "submitted_at": timeline.get("submitted_at"),
@@ -1971,6 +1984,31 @@ def run_daily_report(
         _reason = _trade.get("reason") or _trade.get("strategy_reason") or _trade.get("entry_reason") or ""
         _pnl = _trade.get("gross_realized_pnl") if str(_trade.get("side") or "").upper() == "SELL" else _trade.get("same_day_buy_lot_unrealized_pnl_usd")
         md_lines.append(f"- {_trade.get('symbol','')} {_trade.get('side','')}: reason={_reason} filled_qty={_trade.get('filled_qty')} fill_price={_trade.get('fill_price')} pnl_usd={_pnl}")
+    md_lines.append("")
+    md_lines.extend(["## Verified Trade Decision Evidence (5W1H)", ""])
+    for _audit in report.get("order_audit") or []:
+        _evidence = _audit.get("decision_evidence_5w1h") or {}
+        _label = f"{_audit.get('symbol', '?')} {_audit.get('side', '?')}"
+        _status = _evidence.get("status") or "MISSING"
+        if _status != "VERIFIED":
+            md_lines.append(f"- {_label}: evidence={_status}; no verified 5W1H claim")
+            continue
+        # Quote values are structured observed facts, never generated rationale.
+        def _safe_cell(_value):
+            return str(_value).replace("|", "/").replace("\\n", " ").replace("\\r", " ")
+        md_lines.extend([
+            f"### {_label} — {_safe_cell(_evidence.get('decision_reason'))}",
+            f"- Who: {_safe_cell(_evidence.get('strategy_owner'))}",
+            f"- What: {_safe_cell(_audit.get('position_lifecycle_id'))}; key={_safe_cell(_audit.get('client_order_key'))}",
+            f"- When: {_safe_cell(_evidence.get('when'))}",
+            f"- Where: {_safe_cell(_evidence.get('market_context'))}",
+            f"- Why: facts={_safe_cell(_evidence.get('facts'))}; thresholds={_safe_cell(_evidence.get('thresholds'))}",
+            f"- How: {_safe_cell(_evidence.get('sizing'))}",
+            f"- Changed since entry: {_safe_cell(_evidence.get('changed_since_entry'))}",
+            f"- Entry evidence link: {_safe_cell(_evidence.get('entry_link'))}",
+            f"- Evidence SHA-256: \`{_safe_cell(_evidence.get('evidence_hash'))}\`",
+            "",
+        ])
     md_lines.append("")
 
     if session:
