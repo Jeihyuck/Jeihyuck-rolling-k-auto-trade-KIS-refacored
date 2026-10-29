@@ -268,15 +268,24 @@ def evaluate_price_opportunity(
     if rr is None or rr < min_rr:
         return _decision("WAIT", "unfavorable_reference_reward_risk", style=style, facts=facts,
                          price=fresh_price, stop_reference=stop, target_reference=target, rr=rr)
-    # A favorable limit is a ceiling, not a promise of execution or slippage.
-    ceiling = min(ask * (1 + 0.001), target - min_rr * (ask - stop))
+    # Solve the price ceiling using the FINAL executable limit, not today's
+    # ask: (target - limit)/(limit - stop) >= required reference R:R.
+    # Also re-evaluate structural distance at the final order limit.
+    rr_ceiling = (target + min_rr * stop) / (1.0 + min_rr)
+    risk_ceiling = stop / (1.0 - max_stop_distance)
+    ceiling = min(ask * (1 + 0.001), rr_ceiling, risk_ceiling)
+    # Conservative tick-independent 4dp floor: rounding UP could violate R:R.
+    import math as _math
+    ceiling = _math.floor(ceiling * 10000.0) / 10000.0
+    facts["rr_price_ceiling"] = round(rr_ceiling, 6)
+    facts["max_risk_price_ceiling"] = round(risk_ceiling, 6)
     if ceiling < ask:
         return _decision("WAIT", "entry_ceiling_below_ask", style=style, facts=facts,
                          price=fresh_price, stop_reference=stop, target_reference=target, rr=rr)
     facts["phase"] = "READY"
     return _decision("READY", "confirmed_rebound_or_breakout_with_price_room",
                      style=style, facts=facts, price=fresh_price,
-                     max_entry_price=round(ceiling, 4),
+                     max_entry_price=ceiling,
                      stop_reference=stop, target_reference=target, rr=rr)
 
 
