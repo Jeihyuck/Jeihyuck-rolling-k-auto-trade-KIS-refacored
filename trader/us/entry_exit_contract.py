@@ -16,6 +16,7 @@ US_ENTRY_EXIT_CONTRACT_VERSION = "us_entry_exit_contract_v2"
 _PROVENANCE_FIELDS = (
     "entry_reason", "entry_style_selected", "entry_style_raw", "entry_component", "entry_signal_type",
     "reasons", "filters_passed", "score_breakdown", "explanation_quality",
+    "entry_decision_evidence_5w1h", "entry_decision_evidence_sha256",
     "entry_identity_proof",
     "rank_final30", "score_final", "trend_score", "theme_cluster", "sector",
     "industry", "market_state", "market_regime", "rotation_regime",
