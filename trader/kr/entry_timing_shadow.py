@@ -88,7 +88,8 @@ def evaluate_kr_timing_shadow(
     # Same exchange second is one observation, regardless of repeated scheduler ticks.
     dedup: dict[datetime, tuple[datetime, float, dict[str, Any]]] = {r[0]: r for r in filtered}
     ordered = sorted(dedup.values(), key=lambda r: r[0])
-    opening = [r for r in ordered if time(9, 0) <= r[0].time() < time(9, 30)]
+    opening = [r for r in ordered if time(9, 0) <= r[0].time() < time(9, 30)
+               and bool(r[2].get("quote_fresh"))]
     base["opening_samples"] = len(opening)
     if opening:
         base["opening_observed_high"] = max(r[1] for r in opening)
@@ -107,6 +108,8 @@ def evaluate_kr_timing_shadow(
         return {**base, "reason": "AWAIT_POST_OPENING_QUOTE"}
     if len(ordered) < 3:
         return {**base, "reason": "NOT_ENOUGH_PRICE_OBSERVATIONS"}
+    if not all(bool(r[2].get("quote_fresh")) for r in ordered[-3:]):
+        return {**base, "state": "UNKNOWN", "reason": "RECENT_QUOTES_UNVERIFIED"}
     prices = [r[1] for r in ordered[-3:]]
     rising = prices[0] < prices[1] < prices[2]
     vwap = _number(current[2].get("vwap"))
@@ -124,7 +127,11 @@ def evaluate_kr_timing_shadow(
             return {**detail, "reason": "RVOL_BELOW_EXPLORATORY_THRESHOLD"}
         if (rising and trigger_ok and current[1] > base["opening_observed_high"]):
             return {**detail, "state": "READY_SHADOW", "reason": "MOMENTUM_OPENING_HIGH_BREAKOUT"}
-        if rising and all(r[1] > vwap for r in ordered[-2:]):
+        earlier_below_vwap = any(
+            (prior_vwap := _number(r[2].get("vwap"))) is not None and r[1] < prior_vwap
+            for r in ordered[:-2]
+        )
+        if rising and earlier_below_vwap and all(r[1] > vwap for r in ordered[-2:]):
             return {**detail, "state": "READY_SHADOW", "reason": "MOMENTUM_SUSTAINED_RECLAIM"}
         return {**detail, "reason": "NO_CONFIRMED_MOMENTUM_RESUMPTION"}
     if style == "ENTRY_BREAKOUT":
