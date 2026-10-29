@@ -18,6 +18,7 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
     shutil.copy2(ROOT / "scripts/notify/send_mail_attachment.py", root / "scripts/notify/send_mail_attachment.py")
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-trading-day.py", root / "scripts/wsl/check-nullim-trading-day.py")
     shutil.copy2(ROOT / "scripts/wsl/resolve-nullim-python.sh", root / "scripts/wsl/resolve-nullim-python.sh")
+    shutil.copy2(ROOT / "scripts/wsl/redact-log-archive.py", root / "scripts/wsl/redact-log-archive.py")
     (root / "trader").mkdir()
     shutil.copy2(ROOT / "trader/__init__.py", root / "trader/__init__.py")
     shutil.copy2(ROOT / "trader/time_utils.py", root / "trader/time_utils.py")
@@ -378,3 +379,42 @@ def test_final_health_requires_real_mail_and_returns_matching_exit_code(tmp_path
     (health/f"kr-mail-{DATE}.json").write_text(json.dumps({"status":"OK","mail_sent":True,"market":"kr","trade_date":DATE,"required_missing_count":0,"archive_sha256":"x"}))
     success=subprocess.run(["bash",str(scripts/"check-nullim-day-health.sh"),"kr",DATE],cwd=root,env=health_env)
     assert success.returncode == 0
+
+
+def test_stage4_referenced_worker_log_archived_and_redacted(tmp_path):
+    """Use the exact child path, even when the run token omits 'afternoon'."""
+    root = fixture_repo(tmp_path, "us")
+    worker_rel = f"runtime/logs/us-stage4-worker-{DATE}-randomtoken.log"
+    session = root / f"runtime/logs/us/{DATE}/afternoon/attempt-1.log"
+    session.write_text(f"[US_STAGE4][CHILD_LOG] path={worker_rel}\n")
+    worker = root / worker_rel
+    worker.parent.mkdir(parents=True, exist_ok=True)
+    worker.write_text(
+        "US_STAGE4_WORKER_ERROR KIS_APP_SECRET=no-secret-mail\n"
+        "DB_URL_TRACE postgresql://user:db-password-123@db.internal:5432/trades\n"
+    )
+    result, archive = run_mail(root, "us")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        names = tf.getnames()
+        assert "./" + worker_rel in names
+        data = tf.extractfile("./" + worker_rel).read()
+        assert b"US_STAGE4_WORKER_ERROR" in data
+        assert b"no-secret-mail" not in data
+        assert b"db-password-123" not in data
+        manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
+        assert worker_rel in str(manifest["included_evidence"])
+
+
+def test_stage4_missing_referenced_log_degrades_but_does_not_cancel_mail(tmp_path):
+    root = fixture_repo(tmp_path, "us")
+    worker_rel = f"runtime/logs/us-stage4-worker-{DATE}-missingtoken.log"
+    session = root / f"runtime/logs/us/{DATE}/am/attempt-1.log"
+    session.write_text(f"[US_STAGE4][CHILD_LOG] path={worker_rel}\n")
+    result, archive = run_mail(root, "us")
+    assert result.returncode == 0, result.stdout + result.stderr
+    with tarfile.open(archive, "r:gz") as tf:
+        manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
+        assert manifest["required_missing_count"] >= 1
+        assert manifest["status"] in {"DEGRADED", "DRY_RUN"}
+        assert {"code": "US_STAGE4_WORKER_LOG_MISSING", "path": worker_rel} in manifest["missing_evidence"]
