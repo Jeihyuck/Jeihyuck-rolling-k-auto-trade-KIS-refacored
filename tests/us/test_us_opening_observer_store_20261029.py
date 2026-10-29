@@ -79,6 +79,52 @@ def test_ws_price_never_adds_a_fake_minute_bar(tmp_path, monkeypatch):
     db.close()
 
 
+def test_replay_preserves_only_real_broker_bid_ask_and_handles_legacy_schema(tmp_path):
+    import sqlite3
+    import time
+    from trader.us.entry_timing.opening_observer import load_quote_samples
+    path = store_path(env="practice", account_scope="acct:epoch", 
+                      trade_date="2026-10-28", base=tmp_path)
+    # Older pre-release observer schema must upgrade in-place without
+    # rewriting existing quote history.
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE quote_samples (trade_date TEXT NOT NULL, symbol TEXT NOT NULL,"
+        " owner TEXT NOT NULL, received_epoch REAL NOT NULL, last REAL NOT NULL,"
+        " source TEXT NOT NULL, generation TEXT NOT NULL,"
+        " PRIMARY KEY (trade_date,symbol,owner,received_epoch,source,generation))"
+    )
+    old.commit()
+    old.close()
+    db = open_store(path)
+    epoch = time.time()
+    assert persist_ws_sample(
+        db, trade_date="2026-10-28", symbol="ELV",
+        quote={"received_at": epoch, "last": 99.0, "bid": 98.99,
+               "ask": 99.01, "collector_generation": "gen-1"},
+    )
+    historical = load_quote_samples(
+        db, trade_date="2026-10-28", symbol="ELV"
+    )
+    assert len(historical) == 1
+    assert historical[0]["bid"] == 98.99
+    assert historical[0]["ask"] == 99.01
+    current = load_latest_ws_quote(
+        db, trade_date="2026-10-28", symbol="ELV", now_epoch=epoch + 1
+    )
+    assert current["bid"] == 98.99 and current["ask"] == 99.01
+    # Invalid crossed/absent bid-ask is UNKNOWN, not a fabricated
+    # executable entry price.
+    assert persist_ws_sample(
+        db, trade_date="2026-10-28", symbol="PG",
+        quote={"received_at": epoch, "last": 95, "bid": 97,
+               "ask": 96, "collector_generation": "gen-1"},
+    )
+    assert load_quote_samples(db, trade_date="2026-10-28", symbol="PG")[0]["bid"] is None
+    assert load_quote_samples(db, trade_date="2026-10-28", symbol="TQQQ") == []
+    db.close()
+
+
 def test_broker_minute_endpoint_is_read_only_and_bounded(monkeypatch):
     from trader.us.execution.kis_us_client import KisUSClient
     from trader.us.execution import kis_us_client as mod
