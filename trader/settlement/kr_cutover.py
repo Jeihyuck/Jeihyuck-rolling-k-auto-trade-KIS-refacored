@@ -39,6 +39,11 @@ _OWNER_MAP = {
     "KR_STANDARD": "PB1",
     "KR_INFINITE": "KR_INFINITE",
 }
+# Only an exact durable orders.strategy identity is acceptable as a
+# legacy fallback. Never infer an owner from entry_style/decision_family.
+_ORDER_STRATEGY_OWNER_MAP = {
+    "pb1_pullback_close": "PB1",
+}
 
 
 def _account_scope(env: str) -> str:
@@ -58,12 +63,19 @@ def build_kr_broker_observation(
     execution_qty: int | None = None,
 ) -> SettlementObservation:
     """Build an atomic observation only from an exact durable KR order identity."""
-    raw_owner = str(
-        request_json.get("strategy_owner")
-        or order.get("strategy_owner")
-        or ""
-    ).strip().upper()
-    owner = _OWNER_MAP.get(raw_owner, "")
+    explicit_owner = _OWNER_MAP.get(
+        str(request_json.get("strategy_owner") or order.get("strategy_owner") or "").strip().upper(),
+        "",
+    )
+    durable_order_strategy = str(order.get("strategy") or "").strip().lower()
+    verified_owner = _ORDER_STRATEGY_OWNER_MAP.get(durable_order_strategy, "")
+    if explicit_owner and verified_owner and explicit_owner != verified_owner:
+        raise RuntimeError("KR_SETTLEMENT_STRATEGY_OWNER_CONFLICT")
+    # Mico 2026-10-29: the immutable PB1 order has strategy
+    # pb1_pullback_close, while the pre-PR request_json omitted owner.
+    # Unlike candidate labels, this repository field is a durable order
+    # identity and can safely recover PB1 only when it matches exactly.
+    owner = explicit_owner or verified_owner
     if not owner:
         raise RuntimeError("KR_SETTLEMENT_STRATEGY_OWNER_MISSING")
     env = str(order.get("env") or os.getenv("KIS_ENV") or "practice").strip().lower()
