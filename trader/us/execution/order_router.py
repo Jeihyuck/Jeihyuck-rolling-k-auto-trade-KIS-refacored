@@ -2146,6 +2146,10 @@ def route_order(
             and str(intent.get("position_action") or "") == "NEW_POSITION_BUY"
             and str(intent.get("strategy_owner") or "US_STANDARD").upper() == "US_STANDARD"
             and os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW").upper() == "ENFORCE"
+            and str(
+                intent.get("entry_style_selected") or intent.get("entry_style")
+                or (intent.get("meta") or {}).get("entry_style_selected") or ""
+            ).upper() not in {"ENTRY_VCP", "VCP", "ENTRY_VCP_CONFIRMED"}
         ):
             from trader.us.entry_timing.opportunity import (
                 effective_mode, pre_submit_timing_check,
