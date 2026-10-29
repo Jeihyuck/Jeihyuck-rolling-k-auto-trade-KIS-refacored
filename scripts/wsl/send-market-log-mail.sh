@@ -332,21 +332,22 @@ fi
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
-# Archive exact same-day Stage4 log references, never a guessed
-# session-labeled glob: safe_scope_token(session_run_id) can differ from "am".
-# Only permit local, same-trade-date basename matches; missing evidence
-# degrades archive completeness but never suppresses mail delivery.
+# Read exact same-day Stage4 child paths from each session's own logs.
+# Retain the session-specific missing evidence code for existing mail contracts.
+# Run tokens need not contain the session label; guessed glob paths are unsafe.
 if [[ "$MARKET" == us ]]; then
-  while IFS= read -r worker_path; do
-    [[ "$worker_path" == "runtime/logs/us-stage4-worker-${TRADE_DATE}-"* &&
-       "$worker_path" == *.log && "$worker_path" != *"/../"* ]] || continue
-    collect_path US_STAGE4_WORKER_LOG_MISSING "$worker_path"
-  done < <(
-    grep -hF '[US_STAGE4][CHILD_LOG]' \
-      "$LOG_ROOT"/am/*.log "$LOG_ROOT"/afternoon/*.log 2>/dev/null \
-      | grep -oE 'path=runtime/logs/us-stage4-worker-[A-Za-z0-9._-]+\.log' \
-      | sed 's/^path=//' | sort -u || true
-  )
+  for stage4_purpose in am afternoon; do
+    while IFS= read -r worker_path; do
+      [[ "$worker_path" == "runtime/logs/us-stage4-worker-\${TRADE_DATE}-"* &&
+         "$worker_path" == *.log && "$worker_path" != *"/../"* ]] || continue
+      collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_\${stage4_purpose}" "$worker_path"
+    done < <(
+      grep -hF '[US_STAGE4][CHILD_LOG]' \
+        "$LOG_ROOT/$stage4_purpose"/*.log 2>/dev/null \
+        | grep -oE 'path=runtime/logs/us-stage4-worker-[A-Za-z0-9._-]+\.log' \
+        | sed 's/^path=//' | sort -u || true
+    )
+  done
 fi
 
 MISSING_COUNT="$(wc -l < "$MISSING_LIST" | tr -d ' ')"
