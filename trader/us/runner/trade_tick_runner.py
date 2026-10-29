@@ -4849,6 +4849,19 @@ def run_trade_tick(
         latency_metrics["pre_entry_accounted_ms"]
     ), 3)
     latency_metrics["slot_overrun_300s"] = int(tick_total_ms > 300000)
+    # Persist read-only measured phase telemetry into the returned Tick
+    # diagnostics and the existing log stream. Never add broker I/O here.
+    try:
+        from trader.us.execution.latency_evidence import observed_tick_sample
+        _observed = observed_tick_sample({
+            **tick_context.metrics, "tick_total_ms": tick_total_ms,
+        })
+        latency_metrics["measured_phase_evidence"] = _observed
+        logger.info("[US_TICK][PHASE_EVIDENCE_JSON] payload=%s",
+                    json.dumps(_observed, sort_keys=True, allow_nan=False))
+    except Exception as _phase_exc:
+        logger.warning("[US_TICK][PHASE_EVIDENCE_UNAVAILABLE] error_type=%s",
+                       type(_phase_exc).__name__)
     latency_log = logger.warning if unaccounted_ms > 2000 else logger.info
     latency_log(
         "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
