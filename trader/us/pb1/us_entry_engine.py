@@ -1036,6 +1036,8 @@ def generate_entry_intents(
             position_state = "HELD" if (current_position_symbols and symbol_upper_for_capacity in {str(s).upper().strip() for s in current_position_symbols}) else "NOT_HELD"
         if position_state == "HELD":
             held_candidates_evaluated_for_add += 1
+        # Never reuse a previous symbol's live quote in timing observations.
+        current = None
         # Price lookup (필요한 경우)
         if existing_price is None:
             if _stop_if_cancelled("before_current_price_lookup"):
@@ -1084,8 +1086,183 @@ def generate_entry_intents(
             # 이미 price가 있음 (runtime calculation)
             price = existing_price
 
+        # Read-only timing observation on all new candidates, including those
+        # subsequently skipped for sizing/risk. No additional broker I/O.
+        _timing_shadow = None
+        if position_state != "HELD":
+            try:
+                from trader.us.entry_timing_shadow import (
+                    evaluate_entry_timing_shadow, derive_quote_freshness,
+                )
+                _now_epoch = now.timestamp() if now is not None else datetime.now().timestamp()
+                _quote = current if isinstance(current, dict) else (
+                    (entry_meta or {}).get("live_quote")
+                    or (entry_meta or {}).get("current_quote")
+                )
+                _freshness = derive_quote_freshness(_quote, now_epoch=_now_epoch)
+                _style = str(
+                    (entry_meta or {}).get("entry_style_selected")
+                    or (entry_meta or {}).get("entry_style") or ""
+                ).upper()
+                if _style and not _style.startswith("ENTRY_"):
+                    _style = "ENTRY_" + _style
+                # PREP daily evidence is not a live 5-minute timing confirmation.
+                _proof = (entry_meta or {}).get("intraday_timing_evidence")
+                _proof_valid = bool(
+                    isinstance(_proof, dict)
+                    and derive_quote_freshness(
+                        {"source": _proof.get("source"),
+                         "asof_epoch": _proof.get("observed_at_epoch"),
+                         "last": _proof.get("observed_price")},
+                        now_epoch=_now_epoch,
+                    ).get("quote_fresh")
+                )
+                _facts = {
+                    "quote_fresh": bool(_freshness.get("quote_fresh")),
+                    "quote_reason": _freshness.get("quote_reason"),
+                    "support_reaction_confirmed": _proof.get("support_reaction_confirmed") if _proof_valid else None,
+                    "intraday_continuation_confirmed": _proof.get("intraday_continuation_confirmed") if _proof_valid else None,
+                    "volume_confirmation": _proof.get("volume_confirmation") if _proof_valid else None,
+                    "pivot_breakout_confirmed": _proof.get("pivot_breakout_confirmed") if _proof_valid else None,
+                    "vcp_live_breakout_verified": (entry_meta or {}).get("vcp_live_breakout_verified"),
+                }
+                _timing_shadow = evaluate_entry_timing_shadow(
+                    owner="US_STANDARD", style=_style, prep_eligible=True,
+                    live_facts=_facts,
+                )
+                if diagnostics is not None:
+                    diagnostics.setdefault("entry_timing_shadow", []).append({
+                        "symbol": symbol, "decision": _timing_shadow["timing_state"],
+                        "reason": _timing_shadow["reason"],
+                    })
+                logger.info(
+                    "[US_ENTRY][TIMING_SHADOW] symbol=%s family=%s state=%s reason=%s quote=%s",
+                    symbol, _style, _timing_shadow["timing_state"],
+                    _timing_shadow["reason"], _facts["quote_reason"],
+                )
+            except (TypeError, ValueError, ImportError) as exc:
+                logger.warning("[US_ENTRY][TIMING_SHADOW_UNAVAILABLE] symbol=%s type=%s",
+                               symbol, type(exc).__name__)
+
         position_state_for_order = position_state or (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
+        # Price-aware observation is separate from PREP eligibility and the
+        # time-only opening BUY block. It consumes ALREADY-PERSISTED native KIS
+        # minute bars with bounded local read; never fetches historical REST
+        # quotes on the critical entry path. Other owners/ADD/VCP untouched.
+        _price_opportunity = None
+        _opportunity_mode = "OFF"
+        if position_action == "NEW_POSITION_BUY":
+            try:
+                from trader.us.entry_timing.opportunity import (
+                    effective_mode, evaluate_price_opportunity,
+                )
+                _opportunity_mode = effective_mode()
+                if _opportunity_mode == "ENFORCE_NOT_APPROVED":
+                    track_skip(symbol, "ENTRY_TIMING_POLICY_NOT_APPROVED")
+                    continue
+                from trader.us.pb1.us_explain import normalize_us_entry_style
+                _family = normalize_us_entry_style(
+                    (entry_meta or {}).get("entry_style_selected")
+                    or (entry_meta or {}).get("entry_style")
+                )
+                if _family in {"ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT"} and _opportunity_mode != "OFF":
+                    _observed_bars = []
+                    _scope = str(os.getenv("US_ENTRY_WINDOW_SCOPE") or "").strip()
+                    if _scope:
+                        from trader.us.entry_timing.opening_observer import store_path, load_bars
+                        import sqlite3
+                        from contextlib import closing
+                        _store = store_path(
+                            env="practice", account_scope=_scope,
+                            trade_date=_resolve_us_trade_date(now),
+                        )
+                        if _store.is_file():
+                            with closing(sqlite3.connect(
+                                "file:" + str(_store.resolve()) + "?mode=ro",
+                                uri=True, timeout=0.12,
+                            )) as _read_conn:
+                                _observed_bars = load_bars(
+                                    _read_conn, trade_date=_resolve_us_trade_date(now),
+                                    symbol=symbol, owner="US_STANDARD", limit=450,
+                                )
+                    _opportunity_quote = current if isinstance(current, dict) else {}
+                    # Collector IPC is bounded and read-only, unlike a new
+                    # KIS REST request that could starve protective SELL.
+                    if os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
+                        try:
+                            from trader.marketdata.us_ws_collector import get_quote as _ws_quote
+                            _ws = _ws_quote(
+                                symbol, exchange, env="practice",
+                                max_age_sec=10, timeout_sec=0.11,
+                            )
+                            if _ws:
+                                _opportunity_quote = {
+                                    "source": "KIS_WEBSOCKET_COLLECTOR",
+                                    "last": _ws.get("last"), "bid": _ws.get("bid"),
+                                    "ask": _ws.get("ask"),
+                                    "age_sec": _ws.get("age_sec"),
+                                    "collector_generation": _ws.get("collector_generation"),
+                                }
+                        except (OSError, ValueError, RuntimeError) as _ws_exc:
+                            logger.warning("[US_ENTRY][OPPORTUNITY_WS_MISSING] symbol=%s error=%s",
+                                           symbol, type(_ws_exc).__name__)
+                    from zoneinfo import ZoneInfo
+                    _op_now = now if now is not None else datetime.now(ZoneInfo("America/New_York"))
+                    _price_opportunity = evaluate_price_opportunity(
+                        style=_family, trade_date=_resolve_us_trade_date(now),
+                        now_et=_op_now, verified_bars=_observed_bars,
+                        quote=_opportunity_quote, prep=entry_meta or {},
+                        min_rr=float(os.getenv("US_OPPORTUNITY_MIN_REFERENCE_RR", "1.5")),
+                        max_stop_distance=float(os.getenv("US_OPPORTUNITY_MAX_STOP_DISTANCE", "0.025")),
+                    )
+                    if diagnostics is not None:
+                        diagnostics.setdefault("price_opportunity", []).append({
+                            "symbol": symbol, "family": _family,
+                            "state": _price_opportunity["state"],
+                            "reason": _price_opportunity["reason"],
+                            "max_entry_price": _price_opportunity.get("max_entry_price"),
+                            "reference_rr": _price_opportunity.get("risk_reward_reference"),
+                            "verified_bars": len(_observed_bars),
+                        })
+                    logger.info(
+                        "[US_ENTRY][PRICE_OPPORTUNITY] symbol=%s style=%s "
+                        "mode=%s state=%s reason=%s bar_count=%d max_entry=%s rr=%s",
+                        symbol, _family, _opportunity_mode,
+                        _price_opportunity["state"], _price_opportunity["reason"],
+                        len(_observed_bars), _price_opportunity.get("max_entry_price"),
+                        _price_opportunity.get("risk_reward_reference"),
+                    )
+                    if _opportunity_mode == "ENFORCE" and _price_opportunity["state"] != "READY":
+                        track_skip(symbol, "ENTRY_TIMING_WAIT", {
+                            "state": _price_opportunity["state"],
+                            "reason": _price_opportunity["reason"],
+                        })
+                        continue
+                    if _opportunity_mode == "ENFORCE":
+                        # Sizing, risk and order limit must use a recent quote.
+                        _live = _opportunity_quote.get("last")
+                        _live_value = _as_float_or_none(_live)
+                        if _live_value is None or _live_value <= 0:
+                            track_skip(symbol, "ENTRY_TIMING_LIVE_PRICE_UNKNOWN")
+                            continue
+                        price = _live_value
+                elif _opportunity_mode == "ENFORCE_NOT_APPROVED":
+                    track_skip(symbol, "ENTRY_TIMING_POLICY_NOT_APPROVED")
+                    continue
+                elif _opportunity_mode == "ENFORCE" and _family != "ENTRY_VCP":
+                    # Unknown/new signal family must not bypass a policy gate.
+                    track_skip(symbol, "ENTRY_TIMING_FAMILY_UNSUPPORTED", {"family": _family})
+                    continue
+            except Exception as _opp_exc:
+                logger.warning(
+                    "[US_ENTRY][OPPORTUNITY_UNAVAILABLE] symbol=%s type=%s mode=%s",
+                    symbol, type(_opp_exc).__name__, _opportunity_mode,
+                )
+                if _opportunity_mode in {"ENFORCE", "ENFORCE_NOT_APPROVED"}:
+                    track_skip(symbol, "ENTRY_TIMING_EVIDENCE_UNAVAILABLE")
+                    continue
+
         # REST is only used for an independently proven VCP entry. This quote
         # replaces the decision price before position sizing, risk and routing.
         if (
@@ -1132,6 +1309,26 @@ def generate_entry_intents(
             entry_meta["vcp_live_breakout_verified"] = True
             entry_meta["vcp_live_volume"] = live_evidence["tvol"]
             entry_meta["vcp_live_quote_source"] = live_evidence["source"]
+            # The existing VCP broker proof is authoritative for VCP shadow:
+            # update the earlier pre-LIVE observation without new I/O.
+            try:
+                from trader.us.entry_timing_shadow import evaluate_entry_timing_shadow
+                _timing_shadow = evaluate_entry_timing_shadow(
+                    owner="US_STANDARD", style="ENTRY_VCP", prep_eligible=True,
+                    live_facts={
+                        "quote_fresh": True,
+                        "quote_reason": "vcp_verified_live_broker_pivot_volume",
+                        "vcp_live_breakout_verified": True,
+                    },
+                )
+                if diagnostics is not None:
+                    diagnostics.setdefault("entry_timing_shadow", []).append({
+                        "symbol": symbol, "decision": _timing_shadow["timing_state"],
+                        "reason": "vcp_live_broker_proof", "replaces_pre_vcp": True,
+                    })
+            except Exception as _shadow_exc:
+                logger.warning("[US_ENTRY][VCP_TIMING_SHADOW_WARN] symbol=%s error=%s",
+                               symbol, type(_shadow_exc).__name__)
             logger.info(
                 "[US_ENTRY][VCP_LIVE_PROOF] symbol=%s price=%.4f "
                 "cum_volume=%.0f avg_volume20=%.0f pivot=%.4f",
@@ -1263,6 +1460,18 @@ def generate_entry_intents(
             logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=NOT_HELD candidate_action=NEW_BUY position_action=%s", symbol, position_action)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
+        # Price-cap trial policy applies ONLY to explicitly approved
+        # US_STANDARD new BUY entries, after true 1-minute timing proof.
+        if (
+            position_action == "NEW_POSITION_BUY"
+            and _opportunity_mode == "ENFORCE"
+            and isinstance(_price_opportunity, dict)
+        ):
+            _ceiling = _as_float_or_none(_price_opportunity.get("max_entry_price"))
+            if _ceiling is None or _ceiling < price:
+                track_skip(symbol, "ENTRY_TIMING_PRICE_CEILING_UNAVAILABLE")
+                continue
+            limit_price = round(min(limit_price, _ceiling), 4)
         # Broker/risk economics must use the final executable price, not the decision quote.
         # The router intentionally fail-closes when qty * limit_price != notional_usd.
         notional = round(qty * limit_price, 4)
@@ -1593,6 +1802,26 @@ def generate_entry_intents(
             if entry_meta is not None and proof_key in entry_meta:
                 durable_meta[proof_key] = entry_meta[proof_key]
 
+        # Shadow observation was produced earlier; attaching it cannot affect BUY.
+        if position_action == "NEW_POSITION_BUY" and _timing_shadow is not None:
+            intent.setdefault("meta", {})["entry_timing_shadow_v1"] = _timing_shadow
+
+        # Persist signed timing evidence alongside BUY intent, not as a
+        # report-only score. Pre-HTTP recheck uses the same frozen price cap.
+        if isinstance(_price_opportunity, dict):
+            try:
+                from trader.us.entry_timing.opportunity import attach_opportunity_proof
+                attach_opportunity_proof(
+                    intent, _price_opportunity, mode=_opportunity_mode,
+                    decision_epoch=(now.timestamp() if now is not None
+                                    else datetime.now().timestamp()),
+                )
+            except (ValueError, TypeError) as _attach_exc:
+                if _opportunity_mode == "ENFORCE":
+                    track_skip(symbol, "ENTRY_TIMING_PROOF_PERSIST_ERROR")
+                    continue
+                logger.warning("[US_ENTRY][OPPORTUNITY_META_WARN] symbol=%s err=%s",
+                               symbol, type(_attach_exc).__name__)
         if _stop_if_cancelled("before_order_preflight"):
             break
         if intent_acceptor is not None:
