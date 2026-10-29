@@ -145,6 +145,37 @@ def load_latest_ws_quote(db: sqlite3.Connection, *, trade_date: str,
             "collector_generation": row[2]}
 
 
+def standard_entry_pairs(watchlist: list[dict], limit: int = 30) -> list[tuple[str, str]]:
+    """Canonicalize PREP exchanges without network and isolate strategy owner."""
+    from trader.us.symbols import resolve_exchange
+    aliases = {
+        "NASDAQ": "NASDAQ", "NASD": "NASDAQ", "NAS": "NASDAQ",
+        "NYSE": "NYSE", "NYS": "NYSE",
+        "AMEX": "AMEX", "AMS": "AMEX",
+    }
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in watchlist or []:
+        if not isinstance(raw, dict):
+            continue
+        symbol = str(raw.get("symbol") or "").upper().strip()
+        meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        owner = str(raw.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD").upper()
+        if not symbol or symbol == "TQQQ" or owner != "US_STANDARD" or symbol in seen:
+            continue
+        exchange_raw = str(raw.get("exchange") or "").upper().strip()
+        if not exchange_raw:
+            exchange_raw = str(resolve_exchange(symbol) or "").upper().strip()
+        exchange = aliases.get(exchange_raw)
+        if exchange is None:
+            continue
+        seen.add(symbol)
+        pairs.append((symbol, exchange))
+        if len(pairs) >= max(1, min(30, limit)):
+            break
+    return pairs
+
+
 def run_observer(*, env: str, trade_date: str, scope: str,
                  parent_pid: int, watchlist: list[dict],
                  min_interval_sec: float = 10.0,
@@ -157,18 +188,7 @@ def run_observer(*, env: str, trade_date: str, scope: str,
         "KIS_ENV": "practice", "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
         "US_KIS_ORDER_ALLOWED": "0", "TRADING_REGION": "US",
     })
-    pairs = []
-    seen = set()
-    for raw in watchlist:
-        symbol = str(raw.get("symbol") or "").upper().strip()
-        exchange = str(raw.get("exchange") or "").upper().strip()
-        if (not symbol or symbol == "TQQQ" or
-                exchange not in {"NASDAQ", "NYSE", "AMEX"} or symbol in seen):
-            continue
-        seen.add(symbol)
-        pairs.append((symbol, exchange))
-        if len(pairs) >= 30:
-            break
+    pairs = standard_entry_pairs(watchlist)
     if not pairs:
         LOG.warning("[US_OPENING_OBSERVER][NO_WATCHLIST] action=NO_ORDER")
         return 2
