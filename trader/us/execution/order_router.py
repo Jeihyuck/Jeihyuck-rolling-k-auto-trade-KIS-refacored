@@ -2333,6 +2333,7 @@ def route_order(
                 "US_ENTRY_TIMING_PRICE_CAP_VIOLATED",
                 "US_ENTRY_TIMING_WS_QUOTE_MISSING", "US_ENTRY_TIMING_WS_QUOTE_STALE",
                 "US_ENTRY_TIMING_BROKER_PRICE_MOVED",
+                "US_ENTRY_TIMING_REBOUND_INVALIDATED",
             )
             failure_code = next((code for code in guard_codes if code in str(exc)),
                                 "pre_http_setup_failed")
