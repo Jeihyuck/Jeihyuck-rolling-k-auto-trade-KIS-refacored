@@ -235,3 +235,77 @@ def evaluate_price_opportunity(
                      style=style, facts=facts, price=fresh_price,
                      max_entry_price=round(ceiling, 4),
                      stop_reference=stop, target_reference=target, rr=rr)
+
+
+def effective_mode(environ: dict | None = None) -> str:
+    """Policy approval and practice guard before any BUY permission change."""
+    import os
+    env = environ if environ is not None else os.environ
+    requested = str(env.get("US_ENTRY_OPPORTUNITY_MODE", "SHADOW")).upper()
+    if requested == "OFF":
+        return "OFF"
+    if requested != "ENFORCE":
+        return "SHADOW"
+    if (str(env.get("KIS_ENV", "practice")).lower() != "practice"
+            or str(env.get("US_ENTRY_OPPORTUNITY_APPROVED", "0")) != "1"):
+        return "ENFORCE_NOT_APPROVED"
+    return "ENFORCE"
+
+
+def attach_opportunity_proof(intent: dict, decision: dict, *, mode: str,
+                             decision_epoch: float) -> None:
+    """Freeze the exact observed signal before order sizing/route."""
+    if not isinstance(intent.get("meta"), dict):
+        intent["meta"] = {}
+    intent["meta"]["us_entry_opportunity_v1"] = {
+        **decision, "mode": mode, "decision_epoch": float(decision_epoch),
+        "max_age_sec": 120.0,
+    }
+
+
+def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: dict | None,
+                            max_quote_age: float = 5.0) -> tuple[bool, str]:
+    """Pure BUY-only native HTTP-boundary check; no broker I/O here.
+
+    Caller gets a fresh WS snapshot via bounded read-only collector IPC.
+    The full entry/risk router remains authoritative for order permission.
+    """
+    if (str(intent.get("side") or "").upper() != "BUY"
+            or str(intent.get("position_action") or "") != "NEW_POSITION_BUY"
+            or str(intent.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"):
+        return True, "NOT_APPLICABLE"
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    proof = meta.get("us_entry_opportunity_v1")
+    if not isinstance(proof, dict) or proof.get("mode") != "ENFORCE":
+        return False, "TIMING_PROOF_MISSING"
+    signed = {k: v for k, v in proof.items()
+              if k not in {"mode", "decision_epoch", "max_age_sec", "evidence_sha256"}}
+    try:
+        digest = hashlib.sha256(
+            json.dumps(signed, sort_keys=True, separators=(",", ":"),
+                       allow_nan=False).encode()
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return False, "TIMING_PROOF_INVALID"
+    if digest != proof.get("evidence_sha256") or proof.get("state") != "READY":
+        return False, "TIMING_PROOF_INVALID"
+    observed = finite(proof.get("decision_epoch"))
+    if observed is None or not (0 <= now_epoch - observed <= 120):
+        return False, "TIMING_SIGNAL_EXPIRED"
+    cap = finite(proof.get("max_entry_price"))
+    price = finite(intent.get("limit_price"))
+    if cap is None or cap <= 0 or price is None or price <= 0 or price > cap + 1e-6:
+        return False, "TIMING_PRICE_CAP_VIOLATED"
+    if not isinstance(fresh_ws_quote, dict):
+        return False, "TIMING_WS_QUOTE_MISSING"
+    received = finite(fresh_ws_quote.get("received_at"))
+    last = finite(fresh_ws_quote.get("last"))
+    ask = finite(fresh_ws_quote.get("ask"))
+    bid = finite(fresh_ws_quote.get("bid"))
+    if (received is None or last is None or ask is None or bid is None or
+            received > now_epoch + 1 or now_epoch - received > max_quote_age or
+            last <= 0 or ask < bid or bid <= 0):
+        return False, "TIMING_WS_QUOTE_STALE"
+    if ask > cap + 1e-6 or (ask - bid) / ((ask + bid) / 2) > 0.003:
+        return False, "TIMING_BROKER_PRICE_MOVED"
+    return True, "TIMING_FRESH_PRICE_CONFIRMED"
