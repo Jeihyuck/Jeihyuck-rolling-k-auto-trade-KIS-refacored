@@ -66,3 +66,51 @@ def test_diagnostics_cannot_claim_operation_pass_without_real_evidence():
     })
     assert readiness["status"] == "NOT_PROVEN"
     assert "kis_original_fill_reconcile_pass" in readiness["not_passed"]
+
+
+def test_5w1h_and_price_opportunity_are_frozen_together_without_authorizing_buy():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trader.us.entry_timing.opportunity import (
+        attach_opportunity_proof, evaluate_price_opportunity,
+        pre_submit_timing_check,
+    )
+
+    now = datetime(2026, 10, 28, 9, 45, tzinfo=ZoneInfo("America/New_York"))
+    observed = evaluate_price_opportunity(
+        style="ENTRY_PULLBACK", trade_date="2026-10-28", now_et=now,
+        verified_bars=[], quote={},
+    )
+    assert observed["state"] == "WATCH"
+    buy = build_decision_evidence(
+        decision_id="buy-1", side="BUY", strategy_owner="US_STANDARD",
+        symbol="ELV", decision_at=now.isoformat(),
+        policy_version="us_entry_exit_contract_v2", code_sha="pin-abc",
+        position_lifecycle_id="ENTRY:US_STANDARD:ELV",
+        decision_reason="ENTRY_PULLBACK", facts={"score": 0.9},
+        thresholds={"min_score": 0.05}, market_context={},
+        sizing={"qty": 8},
+    )
+    intent = {
+        "symbol": "ELV", "side": "BUY", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "position_lifecycle_id": "ENTRY:US_STANDARD:ELV",
+        "client_order_key": "buy-key-1",
+        "meta": {
+            "entry_decision_evidence_5w1h": buy,
+            "entry_decision_evidence_sha256": buy["sha256"],
+        },
+    }
+    attach_opportunity_proof(
+        intent, observed, mode="SHADOW", decision_epoch=now.timestamp(),
+    )
+    contract = build_us_entry_exit_contract(intent)
+    assert verify_us_entry_exit_contract(contract)
+    provenance = contract["entry_provenance"]
+    assert provenance["entry_decision_evidence_sha256"] == buy["sha256"]
+    assert (provenance["us_entry_opportunity_v1"]["evidence_sha256"]
+            == observed["evidence_sha256"])
+    # A SHADOW WATCH is a recorded observation, never KIS BUY authority.
+    assert pre_submit_timing_check(
+        intent, now_epoch=now.timestamp(), fresh_ws_quote=None,
+    ) == (False, "TIMING_PROOF_MISSING")
