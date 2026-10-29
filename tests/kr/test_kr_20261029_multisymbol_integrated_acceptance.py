@@ -6,6 +6,7 @@ WSL scheduler change, live broker call, or paper order submission.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -110,6 +111,10 @@ def test_bad_or_duplicate_symbol_does_not_contaminate_other_29(monkeypatch):
     assert not any(sell["code"] in CODES[:2] for sell in sells)
 
 
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="isolated disposable PostgreSQL is required; do not use production",
+)
 def test_physical_postgres_text_json_upsert_isolated_across_thirty_symbols(kr_mico_text_engine):
     # Reuse the disposable PostgreSQL + physical TEXT fixture, never the
     # production trading Supabase. The fixture is skipped if PG is unavailable.
