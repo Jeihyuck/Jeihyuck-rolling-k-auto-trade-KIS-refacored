@@ -81,3 +81,50 @@ def verify_decision_evidence(record: dict) -> bool:
         return digest == evidence_hash({k: v for k, v in record.items() if k != "sha256"})
     except (TypeError, ValueError):
         return False
+
+def build_exit_evidence_from_entry(
+    *, entry_evidence: dict, decision_id: str, decision_at: str,
+    decision_reason: str, current_facts: dict, changed_since_entry: dict,
+    sizing: dict, market_context: dict,
+) -> dict:
+    """Bind SELL evidence to an exactly verified BUY lifecycle and original digest.
+
+    Do not look up the latest symbol snapshot. The caller must supply the
+    position-specific frozen entry record from durable storage.
+    """
+    if not verify_decision_evidence(entry_evidence):
+        raise ValueError("entry_evidence_integrity_invalid")
+    what = entry_evidence.get("what") or {}
+    who = entry_evidence.get("who") or {}
+    if what.get("side") != "BUY":
+        raise ValueError("entry_evidence_not_buy")
+    return build_decision_evidence(
+        decision_id=decision_id, side="SELL",
+        strategy_owner=who["strategy_owner"], symbol=what["symbol"],
+        decision_at=decision_at, policy_version=who["policy_version"],
+        code_sha=who["code_sha"],
+        position_lifecycle_id=what["position_lifecycle_id"],
+        decision_reason=decision_reason,
+        facts=current_facts, thresholds={},
+        market_context=market_context, sizing=sizing,
+        entry_decision_id=what["decision_id"],
+        entry_evidence_hash=entry_evidence["sha256"],
+        changed_since_entry=changed_since_entry,
+    )
+
+def verify_exit_entry_link(exit_evidence: dict, entry_evidence: dict) -> bool:
+    if not verify_decision_evidence(exit_evidence) or not verify_decision_evidence(entry_evidence):
+        return False
+    if (exit_evidence.get("what") or {}).get("side") != "SELL":
+        return False
+    left = exit_evidence["what"]
+    right = entry_evidence["what"]
+    return bool(
+        exit_evidence["entry_link"] == {
+            "decision_id": right["decision_id"],
+            "evidence_hash": entry_evidence["sha256"],
+        }
+        and left["symbol"] == right["symbol"]
+        and left["position_lifecycle_id"] == right["position_lifecycle_id"]
+        and exit_evidence["who"]["strategy_owner"] == entry_evidence["who"]["strategy_owner"]
+    )
