@@ -42,3 +42,25 @@ def test_nonfinite_and_wrong_owner_fail_closed():
         build_decision_evidence(**{**BASE, "facts": {"rvol": math.nan}})
     with pytest.raises(ValueError, match="owner"):
         build_decision_evidence(**{**BASE, "symbol": "TQQQ"})
+
+def test_exit_links_specific_position_cycle_and_detects_other_entry():
+    from trader.us.decision_evidence_5w1h import (
+        build_exit_evidence_from_entry, verify_exit_entry_link,
+    )
+    first = build_decision_evidence(**BASE)
+    second = build_decision_evidence(**{**BASE, "decision_id": "d-new",
+                                        "position_lifecycle_id": "cycle-2"})
+    sell = build_exit_evidence_from_entry(
+        entry_evidence=first, decision_id="exit-1", decision_at="2026-10-29T14:00:00Z",
+        decision_reason="EXIT_STOP", current_facts={"last_price": 395.0},
+        changed_since_entry={"price_change_pct": -0.064},
+        sizing={"qty": 8}, market_context={"regime": "DEFENSIVE"},
+    )
+    assert verify_exit_entry_link(sell, first)
+    assert not verify_exit_entry_link(sell, second)
+    with pytest.raises(ValueError, match="integrity"):
+        build_exit_evidence_from_entry(
+            entry_evidence={**first, "sha256": "0" * 64}, decision_id="exit-2",
+            decision_at="2026-10-29T14:00:00Z", decision_reason="EXIT_STOP",
+            current_facts={}, changed_since_entry={}, sizing={}, market_context={},
+        )
