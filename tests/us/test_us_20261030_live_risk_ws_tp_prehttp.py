@@ -254,6 +254,10 @@ def test_gild_tp1_route_pre_http_fence_recovers_only_after_claim_release(
                         lambda **_kw: "offline-practice-account")
     monkeypatch.setattr(order_router, "canonical_order_risk_check",
                         lambda *_a, **_kw: None, raising=False)
+    monkeypatch.setattr(order_router, "same_day_semantic_sell_exists",
+                        lambda *_a, **_kw: False)
+    monkeypatch.setattr(order_router, "enrich_sell_exchange",
+                        lambda *_a, **_kw: "NYSE")
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order",
                         lambda: False)
     monkeypatch.setattr(repos, "load_today_order_keys", lambda **_kw: set())
