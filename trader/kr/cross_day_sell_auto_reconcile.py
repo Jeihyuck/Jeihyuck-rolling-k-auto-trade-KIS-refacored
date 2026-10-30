@@ -78,6 +78,15 @@ def classify_pending_historical_sells(
             continue
         code = str(row.get("code") or "")
         odno = str(row.get("kis_odno") or row.get("broker_order_id") or "")
+        if not odno:
+            ack = _as_obj(row.get("response_json"))
+            saved_output = _as_obj(ack.get("output"))
+            if str(ack.get("rt_cd") or "") == "0":
+                odno = str(saved_output.get("ODNO") or "").strip()
+                if len(odno) == 10 and odno.isdigit():
+                    row = {**row, "_ack_only_odno": odno}
+                else:
+                    odno = ""
         try:
             qty = int(row.get("qty"))
         except (ValueError, TypeError):
@@ -235,6 +244,61 @@ def _verify_original_sell_economics(
     return True, "ECONOMIC_SETTLED"
 
 
+def find_strict_original_ack_source(
+    *, engine: Any, env: str, strategy: str, code: str,
+    odno: str, trade_date: date, requested_qty: int,
+) -> dict[str, Any] | None:
+    """Recover a missing DB broker-ID field from an immutable successful ACK.
+
+    This lookup is exclusively for *already verified* original-day KIS SELL
+    evidence in reconcile_today(strict_sell_targets=...). The durable
+    response's output.ODNO is identity evidence, NEVER execution evidence.
+    Only a unique same-account/epoch/cycle original SELL can be attributed.
+    """
+    if env != "practice" or len(code) != 6 or not code.isdigit():
+        return None
+    if len(odno) != 10 or not odno.isdigit() or requested_qty <= 0:
+        return None
+    with engine.connect() as conn:
+        epoch_id = active_trading_epoch_id(
+            conn, env=env, account_id=get_account_key(env=env),
+            required=True,
+        )
+        schema = schema_for_engine(engine)
+        rows = conn.execute(sa.select(schema.orders).where(sa.and_(
+            schema.orders.c.env == env,
+            schema.orders.c.strategy == strategy,
+            schema.orders.c.side == "SELL",
+            schema.orders.c.code == code,
+            schema.orders.c.qty == requested_qty,
+            schema.orders.c.trading_epoch_id == str(epoch_id),
+        ))).mappings().all()
+    verified = []
+    for raw in rows:
+        row = dict(raw)
+        if _kst_date(row.get("submitted_at") or row.get("created_at")) != trade_date:
+            continue
+        if not row.get("position_cycle_id") or not row.get("portfolio_epoch_id"):
+            continue
+        durable = _as_obj(row.get("response_json"))
+        output = _as_obj(durable.get("output"))
+        saved_odno = str(output.get("ODNO") or output.get("odno") or "").strip()
+        if str(durable.get("rt_cd") or "") != "0" or saved_odno.zfill(10) != odno:
+            continue
+        # Do not hijack a different broker order already linked to this row.
+        stored = str(row.get("kis_odno") or row.get("broker_order_id") or "").strip()
+        if stored and stored.zfill(10) != odno:
+            continue
+        verified.append(row)
+    if len(verified) != 1:
+        log.error(
+            "[KR_CROSS_DAY_SELL][ACK_LOOKUP_BLOCK] code=%s date=%s matching=%s",
+            code, trade_date, len(verified),
+        )
+        return None
+    return verified[0]
+
+
 def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str) -> list[dict[str, Any]]:
     """Read ALL statuses from authoritative DB, not the recent/open-order cache.
 
@@ -281,7 +345,7 @@ def _order_sort_key(order: dict[str, Any]) -> str:
     return "|".join([
         day.isoformat() if day else "",
         str(order.get("code") or ""),
-        str(order.get("kis_odno") or order.get("broker_order_id") or ""),
+        str(order.get("kis_odno") or order.get("broker_order_id") or order.get("_ack_only_odno") or ""),
         str(order.get("order_id") or ""),
     ])
 
@@ -372,7 +436,7 @@ def run_all_historical_sell_recovery(
             break  # next CLOSE retries remaining original orders; no order state change
         day = _kst_date(order.get("submitted_at") or order.get("created_at"))
         code = str(order["code"])
-        odno = str(order.get("kis_odno") or order.get("broker_order_id"))
+        odno = str(order.get("kis_odno") or order.get("broker_order_id") or order.get("_ack_only_odno"))
         try:
             # The existing PR244 original-day authoritative all-pages writer
             # validates exactly this broker order before any economic DB write.
