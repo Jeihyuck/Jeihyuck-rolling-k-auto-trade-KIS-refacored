@@ -313,7 +313,7 @@ def test_sqlite_all_statuses_and_native_economic_gap(monkeypatch):
                  sid=1, mode=1, code="253590", market="KRX", qty=33,
                  status="OPEN", position_cycle_id=cycle_b, portfolio_epoch_id=portfolio,
                  trading_epoch_id=epoch, total_cost=825000, realized_pnl=0,
-                 avg_buy_price=25000, closed_reason=None),
+                 avg_buy_price=25000, closed_reason=None, position_meta={}),
         ])
         conn.execute(sa.insert(schema.fills), dict(
             fill_id=new_id(), env="practice", order_id=order_a, code="028050",
