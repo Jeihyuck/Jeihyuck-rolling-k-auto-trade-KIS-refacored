@@ -27,7 +27,9 @@ log = logging.getLogger(__name__)
 _KST = ZoneInfo("Asia/Seoul")
 _PENDING = frozenset({
     "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED",
-    "UNRESOLVED_ACK", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+    "UNRESOLVED_ACK", "RECONCILE_PENDING", "ACK_DB_FAILED_RECONCILE_REQUIRED",
+    "PARTIALLY_FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+    "RECONCILED",
 })
 
 
@@ -57,7 +59,7 @@ def classify_pending_historical_sells(
         if str(row.get("side") or "").upper() != "SELL":
             continue
         if str(row.get("status") or "").upper() not in _PENDING and not (
-            str(row.get("status") or "").upper() == "FILLED"
+            str(row.get("status") or "").upper() in {"FILLED", "RECONCILED"}
             and row.get("_economic_repair_required") is True
         ):
             continue
@@ -166,6 +168,7 @@ def _verify_original_sell_economics(
             schema.orders.c.side == "SELL",
             schema.orders.c.position_cycle_id == cycle,
             schema.orders.c.portfolio_epoch_id == portfolio,
+            schema.orders.c.trading_epoch_id == str(source["trading_epoch_id"]),
         )).limit(1)).mappings().first()
         if not order or str(order["status"]).upper() != "FILLED":
             return False, "ORIGINAL_ORDER_NOT_FILLED"
@@ -180,6 +183,8 @@ def _verify_original_sell_economics(
             schema.fills.c.env == env,
             schema.fills.c.order_id == original_id,
             schema.fills.c.side == "SELL",
+            schema.fills.c.position_cycle_id == cycle,
+            schema.fills.c.portfolio_epoch_id == portfolio,
         ))).mappings().all()
         cumulative: list[int] = []
         individual = 0
@@ -203,6 +208,7 @@ def _verify_original_sell_economics(
             schema.positions.c.code == code,
             schema.positions.c.position_cycle_id == cycle,
             schema.positions.c.portfolio_epoch_id == portfolio,
+            schema.positions.c.trading_epoch_id == str(source["trading_epoch_id"]),
         ))).mappings().all()
     if len(positions) != 1:
         return False, "ORIGINAL_POSITION_CYCLE_NOT_UNIQUE"
@@ -245,7 +251,7 @@ def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str)
     candidate_rows = []
     for raw in rows:
         row = dict(raw)
-        if str(row.get("status") or "").upper() == "FILLED":
+        if str(row.get("status") or "").upper() in {"FILLED", "RECONCILED"}:
             try:
                 done, _ = _verify_original_sell_economics(engine=engine, source=row)
             except Exception:
