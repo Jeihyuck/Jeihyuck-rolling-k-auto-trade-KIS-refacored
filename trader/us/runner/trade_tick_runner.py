@@ -1371,6 +1371,30 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) 
     return passthrough + merged
 
 
+def _profit_capture_router_status(result: dict) -> str:
+    """Map broker routing truth into the TP pending state without fail-open.
+
+    A PRE_HTTP failure can release TP pending only when the caller has
+    **verified** the Claim/journal release and no reconciliation is required.
+    Unknown submit, insufficient proof or a failed release retain PENDING.
+    """
+    status = str(result.get("status") or "ERROR").upper()
+    if status in {
+        "BROKER_SUBMIT_PRE_IO_FAILED", "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED",
+    }:
+        return "AMBIGUOUS_ACK" if result.get("requires_reconcile", True) else "FAILED"
+    mapped = {
+        "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "AMBIGUOUS_ACK",
+        "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
+        "ACK_DB_FAILED": "AMBIGUOUS_ACK",
+        "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
+    }.get(status, status)
+    if status == "BLOCKED" and result.get("pre_submit_tp_block"):
+        mapped = ("FAILED" if result.get("safe_to_release_tp_pending") is True
+                  else "AMBIGUOUS_ACK")
+    return mapped
+
+
 _ROUTED_SUBMISSION_STATUSES = {
     "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
     "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
@@ -1524,16 +1548,7 @@ def route_exit_orders_immediately(
                 # A generic BLOCKED is not proof that this stage has no
                 # broker-open attempt. Only a positively verified pre-submit
                 # block may release this attempt's pending reservation.
-                mapped_status = {
-                    "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "AMBIGUOUS_ACK",
-                    "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
-                    "ACK_DB_FAILED": "AMBIGUOUS_ACK", "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
-                }.get(status, status)
-                if status == "BLOCKED" and result.get("pre_submit_tp_block"):
-                    mapped_status = (
-                        "FAILED" if result.get("safe_to_release_tp_pending") is True
-                        else "AMBIGUOUS_ACK"
-                    )
+                mapped_status = _profit_capture_router_status(result)
                 sync_profit_capture_stage_from_order(
                     trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
                     symbol=str(intent.get("symbol") or ""),
