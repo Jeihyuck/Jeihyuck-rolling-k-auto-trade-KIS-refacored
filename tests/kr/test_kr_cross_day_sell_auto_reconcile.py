@@ -263,7 +263,7 @@ def test_close_wrapper_waits_for_trading_child_before_historical_repair():
     assert 'if [[ "$rc" -ne 124 && "$rc" -ne 137' in source
 
 
-def test_sqlite_all_statuses_and_native_economic_gap():
+def test_sqlite_all_statuses_and_native_economic_gap(monkeypatch):
     """Exercise the *actual* SQLAlchemy schema and historical SELL queue."""
     import uuid
     import sqlalchemy as sa
@@ -317,6 +317,15 @@ def test_sqlite_all_statuses_and_native_economic_gap():
             tax=0, filled_at=now, raw_json={},
             fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
         ))
+    # SQLite drops tzinfo from DateTime(timezone=True). Explicitly restore the
+    # *fixture's known UTC provenance*; production Postgres emits aware values
+    # and deliberately fails closed on genuinely unproven naïve timestamps.
+    original_kst_date = recovery._kst_date
+    def sqlite_known_utc_date(value):
+        if isinstance(value, datetime) and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return original_kst_date(value)
+    monkeypatch.setattr(recovery, "_kst_date", sqlite_known_utc_date)
     try:
         rows = recovery._load_pending_orders(
             engine=engine, env="practice", strategy="pb1_pullback_close", epoch_id=epoch,
@@ -469,6 +478,12 @@ def test_original_ack_fallback_rejects_cross_epoch_and_ambiguous_orders(monkeypa
         ))
     monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "account")
     monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: epoch_id)
+    original_kst_date = recovery._kst_date
+    def sqlite_known_utc_date(value):
+        if isinstance(value, datetime) and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return original_kst_date(value)
+    monkeypatch.setattr(recovery, "_kst_date", sqlite_known_utc_date)
     try:
         source = recovery.find_strict_original_ack_source(
             engine=engine, env="practice", strategy="pb1_pullback_close",
