@@ -2835,27 +2835,6 @@ def reconcile_kis(
             guard_result.get("empty_streak") if isinstance(guard_result, dict) else None,
         )
 
-    # Prior-day PB1 SELL reconciliation (PR244 original-order evidence), CLOSE only.
-    # Bounded to one pending historical order per close invocation; never delays
-    # AM/PM protective SELL or BUY. Failures retain the original durable fence.
-    cross_date_sell = {"state": "NOT_RUN"}
-    try:
-        from trader.kr.cross_day_sell_auto_reconcile import run_one_historical_sell_recovery
-        if ctx is not None:
-            cross_date_sell = run_one_historical_sell_recovery(
-                engine=engine, kis=kis, env=env, strategy=strategy,
-                tick_ts=tick_ts, ctx=ctx,
-            )
-    except Exception as cross_date_exc:
-        logger.exception(
-            "[KR_CROSS_DAY_SELL][RETRY_NEXT_CLOSE] error_type=%s",
-            type(cross_date_exc).__name__,
-        )
-        cross_date_sell = {
-            "state": "RETRY_NEXT_CLOSE",
-            "error_type": type(cross_date_exc).__name__,
-        }
-
     reconcile_repo = ReconcileLogRepo(engine)
     reconcile_repo.append_log(
         env=env,
@@ -2880,7 +2859,6 @@ def reconcile_kis(
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
             "run_id": run_id,
-            "cross_date_sell": cross_date_sell,
         },
     )
     reconcile_result.update(
