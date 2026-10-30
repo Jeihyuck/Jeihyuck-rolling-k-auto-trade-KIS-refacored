@@ -154,10 +154,10 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
       rc="$original_rc"
     fi
   fi
-  # All historical SELL repairs run only AFTER the trading child completes.
+  # Run after the trading child terminates, even if CLOSE reported a nonzero\n  # pending-settlement status. Timeouts/killed children are excluded to avoid\n  # recovery racing a potentially incomplete trading shutdown.
   # Use a separately bounded, no-trade maintenance child; preserve the
   # trading session's exit code even if KIS history is unavailable.
-  if [[ "$rc" -eq 0 && "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" && "${KR_CROSS_DAY_SELL_AUTO_RECONCILE:-1}" == "1" ]]; then
+  if [[ "$rc" -ne 124 && "$rc" -ne 137 && "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" && "${KR_CROSS_DAY_SELL_AUTO_RECONCILE:-1}" == "1" ]]; then
     KR_CROSS_DAY_SELL_MAX_SECONDS="${KR_CROSS_DAY_SELL_MAX_SECONDS:-420}"
     if ! [[ "$KR_CROSS_DAY_SELL_MAX_SECONDS" =~ ^[0-9]+$ ]]; then
       KR_CROSS_DAY_SELL_MAX_SECONDS=420
