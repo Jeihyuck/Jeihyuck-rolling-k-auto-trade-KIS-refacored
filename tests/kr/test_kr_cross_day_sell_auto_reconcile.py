@@ -419,3 +419,77 @@ def test_manual_postclose_entrypoint_refuses_nonpractice(monkeypatch):
     monkeypatch.setenv("DISABLE_REAL_TRADING", "1")
     monkeypatch.setenv("NO_TRADE", "1")
     assert entry.main() == 3
+
+
+def test_ack_only_sells_are_queued_without_broker_fill_inference():
+    row = _order(
+        code="253590", kis_odno=None, broker_order_id=None,
+        status="ACK_DB_FAILED_RECONCILE_REQUIRED",
+        response_json={"rt_cd": "0", "output": {"ODNO": "0000013020"}},
+    )
+    selected, blocked = recovery.classify_pending_historical_sells(
+        [row], today=date(2026, 11, 2), epoch_id="current-epoch",
+    )
+    assert not blocked and len(selected) == 1
+    assert selected[0]["_ack_only_odno"] == "0000013020"
+    assert selected[0]["kis_odno"] is None  # must NOT mutate DB before original KIS proof
+    bad = dict(row, response_json={"rt_cd": "1", "output": {"ODNO": "0000013020"}})
+    selected, blocked = recovery.classify_pending_historical_sells(
+        [bad], today=date(2026, 11, 2), epoch_id="current-epoch",
+    )
+    assert not selected and blocked
+
+
+def test_original_ack_fallback_rejects_cross_epoch_and_ambiguous_orders(monkeypatch):
+    """The missing-ODNO path is scoped to exact broker response and current account."""
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.schema import schema_for_engine
+    uid = lambda: str(uuid.uuid4())
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    epoch_id, old_epoch_id, cycle, portfolio = uid(), uid(), uid(), uid()
+    order_id = uid()
+    created = datetime(2026, 10, 30, 0, 45, 46, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders), dict(
+            order_id=order_id, env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="253590", market="KRX", side="SELL",
+            ord_type="LIMIT", qty=110,
+            client_order_key="kr292-ack-only:" + order_id,
+            status="ACK_DB_FAILED_RECONCILE_REQUIRED",
+            trading_epoch_id=epoch_id, portfolio_epoch_id=portfolio,
+            position_cycle_id=cycle, kis_odno=None, broker_order_id=None,
+            created_at=created, submitted_at=created,
+            request_json={"entry_reason": "ENTRY_MOMENTUM_CONTINUATION"},
+            response_json={"rt_cd": "0", "output": {"ODNO": "0000013020"}},
+        ))
+    monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "account")
+    monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: epoch_id)
+    try:
+        source = recovery.find_strict_original_ack_source(
+            engine=engine, env="practice", strategy="pb1_pullback_close",
+            code="253590", odno="0000013020",
+            trade_date=date(2026, 10, 30), requested_qty=110,
+        )
+        assert source is not None and source["order_id"] == order_id
+        assert source["kis_odno"] is None  # read-only identity lookup
+        assert recovery.find_strict_original_ack_source(
+            engine=engine, env="practice", strategy="pb1_pullback_close",
+            code="253590", odno="0000013020",
+            trade_date=date(2026, 10, 29), requested_qty=110,
+        ) is None
+        assert recovery.find_strict_original_ack_source(
+            engine=engine, env="practice", strategy="pb1_pullback_close",
+            code="253590", odno="0000013020",
+            trade_date=date(2026, 10, 30), requested_qty=109,
+        ) is None
+        monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: old_epoch_id)
+        assert recovery.find_strict_original_ack_source(
+            engine=engine, env="practice", strategy="pb1_pullback_close",
+            code="253590", odno="0000013020",
+            trade_date=date(2026, 10, 30), requested_qty=110,
+        ) is None
+    finally:
+        engine.dispose()
