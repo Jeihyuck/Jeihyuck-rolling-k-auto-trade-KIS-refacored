@@ -1768,6 +1768,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     side, code, kis_odno, exc,
                 )
         if strict_sell_targets is not None and not source_order:
+            # A KIS ACK may have succeeded while orders.kis_odno failed to
+            # persist (2026-10-30 NeoSem). The strict original-day all-pages
+            # broker proof has already passed. Use only a unique successful
+            # durable response with exact ODNO/date/symbol/qty/current epoch.
+            from trader.kr.cross_day_sell_auto_reconcile import find_strict_original_ack_source
+            source_order = find_strict_original_ack_source(
+                engine=engine, env=env, strategy=strategy, code=code,
+                odno=str(kis_odno or "").zfill(10),
+                trade_date=order_time.date(),
+                requested_qty=int(strict_sell_targets[code][1]),
+            )
+        if strict_sell_targets is not None and not source_order:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_DURABLE_SELL_ORDER_NOT_FOUND")
         if source_order:
             source_request = _json_dict(source_order.get("request_json"))
