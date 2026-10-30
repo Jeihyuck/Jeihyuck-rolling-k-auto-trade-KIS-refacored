@@ -16,6 +16,7 @@ import json
 import time
 import random
 import logging
+import math
 import threading
 import copy
 from dataclasses import dataclass
@@ -3530,11 +3531,29 @@ class KisAPI:
                             price = r.get("stck_prpr")
                             vol = r.get("cntg_vol")
                             if hhmmss and price is not None and vol is not None:
-                                rows.append({
+                                candle = {
                                     "time": str(hhmmss),
                                     "price": float(price),
                                     "volume": float(vol),
-                                })
+                                }
+                                # Preserve actual minute OHLCV when the native
+                                # KIS payload supplies them. Never synthesize
+                                # open/high/low from the minute-close price.
+                                # The timing gate checks all four fields and
+                                # exchange-date provenance before granting READY.
+                                bar_day = r.get("stck_bsop_date")
+                                if bar_day:
+                                    candle["date"] = str(bar_day)
+                                try:
+                                    o = float(r["stck_oprc"])
+                                    h = float(r["stck_hgpr"])
+                                    l = float(r["stck_lwpr"])
+                                    c = float(price)
+                                    if all(math.isfinite(x) and x > 0 for x in (o, h, l, c)) and l <= o <= h and l <= c <= h:
+                                        candle.update(open=o, high=h, low=l, close=c)
+                                except (KeyError, TypeError, ValueError):
+                                    pass  # unknown OHLC -> fail closed downstream
+                                rows.append(candle)
                         except Exception as e:
                             logger.debug("[INTRADAY_ROW_SKIP] %s rec=%s err=%s", iscd, r, e)
 
