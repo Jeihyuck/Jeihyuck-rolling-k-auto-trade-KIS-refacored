@@ -258,7 +258,7 @@ def test_close_wrapper_waits_for_trading_child_before_historical_repair():
     assert source.index("python -m trader.kr.runner.trade_session_runner") < source.index(
         "python -m scripts.kr_cross_day_sell_reconcile_close")
     assert "DISABLE_REAL_TRADING=1 NO_TRADE=1" in source
-    assert 'if [[ "$rc" -eq 0' in source
+    assert 'if [[ "$rc" -ne 124 && "$rc" -ne 137' in source
 
 
 def test_sqlite_all_statuses_and_native_economic_gap():
