@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import statistics
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -330,6 +331,65 @@ def _intraday_rebound(provider: Any, rets: dict[str, float | None], warnings: li
     data_ok = all(snapshot["valid"] for snapshot in snapshots.values())
     return {"snapshots": snapshots, "signals": signals, "confirmation_count": sum(signals.values()), "data_ok": data_ok, "hard_down": hard_down, "smh_recovered": bool(signals["smh_return"] or signals["smh_price_strength"])}
 
+
+def read_us_live_intraday_returns(
+    provider: Any, completed_returns: dict, warnings: list[str],
+    *, max_age_sec: float = 30.0, fetch_allowed: bool = True,
+) -> dict:
+    """US_STANDARD tick-only index moves, never completed-candle returns.
+
+    Accept only a fresh quote with a timestamp and a verified completed
+    previous close. No last/close/0 fallback can authorize a new BUY.
+    """
+    symbols = ("SPY", "QQQ", "SMH")
+    result: dict = {"quality": "UNKNOWN", "returns": {}, "quotes": {}}
+    clock = time.time()
+    for sym in symbols:
+        q: dict = {}
+        if fetch_allowed:
+            try:
+                if isinstance(provider, dict):
+                    quotes = provider.get("intraday_quotes") or provider.get("quotes") or {}
+                    q = quotes.get(sym) or quotes.get(sym.lower()) or {}
+                elif callable(getattr(provider, "get_current_price", None)):
+                    q = provider.get_current_price(sym, resolve_quote_exchange(sym))
+            except Exception as exc:
+                warnings.append(f"live_intraday_quote_failed:{sym}:{type(exc).__name__}")
+        q = q if isinstance(q, dict) else {}
+        current = next((
+            value for value in (
+                _num(q.get("last")), _num(q.get("current")),
+                _num(q.get("current_price")), _num(q.get("price")),
+            ) if value is not None and math.isfinite(value) and value > 0
+        ), None)
+        previous = _num(completed_returns.get(f"{sym.lower()}_previous_close"))
+        received = _num(q.get("asof_epoch") or q.get("received_at"))
+        source = str(q.get("source") or "").upper()
+        age = (clock - received) if received is not None else None
+        valid = bool(
+            current is not None and previous is not None
+            and math.isfinite(previous) and previous > 0
+            and age is not None and -1.0 <= age <= max_age_sec
+            and not q.get("stale") and not q.get("_stale_date")
+            and str(q.get("quality") or "").upper() not in {
+                "STALE", "SUSPECT", "DEGRADED", "OFFLINE",
+            }
+            and source not in {"DB_STALE", "KIS_STALE_CACHE", "OFFLINE"}
+        )
+        result["returns"][sym.lower()] = (current / previous - 1.0) if valid else None
+        result["quotes"][sym] = {
+            "valid": valid, "age_sec": round(age, 3) if age is not None else None,
+            "source": source or "UNKNOWN",
+            "last": current if valid else None,
+            "previous_close": previous if valid else None,
+        }
+        if not valid:
+            warnings.append(f"live_intraday_quote_unverified:{sym}")
+    if all(result["returns"][sym.lower()] is not None for sym in symbols):
+        result["quality"] = "OK"
+    return result
+
+
 def compute_us_intraday_overlay(spy_1d_return: float | None, qqq_1d_return: float | None,
                                 smh_1d_return: float | None) -> dict[str, Any]:
     """Pure SPY/QQQ/SMH intraday risk overlay for general PB1 risk control only.
@@ -380,6 +440,8 @@ def apply_intraday_overlay_to_qty(qty: int, cluster: str, overlay: dict,
     market = str(overlay.get("intraday_market_overlay") or "NORMAL")
     rotation = str(overlay.get("intraday_rotation_overlay") or "NORMAL")
     cluster = str(cluster or "").upper()
+    if market == "INTRADAY_DATA_UNKNOWN":
+        return 0, True, "INTRADAY_MARKET_DATA_UNVERIFIED_ENTRY_BLOCK"
     if market == "INTRADAY_MARKET_CRASH":
         return 0, True, "INTRADAY_MARKET_CRASH_ENTRY_BLOCK"
     if rotation == "INTRADAY_SEMI_CRASH" and cluster == "AI_SEMI":
@@ -452,7 +514,9 @@ def _account_metrics(positions: list[dict] | None, snap: dict | None) -> dict:
     }
 
 
-def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dict | None, prep_result: dict | None, positions: list[dict] | None, account_snapshot: dict | None, now=None, completed_market_context: dict | None = None) -> dict:
+def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dict | None, prep_result: dict | None, positions: list[dict] | None, account_snapshot: dict | None, now=None, completed_market_context: dict | None = None,
+                             intraday_live_required: bool = False,
+                             intraday_quote_fetch_allowed: bool = True) -> dict:
     warnings: list[str] = []
     rc = rotation_context or (prep_result or {}).get("rotation_context") or {}
     rotation_regime = str((prep_result or {}).get("rotation_regime") or rc.get("rotation_regime") or "UNKNOWN")
@@ -695,8 +759,28 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         out["effective_capital_scale"] = mults[state]
         out["effective_max_new_positions"] = constraints["max_new_positions"]
 
-    # Additive intraday overlay for general PB1 only; TQQQ_INFINITE never reads these keys.
-    intraday = compute_us_intraday_overlay(spy1, qqq1, smh1)
+    # General PB1 intraday risk needs *today's* quote/previous close,
+    # not spy1/qqq1/smh1 from the previous completed daily candle.
+    live = (read_us_live_intraday_returns(
+        provider, rets, warnings,
+        max_age_sec=_env_float("US_INTRADAY_RISK_QUOTE_MAX_AGE_SEC", 30.0),
+        fetch_allowed=intraday_quote_fetch_allowed,
+    ) if intraday_live_required else None)
+    live_returns = (live or {}).get("returns") or {}
+    intraday = compute_us_intraday_overlay(
+        live_returns.get("spy"), live_returns.get("qqq"),
+        live_returns.get("smh"),
+    )
+    if intraday_live_required and live["quality"] != "OK":
+        # A missing index cannot be treated as a zero move / risk-on.
+        # Preserve a verified full-crash signal if one is present.
+        if intraday["intraday_market_overlay"] != "INTRADAY_MARKET_CRASH":
+            intraday["intraday_market_overlay"] = "INTRADAY_DATA_UNKNOWN"
+        intraday["overlay_reasons"].append("LIVE_INTRADAY_MARKET_DATA_UNVERIFIED")
+    out["intraday_live_quote_quality"] = (live or {}).get("quality", "NOT_REQUESTED")
+    out["intraday_live_quotes"] = (live or {}).get("quotes", {})
+    out["intraday_live_returns"] = live_returns
+    out["intraday_overlay_available"] = bool(live and live["quality"] == "OK")
     out["base_market_state"] = state
     out["base_rotation_regime"] = rotation_regime
     out.update(intraday)
@@ -705,6 +789,14 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
 
     logger.info("[US_MARKET_STATE][REGIME] market_state=%s defense_regime=%s risk_on_regime=%s reasons=%s rotation_regime=%s spy_1d=%s qqq_1d=%s smh_1d=%s exposure_multiplier=%.2f allow_new_buy=%s allow_add_to_existing=%s allow_ai_tech_buy=%s", out["market_state"], out["defense_regime"], out["risk_on_regime"], out["market_state_reasons"], rotation_regime, spy1, qqq1, smh1, out["exposure_multiplier"], out["allow_new_buy"], out["allow_add_to_existing"], out["allow_ai_tech_buy"])
     logger.info("[US_MARKET_STATE][INTRADAY_OVERLAY] intraday_market_overlay=%s intraday_rotation_overlay=%s overlay_reasons=%s overlay_source_symbols=%s", intraday["intraday_market_overlay"], intraday["intraday_rotation_overlay"], intraday["overlay_reasons"], intraday["overlay_source_symbols"])
+    if intraday_live_required:
+        logger.info(
+            "[US_MARKET_STATE][INTRADAY_LIVE] trade_date=%s quality=%s "
+            "spy_today=%s qqq_today=%s smh_today=%s quotes=%s",
+            trade_date, live["quality"],
+            live_returns.get("spy"), live_returns.get("qqq"),
+            live_returns.get("smh"), live["quotes"],
+        )
     return out
 
 
