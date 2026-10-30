@@ -121,7 +121,7 @@ def should_run_close_recovery(*, env: str, tick_ts: datetime, enabled: str | Non
         return False
     now = tick_ts.astimezone(_KST)
     session = str(os.getenv("PB1_SESSION") or os.getenv("WSL_RUN_SESSION") or "").lower()
-    return session == "close" and time(15, 15) <= now.time() <= time(16, 30)
+    return session == "close" and time(15, 15) <= now.time() <= time(23, 59, 59)
 
 
 def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str) -> list[dict[str, Any]]:
