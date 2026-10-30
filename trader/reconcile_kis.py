@@ -1794,6 +1794,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 str(strict_sell_epoch_id)
             ):
                 raise RuntimeError("KR_CUMULATIVE_REPAIR_ORIGINAL_ORDER_OR_EPOCH_MISMATCH")
+            # Epoch can change while the historical KIS GET is in progress.
+            # Check the currently active account generation again before writes.
+            active_now = active_trading_epoch_id(
+                engine, env=env, account_id=get_account_key(env=env, kis=kis),
+                required=True,
+            )
+            if str(active_now) != str(strict_sell_epoch_id):
+                raise RuntimeError("KR_CUMULATIVE_REPAIR_ACTIVE_EPOCH_CHANGED")
         if source_order:
             source_request = _json_dict(source_order.get("request_json"))
             source_response = _json_dict(source_order.get("response_json"))
