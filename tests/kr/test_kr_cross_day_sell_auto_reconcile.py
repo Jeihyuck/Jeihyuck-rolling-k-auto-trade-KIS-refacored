@@ -136,7 +136,7 @@ def test_calls_original_day_authoritative_writer_once(monkeypatch):
         tick_ts=datetime(2026, 10, 30, 15, 20, tzinfo=KST),
         ctx=object(),
     )
-    assert result["state"] == "RECONCILE_ATTEMPTED"
+    assert result["state"] == "BATCH_COMPLETE"
     assert len(calls) == 1
     assert calls[0]["trade_date"] == date(2026, 10, 27)
     assert calls[0]["require_authoritative"] is True
@@ -162,8 +162,8 @@ def test_unverified_broker_response_keeps_retry_state(monkeypatch):
         tick_ts=datetime(2026, 10, 30, 15, 20, tzinfo=KST),
         ctx=object(),
     )
-    assert result["state"] == "RETRY_NEXT_CLOSE"
-    assert result["error_type"] == "RuntimeError"
+    assert result["state"] == "BATCH_WITH_PENDING"
+    assert result["orders"][0]["error_type"] == "RuntimeError"
 
 
 def test_order_read_failure_is_not_false_empty(monkeypatch):
@@ -183,3 +183,59 @@ def test_order_read_failure_is_not_false_empty(monkeypatch):
         ctx=object(),
     )
     assert result["state"] == "RETRY_NEXT_CLOSE"
+
+
+def test_all_symbols_are_recovered_even_when_one_proof_fails(monkeypatch):
+    monkeypatch.setenv("PB1_SESSION", "close")
+    monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "account")
+    monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
+    orders = [
+        _order(code="028050", order_id="one", kis_odno="0000034802"),
+        _order(code="253590", order_id="two", kis_odno="0000013020"),
+        _order(code="293490", order_id="three", kis_odno="0000034803"),
+    ]
+    monkeypatch.setattr(recovery, "OrdersRepo", lambda eng: SimpleNamespace(
+        get_open_orders=lambda *a, **kw: list(orders),
+    ))
+    import trader.reconcile_kis as rk
+    calls = []
+
+    def fake_reconcile(**kwargs):
+        code = next(iter(kwargs["strict_sell_targets"]))
+        calls.append(code)
+        if code == "253590":
+            raise ValueError("unproven KIS execution amount")
+        return {"orders": 1, "fills": 1}
+
+    monkeypatch.setattr(rk, "reconcile_today", fake_reconcile)
+    import trader.kr.unpriced_sell_audit as audit
+    monkeypatch.setattr(audit, "audit_kr_pending_sell_orders", lambda *a, **kw: {"orders": []})
+    result = recovery.run_all_historical_sell_recovery(
+        engine=_Engine(), kis=object(), env="practice",
+        strategy="pb1_pullback_close",
+        tick_ts=datetime(2026, 10, 30, 15, 20, tzinfo=KST), ctx=object(),
+    )
+    assert result["eligible"] == 3
+    assert result["attempted"] == 3
+    assert result["pending"] == 1
+    assert set(calls) == {"028050", "253590", "293490"}
+    assert result["state"] == "BATCH_WITH_PENDING"
+
+
+def test_invalid_one_symbol_does_not_starve_valid_other():
+    valid, blocked = recovery.classify_pending_historical_sells(
+        [_order(code="028050", order_id="bad", kis_odno=""),
+         _order(code="293490", order_id="good", kis_odno="0000034803")],
+        today=date(2026, 10, 30), epoch_id="current-epoch",
+    )
+    assert len(valid) == 1 and valid[0]["order_id"] == "good"
+    assert len(blocked) == 1 and blocked[0]["order_id"] == "bad"
+
+
+def test_two_distinct_orders_same_symbol_both_processed():
+    items, blocked = recovery.classify_pending_historical_sells(
+        [_order(order_id="one", kis_odno="0000034802"),
+         _order(order_id="two", kis_odno="0000034803")],
+        today=date(2026, 10, 30), epoch_id="current-epoch",
+    )
+    assert len(items) == 2 and not blocked
