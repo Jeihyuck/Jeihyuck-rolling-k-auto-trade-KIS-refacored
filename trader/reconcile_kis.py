@@ -1784,6 +1784,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 trade_date=order_time.date(),
                 requested_qty=int(strict_sell_targets[code][1]),
             )
+            if source_order is not None:
+                # The durable ACK (unique source order, original day, code,
+                # SELL, qty, current epoch) establishes only the missing
+                # broker-order identity. Authoritative KIS execution proof
+                # above establishes the quantity and notional separately.
+                # Carry this ODNO IN MEMORY for the strict cumulative proof;
+                # do not persist an unproven fill or mutate the source row.
+                verified_ack_odno = str(kis_odno or "").strip().zfill(10)
+                source_order = {
+                    **dict(source_order),
+                    "kis_odno": verified_ack_odno,
+                    "broker_order_id": verified_ack_odno,
+                }
         if strict_sell_targets is not None and not source_order:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_DURABLE_SELL_ORDER_NOT_FOUND")
         if strict_sell_order_ids is not None:
