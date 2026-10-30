@@ -17,6 +17,10 @@ from trader.db.schema import schema_for_engine
 import logging
 import os
 import json
+import hashlib
+import bisect
+from pathlib import Path
+from uuid import uuid4
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -263,6 +267,62 @@ def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str)
     return candidate_rows
 
 
+def _cursor_path(*, account_key: str, epoch_id: str) -> Path:
+    """Private, account+epoch-scoped cursor; no account string in filenames."""
+    from trader.runtime_paths import repo_root
+    identity = hashlib.sha256(
+        (str(account_key) + "\\0" + str(epoch_id)).encode("utf-8")
+    ).hexdigest()[:20]
+    return repo_root() / "runtime" / "state" / ("kr_sell_recovery_" + identity + ".json")
+
+
+def _order_sort_key(order: dict[str, Any]) -> str:
+    day = _kst_date(order.get("submitted_at") or order.get("created_at"))
+    return "|".join([
+        day.isoformat() if day else "",
+        str(order.get("code") or ""),
+        str(order.get("kis_odno") or order.get("broker_order_id") or ""),
+        str(order.get("order_id") or ""),
+    ])
+
+
+def _resume_after_cursor(
+    orders: list[dict[str, Any]], *, cursor: Path,
+) -> list[dict[str, Any]]:
+    """Resume after last attempted order, even if that order was settled."""
+    if not orders:
+        return []
+    ordered = sorted(orders, key=_order_sort_key)
+    try:
+        state = json.loads(cursor.read_text(encoding="utf-8"))
+        last = str(state.get("last_sort_key") or "")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ordered
+    if not last:
+        return ordered
+    keys = [_order_sort_key(order) for order in ordered]
+    at = bisect.bisect_right(keys, last) % len(ordered)
+    return ordered[at:] + ordered[:at]
+
+
+def _save_cursor_after(*, cursor: Path, order: dict[str, Any]) -> None:
+    """Atomic local checkpoint. Failure cannot confirm or release an order."""
+    cursor.parent.mkdir(parents=True, exist_ok=True)
+    temp = cursor.with_name(cursor.name + "." + uuid4().hex + ".tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as file:
+            os.chmod(temp, 0o600)
+            json.dump({"last_sort_key": _order_sort_key(order)}, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp, cursor)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def run_all_historical_sell_recovery(
     *, engine: Any, kis: Any, env: str, strategy: str,
     tick_ts: datetime, ctx: Any,
@@ -278,9 +338,10 @@ def run_all_historical_sell_recovery(
     if strategy != "pb1_pullback_close":
         return {"state": "OTHER_OWNER"}
     try:
+        account_key = get_account_key(env=env, kis=kis)
         with engine.connect() as conn:
             epoch_id = active_trading_epoch_id(
-                conn, env=env, account_id=get_account_key(env=env, kis=kis),
+                conn, env=env, account_id=account_key,
                 required=True,
             )
         if not epoch_id:
@@ -295,11 +356,8 @@ def run_all_historical_sell_recovery(
         return {"state": "RETRY_NEXT_CLOSE", "error_type": type(exc).__name__}
 
     from trader.reconcile_kis import reconcile_today
-        # Rotate the starting order by trade date. An old evidence-poor order
-    # must not monopolize every bounded close recovery pass.
-    if candidates:
-        shift = tick_ts.astimezone(_KST).date().toordinal() % len(candidates)
-        candidates = candidates[shift:] + candidates[:shift]
+        cursor = _cursor_path(account_key=account_key, epoch_id=str(epoch_id))
+    candidates = _resume_after_cursor(candidates, cursor=cursor)
     try:
         budget_sec = max(60, min(900, int(os.getenv("KR_CROSS_DAY_SELL_MAX_SECONDS", "420"))))
     except (ValueError, TypeError):
@@ -342,6 +400,11 @@ def run_all_historical_sell_recovery(
                             "error_type": type(exc).__name__})
             # Continue with the other codes. Never let one broken historical
             # KIS proof starve the rest of the reconciliation queue.
+        finally:
+            try:
+                _save_cursor_after(cursor=cursor, order=order)
+            except OSError as exc:
+                log.warning("[KR_CROSS_DAY_SELL][CURSOR_WRITE_FAILED] type=%s", type(exc).__name__)
     deferred = len(candidates) - attempted
     log.info(
         "[KR_CROSS_DAY_SELL][BATCH] eligible=%d attempted=%d apparently_reconciled=%d pending=%d deferred=%d blocked=%d",
