@@ -228,19 +228,28 @@ def _verify_original_sell_economics(
     pos = dict(positions[0])
     if str(pos.get("closed_reason") or "").upper() == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING":
         return False, "MANUAL_ECONOMICS_NOT_SETTLED"
+    # The reused PositionsRepo.reconcile_sell_execution() writes its
+    # idempotency/proceeds watermark to position_meta.sell_execution_reconcile
+    # keyed by the *original order_id*, not to orders.response_json.
+    # Require this precise order's applied quantity AND realized proceeds so
+    # another SELL from the same symbol/cycle cannot provide false proof.
+    position_meta = _as_obj(pos.get("position_meta"))
+    sell_watermarks = _as_obj(position_meta.get("sell_execution_reconcile"))
+    applied = _as_obj(sell_watermarks.get(str(source["order_id"])))
+    if (
+        int(applied.get("confirmed_cumulative_qty") or 0) < submitted
+        or int(applied.get("qty_accounted") or 0) < submitted
+        or int(applied.get("pnl_accounted_qty") or 0) < submitted
+        or str(applied.get("realized_pnl_status") or "").upper() != "CONFIRMED"
+    ):
+        return False, "SELL_POSITION_APPLY_UNPROVEN"
     request = _as_obj(order.get("request_json"))
     full_close = bool(request.get("force_eod_close")) or str(request.get("reason") or "") == "KR_CLOSE_DAY_FORCE_EOD"
-    if full_close:
-        if int(pos.get("qty") or 0) != 0 or str(pos.get("status") or "").upper() != "CLOSED":
-            return False, "ORIGINAL_POSITION_NOT_CLOSED"
-    else:
-        # Partial SELL must have an idempotent application watermark rather
-        # than merely a priced order. Never infer decrement from other trades.
-        applied = _as_obj(price_evidence.get("broker_truth_sell_applied"))
-        if (int(applied.get("qty") or 0) < submitted
-                and not (int(pos.get("qty") or 0) == 0
-                         and str(pos.get("status") or "").upper() == "CLOSED")):
-            return False, "SELL_POSITION_APPLY_UNPROVEN"
+    if full_close and (
+        int(pos.get("qty") or 0) != 0
+        or str(pos.get("status") or "").upper() != "CLOSED"
+    ):
+        return False, "ORIGINAL_POSITION_NOT_CLOSED"
     return True, "ECONOMIC_SETTLED"
 
 
