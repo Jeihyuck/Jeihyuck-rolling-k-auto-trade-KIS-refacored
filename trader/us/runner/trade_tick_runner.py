@@ -3043,6 +3043,12 @@ def run_trade_tick(
             account_snapshot=account_snapshot,
             now=now,
             completed_market_context=completed_market_context,
+            # Real trading ticks require today's verified index moves.
+            # Offline replay keeps its original completed-market contract.
+            intraday_live_required=not offline,
+            intraday_quote_fetch_allowed=tick_context.has_budget(
+                float(os.getenv("US_INTRADAY_RISK_MIN_REMAINING_SEC", "30"))
+            ),
         )
         if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
             prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
