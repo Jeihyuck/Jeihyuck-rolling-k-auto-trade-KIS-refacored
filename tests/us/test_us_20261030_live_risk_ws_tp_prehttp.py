@@ -330,3 +330,86 @@ def test_gild_tp1_route_pre_http_fence_recovers_only_after_claim_release(
     assert "CLAIM_RELEASE" in events
     assert state["tp1_pending"] is (not claim_release_ok)
     assert result["requires_reconcile"] is (not claim_release_ok)
+
+
+# This production-migration fixture uses a disposable CI PostgreSQL database,
+# never a connected live / practice Supabase trading database.
+from tests.us.test_us_postgres_integration_real import pg_engine  # noqa: E402,F401
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
+    from sqlalchemy import text
+
+    repos.reset_memory_stores()
+    td, lifecycle, key = "2026-10-29", "GILD_PG_L1", "GILD_PG_TP1_K1"
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=lifecycle,
+        order_key=key, qty=5, status="PENDING",
+    )
+    with pg_engine.begin() as conn:
+        before = conn.execute(text("""
+            SELECT stage_status, client_order_key, cumulative_filled_qty
+            FROM us_profit_capture_lifecycle
+            WHERE trade_date=:td AND symbol='GILD'
+            AND stage='tp1' AND position_lifecycle_id=:lifecycle
+        """), {"td": td, "lifecycle": lifecycle}).mappings().one()
+    assert before["stage_status"] == "PENDING"
+    assert before["client_order_key"] == key
+    assert int(before["cumulative_filled_qty"]) == 0
+
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key="WRONG_KEY",
+    )
+    assert repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    # A duplicated abort callback must never release a new claim/order.
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    with pg_engine.begin() as conn:
+        after = conn.execute(text("""
+            SELECT stage_status, cumulative_filled_qty, state
+            FROM us_profit_capture_lifecycle
+            WHERE trade_date=:td AND symbol='GILD'
+            AND stage='tp1' AND position_lifecycle_id=:lifecycle
+        """), {"td": td, "lifecycle": lifecycle}).mappings().one()
+    assert after["stage_status"] == "NOT_TRIGGERED"
+    assert int(after["cumulative_filled_qty"]) == 0
+    assert after["state"]["tp1_pending"] is False
+    assert after["state"]["tp1_done"] is False
+
+
+@pytest.mark.skipif(
+    not os.getenv("PBCORE_TEST_POSTGRES_URL"),
+    reason="disposable PostgreSQL acceptance URL unavailable",
+)
+def test_pg_tp1_ack_is_immune_to_late_pre_http_abort(pg_engine):
+    repos.reset_memory_stores()
+    td, lifecycle, key = "2026-10-29", "GILD_PG_L2", "GILD_PG_TP1_K2"
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=lifecycle,
+        order_key=key, qty=5, status="PENDING",
+    )
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", position_lifecycle_id=lifecycle,
+        order_key=key, qty=5, status="ACK",
+        broker_order_no="KIS_ORDER_123",
+    )
+    assert not repos.release_us_profit_capture_pre_http_abort(
+        trade_date=td, symbol="GILD", stage="tp1",
+        position_lifecycle_id=lifecycle, client_order_key=key,
+    )
+    state = repos.load_us_profit_capture_state(
+        td, ["GILD"], {"GILD": lifecycle},
+    )["GILD"]
+    assert state["tp1_pending"] is True
+    assert state["tp1_done"] is False
+    assert state.get("tp1_broker_order_no")
