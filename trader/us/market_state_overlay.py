@@ -190,6 +190,8 @@ def completed_market_context_usable(
         and isinstance(context.get("returns"), dict)
         and all(context["returns"].get(f"{symbol.lower()}_20d_return") is not None
                 for symbol in _MARKET_RETURN_SYMBOLS)
+        and all(str(context["returns"].get(f"{symbol.lower()}_previous_close_date") or "")
+                == expected_date.replace("-", "") for symbol in ("SPY", "QQQ", "SMH"))
     )
 
 
@@ -235,6 +237,7 @@ def _market_returns(
             clean_rows.sort(key=lambda r: _row_date_value(r) or "00000000")
         out[f"{sym.lower()}_previous_close"] = _row_close_value(clean_rows[-1]) if clean_rows else None
         latest_dates[sym] = str(_row_date_value(clean_rows[-1]) if clean_rows else "").replace("-", "")[:8]
+        out[f"{sym.lower()}_previous_close_date"] = latest_dates[sym]
         if sym == "QQQ":
             qqq_closes = [v for v in (_row_close_value(row) for row in clean_rows) if v is not None]
 
@@ -335,6 +338,7 @@ def _intraday_rebound(provider: Any, rets: dict[str, float | None], warnings: li
 def read_us_live_intraday_returns(
     provider: Any, completed_returns: dict, warnings: list[str],
     *, max_age_sec: float = 30.0, fetch_allowed: bool = True,
+    trade_date: str | None = None,
 ) -> dict:
     """US_STANDARD tick-only index moves, never completed-candle returns.
 
@@ -344,6 +348,10 @@ def read_us_live_intraday_returns(
     symbols = ("SPY", "QQQ", "SMH")
     result: dict = {"quality": "UNKNOWN", "returns": {}, "quotes": {}}
     clock = time.time()
+    expected_close_date = ""
+    if trade_date:
+        from trader.us.market_calendar import previous_completed_us_session
+        expected_close_date = previous_completed_us_session(trade_date).strftime("%Y%m%d")
     for sym in symbols:
         q: dict = {}
         if fetch_allowed:
@@ -363,6 +371,7 @@ def read_us_live_intraday_returns(
             ) if value is not None and math.isfinite(value) and value > 0
         ), None)
         previous = _num(completed_returns.get(f"{sym.lower()}_previous_close"))
+        completed_date = str(completed_returns.get(f"{sym.lower()}_previous_close_date") or "")
         received = _num(q.get("asof_epoch") or q.get("received_at"))
         source = str(q.get("source") or "").upper()
         age = (clock - received) if received is not None else None
@@ -374,7 +383,11 @@ def read_us_live_intraday_returns(
             and str(q.get("quality") or "").upper() not in {
                 "STALE", "SUSPECT", "DEGRADED", "OFFLINE",
             }
-            and source not in {"DB_STALE", "KIS_STALE_CACHE", "OFFLINE"}
+            and source in {
+                "KIS_LIVE", "KIS_CACHE", "KIS_WEBSOCKET",
+                "KIS_WEBSOCKET_COLLECTOR",
+            }
+            and (not expected_close_date or completed_date == expected_close_date)
         )
         result["returns"][sym.lower()] = (current / previous - 1.0) if valid else None
         result["quotes"][sym] = {
@@ -765,6 +778,7 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         provider, rets, warnings,
         max_age_sec=_env_float("US_INTRADAY_RISK_QUOTE_MAX_AGE_SEC", 30.0),
         fetch_allowed=intraday_quote_fetch_allowed,
+        trade_date=trade_date,
     ) if intraday_live_required else None)
     live_returns = (live or {}).get("returns") or {}
     intraday = compute_us_intraday_overlay(
