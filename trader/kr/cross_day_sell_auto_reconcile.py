@@ -420,7 +420,7 @@ def run_all_historical_sell_recovery(
         return {"state": "RETRY_NEXT_CLOSE", "error_type": type(exc).__name__}
 
     from trader.reconcile_kis import reconcile_today
-        cursor = _cursor_path(account_key=account_key, epoch_id=str(epoch_id))
+    cursor = _cursor_path(account_key=account_key, epoch_id=str(epoch_id))
     candidates = _resume_after_cursor(candidates, cursor=cursor)
     try:
         budget_sec = max(60, min(900, int(os.getenv("KR_CROSS_DAY_SELL_MAX_SECONDS", "420"))))
