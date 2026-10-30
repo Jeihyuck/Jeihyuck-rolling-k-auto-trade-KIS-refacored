@@ -22,9 +22,17 @@ def main() -> int:
         and os.getenv("DISABLE_REAL_TRADING") == "1"
         and os.getenv("NO_TRADE") == "1"
         and os.getenv("WSL_RUN_MARKET", "").upper() == "KR"
-        and "openapivts.koreainvestment.com" in str(os.getenv("KIS_REST_URL") or "")
     ):
         print("[KR_CROSS_DAY_SELL][BLOCK] practice_close_read_only_contract_missing")
+        return 3
+
+    # kis_wrapper uses settings.API_BASE_URL, not KIS_REST_URL; validate the
+    # actual endpoint before constructing KisAPI (which can request a token).
+    from settings import API_BASE_URL, KIS_ENV as EFFECTIVE_KIS_ENV
+    if EFFECTIVE_KIS_ENV != "practice" or not str(API_BASE_URL).startswith(
+        "https://openapivts.koreainvestment.com"
+    ):
+        print("[KR_CROSS_DAY_SELL][BLOCK] effective_KIS_endpoint_not_practice")
         return 3
 
     from trader.db.engine import get_engine
