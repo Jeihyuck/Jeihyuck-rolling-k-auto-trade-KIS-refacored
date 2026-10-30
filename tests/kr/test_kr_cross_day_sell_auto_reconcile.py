@@ -224,7 +224,7 @@ def test_all_symbols_are_recovered_even_when_one_proof_fails(monkeypatch):
 
 def test_invalid_one_symbol_does_not_starve_valid_other():
     valid, blocked = recovery.classify_pending_historical_sells(
-        [_order(code="028050", order_id="bad", kis_odno=""),
+        [_order(code="028050", order_id="bad", kis_odno="", broker_order_id=""),
          _order(code="293490", order_id="good", kis_odno="0000034803")],
         today=date(2026, 10, 30), epoch_id="current-epoch",
     )
