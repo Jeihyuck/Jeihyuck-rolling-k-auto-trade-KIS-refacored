@@ -137,6 +137,8 @@ def test_calls_original_day_authoritative_writer_once(monkeypatch):
     assert calls[0]["trade_date"] == date(2026, 10, 27)
     assert calls[0]["require_authoritative"] is True
     assert calls[0]["strict_sell_targets"] == {"028050": ("0000034802", 33)}
+    assert calls[0]["strict_sell_order_ids"] == {"028050": "order-one"}
+    assert calls[0]["strict_sell_epoch_id"] == "current-epoch"
 
 
 def test_unverified_broker_response_keeps_retry_state(monkeypatch):
