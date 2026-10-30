@@ -114,12 +114,7 @@ def test_calls_original_day_authoritative_writer_once(monkeypatch):
     monkeypatch.setenv("PB1_SESSION", "close")
     monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "practice-account")
     monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
-    monkeypatch.setattr(
-        recovery, "OrdersRepo",
-        lambda engine: SimpleNamespace(
-            get_open_orders=lambda *a, **kw: [_order()],
-        ),
-    )
+    monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: [_order()])
     import trader.reconcile_kis as rk
     calls = []
 
@@ -147,9 +142,7 @@ def test_unverified_broker_response_keeps_retry_state(monkeypatch):
     monkeypatch.setenv("PB1_SESSION", "close")
     monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "practice-account")
     monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
-    monkeypatch.setattr(recovery, "OrdersRepo", lambda engine: SimpleNamespace(
-        get_open_orders=lambda *a, **kw: [_order()],
-    ))
+    monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: [_order()])
     import trader.reconcile_kis as rk
 
     def failed_original_day(**kwargs):
@@ -170,12 +163,11 @@ def test_order_read_failure_is_not_false_empty(monkeypatch):
     monkeypatch.setenv("PB1_SESSION", "close")
     monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "practice-account")
     monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
-    def no_db_read(*args, **kwargs):
-        assert kwargs["fail_open"] is False
+    def no_db_read(**kwargs):
+        assert kwargs["env"] == "practice"
+        assert kwargs["strategy"] == "pb1_pullback_close"
         raise TimeoutError("database unavailable")
-    monkeypatch.setattr(recovery, "OrdersRepo", lambda engine: SimpleNamespace(
-        get_open_orders=no_db_read,
-    ))
+    monkeypatch.setattr(recovery, "_load_pending_orders", no_db_read)
     result = recovery.run_one_historical_sell_recovery(
         engine=_Engine(), kis=object(), env="practice",
         strategy="pb1_pullback_close",
