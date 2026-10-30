@@ -21,6 +21,9 @@ def _completed_prices():
         "spy_previous_close": 100.0,
         "qqq_previous_close": 100.0,
         "smh_previous_close": 100.0,
+        "spy_previous_close_date": "20261028",
+        "qqq_previous_close_date": "20261028",
+        "smh_previous_close_date": "20261028",
     }
 
 
