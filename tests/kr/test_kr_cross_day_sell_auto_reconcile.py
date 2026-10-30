@@ -186,9 +186,7 @@ def test_all_symbols_are_recovered_even_when_one_proof_fails(monkeypatch):
         _order(code="253590", order_id="two", kis_odno="0000013020"),
         _order(code="293490", order_id="three", kis_odno="0000034803"),
     ]
-    monkeypatch.setattr(recovery, "OrdersRepo", lambda eng: SimpleNamespace(
-        get_open_orders=lambda *a, **kw: list(orders),
-    ))
+    monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: list(orders))
     import trader.reconcile_kis as rk
     calls = []
 
