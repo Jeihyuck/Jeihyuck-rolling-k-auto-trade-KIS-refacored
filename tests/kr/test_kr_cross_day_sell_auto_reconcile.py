@@ -115,6 +115,7 @@ def test_calls_original_day_authoritative_writer_once(monkeypatch):
     monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "practice-account")
     monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
     monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: [_order()])
+    monkeypatch.setattr(recovery, "_verify_original_sell_economics", lambda **kw: (True, "ECONOMIC_SETTLED"))
     import trader.reconcile_kis as rk
     calls = []
 
@@ -143,6 +144,7 @@ def test_unverified_broker_response_keeps_retry_state(monkeypatch):
     monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "practice-account")
     monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
     monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: [_order()])
+    monkeypatch.setattr(recovery, "_verify_original_sell_economics", lambda **kw: (True, "ECONOMIC_SETTLED"))
     import trader.reconcile_kis as rk
 
     def failed_original_day(**kwargs):
@@ -187,6 +189,7 @@ def test_all_symbols_are_recovered_even_when_one_proof_fails(monkeypatch):
         _order(code="293490", order_id="three", kis_odno="0000034803"),
     ]
     monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: list(orders))
+    monkeypatch.setattr(recovery, "_verify_original_sell_economics", lambda **kw: (True, "ECONOMIC_SETTLED"))
     import trader.reconcile_kis as rk
     calls = []
 
@@ -229,3 +232,30 @@ def test_two_distinct_orders_same_symbol_both_processed():
         today=date(2026, 10, 30), epoch_id="current-epoch",
     )
     assert len(items) == 2 and not blocked
+
+
+
+def test_terminal_filled_with_missing_economics_still_retries():
+    selected, blocked = recovery.classify_pending_historical_sells(
+        [_order(status="FILLED", _economic_repair_required=True)],
+        today=date(2026, 10, 30), epoch_id="current-epoch",
+    )
+    assert len(selected) == 1 and not blocked
+
+
+def test_actual_trading_reconcile_has_no_historical_calls():
+    from pathlib import Path
+    source = Path("trader/reconcile_kis.py").read_text(encoding="utf-8")
+    # Only the post-close separate process may call historical original-day
+    # KIS proof; never under synchronous protective SELL/BUIY reconciliation.
+    assert "run_one_historical_sell_recovery(" not in source
+    assert "run_all_historical_sell_recovery(" not in source
+
+
+def test_close_wrapper_waits_for_trading_child_before_historical_repair():
+    from pathlib import Path
+    source = Path("scripts/wsl/run-kr-close.sh").read_text(encoding="utf-8")
+    assert source.index("python -m trader.kr.runner.trade_session_runner") < source.index(
+        "python -m scripts.kr_cross_day_sell_reconcile_close")
+    assert "DISABLE_REAL_TRADING=1 NO_TRADE=1" in source
+    assert 'if [[ "$rc" -eq 0' in source
