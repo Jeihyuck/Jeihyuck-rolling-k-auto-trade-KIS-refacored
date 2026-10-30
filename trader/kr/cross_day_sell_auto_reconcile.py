@@ -444,6 +444,8 @@ def run_all_historical_sell_recovery(
                 engine=engine, kis=kis, ctx=ctx, trade_date=day,
                 require_authoritative=True,
                 strict_sell_targets={code: (odno, int(order["qty"]))},
+                strict_sell_order_ids={code: str(order["order_id"])},
+                strict_sell_epoch_id=str(epoch_id),
             )
             attempted += 1
             done, state = _verify_original_sell_economics(engine=engine, source=order)
