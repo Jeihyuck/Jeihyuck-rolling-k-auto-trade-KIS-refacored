@@ -3061,7 +3061,26 @@ def run_trade_tick(
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
-        logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
+        logger.warning("[US_MARKET_STATE][WARN] type=%s", type(_market_state_exc).__name__)
+        if not offline:
+            # A failed live-risk evaluation is not evidence of NORMAL markets.
+            # Preserve already-generated protective SELLs and fail closed BUY.
+            entry_can_proceed = False
+            allow_new_symbols = False
+            market_state_overlay.update({
+                "market_regime": "RISK_OFF",
+                "force_entry_block": True,
+                "allow_new_buy": False,
+                "intraday_market_overlay": "INTRADAY_DATA_UNKNOWN",
+                "intraday_live_quote_quality": "ERROR",
+                "intraday_overlay_available": False,
+                "intraday_error_reason": "LIVE_RISK_EVALUATION_FAILED",
+            })
+            logger.error(
+                "[US_MARKET_STATE][LIVE_RISK_FAIL_CLOSED] action=BLOCK_NEW_BUY "
+                "protective_sell_retained=1 error_type=%s",
+                type(_market_state_exc).__name__,
+            )
     finally:
         tick_context.metrics["market_state_ms"] = (time.monotonic() - _market_state_started) * 1000.0
     # A CRASH_REBOUND overlay must not override an exit-stream failure.
