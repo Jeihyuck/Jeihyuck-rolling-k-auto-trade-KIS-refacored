@@ -372,3 +372,50 @@ def test_sqlite_sell_quantity_and_epoch_mismatch_never_pass_as_settled():
         assert not good and reason == "ORIGINAL_ORDER_NOT_FILLED"
     finally:
         engine.dispose()
+
+
+def test_bounded_close_batch_resumes_next_order_across_runs(monkeypatch, tmp_path):
+    """A 420-second cap must not indefinitely retry the same oldest order."""
+    monkeypatch.setenv("PB1_SESSION", "close")
+    monkeypatch.setattr(recovery, "get_account_key", lambda **kw: "account")
+    monkeypatch.setattr(recovery, "active_trading_epoch_id", lambda *a, **kw: "current-epoch")
+    path = tmp_path / "cursor.json"
+    monkeypatch.setattr(recovery, "_cursor_path", lambda **kw: path)
+    orders = [
+        _order(code="028050", order_id="one", kis_odno="0000034802"),
+        _order(code="253590", order_id="two", kis_odno="0000013020"),
+        _order(code="293490", order_id="three", kis_odno="0000034803"),
+    ]
+    monkeypatch.setattr(recovery, "_load_pending_orders", lambda **kw: list(orders))
+    monkeypatch.setattr(recovery, "_verify_original_sell_economics", lambda **kw: (True, "ECONOMIC_SETTLED"))
+    import trader.reconcile_kis as rk
+    calls = []
+
+    def old_day(**kwargs):
+        calls.append(next(iter(kwargs["strict_sell_targets"])))
+        return {"orders": 1, "fills": 1}
+    monkeypatch.setattr(rk, "reconcile_today", old_day)
+    for _ in range(3):
+        moments = iter([0, 0, 400])
+        monkeypatch.setattr(recovery, "monotonic", lambda: next(moments))
+        result = recovery.run_all_historical_sell_recovery(
+            engine=_Engine(), kis=object(), env="practice",
+            strategy="pb1_pullback_close",
+            tick_ts=datetime(2026, 10, 30, 15, 20, tzinfo=KST), ctx=object(),
+        )
+        assert result["attempted"] == 1
+        assert result["deferred"] == 2
+    assert set(calls) == {"028050", "253590", "293490"}
+    assert path.is_file()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_manual_postclose_entrypoint_refuses_nonpractice(monkeypatch):
+    from scripts import kr_cross_day_sell_reconcile_close as entry
+    monkeypatch.setenv("KIS_ENV", "real")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("PB1_SESSION", "close")
+    monkeypatch.setenv("WSL_RUN_SESSION", "close")
+    monkeypatch.setenv("DISABLE_REAL_TRADING", "1")
+    monkeypatch.setenv("NO_TRADE", "1")
+    assert entry.main() == 3
