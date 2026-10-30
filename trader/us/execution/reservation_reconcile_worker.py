@@ -77,61 +77,68 @@ def reconcile_proven_reservations_once(
             engine, env="practice", account_fingerprint=scope["account_id"],
             trading_epoch_id=epoch,
         )
-        lease = authority.acquire_lease(
-            holder_id="reservation-worker:" + uuid.uuid4().hex, ttl_seconds=30,
-        )
         params = {
             "env": "practice", "account": scope["account_id"],
             "epoch": epoch, "trade_date": trade_date, "limit": limit,
         }
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT r.action_key AS attempt_id, a.client_order_key,
+                       o.trade_date AS source_trade_date,
+                       a.attempt_state
+                FROM us_execution_account_reservations AS r
+                JOIN us_execution_attempts AS a
+                  ON a.attempt_id=r.action_key
+                JOIN us_execution_claims AS c
+                  ON c.action_key=a.action_key
+                JOIN us_orders AS o ON o.client_order_key=a.client_order_key
+                  AND o.env=r.env AND o.trading_epoch_id=r.trading_epoch_id
+                  AND o.meta->>'submit_attempt_id'=a.attempt_id
+                WHERE r.env=:env AND r.account_fingerprint=:account
+                  AND r.trading_epoch_id=:epoch
+                  AND c.env=:env AND c.account_id=:account
+                  AND c.trading_epoch_id=:epoch
+                  AND r.state IN ('RESERVED','UNCERTAIN')
+                  AND a.authoritative IS TRUE
+                  AND a.attempt_state IN (
+                      'FILLED','CANCELLED_ZERO_FILL','CANCELLED_PARTIAL_FILL'
+                  )
+                  AND a.client_order_key IS NOT NULL
+                  AND o.trade_date<=CAST(:trade_date AS DATE)
+                ORDER BY r.created_at LIMIT :limit
+            """), params).mappings().all()
+            abandoned = conn.execute(text("""
+                SELECT r.action_key AS attempt_id, a.client_order_key,
+                       NULL::DATE AS source_trade_date,
+                       a.attempt_state
+                FROM us_execution_account_reservations AS r
+                JOIN us_execution_attempts AS a
+                  ON a.attempt_id=r.action_key
+                JOIN us_execution_claims AS c
+                  ON c.action_key=a.action_key
+                WHERE r.env=:env AND r.account_fingerprint=:account
+                  AND r.trading_epoch_id=:epoch
+                  AND c.env=:env AND c.account_id=:account
+                  AND c.trading_epoch_id=:epoch
+                  AND r.state='RESERVED'
+                  AND a.authoritative IS TRUE
+                  AND a.attempt_state='ABANDONED_PRE_SUBMIT'
+                  AND c.active_attempt_id IS DISTINCT FROM a.attempt_id
+                  AND a.client_order_key IS NOT NULL
+                ORDER BY r.created_at LIMIT :limit
+            """), params).mappings().all()
+        # No terminal/pre-submit proof candidates means there is no account
+        # reservation write to perform. Do not contend with a live order
+        # submitter for the fenced lease just to execute an empty sweep.
+        # Terminalization still requires the lease and re-verifies exact proof.
+        candidates = list(rows) + list(abandoned)
+        if not candidates:
+            continue
+        lease = authority.acquire_lease(
+            holder_id="reservation-worker:" + uuid.uuid4().hex, ttl_seconds=30,
+        )
         try:
-            with engine.connect() as conn:
-                rows = conn.execute(text("""
-                    SELECT r.action_key AS attempt_id, a.client_order_key,
-                           o.trade_date AS source_trade_date,
-                           a.attempt_state
-                    FROM us_execution_account_reservations AS r
-                    JOIN us_execution_attempts AS a
-                      ON a.attempt_id=r.action_key
-                    JOIN us_execution_claims AS c
-                      ON c.action_key=a.action_key
-                    JOIN us_orders AS o ON o.client_order_key=a.client_order_key
-                      AND o.env=r.env AND o.trading_epoch_id=r.trading_epoch_id
-                      AND o.meta->>'submit_attempt_id'=a.attempt_id
-                    WHERE r.env=:env AND r.account_fingerprint=:account
-                      AND r.trading_epoch_id=:epoch
-                      AND c.env=:env AND c.account_id=:account
-                      AND c.trading_epoch_id=:epoch
-                      AND r.state IN ('RESERVED','UNCERTAIN')
-                      AND a.authoritative IS TRUE
-                      AND a.attempt_state IN (
-                          'FILLED','CANCELLED_ZERO_FILL','CANCELLED_PARTIAL_FILL'
-                      )
-                      AND a.client_order_key IS NOT NULL
-                      AND o.trade_date<=CAST(:trade_date AS DATE)
-                    ORDER BY r.created_at LIMIT :limit
-                """), params).mappings().all()
-                abandoned = conn.execute(text("""
-                    SELECT r.action_key AS attempt_id, a.client_order_key,
-                           NULL::DATE AS source_trade_date,
-                           a.attempt_state
-                    FROM us_execution_account_reservations AS r
-                    JOIN us_execution_attempts AS a
-                      ON a.attempt_id=r.action_key
-                    JOIN us_execution_claims AS c
-                      ON c.action_key=a.action_key
-                    WHERE r.env=:env AND r.account_fingerprint=:account
-                      AND r.trading_epoch_id=:epoch
-                      AND c.env=:env AND c.account_id=:account
-                      AND c.trading_epoch_id=:epoch
-                      AND r.state='RESERVED'
-                      AND a.authoritative IS TRUE
-                      AND a.attempt_state='ABANDONED_PRE_SUBMIT'
-                      AND c.active_attempt_id IS DISTINCT FROM a.attempt_id
-                      AND a.client_order_key IS NOT NULL
-                    ORDER BY r.created_at LIMIT :limit
-                """), params).mappings().all()
-            for row in list(rows) + list(abandoned):
+            for row in candidates:
                 result["attempted"] += 1
                 try:
                     if row["attempt_state"] == "ABANDONED_PRE_SUBMIT":

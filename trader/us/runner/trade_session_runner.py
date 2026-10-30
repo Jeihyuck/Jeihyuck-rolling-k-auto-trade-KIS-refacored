@@ -892,6 +892,8 @@ def run_trade_session(
     session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
     _unreaped_child_seen = False
     _shadow_reconcile_child: subprocess.Popen | None = None
+    _opening_observer_child: subprocess.Popen | None = None
+    _opening_observer_log_stream = None
     _stage4_worker_log_stream = None
     final_status = "OK"
     final_reason = "session_end"
@@ -1319,12 +1321,129 @@ def run_trade_session(
                             locked_watchlist_cache = []
                             watchlist_cache_source = "artifact_failed"
                             logger.warning("[US_SESSION][WATCHLIST_CACHE][FALLBACK_FAIL] trade_date=%s error=%s", trade_date, fb_exc)
+                # A later interrupted re-PREP cannot mask the prior finished
+                # run. Validate completed-run rows before handing cache to Tick.
+                if str((prep_status_cache or {}).get("status") or "").upper() in {
+                    "STARTED", "ERROR", "FAILED", "INTERRUPTED",
+                }:
+                    from trader.us.db.repos import load_latest_completed_us_prep_status
+                    from trader.us.prep_effective import resolve_session_prep_cache
+                    try:
+                        completed = load_latest_completed_us_prep_status(
+                            trade_date, timeout_sec=db_timeout_sec,
+                        )
+                        chosen, resolution = resolve_session_prep_cache(
+                            prep_status_cache, completed, locked_watchlist_cache,
+                        )
+                        if resolution == "completed_same_run_proven":
+                            prep_status_cache = chosen
+                            prep_cache_source = "verified_completed_same_run_cache"
+                            logger.warning(
+                                "[US_SESSION][PREP_CACHE][RECOVERED_COMPLETED] "
+                                "trade_date=%s run_id=%s",
+                                trade_date, chosen.get("run_id"),
+                            )
+                    except Exception as prep_recovery_exc:
+                        logger.warning(
+                            "[US_SESSION][PREP_CACHE][RECOVERY_UNVERIFIED] "
+                            "trade_date=%s error_type=%s action=keep_entry_fenced",
+                            trade_date, type(prep_recovery_exc).__name__,
+                        )
+
                 logger.info(
                     "[US_SESSION][ENTRY_CACHE][READY] prep_source=%s prep_status=%s watchlist_source=%s watchlist_count=%d",
                     prep_cache_source, (prep_status_cache or {}).get("status"), watchlist_cache_source, len(locked_watchlist_cache or []),
                 )
             except Exception as exc:
                 logger.warning("[US_SESSION][ENTRY_CACHE][SKIP] trade_date=%s error=%s", trade_date, exc)
+
+        # Independent, READ-ONLY KIS 1m bar observer; starts even while
+        # opening BUY permission is blocked. It is not a Tick child and cannot
+        # submit any BUY/SELL order or seize the broker order lock.
+        _timing_mode = str(os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW")).upper()
+        if (
+            session in {"am", "afternoon"} and not offline and str(env).lower() == "practice"
+            and os.getenv("US_OPENING_OBSERVER_ENABLED", "0") == "1"
+            and _timing_mode in {"SHADOW", "ENFORCE"}
+            and locked_watchlist_cache
+        ):
+            try:
+                import hashlib as _opening_hashlib
+                # Prevent a practice-account reset/trading-epoch switch
+                # from borrowing the prior opening-window price history.
+                from trader.db.trading_epoch import active_trading_epoch_id
+                _obs_epoch = active_trading_epoch_id(env="practice", required=True)
+                if not _obs_epoch:
+                    raise RuntimeError("US_OPENING_OBSERVER_EPOCH_UNVERIFIED")
+                _obs_scope = str(session_account_scope) + ":" + str(_obs_epoch)
+                os.environ["US_ENTRY_WINDOW_SCOPE"] = _obs_scope
+                _obs_key = _opening_hashlib.sha256(
+                    (str(env) + ":" + _obs_scope).encode()
+                ).hexdigest()[:20]
+                _obs_dir = Path("runtime/private")
+                _obs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                _obs_file = _obs_dir / (
+                    "us-opening-watchlist-" + _obs_key + "-" + trade_date + ".json"
+                )
+                _obs_temp = _obs_file.with_suffix(".tmp")
+                _obs_rows = [
+                    {"symbol": str(row.get("symbol") or "").upper(),
+                     "exchange": str(row.get("exchange") or "").upper()}
+                    for row in locked_watchlist_cache[:30] if isinstance(row, dict)
+                ]
+                _obs_fd = os.open(
+                    str(_obs_temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(_obs_fd, "w", encoding="utf-8") as _obs_handle:
+                    json.dump(_obs_rows, _obs_handle)
+                _obs_temp.replace(_obs_file)
+                _obs_log_dir = Path("runtime/logs")
+                _obs_log_dir.mkdir(parents=True, exist_ok=True)
+                _obs_log_path = _obs_log_dir / (
+                    "us-opening-observer-" + trade_date + "-" + _obs_key + ".log"
+                )
+                _obs_log_fd = os.open(
+                    str(_obs_log_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600
+                )
+                _opening_observer_log_stream = os.fdopen(
+                    _obs_log_fd, "a", encoding="utf-8", buffering=1
+                )
+                # Start the existing isolated read-only WS collector early
+                # so opening observer subscriptions are possible before 10:00.
+                if os.getenv("US_WS_COLLECTOR_ENABLED", "0") == "1":
+                    try:
+                        from trader.marketdata.us_ws_collector import ensure_started
+                        ensure_started(env=env, offline=False)
+                    except Exception as _collector_early_exc:
+                        logger.warning(
+                            "[US_OPENING_OBSERVER][COLLECTOR_NOT_READY] type=%s",
+                            type(_collector_early_exc).__name__,
+                        )
+                _obs_env = {
+                    **os.environ, "DRY_RUN": "1", "ALLOW_REAL_ORDER": "0",
+                    "US_KIS_ORDER_ALLOWED": "0", "KIS_ENV": "practice",
+                }
+                _opening_observer_child = subprocess.Popen(
+                    [
+                        sys.executable, "-m", "trader.us.entry_timing.opening_observer",
+                        "--env", "practice", "--trade-date", trade_date,
+                        "--scope", _obs_scope, "--parent-pid", str(os.getpid()),
+                        "--watchlist-file", str(_obs_file),
+                    ],
+                    env=_obs_env, stdin=subprocess.DEVNULL,
+                    stdout=_opening_observer_log_stream,
+                    stderr=_opening_observer_log_stream, close_fds=True,
+                )
+                logger.info(
+                    "[US_OPENING_OBSERVER][START] pid=%s session=%s symbols=%d mode=%s "
+                    "read_only=1 entry_gate_unmodified=1",
+                    _opening_observer_child.pid, session, len(_obs_rows), _timing_mode,
+                )
+            except Exception as _obs_exc:
+                logger.warning(
+                    "[US_OPENING_OBSERVER][START_FAILED] type=%s action=CONTINUE_SELL",
+                    type(_obs_exc).__name__,
+                )
 
         # Child processes are ephemeral. The parent owns only immutable,
         # quality-checked completed-day context, never live quotes or positions.
@@ -1775,6 +1894,124 @@ def run_trade_session(
                             session, tick_count,
                         )
                         break
+
+                # A recovered PREP can be selected at the next Tick boundary.
+                # If the original session guard blocked BUY, a brand-new
+                # same-run preflight + pinned revision proof is mandatory
+                # before entry can resume. An EXIT_ONLY marker is never bypassed.
+                _prep_cache_incomplete = str((prep_status_cache or {}).get("status") or "").upper() in {
+                    "STARTED", "ERROR", "FAILED", "INTERRUPTED", "UNKNOWN_DB_DEGRADED",
+                }
+                _prep_entry_blocked = not bool(prep_guard_result.get("entry_can_proceed", False))
+                if (session in {"am", "afternoon"}
+                        and (_prep_cache_incomplete or _prep_entry_blocked)
+                        and tick_count % 2 == 0):
+                    try:
+                        from trader.us.db.repos import (
+                            load_latest_us_prep_status,
+                            load_latest_completed_us_prep_status,
+                            load_locked_us_watchlist,
+                        )
+                        from trader.us.prep_effective import (
+                            is_effective_prep_status, locked_rows_match_prep_run,
+                            resolve_session_prep_cache,
+                        )
+                        _cache_timeout = max(1, int(os.getenv(
+                            "US_SESSION_PREP_CACHE_TIMEOUT_SEC", "5",
+                        )))
+                        _live_attempt = load_latest_us_prep_status(
+                            trade_date, timeout_sec=_cache_timeout,
+                        ) or {}
+                        _fresh_rows = load_locked_us_watchlist(
+                            trade_date,
+                            int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10")),
+                            os.getenv("US_ALLOW_DEGRADED_IN_TRADE", "0") == "1",
+                            _cache_timeout,
+                        ) or []
+                        if (is_effective_prep_status(_live_attempt.get("status"))
+                                and locked_rows_match_prep_run(_live_attempt, _fresh_rows)):
+                            _selected_prep, _resolution = _live_attempt, "fresh_completed_same_run"
+                        else:
+                            _completed = load_latest_completed_us_prep_status(
+                                trade_date, timeout_sec=_cache_timeout,
+                            )
+                            _selected_prep, _resolution = resolve_session_prep_cache(
+                                _live_attempt, _completed, _fresh_rows,
+                            )
+                            if (_resolution == "latest_effective"
+                                    and not locked_rows_match_prep_run(_selected_prep, _fresh_rows)):
+                                _resolution = "unverified_incomplete"
+                        if _resolution in {"fresh_completed_same_run", "completed_same_run_proven"}:
+                            prep_status_cache = _selected_prep
+                            locked_watchlist_cache = _fresh_rows
+                            prep_cache_source = "db_verified_refresh"
+                            watchlist_cache_source = "db_verified_refresh"
+                            logger.warning(
+                                "[US_SESSION][PREP_CACHE][REFRESHED] run_id=%s status=%s "
+                                "session_guard_entry_allowed=%s",
+                                _selected_prep.get("run_id"), _selected_prep.get("status"),
+                                prep_guard_result.get("entry_can_proceed", False),
+                            )
+                            if _prep_entry_blocked:
+                                from trader.us.prep_contract import check_us_prep_guard
+                                from trader.us.prep_effective import (
+                                    authorize_recovered_prep_guard,
+                                    clear_recovered_us_prep_preflight_marker,
+                                )
+                                from trader.us.run_manifest import verify_run_revision
+                                _marker_recovered, _marker_reason = (
+                                    clear_recovered_us_prep_preflight_marker(
+                                        trade_date=trade_date,
+                                        expected_run_id=str(_selected_prep.get("run_id") or ""),
+                                        current_revision=current_revision,
+                                    )
+                                )
+                                if _marker_reason not in {"no_preflight_marker",
+                                                           "preflight_marker_cleared_after_full_source_proof"}:
+                                    logger.warning(
+                                        "[US_SESSION][PREFLIGHT_RECOVERY][FENCED] "
+                                        "trade_date=%s reason=%s",
+                                        trade_date, _marker_reason,
+                                    )
+                                _new_guard = check_us_prep_guard(trade_date, session=session)
+                                _manifest = verify_run_revision(trade_date, current_revision)
+                                _allowed_recovery, _recovery_reason = authorize_recovered_prep_guard(
+                                    candidate=_selected_prep,
+                                    locked_rows=_fresh_rows,
+                                    fresh_guard=_new_guard,
+                                    trade_date=trade_date,
+                                    current_revision=current_revision,
+                                    manifest_revision_verified=bool(_manifest.get("ok")),
+                                )
+                                if _allowed_recovery:
+                                    prep_guard_result = {
+                                        **_new_guard,
+                                        "prep_run_id": str(_selected_prep.get("run_id") or ""),
+                                        "prep_revision": current_revision,
+                                        "session_revision": current_revision,
+                                        "run_revision_mismatch": False,
+                                        "version_mismatch": False,
+                                    }
+                                    logger.warning(
+                                        "[US_SESSION][PREP_GUARD][ENTRY_RECOVERED] "
+                                        "trade_date=%s run_id=%s revision_verified=1 "
+                                        "entry=ALLOW exit=ALLOW",
+                                        trade_date, _selected_prep.get("run_id"),
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[US_SESSION][PREP_GUARD][RECOVERY_ENTRY_BLOCKED] "
+                                        "trade_date=%s run_id=%s reason=%s "
+                                        "entry=BLOCK exit=ALLOW",
+                                        trade_date, _selected_prep.get("run_id"),
+                                        _recovery_reason,
+                                    )
+                    except Exception as _refresh_exc:
+                        logger.warning(
+                            "[US_SESSION][PREP_CACHE][REFRESH_FAILED] type=%s "
+                            "action=retain_prior_order_permission",
+                            type(_refresh_exc).__name__,
+                        )
 
                 tick_count += 1
                 tick_id = f"{session_run_id}:{tick_count}"
@@ -2936,6 +3173,26 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        # Market-data observer is isolated from the SELL execution authority.
+        if _opening_observer_child is not None:
+            try:
+                if _opening_observer_child.poll() is None:
+                    _opening_observer_child.terminate()
+                _opening_observer_child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _opening_observer_child.kill()
+                _opening_observer_child.wait(timeout=2)
+            except Exception as _obs_stop_exc:
+                logger.warning(
+                    "[US_OPENING_OBSERVER][STOP_UNAVAILABLE] type=%s",
+                    type(_obs_stop_exc).__name__,
+                )
+            else:
+                logger.info("[US_OPENING_OBSERVER][STOPPED] pid=%s",
+                            _opening_observer_child.pid)
+        if _opening_observer_log_stream is not None:
+            _opening_observer_log_stream.close()
+        os.environ.pop("US_ENTRY_WINDOW_SCOPE", None)
         # Reap the *read-only* observer independently of Tick children.
         # It never owns the order submission lock, so its lifecycle cannot
         # clear an unverified live Tick or an unresolved execution Claim.

@@ -332,28 +332,21 @@ fi
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
-# Stage4 subprocess logs sit OUTSIDE runtime/logs/us/$TRADE_DATE and were
-# absent from the 2026-10-26 mail despite AM/afternoon Stage4 failures.
-# Include them only when a session log proves the writer was started;
-# a LEGACY/non-WORKER session must not be spuriously marked DEGRADED.
+# Read exact same-day Stage4 child paths from each session's own logs.
+# Retain the session-specific missing evidence code for existing mail contracts.
+# Run tokens need not contain the session label; guessed glob paths are unsafe.
 if [[ "$MARKET" == us ]]; then
   for stage4_purpose in am afternoon; do
-    stage4_session_dir="$LOG_ROOT/$stage4_purpose"
-    if [[ -d "$stage4_session_dir" ]] && grep -lF '[US_STAGE4][CHILD_LOG]' "$stage4_session_dir"/*.log >/dev/null 2>&1; then
-      stage4_found=0
-      shopt -s nullglob
-      stage4_files=(runtime/logs/us-stage4-worker-"$TRADE_DATE"-"$stage4_purpose"-*.log)
-      shopt -u nullglob
-      for stage4_file in "${stage4_files[@]}"; do
-        [[ -f "$stage4_file" ]] || continue
-        collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$stage4_file"
-        stage4_found=1
-      done
-      if [[ "$stage4_found" == 0 ]]; then
-        stage4_expected="runtime/logs/us-stage4-worker-${TRADE_DATE}-${stage4_purpose}-*.log"
-        record_missing "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$stage4_expected"
-      fi
-    fi
+    while IFS= read -r worker_path; do
+      [[ "$worker_path" == "runtime/logs/us-stage4-worker-${TRADE_DATE}-"* &&
+         "$worker_path" == *.log && "$worker_path" != *"/../"* ]] || continue
+      collect_path "REQUIRED_STAGE4_WORKER_LOG_MISSING_${stage4_purpose}" "$worker_path"
+    done < <(
+      grep -hF '[US_STAGE4][CHILD_LOG]' \
+        "$LOG_ROOT/$stage4_purpose"/*.log 2>/dev/null \
+        | grep -oE 'path=runtime/logs/us-stage4-worker-[A-Za-z0-9._-]+\.log' \
+        | sed 's/^path=//' | sort -u || true
+    )
   done
 fi
 
@@ -467,6 +460,7 @@ root=Path(sys.argv[1]); keys={x.lower() for x in 'CANO ACNT_PRDT_CD APP_KEY APP_
 email=re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
 secret=re.compile(r'(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|KRX_ID|KRX_PW|KRX_API_KEY|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,"]+')
 account=re.compile(r'(?<![\d.])(\d{4})[- ]?\d{4}[- ]?(\d{2,6})(?![\d.])')
+url_userinfo=re.compile(r'(?i)\b((?:postgres(?:ql)?|mysql|redis|rediss|amqps?|https?)://)[^\s/@:]+:[^@\s/]+@')
 def clean(v):
     if isinstance(v,dict): return {k:'[REDACTED]' if str(k).lower() in keys else clean(x) for k,x in v.items()}
     if isinstance(v,list): return [clean(x) for x in v]
@@ -475,7 +469,9 @@ for p in root.rglob('*'):
     if not p.is_file(): continue
     if p.suffix.lower()=='.json': p.write_text(json.dumps(clean(json.loads(p.read_text())),ensure_ascii=False,indent=2)+'\n')
     elif p.suffix.lower() in {'.log','.txt','.md'}:
-        s=p.read_text(errors='replace'); p.write_text(account.sub(r'\1-****-\2',email.sub('[REDACTED_EMAIL]',secret.sub(r'\1[REDACTED]',s))))
+        s=p.read_text(errors='replace')
+        s=url_userinfo.sub(r'\1[REDACTED_CREDENTIALS]@',s)
+        p.write_text(account.sub(r'\1-****-\2',email.sub('[REDACTED_EMAIL]',secret.sub(r'\1[REDACTED]',s))))
 PY_REDACT
 fi
 
