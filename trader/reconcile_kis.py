@@ -1646,7 +1646,12 @@ def _kr_source_has_individual_sell_fills(
     return False
 
 
-def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False, strict_sell_targets: dict[str, tuple[str, int]] | None = None) -> dict[str, object]:
+def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False, strict_sell_targets: dict[str, tuple[str, int]] | None = None, strict_sell_order_ids: dict[str, str] | None = None, strict_sell_epoch_id: str | None = None) -> dict[str, object]:
+    if strict_sell_order_ids is not None and (
+        strict_sell_targets is None or not strict_sell_epoch_id
+        or set(strict_sell_order_ids) != set(strict_sell_targets)
+    ):
+        raise RuntimeError("KR_CUMULATIVE_REPAIR_STRICT_SOURCE_CONTRACT_INVALID")
     env = ctx.env
     env_run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
     reconcile_run_id = _resolve_reconcile_run_id(
@@ -1768,7 +1773,48 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     side, code, kis_odno, exc,
                 )
         if strict_sell_targets is not None and not source_order:
+            # A KIS ACK may have succeeded while orders.kis_odno failed to
+            # persist (2026-10-30 NeoSem). The strict original-day all-pages
+            # broker proof has already passed. Use only a unique successful
+            # durable response with exact ODNO/date/symbol/qty/current epoch.
+            from trader.kr.cross_day_sell_auto_reconcile import find_strict_original_ack_source
+            source_order = find_strict_original_ack_source(
+                engine=engine, env=env, strategy=strategy, code=code,
+                odno=str(kis_odno or "").zfill(10),
+                trade_date=order_time.date(),
+                requested_qty=int(strict_sell_targets[code][1]),
+            )
+            if source_order is not None:
+                # The durable ACK (unique source order, original day, code,
+                # SELL, qty, current epoch) establishes only the missing
+                # broker-order identity. Authoritative KIS execution proof
+                # above establishes the quantity and notional separately.
+                # Carry this ODNO IN MEMORY for the strict cumulative proof;
+                # do not persist an unproven fill or mutate the source row.
+                verified_ack_odno = str(kis_odno or "").strip().zfill(10)
+                source_order = {
+                    **dict(source_order),
+                    "kis_odno": verified_ack_odno,
+                    "broker_order_id": verified_ack_odno,
+                }
+        if strict_sell_targets is not None and not source_order:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_DURABLE_SELL_ORDER_NOT_FOUND")
+        if strict_sell_order_ids is not None:
+            if (
+                str((source_order or {}).get("order_id") or "") !=
+                str(strict_sell_order_ids.get(code) or "")
+                or str((source_order or {}).get("trading_epoch_id") or "") !=
+                str(strict_sell_epoch_id)
+            ):
+                raise RuntimeError("KR_CUMULATIVE_REPAIR_ORIGINAL_ORDER_OR_EPOCH_MISMATCH")
+            # Epoch can change while the historical KIS GET is in progress.
+            # Check the currently active account generation again before writes.
+            active_now = active_trading_epoch_id(
+                engine, env=env, account_id=get_account_key(env=env, kis=kis),
+                required=True,
+            )
+            if str(active_now) != str(strict_sell_epoch_id):
+                raise RuntimeError("KR_CUMULATIVE_REPAIR_ACTIVE_EPOCH_CHANGED")
         if source_order:
             source_request = _json_dict(source_order.get("request_json"))
             source_response = _json_dict(source_order.get("response_json"))
@@ -2877,6 +2923,7 @@ def reconcile_kis(
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
+            "cross_date_sell": cross_date_sell,
         }
     )
     # Transient caller-only broker truth.  When daily-ccld observes a fill,
