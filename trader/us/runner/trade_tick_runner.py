@@ -1371,6 +1371,30 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) 
     return passthrough + merged
 
 
+def _profit_capture_router_status(result: dict) -> str:
+    """Map broker routing truth into the TP pending state without fail-open.
+
+    A PRE_HTTP failure can release TP pending only when the caller has
+    **verified** the Claim/journal release and no reconciliation is required.
+    Unknown submit, insufficient proof or a failed release retain PENDING.
+    """
+    status = str(result.get("status") or "ERROR").upper()
+    if status in {
+        "BROKER_SUBMIT_PRE_IO_FAILED", "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED",
+    }:
+        return "AMBIGUOUS_ACK" if result.get("requires_reconcile", True) else "FAILED"
+    mapped = {
+        "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "AMBIGUOUS_ACK",
+        "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
+        "ACK_DB_FAILED": "AMBIGUOUS_ACK",
+        "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
+    }.get(status, status)
+    if status == "BLOCKED" and result.get("pre_submit_tp_block"):
+        mapped = ("FAILED" if result.get("safe_to_release_tp_pending") is True
+                  else "AMBIGUOUS_ACK")
+    return mapped
+
+
 _ROUTED_SUBMISSION_STATUSES = {
     "ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED",
     "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED",
@@ -1524,16 +1548,7 @@ def route_exit_orders_immediately(
                 # A generic BLOCKED is not proof that this stage has no
                 # broker-open attempt. Only a positively verified pre-submit
                 # block may release this attempt's pending reservation.
-                mapped_status = {
-                    "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "AMBIGUOUS_ACK",
-                    "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
-                    "ACK_DB_FAILED": "AMBIGUOUS_ACK", "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
-                }.get(status, status)
-                if status == "BLOCKED" and result.get("pre_submit_tp_block"):
-                    mapped_status = (
-                        "FAILED" if result.get("safe_to_release_tp_pending") is True
-                        else "AMBIGUOUS_ACK"
-                    )
+                mapped_status = _profit_capture_router_status(result)
                 sync_profit_capture_stage_from_order(
                     trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
                     symbol=str(intent.get("symbol") or ""),
@@ -3043,6 +3058,12 @@ def run_trade_tick(
             account_snapshot=account_snapshot,
             now=now,
             completed_market_context=completed_market_context,
+            # Real trading ticks require today's verified index moves.
+            # Offline replay keeps its original completed-market contract.
+            intraday_live_required=not offline,
+            intraday_quote_fetch_allowed=tick_context.has_budget(
+                float(os.getenv("US_INTRADAY_RISK_MIN_REMAINING_SEC", "30"))
+            ),
         )
         if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
             prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
@@ -3055,7 +3076,26 @@ def run_trade_tick(
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
-        logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
+        logger.warning("[US_MARKET_STATE][WARN] type=%s", type(_market_state_exc).__name__)
+        if not offline:
+            # Do not promote a failed market-state evaluation to live NORMAL.
+            # General PB1 BUYs are blocked by the intraday overlay postfilter;
+            # the dedicated TQQQ_INFINITE sleeve retains its own safety gate.
+            # No global entry_can_proceed / RISK_OFF rewrite: that would
+            # accidentally override the TQQQ owner's isolated policy.
+            market_state_overlay.update({
+                "intraday_market_overlay": "INTRADAY_DATA_UNKNOWN",
+                "intraday_live_quote_quality": "ERROR",
+                "intraday_overlay_available": False,
+                "intraday_error_reason": "LIVE_RISK_EVALUATION_FAILED",
+                "effective_market_state": "INTRADAY_DATA_UNKNOWN",
+            })
+            logger.error(
+                "[US_MARKET_STATE][LIVE_RISK_FAIL_CLOSED] "
+                "action=BLOCK_US_STANDARD_BUY_AT_OVERLAY_POSTFILTER "
+                "tqqq_owner_policy_preserved=1 protective_sell_retained=1 error_type=%s",
+                type(_market_state_exc).__name__,
+            )
     finally:
         tick_context.metrics["market_state_ms"] = (time.monotonic() - _market_state_started) * 1000.0
     # A CRASH_REBOUND overlay must not override an exit-stream failure.
@@ -4055,8 +4095,19 @@ def run_trade_tick(
             entry_intents = []
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
-        logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
+        # Never route unfiltered standard BUY intents after a market/risk
+        # postfilter exception. Protection SELLs were routed independently.
+        logger.error(
+            "[US_ENTRY][POSTFILTER_FAIL_CLOSED] type=%s "
+            "action=DISCARD_UNVERIFIED_BUY_INTENTS",
+            type(_cluster_guard_filter_exc).__name__,
+        )
+        entry_intents = []
+        entry_eval_error_count += 1
+        entry_degraded = True
+        entry_degraded_reason = "entry_postfilter_unavailable"
         cluster_guard_blocked_buys = []
+        market_state_blocked_buys = []
         trend_blocked_buys = []
     if 'trend_blocked_buys' not in locals():
         trend_blocked_buys = []

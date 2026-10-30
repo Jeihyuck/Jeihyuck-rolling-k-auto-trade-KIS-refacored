@@ -2667,12 +2667,23 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
         "tp1_done": bool(raw.get("tp1_done") or meta.get("tp1_done")),
         "tp2_done": bool(raw.get("tp2_done") or meta.get("tp2_done")),
         "tp3_done": bool(raw.get("tp3_done") or meta.get("tp3_done")),
-        "tp1_pending": bool(raw.get("tp1_pending") or meta.get("tp1_pending")),
-        "tp2_pending": bool(raw.get("tp2_pending") or meta.get("tp2_pending")),
-        "tp3_pending": bool(raw.get("tp3_pending") or meta.get("tp3_pending")),
+        # An explicit False from the current SQL stage_status must win over
+        # stale nested state JSON. The old `raw or meta` resurrected PENDING
+        # after a verified PRE_HTTP abort and stranded the protective SELL.
+        "tp1_pending": bool(raw["tp1_pending"] if "tp1_pending" in raw else meta.get("tp1_pending"))
+                       and not bool(raw.get("tp1_done") or meta.get("tp1_done")),
+        "tp2_pending": bool(raw["tp2_pending"] if "tp2_pending" in raw else meta.get("tp2_pending"))
+                       and not bool(raw.get("tp2_done") or meta.get("tp2_done")),
+        "tp3_pending": bool(raw["tp3_pending"] if "tp3_pending" in raw else meta.get("tp3_pending"))
+                       and not bool(raw.get("tp3_done") or meta.get("tp3_done")),
         "tp1_order_key": raw.get("tp1_order_key") or meta.get("tp1_order_key"),
         "tp2_order_key": raw.get("tp2_order_key") or meta.get("tp2_order_key"),
         "tp3_order_key": raw.get("tp3_order_key") or meta.get("tp3_order_key"),
+        # Keep broker ACK identity visible on reads so a late abort cannot
+        # silently erase an already-acknowledged TP stage.
+        "tp1_broker_order_no": raw.get("tp1_broker_order_no") or meta.get("tp1_broker_order_no"),
+        "tp2_broker_order_no": raw.get("tp2_broker_order_no") or meta.get("tp2_broker_order_no"),
+        "tp3_broker_order_no": raw.get("tp3_broker_order_no") or meta.get("tp3_broker_order_no"),
         "tp1_at": raw.get("tp1_at") or meta.get("tp1_at"),
         "tp2_at": raw.get("tp2_at") or meta.get("tp2_at"),
         "tp3_at": raw.get("tp3_at") or meta.get("tp3_at"),
@@ -2747,6 +2758,7 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                 state[f"{stage}_pending"]=status=="PENDING"
                 state[f"{stage}_done"]=status=="DONE"
                 state[f"{stage}_order_key"]=row.get("client_order_key")
+                state[f"{stage}_broker_order_no"]=row.get("raw_broker_order_no")
                 state["meta"].update(_parse_json_meta(row.get("state")))
         if state and str(state.get("position_lifecycle_id") or "LEGACY") != lifecycle:
             state = {}
@@ -2890,6 +2902,80 @@ def mark_us_profit_capture_stage(
         else:
             with engine.begin() as conn:
                 _write_profit_capture(conn)
+
+
+
+
+def release_us_profit_capture_pre_http_abort(
+    *, trade_date: str, symbol: str, stage: str,
+    position_lifecycle_id: str, client_order_key: str,
+) -> bool:
+    """Clear a TP intent-only PENDING *only* after proven no-HTTP abort.
+
+    Caller must have durable BROKER_SUBMIT_ABORTED_PRE_IO and successful
+    Claim release. Lock the exact TP lifecycle row so a later ACK/attempt
+    cannot be overwritten by a stale abort. NEVER apply to unknown POST.
+    """
+    sym = str(symbol or "").strip().upper()
+    stg = str(stage or "").strip().lower()
+    lifecycle = str(position_lifecycle_id or "").strip()
+    order_key = str(client_order_key or "").strip()
+    if not all((trade_date, sym, lifecycle, order_key)) or stg not in {"tp1", "tp2", "tp3"}:
+        return False
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        state = load_us_profit_capture_state(
+            trade_date, [sym], {sym: lifecycle},
+        ).get(sym, {})
+        if (str(state.get(f"{stg}_order_key") or "") != order_key
+                or not state.get(f"{stg}_pending")
+                or state.get(f"{stg}_done")
+                or str((state.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
+                or state.get(f"{stg}_broker_order_no")):
+            return False
+        mark_us_profit_capture_stage(
+            trade_date, sym, stg, order_key=order_key,
+            position_lifecycle_id=lifecycle, status="FAILED",
+            evidence_type="BROKER_SUBMIT_ABORTED_PRE_IO",
+        )
+        return True
+
+    with engine.begin() as conn:
+        epoch_id = _active_us_epoch(conn)
+        params = {
+            "td": str(trade_date), "sym": sym, "stage": stg,
+            "lifecycle": lifecycle, "key": order_key,
+        }
+        epoch_clause = ""
+        if epoch_id:
+            params["epoch"] = epoch_id
+            epoch_clause = " AND trading_epoch_id=:epoch"
+        row = conn.execute(text("""
+            SELECT stage_status, cumulative_filled_qty
+            FROM us_profit_capture_lifecycle
+            WHERE trade_date=:td AND symbol=:sym
+              AND position_lifecycle_id=:lifecycle AND stage=:stage
+              AND client_order_key=:key
+        """ + epoch_clause + " FOR UPDATE"), params).mappings().one_or_none()
+        if (not row or str(row["stage_status"]) != "PENDING"
+                or int(row.get("cumulative_filled_qty") or 0) != 0):
+            return False
+        current = load_us_profit_capture_state(
+            trade_date, [sym], {sym: lifecycle}, _conn=conn,
+        ).get(sym, {})
+        if (str(current.get(f"{stg}_order_key") or "") != order_key
+                or not current.get(f"{stg}_pending")
+                or current.get(f"{stg}_done")
+                or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
+                or current.get(f"{stg}_broker_order_no")):
+            return False
+        mark_us_profit_capture_stage(
+            trade_date, sym, stg, order_key=order_key,
+            position_lifecycle_id=lifecycle, status="FAILED",
+            evidence_type="BROKER_SUBMIT_ABORTED_PRE_IO", _conn=conn,
+        )
+        return True
 
 
 def mark_us_position_exit_stage(

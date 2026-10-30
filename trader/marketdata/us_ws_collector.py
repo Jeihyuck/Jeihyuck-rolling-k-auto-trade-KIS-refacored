@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 from pathlib import Path
 import socket
 import subprocess
@@ -38,9 +39,22 @@ def _account_identity(env: str) -> str:
 
 
 def socket_path(env: str) -> Path:
-    root = Path(__file__).resolve().parents[2] / "runtime" / "private"
-    root.mkdir(parents=True, exist_ok=True)
-    return root / ("us-ws-" + _account_identity(env) + ".sock")
+    """Use a short, private AF_UNIX path; repo paths may exceed sun_path.
+
+    Linux AF_UNIX socket names have a 108-byte sun_path including NUL.
+    Do not place the socket beneath a long WSL checkout path.
+    """
+    root = Path("/tmp") / f"usws-{os.getuid()}"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = root.lstat()
+    if (not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise RuntimeError("US_WS_COLLECTOR_SOCKET_DIRECTORY_UNSAFE")
+    path = root / ("us-ws-" + _account_identity(env) + ".sock")
+    if len(os.fsencode(str(path))) >= 108:
+        raise RuntimeError("US_WS_COLLECTOR_SOCKET_PATH_TOO_LONG")
+    return path
 
 
 def _send_request(env: str, payload: dict, *, timeout_sec: float) -> dict | None:
@@ -313,13 +327,50 @@ def ensure_started(*, env: str, offline: bool = False) -> subprocess.Popen | Non
         return None
 
 
+def _record_child_failure(exc: BaseException) -> None:
+    """Write bounded, non-secret crash evidence even with child stderr closed."""
+    try:
+        root = Path(__file__).resolve().parents[2] / "runtime" / "logs" / "us"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / "ws-collector-exit.jsonl"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            meta = os.fstat(fd)
+            if meta.st_uid != os.getuid() or stat.S_IMODE(meta.st_mode) & 0o077:
+                return
+            item = {
+                "event": "US_WS_COLLECTOR_CHILD_EXIT",
+                "pid": os.getpid(),
+                "exception_type": type(exc).__name__,
+                "errno": exc.errno if isinstance(exc, OSError) else None,
+                "socket_path_bytes": (
+                    len(os.fsencode(str(Path("/tmp") / f"usws-{os.getuid()}"
+                                         / ("us-ws-" + "x" * 24 + ".sock"))))
+                ),
+            }
+            os.write(fd, (json.dumps(item) + "\n").encode())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="practice", choices=["practice", "real"])
     parser.add_argument("--parent-pid", type=int, required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    return serve(env=args.env, parent_pid=args.parent_pid)
+    try:
+        return serve(env=args.env, parent_pid=args.parent_pid)
+    except Exception as exc:
+        _record_child_failure(exc)
+        logger.error("[US_WS_COLLECTOR][CHILD_EXIT] type=%s errno=%s",
+                     type(exc).__name__, getattr(exc, "errno", None))
+        return 1
 
 
 if __name__ == "__main__":
