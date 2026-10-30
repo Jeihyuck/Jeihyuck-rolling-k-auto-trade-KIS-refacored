@@ -413,3 +413,23 @@ def test_pg_tp1_ack_is_immune_to_late_pre_http_abort(pg_engine):
     assert state["tp1_pending"] is True
     assert state["tp1_done"] is False
     assert state.get("tp1_broker_order_no")
+
+
+@pytest.mark.parametrize(
+    ("router", "expected"),
+    [
+        ({"status": "BROKER_SUBMIT_PRE_IO_FAILED", "requires_reconcile": False}, "FAILED"),
+        ({"status": "BROKER_SUBMIT_PRE_IO_FAILED", "requires_reconcile": True}, "AMBIGUOUS_ACK"),
+        ({"status": "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED",
+          "requires_reconcile": True}, "AMBIGUOUS_ACK"),
+        ({"status": "BROKER_SUBMIT_RESULT_UNKNOWN"}, "AMBIGUOUS_ACK"),
+        ({"status": "ACK"}, "ACK"),
+        ({"status": "BLOCKED", "pre_submit_tp_block": True,
+          "safe_to_release_tp_pending": False}, "AMBIGUOUS_ACK"),
+        ({"status": "BLOCKED", "pre_submit_tp_block": True,
+          "safe_to_release_tp_pending": True}, "FAILED"),
+    ],
+)
+def test_tp_router_status_requires_complete_pre_http_proof(router, expected):
+    from trader.us.runner.trade_tick_runner import _profit_capture_router_status
+    assert _profit_capture_router_status(router) == expected
