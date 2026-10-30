@@ -259,3 +259,116 @@ def test_close_wrapper_waits_for_trading_child_before_historical_repair():
         "python -m scripts.kr_cross_day_sell_reconcile_close")
     assert "DISABLE_REAL_TRADING=1 NO_TRADE=1" in source
     assert 'if [[ "$rc" -eq 0' in source
+
+
+def test_sqlite_all_statuses_and_native_economic_gap():
+    """Exercise the *actual* SQLAlchemy schema and historical SELL queue."""
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.schema import schema_for_engine
+
+    def new_id():
+        return str(uuid.uuid4())
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    epoch = new_id()
+    portfolio = new_id()
+    cycle_a = new_id()
+    cycle_b = new_id()
+    order_a = new_id()
+    order_b = new_id()
+    now = datetime(2026, 10, 27, 6, 16, tzinfo=timezone.utc)
+    def order_row(oid, cycle, code, no, status):
+        return dict(order_id=oid, env="practice", strategy="pb1_pullback_close",
+                    sid=1, mode=1, code=code, side="SELL", ord_type="MARKET",
+                    market="KRX", qty=33, client_order_key="kr292:" + oid,
+                    status=status, kis_odno=no, broker_order_id=no,
+                    trading_epoch_id=epoch, portfolio_epoch_id=portfolio,
+                    position_cycle_id=cycle, submitted_at=now, created_at=now,
+                    request_json={"reason": "KR_CLOSE_DAY_FORCE_EOD"},
+                    response_json={"confirmed_fill_qty": 33, "confirmed_fill_price": 24000,
+                                   "confirmed_fill_notional": 792000})
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders), [
+            order_row(order_a, cycle_a, "028050", "0000034802", "FILLED"),
+            order_row(order_b, cycle_b, "253590", "0000034803", "RECONCILED"),
+        ])
+        conn.execute(sa.insert(schema.positions), [
+            dict(position_id=new_id(), env="practice", strategy="pb1_pullback_close",
+                 sid=1, mode=1, code="028050", market="KRX", qty=0,
+                 status="CLOSED", position_cycle_id=cycle_a, portfolio_epoch_id=portfolio,
+                 trading_epoch_id=epoch, total_cost=0, realized_pnl=-50000,
+                 avg_buy_price=None, closed_reason="FULL_SELL"),
+            dict(position_id=new_id(), env="practice", strategy="pb1_pullback_close",
+                 sid=1, mode=1, code="253590", market="KRX", qty=33,
+                 status="OPEN", position_cycle_id=cycle_b, portfolio_epoch_id=portfolio,
+                 trading_epoch_id=epoch, total_cost=825000, realized_pnl=0,
+                 avg_buy_price=25000),
+        ])
+        conn.execute(sa.insert(schema.fills), dict(
+            fill_id=new_id(), env="practice", order_id=order_a, code="028050",
+            market="KRX", side="SELL", qty=33, price=24000,
+            trading_epoch_id=epoch, portfolio_epoch_id=portfolio,
+            position_cycle_id=cycle_a, trade_id="kr292-exact-native", fee=0,
+            tax=0, filled_at=now, raw_json={},
+            fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+        ))
+    try:
+        rows = recovery._load_pending_orders(
+            engine=engine, env="practice", strategy="pb1_pullback_close", epoch_id=epoch,
+        )
+        assert [r["code"] for r in rows] == ["253590"], rows
+        assert rows[0]["_economic_repair_required"] is True
+        selected, blocked = recovery.classify_pending_historical_sells(
+            rows, today=date(2026, 10, 30), epoch_id=epoch,
+        )
+        assert len(selected) == 1 and not blocked
+        assert selected[0]["code"] == "253590"
+        with engine.connect() as conn:
+            assert conn.execute(sa.select(schema.positions.c.qty).where(
+                schema.positions.c.code == "253590")).scalar() == 33
+    finally:
+        engine.dispose()
+
+
+def test_sqlite_sell_quantity_and_epoch_mismatch_never_pass_as_settled():
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.schema import schema_for_engine
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    uid = lambda: str(uuid.uuid4())
+    order_id, cycle, portfolio, epoch = uid(), uid(), uid(), uid()
+    original = _order(
+        order_id=order_id, position_cycle_id=cycle,
+        portfolio_epoch_id=portfolio, trading_epoch_id=epoch,
+    )
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders), dict(
+            order_id=order_id, env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="028050", market="KRX", side="SELL",
+            ord_type="MARKET", qty=33, client_order_key="kr292:" + order_id,
+            status="FILLED", kis_odno="0000034802",
+            portfolio_epoch_id=portfolio, position_cycle_id=cycle,
+            trading_epoch_id=epoch, request_json={"reason": "KR_CLOSE_DAY_FORCE_EOD"},
+            response_json={"confirmed_fill_qty": 33, "confirmed_fill_notional": 792000,
+                           "confirmed_fill_price": 24000},
+        ))
+        conn.execute(sa.insert(schema.positions), dict(
+            position_id=uid(), env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="028050", market="KRX", qty=0, status="CLOSED",
+            total_cost=0, realized_pnl=0, position_cycle_id=cycle,
+            portfolio_epoch_id=portfolio, trading_epoch_id=epoch,
+            closed_reason="FULL_SELL",
+        ))
+    try:
+        good, reason = recovery._verify_original_sell_economics(engine=engine, source=original)
+        assert not good and reason == "NATIVE_PRICED_SELL_FILL_GAP"
+        old_epoch = dict(original, trading_epoch_id=uid())
+        good, reason = recovery._verify_original_sell_economics(engine=engine, source=old_epoch)
+        assert not good and reason == "ORIGINAL_ORDER_NOT_FILLED"
+    finally:
+        engine.dispose()
