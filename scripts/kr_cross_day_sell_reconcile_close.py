@@ -20,6 +20,9 @@ def main() -> int:
         and os.getenv("PB1_SESSION", "").lower() == "close"
         and os.getenv("WSL_RUN_SESSION", "").lower() == "close"
         and os.getenv("DISABLE_REAL_TRADING") == "1"
+        and os.getenv("NO_TRADE") == "1"
+        and os.getenv("WSL_RUN_MARKET", "").upper() == "KR"
+        and "openapivts.koreainvestment.com" in str(os.getenv("KIS_REST_URL") or "")
     ):
         print("[KR_CROSS_DAY_SELL][BLOCK] practice_close_read_only_contract_missing")
         return 3
