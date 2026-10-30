@@ -65,7 +65,7 @@ def test_duplicate_broker_identity_and_missing_cycle_fail_closed():
         [_order(position_cycle_id=None)],
         today=date(2026, 10, 30), epoch_id="current-epoch",
     )
-    assert selected is None and reason == "MISSING_ORIGINAL_SELL_IDENTITY"
+    assert selected is None and reason == "ORIGINAL_SELL_IDENTITY_OR_QTY_INVALID"
 
 
 def test_never_reconcile_current_day_or_filled_or_missing_broker_id():
@@ -81,7 +81,7 @@ def test_never_reconcile_current_day_or_filled_or_missing_broker_id():
         [_order(kis_odno=None, broker_order_id=None)],
         today=date(2026, 10, 30), epoch_id="current-epoch",
     )
-    assert selected is None and reason == "MISSING_ORIGINAL_SELL_IDENTITY"
+    assert selected is None and reason == "ORIGINAL_SELL_IDENTITY_OR_QTY_INVALID"
 
 
 def test_close_only_and_practice_only(monkeypatch):
