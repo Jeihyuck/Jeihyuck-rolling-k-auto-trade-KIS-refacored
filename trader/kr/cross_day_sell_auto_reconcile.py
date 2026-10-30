@@ -1,6 +1,6 @@
 """Bounded, practice-only automatic recovery of prior-day PB1 SELL settlements.
 
-Runs only in the existing close reconciliation lane, never in AM/PM BUY or
+Runs only when the WSL close session invokes reconciliation; never in AM/PM BUY or
 protective-SELL preparation. Reuses the PR244 authoritative original-day
 KIS all-pages, strict ODNO/date/code/side/quantity path. No new broker orders.
 
@@ -97,7 +97,8 @@ def should_run_close_recovery(*, env: str, tick_ts: datetime, enabled: str | Non
     if tick_ts.tzinfo is None:
         return False
     now = tick_ts.astimezone(_KST)
-    return time(15, 35) <= now.time() <= time(20, 0)
+    session = str(os.getenv("PB1_SESSION") or os.getenv("WSL_RUN_SESSION") or "").lower()
+    return session == "close" and time(15, 15) <= now.time() <= time(16, 30)
 
 
 def run_one_historical_sell_recovery(
