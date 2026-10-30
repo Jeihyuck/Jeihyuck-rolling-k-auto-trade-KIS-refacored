@@ -16,6 +16,7 @@ import sqlalchemy as sa
 from trader.db.schema import schema_for_engine
 import logging
 import os
+import json
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -55,7 +56,10 @@ def classify_pending_historical_sells(
     for row in orders:
         if str(row.get("side") or "").upper() != "SELL":
             continue
-        if str(row.get("status") or "").upper() not in _PENDING:
+        if str(row.get("status") or "").upper() not in _PENDING and not (
+            str(row.get("status") or "").upper() == "FILLED"
+            and row.get("_economic_repair_required") is True
+        ):
             continue
         if str(row.get("trading_epoch_id") or "") != epoch_id:
             continue
@@ -124,6 +128,103 @@ def should_run_close_recovery(*, env: str, tick_ts: datetime, enabled: str | Non
     return session == "close" and time(15, 15) <= now.time() <= time(23, 59, 59)
 
 
+def _as_obj(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _verify_original_sell_economics(
+    *, engine: Any, source: dict[str, Any],
+) -> tuple[bool, str]:
+    """Require durable native KIS fill AND correct original lifecycle.
+
+    This is deliberately stricter than a terminal order status or a broker
+    ACK. It prevents a FILLED-but-no-fill DB order from disappearing from the
+    retry queue, and detects a stale OPEN position after forced day liquidation.
+    """
+    from trader.db.schema import uuid_value_for_url
+    schema = schema_for_engine(engine)
+    env = str(source["env"])
+    strategy = str(source["strategy"])
+    code = str(source["code"])
+    cycle = str(source["position_cycle_id"])
+    portfolio = str(source["portfolio_epoch_id"])
+    original_id = uuid_value_for_url(str(engine.url), str(source["order_id"]))
+    with engine.connect() as conn:
+        order = conn.execute(sa.select(schema.orders).where(sa.and_(
+            schema.orders.c.order_id == original_id,
+            schema.orders.c.env == env,
+            schema.orders.c.strategy == strategy,
+            schema.orders.c.code == code,
+            schema.orders.c.side == "SELL",
+            schema.orders.c.position_cycle_id == cycle,
+            schema.orders.c.portfolio_epoch_id == portfolio,
+        )).limit(1)).mappings().first()
+        if not order or str(order["status"]).upper() != "FILLED":
+            return False, "ORIGINAL_ORDER_NOT_FILLED"
+        order = dict(order)
+        price_evidence = _as_obj(order.get("response_json"))
+        submitted = int(order.get("qty") or 0)
+        if (int(price_evidence.get("confirmed_fill_qty") or 0) != submitted
+                or float(price_evidence.get("confirmed_fill_notional") or 0) <= 0
+                or float(price_evidence.get("confirmed_fill_price") or 0) <= 0):
+            return False, "KIS_NATIVE_ORDER_ECONOMICS_NOT_DURABLE"
+        fills = conn.execute(sa.select(schema.fills).where(sa.and_(
+            schema.fills.c.env == env,
+            schema.fills.c.order_id == original_id,
+            schema.fills.c.side == "SELL",
+        ))).mappings().all()
+        cumulative: list[int] = []
+        individual = 0
+        for fill in fills:
+            meta = _as_obj(fill.get("fill_meta_json"))
+            kind = str(meta.get("evidence_kind") or "").upper()
+            qty = int(fill.get("qty") or 0)
+            price = float(fill.get("price") or 0)
+            if qty <= 0 or price <= 0:
+                continue
+            if kind == "KIS_ORDER_CUMULATIVE_EXECUTION":
+                cumulative.append(qty)
+            elif kind == "KIS_INDIVIDUAL_EXECUTION":
+                individual += qty
+        native_qty = max(max(cumulative, default=0), individual)
+        if native_qty != submitted:
+            return False, "NATIVE_PRICED_SELL_FILL_GAP"
+        positions = conn.execute(sa.select(schema.positions).where(sa.and_(
+            schema.positions.c.env == env,
+            schema.positions.c.strategy == strategy,
+            schema.positions.c.code == code,
+            schema.positions.c.position_cycle_id == cycle,
+            schema.positions.c.portfolio_epoch_id == portfolio,
+        ))).mappings().all()
+    if len(positions) != 1:
+        return False, "ORIGINAL_POSITION_CYCLE_NOT_UNIQUE"
+    pos = dict(positions[0])
+    if str(pos.get("closed_reason") or "").upper() == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING":
+        return False, "MANUAL_ECONOMICS_NOT_SETTLED"
+    request = _as_obj(order.get("request_json"))
+    full_close = bool(request.get("force_eod_close")) or str(request.get("reason") or "") == "KR_CLOSE_DAY_FORCE_EOD"
+    if full_close:
+        if int(pos.get("qty") or 0) != 0 or str(pos.get("status") or "").upper() != "CLOSED":
+            return False, "ORIGINAL_POSITION_NOT_CLOSED"
+    else:
+        # Partial SELL must have an idempotent application watermark rather
+        # than merely a priced order. Never infer decrement from other trades.
+        applied = _as_obj(price_evidence.get("broker_truth_sell_applied"))
+        if (int(applied.get("qty") or 0) < submitted
+                and not (int(pos.get("qty") or 0) == 0
+                         and str(pos.get("status") or "").upper() == "CLOSED")):
+            return False, "SELL_POSITION_APPLY_UNPROVEN"
+    return True, "ECONOMIC_SETTLED"
+
+
 def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str) -> list[dict[str, Any]]:
     """Read ALL statuses from authoritative DB, not the recent/open-order cache.
 
@@ -137,11 +238,23 @@ def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str)
                 schema.orders.c.env == env,
                 schema.orders.c.strategy == strategy,
                 schema.orders.c.side == "SELL",
-                schema.orders.c.status.in_(sorted(_PENDING)),
+                schema.orders.c.status.in_(sorted(_PENDING | {"FILLED"})),
                 schema.orders.c.trading_epoch_id == epoch_id,
             )).order_by(schema.orders.c.created_at.asc())
         ).mappings().all()
-    return [dict(row) for row in rows]
+    candidate_rows = []
+    for raw in rows:
+        row = dict(raw)
+        if str(row.get("status") or "").upper() == "FILLED":
+            try:
+                done, _ = _verify_original_sell_economics(engine=engine, source=row)
+            except Exception:
+                done = False
+            if done:
+                continue
+            row["_economic_repair_required"] = True
+        candidate_rows.append(row)
+    return candidate_rows
 
 
 def run_all_historical_sell_recovery(
@@ -176,8 +289,7 @@ def run_all_historical_sell_recovery(
         return {"state": "RETRY_NEXT_CLOSE", "error_type": type(exc).__name__}
 
     from trader.reconcile_kis import reconcile_today
-    from trader.kr.unpriced_sell_audit import audit_kr_pending_sell_orders
-    # Rotate the starting order by trade date. An old evidence-poor order
+        # Rotate the starting order by trade date. An old evidence-poor order
     # must not monopolize every bounded close recovery pass.
     if candidates:
         shift = tick_ts.astimezone(_KST).date().toordinal() % len(candidates)
@@ -206,16 +318,11 @@ def run_all_historical_sell_recovery(
                 strict_sell_targets={code: (odno, int(order["qty"]))},
             )
             attempted += 1
-            audit = audit_kr_pending_sell_orders(engine, env=env, trade_date=day)
-            pending_ids = {str(row.get("order_id") or "") for row in audit.get("orders", [])}
-            if str(order["order_id"]) in pending_ids:
-                state = "STILL_PENDING_RETRY_NEXT_CLOSE"
-                failed += 1
-            else:
-                # Audit is not by itself economic proof: the writer's own
-                # execution evidence must also be positive.
-                state = "RECONCILE_ATTEMPTED"
+            done, state = _verify_original_sell_economics(engine=engine, source=order)
+            if done:
                 settled += 1
+            else:
+                failed += 1
             results.append({"code": code, "order_id": str(order["order_id"]),
                             "trade_date": str(day), "state": state,
                             "broker_fills": int(evidence.get("fills") or 0)})
