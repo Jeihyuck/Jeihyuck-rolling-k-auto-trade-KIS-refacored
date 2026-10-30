@@ -149,3 +149,53 @@ def test_tp_pre_http_abort_cannot_clear_acked_order(monkeypatch):
             "2026-10-29", ["GILD"], {"GILD": "life-gild"},
         )["GILD"]
         assert state["tp1_pending"] is True
+
+
+def test_real_tick_market_overlay_uses_today_not_daily(monkeypatch):
+    # Completed index candles are green; only today's QQQ quote is negative.
+    def completed(_provider, _date, _warnings, **_kw):
+        return {
+            "spy_1d_return": .0073,
+            "qqq_1d_return": .00417,
+            "smh_1d_return": .01117,
+            "spy_3d_return": .0073,
+            "qqq_3d_return": .00417,
+            "smh_3d_return": .01117,
+            **_completed_prices(),
+        }
+
+    monkeypatch.setattr(overlay, "_market_returns", completed)
+    provider = {"intraday_quotes": {
+        "SPY": _live_quote(99.7),
+        "QQQ": _live_quote(98.0),
+        "SMH": _live_quote(98.5),
+    }}
+    result = overlay.evaluate_us_market_state(
+        trade_date="2026-10-29", provider=provider, positions=[],
+        account_snapshot={}, rotation_context={"rotation_regime": "NORMAL"},
+        prep_result={}, intraday_live_required=True,
+    )
+    assert result["qqq_1d_return"] == .00417
+    assert result["intraday_live_returns"]["qqq"] == pytest.approx(-.02)
+    assert result["intraday_market_overlay"] == "INTRADAY_RISK_OFF"
+    assert result["intraday_overlay_available"] is True
+
+
+def test_real_tick_missing_quote_is_not_faked_as_no_risk(monkeypatch):
+    monkeypatch.setattr(
+        overlay, "_market_returns",
+        lambda *_a, **_kw: {
+            "spy_1d_return": .01, "qqq_1d_return": .01,
+            "smh_1d_return": .01, **_completed_prices(),
+        },
+    )
+    result = overlay.evaluate_us_market_state(
+        trade_date="2026-10-29",
+        provider={"intraday_quotes": {"SPY": _live_quote(100)}},
+        positions=[], account_snapshot={},
+        rotation_context={"rotation_regime": "NORMAL"},
+        prep_result={}, intraday_live_required=True,
+    )
+    assert result["intraday_live_quote_quality"] == "UNKNOWN"
+    assert result["intraday_market_overlay"] == "INTRADAY_DATA_UNKNOWN"
+    assert result["intraday_overlay_available"] is False
