@@ -510,3 +510,127 @@ def test_original_ack_fallback_rejects_cross_epoch_and_ambiguous_orders(monkeypa
         ) is None
     finally:
         engine.dispose()
+
+
+def test_ack_only_original_day_evidence_reaches_economic_validator(monkeypatch):
+    """P1 regression: successful ACK with missing DB kis_odno must not be stranded."""
+    import pytest
+    from trader import reconcile_kis as rk
+    from trader.run_context import RunContext
+    from trader.kr import runtime_integrity_20260929 as integrity
+
+    broker_row = {
+        "ord_dt": "20261030", "ord_tmd": "094546", "pdno": "253590",
+        "sll_buy_dvsn_cd": "01", "odno": "0000013020", "ord_qty": "110",
+        "tot_ccld_qty": "110", "tot_ccld_amt": "1698400",
+        "avg_prvs": "15440",
+    }
+    response = {"rt_cd": "0", "_sep29_complete": True, "output1": [broker_row], "output2": []}
+    monkeypatch.setattr(integrity, "_daily_ccld_all_pages_for_date", lambda *a, **kw: response)
+    monkeypatch.setattr(rk, "_resolve_reconcile_run_id", lambda *a: None)
+    monkeypatch.setattr(rk, "get_account_key", lambda **kw: "practice-test-account")
+    monkeypatch.setattr(rk, "active_trading_epoch_id", lambda *a, **kw: "test-epoch")
+    class NoStoredBrokerId:
+        def get_order_by_kis_odno_scoped(self, *a, **kw):
+            return None
+    monkeypatch.setattr(rk, "OrdersRepo", lambda eng: NoStoredBrokerId())
+    for name in ("FillsRepo", "PositionsRepo", "LedgerEventsRepo", "ReconcileLogRepo"):
+        monkeypatch.setattr(rk, name, lambda eng: object())
+    original = {
+        "order_id": "original-sell-uuid", "env": "practice",
+        "strategy": "pb1_pullback_close", "sid": 1, "mode": 1,
+        "code": "253590", "side": "SELL", "qty": 110,
+        "client_order_key": "original-ack-only",
+        "kis_odno": None, "broker_order_id": None,
+        "trading_epoch_id": "test-epoch",
+        "position_cycle_id": "position-cycle", "portfolio_epoch_id": "portfolio-epoch",
+        "response_json": {"rt_cd": "0", "output": {"ODNO": "0000013020"}},
+    }
+    monkeypatch.setattr(recovery, "find_strict_original_ack_source", lambda **kw: dict(original))
+    real_proof = rk._verified_kr_cumulative_sell_evidence
+    captured = {}
+    def verify_and_stop(*args, **kwargs):
+        actual = real_proof(*args, **kwargs)
+        captured["source"] = kwargs["source_order"]
+        captured["evidence"] = actual
+        raise RuntimeError("INTENTIONAL_STOP_BEFORE_ANY_DB_WRITE")
+    monkeypatch.setattr(rk, "_verified_kr_cumulative_sell_evidence", verify_and_stop)
+
+    with pytest.raises(RuntimeError, match="INTENTIONAL_STOP_BEFORE_ANY_DB_WRITE"):
+        rk.reconcile_today(
+            engine=None, kis=object(),
+            ctx=RunContext(env="practice", strategy="pb1_pullback_close"),
+            trade_date=date(2026, 10, 30), require_authoritative=True,
+            strict_sell_targets={"253590": ("0000013020", 110)},
+            strict_sell_order_ids={"253590": "original-sell-uuid"},
+            strict_sell_epoch_id="test-epoch",
+        )
+    assert captured["source"]["kis_odno"] == "0000013020"
+    assert captured["source"]["broker_order_id"] == "0000013020"
+    assert captured["evidence"]["qty"] == 110
+    assert captured["evidence"]["notional"] == 1698400
+    assert original["kis_odno"] is None  # original durable record untouched
+
+
+def test_partial_sell_settlement_uses_actual_position_order_watermark():
+    """P2 regression: a valid non-closing SELL is not retried indefinitely."""
+    import uuid
+    import sqlalchemy as sa
+    from trader.db.schema import schema_for_engine
+    uid = lambda: str(uuid.uuid4())
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    order_id, cycle, portfolio, epoch = uid(), uid(), uid(), uid()
+    day = datetime(2026, 10, 27, 6, 16, tzinfo=timezone.utc)
+    source = {
+        "order_id": order_id, "env": "practice", "strategy": "pb1_pullback_close",
+        "code": "028050", "side": "SELL", "qty": 4,
+        "position_cycle_id": cycle, "portfolio_epoch_id": portfolio,
+        "trading_epoch_id": epoch,
+    }
+    watermark = {
+        "confirmed_cumulative_qty": 4, "qty_accounted": 4,
+        "pnl_accounted_qty": 4, "realized_pnl_status": "CONFIRMED",
+        "pnl_accounted_notional": 240000,
+    }
+    meta = {"sell_execution_reconcile": {order_id: watermark}}
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.orders), dict(
+            order_id=order_id, env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="028050", market="KRX", side="SELL",
+            ord_type="LIMIT", qty=4, client_order_key="pr292:partial:" + order_id,
+            status="FILLED", kis_odno="0000034802", position_cycle_id=cycle,
+            portfolio_epoch_id=portfolio, trading_epoch_id=epoch,
+            request_json={}, response_json={
+                "confirmed_fill_qty": 4, "confirmed_fill_notional": 240000,
+                "confirmed_fill_price": 60000,
+            },
+        ))
+        conn.execute(sa.insert(schema.positions), dict(
+            position_id=uid(), env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="028050", market="KRX", qty=6,
+            status="OPEN", avg_buy_price=55000, total_cost=330000,
+            realized_pnl=20000, position_cycle_id=cycle,
+            portfolio_epoch_id=portfolio, trading_epoch_id=epoch,
+            position_meta=meta,
+        ))
+        conn.execute(sa.insert(schema.fills), dict(
+            fill_id=uid(), order_id=order_id, env="practice", side="SELL",
+            code="028050", market="KRX", qty=4, price=60000,
+            fee=0, tax=0, filled_at=day, raw_json={},
+            fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+            position_cycle_id=cycle, portfolio_epoch_id=portfolio,
+            trading_epoch_id=epoch, trade_id="test-pr292-cumulative",
+        ))
+    try:
+        done, why = recovery._verify_original_sell_economics(engine=engine, source=source)
+        assert done and why == "ECONOMIC_SETTLED"
+        with engine.begin() as conn:
+            conn.execute(sa.update(schema.positions).where(
+                schema.positions.c.position_cycle_id == cycle
+            ).values(position_meta={"sell_execution_reconcile": {"other-order": watermark}}))
+        done, why = recovery._verify_original_sell_economics(engine=engine, source=source)
+        assert not done and why == "SELL_POSITION_APPLY_UNPROVEN"
+    finally:
+        engine.dispose()
