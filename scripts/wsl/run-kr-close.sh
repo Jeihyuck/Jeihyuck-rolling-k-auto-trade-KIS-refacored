@@ -154,6 +154,26 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
       rc="$original_rc"
     fi
   fi
+  # All historical SELL repairs run only AFTER the trading child completes.
+  # Use a separately bounded, no-trade maintenance child; preserve the
+  # trading session's exit code even if KIS history is unavailable.
+  if [[ "$rc" -eq 0 && "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" && "${KR_CROSS_DAY_SELL_AUTO_RECONCILE:-1}" == "1" ]]; then
+    KR_CROSS_DAY_SELL_MAX_SECONDS="${KR_CROSS_DAY_SELL_MAX_SECONDS:-420}"
+    if ! [[ "$KR_CROSS_DAY_SELL_MAX_SECONDS" =~ ^[0-9]+$ ]]; then
+      KR_CROSS_DAY_SELL_MAX_SECONDS=420
+    fi
+    if (( KR_CROSS_DAY_SELL_MAX_SECONDS < 60 )); then KR_CROSS_DAY_SELL_MAX_SECONDS=60; fi
+    if (( KR_CROSS_DAY_SELL_MAX_SECONDS > 900 )); then KR_CROSS_DAY_SELL_MAX_SECONDS=900; fi
+    echo "[KR_CROSS_DAY_SELL][POST_CLOSE_START] timeout_sec=$KR_CROSS_DAY_SELL_MAX_SECONDS"
+    set +e
+    timeout --kill-after=15s "$(( KR_CROSS_DAY_SELL_MAX_SECONDS + 25 ))s" \
+      env DISABLE_REAL_TRADING=1 NO_TRADE=1 \
+      KR_CROSS_DAY_SELL_MAX_SECONDS="$KR_CROSS_DAY_SELL_MAX_SECONDS" \
+      python -m scripts.kr_cross_day_sell_reconcile_close
+    cross_date_rc=$?
+    set -e
+    echo "[KR_CROSS_DAY_SELL][POST_CLOSE_DONE] rc=$cross_date_rc"
+  fi
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG_FILE" 2>&1
