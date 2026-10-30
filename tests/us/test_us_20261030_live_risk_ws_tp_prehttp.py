@@ -9,6 +9,8 @@ import socket
 import stat
 import time
 
+import pytest
+
 from trader.marketdata import us_ws_collector
 from trader.us import market_state_overlay as overlay
 from trader.us.db import repos
@@ -63,7 +65,7 @@ def test_live_intraday_risk_overrides_positive_completed_day():
     warnings = []
     actual = overlay.read_us_live_intraday_returns(provider, daily, warnings)
     assert actual["quality"] == "OK"
-    assert actual["returns"]["qqq"] == -0.02
+    assert actual["returns"]["qqq"] == pytest.approx(-0.02)
     assert daily["qqq_1d_return"] > 0
     intraday = overlay.compute_us_intraday_overlay(
         actual["returns"]["spy"], actual["returns"]["qqq"],
