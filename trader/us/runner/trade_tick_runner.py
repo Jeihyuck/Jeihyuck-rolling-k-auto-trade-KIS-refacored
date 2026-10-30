@@ -3063,22 +3063,22 @@ def run_trade_tick(
     except Exception as _market_state_exc:
         logger.warning("[US_MARKET_STATE][WARN] type=%s", type(_market_state_exc).__name__)
         if not offline:
-            # A failed live-risk evaluation is not evidence of NORMAL markets.
-            # Preserve already-generated protective SELLs and fail closed BUY.
-            entry_can_proceed = False
-            allow_new_symbols = False
+            # Do not promote a failed market-state evaluation to live NORMAL.
+            # General PB1 BUYs are blocked by the intraday overlay postfilter;
+            # the dedicated TQQQ_INFINITE sleeve retains its own safety gate.
+            # No global entry_can_proceed / RISK_OFF rewrite: that would
+            # accidentally override the TQQQ owner's isolated policy.
             market_state_overlay.update({
-                "market_regime": "RISK_OFF",
-                "force_entry_block": True,
-                "allow_new_buy": False,
                 "intraday_market_overlay": "INTRADAY_DATA_UNKNOWN",
                 "intraday_live_quote_quality": "ERROR",
                 "intraday_overlay_available": False,
                 "intraday_error_reason": "LIVE_RISK_EVALUATION_FAILED",
+                "effective_market_state": "INTRADAY_DATA_UNKNOWN",
             })
             logger.error(
-                "[US_MARKET_STATE][LIVE_RISK_FAIL_CLOSED] action=BLOCK_NEW_BUY "
-                "protective_sell_retained=1 error_type=%s",
+                "[US_MARKET_STATE][LIVE_RISK_FAIL_CLOSED] "
+                "action=BLOCK_US_STANDARD_BUY_AT_OVERLAY_POSTFILTER "
+                "tqqq_owner_policy_preserved=1 protective_sell_retained=1 error_type=%s",
                 type(_market_state_exc).__name__,
             )
     finally:
