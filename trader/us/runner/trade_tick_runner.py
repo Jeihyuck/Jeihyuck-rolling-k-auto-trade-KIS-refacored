@@ -4080,8 +4080,19 @@ def run_trade_tick(
             entry_intents = []
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
-        logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
+        # Never route unfiltered standard BUY intents after a market/risk
+        # postfilter exception. Protection SELLs were routed independently.
+        logger.error(
+            "[US_ENTRY][POSTFILTER_FAIL_CLOSED] type=%s "
+            "action=DISCARD_UNVERIFIED_BUY_INTENTS",
+            type(_cluster_guard_filter_exc).__name__,
+        )
+        entry_intents = []
+        entry_eval_error_count += 1
+        entry_degraded = True
+        entry_degraded_reason = "entry_postfilter_unavailable"
         cluster_guard_blocked_buys = []
+        market_state_blocked_buys = []
         trend_blocked_buys = []
     if 'trend_blocked_buys' not in locals():
         trend_blocked_buys = []
