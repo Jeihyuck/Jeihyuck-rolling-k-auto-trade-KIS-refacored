@@ -1,7 +1,7 @@
 """Bounded, practice-only automatic recovery of prior-day PB1 SELL settlements.
 
-Runs only when the WSL close session invokes reconciliation; never in AM/PM BUY or
-protective-SELL preparation. Reuses the PR244 authoritative original-day
+Runs only after the WSL close trading process returns; never inside AM/PM BUY,
+CLOSE SELL or synchronous broker reconciliation. Reuses the PR244 authoritative original-day
 KIS all-pages, strict ODNO/date/code/side/quantity path. No new broker orders.
 
 A failed/ambiguous proof leaves the durable SUBMITTED/ACKED record untouched,
@@ -10,13 +10,16 @@ so the next close run tries again. No symbol-only or holdings-delta settlement.
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from time import monotonic
+import sqlalchemy as sa
+
+from trader.db.schema import schema_for_engine
 import logging
 import os
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from trader.account_state import get_account_key
-from trader.db.repos import OrdersRepo
 from trader.db.trading_epoch import active_trading_epoch_id
 
 log = logging.getLogger(__name__)
@@ -121,6 +124,26 @@ def should_run_close_recovery(*, env: str, tick_ts: datetime, enabled: str | Non
     return session == "close" and time(15, 15) <= now.time() <= time(16, 30)
 
 
+def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str) -> list[dict[str, Any]]:
+    """Read ALL statuses from authoritative DB, not the recent/open-order cache.
+
+    The normal get_open_orders API can scope old orders and terminal-like
+    quantity-confirmed SELLs out; that cannot serve as an unbounded recovery queue.
+    """
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(schema.orders).where(sa.and_(
+                schema.orders.c.env == env,
+                schema.orders.c.strategy == strategy,
+                schema.orders.c.side == "SELL",
+                schema.orders.c.status.in_(sorted(_PENDING)),
+                schema.orders.c.trading_epoch_id == epoch_id,
+            )).order_by(schema.orders.c.created_at.asc())
+        ).mappings().all()
+    return [dict(row) for row in rows]
+
+
 def run_all_historical_sell_recovery(
     *, engine: Any, kis: Any, env: str, strategy: str,
     tick_ts: datetime, ctx: Any,
@@ -143,11 +166,9 @@ def run_all_historical_sell_recovery(
             )
         if not epoch_id:
             return {"state": "EPOCH_UNPROVEN"}
-        orders = OrdersRepo(engine).get_open_orders(
-            env, include_stale=True, fail_open=False,
-        )
+        orders = _load_pending_orders(engine=engine, env=env, strategy=strategy, epoch_id=str(epoch_id))
         candidates, blocked = classify_pending_historical_sells(
-            [row for row in orders or [] if str(row.get("strategy") or "") == strategy],
+            orders,
             today=tick_ts.astimezone(_KST).date(), epoch_id=str(epoch_id),
         )
     except Exception as exc:
@@ -156,11 +177,23 @@ def run_all_historical_sell_recovery(
 
     from trader.reconcile_kis import reconcile_today
     from trader.kr.unpriced_sell_audit import audit_kr_pending_sell_orders
+    # Rotate the starting order by trade date. An old evidence-poor order
+    # must not monopolize every bounded close recovery pass.
+    if candidates:
+        shift = tick_ts.astimezone(_KST).date().toordinal() % len(candidates)
+        candidates = candidates[shift:] + candidates[:shift]
+    try:
+        budget_sec = max(60, min(900, int(os.getenv("KR_CROSS_DAY_SELL_MAX_SECONDS", "420"))))
+    except (ValueError, TypeError):
+        budget_sec = 420
+    deadline = monotonic() + budget_sec
     results: list[dict[str, Any]] = []
     attempted = 0
     settled = 0
     failed = 0
     for order in candidates:
+        if monotonic() >= deadline - 25:
+            break  # next CLOSE retries remaining original orders; no order state change
         day = _kst_date(order.get("submitted_at") or order.get("created_at"))
         code = str(order["code"])
         odno = str(order.get("kis_odno") or order.get("broker_order_id"))
@@ -196,14 +229,15 @@ def run_all_historical_sell_recovery(
                             "error_type": type(exc).__name__})
             # Continue with the other codes. Never let one broken historical
             # KIS proof starve the rest of the reconciliation queue.
+    deferred = len(candidates) - attempted
     log.info(
-        "[KR_CROSS_DAY_SELL][BATCH] eligible=%d attempted=%d apparently_reconciled=%d pending=%d blocked=%d",
-        len(candidates), attempted, settled, failed, len(blocked),
+        "[KR_CROSS_DAY_SELL][BATCH] eligible=%d attempted=%d apparently_reconciled=%d pending=%d deferred=%d blocked=%d",
+        len(candidates), attempted, settled, failed, deferred, len(blocked),
     )
     return {
-        "state": "BATCH_COMPLETE" if not failed and not blocked else "BATCH_WITH_PENDING",
+        "state": "BATCH_COMPLETE" if not failed and not blocked and not deferred else "BATCH_WITH_PENDING",
         "eligible": len(candidates), "attempted": attempted,
-        "apparently_reconciled": settled, "pending": failed,
+        "apparently_reconciled": settled, "pending": failed, "deferred": deferred,
         "blocked": blocked, "orders": results,
     }
 
