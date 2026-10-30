@@ -39,52 +39,72 @@ def _kst_date(raw: Any) -> date | None:
         return None
 
 
-def select_pending_historical_sell(
+def classify_pending_historical_sells(
     orders: list[dict[str, Any]], *, today: date, epoch_id: str,
-) -> tuple[dict[str, Any] | None, str]:
-    """Oldest fully identified same-epoch pending SELL; no age cutoff.
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Select *all* old same-epoch SELLs, reporting blocked orders independently.
 
-    A missing identity or conflicting same-broker-ID row cannot be auto-repaired.
-    The caller must use the *original order day* and broker's immutable ODNO.
+    A bad record must not starve other symbols. Duplicate broker identities
+    are quarantined together; no age cutoff and no inference from DB holdings.
     """
-    pending = []
+    candidates: list[tuple[date, str, str, dict[str, Any]]] = []
+    blocked: list[dict[str, str]] = []
     for row in orders:
         if str(row.get("side") or "").upper() != "SELL":
             continue
         if str(row.get("status") or "").upper() not in _PENDING:
             continue
+        if str(row.get("trading_epoch_id") or "") != epoch_id:
+            continue
+        identity = str(row.get("order_id") or "")
         day = _kst_date(row.get("submitted_at") or row.get("created_at"))
         if day is None:
-            return None, "UNPROVEN_ORIGINAL_TRADE_DATE"
+            blocked.append({"order_id": identity, "reason": "UNPROVEN_ORIGINAL_TRADE_DATE"})
+            continue
         if day >= today:
             continue
-        if str(row.get("trading_epoch_id") or "") != epoch_id:
-            continue  # a different account/epoch must never be queried as this account
         code = str(row.get("code") or "")
         odno = str(row.get("kis_odno") or row.get("broker_order_id") or "")
+        try:
+            qty = int(row.get("qty"))
+        except (ValueError, TypeError):
+            qty = 0
         if (
             len(code) != 6 or not code.isdigit()
             or len(odno) != 10 or not odno.isdigit()
-            or not row.get("order_id")
+            or not identity
             or not row.get("position_cycle_id")
             or not row.get("portfolio_epoch_id")
+            or qty <= 0
         ):
-            return None, "MISSING_ORIGINAL_SELL_IDENTITY"
-        pending.append((day, code, odno, row))
-    if not pending:
-        return None, "NO_PRIOR_DAY_PENDING_SELL"
-    pending.sort(key=lambda x: (x[0], x[1], x[2]))
-    day, code, odno, selected = pending[0]
-    if sum(1 for d, c, n, _ in pending if d == day and c == code and n == odno) != 1:
-        return None, "DUPLICATE_ORIGINAL_SELL_IDENTITY"
-    qty = selected.get("qty")
-    try:
-        qty = int(qty)
-    except (TypeError, ValueError):
-        return None, "ORIGINAL_SELL_QTY_INVALID"
-    if qty <= 0:
-        return None, "ORIGINAL_SELL_QTY_INVALID"
-    return selected, "READY"
+            blocked.append({"order_id": identity, "reason": "ORIGINAL_SELL_IDENTITY_OR_QTY_INVALID"})
+            continue
+        candidates.append((day, code, odno, row))
+    counts: dict[tuple[date, str, str], int] = {}
+    for day, code, odno, _ in candidates:
+        key = (day, code, odno)
+        counts[key] = counts.get(key, 0) + 1
+    selected: list[dict[str, Any]] = []
+    for day, code, odno, row in candidates:
+        if counts[(day, code, odno)] != 1:
+            blocked.append({"order_id": str(row["order_id"]), "reason": "DUPLICATE_ORIGINAL_SELL_IDENTITY"})
+        else:
+            selected.append(row)
+    selected.sort(key=lambda row: (
+        _kst_date(row.get("submitted_at") or row.get("created_at")),
+        str(row.get("code")), str(row.get("kis_odno") or row.get("broker_order_id"))
+    ))
+    return selected, blocked
+
+
+def select_pending_historical_sell(
+    orders: list[dict[str, Any]], *, today: date, epoch_id: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Compatibility helper for single-order tests; production uses batch."""
+    selected, blocked = classify_pending_historical_sells(orders, today=today, epoch_id=epoch_id)
+    if selected:
+        return selected[0], "READY"
+    return None, blocked[0]["reason"] if blocked else "NO_PRIOR_DAY_PENDING_SELL"
 
 
 def should_run_close_recovery(*, env: str, tick_ts: datetime, enabled: str | None = None) -> bool:
@@ -101,17 +121,21 @@ def should_run_close_recovery(*, env: str, tick_ts: datetime, enabled: str | Non
     return session == "close" and time(15, 15) <= now.time() <= time(16, 30)
 
 
-def run_one_historical_sell_recovery(
+def run_all_historical_sell_recovery(
     *, engine: Any, kis: Any, env: str, strategy: str,
     tick_ts: datetime, ctx: Any,
 ) -> dict[str, Any]:
-    """One original trade date per close invocation; retry automatically later."""
+    """Attempt all eligible prior-day SELLs, isolating each failure.
+
+    Critical trading must be finished before this maintenance call. No broker
+    order POST, cancel or new BUY. If the close process has a deadline, exit
+    before starting another KIS inquiry, leaving unprocessed orders pending.
+    """
     if not should_run_close_recovery(env=env, tick_ts=tick_ts):
         return {"state": "NOT_CLOSE_WINDOW"}
     if strategy != "pb1_pullback_close":
         return {"state": "OTHER_OWNER"}
     try:
-        from trader.db.repos import OrdersRepo
         with engine.connect() as conn:
             epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=get_account_key(env=env, kis=kis),
@@ -119,45 +143,71 @@ def run_one_historical_sell_recovery(
             )
         if not epoch_id:
             return {"state": "EPOCH_UNPROVEN"}
-        # Strict read: a DB timeout must NOT become an empty retry queue.
         orders = OrdersRepo(engine).get_open_orders(
             env, include_stale=True, fail_open=False,
         )
-        rows = [o for o in orders or [] if str(o.get("strategy") or "") == strategy]
-        selected, reason = select_pending_historical_sell(
-            rows, today=tick_ts.astimezone(_KST).date(), epoch_id=str(epoch_id),
+        candidates, blocked = classify_pending_historical_sells(
+            [row for row in orders or [] if str(row.get("strategy") or "") == strategy],
+            today=tick_ts.astimezone(_KST).date(), epoch_id=str(epoch_id),
         )
-        if not selected:
-            return {"state": reason}
-        day = _kst_date(selected.get("submitted_at") or selected.get("created_at"))
-        code = str(selected["code"])
-        odno = str(selected.get("kis_odno") or selected.get("broker_order_id"))
-        qty = int(selected["qty"])
-        # PR244: exhaustive original-day broker evidence is checked BEFORE a
-        # single DB mutation, and the existing writer is idempotent.
-        from trader.reconcile_kis import reconcile_today
-        result = reconcile_today(
-            engine=engine, kis=kis, ctx=ctx, trade_date=day,
-            require_authoritative=True,
-            strict_sell_targets={code: (odno, qty)},
-        )
-        # Query again: a reconciler return is not proof of economic settlement.
-        from trader.kr.unpriced_sell_audit import audit_kr_pending_sell_orders
-        audit = audit_kr_pending_sell_orders(engine, env=env, trade_date=day)
-        unresolved = [
-            entry for entry in audit.get("orders", [])
-            if str(entry.get("code") or "") == code
-            and str(entry.get("kis_odno") or entry.get("broker_order_id") or "") in {"", odno}
-        ]
-        state = "RECONCILE_ATTEMPTED_AUDIT_PENDING" if unresolved else "RECONCILE_ATTEMPTED"
-        log.warning(
-            "[KR_CROSS_DAY_SELL][%s] code=%s original_day=%s order_no=%s broker_orders=%s broker_fills=%s",
-            state, code, day, odno, result.get("orders"), result.get("fills"),
-        )
-        return {"state": state, "code": code, "original_day": str(day),
-                "broker_orders": int(result.get("orders") or 0),
-                "broker_fills": int(result.get("fills") or 0)}
     except Exception as exc:
-        # Keep original pending order and duplicate-order fences intact.
-        log.exception("[KR_CROSS_DAY_SELL][RETRY_NEXT_CLOSE] error_type=%s", type(exc).__name__)
+        log.exception("[KR_CROSS_DAY_SELL][QUEUE_READ_FAILED] err_type=%s", type(exc).__name__)
         return {"state": "RETRY_NEXT_CLOSE", "error_type": type(exc).__name__}
+
+    from trader.reconcile_kis import reconcile_today
+    from trader.kr.unpriced_sell_audit import audit_kr_pending_sell_orders
+    results: list[dict[str, Any]] = []
+    attempted = 0
+    settled = 0
+    failed = 0
+    for order in candidates:
+        day = _kst_date(order.get("submitted_at") or order.get("created_at"))
+        code = str(order["code"])
+        odno = str(order.get("kis_odno") or order.get("broker_order_id"))
+        try:
+            # The existing PR244 original-day authoritative all-pages writer
+            # validates exactly this broker order before any economic DB write.
+            evidence = reconcile_today(
+                engine=engine, kis=kis, ctx=ctx, trade_date=day,
+                require_authoritative=True,
+                strict_sell_targets={code: (odno, int(order["qty"]))},
+            )
+            attempted += 1
+            audit = audit_kr_pending_sell_orders(engine, env=env, trade_date=day)
+            pending_ids = {str(row.get("order_id") or "") for row in audit.get("orders", [])}
+            if str(order["order_id"]) in pending_ids:
+                state = "STILL_PENDING_RETRY_NEXT_CLOSE"
+                failed += 1
+            else:
+                # Audit is not by itself economic proof: the writer's own
+                # execution evidence must also be positive.
+                state = "RECONCILE_ATTEMPTED"
+                settled += 1
+            results.append({"code": code, "order_id": str(order["order_id"]),
+                            "trade_date": str(day), "state": state,
+                            "broker_fills": int(evidence.get("fills") or 0)})
+        except Exception as exc:
+            attempted += 1
+            failed += 1
+            log.exception("[KR_CROSS_DAY_SELL][RETRY_NEXT_CLOSE] code=%s date=%s err_type=%s",
+                          code, day, type(exc).__name__)
+            results.append({"code": code, "order_id": str(order["order_id"]),
+                            "trade_date": str(day), "state": "RETRY_NEXT_CLOSE",
+                            "error_type": type(exc).__name__})
+            # Continue with the other codes. Never let one broken historical
+            # KIS proof starve the rest of the reconciliation queue.
+    log.info(
+        "[KR_CROSS_DAY_SELL][BATCH] eligible=%d attempted=%d apparently_reconciled=%d pending=%d blocked=%d",
+        len(candidates), attempted, settled, failed, len(blocked),
+    )
+    return {
+        "state": "BATCH_COMPLETE" if not failed and not blocked else "BATCH_WITH_PENDING",
+        "eligible": len(candidates), "attempted": attempted,
+        "apparently_reconciled": settled, "pending": failed,
+        "blocked": blocked, "orders": results,
+    }
+
+
+def run_one_historical_sell_recovery(**kwargs: Any) -> dict[str, Any]:
+    """Backwards-compatible entrypoint now performs the entire batch."""
+    return run_all_historical_sell_recovery(**kwargs)
