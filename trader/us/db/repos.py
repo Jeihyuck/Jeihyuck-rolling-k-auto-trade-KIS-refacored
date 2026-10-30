@@ -2667,12 +2667,23 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
         "tp1_done": bool(raw.get("tp1_done") or meta.get("tp1_done")),
         "tp2_done": bool(raw.get("tp2_done") or meta.get("tp2_done")),
         "tp3_done": bool(raw.get("tp3_done") or meta.get("tp3_done")),
-        "tp1_pending": bool(raw.get("tp1_pending") or meta.get("tp1_pending")),
-        "tp2_pending": bool(raw.get("tp2_pending") or meta.get("tp2_pending")),
-        "tp3_pending": bool(raw.get("tp3_pending") or meta.get("tp3_pending")),
+        # An explicit False from the current SQL stage_status must win over
+        # stale nested state JSON. The old `raw or meta` resurrected PENDING
+        # after a verified PRE_HTTP abort and stranded the protective SELL.
+        "tp1_pending": bool(raw["tp1_pending"] if "tp1_pending" in raw else meta.get("tp1_pending"))
+                       and not bool(raw.get("tp1_done") or meta.get("tp1_done")),
+        "tp2_pending": bool(raw["tp2_pending"] if "tp2_pending" in raw else meta.get("tp2_pending"))
+                       and not bool(raw.get("tp2_done") or meta.get("tp2_done")),
+        "tp3_pending": bool(raw["tp3_pending"] if "tp3_pending" in raw else meta.get("tp3_pending"))
+                       and not bool(raw.get("tp3_done") or meta.get("tp3_done")),
         "tp1_order_key": raw.get("tp1_order_key") or meta.get("tp1_order_key"),
         "tp2_order_key": raw.get("tp2_order_key") or meta.get("tp2_order_key"),
         "tp3_order_key": raw.get("tp3_order_key") or meta.get("tp3_order_key"),
+        # Keep broker ACK identity visible on reads so a late abort cannot
+        # silently erase an already-acknowledged TP stage.
+        "tp1_broker_order_no": raw.get("tp1_broker_order_no") or meta.get("tp1_broker_order_no"),
+        "tp2_broker_order_no": raw.get("tp2_broker_order_no") or meta.get("tp2_broker_order_no"),
+        "tp3_broker_order_no": raw.get("tp3_broker_order_no") or meta.get("tp3_broker_order_no"),
         "tp1_at": raw.get("tp1_at") or meta.get("tp1_at"),
         "tp2_at": raw.get("tp2_at") or meta.get("tp2_at"),
         "tp3_at": raw.get("tp3_at") or meta.get("tp3_at"),
@@ -2747,6 +2758,7 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
                 state[f"{stage}_pending"]=status=="PENDING"
                 state[f"{stage}_done"]=status=="DONE"
                 state[f"{stage}_order_key"]=row.get("client_order_key")
+                state[f"{stage}_broker_order_no"]=row.get("raw_broker_order_no")
                 state["meta"].update(_parse_json_meta(row.get("state")))
         if state and str(state.get("position_lifecycle_id") or "LEGACY") != lifecycle:
             state = {}
