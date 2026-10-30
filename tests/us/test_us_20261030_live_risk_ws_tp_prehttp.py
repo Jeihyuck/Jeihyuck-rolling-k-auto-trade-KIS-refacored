@@ -258,6 +258,21 @@ def test_gild_tp1_route_pre_http_fence_recovers_only_after_claim_release(
                         lambda *_a, **_kw: False)
     monkeypatch.setattr(order_router, "enrich_sell_exchange",
                         lambda *_a, **_kw: "NYSE")
+    # The Stage4 fault occurs only after the independent fresh balance and
+    # frozen TP checks have passed; isolate those checks with known evidence.
+    monkeypatch.setattr(
+        order_router, "_get_broker_position",
+        lambda *_a, **_kw: {
+            "symbol": "GILD", "qty": 22, "orderable_qty": 22,
+            "currency": "USD", "avg_price": 157.43,
+        },
+    )
+    monkeypatch.setattr(
+        order_router, "_validate_take_profit_with_fresh_broker_position",
+        lambda *_a, **_kw: {
+            "ok": True, "broker_avg_price": 157.43, "return_rate": .03344,
+        },
+    )
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order",
                         lambda: False)
     monkeypatch.setattr(repos, "load_today_order_keys", lambda **_kw: set())
