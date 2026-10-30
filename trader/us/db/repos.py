@@ -2918,7 +2918,9 @@ def release_us_profit_capture_pre_http_abort(
         ).get(sym, {})
         if (str(state.get(f"{stg}_order_key") or "") != order_key
                 or not state.get(f"{stg}_pending")
-                or state.get(f"{stg}_done")):
+                or state.get(f"{stg}_done")
+                or str((state.get("meta") or {}).get("last_status") or "") != "PENDING"
+                or state.get(f"{stg}_broker_order_no")):
             return False
         mark_us_profit_capture_stage(
             trade_date, sym, stg, order_key=order_key,
@@ -2952,7 +2954,9 @@ def release_us_profit_capture_pre_http_abort(
         ).get(sym, {})
         if (str(current.get(f"{stg}_order_key") or "") != order_key
                 or not current.get(f"{stg}_pending")
-                or current.get(f"{stg}_done")):
+                or current.get(f"{stg}_done")
+                or str((current.get("meta") or {}).get("last_status") or "") != "PENDING"
+                or current.get(f"{stg}_broker_order_no")):
             return False
         mark_us_profit_capture_stage(
             trade_date, sym, stg, order_key=order_key,
