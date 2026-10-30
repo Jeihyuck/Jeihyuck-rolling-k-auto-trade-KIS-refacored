@@ -2396,16 +2396,18 @@ def route_order(
                 type(exc).__name__, type(exc.__cause__).__name__,
             )
             integrity_error = str(exc)
+            abort_journal_ok = False
             try:
                 append_order_event(
                     "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
                     broker_status="PRE_SUBMIT_FAILURE",
                     raw_response={"error": integrity_error},
                 )
+                abort_journal_ok = True
             except Exception as journal_exc:
                 integrity_error = f"{integrity_error}; abort journal failed: {journal_exc}"
                 logger.exception("[US_ORDER][PRE_IO_ABORT_JOURNAL_FAILED] action_key=%s", claim.action_key)
-            requires_reconcile = False
+            requires_reconcile = not abort_journal_ok
             try:
                 from trader.us.db.repos import release_execution_action_before_submit
                 release_execution_action_before_submit(
@@ -2418,6 +2420,41 @@ def route_order(
                     "[US_ORDER][EXECUTION_CLAIM][PRE_IO_RELEASE_FAILED] action_key=%s",
                     claim.action_key,
                 )
+            # An intent-created TP PENDING must not strand a protective SELL
+            # when KIS HTTP was provably never reached. Never clear PENDING
+            # when Claim release/journal proof failed or the order is unknown.
+            tp_stage = str((intent.get("meta") or {}).get("profit_capture_stage") or "").lower()
+            if (not requires_reconcile and side == "SELL"
+                    and tp_stage in {"tp1", "tp2", "tp3"}):
+                try:
+                    from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                    restored = release_us_profit_capture_pre_http_abort(
+                        trade_date=str(trade_date or ""),
+                        symbol=symbol_upper, stage=tp_stage,
+                        position_lifecycle_id=str(
+                            intent.get("position_lifecycle_id")
+                            or (intent.get("meta") or {}).get("position_lifecycle_id") or ""
+                        ),
+                        client_order_key=str(order_key or ""),
+                    )
+                    if not restored:
+                        requires_reconcile = True
+                        logger.error(
+                            "[US_PROFIT_CAPTURE][PRE_IO_ABORT_NOT_RELEASED] symbol=%s stage=%s "
+                            "action=RECONCILE_ONLY", symbol_upper, tp_stage,
+                        )
+                    else:
+                        logger.warning(
+                            "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASED] symbol=%s stage=%s "
+                            "action=REEVALUATE_NEXT_TICK", symbol_upper, tp_stage,
+                        )
+                except Exception as tp_abort_exc:
+                    requires_reconcile = True
+                    logger.error(
+                        "[US_PROFIT_CAPTURE][PRE_IO_ABORT_RELEASE_FAILED] symbol=%s "
+                        "stage=%s type=%s action=RECONCILE_ONLY",
+                        symbol_upper, tp_stage, type(tp_abort_exc).__name__,
+                    )
             return {
                 "status": (
                     "ORDER_DISABLED_CLAIM_OBSERVATION_FAILED"
