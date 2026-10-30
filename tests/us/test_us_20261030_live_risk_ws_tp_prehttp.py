@@ -202,3 +202,112 @@ def test_real_tick_missing_quote_is_not_faked_as_no_risk(monkeypatch):
     assert result["intraday_live_quote_quality"] == "UNKNOWN"
     assert result["intraday_market_overlay"] == "INTRADAY_DATA_UNKNOWN"
     assert result["intraday_overlay_available"] is False
+
+
+@pytest.mark.parametrize("claim_release_ok", [True, False])
+def test_gild_tp1_route_pre_http_fence_recovers_only_after_claim_release(
+    monkeypatch, claim_release_ok,
+):
+    """Exercise real order_router callback + TP lifecycle; no KIS HTTP."""
+    from types import SimpleNamespace
+
+    from trader.us.execution import order_router, order_journal
+    from trader.us.execution.tick_context import TickExecutionContext
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    td, lifecycle, order_key = "2026-10-29", "gild-lifecycle", "gild-tp1-key"
+    repos.mark_us_profit_capture_stage(
+        td, "GILD", "tp1", order_key=order_key, qty=5,
+        position_lifecycle_id=lifecycle, status="PENDING",
+    )
+    events = []
+
+    class NoPostClient:
+        def __init__(self):
+            self.before_http = None
+            self.http_calls = 0
+
+        def bind_tick_context(self, _context):
+            return self
+
+        def set_before_order_http(self, callback):
+            self.before_http = callback
+
+        def clear_before_order_http(self):
+            self.before_http = None
+
+        def place_us_sell_order(self, *_args):
+            # The Stage4 health recheck fails within the before-HTTP callback.
+            assert self.before_http is not None
+            self.before_http()
+            self.http_calls += 1
+            pytest.fail("broker POST must remain unreachable")
+
+    client = NoPostClient()
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    monkeypatch.setattr("trader.account_state.get_account_key",
+                        lambda **_kw: "offline-practice-account")
+    monkeypatch.setattr(order_router, "canonical_order_risk_check",
+                        lambda *_a, **_kw: None, raising=False)
+    monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order",
+                        lambda: False)
+    monkeypatch.setattr(repos, "load_today_order_keys", lambda **_kw: set())
+    monkeypatch.setattr(repos, "save_order_intent", lambda *_a, **_kw: True)
+    monkeypatch.setattr(repos, "claim_execution_action",
+                        lambda *_a, **_kw: SimpleNamespace(
+                            acquired=True, action_key="claim-gild", reason=""))
+    monkeypatch.setattr(repos, "record_execution_action_observation",
+                        lambda *_a, **_kw: None)
+
+    def claim_release(*_a, **_kw):
+        events.append("CLAIM_RELEASE")
+        if not claim_release_ok:
+            raise RuntimeError("injected_claim_release_failure")
+        return True
+
+    monkeypatch.setattr(
+        repos, "release_execution_action_before_submit", claim_release,
+    )
+    monkeypatch.setattr(
+        order_journal, "append_order_event",
+        lambda event_type, *_a, **_kw: events.append(event_type),
+    )
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    monkeypatch.setattr(
+        worker, "read_worker_health",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("writer-fenced")),
+    )
+    context = TickExecutionContext(
+        td, "am", "run-gild", 1, "tick-gild",
+        deadline=time.monotonic() + 30,
+    )
+    result = order_router.route_order({
+        "symbol": "GILD", "exchange": "NYSE", "side": "SELL",
+        "qty": 5, "limit_price": 162.695,
+        "notional_usd": 813.475, "client_order_key": order_key,
+        "trade_date": td, "trading_epoch_id": "offline-epoch",
+        "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": lifecycle,
+        "position_action": "TAKE_PROFIT_SELL",
+        "reason": "TAKE_PROFIT_TP1",
+        "meta": {
+            "profit_capture_stage": "tp1",
+            "position_lifecycle_id": lifecycle,
+            "strategy_owner": "US_STANDARD",
+            "reason": "TAKE_PROFIT_TP1",
+        },
+    }, kis_client=client, context=context)
+    state = repos.load_us_profit_capture_state(
+        td, ["GILD"], {"GILD": lifecycle},
+    )["GILD"]
+    assert result["broker_submit"] is False
+    assert client.http_calls == 0
+    assert "BROKER_SUBMIT_ABORTED_PRE_IO" in events
+    assert "CLAIM_RELEASE" in events
+    assert state["tp1_pending"] is (not claim_release_ok)
+    assert result["requires_reconcile"] is (not claim_release_ok)
