@@ -163,7 +163,25 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.UniqueConstraint("env", "client_order_key", name="uq_orders_env_client_order_key"),
-        sa.UniqueConstraint("env", "broker_order_id", name="uq_orders_env_broker_order_id"),
+    )
+
+    # KIS order numbers are reused across trade days. The trading epoch
+    # represents the brokerage account generation; NULL is the legacy scope.
+    # The fixed Asia/Seoul timezone is essential for immutable PG indexes.
+    broker_day = (
+        sa.cast(sa.func.timezone("Asia/Seoul", sa.func.coalesce(
+            orders.c.submitted_at, orders.c.acked_at, orders.c.created_at,
+        )), sa.Date)
+        if database_url.startswith("postgres")
+        else sa.func.date(sa.func.coalesce(
+            orders.c.submitted_at, orders.c.acked_at, orders.c.created_at,
+        ))
+    )
+    sa.Index(
+        "uq_orders_env_broker_order_day_epoch",
+        orders.c.env, orders.c.broker_order_id, broker_day,
+        sa.func.coalesce(orders.c.trading_epoch_id, "__legacy__"),
+        unique=True,
     )
 
     fills = sa.Table(

@@ -3736,6 +3736,7 @@ class OrdersRepo:
                 existing_conditions = [
                     self._schema.orders.c.env == env,
                     self._schema.orders.c.broker_order_id == kis_odno,
+                    self._kr_broker_trade_day_expr() == now_kst().date(),
                 ]
                 current_conditions = [
                     self._schema.orders.c.env == env,
@@ -3754,12 +3755,14 @@ class OrdersRepo:
                 current = conn.execute(
                     select(self._schema.orders).where(and_(*current_conditions))
                 ).mappings().first()
-                same_identity = bool(existing and current and (
-                    str(existing.get("client_order_key") or "") == client_order_key or
-                    (str(existing.get("code") or "") == str(current.get("code") or "") and
-                     str(existing.get("side") or "") == str(current.get("side") or "") and
-                     int(existing.get("qty") or 0) == int(current.get("qty") or 0))
-                ))
+                # Matching symbol/side/qty is NOT enough to prove the same
+                # broker submission. Only the exact durable client intent may
+                # recover an ACK from a unique-index collision.
+                same_identity = bool(
+                    existing and current
+                    and str(existing.get("client_order_key") or "") == client_order_key
+                    and str(existing.get("order_id") or "") == str(current.get("order_id") or "")
+                )
                 if same_identity:
                     recovered_values = dict(values)
                     recovered_values.pop("broker_order_id", None)
@@ -3836,6 +3839,10 @@ class OrdersRepo:
         *,
         entry_meta_json: dict | None = None,
     ) -> None:
+        """Only the unique current-day/current-epoch broker order can be ACKED."""
+        if not kis_odno:
+            logger.error("[ORDERS][MARK_ACKED][BLOCK] reason=ODNO_MISSING")
+            return
         safe_response_json = json_sanitize(response_json or {})
         values = {
             "status": "ACKED",
@@ -3854,12 +3861,23 @@ class OrdersRepo:
             conditions = [
                 self._schema.orders.c.env == env,
                 self._schema.orders.c.kis_odno == kis_odno,
+                self._kr_broker_trade_day_expr() == now_kst().date(),
             ]
             if trading_epoch_id is not None:
                 conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
+            rows = conn.execute(
+                sa.select(self._schema.orders.c.order_id).where(and_(*conditions))
+                .limit(2).with_for_update()
+            ).scalars().all()
+            if len(rows) != 1:
+                logger.error(
+                    "[ORDERS][MARK_ACKED][BLOCK] odno=%s matched=%d reason=DAY_EPOCH_NOT_UNIQUE",
+                    kis_odno, len(rows),
+                )
+                return
             conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(*conditions))
+                .where(self._schema.orders.c.order_id == rows[0])
                 .values(**values)
             )
 
@@ -3869,27 +3887,21 @@ class OrdersRepo:
         kis_odno: str | None = None,
         client_order_key: str | None = None,
     ) -> None:
-        """
-        주문을 FILLED 상태로 변경. SELL fill confirmed 후 호출.
-        
-        Args:
-            env: 환경
-            kis_odno: KIS 주문번호 (우선 사용)
-            client_order_key: 클라이언트 주문 키 (fallback)
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-        
+        """Never terminalize multiple orders with a recycled KIS ODNO."""
         if not kis_odno and not client_order_key:
             logger.warning("[ORDERS][MARK_FILLED][SKIP] no identifier provided")
             return
-        
         conditions = [self._schema.orders.c.env == env]
-        if kis_odno:
-            conditions.append(self._schema.orders.c.kis_odno == kis_odno)
-        elif client_order_key:
+        if client_order_key:
+            # Durable intent identity wins over a recycled broker number.
             conditions.append(self._schema.orders.c.client_order_key == client_order_key)
-        
+            if kis_odno:
+                conditions.append(self._schema.orders.c.kis_odno == kis_odno)
+        else:
+            conditions.extend([
+                self._schema.orders.c.kis_odno == kis_odno,
+                self._kr_broker_trade_day_expr() == now_kst().date(),
+            ])
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=get_account_key(env=env),
@@ -3897,15 +3909,26 @@ class OrdersRepo:
             )
             if trading_epoch_id is not None:
                 conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
+            rows = conn.execute(
+                sa.select(self._schema.orders.c.order_id).where(and_(*conditions))
+                .limit(2).with_for_update()
+            ).scalars().all()
+            if len(rows) != 1:
+                logger.error(
+                    "[ORDERS][MARK_FILLED][BLOCK] kis_odno=%s key=%s matched=%d "
+                    "reason=ORDER_IDENTITY_UNVERIFIED",
+                    kis_odno, client_order_key, len(rows),
+                )
+                return
             result = conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(*conditions))
+                .where(self._schema.orders.c.order_id == rows[0])
                 .values(status="FILLED", updated_at=func.now())
             )
             updated_count = result.rowcount
-        
         logger.info(
-            "[ORDERS][STATUS_UPDATE] env=%s kis_odno=%s client_order_key=%s from=ACKED/ACCEPTED to=FILLED updated=%s",
+            "[ORDERS][STATUS_UPDATE] env=%s kis_odno=%s client_order_key=%s "
+            "to=FILLED updated=%s",
             env, kis_odno, client_order_key, updated_count,
         )
 
@@ -4179,25 +4202,41 @@ class OrdersRepo:
         }
 
     def get_order_by_kis_odno(self, env: str, kis_odno: str) -> dict | None:
+        """Legacy current-day lookup; refuse recycled/ambiguous ODNO matches.
+
+        Historical settlement must call get_order_by_kis_odno_scoped with
+        explicit original broker date, code and side.
+        """
         broker_id = str(kis_odno or "").strip()
         if not broker_id:
             return None
-        stmt = select(self._schema.orders).where(
-            and_(
-                self._schema.orders.c.env == env,
-                or_(
-                    self._schema.orders.c.kis_odno == broker_id,
-                    self._schema.orders.c.broker_order_id == broker_id,
-                ),
-            )
-        ).order_by(self._schema.orders.c.created_at.desc())
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=False,
+        )
+        conditions = [
+            self._schema.orders.c.env == env,
+            self._kr_broker_trade_day_expr() == now_kst().date(),
+            or_(self._schema.orders.c.kis_odno == broker_id,
+                self._schema.orders.c.broker_order_id == broker_id),
+        ]
+        if trading_epoch_id is not None:
+            conditions.append(self._schema.orders.c.trading_epoch_id == str(trading_epoch_id))
+        else:
+            conditions.append(self._schema.orders.c.trading_epoch_id.is_(None))
         rows = _safe_repo_read(
             self.engine,
-            stmt,
-            op_name="orders.get_order_by_kis_odno",
-            fail_open=_resolve_lookup_fail_open(),
+            select(self._schema.orders).where(and_(*conditions)).limit(2),
+            op_name="orders.get_order_by_kis_odno_current_day",
+            fail_open=False,
         )
-        return rows[0] if rows else None
+        if len(rows) != 1:
+            logger.warning(
+                "[ORDERS][BROKER_LOOKUP][UNVERIFIED] env=%s odno=%s matched=%d action=NONE",
+                env, broker_id, len(rows),
+            )
+            return None
+        return rows[0]
 
     def get_order_by_kis_odno_scoped(
         self, env: str, kis_odno: str, *, trade_date: date, code: str, side: str,
@@ -4213,18 +4252,13 @@ class OrdersRepo:
         direction = str(side or "").strip().upper()
         if not broker_id or not isinstance(trade_date, date) or not symbol or direction not in {"BUY", "SELL"}:
             return None
-        start_kst = pytz.timezone("Asia/Seoul").localize(datetime.combine(trade_date, datetime.min.time()))
-        end_kst = start_kst + timedelta(days=1)
-        if self.engine.dialect.name == "postgresql":
-            start, end = start_kst.astimezone(pytz.UTC), end_kst.astimezone(pytz.UTC)
-        else:
-            start, end = start_kst.replace(tzinfo=None), end_kst.replace(tzinfo=None)
+        # An ACK may be written to DB after midnight or on a later retry.
+        # The broker's original submitted_at is the trade-day evidence.
         stmt = select(self._schema.orders).where(and_(
             self._schema.orders.c.env == env,
             self._schema.orders.c.side == direction,
             self._schema.orders.c.code == symbol,
-            self._schema.orders.c.created_at >= start,
-            self._schema.orders.c.created_at < end,
+            self._kr_broker_trade_day_expr() == trade_date,
             or_(self._schema.orders.c.kis_odno == broker_id,
                 self._schema.orders.c.broker_order_id == broker_id),
         )).limit(2)
@@ -4648,6 +4682,17 @@ class OrdersRepo:
             fail_open=None,
         )
 
+    def _kr_broker_trade_day_expr(self):
+        """KST broker trading day, identical to migration 0061 identity index."""
+        stamp = sa.func.coalesce(
+            self._schema.orders.c.submitted_at,
+            self._schema.orders.c.acked_at,
+            self._schema.orders.c.created_at,
+        )
+        if self.engine.dialect.name == "postgresql":
+            return sa.cast(sa.func.timezone("Asia/Seoul", stamp), sa.Date)
+        return sa.func.date(stamp)
+
     def upsert_reconciled_order(
         self,
         *,
@@ -4702,15 +4747,31 @@ class OrdersRepo:
                 trading_epoch_id=trading_epoch_id,
             )
 
+            # The KIS ODNO may be reused on another trading day, including
+            # across legacy NULL epochs. Never bind a global ODNO match.
+            # A source execution timestamp is preferred to a DB insertion day.
+            source_time = submitted_at or acked_at or now_kst()
+            broker_day = (
+                source_time.astimezone(pytz.timezone("Asia/Seoul")).date()
+                if source_time.tzinfo else source_time.date()
+            )
+            epoch_scope = str(trading_epoch_id) if trading_epoch_id is not None else "__legacy__"
             broker_row = None
             client_row = None
             if broker_order_id:
-                broker_row = conn.execute(
+                broker_matches = conn.execute(
                     select(self._schema.orders).where(and_(
                         self._schema.orders.c.env == env,
                         self._schema.orders.c.broker_order_id == broker_order_id,
-                    ))
-                ).mappings().first()
+                        self._kr_broker_trade_day_expr() == broker_day,
+                        sa.func.coalesce(
+                            self._schema.orders.c.trading_epoch_id, "__legacy__"
+                        ) == epoch_scope,
+                    )).limit(2)
+                ).mappings().all()
+                if len(broker_matches) > 1:
+                    raise RuntimeError("KR_RECONCILE_ORDER_IDENTITY_AMBIGUOUS")
+                broker_row = broker_matches[0] if broker_matches else None
             if client_order_key:
                 client_row = conn.execute(
                     select(self._schema.orders).where(and_(

@@ -60,5 +60,8 @@ def test_reconcile_reset_mode_skips_restore(monkeypatch):
 
     assert _DummyPositionsRepo.called is False
     assert result["restored_positions"] == 0
+    # PR #292 regressed this actual pre/post-tick path by returning an
+    # undefined cross_date_sell. Cross-day SELL work has its own CLOSE worker.
+    assert "cross_date_sell" not in result
     assert result["reset_mode"] is True
     assert result["masked_account"] == "practice:***0136:01"
