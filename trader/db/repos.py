@@ -3755,12 +3755,14 @@ class OrdersRepo:
                 current = conn.execute(
                     select(self._schema.orders).where(and_(*current_conditions))
                 ).mappings().first()
-                same_identity = bool(existing and current and (
-                    str(existing.get("client_order_key") or "") == client_order_key or
-                    (str(existing.get("code") or "") == str(current.get("code") or "") and
-                     str(existing.get("side") or "") == str(current.get("side") or "") and
-                     int(existing.get("qty") or 0) == int(current.get("qty") or 0))
-                ))
+                # Matching symbol/side/qty is NOT enough to prove the same
+                # broker submission. Only the exact durable client intent may
+                # recover an ACK from a unique-index collision.
+                same_identity = bool(
+                    existing and current
+                    and str(existing.get("client_order_key") or "") == client_order_key
+                    and str(existing.get("order_id") or "") == str(current.get("order_id") or "")
+                )
                 if same_identity:
                     recovered_values = dict(values)
                     recovered_values.pop("broker_order_id", None)
