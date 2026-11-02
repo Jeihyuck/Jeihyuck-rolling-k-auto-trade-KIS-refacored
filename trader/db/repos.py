@@ -4213,18 +4213,13 @@ class OrdersRepo:
         direction = str(side or "").strip().upper()
         if not broker_id or not isinstance(trade_date, date) or not symbol or direction not in {"BUY", "SELL"}:
             return None
-        start_kst = pytz.timezone("Asia/Seoul").localize(datetime.combine(trade_date, datetime.min.time()))
-        end_kst = start_kst + timedelta(days=1)
-        if self.engine.dialect.name == "postgresql":
-            start, end = start_kst.astimezone(pytz.UTC), end_kst.astimezone(pytz.UTC)
-        else:
-            start, end = start_kst.replace(tzinfo=None), end_kst.replace(tzinfo=None)
+        # An ACK may be written to DB after midnight or on a later retry.
+        # The broker's original submitted_at is the trade-day evidence.
         stmt = select(self._schema.orders).where(and_(
             self._schema.orders.c.env == env,
             self._schema.orders.c.side == direction,
             self._schema.orders.c.code == symbol,
-            self._schema.orders.c.created_at >= start,
-            self._schema.orders.c.created_at < end,
+            self._kr_broker_trade_day_expr() == trade_date,
             or_(self._schema.orders.c.kis_odno == broker_id,
                 self._schema.orders.c.broker_order_id == broker_id),
         )).limit(2)
@@ -4648,6 +4643,17 @@ class OrdersRepo:
             fail_open=None,
         )
 
+    def _kr_broker_trade_day_expr(self):
+        """KST broker trading day, identical to migration 0061 identity index."""
+        stamp = sa.func.coalesce(
+            self._schema.orders.c.submitted_at,
+            self._schema.orders.c.acked_at,
+            self._schema.orders.c.created_at,
+        )
+        if self.engine.dialect.name == "postgresql":
+            return sa.cast(sa.func.timezone("Asia/Seoul", stamp), sa.Date)
+        return sa.func.date(stamp)
+
     def upsert_reconciled_order(
         self,
         *,
@@ -4702,15 +4708,31 @@ class OrdersRepo:
                 trading_epoch_id=trading_epoch_id,
             )
 
+            # The KIS ODNO may be reused on another trading day, including
+            # across legacy NULL epochs. Never bind a global ODNO match.
+            # A source execution timestamp is preferred to a DB insertion day.
+            source_time = submitted_at or acked_at or now_kst()
+            broker_day = (
+                source_time.astimezone(pytz.timezone("Asia/Seoul")).date()
+                if source_time.tzinfo else source_time.date()
+            )
+            epoch_scope = str(trading_epoch_id) if trading_epoch_id is not None else "__legacy__"
             broker_row = None
             client_row = None
             if broker_order_id:
-                broker_row = conn.execute(
+                broker_matches = conn.execute(
                     select(self._schema.orders).where(and_(
                         self._schema.orders.c.env == env,
                         self._schema.orders.c.broker_order_id == broker_order_id,
-                    ))
-                ).mappings().first()
+                        self._kr_broker_trade_day_expr() == broker_day,
+                        sa.func.coalesce(
+                            self._schema.orders.c.trading_epoch_id, "__legacy__"
+                        ) == epoch_scope,
+                    )).limit(2)
+                ).mappings().all()
+                if len(broker_matches) > 1:
+                    raise RuntimeError("KR_RECONCILE_ORDER_IDENTITY_AMBIGUOUS")
+                broker_row = broker_matches[0] if broker_matches else None
             if client_order_key:
                 client_row = conn.execute(
                     select(self._schema.orders).where(and_(
