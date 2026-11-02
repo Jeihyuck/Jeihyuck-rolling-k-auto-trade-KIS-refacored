@@ -81,6 +81,18 @@ def _install_order_response_merge_guard() -> None:
                         code=str(kwargs.get("code") or ""),
                         side=str(kwargs.get("side") or ""),
                     )
+                    if existing is not None:
+                        # A same-day ODNO from another account generation is
+                        # not authority to copy its fill/P&L watermarks.
+                        from trader.db import repos as repo_module
+                        from trader.db.trading_epoch import active_trading_epoch_id
+                        current_epoch = active_trading_epoch_id(
+                            self.engine, env=env,
+                            account_id=repo_module.get_account_key(env=env),
+                            required=False,
+                        )
+                        if str(existing.get("trading_epoch_id") or "") != str(current_epoch or ""):
+                            existing = None
             if existing is not None:
                 existing_response = base._json_dict(existing.get("response_json"))
         except Exception as exc:
