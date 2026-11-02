@@ -715,7 +715,8 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
         holdings_rows=holdings_rows,
     )
     review_count = len(policy.get("review_required") or [])
-    red = bool(health.get("qty_mismatch_count") or health.get("stale_open_order_count") or review_count)
+    reconcile_unverified = result.get("ok") is not True
+    red = bool(reconcile_unverified or health.get("qty_mismatch_count") or health.get("stale_open_order_count") or review_count)
     payload = getattr(engine_obj, "_run_summary_payload", None)
     if isinstance(payload, dict):
         payload.update(
@@ -731,6 +732,8 @@ def _post_pb1_tick_reconcile(engine_obj: Any) -> None:
                 "broker_truth_policy_review_required": list(policy.get("review_required") or []),
                 "broker_truth_qty_mismatch_count": int(health.get("qty_mismatch_count") or 0),
                 "broker_truth_stale_open_order_count": int(health.get("stale_open_order_count") or 0),
+                "broker_truth_reconcile_degraded": int(reconcile_unverified),
+                "broker_truth_reconcile_reason": str(result.get("degraded") or result.get("reason") or ""),
                 "broker_truth_health_status": "RED" if red else "OK",
             }
         )
