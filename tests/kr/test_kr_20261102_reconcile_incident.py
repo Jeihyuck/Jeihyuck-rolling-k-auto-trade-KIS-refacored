@@ -78,3 +78,72 @@ def test_post_tick_reconcile_failure_is_red_even_when_quantity_matches(monkeypat
     )
     assert metrics["degraded"] is True
     assert metrics["api_submitted"] == 1
+
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_verified_kis_order_cumulative_contract_is_authorized_and_idempotent(side, monkeypatch):
+    from datetime import date
+    from decimal import Decimal
+    from trader import reconcile_kis
+    from trader.settlement import kr_cutover
+    from trader.settlement.core import preview_decision
+
+    monkeypatch.setattr(kr_cutover, "_account_scope", lambda env: "offline-account-scope")
+    proof = {"qty": 85, "notional": 85 * 23700, "avg_price": 23700}
+    args = reconcile_kis._kr_atomic_execution_evidence(
+        cumulative_sell_evidence=proof if side == "SELL" else None,
+        cumulative_buy_evidence=proof if side == "BUY" else None,
+        filled_price=23900,  # a raw KIS quote must not override verified cumulative avg
+        filled_qty=85,
+    )
+    assert args == {
+        "evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "execution_price": 23700,
+        "execution_qty": None,
+    }
+    order = {
+        "env": "practice", "strategy": "pb1_pullback_close",
+        "trading_epoch_id": "offline-epoch", "position_cycle_id": "offline-cycle",
+        "client_order_key": f"offline:{side}:test", "market": "KRX",
+        "kis_odno": "0000011233", "side": side,
+    }
+    observation = kr_cutover.build_kr_broker_observation(
+        order=order, request_json={},
+        broker_trade_date=date(2026, 11, 2),
+        requested_qty=85, cumulative_qty=85,
+        evidence_digest="offline-single-aggregate", **args,
+    )
+    first = preview_decision(observation)
+    assert first.qty_delta == 85
+    assert first.notional_delta == Decimal(85 * 23700)
+    replay = preview_decision(
+        observation, applied_qty=85,
+        applied_notional=Decimal(85 * 23700), priced_qty=85,
+        price_status="CONFIRMED",
+    )
+    assert replay.qty_delta == 0
+    assert replay.notional_delta == 0
+
+
+def test_unverified_cumulative_price_is_not_promoted_to_atomic_settlement():
+    from trader import reconcile_kis
+    with pytest.raises(ValueError, match="KR_ATOMIC_CUMULATIVE_PRICE_PROOF_INVALID"):
+        reconcile_kis._kr_atomic_execution_evidence(
+            cumulative_sell_evidence={"qty": 85, "notional": 0, "avg_price": 23700},
+            cumulative_buy_evidence=None,
+            filled_price=23700, filled_qty=85,
+        )
+
+
+def test_actual_individual_execution_keeps_individual_quantity():
+    from trader import reconcile_kis
+    args = reconcile_kis._kr_atomic_execution_evidence(
+        cumulative_sell_evidence=None, cumulative_buy_evidence=None,
+        filled_price=23700, filled_qty=2,
+    )
+    assert args == {
+        "evidence_type": "KIS_EXECUTION_ACTUAL",
+        "execution_price": 23700,
+        "execution_qty": 2,
+    }
