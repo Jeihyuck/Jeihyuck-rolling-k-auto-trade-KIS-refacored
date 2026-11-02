@@ -222,6 +222,39 @@ def _count_kr_tick_attempt(session_metrics: dict[str, int]) -> None:
     session_metrics["ticks_total"] = int(session_metrics.get("ticks_total", 0)) + 1
 
 
+def _apply_kr_broker_reconcile_health(
+    metrics: dict[str, Any], payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """A successful broker submit cannot mask a failed/deferred reconciliation."""
+    summary = payload or {}
+    unverified = bool(
+        summary.get("broker_truth_reconcile_failed")
+        or summary.get("broker_truth_reconcile_degraded")
+        or (
+            summary.get("broker_truth_reconcile_deferred")
+            and summary.get("broker_truth_health_status") == "RED"
+        )
+    )
+    if not unverified:
+        return metrics
+    metrics["degraded"] = True
+    warning_counts = dict(metrics.get("warning_counts") or {})
+    warning_counts["kr_broker_reconcile_degraded_count"] = (
+        int(warning_counts.get("kr_broker_reconcile_degraded_count", 0) or 0) + 1
+    )
+    metrics["warning_counts"] = warning_counts
+    logger.error(
+        "[KR_BROKER_TRUTH][TICK_DEGRADED] reconcile_failed=%s "
+        "reconcile_degraded=%s reason=%s accepted_orders_preserved=1",
+        int(bool(summary.get("broker_truth_reconcile_failed"))),
+        int(bool(summary.get("broker_truth_reconcile_degraded"))),
+        summary.get("broker_truth_reconcile_reason")
+        or summary.get("broker_truth_reconcile_error")
+        or summary.get("broker_truth_reconcile_defer_reason") or "unverified",
+    )
+    return metrics
+
+
 def _merge_warning_counts(base: dict[str, int], incoming: dict[str, Any] | None) -> dict[str, int]:
     merged = dict(base)
     for key, value in _normalize_warning_counts(incoming).items():
@@ -8216,27 +8249,9 @@ def run_once(
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
-    # Broker ACK and post-tick economic reconciliation are separate outcomes.
-    # Keep accepted orders intact while surfacing independent degraded status.
-    broker_truth_payload = dict(getattr(engine_runner, "_run_summary_payload", {}) or {})
-    if bool(
-        broker_truth_payload.get("broker_truth_reconcile_failed")
-        or broker_truth_payload.get("broker_truth_reconcile_degraded")
-    ):
-        metrics["degraded"] = True
-        warning_counts = dict(metrics.get("warning_counts") or {})
-        warning_counts["kr_broker_reconcile_degraded_count"] = (
-            int(warning_counts.get("kr_broker_reconcile_degraded_count", 0) or 0) + 1
-        )
-        metrics["warning_counts"] = warning_counts
-        logger.error(
-            "[KR_BROKER_TRUTH][TICK_DEGRADED] reconcile_failed=%s "
-            "reconcile_degraded=%s reason=%s accepted_orders_preserved=1",
-            int(bool(broker_truth_payload.get("broker_truth_reconcile_failed"))),
-            int(bool(broker_truth_payload.get("broker_truth_reconcile_degraded"))),
-            broker_truth_payload.get("broker_truth_reconcile_reason")
-            or broker_truth_payload.get("broker_truth_reconcile_error") or "unverified",
-        )
+    metrics = _apply_kr_broker_reconcile_health(
+        metrics, getattr(engine_runner, "_run_summary_payload", None)
+    )
     # KR_INFINITE ran at the first safe point AFTER protective exits and
     # BEFORE PB1 entries. Never dispatch it a second time after engine.run().
     inf = locals().get("kr_inf_run_result")
