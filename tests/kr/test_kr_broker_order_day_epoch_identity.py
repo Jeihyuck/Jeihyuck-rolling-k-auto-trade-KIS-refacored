@@ -224,3 +224,70 @@ def test_response_merge_does_not_adopt_august_broker_watermark(monkeypatch):
         }
     assert rows[old]["response_json"]["confirmed_fill_qty"] == 999
     assert rows[new]["response_json"]["confirmed_fill_qty"] == 110
+
+
+
+def test_reused_odno_mark_filled_affects_only_current_day_and_epoch(monkeypatch):
+    from datetime import timedelta
+    engine, schema = _db(monkeypatch)
+    epoch = start_new_trading_epoch(
+        engine, env="practice", account_id="practice:kr-incident",
+        reason="STATUS_DAY_FENCE",
+    )
+    now = datetime.now(timezone.utc)
+    old_ts = now - timedelta(days=3)
+    with engine.begin() as conn:
+        old = _insert_existing(
+            schema, conn, code="005830", key="filled-old", odno="0000013020",
+            day=old_ts, epoch=epoch,
+        )
+        new = _insert_existing(
+            schema, conn, code="253590", key="filled-new", odno="0000013020",
+            day=now, epoch=epoch,
+        )
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id.in_([old, new]),
+        ).values(status="ACKED"))
+
+    OrdersRepo(engine).mark_filled("practice", kis_odno="0000013020")
+    with engine.connect() as conn:
+        rows = {
+            x["order_id"]: x["status"] for x in conn.execute(
+                sa.select(schema.orders.c.order_id, schema.orders.c.status)
+            ).mappings()
+        }
+    assert rows[old] == "ACKED"
+    assert rows[new] == "FILLED"
+
+
+def test_reused_odno_mark_acked_affects_only_current_day(monkeypatch):
+    from datetime import timedelta
+    engine, schema = _db(monkeypatch)
+    epoch = start_new_trading_epoch(
+        engine, env="practice", account_id="practice:kr-incident",
+        reason="ACK_DAY_FENCE",
+    )
+    now = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        old = _insert_existing(
+            schema, conn, code="005830", key="ack-old", odno="0000013020",
+            day=now - timedelta(days=3), epoch=epoch,
+        )
+        new = _insert_existing(
+            schema, conn, code="253590", key="ack-new", odno="0000013020",
+            day=now, epoch=epoch,
+        )
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id.in_([old, new])
+        ).values(status="SUBMITTED"))
+
+    OrdersRepo(engine).mark_acked("practice", kis_odno="0000013020",
+                                 response_json={"rt_cd": "0"})
+    with engine.connect() as conn:
+        rows = {
+            x["order_id"]: x["status"] for x in conn.execute(
+                sa.select(schema.orders.c.order_id, schema.orders.c.status)
+            ).mappings()
+        }
+    assert rows[old] == "SUBMITTED"
+    assert rows[new] == "ACKED"
