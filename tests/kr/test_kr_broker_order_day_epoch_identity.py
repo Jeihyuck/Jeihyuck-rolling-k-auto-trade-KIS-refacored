@@ -156,3 +156,71 @@ def test_migration_preflights_and_replaces_index_without_rewriting_trades():
     )
     assert "DELETE FROM" not in sql.upper()
     assert "UPDATE PUBLIC.ORDERS" not in sql.upper()
+
+
+
+def test_reused_odno_same_date_different_trading_epoch_is_distinct(monkeypatch):
+    engine, schema = _db(monkeypatch)
+    day = datetime(2026, 10, 30, 0, 15, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        old = _insert_existing(
+            schema, conn, code="005830", key="epoch-before",
+            odno="0000099999", day=day, epoch="older-epoch",
+        )
+        new = _insert_existing(
+            schema, conn, code="253590", key="epoch-after",
+            odno="0000099999", day=day, epoch="newer-epoch",
+        )
+    assert old != new
+
+
+def test_response_merge_does_not_adopt_august_broker_watermark(monkeypatch):
+    from trader.kr import broker_truth_final_review_fixes as final
+
+    engine, schema = _db(monkeypatch)
+    old_stamp = datetime(2026, 8, 26, 0, 15, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        old = _insert_existing(
+            schema, conn, code="005830", key="legacy-buy",
+            odno="0000013020", day=old_stamp,
+        )
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == old,
+        ).values(response_json={"confirmed_fill_qty": 999, "rt_cd": "0"}))
+
+    epoch_id = start_new_trading_epoch(
+        engine, env="practice", account_id="practice:kr-incident",
+        reason="TEST_RESPONSE_MERGE_DATE_FENCE",
+    )
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.trading_epochs).where(
+            schema.trading_epochs.c.trading_epoch_id == epoch_id,
+        ).values(started_at=datetime(2026, 10, 25, tzinfo=timezone.utc)))
+
+    class IsolatedOrdersRepo(OrdersRepo):
+        pass
+
+    monkeypatch.setattr(final, "OrdersRepo", IsolatedOrdersRepo)
+    final._install_order_response_merge_guard()
+    current_time = datetime(2026, 10, 30, 2, 10, tzinfo=timezone.utc)
+    repo = IsolatedOrdersRepo(engine)
+    new = repo.upsert_reconciled_order(
+        env="practice", run_id=None, strategy="pb1_pullback_close",
+        sid=1, mode=1, code="253590", market="KRX", side="SELL",
+        ord_type="RECONCILED", qty=110, limit_price=None,
+        stage="RECONCILE", client_order_key="new-epoch-neosem",
+        kis_odno="0000013020", status="ACKED", request_json={},
+        response_json={"rt_cd": "0", "confirmed_fill_qty": 110},
+        submitted_at=current_time, acked_at=current_time,
+    )
+    assert new != old
+    with engine.connect() as conn:
+        rows = {
+            x["order_id"]: x for x in conn.execute(
+                sa.select(schema.orders).where(
+                    schema.orders.c.broker_order_id == "0000013020",
+                )
+            ).mappings()
+        }
+    assert rows[old]["response_json"]["confirmed_fill_qty"] == 999
+    assert rows[new]["response_json"]["confirmed_fill_qty"] == 110
