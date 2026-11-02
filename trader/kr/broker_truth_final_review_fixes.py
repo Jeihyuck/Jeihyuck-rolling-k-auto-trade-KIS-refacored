@@ -54,27 +54,35 @@ def _install_order_response_merge_guard() -> None:
         existing_response: dict[str, Any] = {}
         try:
             schema = self._schema
-            conditions = [schema.orders.c.env == env]
-            if kis_odno:
-                conditions.append(
-                    sa.or_(
-                        schema.orders.c.kis_odno == kis_odno,
-                        schema.orders.c.broker_order_id == kis_odno,
-                    )
-                )
-            elif client_order_key:
-                conditions.append(schema.orders.c.client_order_key == client_order_key)
-            else:
-                conditions = []
-            if conditions:
+            # Prefer the immutable client intent; never merge an older day's
+            # response_json merely because KIS recycled its numeric ODNO.
+            existing = None
+            if client_order_key:
                 with self.engine.connect() as conn:
                     existing = conn.execute(
-                        sa.select(schema.orders.c.response_json)
-                        .where(sa.and_(*conditions))
-                        .order_by(schema.orders.c.created_at.desc())
-                        .limit(1)
-                    ).scalar()
-                existing_response = base._json_dict(existing)
+                        sa.select(schema.orders)
+                        .where(sa.and_(
+                            schema.orders.c.env == env,
+                            schema.orders.c.client_order_key == client_order_key,
+                        )).limit(1)
+                    ).mappings().first()
+            if existing is None and kis_odno:
+                submitted = kwargs.get("submitted_at") or kwargs.get("acked_at")
+                if submitted is not None:
+                    from datetime import datetime
+                    from zoneinfo import ZoneInfo
+                    day = (
+                        submitted.astimezone(ZoneInfo("Asia/Seoul")).date()
+                        if isinstance(submitted, datetime) and submitted.tzinfo
+                        else submitted.date()
+                    )
+                    existing = OrdersRepo(self.engine).get_order_by_kis_odno_scoped(
+                        env, kis_odno, trade_date=day,
+                        code=str(kwargs.get("code") or ""),
+                        side=str(kwargs.get("side") or ""),
+                    )
+            if existing is not None:
+                existing_response = base._json_dict(existing.get("response_json"))
         except Exception as exc:
             logger.warning(
                 "[KR_BROKER_TRUTH][ORDER_RESPONSE_MERGE][READ_FAIL] kis_odno=%s err_type=%s err=%s",
