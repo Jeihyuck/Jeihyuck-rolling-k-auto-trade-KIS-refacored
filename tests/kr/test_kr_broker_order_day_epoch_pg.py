@@ -41,7 +41,7 @@ def test_0061_pg_migration_preserves_old_row_and_allows_recycled_odno():
                 )
             """)
             conn.exec_driver_sql(f"""
-                CREATE UNIQUE INDEX {name}.uq_orders_env_broker_order_id
+                CREATE UNIQUE INDEX uq_orders_env_broker_order_id
                 ON {name}.orders(env, broker_order_id)
             """)
             conn.exec_driver_sql(f"""
