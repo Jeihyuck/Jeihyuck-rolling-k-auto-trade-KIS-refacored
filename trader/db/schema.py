@@ -173,9 +173,9 @@ def _build_schema(database_url: str) -> SchemaTables:
             orders.c.submitted_at, orders.c.acked_at, orders.c.created_at,
         )), sa.Date)
         if database_url.startswith("postgres")
-        else sa.func.date(sa.func.datetime(sa.func.coalesce(
+        else sa.func.date(sa.func.coalesce(
             orders.c.submitted_at, orders.c.acked_at, orders.c.created_at,
-        ), "+9 hours"))
+        ))
     )
     sa.Index(
         "uq_orders_env_broker_order_day_epoch",
