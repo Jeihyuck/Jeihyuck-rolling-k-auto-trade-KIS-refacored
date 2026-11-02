@@ -1646,6 +1646,37 @@ def _kr_source_has_individual_sell_fills(
     return False
 
 
+def _kr_atomic_execution_evidence(
+    *, cumulative_sell_evidence: dict[str, Any] | None,
+    cumulative_buy_evidence: dict[str, Any] | None,
+    filled_price: float | None, filled_qty: int,
+) -> dict[str, Any]:
+    """Map verified KIS evidence to the existing atomic settlement contract.
+
+    Aggregate order-average price is not an individual execution: never pass
+    its cumulative quantity as execution_qty (which would double-count).
+    """
+    if cumulative_sell_evidence and cumulative_buy_evidence:
+        raise ValueError("KR_ATOMIC_AMBIGUOUS_CUMULATIVE_SIDE")
+    aggregate = cumulative_sell_evidence or cumulative_buy_evidence
+    if aggregate is not None:
+        avg = _to_float(aggregate.get("avg_price"))
+        qty = _to_int(aggregate.get("qty"))
+        notional = _to_float(aggregate.get("notional"))
+        if avg is None or avg <= 0 or not qty or qty <= 0 or notional is None or notional <= 0:
+            raise ValueError("KR_ATOMIC_CUMULATIVE_PRICE_PROOF_INVALID")
+        return {
+            "evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "execution_price": avg,
+            "execution_qty": None,
+        }
+    return {
+        "evidence_type": "KIS_EXECUTION_ACTUAL",
+        "execution_price": filled_price,
+        "execution_qty": int(filled_qty),
+    }
+
+
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | None = None, require_authoritative: bool = False, strict_sell_targets: dict[str, tuple[str, int]] | None = None, strict_sell_order_ids: dict[str, str] | None = None, strict_sell_epoch_id: str | None = None) -> dict[str, object]:
     if strict_sell_order_ids is not None and (
         strict_sell_targets is None or not strict_sell_epoch_id
@@ -2011,16 +2042,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     ),
                     requested_qty=_to_int(source_order.get("qty")) or qty,
                     cumulative_qty=next_confirmed_qty,
-                    evidence_type=(
-                        "KIS_EXECUTION_CUMULATIVE" if (cumulative_sell_evidence or cumulative_buy_evidence)
-                        else "KIS_EXECUTION_ACTUAL"
-                    ),
                     evidence_digest=(
                         f"daily_ccld_cumulative:{trade_id}" if (cumulative_sell_evidence or cumulative_buy_evidence)
                         else f"daily_ccld:{trade_id}"
                     ),
-                    execution_price=filled_price,
-                    execution_qty=int(filled_qty),
+                    **_kr_atomic_execution_evidence(
+                        cumulative_sell_evidence=cumulative_sell_evidence,
+                        cumulative_buy_evidence=cumulative_buy_evidence,
+                        filled_price=filled_price,
+                        filled_qty=int(filled_qty),
+                    ),
                 )
                 atomic_release = load_kr_runtime_release(engine, atomic_observation)
                 atomic_writer_active = bool(atomic_release.writer_allowed)
