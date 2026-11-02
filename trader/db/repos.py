@@ -4200,25 +4200,41 @@ class OrdersRepo:
         }
 
     def get_order_by_kis_odno(self, env: str, kis_odno: str) -> dict | None:
+        """Legacy current-day lookup; refuse recycled/ambiguous ODNO matches.
+
+        Historical settlement must call get_order_by_kis_odno_scoped with
+        explicit original broker date, code and side.
+        """
         broker_id = str(kis_odno or "").strip()
         if not broker_id:
             return None
-        stmt = select(self._schema.orders).where(
-            and_(
-                self._schema.orders.c.env == env,
-                or_(
-                    self._schema.orders.c.kis_odno == broker_id,
-                    self._schema.orders.c.broker_order_id == broker_id,
-                ),
-            )
-        ).order_by(self._schema.orders.c.created_at.desc())
+        trading_epoch_id = active_trading_epoch_id(
+            self.engine, env=env, account_id=get_account_key(env=env),
+            required=False,
+        )
+        conditions = [
+            self._schema.orders.c.env == env,
+            self._kr_broker_trade_day_expr() == now_kst().date(),
+            or_(self._schema.orders.c.kis_odno == broker_id,
+                self._schema.orders.c.broker_order_id == broker_id),
+        ]
+        if trading_epoch_id is not None:
+            conditions.append(self._schema.orders.c.trading_epoch_id == str(trading_epoch_id))
+        else:
+            conditions.append(self._schema.orders.c.trading_epoch_id.is_(None))
         rows = _safe_repo_read(
             self.engine,
-            stmt,
-            op_name="orders.get_order_by_kis_odno",
-            fail_open=_resolve_lookup_fail_open(),
+            select(self._schema.orders).where(and_(*conditions)).limit(2),
+            op_name="orders.get_order_by_kis_odno_current_day",
+            fail_open=False,
         )
-        return rows[0] if rows else None
+        if len(rows) != 1:
+            logger.warning(
+                "[ORDERS][BROKER_LOOKUP][UNVERIFIED] env=%s odno=%s matched=%d action=NONE",
+                env, broker_id, len(rows),
+            )
+            return None
+        return rows[0]
 
     def get_order_by_kis_odno_scoped(
         self, env: str, kis_odno: str, *, trade_date: date, code: str, side: str,
