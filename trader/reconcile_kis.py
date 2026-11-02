@@ -2923,7 +2923,6 @@ def reconcile_kis(
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
-            "cross_date_sell": cross_date_sell,
         }
     )
     # Transient caller-only broker truth.  When daily-ccld observes a fill,
@@ -2955,6 +2954,13 @@ def reconcile_kis(
         integrity_reason = integrity_reason or "unresolved_broker_activity"
     if reconcile_result.get("guard_reason"):
         integrity_reason = integrity_reason or str(reconcile_result["guard_reason"])
+    if reconcile_result.get("ok") is not True:
+        # A failed daily-ccld pass is degraded even when balance parity appears
+        # healthy. Accepted broker orders are not economic settlement evidence.
+        integrity_reason = integrity_reason or str(
+            reconcile_result.get("degraded") or reconcile_result.get("reason")
+            or "reconcile_today_unverified"
+        )
     if integrity_reason:
         reconcile_result["ok"] = False
         reconcile_result["degraded"] = (
