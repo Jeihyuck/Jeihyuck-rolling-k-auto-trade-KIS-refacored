@@ -3736,6 +3736,7 @@ class OrdersRepo:
                 existing_conditions = [
                     self._schema.orders.c.env == env,
                     self._schema.orders.c.broker_order_id == kis_odno,
+                    self._kr_broker_trade_day_expr() == now_kst().date(),
                 ]
                 current_conditions = [
                     self._schema.orders.c.env == env,
@@ -3836,6 +3837,10 @@ class OrdersRepo:
         *,
         entry_meta_json: dict | None = None,
     ) -> None:
+        """Only the unique current-day/current-epoch broker order can be ACKED."""
+        if not kis_odno:
+            logger.error("[ORDERS][MARK_ACKED][BLOCK] reason=ODNO_MISSING")
+            return
         safe_response_json = json_sanitize(response_json or {})
         values = {
             "status": "ACKED",
@@ -3854,12 +3859,23 @@ class OrdersRepo:
             conditions = [
                 self._schema.orders.c.env == env,
                 self._schema.orders.c.kis_odno == kis_odno,
+                self._kr_broker_trade_day_expr() == now_kst().date(),
             ]
             if trading_epoch_id is not None:
                 conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
+            rows = conn.execute(
+                sa.select(self._schema.orders.c.order_id).where(and_(*conditions))
+                .limit(2).with_for_update()
+            ).scalars().all()
+            if len(rows) != 1:
+                logger.error(
+                    "[ORDERS][MARK_ACKED][BLOCK] odno=%s matched=%d reason=DAY_EPOCH_NOT_UNIQUE",
+                    kis_odno, len(rows),
+                )
+                return
             conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(*conditions))
+                .where(self._schema.orders.c.order_id == rows[0])
                 .values(**values)
             )
 
@@ -3869,27 +3885,21 @@ class OrdersRepo:
         kis_odno: str | None = None,
         client_order_key: str | None = None,
     ) -> None:
-        """
-        주문을 FILLED 상태로 변경. SELL fill confirmed 후 호출.
-        
-        Args:
-            env: 환경
-            kis_odno: KIS 주문번호 (우선 사용)
-            client_order_key: 클라이언트 주문 키 (fallback)
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-        
+        """Never terminalize multiple orders with a recycled KIS ODNO."""
         if not kis_odno and not client_order_key:
             logger.warning("[ORDERS][MARK_FILLED][SKIP] no identifier provided")
             return
-        
         conditions = [self._schema.orders.c.env == env]
-        if kis_odno:
-            conditions.append(self._schema.orders.c.kis_odno == kis_odno)
-        elif client_order_key:
+        if client_order_key:
+            # Durable intent identity wins over a recycled broker number.
             conditions.append(self._schema.orders.c.client_order_key == client_order_key)
-        
+            if kis_odno:
+                conditions.append(self._schema.orders.c.kis_odno == kis_odno)
+        else:
+            conditions.extend([
+                self._schema.orders.c.kis_odno == kis_odno,
+                self._kr_broker_trade_day_expr() == now_kst().date(),
+            ])
         with self.engine.begin() as conn:
             trading_epoch_id = active_trading_epoch_id(
                 conn, env=env, account_id=get_account_key(env=env),
@@ -3897,15 +3907,26 @@ class OrdersRepo:
             )
             if trading_epoch_id is not None:
                 conditions.append(self._schema.orders.c.trading_epoch_id == trading_epoch_id)
+            rows = conn.execute(
+                sa.select(self._schema.orders.c.order_id).where(and_(*conditions))
+                .limit(2).with_for_update()
+            ).scalars().all()
+            if len(rows) != 1:
+                logger.error(
+                    "[ORDERS][MARK_FILLED][BLOCK] kis_odno=%s key=%s matched=%d "
+                    "reason=ORDER_IDENTITY_UNVERIFIED",
+                    kis_odno, client_order_key, len(rows),
+                )
+                return
             result = conn.execute(
                 sa.update(self._schema.orders)
-                .where(and_(*conditions))
+                .where(self._schema.orders.c.order_id == rows[0])
                 .values(status="FILLED", updated_at=func.now())
             )
             updated_count = result.rowcount
-        
         logger.info(
-            "[ORDERS][STATUS_UPDATE] env=%s kis_odno=%s client_order_key=%s from=ACKED/ACCEPTED to=FILLED updated=%s",
+            "[ORDERS][STATUS_UPDATE] env=%s kis_odno=%s client_order_key=%s "
+            "to=FILLED updated=%s",
             env, kis_odno, client_order_key, updated_count,
         )
 
