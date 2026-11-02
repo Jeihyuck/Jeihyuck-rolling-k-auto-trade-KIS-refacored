@@ -291,3 +291,42 @@ def test_reused_odno_mark_acked_affects_only_current_day(monkeypatch):
         }
     assert rows[old] == "SUBMITTED"
     assert rows[new] == "ACKED"
+
+
+
+def test_mark_submitted_same_symbol_qty_cannot_hijack_other_intent(monkeypatch):
+    engine, schema = _db(monkeypatch)
+    epoch = start_new_trading_epoch(
+        engine, env="practice", account_id="practice:kr-incident",
+        reason="BROKER_ACK_CLIENT_IDENTITY_FENCE",
+    )
+    stamp = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        first = _insert_existing(
+            schema, conn, code="253590", key="original-client",
+            odno="0000013020", day=stamp, epoch=epoch,
+        )
+        second = str(uuid4())
+        conn.execute(schema.orders.insert().values(
+            order_id=second, env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="253590", side="BUY",
+            ord_type="LIMIT", qty=1,
+            client_order_key="unrelated-same-symbol",
+            status="CREATED", request_json={}, response_json={},
+            trading_epoch_id=epoch, created_at=stamp,
+        ))
+
+    result = OrdersRepo(engine).mark_submitted(
+        env="practice", client_order_key="unrelated-same-symbol",
+        kis_odno="0000013020", response_json={"rt_cd": "0"},
+    )
+    assert result == "AMBIGUOUS_BROKER_ORDER_ID"
+    with engine.connect() as conn:
+        rows = {r["order_id"]: r for r in conn.execute(
+            sa.select(schema.orders).where(
+                schema.orders.c.order_id.in_([first, second])
+            )
+        ).mappings().all()}
+    assert rows[first]["broker_order_id"] == "0000013020"
+    assert rows[second]["broker_order_id"] is None
+    assert rows[second]["status"] == "ACK_DB_FAILED_RECONCILE_REQUIRED"
