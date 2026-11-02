@@ -8216,6 +8216,27 @@ def run_once(
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
+    # Broker ACK and post-tick economic reconciliation are separate outcomes.
+    # Keep accepted orders intact while surfacing independent degraded status.
+    broker_truth_payload = dict(getattr(engine_runner, "_run_summary_payload", {}) or {})
+    if bool(
+        broker_truth_payload.get("broker_truth_reconcile_failed")
+        or broker_truth_payload.get("broker_truth_reconcile_degraded")
+    ):
+        metrics["degraded"] = True
+        warning_counts = dict(metrics.get("warning_counts") or {})
+        warning_counts["kr_broker_reconcile_degraded_count"] = (
+            int(warning_counts.get("kr_broker_reconcile_degraded_count", 0) or 0) + 1
+        )
+        metrics["warning_counts"] = warning_counts
+        logger.error(
+            "[KR_BROKER_TRUTH][TICK_DEGRADED] reconcile_failed=%s "
+            "reconcile_degraded=%s reason=%s accepted_orders_preserved=1",
+            int(bool(broker_truth_payload.get("broker_truth_reconcile_failed"))),
+            int(bool(broker_truth_payload.get("broker_truth_reconcile_degraded"))),
+            broker_truth_payload.get("broker_truth_reconcile_reason")
+            or broker_truth_payload.get("broker_truth_reconcile_error") or "unverified",
+        )
     # KR_INFINITE ran at the first safe point AFTER protective exits and
     # BEFORE PB1 entries. Never dispatch it a second time after engine.run().
     inf = locals().get("kr_inf_run_result")
