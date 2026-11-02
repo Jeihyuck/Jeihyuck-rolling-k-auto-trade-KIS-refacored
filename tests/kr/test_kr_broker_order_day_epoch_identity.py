@@ -61,8 +61,13 @@ def test_nov02_neosem_odno_can_recur_after_aug_legacy_epoch(monkeypatch):
         )
     current = start_new_trading_epoch(
         engine, env="practice", account_id="practice:kr-incident",
-        reason="REPRO_KR_NEOS", 
+        reason="REPRO_KR_NEOS",
     )
+    # Simulate the actual Oct 25 active-epoch start, not the test's wall clock.
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.trading_epochs).where(
+            schema.trading_epochs.c.trading_epoch_id == current,
+        ).values(started_at=datetime(2026, 10, 25, tzinfo=timezone.utc)))
     # A new trading epoch does not allow claiming the old order row.
     repo = OrdersRepo(engine)
     stamp = datetime(2026, 10, 30, 2, 10, tzinfo=timezone.utc)
