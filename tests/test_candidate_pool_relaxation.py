@@ -97,6 +97,12 @@ def test_strict_relax_shortage_fallback_topup(monkeypatch: pytest.MonkeyPatch) -
     assert len(selected) == 40
     assert int(report.get("relaxed_kept", 0)) == 18
     assert int(report.get("selection_mode_counts", {}).get("fallback_topup", 0)) > 0
+    # Underfilled target is a reported policy/data-quality fact, not a
+    # license to lower the Minervini admission floor silently.
+    assert report["target_shortfall"] == 80
+    assert report["target_size"] == 120
+    assert report["exclusions"]["insufficient_ohlcv"] == 0
+    assert report["exclusions"]["provider_error"] == 0
 
 
 def test_bootstrap_thresholds_applied(monkeypatch: pytest.MonkeyPatch) -> None:
