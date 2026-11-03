@@ -36,6 +36,25 @@ def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, str, str]
     return frozenset(keys)
 
 
+def _broker_book_facts(rows: list[dict]) -> tuple:
+    """Compare authoritative order facts, not volatile HTTP observation time.
+
+    A reader may refresh an identical page while the writer is reconciling.
+    That should not starve READY. Different cumulative fill/status/identity
+    must block committing the older snapshot until replayed.
+    """
+    fields = (
+        "order_no", "canonical_order_no", "symbol", "side", "exchange",
+        "requested_qty", "filled_qty", "remaining_qty", "status",
+        "normalization_result", "filled_qty_present", "avg_price",
+        "avg_price_usd", "trade_date",
+    )
+    return tuple(sorted(
+        tuple(str(row.get(field) or "") for field in fields)
+        for row in rows
+    ))
+
+
 def _debt_order_source_dates(debts: list[dict], *, scope: dict,
                              max_dates: int) -> set[str]:
     if not debts:
@@ -353,9 +372,14 @@ class HistoricalReadOnlyReader:
             raise RuntimeError("US_STAGE4_HISTORICAL_CLAIM_SET_CHANGED")
         current = self.snapshot_for_claims(claims)
         for day in {k[0] for k in snapshot["active_keys"]}:
-            if (day not in current["books"]
-                    or current["books"][day]["at"] != snapshot["books"][day]["at"]):
+            if day not in current["books"]:
                 raise RuntimeError("US_STAGE4_HISTORICAL_EVIDENCE_REPLACED")
+            updated = current["books"][day]
+            original = snapshot["books"][day]
+            if (updated["at"] != original["at"]
+                    and _broker_book_facts(updated["orders"])
+                    != _broker_book_facts(original["orders"])):
+                raise RuntimeError("US_STAGE4_HISTORICAL_NEWER_BROKER_FACTS_CHANGED")
 
     def provider_for(self, snapshot: dict) -> SnapshotOnlyProvider:
         if snapshot["scope"] != self.scope or snapshot["generation"] != self.generation:
