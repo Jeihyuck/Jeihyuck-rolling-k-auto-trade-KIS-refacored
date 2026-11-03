@@ -2503,7 +2503,7 @@ def _resolve_session_kind(now: datetime | None = None) -> str:
 
 def _resolve_session_end_dt(now: datetime) -> datetime:
     session_kind = _resolve_session_kind()
-    am_end = os.getenv("PB1_AM_SESSION_END", "13:00")
+    am_end = os.getenv("PB1_AM_SESSION_END", "12:55")
     pm_end = os.getenv("PB1_PM_SESSION_END", "15:10")
     close_end = os.getenv("PB1_CLOSE_SESSION_END", CLOSE_AUCTION_END or MARKET_CLOSE_HHMM or "15:30")
 
@@ -2517,7 +2517,7 @@ def _resolve_session_end_dt(now: datetime) -> datetime:
     try:
         end_time = _parse_hhmm_to_time(end_hhmm)
     except Exception:
-        fallback_hhmm = "15:30" if session_kind == "close" else ("13:00" if session_kind == "am" else "15:10")
+        fallback_hhmm = "15:30" if session_kind == "close" else ("12:55" if session_kind == "am" else "15:10")
         logger.warning(
             "[PB1][LOOP][SESSION] invalid session end override kind=%s raw=%s fallback=%s",
             session_kind,
@@ -8614,12 +8614,17 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
             window = decide_window(now=now, override=args.window)
             if window is None:
-                active_end_raw = (os.getenv("PB1_AM_EXPECTED_END", "10:30")
-                                  if session_kind == "am" else os.getenv("PB1_PM_EXPECTED_END", "15:10"))
-                try:
-                    active_end = _parse_hhmm_to_time(active_end_raw)
-                except Exception:
+                # AM_EXPECTED_END is also used by the *start/recovery* guard.
+                # It must not terminate an already-running AM loop at 10:30.
+                # The AM loop's authoritative deadline is PB1_AM_SESSION_END.
+                if session_kind == "am":
                     active_end = session_end_dt.time()
+                else:
+                    active_end_raw = os.getenv("PB1_PM_EXPECTED_END", "15:10")
+                    try:
+                        active_end = _parse_hhmm_to_time(active_end_raw)
+                    except Exception:
+                        active_end = session_end_dt.time()
                 if now.time() >= active_end:
                     logger.info("[PB1][LOOP][SESSION_END_RELEASE] kind=%s reason=no_future_active_tick now=%s active_end=%s",
                                 session_kind, now.isoformat(), active_end)
