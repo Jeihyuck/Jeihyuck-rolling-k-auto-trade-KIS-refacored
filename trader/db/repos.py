@@ -7600,6 +7600,7 @@ class PositionsRepo:
         position_cycle_id: str | None = None,
         order_id: str | None = None,
         buy_application_cumulative_qty: int | None = None,
+        buy_application_previous_confirmed_qty: int | None = None,
         buy_cost_delta_override: float | None = None,
         _conn: Any = None,
     ) -> None:
@@ -7616,6 +7617,7 @@ class PositionsRepo:
                     entry_meta=entry_meta, account_id=account_id,
                     portfolio_epoch_id=portfolio_epoch_id, position_cycle_id=position_cycle_id,
                     order_id=order_id, buy_application_cumulative_qty=buy_application_cumulative_qty,
+                    buy_application_previous_confirmed_qty=buy_application_previous_confirmed_qty,
                     buy_cost_delta_override=buy_cost_delta_override, _conn=conn,
                 )
         conn = _conn
@@ -7788,10 +7790,34 @@ class PositionsRepo:
                 previous_qty = int(previous.get("qty") or 0)
                 if target < previous_qty or target - previous_qty != qty:
                     raise RuntimeError("KR_BUY_APPLICATION_CUMULATIVE_CONFLICT")
+                # The KIS order proves the pre-submit holding and already
+                # acknowledged cumulative shares. A duplicate/stale DB row
+                # (Nov 3 Mico: 22 phantom shares before 91 new BUY shares)
+                # must never be silently added to the new BUY notional.
                 pre_qty = request_json.get("pre_order_holding_qty")
-                if not previous and row and (
-                    pre_qty is None or current_qty != int(pre_qty)
-                ):
+                if pre_qty is None:
+                    raise RuntimeError("KR_BUY_APPLICATION_PRE_ORDER_HOLDING_MISSING")
+                try:
+                    pre_qty = int(pre_qty)
+                    prior_confirmed = (
+                        int(buy_application_previous_confirmed_qty)
+                        if buy_application_previous_confirmed_qty is not None
+                        else previous_qty
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("KR_BUY_APPLICATION_BASELINE_INVALID") from exc
+                if pre_qty < 0 or prior_confirmed < 0 or prior_confirmed > target:
+                    raise RuntimeError("KR_BUY_APPLICATION_BASELINE_INVALID")
+                if previous and buy_application_previous_confirmed_qty is not None and previous_qty != prior_confirmed:
+                    raise RuntimeError("KR_BUY_APPLICATION_WATERMARK_CONFLICT")
+                if target - prior_confirmed != qty or current_qty != pre_qty + prior_confirmed:
+                    logger.error(
+                        "[KR_BUY_APPLICATION][BASELINE_DRIFT] code=%s order_id=%s "
+                        "db_qty=%s pre_order_qty=%s prior_kis_confirmed=%s "
+                        "cumulative=%s delta=%s action=BLOCK_NO_POSITION_MUTATION",
+                        code, order_id, current_qty, pre_qty,
+                        prior_confirmed, target, qty,
+                    )
                     raise RuntimeError("KR_BUY_APPLICATION_BASELINE_DRIFT")
                 watermark_map[str(order_id)] = {
                     "qty": target,
