@@ -562,10 +562,19 @@ def main() -> int:
                         deferred_started=time.monotonic()
                         logger.info("[US_STAGE4][DEFERRED_RECOVERY_START] cycle_id=%s observed_at_utc=%s",cycle_id,datetime.now(timezone.utc).isoformat())
                         # Deferred DB mutations remain owned by this writer.
-                        # KIS reads were prefetched independently; no broker
-                        # GET fallback is possible through the snapshot facade.
+                        # Normal historical KIS reads were prefetched without
+                        # holding the authoritative writer. Preserve the
+                        # *explicitly operator-authorized* cancel flow: never
+                        # substitute a GET-only facade for an authorized KIS
+                        # cancel client. That exceptional operator path remains
+                        # synchronous and must be measured separately.
+                        _operator_cancel = (
+                            os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
+                            and os.getenv("US_STOP_RECOVERY_AUTHORIZED", "0") == "1"
+                        )
                         deferred=run_deferred_recovery_once(
-                            provider=historical_provider,trade_date=args.trade_date,
+                            provider=provider if _operator_cancel else historical_provider,
+                            trade_date=args.trade_date,
                         )
                         logger.info("[US_STAGE4][DEFERRED_RECOVERY] cycle_id=%s elapsed_ms=%.1f result=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,deferred)
                     except Exception as recovery_exc:
