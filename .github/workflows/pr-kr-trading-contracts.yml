@@ -113,6 +113,11 @@ jobs:
           pytest tests/test_kr_prep_market_benchmark_runtime.py -q
           pytest tests/kr -q
 
+      - name: KR AM 12:55 / PM 13:00 session-boundary regression (no broker I/O)
+        run: |
+          pytest tests/test_kr_am_pm_session_boundary_20261103.py -q
+          pytest tests/test_pb1_session_end_policy.py tests/test_trade_session_policy.py tests/test_recovery_control_plane_contracts.py -q
+
       - name: Check KR legacy regime removal
         run: bash scripts/check_kr_legacy_regime.sh
 
