@@ -371,3 +371,18 @@ def test_same_attempt_cumulative_fill_change_fences_old_broker_snapshot():
     new_state = {**original, "attempt_state": "PARTIALLY_SATISFIED"}
     with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
         reader.assert_still_valid(snapshot, [new_state])
+
+
+def test_zero_filled_and_missing_cumulative_are_different_broker_facts():
+    now = [60.0]
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, clock=lambda: now[0])
+    reader._poll_once(kis)
+    original = reader.snapshot_for_claims([CLAIM])
+    # Treat "filled_qty=0" as actual KIS zero, not an absent unknown.
+    kis.rows[0].pop("filled_qty")
+    kis.rows[0].pop("filled_qty_present")
+    now[0] = 61.0
+    reader._poll_once(kis)
+    with pytest.raises(RuntimeError, match="NEWER_BROKER_FACTS_CHANGED"):
+        reader.assert_still_valid(original, [CLAIM])
