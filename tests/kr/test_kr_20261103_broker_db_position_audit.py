@@ -1,5 +1,5 @@
 """No KIS, DB mutation or scheduler action: synthetic broker snapshot audit tests."""
-from trader.kr.broker_db_position_audit import compare_pb1_db_to_kis
+from trader.kr.broker_db_position_audit import compare_pb1_db_to_kis, summarize_pb1_execution_claim_backlog
 
 
 def _broker(*holdings):
@@ -94,3 +94,46 @@ def test_broker_economics_must_be_proven_for_91_share_position():
     )
     assert missing_proof["verified_match"] is False
     assert missing_proof["mismatches"][0]["reason"] == "COST_PROOF_UNAVAILABLE"
+
+
+def test_old_pb1_claim_backlog_is_not_silently_marked_settled():
+    """Nov 3: 5 historical claims still need exact original broker proof."""
+    cases = [
+        ("293490", "UNCERTAIN", 174, 0, 174),
+        ("012750", "PARTIALLY_SATISFIED", 11, 2, 9),
+        ("086450", "PARTIALLY_SATISFIED", 64, 48, 16),
+        ("192820", "OPEN", 4, 0, 4),
+        ("086450-pm", "OPEN", 66, 0, 66),
+    ]
+    rows = [{
+        "action_key": code, "trade_date": "2026-10-27",
+        "action": "BUY_ENTRY:PB1-AM", "action_state": state,
+        "target_qty": target, "cumulative_filled_qty": filled,
+        "remaining_target_qty": remaining,
+    } for code, state, target, filled, remaining in cases]
+    rows += [{
+        "action_key": "neosem-recovered", "trade_date": "2026-10-30",
+        "action": "SELL:HARD_STOP:FULL_EXIT", "action_state": "SATISFIED",
+        "target_qty": 110, "cumulative_filled_qty": 110,
+        "remaining_target_qty": 0,
+    }]
+    result = summarize_pb1_execution_claim_backlog(rows)
+    assert result["unresolved_count"] == 5
+    assert len(result["execution_claims"]) == 5
+    assert {x["reason"] for x in result["execution_claims"]} == {
+        "BROKER_SUBMIT_OUTCOME_UNRESOLVED",
+        "BROKER_PARTIAL_EXECUTION_PENDING",
+        "CLAIM_NEEDS_ORIGINAL_ORDER_PROOF",
+    }
+
+
+def test_inconsistent_claim_quantity_is_explicitly_flagged():
+    rows = [{
+        "action_key": "bad", "trade_date": "2026-11-03",
+        "action": "SELL:TP1", "action_state": "PARTIALLY_SATISFIED",
+        "target_qty": 100, "cumulative_filled_qty": 70,
+        "remaining_target_qty": 40,
+    }]
+    result = summarize_pb1_execution_claim_backlog(rows)
+    assert result["unresolved_count"] == 1
+    assert result["execution_claims"][0]["reason"] == "CLAIM_QUANTITY_INCONSISTENT"
