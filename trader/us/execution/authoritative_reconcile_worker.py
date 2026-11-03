@@ -247,7 +247,8 @@ def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "p
 
 def run_reconcile_once(*, provider: Any, trade_date: str,
                        session_run_id: str, writer_generation: str,
-                       conn: Any, scope: dict) -> dict:
+                       conn: Any, scope: dict,
+                       historical_provider: Any | None = None) -> dict:
     """One serial authoritative reconciliation cycle, no order submissions."""
     from trader.us.execution.fills import get_fills_today
     from trader.us.db.repos import save_fills_with_result
@@ -297,8 +298,8 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     replay=replay_order_journal(
         trade_date,session_run_id=session_run_id,
         tick_id="stage4-"+writer_generation,
-        provider=provider,include_active_claims=True,
-        active_claims_only=True,
+        provider=historical_provider if historical_provider is not None else provider,
+        include_active_claims=True, active_claims_only=True,
     )
     phase.mark("active_claim_replay")
     ack=reconcile_ack_orders_with_balance(
@@ -469,6 +470,7 @@ def main() -> int:
     from trader.us.execution.stage4_phase_latency import RollingStage4Latency
     ready_window = RollingStage4Latency(size=128)
     last_ready_mono: float | None = None
+    historical_reader = None
     # Hold only the dedicated one-writer advisory lock. It is distinct from
     # the short-lived trade reservation leases, so it does not hold KIS HTTP.
     with engine.connect() as lease:
@@ -486,16 +488,39 @@ def main() -> int:
                 publish_health(conn, scope=scope, generation=generation, state="STARTING")
             logger.info("[US_STAGE4][WORKER_STARTING] generation=%s", generation)
             provider=USDataProvider(offline=False,env="practice")
+            from trader.us.execution.stage4_historical_reader import HistoricalReadOnlyReader
+            historical_reader = HistoricalReadOnlyReader(
+                scope=scope, generation=generation,
+                # The reader creates a separate read-only KIS client. It has
+                # no execution / cancel / claim-release / health-write API.
+                provider_factory=lambda: USDataProvider(offline=False, env="practice"),
+            )
+            historical_reader.start()
             while not _STOP:
                 started=time.monotonic()
                 cycle_id=uuid.uuid4().hex
                 token=_stage4_cycle_id.set(cycle_id)
                 logger.info("[US_STAGE4][CYCLE_START] cycle_id=%s observed_at_utc=%s generation=%s",cycle_id,datetime.now(timezone.utc).isoformat(),generation)
                 try:
+                    from trader.us.db.repos import load_active_execution_claim_attempts
+                    # Read-only broker GETs for old orders never run on this
+                    # authoritative writer. A missing or stale historical
+                    # snapshot blocks READY; no synthetic terminality.
+                    active_before = load_active_execution_claim_attempts()
+                    historical_snapshot = historical_reader.snapshot_for_claims(active_before)
+                    historical_provider = historical_reader.provider_for(historical_snapshot)
                     result=run_reconcile_once(
                         provider=provider,trade_date=args.trade_date,
                         session_run_id=args.session_run_id,
                         writer_generation=generation,conn=lease,scope=scope,
+                        historical_provider=historical_provider,
+                    )
+                    # Verify both the current DB claim set and snapshot age at
+                    # the point of publishing, including any mutations the
+                    # writer just committed during the replay. Fail closed if
+                    # claims changed or the reader replaced/expired evidence.
+                    historical_reader.assert_still_valid(
+                        historical_snapshot, load_active_execution_claim_attempts(),
                     )
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
@@ -536,8 +561,11 @@ def main() -> int:
                     try:
                         deferred_started=time.monotonic()
                         logger.info("[US_STAGE4][DEFERRED_RECOVERY_START] cycle_id=%s observed_at_utc=%s",cycle_id,datetime.now(timezone.utc).isoformat())
+                        # Deferred DB mutations remain owned by this writer.
+                        # KIS reads were prefetched independently; no broker
+                        # GET fallback is possible through the snapshot facade.
                         deferred=run_deferred_recovery_once(
-                            provider=provider,trade_date=args.trade_date,
+                            provider=historical_provider,trade_date=args.trade_date,
                         )
                         logger.info("[US_STAGE4][DEFERRED_RECOVERY] cycle_id=%s elapsed_ms=%.1f result=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,deferred)
                     except Exception as recovery_exc:
@@ -561,6 +589,8 @@ def main() -> int:
                         break
                     time.sleep(min(0.25,remaining))
         finally:
+            if historical_reader is not None:
+                historical_reader.stop()
             with engine.begin() as conn:
                 publish_health(conn,scope=scope,generation=generation,state="STOPPED")
             lease.execute(text("SELECT pg_advisory_unlock(:key)"),
