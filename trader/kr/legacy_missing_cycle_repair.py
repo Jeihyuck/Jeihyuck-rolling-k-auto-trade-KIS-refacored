@@ -58,6 +58,8 @@ def certify_legacy_pb1_missing_cycle(
         len(code) != 6 or not code.isdigit()
         or balance_source != "api"
         or broker_balance.get("rt_cd") != "0"
+        or broker_balance.get("_diag_stub") is True
+        or broker_balance.get("_kis_disabled") is True
         or not isinstance(broker_balance.get("output1"), list)
     ):
         return blocked("FRESH_BROKER_PROOF_REQUIRED")
