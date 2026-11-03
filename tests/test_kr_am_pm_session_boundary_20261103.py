@@ -65,6 +65,39 @@ def test_live_wsl_am_isolation_and_pm_handoff_contract() -> None:
     assert 'PB1_AFTERNOON_WINDOW_START="13:00"' in pm
 
 
+
+def test_legacy_1030_env_is_corrected_by_am_launcher_without_running_trading() -> None:
+    """Exercise ONLY the WSL export statements in a bash subprocess, never the runner."""
+    am = (REPO / "scripts/wsl/run-kr-am.sh").read_text(encoding="utf-8")
+    export_lines = [
+        line for line in am.splitlines()
+        if line.startswith("export PB1_AM_SESSION_END=")
+        or line.startswith("export PB1_MORNING_WINDOW_END=")
+        or line.startswith("export MORNING_WINDOW_END=")
+        or line.startswith("export PB1_AFTERNOON_WINDOW_START=")
+        or line.startswith("export AFTERNOON_WINDOW_START=")
+    ]
+    assert len(export_lines) == 5
+    assert am.index("source .env;") < am.index('export PB1_MORNING_WINDOW_END="$PB1_AM_SESSION_END"')
+    env = os.environ.copy()
+    env.update({
+        "PB1_AM_SESSION_END": "12:55",
+        "PB1_MORNING_WINDOW_END": "10:30",
+        "MORNING_WINDOW_END": "10:30",
+        "PB1_AFTERNOON_WINDOW_START": "10:30",
+        "AFTERNOON_WINDOW_START": "10:30",
+    })
+    code = "\n".join(export_lines) + "\nprintf '%s|%s|%s|%s' " \
+        '"$PB1_MORNING_WINDOW_END" "$MORNING_WINDOW_END" ' \
+        '"$PB1_AFTERNOON_WINDOW_START" "$AFTERNOON_WINDOW_START"'
+    completed = subprocess.run(
+        ["bash", "-c", code], cwd=REPO, env=env,
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "12:55|12:55|13:00|13:00"
+
+
 def test_workflow_boundary_contract() -> None:
     am = (REPO / ".github/workflows/trade-am.yml").read_text(encoding="utf-8")
     pm = (REPO / ".github/workflows/trade-pm.yml").read_text(encoding="utf-8")
