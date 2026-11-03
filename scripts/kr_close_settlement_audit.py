@@ -218,8 +218,16 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
             "env": env, "epoch": epoch,
             "end_utc": __import__("datetime").datetime.combine(day + timedelta(days=1), __import__("datetime").time.min, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=9))).astimezone(__import__("datetime").timezone.utc),
         }).mappings()]
-        positions = [dict(x) for x in conn.execute(text("""
-            SELECT code, position_cycle_id, status, qty, closed_reason, position_meta
+        # Production PostgreSQL has position_meta JSONB. Legacy SQLite
+        # compatibility fixtures intentionally omit the column; they must
+        # continue auditing original missing-price SELLs normally, but can
+        # never supply a certified Infinite mirror exemption.
+        meta_projection = (
+            "NULL AS position_meta" if engine.dialect.name == "sqlite"
+            else "position_meta"
+        )
+        positions = [dict(x) for x in conn.execute(text(f"""
+            SELECT code, position_cycle_id, status, qty, closed_reason, {meta_projection}
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """), {"env": env, "epoch": epoch}).mappings()]
     # Use the broker's own product name when present, but never trust a JSON
