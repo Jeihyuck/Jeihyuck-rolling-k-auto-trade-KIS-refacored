@@ -49,6 +49,7 @@ def main() -> int:
                     sa.select(
                         schema.positions.c.code,
                         schema.positions.c.qty,
+                        schema.positions.c.total_cost,
                         schema.positions.c.status,
                     ).where(sa.and_(
                         schema.positions.c.env == "practice",
@@ -83,6 +84,7 @@ def main() -> int:
         snapshot, source = kis.get_balance_cached(force=True, return_source=True)
         result = compare_pb1_db_to_kis(
             positions=db_rows, broker_snapshot=snapshot, source=source,
+            require_economics=True,
         )
         result["unresolved_sell_orders"] = unresolved
         # A match in holdings does not prove old SELLs' individual fills.
