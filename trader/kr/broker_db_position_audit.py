@@ -6,6 +6,7 @@ broker ACK equals a fill. Broker-only symbols may belong to other sleeves.
 from __future__ import annotations
 
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 
@@ -20,11 +21,20 @@ def _nonnegative_int(value: Any) -> int | None:
         return None
 
 
+def _amount(value: Any) -> Decimal | None:
+    try:
+        result = Decimal(str(value).replace(",", ""))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    return result if result.is_finite() and result >= 0 else None
+
+
 def compare_pb1_db_to_kis(
     *,
     positions: list[dict[str, Any]],
     broker_snapshot: dict[str, Any] | None,
     source: str,
+    require_economics: bool = False,
 ) -> dict[str, Any]:
     """Pure snapshot comparison. Only the caller can prove source/epoch/freshness."""
     if (
@@ -37,6 +47,7 @@ def compare_pb1_db_to_kis(
                 "verified_match": False}
 
     broker_qty: dict[str, int] = {}
+    broker_cost: dict[str, Decimal | None] = {}
     for row in broker_snapshot["output1"]:
         if not isinstance(row, dict):
             return {"status": "UNVERIFIED_BROKER_SNAPSHOT", "mismatches": [],
@@ -47,6 +58,7 @@ def compare_pb1_db_to_kis(
             return {"status": "UNVERIFIED_BROKER_SNAPSHOT", "mismatches": [],
                     "verified_match": False}
         broker_qty[code] = qty
+        broker_cost[code] = _amount(row.get("pchs_amt"))
 
     by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in positions:
@@ -69,6 +81,16 @@ def compare_pb1_db_to_kis(
         if db_qty is None or db_qty != actual_qty:
             mismatches.append({"code": code, "reason": "DB_KIS_QTY_MISMATCH",
                                "db_qty": db_qty, "kis_qty": actual_qty})
+            continue
+        if require_economics and db_qty > 0:
+            amount = broker_cost.get(code)
+            db_amount = _amount(rows[0].get("total_cost"))
+            if amount is None or db_amount is None:
+                mismatches.append({"code": code, "reason": "COST_PROOF_UNAVAILABLE"})
+            elif abs(amount - db_amount) > Decimal("1.00"):
+                mismatches.append({"code": code, "reason": "DB_KIS_COST_MISMATCH",
+                                   "db_cost": str(db_amount),
+                                   "kis_cost": str(amount)})
     return {
         "status": "MISMATCH" if mismatches else "MATCH_FOR_PB1_OPEN_SYMBOLS",
         "verified_match": not mismatches,
