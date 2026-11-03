@@ -37,6 +37,9 @@ class InfiniteConfig:
     reserve_capital_usd: float = 2_500.0
     unit_usd: float = 250.0
     max_daily_buy_usd: float = 250.0
+    conflict_first_buy_enabled: bool = True
+    conflict_first_buy_confirm_days: int = 2
+    conflict_first_buy_max_usd: float = 125.0
     max_total_capital_usd: float = 10_000.0
     buy_premium_pct: float = 0.03
     take_profit_pct: float = 0.10
@@ -76,6 +79,9 @@ class InfiniteConfig:
             reserve_capital_usd=_float(prefix + "RESERVE_CAPITAL_USD", 2_500),
             unit_usd=_float(prefix + "UNIT_USD", 250),
             max_daily_buy_usd=_float(prefix + "MAX_DAILY_BUY_USD", 250),
+            conflict_first_buy_enabled=_bool(prefix + "CONFLICT_FIRST_BUY_ENABLED", True),
+            conflict_first_buy_confirm_days=_int(prefix + "CONFLICT_FIRST_BUY_CONFIRM_DAYS", 2),
+            conflict_first_buy_max_usd=_float(prefix + "CONFLICT_FIRST_BUY_MAX_USD", 125),
             max_total_capital_usd=_float(prefix + "MAX_TOTAL_CAPITAL_USD", 10_000),
             buy_premium_pct=_float(prefix + "BUY_PREMIUM_PCT", .03),
             take_profit_pct=_float(prefix + "TAKE_PROFIT_PCT", .10),
@@ -111,3 +117,7 @@ class InfiniteConfig:
             raise ValueError("core plus reserve exceeds hard cap")
         if self.total_capital_usd > self.max_total_capital_usd:
             raise ValueError("total capital exceeds hard cap")
+        if not 2 <= self.conflict_first_buy_confirm_days <= 5:
+            raise ValueError("conflict first buy requires 2-5 separate US trading sessions")
+        if (not 0 < self.conflict_first_buy_max_usd <= 125.0):
+            raise ValueError("conflict first buy max must stay within the $125 hard ceiling")
