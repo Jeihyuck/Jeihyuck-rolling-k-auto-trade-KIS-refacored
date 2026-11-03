@@ -56,7 +56,8 @@ class ReadOnlyKIS:
         }
 
 
-def _reader(*, kis=None, active=None, debts=None, clock=None, **kwargs):
+def _reader(*, kis=None, active=None, debts=None, debt_dates=None,
+            clock=None, **kwargs):
     provider = kis or ReadOnlyKIS()
     rows = active if active is not None else [CLAIM]
     debt_rows = debts if debts is not None else []
@@ -65,7 +66,7 @@ def _reader(*, kis=None, active=None, debts=None, clock=None, **kwargs):
         provider_factory=lambda: provider,
         load_claims=lambda: list(rows),
         load_debts=lambda **kw: list(debt_rows),
-        load_debt_dates=lambda _debts, **kw: set(),
+        load_debt_dates=lambda _debts, **kw: set(debt_dates or ()),
         load_scope=lambda: dict(SCOPE),
         clock=clock or time.monotonic,
         poll_sec=1.0, ttl_sec=15.0,
@@ -197,13 +198,29 @@ def test_only_deferred_debts_fetch_prefetched_balance_off_writer():
         "account_id": "practice:stub", "trading_epoch_id": "epoch-test",
         "symbol": "TMO", "lifecycle_id": "life",
     }
-    reader = _reader(kis=kis, active=[], debts=[debt])
-    reader._poll_once(kis)
+    reader = _reader(kis=kis, active=[], debts=[debt],
+                     debt_dates={SOURCE_DATE})
+    reader._poll_once(kis)  # original-day book GET
+    reader._poll_once(kis)  # independent balance GET
     snapshot = reader.snapshot_for_claims([])
     proxy = reader.provider_for(snapshot)
-    assert kis.calls == [("GET_BALANCE", True)]
+    assert kis.calls == [("GET_ORDER_BOOK", SOURCE_DATE), ("GET_BALANCE", True)]
     assert proxy.get_balance(force_refresh=True)["positions"] == []
-    assert kis.calls == [("GET_BALANCE", True)]
+    assert kis.calls == [("GET_ORDER_BOOK", SOURCE_DATE), ("GET_BALANCE", True)]
+
+
+def test_stop_debt_without_matching_original_tp_skips_3_exchange_balance():
+    debt = {
+        "account_id": "practice:stub", "trading_epoch_id": "epoch-test",
+        "symbol": "ELV", "lifecycle_id": "life",
+    }
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, active=[], debts=[debt], debt_dates=set())
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([])
+    assert kis.calls == []
+    with pytest.raises(RuntimeError, match="BALANCE_NOT_PREFETCHED"):
+        reader.provider_for(snapshot).get_balance(force_refresh=True)
 
 
 def test_prefetch_active_claims_identity_must_be_complete():
