@@ -54,6 +54,11 @@ def certify_legacy_pb1_missing_cycle(
 ) -> dict:
     def blocked(reason):
         return {"state": "BLOCKED", "reason": reason, "updated_orders": 0}
+    # KR Infinite owns 122630. The historical PB1 row is a passive mirror,
+    # not an independently tradable PB1 cycle; attaching its orders to PB1
+    # would double-book the Infinite TP1/TP2 realized P&L.
+    if code == "122630":
+        return blocked("KR_INFINITE_OWNER_RESERVED_USE_DEDICATED_REPAIR")
     if (
         len(code) != 6 or not code.isdigit()
         or balance_source != "api"
