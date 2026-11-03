@@ -97,7 +97,7 @@ def test_broker_economics_must_be_proven_for_91_share_position():
 
 
 def test_old_pb1_claim_backlog_is_not_silently_marked_settled():
-    """Nov 3: 5 historical claims still need exact original broker proof."""
+    """All-epoch inventory: five old claims; operational query must filter active epoch."""
     cases = [
         ("293490", "UNCERTAIN", 174, 0, 174),
         ("012750", "PARTIALLY_SATISFIED", 11, 2, 9),
