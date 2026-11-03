@@ -173,6 +173,13 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
     cross_date_rc=$?
     set -e
     echo "[KR_CROSS_DAY_SELL][POST_CLOSE_DONE] rc=$cross_date_rc"
+    if [[ "$cross_date_rc" -ne 0 && "$rc" -eq 0 ]]; then
+      # Trading child finished; independent historical settlement did not.
+      # Keep scheduler exit code while reporting reconciler debt explicitly.
+      export NULLIM_SESSION_FINAL_STATUS=OK_WITH_WARNINGS
+      export NULLIM_SESSION_FINAL_REASON=HISTORICAL_SELL_RECONCILIATION_PENDING
+      echo "[KR_CLOSE][SETTLEMENT_REPORT][DEGRADED] postclose_rc=$cross_date_rc action=PRESERVE_TRADE_RC_NO_SELL_RETRY"
+    fi
   fi
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
