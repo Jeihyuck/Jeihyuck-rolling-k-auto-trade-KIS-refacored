@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 import json
+import hashlib
 
 import sqlalchemy as sa
 
@@ -196,7 +197,7 @@ def validate_frozen_tp2_proof(
     mirror_cost = _num(pos.get("total_cost"))
     if buy_cost is None or mirror_cost is None or abs(mirror_cost - buy_cost) > Decimal(quantities[0]):
         return block("LEGACY_MIRROR_COST_NOT_RECONCILABLE")
-    if abs(_num(pos.get("avg_buy_price")) or Decimal(-1) - (buy_cost / quantities[0])) > Decimal("1"):
+    if (\n        _num(pos.get("avg_buy_price")) is None\n        or abs(_num(pos.get("avg_buy_price")) - buy_cost / quantities[0]) > Decimal("1")\n    ):
         return block("LEGACY_MIRROR_AVG_NOT_PROVEN")
     if len({(str(x.get("broker_order_id")), _iso_day(x.get("trade_date"))) for x in intents}) != 3:
         return block("INFINITE_ORIGINAL_ORDER_IDS_COLLIDE")
@@ -284,7 +285,7 @@ def certify_frozen_infinite_cycle(*, engine, broker_balance, balance_source,
         claim_rows = conn.execute(
             sa.select(schema.execution_claims).where(sa.and_(
                 schema.execution_claims.c.env == "practice",
-                schema.execution_claims.c.account_id == get_account_key(env="practice"),
+                schema.execution_claims.c.account_id == hashlib.sha256(\n                    get_account_key(env="practice").encode("utf-8")\n                ).hexdigest(),
                 schema.execution_claims.c.trading_epoch_id == epoch,
                 schema.execution_claims.c.market == "KR",
                 schema.execution_claims.c.strategy_owner == OWNER,
