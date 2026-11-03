@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
+import math
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,66 @@ def apply_tqqq_runtime_entry_override(overlay: dict | None) -> tuple[bool, str]:
     overlay["tqqq_runtime_entry_override"] = True
     overlay["tqqq_runtime_entry_override_reason"] = block_reason
     return True, block_reason
+
+
+def previous_us_trading_day(day: date) -> date | None:
+    """Trading-session predecessor, not calendar-day predecessor (weekends/holidays)."""
+    from trader.us.market_calendar import is_us_trading_day
+
+    candidate = day - timedelta(days=1)
+    for _ in range(14):
+        try:
+            if is_us_trading_day(candidate):
+                return candidate
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        candidate -= timedelta(days=1)
+    return None
+
+
+def is_conflict_first_buy_signal(overlay: dict | None) -> bool:
+    """Fail-closed TQQQ-only bootstrap evidence, NEVER a global risk override.
+
+    A strong short-term state may conflict with a DEFENSIVE structural regime.
+    This is only a *candidate* for a tiny new-cycle first buy. Existing broker,
+    reconciliation, opening-window, exposure and crash gates still apply.
+    """
+    o = overlay if isinstance(overlay, dict) else {}
+    if (str(o.get("market_state") or "").upper() != "STRONG_RISK_ON"
+            or str(o.get("market_regime") or "").upper() != "DEFENSIVE"):
+        return False
+    if not all(o.get(key) is True for key in
+               ("entry_can_proceed", "exit_can_proceed", "allow_new_buy")):
+        return False
+    if any(o.get(key) is True for key in
+           ("force_entry_block", "hard_system_failure", "reconcile_entry_block",
+            "tqqq_capital_preservation")):
+        return False
+    if str(o.get("tqqq_context_quality") or "").lower() != "ok":
+        return False
+    if any(bool(o.get(key)) for key in
+           ("qqq_stale", "qqq_suspect", "qqq_degraded",
+            "tqqq_context_stale", "tqqq_context_suspect", "tqqq_context_degraded",
+            "tqqq_quote_stale", "tqqq_quote_suspect", "tqqq_quote_degraded")):
+        return False
+    try:
+        numbers = {key: float(o[key]) for key in (
+            "qqq_completed_close", "qqq_ma50", "qqq_ma200", "qqq_ma200_slope",
+            "qqq_20d_return", "qqq_drawdown_252", "qqq_realized_vol_20d",
+            "qqq_trend_efficiency_20d")}
+        if not all(math.isfinite(value) for value in numbers.values()):
+            return False
+        if not all(numbers[key] > 0 for key in
+                   ("qqq_completed_close", "qqq_ma50", "qqq_ma200")):
+            return False
+        if numbers["qqq_realized_vol_20d"] < 0:
+            return False
+        # Same BULL structural test used by classify_long_trend().
+        return (numbers["qqq_completed_close"] > numbers["qqq_ma200"]
+                and numbers["qqq_ma50"] > numbers["qqq_ma200"]
+                and numbers["qqq_ma200_slope"] > 0)
+    except (KeyError, ValueError, TypeError):
+        return False
 
 
 def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]:
