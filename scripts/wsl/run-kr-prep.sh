@@ -152,5 +152,11 @@ fi
     echo "[KR_PREP][TIMEOUT][ARTIFACT_STATE] runtime_contract=${RUNTIME_CONTRACT_EXISTS} latest_contract=${LATEST_CONTRACT_EXISTS} prep_done=${PREP_DONE_EXISTS} db_final30_hint=${LAST_STAGE_ROWS}"
   fi
   echo "[KR_PREP][EXIT] ts=$(date -Is) exit_code=$rc"
-  exit $rc
+  # Observed 11/03 PREP exit_code=0 but session-manifest stayed RUNNING.
+  # Do not depend on an inherited EXIT trap surviving the full PREP wrapper.
+  # The shared finalizer is idempotent; retain the trading child exit code.
+  set +e
+  nullim_finish_session_log "$rc"
+  set -e
+  exit "$rc"
 } >> "$LOG_FILE" 2>&1
