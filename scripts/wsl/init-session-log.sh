@@ -52,6 +52,9 @@ PY
 
 nullim_finish_session_log() {
   local rc="${1:-0}" status reason lock
+  # A completed explicit PREP finalization and the inherited EXIT trap may
+  # both arrive here. A manifest write is idempotent, logs should be too.
+  [[ "${NULLIM_SESSION_FINISHED:-0}" == "1" ]] && return "$rc"
   if declare -F nullim_session_lock_release >/dev/null; then nullim_session_lock_release || true; fi
   [[ -n "${NULLIM_SESSION_MANIFEST:-}" && -f "$NULLIM_SESSION_MANIFEST" ]] || return "$rc"
   status="${NULLIM_SESSION_FINAL_STATUS:-}"; reason="${NULLIM_SESSION_FINAL_REASON:-}"
@@ -71,6 +74,7 @@ fd,tmp=tempfile.mkstemp(prefix=path.name+".",dir=path.parent); os.close(fd)
 Path(tmp).write_text(json.dumps(data,ensure_ascii=False,indent=2)+"\n"); os.replace(tmp,path)
 PY
   flock -u "$NULLIM_MANIFEST_FD"; eval "exec ${NULLIM_MANIFEST_FD}>&-"
+  NULLIM_SESSION_FINISHED=1
   printf '[NULLIM_RUN][END] run_id=%s status=%s reason=%s exit_code=%s ended_at=%s\n' "$NULLIM_RUN_ID" "$status" "$reason" "$rc" "$(date -Is)"
   return "$rc"
 }
