@@ -5,7 +5,7 @@ from datetime import date
 
 from .config import InfiniteConfig
 from .models import Action, Decision, InfiniteState, PositionSnapshot, Status
-from .risk_adapter import assess_market_risk
+from .risk_adapter import assess_market_risk, is_conflict_first_buy_signal, previous_us_trading_day
 
 
 US_TQQQ_ADAPTIVE_TP_MAP: dict[str, tuple[float, float, str] | None] = {
@@ -80,6 +80,46 @@ def adaptive_tp_stage(*, market_state: str, cycle_age: int, units_used: int) -> 
     if policy is None:
         raise KeyError(f"TQQQ_INF_UNMAPPED_REGIME:{state}")
     return policy
+
+
+def _confirmed_conflict_first_buy(
+    *, config: InfiniteConfig, state: InfiniteState, position: PositionSnapshot,
+    trading_date: date, overlay: dict, effective_regime_name: str,
+) -> bool:
+    """Exact, short-lived exception for starting a previously empty TQQQ sleeve."""
+    if (not config.conflict_first_buy_enabled or position.qty != 0
+            or state.total_filled_notional != 0 or effective_regime_name != "DEFENSIVE"):
+        return False
+    if state.cycle_id is None:
+        if state.status != Status.READY:
+            return False
+    elif not (
+        state.status in {Status.READY, Status.ACTIVE}
+        and state.cycle_start_date == trading_date
+        and state.last_buy_date is None
+        and state.metadata.get("conflict_first_buy_reserved_cycle") is True
+    ):
+        # A reserved but unfilled attempt may retry only within this same
+        # US session. Older/filled/foreign cycles never gain this exception.
+        return False
+    from trader.us.market_calendar import is_us_trading_day
+    if not is_us_trading_day(trading_date) or not is_conflict_first_buy_signal(overlay):
+        return False
+    if classify_long_trend(overlay, bool(state.metadata.get("structural_bear_seen"))) != "BULL":
+        return False
+    raw_dates = state.metadata.get("conflict_first_buy_confirmed_dates")
+    if not isinstance(raw_dates, list) or len(raw_dates) < config.conflict_first_buy_confirm_days:
+        return False
+    try:
+        dates = [date.fromisoformat(str(s)) for s in raw_dates]
+    except (ValueError, TypeError):
+        return False
+    if dates[-1] != trading_date:
+        return False
+    for prev, current in zip(dates[:-1], dates[1:]):
+        if previous_us_trading_day(current) != prev:
+            return False
+    return True
 
 
 def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: PositionSnapshot,
@@ -258,6 +298,10 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     # but the held defensive/risk-off fast-dip exception is evaluated first.
     if not entry_allowed:
         return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
+    conflict_first_buy = _confirmed_conflict_first_buy(
+        config=config, state=state, position=position, trading_date=trading_date,
+        overlay=overlay, effective_regime_name=effective_regime_name,
+    )
 
     infinite_overlay_bypass = config.symbol == "TQQQ"
     # PB1 intraday labels are deliberately not used as strategy conditions here.
@@ -287,7 +331,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             valid_context = False
     if not valid_context:
         return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
-    if position.qty <= 0 and effective_regime_name in {
+    if position.qty <= 0 and not conflict_first_buy and effective_regime_name in {
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
@@ -367,7 +411,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                    and position.average_price > 0 and position.price <= position.average_price)
         if not allowed:
             return Decision(Action.BLOCK, "chop_high_vol_wait")
-    elif policy_regime in {"RISK_OFF", "DEFENSIVE"}:
+    elif policy_regime in {"RISK_OFF", "DEFENSIVE"} and not conflict_first_buy:
         allowed = (position.qty > 0 and long_trend == "BEAR" and days_since >= config.bear_fallback_gap
                    and last_price and position.price <= last_price * (1 - config.bear_step)
                    and position.average_price > 0 and position.price <= position.average_price)
@@ -409,11 +453,29 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     # Structural TQQQ regime sizing always wins for routine/non-fast-dip adds.
     effective_buy_multiplier = buy_multiplier
     budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
+    if conflict_first_buy:
+        # This exception can never exceed $125, even under an incorrect ENV value.
+        budget = min(budget, config.conflict_first_buy_max_usd, 125.0)
     qty = math.floor(budget / position.price)
     notional = qty * position.price
     if qty < 1:
         return Decision(Action.BLOCK, "unit_cannot_buy_whole_share")
     if state.total_filled_notional + notional > config.max_total_capital_usd + 1e-6:
         return Decision(Action.BLOCK, "hard_cap_exceeded")
+    if conflict_first_buy:
+        return Decision(
+            Action.BUY, "CONFLICT_STRONG_RISK_ON_FIRST_BUY", qty=qty,
+            notional=notional, next_status=Status.ACTIVE,
+            metadata={
+                "conflict_first_buy_confirmed_dates": list(
+                    state.metadata.get("conflict_first_buy_confirmed_dates") or []
+                ),
+                "conflict_first_buy_source_state": str(overlay.get("market_state")),
+                "conflict_first_buy_structural_regime": effective_regime_name,
+                "conflict_first_buy_long_trend": "BULL",
+                "conflict_first_buy_max_usd": min(config.conflict_first_buy_max_usd, 125.0),
+                "conflict_first_buy_actual_notional": notional,
+            },
+        )
     return Decision(Action.BUY, "first_buy" if position.qty == 0 else "average_buy", qty=qty,
                     notional=notional, next_status=Status.ACTIVE if core_left > 0 else Status.RESERVE)
