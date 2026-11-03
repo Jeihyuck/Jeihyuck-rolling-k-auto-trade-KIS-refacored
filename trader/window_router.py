@@ -8,8 +8,9 @@ from typing import Optional
 KST = timezone(timedelta(hours=9))
 
 MORNING_WINDOW_START = time.fromisoformat(os.getenv("MORNING_WINDOW_START", "09:00"))
-MORNING_WINDOW_END = time.fromisoformat(os.getenv("PB1_MORNING_WINDOW_END", "10:30"))
-DAY_WINDOW_START = MORNING_WINDOW_END
+MORNING_WINDOW_END = time.fromisoformat(os.getenv("PB1_MORNING_WINDOW_END", "12:55"))
+# AM and afternoon are separately scheduled KR sessions; 12:55-13:00 is a no-entry handoff.
+DAY_WINDOW_START = time.fromisoformat(os.getenv("PB1_AFTERNOON_WINDOW_START", "13:00"))
 DAY_WINDOW_END = time.fromisoformat(os.getenv("PB1_ENTRY_WINDOW_END", "15:15"))
 CLOSE_WINDOW_START = DAY_WINDOW_END
 CLOSE_WINDOW_END = time.fromisoformat(os.getenv("PB1_EXIT_WINDOW_END", "15:30"))
