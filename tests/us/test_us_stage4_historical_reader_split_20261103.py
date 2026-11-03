@@ -208,3 +208,91 @@ def test_only_deferred_debts_fetch_prefetched_balance_off_writer():
 def test_prefetch_active_claims_identity_must_be_complete():
     with pytest.raises(RuntimeError, match="IDENTITY_MISSING"):
         active_claim_signature([{"trade_date": "2026-10-30"}])
+
+
+def test_writer_uses_prefetched_historical_book_but_critical_fills_remain_kis(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.execution import fills as fill_source
+    from trader.us.db import repos
+    from trader.us.execution import order_journal, reconcile
+    from trader.us.execution import reservation_reconcile_worker as reservation
+    from trader.us.runner import trade_tick_runner as ticks
+
+    main_kis = object()
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis)
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([CLAIM])
+    historical_provider = reader.provider_for(snapshot)
+    observed = []
+
+    def fetch_critical(**kwargs):
+        assert kwargs["provider"] is main_kis
+        observed.append("CURRENT_KIS_FILL")
+        return {"status": "OK", "fills": []}
+
+    def replay(*args, **kwargs):
+        assert kwargs["provider"] is historical_provider
+        # The writer may read the frozen GET-only original source day; it
+        # cannot make additional original KIS network requests.
+        assert kwargs["provider"].get_today_orders(SOURCE_DATE)[0]["status"] == "OPEN"
+        observed.append("ORIGINAL_DATE_REPLAY")
+        return {"status": "UNRESOLVED", "unresolved_count": 1}
+
+    def ack(**kwargs):
+        assert kwargs["provider"] is main_kis
+        observed.append("CURRENT_ACK")
+        return {"status": "OK", "unresolved_count": 0, "pending_count": 0}
+
+    monkeypatch.setattr(worker, "_STAGE4_FILL_MEMOS", {})
+    monkeypatch.setattr(fill_source, "get_fills_today", fetch_critical)
+    monkeypatch.setattr(repos, "save_fills_with_result",
+                        lambda *a, **k: {"status": "OK"})
+    monkeypatch.setattr(order_journal, "replay_order_journal", replay)
+    monkeypatch.setattr(reconcile, "reconcile_ack_orders_with_balance", ack)
+    monkeypatch.setattr(reservation, "reconcile_proven_reservations_once",
+                        lambda **k: {"unresolved": 0})
+    monkeypatch.setattr(ticks, "_mark_trend_stages_from_records",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(ticks, "_mark_soft_stop_stages_from_records",
+                        lambda *a, **k: None)
+    result = worker.run_reconcile_once(
+        provider=main_kis, trade_date="2026-11-02",
+        session_run_id="offline-split", writer_generation="g",
+        conn=None, scope={}, historical_provider=historical_provider,
+    )
+    assert result["reconcile_status"] == "OK"
+    assert result["replay_status"] == "UNRESOLVED"
+    assert result["unresolved_count"] == 1
+    assert observed == ["CURRENT_KIS_FILL", "ORIGINAL_DATE_REPLAY", "CURRENT_ACK"]
+    assert kis.calls == [("GET_ORDER_BOOK", SOURCE_DATE)]
+
+
+def test_writer_snapshot_get_rechecks_expiration_at_exact_use_boundary():
+    now = [50.0]
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, clock=lambda: now[0])
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([CLAIM])
+    historical_provider = reader.provider_for(snapshot)
+    now[0] = 66.0
+    with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
+        historical_provider.get_today_orders(SOURCE_DATE)
+    with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
+        historical_provider.get_fills_by_order_no(
+            order_no="0000036019", symbol="TMO", trade_date=SOURCE_DATE,
+        )
+
+
+def test_source_day_limit_fails_closed_without_truncating_old_claims():
+    claims = [
+        {"trade_date": f"2026-10-{day:02d}",
+         "client_order_key": f"key-{day}",
+         "active_attempt_id": f"attempt-{day}"}
+        for day in range(20, 25)
+    ]
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, active=claims)
+    with pytest.raises(RuntimeError, match="SOURCE_DATES_OVER_BUDGET"):
+        reader._poll_once(kis)
+    assert kis.calls == []
