@@ -98,3 +98,70 @@ def test_reconcile_cycle_still_reads_kis_and_replays_ack_on_memo_hit(monkeypatch
     assert events.count("PERSIST") == 1
     assert events.count("REPLAY") == 2
     assert events.count("ACK") == 2
+
+
+def test_stage4_mutating_persistence_retains_original_broker_digest(monkeypatch):
+    """Actual save_fills enriches inputs; it must not cause a write every tick."""
+    import trader.us.execution.authoritative_reconcile_worker as worker
+    import trader.us.execution.fills as fills_mod
+    import trader.us.db.repos as repos
+    import trader.us.execution.order_journal as journal
+    import trader.us.execution.reconcile as reconcile
+    import trader.us.execution.reservation_reconcile_worker as reservations
+    import trader.us.runner.trade_tick_runner as ticks
+
+    now = [0.0]
+    qty = [8]
+    events = []
+    monkeypatch.setattr(worker, "_STAGE4_FILL_MEMOS", {
+        "2026-11-02": VerifiedFillPersistenceMemo(
+            clock=lambda: now[0], refresh_sec=120,
+        )
+    })
+
+    def get_fills(**_):
+        events.append("KIS")
+        return {"status": "OK", "fills": [_fill(qty=qty[0])]}
+    def mutable_save(rows, **_):
+        events.append("DB_SAVE")
+        rows[0]["client_order_key"] = "US_STANDARD_LOCAL_ORDER_KEY"
+        rows[0]["meta"]["strategy_owner"] = "US_STANDARD"
+        rows[0]["meta"]["attribution_status"] = "MATCHED"
+        rows[0]["save_status"] = "OK"
+        return {"status": "OK"}
+
+    monkeypatch.setattr(fills_mod, "get_fills_today", get_fills)
+    monkeypatch.setattr(repos, "save_fills_with_result", mutable_save)
+    monkeypatch.setattr(journal, "replay_order_journal",
+                        lambda *a, **k: {"status": "OK", "unresolved_count": 0})
+    monkeypatch.setattr(reconcile, "reconcile_ack_orders_with_balance",
+                        lambda **k: {"status": "OK", "unresolved_count": 0})
+    monkeypatch.setattr(reservations, "reconcile_proven_reservations_once",
+                        lambda **k: {"unresolved": 0})
+    monkeypatch.setattr(ticks, "_mark_trend_stages_from_records", lambda *a, **k: None)
+    monkeypatch.setattr(ticks, "_mark_soft_stop_stages_from_records", lambda *a, **k: None)
+    args = dict(provider=object(), trade_date="2026-11-02", session_run_id="test",
+                writer_generation="test", conn=None, scope={})
+
+    worker.run_reconcile_once(**args)
+    now[0] = 10.0
+    worker.run_reconcile_once(**args)
+    assert events == ["KIS", "DB_SAVE", "KIS"]
+    qty[0] = 9
+    now[0] = 20.0
+    worker.run_reconcile_once(**args)
+    assert events.count("DB_SAVE") == 2  # changed broker quantity is never skipped
+    now[0] = 141.0
+    worker.run_reconcile_once(**args)
+    assert events.count("DB_SAVE") == 3  # TTL refresh is retained
+
+
+def test_stage4_failed_mutating_save_does_not_memoize():
+    memo = VerifiedFillPersistenceMemo(clock=lambda: 3.0)
+    original = [_fill()]
+    original_digest = fills_digest(original)
+    original[0]["client_order_key"] = "MUTATED"
+    memo.mark_persisted_digest(original_digest, status="DB_ERROR")
+    assert memo.should_persist([_fill()])
+    memo.mark_persisted_digest(original_digest, status="OK")
+    assert not memo.should_persist([_fill()])
