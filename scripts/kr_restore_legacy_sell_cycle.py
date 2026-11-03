@@ -2,9 +2,9 @@
 
 Read-only evidence check:
   FORCE_HTTP=1 NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_restore_legacy_sell_cycle \
-    --code 122630 --buy-day 20261026 --sell-day 20261027
+    --code <PB1-owned-symbol> --buy-day YYYYMMDD --sell-day YYYYMMDD
 
-Only after reviewing the READY_TO_BIND evidence, repeat with --apply.
+The reserved Infinite symbol 122630 is NOT a PB1-owned trade and must use\nscripts.kr_infinite_certify_frozen_exit instead. After reviewing\nREADY_TO_BIND evidence for a PB1-owned symbol, repeat with --apply.
 This may update THREE missing order cycle links. It NEVER marks orders
 FILLED, writes fills, changes positions/P&L, or submits broker orders.
 """
@@ -32,6 +32,12 @@ def main(argv=None):
         or len(args.code) != 6 or not args.code.isdigit()
     ):
         print(json.dumps({"state":"BLOCKED","reason":"PRACTICE_NO_TRADE_FORCE_GET_REQUIRED"}))
+        return 3
+    if args.code == "122630":
+        print(json.dumps({
+            "state": "BLOCKED",
+            "reason": "KR_INFINITE_OWNER_RESERVED_USE_DEDICATED_REPAIR",
+        }))
         return 3
     try:
         dates = {
