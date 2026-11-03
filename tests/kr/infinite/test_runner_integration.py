@@ -575,3 +575,55 @@ def test_tail_budget_defer_skips_infinite_db_and_broker_work(monkeypatch, armed_
 
     assert result.decision.action == Action.WAIT
     assert result.decision.reason == "KR_INF_TICK_BUDGET_DEFERRED"
+
+
+def test_certified_prior_tp2_complete_reopens_next_day_without_changing_policy(armed_practice_env):
+    """A rigorously certified COMPLETE cycle re-enters via the existing KIS BUY."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    prior_exit = date(2026, 10, 27)
+    next_day = date(2026, 11, 4)
+    old = replace(
+        active(), status=Status.COMPLETE, last_exit_date=prior_exit,
+        cycle_complete_date=prior_exit,
+        metadata={
+            "profit_stage": "TP2_FILLED", "pending_profit_stage": None,
+            "frozen_tp2_repair_proof": {
+                "source": "ORIGINAL_KIS_FULL_ORDER_CCLD_AND_EXECUTION_CLAIMS",
+                "result": "VERIFIED_FULL_TP2_EXIT",
+            },
+        },
+    )
+    kis, repo = FakeKIS(fill_qty=300), FakeRepository(old)
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=next_day, kis_env="practice",
+        now_kst_value=datetime(2026, 11, 4, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+    assert result.decision.action == Action.BUY
+    assert result.decision.reason == "NEW_CYCLE_BUY"
+    assert result.submitted
+    assert kis.orders == [("BUY", 300)]
+    assert repo.state.cycle_id != old.cycle_id
+    assert repo.state.status == Status.ACTIVE
+
+
+def test_certified_full_exit_does_not_restart_on_same_trade_day(armed_practice_env):
+    """Certificate never overrides the existing same-day-restart safety policy."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    day = date(2026, 10, 27)
+    old = replace(active(), status=Status.COMPLETE,
+                  last_exit_date=day, cycle_complete_date=day,
+                  metadata={"profit_stage": "TP2_FILLED"})
+    kis, repo = FakeKIS(), FakeRepository(old)
+    result = run_once(
+        config=config(), kis=kis, repository=repo,
+        regime_provider=REGIME, trade_date=day, kis_env="practice",
+        now_kst_value=datetime(2026, 10, 27, 10, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+    assert result.decision.action in (Action.BLOCK, Action.WAIT)
+    assert len(kis.orders) == 0
+    assert repo.state.cycle_id == old.cycle_id
