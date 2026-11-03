@@ -116,6 +116,8 @@ jobs:
       - name: KR AM 12:55 / PM 13:00 session-boundary regression (no broker I/O)
         run: |
           pytest tests/test_kr_am_pm_session_boundary_20261103.py -q
+          pytest tests/kr/test_kr_20261103_mico_neosem_integrity.py -q
+          pytest tests/kr/test_kr_cross_day_sell_auto_reconcile.py tests/test_reconcile_execution_claims.py -q
           pytest tests/test_pb1_session_end_policy.py tests/test_trade_session_policy.py tests/test_recovery_control_plane_contracts.py -q
 
       - name: Check KR legacy regime removal
