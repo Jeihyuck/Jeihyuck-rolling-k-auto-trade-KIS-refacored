@@ -219,3 +219,66 @@ def test_unowned_fill_from_closed_cycle_does_not_fence_new_open_cycle_same_symbo
         raw_json={"source": "daily_ccld"}, fill_meta_json={"fill_source": "daily_ccld"},
     )
     assert _pending_fill_application_codes(engine=engine, env="practice", strategy=STRATEGY) == set()
+
+
+def test_nov03_mico_phantom_22_never_overwritten_by_kis_balance() -> None:
+    """A broker-confirmed 91 must not quietly repair an unproven 113 DB row."""
+    engine = _db()
+    schema = schema_for_engine(engine)
+    epoch_id, cycle_id, position_id, order_id = (str(uuid4()) for _ in range(4))
+    ts = now_kst()
+    with engine.begin() as conn:
+        _epoch(conn, schema, epoch_id, "practice:mico-nov03")
+        conn.execute(sa.insert(schema.positions).values(
+            position_id=position_id, position_cycle_id=cycle_id,
+            portfolio_epoch_id=epoch_id, opened_at=ts, position_origin="SYSTEM",
+            env="practice", strategy=STRATEGY, sid=1, mode=1,
+            code="059090", market="KOSDAQ", qty=113,
+            avg_buy_price=1982400 / 113, total_cost=1982400,
+            realized_pnl=0, status="OPEN", entry_meta_json={},
+            entry_exit_plan_json={}, position_meta={},
+        ))
+        conn.execute(sa.insert(schema.orders).values(
+            order_id=order_id, position_cycle_id=cycle_id,
+            portfolio_epoch_id=epoch_id, env="practice", strategy=STRATEGY,
+            sid=1, mode=1, code="059090", market="KOSDAQ", side="BUY",
+            ord_type="LIMIT", qty=91, stage="PB1-AM",
+            client_order_key="mico-20261103-phantom-22", status="FILLED",
+            kis_odno="0000011762", broker_order_id="0000011762",
+            request_json={"pre_order_holding_qty": 0},
+            response_json={"rt_cd": "0", "confirmed_fill_qty": 91},
+            created_at=ts, submitted_at=ts, acked_at=ts,
+        ))
+        conn.execute(sa.insert(schema.fills).values(
+            fill_id=str(uuid4()), env="practice", order_id=order_id,
+            kis_odno="0000011762", trade_id="KIS_ORDER_CUMULATIVE:MICO91",
+            broker_fill_id="KIS_ORDER_CUMULATIVE:MICO91",
+            code="059090", market="KOSDAQ", side="BUY", qty=91,
+            price=1982400 / 91, fee=0.0, tax=0.0, filled_at=ts,
+            position_cycle_id=cycle_id, portfolio_epoch_id=epoch_id,
+            raw_json={"kis_response": {"tot_ccld_qty": "91",
+                                       "tot_ccld_amt": "1982400"}},
+            fill_meta_json={"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+        ))
+
+    assert _pending_fill_application_codes(
+        engine=engine, env="practice", strategy=STRATEGY,
+    ) == {"059090"}
+    _close_stale_positions_guarded_with_fill_fence(
+        engine=engine, env="practice", strategy=STRATEGY,
+        reason="exit_phase", ts=ts,
+        kis_balance={"output1": [{
+            "pdno": "059090", "hldg_qty": "91",
+            "ord_psbl_qty": "91", "pchs_avg_pric": str(1982400/91),
+        }]},
+        runtime_dir=None,
+    )
+    with engine.connect() as conn:
+        position = dict(conn.execute(
+            sa.select(schema.positions).where(
+                schema.positions.c.position_id == position_id
+            )
+        ).mappings().one())
+    assert int(position["qty"]) == 113
+    assert abs(float(position["total_cost"]) - 1982400) < 0.1
+    engine.dispose()

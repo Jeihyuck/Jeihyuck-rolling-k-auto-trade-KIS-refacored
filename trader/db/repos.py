@@ -7318,6 +7318,7 @@ class PositionsRepo:
         order_id: str,
         pre_order_holding_qty: int | None = None,
         broker_holding_qty: int | None = None,
+        native_original_order_price_proof: bool = False,
         _conn: Any = None,
     ) -> dict[str, Any]:
         """Converge SELL quantity independently from execution-price/PnL truth.
@@ -7343,7 +7344,9 @@ class PositionsRepo:
                     fill_price=fill_price, filled_at=filled_at,
                     position_cycle_id=position_cycle_id, portfolio_epoch_id=portfolio_epoch_id,
                     order_id=order_id, pre_order_holding_qty=pre_order_holding_qty,
-                    broker_holding_qty=broker_holding_qty, _conn=conn,
+                    broker_holding_qty=broker_holding_qty,
+                    native_original_order_price_proof=native_original_order_price_proof,
+                    _conn=conn,
                 )
         conn = _conn
         trading_epoch_id = active_trading_epoch_id(
@@ -7471,7 +7474,37 @@ class PositionsRepo:
                 raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_NEW_PROCEEDS")
             if pnl_accounted_qty == confirmed_qty and pnl_accounted_qty > 0:
                 if abs(new_proceeds - previously_accounted_notional) > 1e-5:
-                    raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
+                    # Old manually entered MTS averages were intentionally
+                    # PROVISIONAL, not authoritative original-day KIS fills.
+                    # Upgrade only a closed, same-order fully accounted
+                    # lifecycle with explicit ORIGINAL KIS order-price proof.
+                    # No quantity, other cycle, or regular confirmed price
+                    # conflict may pass this gate.
+                    provisional = (
+                        native_original_order_price_proof
+                        and str(row.get("status") or "").upper() == "CLOSED"
+                        and str(row.get("closed_reason") or "").upper()
+                        == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING"
+                        and new_qty == 0
+                        and state.get("manual_mts_price_provisional") is True
+                        and bool(state.get("manual_mts_source"))
+                        and qty_accounted == confirmed_qty
+                        and int(state.get("pnl_accounted_qty") or 0) == confirmed_qty
+                    )
+                    if not provisional:
+                        raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
+                    next_realized_pnl += new_proceeds - previously_accounted_notional
+                    state["manual_mts_price_provisional"] = False
+                    state["manual_mts_source_superseded_by"] = "KIS_ORIGINAL_ORDER_EXECUTION"
+                    state["manual_mts_original_notional"] = previously_accounted_notional
+                    previously_accounted_notional = new_proceeds
+                    logger.warning(
+                        "[KR_SELL_RECONCILE][PROVISIONAL_MTS_UPGRADED] "
+                        "code=%s order_id=%s prior_notional=%.5f "
+                        "kis_notional=%.5f pnl_delta=%.5f",
+                        code, order_key, state["manual_mts_original_notional"],
+                        new_proceeds, new_proceeds - state["manual_mts_original_notional"],
+                    )
             else:
                 pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
                 if new_proceeds + 1e-5 < previously_accounted_notional:
@@ -7549,6 +7582,14 @@ class PositionsRepo:
         elif str(row.get("status") or "").upper() == "CLOSED":
             if new_qty != 0:
                 raise RuntimeError("KR_SELL_RECONCILE_CLOSED_POSITION_REOPEN")
+            if (
+                native_original_order_price_proof
+                and str(row.get("closed_reason") or "").upper()
+                == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING"
+                and state.get("manual_mts_source_superseded_by")
+                == "KIS_ORIGINAL_ORDER_EXECUTION"
+            ):
+                values["closed_reason"] = "FULL_SELL"
             # Delayed price reconciliation must not rewrite the economic
             # close time or reopen a completed position.
             values.pop("last_trade_at", None)
@@ -7600,6 +7641,7 @@ class PositionsRepo:
         position_cycle_id: str | None = None,
         order_id: str | None = None,
         buy_application_cumulative_qty: int | None = None,
+        buy_application_previous_confirmed_qty: int | None = None,
         buy_cost_delta_override: float | None = None,
         _conn: Any = None,
     ) -> None:
@@ -7616,6 +7658,7 @@ class PositionsRepo:
                     entry_meta=entry_meta, account_id=account_id,
                     portfolio_epoch_id=portfolio_epoch_id, position_cycle_id=position_cycle_id,
                     order_id=order_id, buy_application_cumulative_qty=buy_application_cumulative_qty,
+                    buy_application_previous_confirmed_qty=buy_application_previous_confirmed_qty,
                     buy_cost_delta_override=buy_cost_delta_override, _conn=conn,
                 )
         conn = _conn
@@ -7788,10 +7831,34 @@ class PositionsRepo:
                 previous_qty = int(previous.get("qty") or 0)
                 if target < previous_qty or target - previous_qty != qty:
                     raise RuntimeError("KR_BUY_APPLICATION_CUMULATIVE_CONFLICT")
+                # The KIS order proves the pre-submit holding and already
+                # acknowledged cumulative shares. A duplicate/stale DB row
+                # (Nov 3 Mico: 22 phantom shares before 91 new BUY shares)
+                # must never be silently added to the new BUY notional.
                 pre_qty = request_json.get("pre_order_holding_qty")
-                if not previous and row and (
-                    pre_qty is None or current_qty != int(pre_qty)
-                ):
+                if pre_qty is None:
+                    raise RuntimeError("KR_BUY_APPLICATION_PRE_ORDER_HOLDING_MISSING")
+                try:
+                    pre_qty = int(pre_qty)
+                    prior_confirmed = (
+                        int(buy_application_previous_confirmed_qty)
+                        if buy_application_previous_confirmed_qty is not None
+                        else previous_qty
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("KR_BUY_APPLICATION_BASELINE_INVALID") from exc
+                if pre_qty < 0 or prior_confirmed < 0 or prior_confirmed > target:
+                    raise RuntimeError("KR_BUY_APPLICATION_BASELINE_INVALID")
+                if previous and buy_application_previous_confirmed_qty is not None and previous_qty != prior_confirmed:
+                    raise RuntimeError("KR_BUY_APPLICATION_WATERMARK_CONFLICT")
+                if target - prior_confirmed != qty or current_qty != pre_qty + prior_confirmed:
+                    logger.error(
+                        "[KR_BUY_APPLICATION][BASELINE_DRIFT] code=%s order_id=%s "
+                        "db_qty=%s pre_order_qty=%s prior_kis_confirmed=%s "
+                        "cumulative=%s delta=%s action=BLOCK_NO_POSITION_MUTATION",
+                        code, order_id, current_qty, pre_qty,
+                        prior_confirmed, target, qty,
+                    )
                     raise RuntimeError("KR_BUY_APPLICATION_BASELINE_DRIFT")
                 watermark_map[str(order_id)] = {
                     "qty": target,

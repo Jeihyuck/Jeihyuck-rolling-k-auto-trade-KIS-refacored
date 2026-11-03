@@ -3,7 +3,7 @@ from pathlib import Path
 
 def test_kr_am_loop_env_contract():
     s = Path('scripts/wsl/run-kr-am.sh').read_text()
-    for needle in ['PB1_LOOP_ENABLED="${PB1_LOOP_ENABLED:-1}"','PB1_RUN_LOOP="${PB1_RUN_LOOP:-1}"','PB1_RUN_LOOP_MINUTES="${PB1_RUN_LOOP_MINUTES:-235}"','PB1_AM_SESSION_END="${PB1_AM_SESSION_END:-12:55}"','KR_AM_SESSION_TIMEOUT_SEC="${KR_AM_SESSION_TIMEOUT_SEC:-15000}"','PB1 loop enabled']:
+    for needle in ['PB1_LOOP_ENABLED="${PB1_LOOP_ENABLED:-1}"','PB1_RUN_LOOP="${PB1_RUN_LOOP:-1}"','PB1_RUN_LOOP_MINUTES="${PB1_RUN_LOOP_MINUTES:-235}"','PB1_AM_SESSION_END="12:55"','KR_AM_SESSION_TIMEOUT_SEC="${KR_AM_SESSION_TIMEOUT_SEC:-15000}"','PB1 loop enabled']:
         assert needle in s
 
 
