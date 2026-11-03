@@ -21,7 +21,13 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 
-def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, str, str]]:
+def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, ...]]:
+    """Immutable fingerprint includes changing claim evidence as well as identity.
+
+    An execution action can partially fill while its attempt ID remains
+    unchanged. Checking just (source date, client key, attempt) would allow
+    READY to be published against a superseded cumulative quantity.
+    """
     if not isinstance(claims, list):
         raise RuntimeError("US_STAGE4_HISTORICAL_CLAIMS_UNVERIFIED")
     keys = set()
@@ -32,7 +38,14 @@ def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, str, str]
         if not (day and client_key and attempt_id):
             raise RuntimeError("US_STAGE4_HISTORICAL_CLAIM_IDENTITY_MISSING")
         date.fromisoformat(day)
-        keys.add((day, client_key, attempt_id))
+        keys.add((
+            day, client_key, attempt_id,
+            str(claim.get("strategy_owner") or "").upper(),
+            str(claim.get("trading_epoch_id") or ""),
+            str(claim.get("requested_qty") if claim.get("requested_qty") is not None else ""),
+            str(claim.get("cumulative_filled_qty") if claim.get("cumulative_filled_qty") is not None else ""),
+            str(claim.get("attempt_state") or "").upper(),
+        ))
     return frozenset(keys)
 
 
@@ -49,8 +62,15 @@ def _broker_book_facts(rows: list[dict]) -> tuple:
         "normalization_result", "filled_qty_present", "avg_price",
         "avg_price_usd", "trade_date",
     )
+    # 0 is a proven numerical value, while a missing value is UNKNOWN.
+    # Never treat them as equivalent merely because both are falsy.
     return tuple(sorted(
-        tuple(str(row.get(field) or "") for field in fields)
+        tuple(
+            "<ABSENT>" if field not in row
+            else "<NULL>" if row[field] is None
+            else str(row[field])
+            for field in fields
+        )
         for row in rows
     ))
 
@@ -83,14 +103,18 @@ def _debt_order_source_dates(debts: list[dict], *, scope: dict,
                 SELECT DISTINCT o.trade_date
                   FROM us_orders o
                   JOIN us_execution_claims c
-                    ON c.trading_epoch_id=o.trading_epoch_id
+                    ON c.action_key=o.meta->>'execution_action_key'
+                   AND c.trading_epoch_id=o.trading_epoch_id
                    AND c.env=o.env AND c.trade_date=o.trade_date
                    AND c.lifecycle_id=:life AND c.account_id=:account
+                   AND c.market='US'
                    AND c.strategy_owner='US_STANDARD'
                    AND c.action=upper(o.meta->>'profit_capture_stage')
                  WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                    AND o.symbol=:symbol AND o.side='SELL'
                    AND o.order_no IS NOT NULL
+                   AND o.meta->>'position_lifecycle_id'=:life
+                   AND upper(o.meta->>'strategy_owner')='US_STANDARD'
                  ORDER BY o.trade_date DESC
                  LIMIT :cap
             """), {
@@ -225,14 +249,21 @@ class HistoricalReadOnlyReader:
         debts = self.load_debts(env="practice")
         if not isinstance(debts, list):
             raise RuntimeError("US_STAGE4_HISTORICAL_DEBTS_UNVERIFIED")
-        source_dates = {k[0] for k in signatures}
-        source_dates.update(
-            self.load_debt_dates(debts, scope=self.scope, max_dates=self.max_dates)
+        debt_dates = self.load_debt_dates(
+            debts, scope=self.scope, max_dates=self.max_dates,
         )
+        if not isinstance(debt_dates, set):
+            raise RuntimeError("US_STAGE4_HISTORICAL_DEBT_DATES_UNVERIFIED")
+        source_dates = {k[0] for k in signatures}
+        source_dates.update(debt_dates)
         if len(source_dates) > self.max_dates:
             raise RuntimeError("US_STAGE4_HISTORICAL_SOURCE_DATES_OVER_BUDGET")
         tasks = [("book", day) for day in sorted(source_dates)]
-        if debts:
+        # Historical stop settlement requires an actual original TP order.
+        # Existing soft-stop-only debts are durable/fenced, but an unrelated
+        # three-exchange balance GET cannot prove those absent TP originals
+        # terminal. Skip that expensive read until the scoped DB proof exists.
+        if debts and debt_dates:
             tasks.append(("balance", None))
         if not tasks:
             with self._lock:
