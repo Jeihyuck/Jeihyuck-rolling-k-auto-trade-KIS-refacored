@@ -2386,6 +2386,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         order_id=str(source_order.get("order_id") or ""),
                         pre_order_holding_qty=_to_int(request_json.get("pre_order_holding_qty")),
                         broker_holding_qty=None,
+                        # An exact ORIGINAL-day cumulative KIS SELL amount is
+                        # the only authority permitted to supersede a historic
+                        # manually entered provisional MTS execution price.
+                        native_original_order_price_proof=(cumulative_sell_evidence is not None),
                     )
 
                 if atomic_observation is not None and atomic_release is not None:
@@ -2446,6 +2450,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             order_id=str(source_order.get("order_id") or ""),
                             pre_order_holding_qty=_to_int(request_json.get("pre_order_holding_qty")),
                             broker_holding_qty=None,
+                            native_original_order_price_proof=(cumulative_sell_evidence is not None),
                             _conn=conn,
                         )
 
