@@ -62,7 +62,8 @@ def certify_existing_pb1_buy_watermark(
         return block("FRESH_KIS_BALANCE_REQUIRED")
     if (original_day_ccld.get("rt_cd") != "0"
             or original_day_ccld.get("_diag_stub") is True
-            or original_day_ccld.get("_kis_disabled") is True):
+            or original_day_ccld.get("_kis_disabled") is True
+            or original_day_ccld.get("_sep29_complete") is not True):
         return block("ORIGINAL_DAY_KIS_CCLD_REQUIRED")
     if not isinstance(kis_balance.get("output1"), list) or not isinstance(original_day_ccld.get("output1"), list):
         return block("BROKER_ROWS_UNVERIFIED")
