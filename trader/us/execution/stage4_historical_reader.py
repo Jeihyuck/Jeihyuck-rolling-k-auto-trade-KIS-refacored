@@ -96,14 +96,18 @@ def _debt_order_source_dates(debts: list[dict], *, scope: dict,
                 SELECT DISTINCT o.trade_date
                   FROM us_orders o
                   JOIN us_execution_claims c
-                    ON c.trading_epoch_id=o.trading_epoch_id
+                    ON c.action_key=o.meta->>'execution_action_key'
+                   AND c.trading_epoch_id=o.trading_epoch_id
                    AND c.env=o.env AND c.trade_date=o.trade_date
                    AND c.lifecycle_id=:life AND c.account_id=:account
+                   AND c.market='US'
                    AND c.strategy_owner='US_STANDARD'
                    AND c.action=upper(o.meta->>'profit_capture_stage')
                  WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                    AND o.symbol=:symbol AND o.side='SELL'
                    AND o.order_no IS NOT NULL
+                   AND o.meta->>'position_lifecycle_id'=:life
+                   AND upper(o.meta->>'strategy_owner')='US_STANDARD'
                  ORDER BY o.trade_date DESC
                  LIMIT :cap
             """), {
