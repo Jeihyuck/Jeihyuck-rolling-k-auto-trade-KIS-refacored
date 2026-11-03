@@ -101,3 +101,50 @@ def compare_pb1_db_to_kis(
         # Broker-only symbols are deliberately not asserted to be PB1-owned.
         "broker_only_symbols_unattributed": sorted(set(broker_qty) - set(by_code)),
     }
+
+
+def summarize_pb1_execution_claim_backlog(
+    claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Show unresolved PB1 execution claims without attempting a retry or fill.
+
+    An OPEN BUY claim is not by itself an acknowledged broker order, so the
+    report distinguishes pending state from confirmed settlement defects.
+    """
+    pending = {"UNCERTAIN", "IN_FLIGHT", "PARTIALLY_SATISFIED",
+               "RETRYABLE", "OPEN"}
+    active = []
+    for row in claims:
+        state = str(row.get("action_state") or "").upper()
+        if state not in pending:
+            continue
+        target = _nonnegative_int(row.get("target_qty"))
+        filled = _nonnegative_int(row.get("cumulative_filled_qty"))
+        remaining = _nonnegative_int(row.get("remaining_target_qty"))
+        if (
+            target is None or filled is None or remaining is None
+            or filled + remaining != target
+        ):
+            reason = "CLAIM_QUANTITY_INCONSISTENT"
+        elif state in {"UNCERTAIN", "IN_FLIGHT"}:
+            reason = "BROKER_SUBMIT_OUTCOME_UNRESOLVED"
+        elif state == "PARTIALLY_SATISFIED":
+            reason = "BROKER_PARTIAL_EXECUTION_PENDING"
+        else:
+            reason = "CLAIM_NEEDS_ORIGINAL_ORDER_PROOF"
+        active.append({
+            "action_key": str(row.get("action_key") or ""),
+            "trade_date": str(row.get("trade_date") or ""),
+            "action": str(row.get("action") or ""),
+            "state": state,
+            "target_qty": target,
+            "filled_qty": filled,
+            "remaining_qty": remaining,
+            "reason": reason,
+        })
+    return {
+        "unresolved_count": len(active),
+        "execution_claims": sorted(
+            active, key=lambda x: (x["trade_date"], x["action_key"]),
+        ),
+    }
