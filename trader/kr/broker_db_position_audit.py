@@ -41,6 +41,8 @@ def compare_pb1_db_to_kis(
         source != "api"
         or not isinstance(broker_snapshot, dict)
         or broker_snapshot.get("rt_cd") != "0"
+        or broker_snapshot.get("_diag_stub") is True
+        or broker_snapshot.get("_kis_disabled") is True
         or not isinstance(broker_snapshot.get("output1"), list)
     ):
         return {"status": "UNVERIFIED_BROKER_SNAPSHOT", "mismatches": [],
