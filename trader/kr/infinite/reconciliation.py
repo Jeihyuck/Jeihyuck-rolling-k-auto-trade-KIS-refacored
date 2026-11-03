@@ -51,9 +51,23 @@ def reconcile(state:State|None,position:BrokerPosition,trade_date:date,pending_s
             # A terminal partial-profit fill leaves the macro cycle open when
             # the freshly fetched broker balance still has a residual holding.
             # ACK/PENDING and intermediate partial fills retain EXIT_PENDING.
-            if (not state.metadata.get("pending_profit_stage")
-                    and str(state.metadata.get("profit_stage") or "").upper().endswith("_FILLED")):
+            stage = str(state.metadata.get("profit_stage") or "").upper()
+            # Only a terminal FIRST-stage partial profit may rearm the
+            # currently held cycle. A terminal TP2/CAPITAL_RECOVERY is a
+            # final-exit intent: the broker holding may temporarily lag the
+            # confirmed fill. Turning that into ACTIVE would make the next
+            # zero-balance tick freeze a fully sold cycle forever.
+            if (
+                not state.metadata.get("pending_profit_stage")
+                and stage.startswith("TP1")
+                and stage.endswith("_FILLED")
+            ):
                 return replace(state,status=Status.ACTIVE),"PARTIAL_PROFIT_FILLED_RESIDUAL"
+            if (
+                not state.metadata.get("pending_profit_stage")
+                and stage in {"TP2_FILLED", "CAPITAL_RECOVERY_FILLED"}
+            ):
+                return state, "FINAL_PROFIT_FILL_BALANCE_PENDING"
             return state,"EXIT_PENDING"
         if pending_sell:return state,"SELL_RECONCILE_PENDING"
         return replace(state,status=Status.COMPLETE,cycle_complete_date=trade_date,last_exit_date=trade_date),"CYCLE_COMPLETE"
