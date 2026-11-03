@@ -56,13 +56,24 @@ class VerifiedFillPersistenceMemo:
             return True
         return fills_digest(fills) != self._digest
 
-    def mark_persisted(self, fills: list[dict], *, status: str) -> None:
+    def mark_persisted_digest(self, digest: str, *, status: str) -> None:
+        """Remember the *pre-save* broker snapshot only after confirmed DB success.
+
+        save_fills_with_result enriches input dictionaries with local order keys,
+        strategy metadata and status. Hashing that mutated list would compare
+        unlike objects on the next KIS fetch, defeating the safe write memo.
+        """
         if str(status).upper() != "OK":
-            self._digest = None
-            self._saved_at = None
+            self.invalidate()
             return
-        self._digest = fills_digest(fills)
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("US_STAGE4_PRE_SAVE_DIGEST_INVALID")
+        self._digest = digest
         self._saved_at = self.clock()
+
+    def mark_persisted(self, fills: list[dict], *, status: str) -> None:
+        # Compatibility for clients whose fills are not mutated by persistence.
+        self.mark_persisted_digest(fills_digest(fills), status=status)
 
     def invalidate(self) -> None:
         self._digest = None

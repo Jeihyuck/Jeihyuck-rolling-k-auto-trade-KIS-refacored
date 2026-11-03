@@ -467,7 +467,8 @@ def test_active_claim_replay_skips_completed_attempts_and_queries_only_unresolve
     # order book; do not repeat an entire CCNL REST request through the
     # per-order helper. Each replay still refetches broker truth.
     assert provider.fill_calls == []
-    assert provider.order_calls == provider.balance_calls == 2
+    assert provider.order_calls == 2  # fresh original-date KIS proof every invocation
+    assert provider.balance_calls == 0  # no account balance call when exact OPEN proof exists
     assert claim_repo.get(active_identity).active_attempt_id == "unresolved-attempt"
     claim_repo.record_observation(
         active_identity, attempt_id="unresolved-attempt", state="FILLED",

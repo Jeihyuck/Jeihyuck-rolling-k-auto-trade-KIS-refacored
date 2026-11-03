@@ -88,3 +88,22 @@ def test_stage4_only_cli_rejects_log_with_single_stale_gap(tmp_path, monkeypatch
     log.write_text("\n".join(_samples(n=19) + _samples(ms=31000., n=1)))
     monkeypatch.setattr(sys, "argv", ["stage4_acceptance", "--stage4-only", str(log)])
     assert cli.main() == 2
+
+
+def test_stage4_current_p95_target_is_20_seconds_not_legacy_25():
+    # A 22s healthy-looking worker does not meet the new performance target.
+    result = evaluate_stage4_ready_intervals(_samples(ms=22000.))
+    assert result["status"] == "NOT_PROVEN"
+    assert result["p95_limit_ms"] == 20000.0
+    assert result["ready_intervals_over_30s_count"] == 0
+    assert result["observed_ready_interval_seconds"] == 440.0
+    assert "STAGE4_READY_INTERVAL_P95_TOO_HIGH" in result["blockers"]
+
+
+def test_stage4_reports_over_30s_count_instead_of_only_one_stale_flag():
+    result = evaluate_stage4_ready_intervals(
+        _samples(ms=31000., n=2) + _samples(ms=15000., n=18)
+    )
+    assert result["ready_intervals_over_30s_count"] == 2
+    assert result["status"] == "NOT_PROVEN"
+    assert result["max_ms"] == 31000.

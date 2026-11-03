@@ -691,3 +691,30 @@ def test_two_workers_cannot_claim_the_same_action_in_postgresql():
         results = list(pool.map(acquire, range(2)))
     assert sorted(results) == [False, True]
     engine.dispose()
+
+
+def test_claim_health_source_day_breakdown_preserves_account_wide_fatal_totals():
+    """An old OPEN TP claim and an old blocked BUY must stay visible at close."""
+    engine, repo = _repo()
+    prior = _identity(stage="TP1", lifecycle="prior-tmo")
+    current = SemanticActionIdentity(
+        env="practice", account_id="test-account", market="US",
+        trading_epoch_id="epoch-test", strategy_owner="US_STANDARD",
+        lifecycle_id="current-ko", action="TP1",
+        trade_date=date(2026, 10, 3),
+    )
+    assert repo.acquire(prior, attempt_id="prior-attempt", requested_qty=1).acquired
+    assert repo.acquire(current, attempt_id="current-attempt", requested_qty=1).acquired
+    # Real original-date duplicate prevention counter: do not invent a broker POST.
+    assert not repo.acquire(prior, attempt_id="blocked-duplicate", requested_qty=1).acquired
+    report = repo.health(env="practice", account_id="test-account", market="US",
+                         trading_epoch_id="epoch-test", trade_date="2026-10-03")
+    assert report["unresolved_execution_actions"] == 2
+    assert report["unresolved_source_date_current"] == 1
+    assert report["unresolved_source_date_prior"] == 1
+    assert report["unresolved_source_date_other_or_unknown"] == 0
+    assert report["execution_claim_conflicts"] == 1
+    assert report["claim_conflicts_source_date_current"] == 0
+    assert report["claim_conflicts_source_date_prior"] == 1
+    assert report["claim_conflicts_source_date_other_or_unknown"] == 0
+    assert repo.health(market="US")["unresolved_execution_actions"] == 2

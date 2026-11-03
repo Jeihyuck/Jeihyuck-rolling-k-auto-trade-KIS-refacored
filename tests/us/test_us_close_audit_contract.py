@@ -43,3 +43,32 @@ def test_missing_broker_health_is_visible():
     result = audit_us_close_report({})
     assert result["p0_count"] == 1
     assert result["findings"][0]["code"] == "BROKER_RECOVERY_HEALTH_UNAVAILABLE"
+
+
+def test_close_audit_preserves_fatality_while_explaining_old_claim_origins():
+    report = {
+        "broker_recovery_health": {
+            "available": True,
+            "unresolved_execution_actions": 1,
+            "duplicate_semantic_submit_detection_count": 2,
+            "execution_claim_source_date_breakdown_available": True,
+            "unresolved_source_date_current": 0,
+            "unresolved_source_date_prior": 1,
+            "unresolved_source_date_other_or_unknown": 0,
+            "claim_conflicts_source_date_current": 0,
+            "claim_conflicts_source_date_prior": 2,
+            "claim_conflicts_source_date_other_or_unknown": 0,
+        },
+        "report_consistency": "OK",
+        "close_integrity_status": "OK",
+    }
+    result = audit_us_close_report(report)
+    by_code = {f["code"]: f for f in result["findings"]}
+    assert by_code["UNRESOLVED_EXECUTION_ACTIONS"]["severity"] == "P0"
+    assert by_code["UNRESOLVED_EXECUTION_ACTIONS"]["evidence"][
+        "unresolved_source_date_prior"
+    ] == 1
+    assert by_code["BLOCKED_EXECUTION_CLAIM_ATTEMPTS"]["severity"] == "P1"
+    assert by_code["BLOCKED_EXECUTION_CLAIM_ATTEMPTS"]["evidence"][
+        "claim_conflicts_source_date_prior"
+    ] == 2

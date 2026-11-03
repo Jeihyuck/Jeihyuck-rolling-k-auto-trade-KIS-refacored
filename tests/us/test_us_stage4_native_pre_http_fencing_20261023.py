@@ -60,7 +60,7 @@ def test_successful_pre_http_callback_is_logged_before_exactly_one_post(monkeypa
     assert sequence == ["FENCE_PASS", "HTTP_AUDIT", "POST"]
 
 
-@pytest.mark.parametrize("gate_failure", ["expired_tick", "stale_stage4"])
+@pytest.mark.parametrize("gate_failure", ["expired_tick", "stale_stage4", "stale_after_claim"])
 def test_late_boundary_fences_before_broker_http(monkeypatch, gate_failure):
     from trader.us.execution import order_router, order_journal
     from trader.us.db import repos
@@ -90,11 +90,16 @@ def test_late_boundary_fences_before_broker_http(monkeypatch, gate_failure):
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("DRY_RUN", "0")
     monkeypatch.setenv("US_RECONCILE_WORKER_MODE",
-                       "WORKER" if gate_failure == "stale_stage4" else "LEGACY")
-    if gate_failure == "stale_stage4":
+                       "WORKER" if gate_failure.startswith("stale_") else "LEGACY")
+    if gate_failure.startswith("stale_"):
         from trader.us.execution import authoritative_reconcile_worker as worker
+        stage4_checks = []
         def stale_health(**_kwargs):
-            raise RuntimeError("US_STAGE4_WRITER_STALE")
+            stage4_checks.append(len(stage4_checks) + 1)
+            if (gate_failure == "stale_stage4"
+                    or len(stage4_checks) >= 2):
+                raise RuntimeError("US_STAGE4_WRITER_STALE")
+            return {"reconcile_status": "OK", "replay_status": "OK"}
         monkeypatch.setattr(worker, "read_worker_health", stale_health)
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
@@ -133,7 +138,13 @@ def test_late_boundary_fences_before_broker_http(monkeypatch, gate_failure):
     assert result["requires_reconcile"] is False
     assert client.http_calls == 0
     assert events == ["BROKER_SUBMIT_STARTED", "BROKER_SUBMIT_ABORTED_PRE_IO"]
-    assert not any(x.get("state") == "SUBMITTED" for x in observed)
+    # The post-DB fence is intentionally after durable SUBMITTED observation;
+    # the broker still sees zero HTTP calls and the journal proves pre-I/O abort.
+    if gate_failure == "stale_after_claim":
+        assert any(x.get("state") == "SUBMITTED" for x in observed)
+        assert len(stage4_checks) == 2
+    else:
+        assert not any(x.get("state") == "SUBMITTED" for x in observed)
 
 
 def test_stage4_health_accepts_uuid_hex_and_hyphenated_database_value(monkeypatch):

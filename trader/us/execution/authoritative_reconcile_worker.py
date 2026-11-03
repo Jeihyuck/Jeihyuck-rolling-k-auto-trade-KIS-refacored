@@ -122,6 +122,11 @@ def assert_stage4_worker_process_alive() -> None:
         raise RuntimeError("US_STAGE4_WORKER_PROCESS_DEAD")
 
 
+# Diagnostic only: never authorizes orders or extends READY evidence.
+import contextvars
+_stage4_cycle_id = contextvars.ContextVar("us_stage4_cycle_id", default="unassigned")
+
+
 def read_worker_health(*, env: str="practice", max_age_seconds: float=30.) -> dict:
     """Fail closed on stale, wrong-account, wrong-epoch or unready writer."""
     from trader.us.db.repos import _get_engine_or_none, _us_execution_claim_scope
@@ -242,7 +247,8 @@ def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "p
 
 def run_reconcile_once(*, provider: Any, trade_date: str,
                        session_run_id: str, writer_generation: str,
-                       conn: Any, scope: dict) -> dict:
+                       conn: Any, scope: dict,
+                       historical_provider: Any | None = None) -> dict:
     """One serial authoritative reconciliation cycle, no order submissions."""
     from trader.us.execution.fills import get_fills_today
     from trader.us.db.repos import save_fills_with_result
@@ -252,6 +258,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     phase = Stage4PhaseTimer()
     fills=get_fills_today(provider=provider,signal_only=False,trade_date=trade_date)
     phase.mark("kis_fill_fetch")
+    logger.info("[US_STAGE4][CYCLE_BROKER_EVIDENCE] cycle_id=%s observed_at_utc=%s status=%s", _stage4_cycle_id.get(), datetime.now(timezone.utc).isoformat(), fills.get("status"))
     if fills.get("status")!="OK":
         raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
     # Every cycle still fetches current authoritative KIS evidence. Skip only
@@ -259,12 +266,18 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     # This removes the repeated 18-22s DB write observed on 2026-10-27.
     # A changed quantity/price, failed save, worker restart or TTL expiry
     # always forces the original full persistence/reconciliation path.
-    from trader.us.execution.stage4_fill_memo import VerifiedFillPersistenceMemo
+    from trader.us.execution.stage4_fill_memo import (
+        VerifiedFillPersistenceMemo, fills_digest,
+    )
     memo = _STAGE4_FILL_MEMOS.setdefault(trade_date, VerifiedFillPersistenceMemo())
     broker_fills = fills.get("fills") or []
     if memo.should_persist(broker_fills):
+        # DB persistence mutates these dictionaries to attach local-order
+        # attribution. Capture original KIS proof before the save; otherwise
+        # every subsequent fetch appears changed and repeats an expensive write.
+        broker_digest = fills_digest(broker_fills)
         save = save_fills_with_result(broker_fills, trade_date=trade_date)
-        memo.mark_persisted(broker_fills, status=save.get("status", ""))
+        memo.mark_persisted_digest(broker_digest, status=save.get("status", ""))
         if save.get("status") != "OK":
             raise RuntimeError("US_STAGE4_FILLS_PERSIST_UNVERIFIED")
     else:
@@ -285,8 +298,8 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     replay=replay_order_journal(
         trade_date,session_run_id=session_run_id,
         tick_id="stage4-"+writer_generation,
-        provider=provider,include_active_claims=True,
-        active_claims_only=True,
+        provider=historical_provider if historical_provider is not None else provider,
+        include_active_claims=True, active_claims_only=True,
     )
     phase.mark("active_claim_replay")
     ack=reconcile_ack_orders_with_balance(
@@ -316,7 +329,8 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
     metrics = phase.summary()
     logger.info(
-        "[US_STAGE4][RECONCILE_PHASES] total_ms=%s phases_ms=%s",
+        "[US_STAGE4][RECONCILE_PHASES] cycle_id=%s total_ms=%s phases_ms=%s",
+        _stage4_cycle_id.get(),
         metrics["total_ms"], metrics["phases_ms"],
     )
     # Publish fresh critical-path proof first. Expensive original-date TP
@@ -452,9 +466,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM,_stop)
     signal.signal(signal.SIGINT,_stop)
     generation=str(os.getenv("US_STAGE4_EXPECTED_GENERATION") or uuid.uuid4().hex)
+    logger.info("[US_STAGE4][WORKER_BOOT] observed_at_utc=%s generation=%s trade_date=%s session_run_id=%s", datetime.now(timezone.utc).isoformat(), generation, args.trade_date, args.session_run_id)
     from trader.us.execution.stage4_phase_latency import RollingStage4Latency
     ready_window = RollingStage4Latency(size=128)
     last_ready_mono: float | None = None
+    historical_reader = None
     # Hold only the dedicated one-writer advisory lock. It is distinct from
     # the short-lived trade reservation leases, so it does not hold KIS HTTP.
     with engine.connect() as lease:
@@ -472,18 +488,45 @@ def main() -> int:
                 publish_health(conn, scope=scope, generation=generation, state="STARTING")
             logger.info("[US_STAGE4][WORKER_STARTING] generation=%s", generation)
             provider=USDataProvider(offline=False,env="practice")
+            from trader.us.execution.stage4_historical_reader import HistoricalReadOnlyReader
+            historical_reader = HistoricalReadOnlyReader(
+                scope=scope, generation=generation,
+                # The reader creates a separate read-only KIS client. It has
+                # no execution / cancel / claim-release / health-write API.
+                provider_factory=lambda: USDataProvider(offline=False, env="practice"),
+            )
+            historical_reader.start()
             while not _STOP:
                 started=time.monotonic()
+                cycle_id=uuid.uuid4().hex
+                token=_stage4_cycle_id.set(cycle_id)
+                logger.info("[US_STAGE4][CYCLE_START] cycle_id=%s observed_at_utc=%s generation=%s",cycle_id,datetime.now(timezone.utc).isoformat(),generation)
                 try:
+                    from trader.us.db.repos import load_active_execution_claim_attempts
+                    # Read-only broker GETs for old orders never run on this
+                    # authoritative writer. A missing or stale historical
+                    # snapshot blocks READY; no synthetic terminality.
+                    active_before = load_active_execution_claim_attempts()
+                    historical_snapshot = historical_reader.snapshot_for_claims(active_before)
+                    historical_provider = historical_reader.provider_for(historical_snapshot)
                     result=run_reconcile_once(
                         provider=provider,trade_date=args.trade_date,
                         session_run_id=args.session_run_id,
                         writer_generation=generation,conn=lease,scope=scope,
+                        historical_provider=historical_provider,
+                    )
+                    # Verify both the current DB claim set and snapshot age at
+                    # the point of publishing, including any mutations the
+                    # writer just committed during the replay. Fail closed if
+                    # claims changed or the reader replaced/expired evidence.
+                    historical_reader.assert_still_valid(
+                        historical_snapshot, load_active_execution_claim_attempts(),
                     )
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="READY",result=result)
                     ready_now = time.monotonic()
+                    logger.info("[US_STAGE4][CYCLE_READY_PUBLISHED] cycle_id=%s observed_at_utc=%s elapsed_ms=%.1f generation=%s",cycle_id,datetime.now(timezone.utc).isoformat(),(ready_now-started)*1000.0,generation)
                     if last_ready_mono is not None:
                         interval_ms = max(0.0, (ready_now - last_ready_mono) * 1000.0)
                         window = ready_window.observe(interval_ms)
@@ -516,21 +559,34 @@ def main() -> int:
                     # Slow historical broker inquiries are outside the main
                     # Tick and after the READY evidence publication.
                     try:
-                        deferred=run_deferred_recovery_once(
-                            provider=provider,trade_date=args.trade_date,
+                        deferred_started=time.monotonic()
+                        logger.info("[US_STAGE4][DEFERRED_RECOVERY_START] cycle_id=%s observed_at_utc=%s",cycle_id,datetime.now(timezone.utc).isoformat())
+                        # Deferred DB mutations remain owned by this writer.
+                        # Normal historical KIS reads were prefetched without
+                        # holding the authoritative writer. Preserve the
+                        # *explicitly operator-authorized* cancel flow: never
+                        # substitute a GET-only facade for an authorized KIS
+                        # cancel client. That exceptional operator path remains
+                        # synchronous and must be measured separately.
+                        _operator_cancel = (
+                            os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
+                            and os.getenv("US_STOP_RECOVERY_AUTHORIZED", "0") == "1"
                         )
-                        logger.info("[US_STAGE4][DEFERRED_RECOVERY] %s",deferred)
+                        deferred=run_deferred_recovery_once(
+                            provider=provider if _operator_cancel else historical_provider,
+                            trade_date=args.trade_date,
+                        )
+                        logger.info("[US_STAGE4][DEFERRED_RECOVERY] cycle_id=%s elapsed_ms=%.1f result=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,deferred)
                     except Exception as recovery_exc:
                         # Keep the confirmed stop obligation and old TP fence.
                         # Do not falsify earlier *confirmed* ACK/Fill proof.
-                        logger.exception("[US_STAGE4][DEFERRED_RECOVERY_FAILED] type=%s",
-                                         type(recovery_exc).__name__)
+                        logger.exception("[US_STAGE4][DEFERRED_RECOVERY_FAILED] cycle_id=%s elapsed_ms=%.1f type=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,type(recovery_exc).__name__)
                 except Exception as exc:
-                    logger.exception("[US_STAGE4][RECONCILE_FAILURE] type=%s",
-                                     type(exc).__name__)
+                    logger.exception("[US_STAGE4][RECONCILE_FAILURE] cycle_id=%s elapsed_ms=%.1f type=%s",cycle_id,(time.monotonic()-started)*1000.0,type(exc).__name__)
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
                                        state="FAILED")
+                _stage4_cycle_id.reset(token)
                 wait=max(0.0,max(5,args.interval_sec)-(time.monotonic()-started))
                 # Python sleep can resume after SIGTERM (PEP 475). Poll the
                 # stop flag so normal shutdown reaches publish_health(STOPPED)
@@ -542,6 +598,8 @@ def main() -> int:
                         break
                     time.sleep(min(0.25,remaining))
         finally:
+            if historical_reader is not None:
+                historical_reader.stop()
             with engine.begin() as conn:
                 publish_health(conn,scope=scope,generation=generation,state="STOPPED")
             lease.execute(text("SELECT pg_advisory_unlock(:key)"),

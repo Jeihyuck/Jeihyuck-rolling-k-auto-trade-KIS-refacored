@@ -499,6 +499,13 @@ def load_execution_claim_health() -> dict[str, int]:
     return _execution_claim_repo().health(**_us_execution_claim_scope())
 
 
+def load_execution_claim_origin_diagnostics(trade_date: str) -> dict[str, int]:
+    """Additional read-only source-date diagnostics; never clears a claim."""
+    return _execution_claim_repo().health(
+        trade_date=trade_date, **_us_execution_claim_scope()
+    )
+
+
 def _us_execution_claim_scope() -> dict[str, str]:
     from trader.account_state import get_account_key, resolve_env_name
 
@@ -812,6 +819,24 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         unresolved_actions = 0
         duplicate_detections = 0
         claim_health_available = False
+    origin_breakdown_available = False
+    origin_health: dict = {}
+    if claim_health_available:
+        try:
+            origin_health = load_execution_claim_origin_diagnostics(trade_date)
+            # The aggregate totals must agree within a consistent snapshot.
+            # A concurrent order update may race the two read-only queries;
+            # in that case flag the detail as unavailable, never clear totals.
+            if (int(origin_health.get("unresolved_execution_actions", -1))
+                    == unresolved_actions
+                    and int(origin_health.get("execution_claim_conflicts", -1))
+                    == duplicate_detections):
+                origin_breakdown_available = True
+        except Exception as exc:
+            logger.warning(
+                "[US_CLOSE][CLAIM_ORIGIN_DIAGNOSTICS_UNAVAILABLE] error_type=%s",
+                type(exc).__name__,
+            )
     return {
         "available": journal_available and claim_health_available,
         "journal_available": journal_available,
@@ -822,6 +847,21 @@ def load_broker_recovery_health(trade_date: str) -> dict[str, int | bool]:
         "broker_fill_rebound_success_count": successful_rebounds,
         "broker_fill_rebound_failure_count": failed_rebounds,
         "duplicate_semantic_submit_detection_count": duplicate_detections,
+        # Source trade date of claim, NOT occurrence date of a conflict.
+        # Null means this optional diagnostic was not proven; the original
+        # global unresolved/conflict totals remain fatal and unchanged.
+        "execution_claim_source_date_breakdown_available": origin_breakdown_available,
+        **{
+            name: int(origin_health.get(name, 0)) if origin_breakdown_available else None
+            for name in (
+                "unresolved_source_date_current",
+                "unresolved_source_date_prior",
+                "unresolved_source_date_other_or_unknown",
+                "claim_conflicts_source_date_current",
+                "claim_conflicts_source_date_prior",
+                "claim_conflicts_source_date_other_or_unknown",
+            )
+        },
         "broker_local_cumulative_fill_mismatch_count": cumulative_mismatches,
         "filled_sell_missing_cost_basis_count": len(missing_sell_cost_basis_keys),
         "stale_pending_exit_stage_after_fill_count": stale_pending_exit_stage_count,

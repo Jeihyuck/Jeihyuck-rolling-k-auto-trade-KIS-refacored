@@ -2227,6 +2227,32 @@ def route_order(
         # Fail closed after persistence as well as before it.
         if context is not None and not context.broker_submit_allowed():
             raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
+        # The earlier Stage4 check preceded DB persistence of SUBMITTED.
+        # A slow DB write can push that evidence past the strict 30-second
+        # validity window. Re-check AFTER the write and BEFORE native HTTP.
+        # A failed final check is still pre-I/O: journal an abort and release
+        # the attempt through the existing proven-unsent path, never retry
+        # an ambiguous broker submission.
+        if os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") == "WORKER":
+            try:
+                from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+                _stage4_final = read_worker_health(env=account_env)
+                if (_stage4_final.get("reconcile_status") not in {"OK", "WARN"}
+                        or _stage4_final.get("replay_status") not in {
+                            "OK", "RECOVERED", "NO_ACTIVE_CLAIMS",
+                            "WARN", "PARTIAL", "UNRESOLVED",
+                        }):
+                    raise RuntimeError("US_STAGE4_RECONCILE_NOT_VERIFIED")
+            except Exception as _final_stage4_exc:
+                logger.warning(
+                    "[US_ORDER][STAGE4][FINAL_PRE_HTTP_FENCED] "
+                    "symbol=%s side=%s attempt=%s reason=%s",
+                    symbol_upper, side, intent["submit_attempt_id"],
+                    type(_final_stage4_exc).__name__,
+                )
+                raise KisUSPreSubmitError(
+                    "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
+                ) from _final_stage4_exc
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
