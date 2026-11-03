@@ -26,7 +26,7 @@ def test_settlement_rejects_non_authoritative_balance(monkeypatch):
         def __exit__(self, *_): pass
         def execute(self, *_args, **_kwargs):
             class Result:
-                def scalar_one(self): return 0
+                def scalar_one(self): return (1 if "exact_original_tp" in str(_args[0]) else 0)
             return Result()
     class Engine:
         def connect(self): return ReadOnlyConn()
@@ -43,9 +43,7 @@ def test_settlement_requires_original_date_terminal_order_for_zero_balance(monke
     monkeypatch.setattr(state,"resolve_env_name",lambda:"practice")
     monkeypatch.setattr(state,"get_account_key",lambda **kw:"practice:123:01")
     monkeypatch.setattr(reconcile,"reconcile_positions",
-                        lambda **kw:{"status":"OK","balance_fetch_status":"OK",
-                        "authoritative_positions":True,"preserve_previous_positions":False,
-                        "positions":[]})
+                        lambda **kw: pytest.fail("without original TP proof, must skip balance"))
     monkeypatch.setattr(stop,"load_pending_stop_obligations",lambda **kw:[{
         "account_id":"practice:123:01","trading_epoch_id":"epoch",
         "symbol":"AMD","lifecycle_id":"life-1","severity":3,
@@ -129,7 +127,10 @@ def test_settlement_rechecks_durable_claim_after_kis_balance_race(monkeypatch):
         def __exit__(self, *_): pass
         def execute(self, sql, params):
             assert "COUNT(*)" in str(sql)
-            count.append(params["life"])
+            count.append(("original" if "exact_original_tp" in str(sql) else "claim",
+                          params["life"]))
+            if "exact_original_tp" in str(sql):
+                return Row(1)  # original TP exists; balance GET necessary
             return Row(0 if len(count) == 1 else 1)
     class Engine:
         def connect(self): return Conn()
@@ -146,5 +147,23 @@ def test_settlement_rechecks_durable_claim_after_kis_balance_race(monkeypatch):
     result = settlement.settle_verified_stop_debts_once(
         provider=object(), trade_date="2026-11-02", limit=1
     )
-    assert count == ["life-pfe", "life-pfe"]
+    assert count == [("claim","life-pfe"), ("original","life-pfe"),
+                     ("claim","life-pfe")]
     assert result == {"checked":1, "settled":0, "blocked":1, "total_pending":1}
+
+
+def test_original_tp_lookup_cannot_associate_another_lifecycle_same_symbol_day():
+    """Source-day matching alone is NOT original TP claim ownership proof."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        root / "trader/us/execution/protective_stop_settlement_worker.py",
+        root / "trader/us/execution/stage4_historical_reader.py",
+    ]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "c.action_key=o.meta->>'execution_action_key'" in text
+        assert "o.meta->>'position_lifecycle_id'=:life" in text
+        assert "upper(o.meta->>'strategy_owner')='US_STANDARD'" in text
+        assert "c.account_id=:account" in text
+        assert "c.market='US'" in text
