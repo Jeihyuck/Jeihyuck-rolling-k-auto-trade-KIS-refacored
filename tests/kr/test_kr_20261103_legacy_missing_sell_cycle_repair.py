@@ -98,6 +98,7 @@ def test_122630_original_kis_buy11_sell5_6_binds_only_cycle_metadata():
     ("wrong_side","ORIGINAL_ORDER_KIS_MATCH_NOT_UNIQUE"),
     ("wrong_sell_qty","ORIGINAL_KIS_FULL_FILL_NOT_PROVEN"),
     ("broker_nonzero","BROKER_HOLDING_NONZERO"),
+    ("broker_diag_stub","FRESH_BROKER_PROOF_REQUIRED"),
 ])
 def test_legacy_missing_cycle_fail_closed_without_mutations(change,reason):
     engine,schema,pos,pages,broker=_fixture()
@@ -109,6 +110,8 @@ def test_legacy_missing_cycle_fail_closed_without_mutations(change,reason):
         pages["20261027"]["output1"][0]["tot_ccld_qty"]="4"
     elif change=="broker_nonzero":
         broker["output1"]=[{"pdno":"122630","hldg_qty":"11"}]
+    elif change=="broker_diag_stub":
+        broker["_diag_stub"]=True
     out=_call(engine,pages,broker,apply=True)
     assert out["state"]=="BLOCKED" and out["reason"]==reason
     with engine.connect() as conn:
