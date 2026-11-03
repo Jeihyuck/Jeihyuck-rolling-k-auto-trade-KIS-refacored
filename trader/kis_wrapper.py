@@ -3320,10 +3320,21 @@ class KisAPI:
                 return {"ok": True, "inv": inv}
             except Exception as e:
                 err_text = str(e)
-                err_type = "HTTP500" if "500" in err_text else ("TIMEOUT" if "timeout" in err_text.lower() or "ReadTimeout" in err_text else type(e).__name__)
+                err_type = (
+                    "RATE_LIMIT_EGW00201"
+                    if "EGW00201" in err_text or "초당 거래건수" in err_text
+                    else "HTTP500" if "500" in err_text
+                    else "TIMEOUT" if "timeout" in err_text.lower() or "ReadTimeout" in err_text
+                    else type(e).__name__
+                )
                 logger.warning("[KR_FLOW][KIS_INVESTOR][FAIL_SOFT] code=%s err_type=%s action=impute_and_continue", iscd, err_type)
                 if attempt >= attempts or os.getenv("KR_INVESTOR_FLOW_FAIL_SOFT", "1") == "1":
-                    reason = "kis_investor_http_500" if err_type == "HTTP500" else "kis_investor_timeout" if err_type == "TIMEOUT" else err_type
+                    reason = (
+                        "kis_investor_rate_limit" if err_type == "RATE_LIMIT_EGW00201"
+                        else "kis_investor_http_500" if err_type == "HTTP500"
+                        else "kis_investor_timeout" if err_type == "TIMEOUT"
+                        else err_type
+                    )
                     return {"ok": False, "error": reason, "inv": None, "flow_data_available": 0, "flow_missing": 1, "flow_fail_reason": reason, "flow_score_imputed": 1, "foreign_20_ratio": 0.0, "inst_20_ratio": 0.0}
                 time.sleep(min(0.2 * (2 ** (attempt - 1)), 0.5))
 
