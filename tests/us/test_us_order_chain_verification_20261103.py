@@ -70,7 +70,11 @@ def test_cumulative_qty_invariant_mismatch_is_flagged_not_fabricated():
     result = audit_us_order_chains(orders, fills, journal)
     assert result["kis_broker_chain_verified_count"] == 0
     assert result["orders"][0]["broker_chain_status"] == "BROKER_DB_FILLED_QTY_MISMATCH"
-    assert result["orders"][0]["policy_verdict"] == "IMPLEMENTATION BUG"
+    assert result["orders"][0]["policy_verdict"] == "PENDING_EVIDENCE"
+    assert result["broker_db_quantity_conflict_count"] == 1
+    assert result["orders"][0]["policy_verdict_reason"] == (
+        "KIS_AND_DB_QUANTITY_CONTRADICTION_UNVERIFIED_CAUSE"
+    )
 
 
 def test_synthetic_confirmation_is_not_kis_execution():
