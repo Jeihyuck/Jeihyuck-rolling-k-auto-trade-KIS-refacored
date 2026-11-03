@@ -62,8 +62,15 @@ def _broker_book_facts(rows: list[dict]) -> tuple:
         "normalization_result", "filled_qty_present", "avg_price",
         "avg_price_usd", "trade_date",
     )
+    # 0 is a proven numerical value, while a missing value is UNKNOWN.
+    # Never treat them as equivalent merely because both are falsy.
     return tuple(sorted(
-        tuple(str(row.get(field) or "") for field in fields)
+        tuple(
+            "<ABSENT>" if field not in row
+            else "<NULL>" if row[field] is None
+            else str(row[field])
+            for field in fields
+        )
         for row in rows
     ))
 
