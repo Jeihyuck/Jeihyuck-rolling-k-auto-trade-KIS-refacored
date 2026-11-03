@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 
 logger=logging.getLogger(__name__)
+_DEFERRED_SETTLEMENT_CURSOR=0
 
 
 def settle_verified_stop_debts_once(*, provider, trade_date: str,
@@ -33,7 +34,54 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
     debts=load_pending_stop_obligations(env="practice")
     if not debts:
         return {"checked":0,"settled":0,"blocked":0,"total_pending":0}
+    global _DEFERRED_SETTLEMENT_CURSOR
     account=str(get_account_key(env="practice"))
+    engine=_get_engine_or_none()
+    if engine is None:
+        raise RuntimeError("STAGE4_STOP_SETTLEMENT_DB_UNAVAILABLE")
+    account_claim=hashlib.sha256(account.encode("utf-8")).hexdigest()
+    # Stage4 calls this with limit=1. Repeatedly taking debts[:1] starves
+    # every later obligation if the first remains permanently fenced.
+    count=min(20,max(1,int(limit)),len(debts))
+    start=_DEFERRED_SETTLEMENT_CURSOR % len(debts)
+    selected=[debts[(start+index)%len(debts)] for index in range(count)]
+    _DEFERRED_SETTLEMENT_CURSOR=(start+count)%len(debts)
+
+    # Cheap scoped DB preflight BEFORE the expensive three-exchange KIS
+    # balance query. An active original claim means terminal settlement is
+    # forbidden irrespective of holdings. Keep all those fences in place.
+    eligible=[]
+    blocked=0
+    for debt in selected:
+        symbol=str(debt.get("symbol") or "").upper()
+        life=str(debt.get("lifecycle_id") or "")
+        epoch=str(debt.get("trading_epoch_id") or "")
+        if (not symbol or symbol=="TQQQ" or not life or not epoch
+                or str(debt.get("account_id") or "")!=account):
+            blocked+=1
+            continue
+        with engine.connect() as conn:
+            active=conn.execute(text("""
+                SELECT COUNT(*)
+                FROM us_execution_claims c
+                WHERE c.env='practice' AND c.market='US'
+                  AND c.trading_epoch_id=:epoch AND c.account_id=:account
+                  AND c.strategy_owner='US_STANDARD' AND c.lifecycle_id=:life
+                  AND c.action_state IN (
+                      'IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED'
+                  )
+            """),{"epoch":epoch,"account":account_claim,"life":life}).scalar_one()
+        if int(active or 0)>0:
+            blocked+=1
+            continue
+        eligible.append(debt)
+    if not eligible:
+        result={"checked":0,"settled":0,"blocked":blocked,
+                "total_pending":len(debts)}
+        logger.info("[US_STAGE4][STOP_SETTLEMENT][BROKER_BALANCE_SKIPPED] "
+                    "reason=no_eligible_debt result=%s",result)
+        return result
+
     broker_balance=reconcile_positions(provider=provider,trade_date=trade_date)
     if not (broker_balance.get("status")=="OK"
             and broker_balance.get("balance_fetch_status")=="OK"
@@ -44,13 +92,9 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
         str(row.get("symbol") or "").upper():int(row.get("qty") or 0)
         for row in (broker_balance.get("positions") or [])
     }
-    engine=_get_engine_or_none()
-    if engine is None:
-        raise RuntimeError("STAGE4_STOP_SETTLEMENT_DB_UNAVAILABLE")
     checked=0
     settled=0
-    blocked=0
-    for debt in debts[:min(20,max(1,int(limit)))]:
+    for debt in eligible:
         symbol=str(debt.get("symbol") or "").upper()
         life=str(debt.get("lifecycle_id") or "")
         epoch=str(debt.get("trading_epoch_id") or "")
@@ -61,8 +105,8 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
         if held.get(symbol,0)!=0:
             continue
         checked+=1
-        # Claim account_id is SHA256 of canonical broker account key.
-        account_claim=hashlib.sha256(account.encode("utf-8")).hexdigest()
+        # Re-check the claim AFTER balance I/O. A new claim appearing while
+        # KIS was slow must still prevent terminal debt settlement.
         with engine.connect() as conn:
             active=conn.execute(text("""
                 SELECT COUNT(*)
