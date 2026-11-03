@@ -352,3 +352,22 @@ def test_newer_kis_fill_cannot_be_overwritten_by_old_snapshot():
     reader._poll_once(kis)
     with pytest.raises(RuntimeError, match="NEWER_BROKER_FACTS_CHANGED"):
         reader.assert_still_valid(original, [CLAIM])
+
+
+def test_same_attempt_cumulative_fill_change_fences_old_broker_snapshot():
+    kis = ReadOnlyKIS()
+    original = {
+        **CLAIM, "strategy_owner": "US_STANDARD",
+        "trading_epoch_id": SCOPE["trading_epoch_id"],
+        "requested_qty": 1, "cumulative_filled_qty": 0,
+        "attempt_state": "ACK_PENDING",
+    }
+    reader = _reader(kis=kis, active=[original])
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([original])
+    new_fill = {**original, "cumulative_filled_qty": 1}
+    with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
+        reader.assert_still_valid(snapshot, [new_fill])
+    new_state = {**original, "attempt_state": "PARTIALLY_SATISFIED"}
+    with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
+        reader.assert_still_valid(snapshot, [new_state])
