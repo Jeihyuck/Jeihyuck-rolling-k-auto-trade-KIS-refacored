@@ -7,7 +7,7 @@ from datetime import date
 
 from .config import InfiniteConfig
 from .models import InfiniteState, Status
-from .risk_adapter import assess_market_risk
+from .risk_adapter import assess_market_risk, is_conflict_first_buy_signal, previous_us_trading_day
 from .strategy import classify_long_trend
 
 
@@ -26,6 +26,45 @@ def reserve_new_cycle(state: InfiniteState, trading_date: date,
         market_crash_streak=0, material_market_crash=False,
         reserve_unlocked=False, cycle_age_trading_days=0, status=Status.READY,
         metadata={},
+    )
+
+
+def record_conflict_first_buy_confirmation(
+    *, state: InfiniteState, trading_date: date, overlay: dict, config: InfiniteConfig,
+) -> InfiniteState:
+    """Record at most one *eligible* tick per distinct US trading session.
+
+    The record is scoped by InfiniteRepository's active trading_epoch_id.
+    No previous account/epoch data is copied or replayed to authorize orders.
+    """
+    if (not config.conflict_first_buy_enabled or state.status != Status.READY
+            or state.cycle_id is not None or state.total_filled_notional > 0):
+        return state
+    from trader.us.market_calendar import is_us_trading_day
+    if not is_us_trading_day(trading_date) or not is_conflict_first_buy_signal(overlay):
+        return state
+    if classify_long_trend(overlay, bool(state.metadata.get("structural_bear_seen"))) != "BULL":
+        return state
+
+    today = trading_date.isoformat()
+    previous = previous_us_trading_day(trading_date)
+    if previous is None:
+        return state
+    raw_dates = state.metadata.get("conflict_first_buy_confirmed_dates")
+    prior_dates = list(raw_dates) if isinstance(raw_dates, list) else []
+    last = str(prior_dates[-1]) if prior_dates else ""
+    if last == today:
+        return state  # Repeated AM/afternoon ticks never count as extra days.
+    if last == previous.isoformat():
+        dates = [*prior_dates[-(config.conflict_first_buy_confirm_days - 1):], today]
+    else:
+        dates = [today]  # Missed a trading day: start a new consecutive streak.
+    return replace(
+        state, metadata={
+            **state.metadata,
+            "conflict_first_buy_confirmed_dates": dates,
+            "conflict_first_buy_last_signal": "STRONG_RISK_ON+DEFENSIVE",
+        },
     )
 
 
@@ -88,6 +127,9 @@ def update_adaptive_policy_state(*, state: InfiniteState, trading_date: date,
               (material_crash or structural) and
               int(metadata.get("recovery_streak") or 0) >= config.recovery_confirmation_days and
               market_state not in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"})
-    return replace(state, metadata=metadata, market_crash_streak=crash_streak,
-                   material_market_crash=material_crash,
-                   reserve_unlocked=state.reserve_unlocked or unlock, status=status)
+    next_state = replace(state, metadata=metadata, market_crash_streak=crash_streak,
+                         material_market_crash=material_crash,
+                         reserve_unlocked=state.reserve_unlocked or unlock, status=status)
+    return record_conflict_first_buy_confirmation(
+        state=next_state, trading_date=trading_date, overlay=overlay, config=config,
+    )
