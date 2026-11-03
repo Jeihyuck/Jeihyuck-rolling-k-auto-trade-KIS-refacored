@@ -81,7 +81,7 @@ def test_legacy_1030_env_is_corrected_by_am_launcher_without_running_trading() -
     assert am.index("source .env;") < am.index('export PB1_MORNING_WINDOW_END="$PB1_AM_SESSION_END"')
     env = os.environ.copy()
     env.update({
-        "PB1_AM_SESSION_END": "12:55",
+        "PB1_AM_SESSION_END": "10:30",
         "PB1_MORNING_WINDOW_END": "10:30",
         "MORNING_WINDOW_END": "10:30",
         "PB1_AFTERNOON_WINDOW_START": "10:30",
