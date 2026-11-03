@@ -32,7 +32,9 @@ def main() -> int:
     from trader.db.schema import schema_for_engine
     from trader.db.trading_epoch import active_trading_epoch_id
     from trader.kis_wrapper import KisAPI
-    from trader.kr.broker_db_position_audit import compare_pb1_db_to_kis
+    from trader.kr.broker_db_position_audit import (
+        compare_pb1_db_to_kis, summarize_pb1_execution_claim_backlog,
+    )
 
     engine = make_engine()
     try:
@@ -57,6 +59,29 @@ def main() -> int:
                         schema.positions.c.strategy == "pb1_pullback_close",
                         schema.positions.c.trading_epoch_id == str(epoch),
                         schema.positions.c.status == "OPEN",
+                    ))
+                ).mappings().all()
+            ]
+            claims = [
+                dict(row) for row in conn.execute(
+                    sa.select(
+                        schema.execution_claims.c.action_key,
+                        schema.execution_claims.c.action,
+                        schema.execution_claims.c.action_state,
+                        schema.execution_claims.c.target_qty,
+                        schema.execution_claims.c.cumulative_filled_qty,
+                        schema.execution_claims.c.remaining_target_qty,
+                        schema.execution_claims.c.trade_date,
+                    ).where(sa.and_(
+                        schema.execution_claims.c.env == "practice",
+                        schema.execution_claims.c.account_id == get_account_key(env="practice"),
+                        schema.execution_claims.c.market == "KR",
+                        schema.execution_claims.c.strategy_owner == "PB1",
+                        schema.execution_claims.c.trading_epoch_id == str(epoch),
+                        schema.execution_claims.c.action_state.in_([
+                            "UNCERTAIN", "IN_FLIGHT", "PARTIALLY_SATISFIED",
+                            "RETRYABLE", "OPEN",
+                        ]),
                     ))
                 ).mappings().all()
             ]
@@ -88,9 +113,14 @@ def main() -> int:
             require_economics=True,
         )
         result["unresolved_sell_orders"] = unresolved
+        claim_backlog = summarize_pb1_execution_claim_backlog(claims)
+        result["execution_claim_backlog"] = claim_backlog
         # A match in holdings does not prove old SELLs' individual fills.
         if unresolved and result["verified_match"]:
             result["status"] = "UNRESOLVED_SELL_RECONCILIATION"
+            result["verified_match"] = False
+        if claim_backlog["unresolved_count"] and result["verified_match"]:
+            result["status"] = "UNRESOLVED_PB1_EXECUTION_CLAIMS"
             result["verified_match"] = False
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return 0 if result["verified_match"] else 2
