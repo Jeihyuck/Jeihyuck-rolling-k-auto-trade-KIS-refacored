@@ -331,7 +331,7 @@ def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str)
         if str(row.get("code") or "").zfill(6) == "122630":
             # KR_INFINITE owns 122630; the historical PB1 row was only a
             # passive broker-truth mirror. Never settle its SELL again as PB1.
-            logger.info(
+            log.info(
                 "[KR_CROSS_DAY_SELL][OWNER_SKIP] code=122630 "
                 "reason=KR_INFINITE_RESERVED action=DEDICATED_INFINITE_PROOF"
             )
