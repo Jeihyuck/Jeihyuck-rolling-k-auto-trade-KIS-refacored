@@ -2080,6 +2080,7 @@ def run_daily_report(
         f"- Broker-confirmed order chains: {_chain.get('kis_broker_chain_verified_count', 0)} / {_chain.get('order_count', 0)}",
         f"- Pre-HTTP aborts (not submitted orders): {_chain.get('safe_pre_http_abort_attempt_count', 0)}",
         f"- Missing verified 5W1H decisions: {_chain.get('missing_5w1h_count', 0)}",
+        f"- Broker/DB evidence quantity discrepancies: {_chain.get('broker_db_quantity_conflict_count', 0)}",
         f"- Broker ACKs by session: {_chain.get('broker_ack_by_session', {})}",
         f"- Policy verdict counts: {_chain.get('policy_verdict_counts', {})}",
         "",
