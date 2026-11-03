@@ -62,7 +62,7 @@ def _fixture(*, phantom=False):
     balance = {"rt_cd": "0", "output1": [
         {"pdno": "059090", "hldg_qty": "91", "pchs_amt": "1982400"}
     ]}
-    ccld = {"rt_cd": "0", "output1": [{
+    ccld = {"rt_cd": "0", "_sep29_complete": True, "_sep29_pages": 1, "output1": [{
         "ord_dt": "20261103", "pdno": "059090",
         "odno": "0000011762", "sll_buy_dvsn_cd": "02",
         "tot_ccld_qty": "91", "tot_ccld_amt": "1982400",
@@ -139,3 +139,15 @@ def test_other_cycle_order_cannot_be_hidden_inside_certification():
     result = _certify(engine, order_id, balance, ccld, apply=True)
     assert result == {"state": "BLOCKED",
                       "reason": "OTHER_SAME_CYCLE_ORDER_PRESENT", "applied": False}
+
+
+def test_incomplete_original_day_pages_never_certify_existing_buy():
+    engine, schema, order_id, balance, ccld = _fixture()
+    broken = dict(ccld, _sep29_complete=False)
+    assert _certify(engine, order_id, balance, broken, apply=True) == {
+        "state": "BLOCKED", "reason": "ORIGINAL_DAY_KIS_CCLD_REQUIRED",
+        "applied": False,
+    }
+    with engine.connect() as conn:
+        position = dict(conn.execute(sa.select(schema.positions)).mappings().one())
+    assert not (position["entry_meta_json"] or {}).get("broker_truth_buy_applied_orders")
