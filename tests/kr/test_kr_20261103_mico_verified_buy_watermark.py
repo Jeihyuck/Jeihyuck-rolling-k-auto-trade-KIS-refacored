@@ -110,6 +110,7 @@ def test_no_original_broker_price_or_stale_balance_never_certifies():
         (balance, "api", {"rt_cd": "1", "output1": []}),
         ({"rt_cd": "0", "output1": [{"pdno": "059090", "hldg_qty": "91",
                                    "pchs_amt": "0"}]}, "api", ccld),
+        ({"rt_cd": "0", "_diag_stub": True, "output1": deepcopy(balance["output1"])}, "api", ccld),
         (balance, "api", {"rt_cd": "0", "output1": [{
             **ccld["output1"][0], "tot_ccld_amt": "1982500",
         }]}),
