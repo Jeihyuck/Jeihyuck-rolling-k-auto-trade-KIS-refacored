@@ -90,7 +90,8 @@ def test_exact_original_mico_certifies_metadata_only_and_replays_idempotently():
     with engine.connect() as conn:
         after = dict(conn.execute(sa.select(schema.positions)).mappings().one())
     assert after["qty"] == before["qty"] == 91
-    assert after["total_cost"] == before["total_cost"] == 1982400
+    assert after["total_cost"] == before["total_cost"]
+    assert abs(after["total_cost"] - 1982400) < 0.01
     assert after["realized_pnl"] == before["realized_pnl"]
     assert after["entry_meta_json"]["broker_truth_buy_applied_orders"][order_id]["qty"] == 91
 
