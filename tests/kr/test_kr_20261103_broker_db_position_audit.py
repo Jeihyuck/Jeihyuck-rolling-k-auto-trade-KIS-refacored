@@ -65,3 +65,31 @@ def test_duplicate_open_pb1_lifecycles_is_red():
         source="api",
     )
     assert result["mismatches"][0]["reason"] == "MULTIPLE_OPEN_LIFECYCLES"
+
+
+def test_broker_economics_must_be_proven_for_91_share_position():
+    matching = compare_pb1_db_to_kis(
+        positions=[{"code": "059090", "status": "OPEN", "qty": 91,
+                    "total_cost": 1982400}],
+        broker_snapshot=_broker({"pdno": "059090", "hldg_qty": "91",
+                                 "pchs_amt": "1982400"}),
+        source="api", require_economics=True,
+    )
+    assert matching["verified_match"] is True
+    wrong_cost = compare_pb1_db_to_kis(
+        positions=[{"code": "059090", "status": "OPEN", "qty": 91,
+                    "total_cost": 1900000}],
+        broker_snapshot=_broker({"pdno": "059090", "hldg_qty": "91",
+                                 "pchs_amt": "1982400"}),
+        source="api", require_economics=True,
+    )
+    assert wrong_cost["verified_match"] is False
+    assert wrong_cost["mismatches"][0]["reason"] == "DB_KIS_COST_MISMATCH"
+    missing_proof = compare_pb1_db_to_kis(
+        positions=[{"code": "059090", "status": "OPEN", "qty": 91,
+                    "total_cost": 1982400}],
+        broker_snapshot=_broker({"pdno": "059090", "hldg_qty": "91"}),
+        source="api", require_economics=True,
+    )
+    assert missing_proof["verified_match"] is False
+    assert missing_proof["mismatches"][0]["reason"] == "COST_PROOF_UNAVAILABLE"
