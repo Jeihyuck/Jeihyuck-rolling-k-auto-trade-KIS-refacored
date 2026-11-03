@@ -1,7 +1,7 @@
 """Operator-only original KIS proof certification, never an order submission.
 
 Dry-run (default):
-  NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_certify_buy_application \
+  FORCE_HTTP=1 NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_certify_buy_application \
     --order-id 1c610884-7952-49f1-8d7d-4e2712240d8c --trade-date 20261103
 
 To *only* save broker-proven application metadata after reviewing the result,
@@ -26,6 +26,7 @@ def main(argv=None) -> int:
         os.getenv("KIS_ENV") != "practice"
         or os.getenv("NO_TRADE") != "1"
         or os.getenv("DRY_RUN") != "1"
+        or os.getenv("FORCE_HTTP") != "1"
         or not (len(args.trade_date) == 8 and args.trade_date.isdigit())
     ):
         print(json.dumps({"state": "BLOCKED", "reason": "PRACTICE_READONLY_FLAGS_AND_DATE_REQUIRED"}))
