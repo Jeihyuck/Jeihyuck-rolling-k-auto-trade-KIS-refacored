@@ -49,8 +49,11 @@ def main(argv=None) -> int:
         if str(kis.env).lower() != "practice":
             raise RuntimeError("NONPRACTICE_KIS_CLIENT")
         fresh_balance, source = kis.get_balance_cached(force=True, return_source=True)
-        original = kis.inquire_daily_ccld(
-            start_date=args.trade_date, end_date=args.trade_date
+        from datetime import datetime
+        from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
+
+        original = _daily_ccld_all_pages_for_date(
+            kis, datetime.strptime(args.trade_date, "%Y%m%d").date()
         )
         result = certify_existing_pb1_buy_watermark(
             engine=engine, order_id=args.order_id,
