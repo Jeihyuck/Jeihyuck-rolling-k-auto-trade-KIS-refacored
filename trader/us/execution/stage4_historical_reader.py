@@ -159,6 +159,7 @@ class HistoricalReadOnlyReader:
         load_claims: Callable[[], list[dict]] | None = None,
         load_debts: Callable[..., list[dict]] | None = None,
         load_debt_dates: Callable[..., set[str]] = _debt_order_source_dates,
+        load_scope: Callable[[], dict] | None = None,
         clock: Callable[[], float] = time.monotonic,
         poll_sec: float = 2.0, ttl_sec: float = 15.0,
         max_dates: int = 4,
@@ -180,6 +181,10 @@ class HistoricalReadOnlyReader:
         self.load_claims = load_claims
         self.load_debts = load_debts
         self.load_debt_dates = load_debt_dates
+        if load_scope is None:
+            from trader.us.db.repos import _us_execution_claim_scope
+            load_scope = _us_execution_claim_scope
+        self.load_scope = load_scope
         self.clock = clock
         self.poll_sec = max(1.0, float(poll_sec))
         self.ttl_sec = max(1.0, min(float(ttl_sec), 20.0))
@@ -194,6 +199,8 @@ class HistoricalReadOnlyReader:
         self._thread: threading.Thread | None = None
 
     def _poll_once(self, provider: Any) -> None:
+        if self.load_scope() != self.scope:
+            raise RuntimeError("US_STAGE4_HISTORICAL_ACCOUNT_OR_EPOCH_CHANGED")
         claims = self.load_claims()
         signatures = active_claim_signature(claims)
         debts = self.load_debts(env="practice")
@@ -300,6 +307,10 @@ class HistoricalReadOnlyReader:
             self._thread.join(timeout=0.5)
 
     def snapshot_for_claims(self, claims: list[dict]) -> dict:
+        # Verify the original broker account/epoch is still active at each
+        # authoritative handoff, not just at process startup.
+        if self.load_scope() != self.scope:
+            raise RuntimeError("US_STAGE4_HISTORICAL_ACCOUNT_OR_EPOCH_CHANGED")
         required = active_claim_signature(claims)
         if self._thread is not None and not self._thread.is_alive():
             raise RuntimeError("US_STAGE4_HISTORICAL_READER_DEAD")
@@ -334,6 +345,8 @@ class HistoricalReadOnlyReader:
         }
 
     def assert_still_valid(self, snapshot: dict, claims: list[dict]) -> None:
+        if self.load_scope() != self.scope:
+            raise RuntimeError("US_STAGE4_HISTORICAL_ACCOUNT_OR_EPOCH_CHANGED")
         if snapshot["scope"] != self.scope or snapshot["generation"] != self.generation:
             raise RuntimeError("US_STAGE4_HISTORICAL_GENERATION_MISMATCH")
         if snapshot["active_keys"] != active_claim_signature(claims):
