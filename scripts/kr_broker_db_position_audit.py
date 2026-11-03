@@ -8,6 +8,7 @@ No scheduler activation, no broker order POST, and no database writes.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sys
 
@@ -74,7 +75,9 @@ def main() -> int:
                         schema.execution_claims.c.trade_date,
                     ).where(sa.and_(
                         schema.execution_claims.c.env == "practice",
-                        schema.execution_claims.c.account_id == get_account_key(env="practice"),
+                        schema.execution_claims.c.account_id == hashlib.sha256(
+                            get_account_key(env="practice").encode("utf-8")
+                        ).hexdigest(),
                         schema.execution_claims.c.market == "KR",
                         schema.execution_claims.c.strategy_owner == "PB1",
                         schema.execution_claims.c.trading_epoch_id == str(epoch),
