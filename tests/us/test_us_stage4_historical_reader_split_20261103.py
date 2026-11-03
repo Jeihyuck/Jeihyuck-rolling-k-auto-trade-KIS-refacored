@@ -66,6 +66,7 @@ def _reader(*, kis=None, active=None, debts=None, clock=None, **kwargs):
         load_claims=lambda: list(rows),
         load_debts=lambda **kw: list(debt_rows),
         load_debt_dates=lambda _debts, **kw: set(),
+        load_scope=lambda: dict(SCOPE),
         clock=clock or time.monotonic,
         poll_sec=1.0, ttl_sec=15.0,
         **kwargs,
@@ -296,3 +297,15 @@ def test_source_day_limit_fails_closed_without_truncating_old_claims():
     with pytest.raises(RuntimeError, match="SOURCE_DATES_OVER_BUDGET"):
         reader._poll_once(kis)
     assert kis.calls == []
+
+
+def test_epoch_mismatch_after_read_before_publish_is_fenced():
+    reader = _reader(kis=ReadOnlyKIS())
+    kis = ReadOnlyKIS()
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([CLAIM])
+    reader.load_scope = lambda: {**SCOPE, "trading_epoch_id": "new-epoch"}
+    with pytest.raises(RuntimeError, match="ACCOUNT_OR_EPOCH_CHANGED"):
+        reader.assert_still_valid(snapshot, [CLAIM])
+    with pytest.raises(RuntimeError, match="ACCOUNT_OR_EPOCH_CHANGED"):
+        reader.snapshot_for_claims([CLAIM])
