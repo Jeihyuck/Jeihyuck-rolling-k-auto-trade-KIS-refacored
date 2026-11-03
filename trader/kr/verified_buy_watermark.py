@@ -104,7 +104,12 @@ def certify_existing_pb1_buy_watermark(
             return block("ORIGINAL_BROKER_ORDER_IDENTITY_INVALID")
         if not order.get("created_at"):
             return block("ORIGINAL_ORDER_DATE_MISSING")
-        order_date = order["created_at"].astimezone(_KST).strftime("%Y%m%d")
+        created_at = order["created_at"]
+        if created_at.tzinfo is None:
+            # SQLAlchemy's legacy SQLite fixture may drop tzinfo; persisted
+            # database timestamps are UTC, never process-local time.
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        order_date = created_at.astimezone(_KST).strftime("%Y%m%d")
         ccld_rows = [
             row for row in original_day_ccld["output1"]
             if isinstance(row, dict)
