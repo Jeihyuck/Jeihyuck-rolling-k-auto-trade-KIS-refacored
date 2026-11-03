@@ -91,17 +91,36 @@ class SnapshotOnlyProvider:
     _offline = False
     _tick_context = None
 
-    def __init__(self, *, books: dict[str, dict], balance: dict | None):
+    def __init__(
+        self, *, books: dict[str, dict], balance: dict | None,
+        balance_at: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        ttl_sec: float = 15.0,
+    ):
         self._books = copy.deepcopy(books)
         self._balance = copy.deepcopy(balance)
+        self._balance_at = balance_at
+        self._clock = clock
+        self._ttl_sec = ttl_sec
+
+    def _assert_fresh(self, observed_at: float) -> None:
+        age = self._clock() - observed_at
+        if age < 0 or age > self._ttl_sec:
+            raise RuntimeError("US_STAGE4_HISTORICAL_BROKER_EVIDENCE_STALE")
 
     def get_today_orders(self, trade_date: str) -> list[dict] | None:
         row = self._books.get(str(trade_date)[:10])
-        return copy.deepcopy(row["orders"]) if row is not None else None
+        if row is None:
+            return None
+        self._assert_fresh(row["at"])
+        return copy.deepcopy(row["orders"])
 
     def get_order_lookup_provenance(self, trade_date: str) -> dict:
         row = self._books.get(str(trade_date)[:10])
-        return copy.deepcopy(row["provenance"]) if row is not None else {}
+        if row is None:
+            return {}
+        self._assert_fresh(row["at"])
+        return copy.deepcopy(row["provenance"])
 
     def get_fills_by_order_no(
         self, order_no: str, symbol: str, trade_date: str, **_kwargs,
@@ -116,8 +135,9 @@ class SnapshotOnlyProvider:
         )
 
     def get_balance(self, force_refresh: bool = False) -> dict:
-        if self._balance is None:
+        if self._balance is None or self._balance_at is None:
             raise RuntimeError("US_STAGE4_HISTORICAL_BALANCE_NOT_PREFETCHED")
+        self._assert_fresh(self._balance_at)
         return copy.deepcopy(self._balance)
 
     def _get_client(self):
@@ -308,7 +328,9 @@ class HistoricalReadOnlyReader:
         return {
             "scope": dict(self.scope), "generation": self.generation,
             "active_keys": required, "books": books,
-            "balance": balance, "as_of_monotonic": now,
+            "balance": balance,
+            "balance_at": self._balance_at if balance is not None else None,
+            "as_of_monotonic": now,
         }
 
     def assert_still_valid(self, snapshot: dict, claims: list[dict]) -> None:
@@ -322,8 +344,11 @@ class HistoricalReadOnlyReader:
                     or current["books"][day]["at"] != snapshot["books"][day]["at"]):
                 raise RuntimeError("US_STAGE4_HISTORICAL_EVIDENCE_REPLACED")
 
-    @staticmethod
-    def provider_for(snapshot: dict) -> SnapshotOnlyProvider:
+    def provider_for(self, snapshot: dict) -> SnapshotOnlyProvider:
+        if snapshot["scope"] != self.scope or snapshot["generation"] != self.generation:
+            raise RuntimeError("US_STAGE4_HISTORICAL_GENERATION_MISMATCH")
         return SnapshotOnlyProvider(
             books=snapshot["books"], balance=snapshot.get("balance"),
+            balance_at=snapshot.get("balance_at"),
+            clock=self.clock, ttl_sec=self.ttl_sec,
         )
