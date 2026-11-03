@@ -74,6 +74,45 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
         if int(active or 0)>0:
             blocked+=1
             continue
+        # A terminal stop obligation requires original-date TP broker proof.
+        # If this lifecycle has NO original TP order at all, three-exchange
+        # balance I/O and another position DB write cannot possibly settle it.
+        # This cheap SELECT is not a terminality inference: a missing original
+        # order leaves the stop obligation and every fence unchanged.
+        with engine.connect() as conn:
+            candidate_originals = conn.execute(text("""
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT o.trade_date, o.symbol, o.order_no,
+                           o.qty_requested, o.qty_filled, o.env, o.trading_epoch_id
+                    FROM us_orders o
+                    JOIN us_execution_claims c
+                      ON c.action_key=o.meta->>'execution_action_key'
+                      AND c.trading_epoch_id=o.trading_epoch_id
+                     AND c.env=o.env AND c.trade_date=o.trade_date
+                     AND c.lifecycle_id=:life AND c.account_id=:account
+                     AND c.strategy_owner='US_STANDARD'
+                     AND c.market='US'
+                     AND c.action=upper(o.meta->>'profit_capture_stage')
+                    WHERE o.env='practice' AND o.trading_epoch_id=:epoch
+                      AND o.symbol=:symbol AND o.side='SELL'
+                      AND o.order_no IS NOT NULL
+                    AND o.meta->>'position_lifecycle_id'=:life
+                    AND upper(o.meta->>'strategy_owner')='US_STANDARD'
+                    LIMIT 50
+                ) exact_original_tp
+            """), {
+                "life":life, "account":account_claim,
+                "epoch":epoch, "symbol":symbol,
+            }).scalar_one()
+        if not (0 < int(candidate_originals or 0) < 50):
+            blocked+=1
+            logger.info(
+                "[US_STAGE4][STOP_SETTLEMENT][NO_ORIGINAL_TP_PROOF] "
+                "symbol=%s reason=NO_MATCHING_OR_TOO_MANY_ORIGINALS "
+                "action=KEEP_FENCE_SKIP_KIS_BALANCE",
+                symbol,
+            )
+            continue
         eligible.append(debt)
     if not eligible:
         result={"checked":0,"settled":0,"blocked":blocked,
@@ -126,14 +165,18 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                        o.qty_requested,o.qty_filled,o.env,o.trading_epoch_id
                 FROM us_orders o
                 JOIN us_execution_claims c
-                  ON c.trading_epoch_id=o.trading_epoch_id
+                  ON c.action_key=o.meta->>'execution_action_key'
+                  AND c.trading_epoch_id=o.trading_epoch_id
                  AND c.env=o.env AND c.trade_date=o.trade_date
                  AND c.lifecycle_id=:life AND c.account_id=:account
                  AND c.strategy_owner='US_STANDARD'
+                 AND c.market='US'
                  AND c.action=upper(o.meta->>'profit_capture_stage')
                 WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                   AND o.symbol=:symbol AND o.side='SELL'
                   AND o.order_no IS NOT NULL
+                  AND o.meta->>'position_lifecycle_id'=:life
+                  AND upper(o.meta->>'strategy_owner')='US_STANDARD'
                 ORDER BY o.trade_date
                 LIMIT 50
             """),{"life":life,"account":account_claim,"epoch":epoch,
