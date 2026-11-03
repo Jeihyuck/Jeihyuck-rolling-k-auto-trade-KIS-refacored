@@ -182,24 +182,33 @@ def _revision_mismatch_is_safe(prep_contract: dict, latest_contract: dict) -> tu
 
 def _runtime_provenance(*, session: str, run_id: str, started_at_et: str = "", ended_at_et: str = "", wall_elapsed_sec: float = 0.0) -> dict:
     from datetime import datetime, timezone
-    try:
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
-        kst = ZoneInfo("Asia/Seoul")
-        now_utc_dt = datetime.now(timezone.utc)
-        started_utc_val = os.getenv("US_STARTED_AT_UTC") or now_utc_dt.isoformat().replace("+00:00", "Z")
-        started_et_val = started_at_et or now_utc_dt.astimezone(et).isoformat()
-        started_kst_val = os.getenv("US_STARTED_AT_KST") or now_utc_dt.astimezone(kst).isoformat()
-        ended_et_val = ended_at_et or now_utc_dt.astimezone(et).isoformat()
-        ended_kst_val = now_utc_dt.astimezone(kst).isoformat()
-        ended_utc_val = now_utc_dt.isoformat().replace("+00:00", "Z")
-    except Exception:
-        started_utc_val = os.getenv("US_STARTED_AT_UTC") or datetime.utcnow().isoformat() + "Z"
-        started_et_val = started_at_et or "unknown"
-        started_kst_val = os.getenv("US_STARTED_AT_KST") or "unknown"
-        ended_et_val = ended_at_et or "unknown"
-        ended_kst_val = "unknown"
-        ended_utc_val = datetime.utcnow().isoformat() + "Z"
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    kst = ZoneInfo("Asia/Seoul")
+    now_utc_dt = datetime.now(timezone.utc)
+
+    def aware_event(value: str) -> datetime:
+        event = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if event.tzinfo is None or event.utcoffset() is None:
+            raise ValueError("US_SESSION_PROVENANCE_NAIVE_TIMESTAMP")
+        return event
+
+    # Use one actual start/end event to derive every timezone. Previously,
+    # UTC/KST start silently used *report-generation time* if the WSL
+    # scheduler didn't export US_STARTED_AT_UTC/US_STARTED_AT_KST. That can
+    # make the reported start equal to the end despite hours of trading.
+    start_source = (
+        aware_event(started_at_et) if started_at_et
+        else aware_event(os.environ["US_STARTED_AT_UTC"])
+        if os.getenv("US_STARTED_AT_UTC") else now_utc_dt
+    )
+    end_source = aware_event(ended_at_et) if ended_at_et else now_utc_dt
+    started_utc_val = start_source.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    started_et_val = start_source.astimezone(et).isoformat()
+    started_kst_val = start_source.astimezone(kst).isoformat()
+    ended_utc_val = end_source.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    ended_et_val = end_source.astimezone(et).isoformat()
+    ended_kst_val = end_source.astimezone(kst).isoformat()
     branch = os.getenv("GITHUB_REF_NAME") or _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
     sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
     workflow = os.getenv("GITHUB_WORKFLOW") or "local"

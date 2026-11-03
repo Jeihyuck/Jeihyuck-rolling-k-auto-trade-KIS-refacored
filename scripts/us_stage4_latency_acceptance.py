@@ -37,7 +37,7 @@ STAGE4_READY_INTERVAL = re.compile(
 
 
 def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
-                                    p95_limit_ms: float = 25000.,
+                                    p95_limit_ms: float = 20000.,
                                     p99_limit_ms: float = 30000.) -> dict:
     """Stage4 continuity includes deferred work, not just reconciliation body.
 
@@ -77,12 +77,14 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
         if match:
             values.append(float(match.group("ms")))
     pct = interval_percentiles(values)
+    over_30s_count = sum(value >= 30000. for value in values)
+    observed_interval_seconds = round(sum(values) / 1000., 3)
     blockers = []
     if pct["count"] < min_samples:
         blockers.append("STAGE4_READY_INTERVAL_SAMPLES_INSUFFICIENT")
     if reconcile_failures:
         blockers.append("STAGE4_RECONCILE_FAILURE_OBSERVED")
-    if stale_events or any(v >= 30000. for v in values):
+    if stale_events or over_30s_count:
         blockers.append("STAGE4_WRITER_STALE_RISK")
     if startup_timeouts:
         blockers.append("STAGE4_STARTUP_TIMEOUT_OBSERVED")
@@ -105,6 +107,8 @@ def evaluate_stage4_ready_intervals(lines, *, min_samples: int = 20,
         "tick_health_retry_exhausted_count": tick_health_exhausted,
         "block_all_orders_count": order_fences,
         "p95_limit_ms": p95_limit_ms,
+        "ready_intervals_over_30s_count": over_30s_count,
+        "observed_ready_interval_seconds": observed_interval_seconds,
         "p99_limit_ms": p99_limit_ms,
         "blockers": blockers,
         **pct,

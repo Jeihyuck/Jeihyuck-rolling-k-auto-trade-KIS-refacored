@@ -831,18 +831,34 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 fills_by_trade_date[source_trade_date] = None
         return fills_by_trade_date[source_trade_date]
 
-    # A replay of *historical* active claims must not query today's broker
-    # order/fill books. Every source day is resolved only when an attempt
-    # actually needs it. This is a per-invocation cache, never shared with a
-    # later tick or generation.
-    if provider is not None and budget_available():
-        try: balance = provider.get_balance(force_refresh=True)
-        except TypeError: balance = provider.get_balance()
-        except Exception: balance = None
-    positions_by_symbol = {}
-    if isinstance(balance, dict):
-        for pos in balance.get("positions") or []:
-            positions_by_symbol[str(pos.get("symbol") or pos.get("pdno") or "").upper()] = pos
+    # Historical broker order/fill evidence is authoritative. A three-
+    # exchange account balance request must not precede every replay when
+    # the source-date KIS order already proves the attempt's status. Fetch
+    # balance only in the existing unverified-order fallback; never cache
+    # across invocations, so a missing order remains durably unresolved.
+    balance_checked = False
+    positions_by_symbol: dict[str, dict] = {}
+
+    def position_from_authoritative_balance(symbol: str) -> dict | None:
+        nonlocal balance, balance_checked
+        if not balance_checked:
+            balance_checked = True
+            if provider is not None and budget_available():
+                try:
+                    balance = provider.get_balance(force_refresh=True)
+                except TypeError:
+                    try:
+                        balance = provider.get_balance()
+                    except Exception:
+                        balance = None
+                except Exception:
+                    balance = None
+                if isinstance(balance, dict):
+                    for pos in balance.get("positions") or []:
+                        positions_by_symbol[
+                            str(pos.get("symbol") or pos.get("pdno") or "").upper()
+                        ] = pos
+        return positions_by_symbol.get(symbol)
 
     collision_keys_recorded: set[str] = set()
     for (key, active_attempt), order_events in grouped.items():
@@ -1213,7 +1229,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         pre_qty_raw = latest.get("pre_qty")
                     if pre_qty_raw is None and isinstance(latest.get("meta"), dict):
                         pre_qty_raw = latest["meta"].get("pre_order_position_qty")
-                    post_pos = positions_by_symbol.get(symbol) if positions_by_symbol else None
+                    post_pos = position_from_authoritative_balance(symbol)
                     post_qty_raw = (post_pos or {}).get("qty") or (post_pos or {}).get("holding_qty") or (post_pos or {}).get("ovrs_cblc_qty")
                     if pre_qty_raw is not None and post_qty_raw is not None and requested > 0:
                         try:

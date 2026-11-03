@@ -596,9 +596,38 @@ def _report_provenance(session: str | None) -> dict:
     sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
     workflow = os.getenv("GITHUB_WORKFLOW") or "local"
     run_id = os.getenv("GITHUB_RUN_ID", "local")
-    now_utc = datetime.utcnow().isoformat() + "Z"
-    now_et = datetime.now(tz=NY_TZ).isoformat()
-    now_kst = datetime.now(tz=ZoneInfo("Asia/Seoul")).isoformat()
+    from datetime import timezone
+    utc = timezone.utc
+    kst = ZoneInfo("Asia/Seoul")
+    now = datetime.now(utc)
+
+    def event_timestamp(value: str) -> datetime:
+        event = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if event.tzinfo is None or event.utcoffset() is None:
+            raise ValueError("US_DAILY_REPORT_NAIVE_PROVENANCE")
+        return event.astimezone(utc)
+
+    # Prefer a single supplied start/end event over three independently
+    # exported timestamps. Without a source event this is the report
+    # generation time, not a claim that the trading session began now.
+    started_raw = (
+        os.getenv("US_STARTED_AT_ET") or os.getenv("US_STARTED_AT_UTC")
+        or os.getenv("US_STARTED_AT_KST") or ""
+    )
+    ended_raw = (
+        os.getenv("US_ENDED_AT_ET") or os.getenv("US_ENDED_AT_UTC")
+        or os.getenv("US_ENDED_AT_KST") or ""
+    )
+    try:
+        started = event_timestamp(started_raw) if started_raw else now
+        ended = event_timestamp(ended_raw) if ended_raw else now
+        timestamp_status = "OK"
+    except (ValueError, OverflowError):
+        started, ended = now, now
+        timestamp_status = "INVALID_OR_UNVERIFIED_EVENT_TIME"
+    def utc_iso(value: datetime) -> str:
+        return value.astimezone(utc).isoformat().replace("+00:00", "Z")
+
     return {
         "branch": branch or "unknown",
         "commit_sha": sha or "unknown",
@@ -612,12 +641,17 @@ def _report_provenance(session: str | None) -> dict:
         "run_id": run_id,
         "session_id": f"{session or 'daily'}-{run_id}",
         "source_log_file": os.getenv("US_SOURCE_LOG_FILE", "runtime/wsl-us-trader.log"),
-        "started_at_utc": os.getenv("US_STARTED_AT_UTC", now_utc),
-        "started_at_et": os.getenv("US_STARTED_AT_ET", now_et),
-        "started_at_kst": os.getenv("US_STARTED_AT_KST", now_kst),
-        "ended_at_utc": now_utc,
-        "ended_at_et": os.getenv("US_ENDED_AT_ET", now_et),
-        "ended_at_kst": os.getenv("US_ENDED_AT_KST", now_kst),
+        "started_at_utc": utc_iso(started),
+        "started_at_et": started.astimezone(NY_TZ).isoformat(),
+        "started_at_kst": started.astimezone(kst).isoformat(),
+        "ended_at_utc": utc_iso(ended),
+        "ended_at_et": ended.astimezone(NY_TZ).isoformat(),
+        "ended_at_kst": ended.astimezone(kst).isoformat(),
+        "timestamp_provenance_status": timestamp_status,
+        "started_at_source": (
+            "supplied_event" if started_raw and timestamp_status == "OK"
+            else "report_generation_fallback"
+        ),
         "wall_elapsed_sec": float(os.getenv("US_WALL_ELAPSED_SEC", "0") or 0),
         "code_version_source": "github_actions" if os.getenv("GITHUB_RUN_ID") else "git_fallback",
     }

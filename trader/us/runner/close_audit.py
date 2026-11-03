@@ -19,13 +19,30 @@ def audit_us_close_report(report: dict[str, Any]) -> dict[str, Any]:
     recovery = report.get("broker_recovery_health") or {}
     if not recovery.get("available"):
         record("BROKER_RECOVERY_HEALTH_UNAVAILABLE", "P0")
+    # Diagnostic origin date is not the date on which a conflict occurred.
+    # Preserve global P0/P1 findings even if all source claims are historical.
+    origin = {}
+    if recovery.get("execution_claim_source_date_breakdown_available") is True:
+        origin = {
+            name: recovery.get(name)
+            for name in (
+                "unresolved_source_date_current",
+                "unresolved_source_date_prior",
+                "unresolved_source_date_other_or_unknown",
+                "claim_conflicts_source_date_current",
+                "claim_conflicts_source_date_prior",
+                "claim_conflicts_source_date_other_or_unknown",
+            )
+        }
     if int(recovery.get("unresolved_execution_actions") or 0):
         record("UNRESOLVED_EXECUTION_ACTIONS", "P0",
-               count=int(recovery["unresolved_execution_actions"]))
+               count=int(recovery["unresolved_execution_actions"]),
+               **{k: v for k, v in origin.items() if k.startswith("unresolved_")})
     blocked = int(recovery.get("duplicate_semantic_submit_detection_count") or 0)
     if blocked:
         record("BLOCKED_EXECUTION_CLAIM_ATTEMPTS", "P1", count=blocked,
-               note="This metric counts blocked claims, not broker submissions")
+               note="This metric counts blocked claims, not broker submissions",
+               **{k: v for k, v in origin.items() if k.startswith("claim_conflicts_")})
 
     if str(report.get("report_consistency") or "").upper() == "FAILED":
         record("CLOSE_REPORT_CONSISTENCY_FAILED", "P0")

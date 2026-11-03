@@ -47,7 +47,7 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
             self.reads = []
 
         def get_balance(self, force_refresh=False):
-            return {"positions": []}
+            pytest.fail("verified broker order does not require a three-exchange balance read")
 
         def get_order_lookup_provenance(self, trade_date):
             return {"verified": True, "source": "kis_authenticated_order_book",
@@ -80,6 +80,7 @@ def test_two_old_claims_share_single_source_date_order_book(monkeypatch):
     assert result["failed_count"] == 0
     assert result["broker_unfilled_ack_count"] == 2
     assert result["broker_full_fill_count"] == 0
+    assert result["balance_fetched"] is False
     # A NEW invocation must fetch fresh evidence again, never reuse stale state.
     journal.replay_order_journal(
         current_date, provider=provider,

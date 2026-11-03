@@ -39,8 +39,10 @@ def test_missing_orderbook_still_fetches_original_day_fills(monkeypatch):
         def __init__(self):
             self.order_days = []
             self.detail_calls = []
+            self.balance_calls = 0
 
         def get_balance(self, force_refresh=False):
+            self.balance_calls += 1
             return {"positions": []}
 
         def get_order_lookup_provenance(self, day):
@@ -64,6 +66,7 @@ def test_missing_orderbook_still_fetches_original_day_fills(monkeypatch):
     assert provider.order_days == [source_date]
     assert fill_days == [source_date], "missing exact order proof must retain fill fallback"
     assert len(provider.detail_calls) == 1
+    assert provider.balance_calls == 1  # still fetch for unresolved broker-proof fallback
     assert result["broker_unknown_count"] == 1
     assert result["broker_full_fill_count"] == 0
     assert result["unresolved_count"] == 1
