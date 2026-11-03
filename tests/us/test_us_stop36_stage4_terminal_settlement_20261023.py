@@ -150,3 +150,20 @@ def test_settlement_rechecks_durable_claim_after_kis_balance_race(monkeypatch):
     assert count == [("claim","life-pfe"), ("original","life-pfe"),
                      ("claim","life-pfe")]
     assert result == {"checked":1, "settled":0, "blocked":1, "total_pending":1}
+
+
+def test_original_tp_lookup_cannot_associate_another_lifecycle_same_symbol_day():
+    """Source-day matching alone is NOT original TP claim ownership proof."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    paths = [
+        root / "trader/us/execution/protective_stop_settlement_worker.py",
+        root / "trader/us/execution/stage4_historical_reader.py",
+    ]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "c.action_key=o.meta->>'execution_action_key'" in text
+        assert "o.meta->>'position_lifecycle_id'=:life" in text
+        assert "upper(o.meta->>'strategy_owner')='US_STANDARD'" in text
+        assert "c.account_id=:account" in text
+        assert "c.market='US'" in text
