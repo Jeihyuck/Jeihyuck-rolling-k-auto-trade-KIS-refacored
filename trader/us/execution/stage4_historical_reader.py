@@ -21,7 +21,13 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 
-def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, str, str]]:
+def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, ...]]:
+    """Immutable fingerprint includes changing claim evidence as well as identity.
+
+    An execution action can partially fill while its attempt ID remains
+    unchanged. Checking just (source date, client key, attempt) would allow
+    READY to be published against a superseded cumulative quantity.
+    """
     if not isinstance(claims, list):
         raise RuntimeError("US_STAGE4_HISTORICAL_CLAIMS_UNVERIFIED")
     keys = set()
@@ -32,7 +38,14 @@ def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, str, str]
         if not (day and client_key and attempt_id):
             raise RuntimeError("US_STAGE4_HISTORICAL_CLAIM_IDENTITY_MISSING")
         date.fromisoformat(day)
-        keys.add((day, client_key, attempt_id))
+        keys.add((
+            day, client_key, attempt_id,
+            str(claim.get("strategy_owner") or "").upper(),
+            str(claim.get("trading_epoch_id") or ""),
+            str(claim.get("requested_qty") if claim.get("requested_qty") is not None else ""),
+            str(claim.get("cumulative_filled_qty") if claim.get("cumulative_filled_qty") is not None else ""),
+            str(claim.get("attempt_state") or "").upper(),
+        ))
     return frozenset(keys)
 
 
