@@ -328,6 +328,14 @@ def _load_pending_orders(*, engine: Any, env: str, strategy: str, epoch_id: str)
     candidate_rows = []
     for raw in rows:
         row = dict(raw)
+        if str(row.get("code") or "").zfill(6) == "122630":
+            # KR_INFINITE owns 122630; the historical PB1 row was only a
+            # passive broker-truth mirror. Never settle its SELL again as PB1.
+            logger.info(
+                "[KR_CROSS_DAY_SELL][OWNER_SKIP] code=122630 "
+                "reason=KR_INFINITE_RESERVED action=DEDICATED_INFINITE_PROOF"
+            )
+            continue
         if str(row.get("status") or "").upper() in {"FILLED", "RECONCILED"}:
             try:
                 done, _ = _verify_original_sell_economics(engine=engine, source=row)
