@@ -265,12 +265,18 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     # This removes the repeated 18-22s DB write observed on 2026-10-27.
     # A changed quantity/price, failed save, worker restart or TTL expiry
     # always forces the original full persistence/reconciliation path.
-    from trader.us.execution.stage4_fill_memo import VerifiedFillPersistenceMemo
+    from trader.us.execution.stage4_fill_memo import (
+        VerifiedFillPersistenceMemo, fills_digest,
+    )
     memo = _STAGE4_FILL_MEMOS.setdefault(trade_date, VerifiedFillPersistenceMemo())
     broker_fills = fills.get("fills") or []
     if memo.should_persist(broker_fills):
+        # DB persistence mutates these dictionaries to attach local-order
+        # attribution. Capture original KIS proof before the save; otherwise
+        # every subsequent fetch appears changed and repeats an expensive write.
+        broker_digest = fills_digest(broker_fills)
         save = save_fills_with_result(broker_fills, trade_date=trade_date)
-        memo.mark_persisted(broker_fills, status=save.get("status", ""))
+        memo.mark_persisted_digest(broker_digest, status=save.get("status", ""))
         if save.get("status") != "OK":
             raise RuntimeError("US_STAGE4_FILLS_PERSIST_UNVERIFIED")
     else:
