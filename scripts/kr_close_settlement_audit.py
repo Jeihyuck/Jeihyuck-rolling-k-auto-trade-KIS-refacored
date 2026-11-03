@@ -100,8 +100,42 @@ def audit_sell_settlement(
     }
     gaps = []
     inspected = 0
+    excluded_infinite_mirror_orders = 0
+    certified_mirror_sell_ids = set()
+    for position in positions:
+        if (
+            str(position.get("code") or "") == "122630"
+            and str(position.get("status") or "").upper() == "CLOSED"
+            and str(position.get("closed_reason") or "").upper()
+            == "KR_INFINITE_LEGACY_MIRROR_RETIRED"
+        ):
+            raw = position.get("position_meta") or {}
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (TypeError, ValueError):
+                    raw = {}
+            proof = (raw.get("kr_infinite_legacy_mirror_retired") or {}) if isinstance(raw, dict) else {}
+            if (
+                isinstance(proof, dict)
+                and proof.get("result") == "VERIFIED_FULL_TP2_EXIT"
+                and proof.get("source") == "ORIGINAL_KIS_FULL_ORDER_CCLD_AND_EXECUTION_CLAIMS"
+            ):
+                certified_mirror_sell_ids.update(
+                    str(x) for x in proof.get("verified_sell_broker_order_ids", [])
+                    if isinstance(x, str) and len(x) == 10 and x.isdigit()
+                )
     for order in orders:
         if str(order.get("side") or "").upper() != "SELL":
+            continue
+        if (
+            str(order.get("code") or "") == "122630"
+            and str(order.get("status") or "").upper() == "FILLED"
+            and str(order.get("kis_odno") or "") in certified_mirror_sell_ids
+        ):
+            # Not a PB1 economic SELL: the KR_INFINITE owner has separately
+            # certified these exact broker IDs and retired its legacy mirror.
+            excluded_infinite_mirror_orders += 1
             continue
         inspected += 1
         order_id = str(order.get("order_id") or "")
@@ -150,6 +184,7 @@ def audit_sell_settlement(
     return {
         "status": "ECONOMIC_SETTLEMENT_PENDING" if gaps else "PRICED_SELL_EVIDENCE_MATCHED",
         "sell_orders_checked": inspected,
+        "certified_infinite_mirror_sells_excluded": excluded_infinite_mirror_orders,
         "gap_count": len(gaps),
         "gaps": gaps,
         "note": "Read-only DB evidence. Broker-native replay requires separate KIS read-only proof.",
@@ -184,7 +219,7 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
             "end_utc": __import__("datetime").datetime.combine(day + timedelta(days=1), __import__("datetime").time.min, tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=9))).astimezone(__import__("datetime").timezone.utc),
         }).mappings()]
         positions = [dict(x) for x in conn.execute(text("""
-            SELECT code, position_cycle_id, status, qty, closed_reason
+            SELECT code, position_cycle_id, status, qty, closed_reason, position_meta
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """), {"env": env, "epoch": epoch}).mappings()]
     # Use the broker's own product name when present, but never trust a JSON
