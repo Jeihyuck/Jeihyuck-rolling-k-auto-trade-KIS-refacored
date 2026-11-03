@@ -590,6 +590,20 @@ class CandidatePoolBuilder:
             self.target_size,
         )
         logger.info("[CANDIDATE_POOL][BUILD][FINAL_SAMPLE] %s", final_sample)
+        target_shortfall = max(0, self.target_size - len(result_codes))
+        if target_shortfall:
+            # Observability only; do not relax Minervini/RS/VCP policy or
+            # automatically admit a different strategy owner's candidates.
+            logger.warning(
+                "[CANDIDATE_POOL][BUILD][TARGET_SHORTFALL] target=%s actual=%s "
+                "shortfall=%s prefilter_scored=%s excluded_insufficient_ohlcv=%s "
+                "excluded_volatility=%s excluded_provider=%s strict=%s "
+                "relaxed=%s fallback=%s action=KEEP_CURRENT_ADMISSION_POLICY",
+                self.target_size, len(result_codes), target_shortfall,
+                len(scored), excluded_data_insufficient,
+                excluded_high_volatility, excluded_provider_error,
+                strict_final, relaxed_final, fallback_final,
+            )
 
         self.last_build_report = {
             "universe": len(codes),
@@ -601,6 +615,13 @@ class CandidatePoolBuilder:
             "final_selected": len(result_codes),
             "min_size": min_size,
             "target_size": self.target_size,
+            "target_shortfall": target_shortfall,
+            "exclusions": {
+                "insufficient_ohlcv": excluded_data_insufficient,
+                "low_price": excluded_low_price,
+                "high_volatility": excluded_high_volatility,
+                "provider_error": excluded_provider_error,
+            },
             "chosen_pass": chosen_pass,
             "thresholds_used": {
                 "base_rs_min": base_rs_min,
