@@ -725,7 +725,13 @@ class DurableExecutionClaimRepo:
         market: str | None = None,
         trading_epoch_id: str | None = None,
         strategy_owner: str | None = None,
+        trade_date: date | str | None = None,
     ) -> dict[str, int]:
+        """Durable unresolved safety totals plus optional source-date breakdown.
+
+        Source dates identify the originating claim, NOT when a conflict
+        occurred. Historical counts remain in the original fatal totals.
+        """
         filters = []
         for field, value, normalize in (
             (self.actions.c.env, env, str.lower),
@@ -736,24 +742,39 @@ class DurableExecutionClaimRepo:
         ):
             if value is not None:
                 filters.append(field == normalize(str(value).strip()))
+        unresolved = sa.or_(
+            self.actions.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
+            self.actions.c.active_attempt_id.is_not(None),
+        )
+        aggregates = [
+            sa.func.sum(sa.case((unresolved, 1), else_=0)),
+            sa.func.sum(self.actions.c.claim_conflicts),
+        ]
+        breakdown_labels = []
+        if trade_date is not None:
+            day = (trade_date if isinstance(trade_date, date)
+                   else date.fromisoformat(str(trade_date)[:10]))
+            origin = self.actions.c.trade_date
+            groups = (
+                ("current", origin == day),
+                ("prior", origin < day),
+                ("other_or_unknown", sa.or_(origin.is_(None), origin > day)),
+            )
+            for label, predicate in groups:
+                aggregates.append(sa.func.sum(
+                    sa.case((sa.and_(unresolved, predicate), 1), else_=0)
+                ))
+                breakdown_labels.append("unresolved_source_date_" + label)
+                aggregates.append(sa.func.sum(
+                    sa.case((predicate, self.actions.c.claim_conflicts), else_=0)
+                ))
+                breakdown_labels.append("claim_conflicts_source_date_" + label)
         with self.engine.connect() as conn:
-            values = conn.execute(
-                sa.select(
-                    sa.func.sum(sa.case(
-                        (
-                            sa.or_(
-                                self.actions.c.action_state.in_(("IN_FLIGHT", "UNCERTAIN")),
-                                self.actions.c.active_attempt_id.is_not(None),
-                            ),
-                            1,
-                        ),
-                        else_=0,
-                    )),
-                    sa.func.sum(self.actions.c.claim_conflicts),
-                )
-                .where(*filters)
-            ).one()
-        return {
+            values = conn.execute(sa.select(*aggregates).where(*filters)).one()
+        result = {
             "unresolved_execution_actions": int(values[0] or 0),
             "execution_claim_conflicts": int(values[1] or 0),
         }
+        for index, label in enumerate(breakdown_labels, 2):
+            result[label] = int(values[index] or 0)
+        return result
