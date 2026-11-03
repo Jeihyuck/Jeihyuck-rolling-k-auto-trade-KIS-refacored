@@ -165,3 +165,49 @@ def test_stage4_failed_mutating_save_does_not_memoize():
     assert memo.should_persist([_fill()])
     memo.mark_persisted_digest(original_digest, status="OK")
     assert not memo.should_persist([_fill()])
+
+
+def test_stage4_db_failure_after_input_mutation_blocks_ready_and_retries(monkeypatch):
+    """Crash-like failed persistence never proceeds to replay/READY evidence."""
+    import pytest
+    import trader.us.execution.authoritative_reconcile_worker as worker
+    import trader.us.execution.fills as fills_mod
+    import trader.us.db.repos as repos
+    import trader.us.execution.order_journal as journal
+    import trader.us.execution.reconcile as reconcile
+    import trader.us.execution.reservation_reconcile_worker as reservations
+    import trader.us.runner.trade_tick_runner as ticks
+
+    events = []
+    monkeypatch.setattr(worker, "_STAGE4_FILL_MEMOS", {})
+    monkeypatch.setattr(fills_mod, "get_fills_today",
+                        lambda **kw: (events.append("KIS"),
+                                     {"status": "OK", "fills": [_fill()]})[1])
+    def persist(rows, **_):
+        events.append("DB_SAVE")
+        rows[0]["client_order_key"] = "LOCAL_KEY"
+        rows[0]["meta"]["strategy_owner"] = "US_STANDARD"
+        return {"status": "DB_ERROR" if events.count("DB_SAVE") == 1 else "OK"}
+    monkeypatch.setattr(repos, "save_fills_with_result", persist)
+    monkeypatch.setattr(journal, "replay_order_journal",
+                        lambda *a, **k: (events.append("REPLAY"),
+                                        {"status": "OK", "unresolved_count": 0})[1])
+    monkeypatch.setattr(reconcile, "reconcile_ack_orders_with_balance",
+                        lambda **k: {"status": "OK", "unresolved_count": 0})
+    monkeypatch.setattr(reservations, "reconcile_proven_reservations_once",
+                        lambda **k: {"unresolved": 0})
+    monkeypatch.setattr(ticks, "_mark_trend_stages_from_records", lambda *a, **k: None)
+    monkeypatch.setattr(ticks, "_mark_soft_stop_stages_from_records", lambda *a, **k: None)
+    args = dict(provider=object(), trade_date="2026-11-02",
+                session_run_id="fault-injection", writer_generation="g",
+                conn=None, scope={})
+
+    with pytest.raises(RuntimeError, match="US_STAGE4_FILLS_PERSIST_UNVERIFIED"):
+        worker.run_reconcile_once(**args)
+    assert events == ["KIS", "DB_SAVE"]  # no READY-safe result, no replay
+    worker.run_reconcile_once(**args)
+    assert events.count("DB_SAVE") == 2  # original evidence re-persisted
+    assert events.count("REPLAY") == 1
+    worker.run_reconcile_once(**args)
+    assert events.count("KIS") == 3     # authoritative KIS still fetched
+    assert events.count("DB_SAVE") == 2  # saved evidence memo now succeeds
