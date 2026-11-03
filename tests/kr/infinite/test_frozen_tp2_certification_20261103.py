@@ -67,9 +67,9 @@ def _fixture():
             "position_cycle_id": None, "side": "BUY" if i == 0 else "SELL",
             "qty": qty, "status": "RECONCILED" if i == 0 else "FILLED",
             "kis_odno": odno,
-            "submitted_at": datetime.strptime(day+" 10:00:00", "%Y%m%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
-            ) if False else datetime.strptime(day+" 00:31:54", "%Y%m%d %H:%M:%S").replace(tzinfo=timezone.utc),
+            "submitted_at": datetime.strptime(
+                day+" 00:31:54", "%Y%m%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc),
             "request_json": {},
         })
     positions = [{
@@ -118,3 +118,13 @@ def test_fail_closed_without_proof(mutate,reason):
     mutate(args)
     result = validate_frozen_tp2_proof(**args)
     assert result == {"state": "BLOCKED", "reason": reason, "updated_rows": 0}
+
+
+def test_unattributed_extra_122630_broker_trade_blocks_repair():
+    args = _fixture()
+    args["original_pages"]["20261027"]["output1"].append({
+        "ord_dt": "20261027", "pdno": "122630",
+        "odno": "0000099999", "sll_buy_dvsn_cd": "01",
+        "tot_ccld_qty": "1", "tot_ccld_amt": "72090", "rmn_qty": "0",
+    })
+    assert validate_frozen_tp2_proof(**args)["reason"] == "UNATTRIBUTED_ORIGINAL_KIS_SYMBOL_ORDER"
