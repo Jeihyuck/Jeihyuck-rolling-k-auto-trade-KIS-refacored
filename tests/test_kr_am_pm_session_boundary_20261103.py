@@ -51,7 +51,7 @@ def test_live_wsl_am_isolation_and_pm_handoff_contract() -> None:
     am = (REPO / "scripts/wsl/run-kr-am.sh").read_text(encoding="utf-8")
     pm = (REPO / "scripts/wsl/run-kr-afternoon.sh").read_text(encoding="utf-8")
     runner = (REPO / "trader/pb1_runner.py").read_text(encoding="utf-8")
-    assert 'PB1_AM_SESSION_END="${PB1_AM_SESSION_END:-12:55}"' in am
+    assert 'PB1_AM_SESSION_END="12:55"' in am
     assert 'PB1_MORNING_WINDOW_END="$PB1_AM_SESSION_END"' in am
     assert 'MORNING_WINDOW_END="$PB1_AM_SESSION_END"' in am
     assert 'PB1_AFTERNOON_WINDOW_START="13:00"' in am
