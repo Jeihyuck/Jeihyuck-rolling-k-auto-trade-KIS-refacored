@@ -1,7 +1,7 @@
 """Operator-triggered KR PB1 legacy missing-cycle repair, practice only.
 
 Read-only evidence check:
-  NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_restore_legacy_sell_cycle \
+  FORCE_HTTP=1 NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_restore_legacy_sell_cycle \
     --code 122630 --buy-day 20261026 --sell-day 20261027
 
 Only after reviewing the READY_TO_BIND evidence, repeat with --apply.
@@ -28,9 +28,10 @@ def main(argv=None):
         os.getenv("NO_TRADE") != "1"
         or os.getenv("DRY_RUN") != "1"
         or os.getenv("KIS_ENV") != "practice"
+        or os.getenv("FORCE_HTTP") != "1"
         or len(args.code) != 6 or not args.code.isdigit()
     ):
-        print(json.dumps({"state":"BLOCKED","reason":"PRACTICE_NO_TRADE_REQUIRED"}))
+        print(json.dumps({"state":"BLOCKED","reason":"PRACTICE_NO_TRADE_FORCE_GET_REQUIRED"}))
         return 3
     try:
         dates = {
