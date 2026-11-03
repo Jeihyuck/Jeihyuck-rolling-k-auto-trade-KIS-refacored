@@ -2177,6 +2177,20 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
                         position_cycle_id=str(source_order.get("position_cycle_id") or "") or None,
                         order_id=str(source_order.get("order_id") or "") or None,
+                        # Bind the exact current KIS cumulative watermark to
+                        # the pre-order holding baseline. Prevents 91 confirmed
+                        # shares being added atop an unproven phantom 22-share
+                        # DB position while retaining valid partial 20→91.
+                        buy_application_cumulative_qty=(
+                            next_confirmed_qty if cumulative_buy_evidence is not None else None
+                        ),
+                        buy_application_previous_confirmed_qty=(
+                            previous_confirmed_qty if cumulative_buy_evidence is not None else None
+                        ),
+                        buy_cost_delta_override=(
+                            next_confirmed_notional - previous_confirmed_notional
+                            if cumulative_buy_evidence is not None else None
+                        ),
                     )
 
                 atomic_buy_applied = False
