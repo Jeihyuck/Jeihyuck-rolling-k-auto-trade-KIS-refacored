@@ -238,8 +238,27 @@ def _pending_fill_application_codes(*, engine, env: str, strategy: str) -> set[s
                     pending.add(code)
                 continue
             baseline = _baseline_qty(order)
-            if baseline is not None and _qty(position.get("qty")) == baseline:
-                pending.add(code)
+            if baseline is not None:
+                # A confirmed BUY cannot be reconstructed by copying a KIS
+                # aggregate over an unexplained DB lifecycle. Mico 11/03:
+                # 91 cumulatively executed, pre-order holdings 0, DB 113.
+                # Without this fence stale-position adjustment could silently
+                # overwrite 113 -> 91 while leaving no applied-order watermark.
+                db_qty = _qty(position.get("qty"))
+                expected_qty = baseline + cumulative_qty
+                if db_qty != expected_qty:
+                    logger.error(
+                        "[KR_BUY_APPLICATION][UNATTRIBUTED_POSITION_DELTA] "
+                        "code=%s order_id=%s db_qty=%s pre_order_qty=%s "
+                        "cumulative_fill_qty=%s expected_qty=%s action=NO_BALANCE_OVERWRITE",
+                        code, order_id, db_qty, baseline, cumulative_qty,
+                        expected_qty,
+                    )
+                    pending.add(code)
+                # A matching quantity with no watermark is not proof of
+                # applied economics; leave it for the normal fill writer
+                # and the external audit, without inventing a fill.
+
 
     return pending
 
