@@ -2217,6 +2217,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                                 portfolio_epoch_id=str(source_order.get("portfolio_epoch_id") or "") or None,
                                 position_cycle_id=str(source_order.get("position_cycle_id") or "") or None,
                                 order_id=str(source_order.get("order_id") or "") or None,
+                                buy_application_cumulative_qty=int(decision.cumulative_qty),
+                                buy_application_previous_confirmed_qty=(
+                                    int(decision.cumulative_qty) - int(decision.qty_delta)
+                                ),
                                 buy_cost_delta_override=float(decision.notional_delta),
                                 _conn=conn,
                             )
