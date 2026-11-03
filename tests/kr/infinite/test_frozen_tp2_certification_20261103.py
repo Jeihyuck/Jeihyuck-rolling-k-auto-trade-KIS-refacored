@@ -128,3 +128,41 @@ def test_unattributed_extra_122630_broker_trade_blocks_repair():
         "tot_ccld_qty": "1", "tot_ccld_amt": "72090", "rmn_qty": "0",
     })
     assert validate_frozen_tp2_proof(**args)["reason"] == "UNATTRIBUTED_ORIGINAL_KIS_SYMBOL_ORDER"
+
+
+def test_pb1_close_audit_ignores_only_certified_infinite_mirror_sells():
+    from scripts.kr_close_settlement_audit import audit_sell_settlement
+
+    sells = [
+        {"code": "122630", "side": "SELL", "status": "FILLED",
+         "order_id": "legacy-infinite-5", "kis_odno": "0000008799", "qty": 5,
+         "position_cycle_id": None},
+        {"code": "122630", "side": "SELL", "status": "FILLED",
+         "order_id": "legacy-infinite-6", "kis_odno": "0000017474", "qty": 6,
+         "position_cycle_id": None},
+    ]
+    retired = [{
+        "code": "122630", "status": "CLOSED",
+        "closed_reason": "KR_INFINITE_LEGACY_MIRROR_RETIRED",
+        "position_meta": {
+            "kr_infinite_legacy_mirror_retired": {
+                "result": "VERIFIED_FULL_TP2_EXIT",
+                "source": "ORIGINAL_KIS_FULL_ORDER_CCLD_AND_EXECUTION_CLAIMS",
+                "verified_sell_broker_order_ids": ["0000008799", "0000017474"],
+            },
+        },
+    }]
+    unknown = audit_sell_settlement(orders=sells, fills=[], positions=[])
+    assert unknown["gap_count"] == 2
+
+    confirmed = audit_sell_settlement(orders=sells, fills=[], positions=retired)
+    assert confirmed["status"] == "PRICED_SELL_EVIDENCE_MATCHED"
+    assert confirmed["gap_count"] == 0
+    assert confirmed["certified_infinite_mirror_sells_excluded"] == 2
+
+    fake = [{**sells[0], "order_id": "not-owned", "kis_odno": "0000099999"}]
+    still_blocked = audit_sell_settlement(
+        orders=fake, fills=[], positions=retired,
+    )
+    assert still_blocked["gap_count"] == 1
+    assert still_blocked["certified_infinite_mirror_sells_excluded"] == 0
