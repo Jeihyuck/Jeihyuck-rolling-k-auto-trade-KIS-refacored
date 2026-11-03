@@ -1020,7 +1020,20 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             state = replace(state, status=decision.next_status)
             repository.save_state(state)
         if needs_new_cycle and state:
+            bootstrap_proof = (
+                list(decision.metadata.get("conflict_first_buy_confirmed_dates") or [])
+                if decision.reason == "CONFLICT_STRONG_RISK_ON_FIRST_BUY" else []
+            )
             state = reserve_new_cycle(state, trading_date)
+            if bootstrap_proof:
+                # Keep only this epoch's verified two-session evidence so a
+                # pre-HTTP KIS failure can retry the same reserved cycle;
+                # never resurrect any prior-cycle sizing/ownership metadata.
+                state = replace(state, metadata={
+                    "conflict_first_buy_confirmed_dates": bootstrap_proof,
+                    "conflict_first_buy_last_signal": "STRONG_RISK_ON+DEFENSIVE",
+                    "conflict_first_buy_reserved_cycle": True,
+                })
             repository.save_state(state)
         if not config.real_order or decision.action not in {Action.BUY, Action.SELL}:
             return {"status": "SHADOW" if not config.real_order else decision.action.value,
@@ -1148,7 +1161,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "tqqq_daily_committed_before_usd": daily + pending_buy_notional,
                      "tqqq_cycle_committed_before_usd": state.total_filled_notional + pending_buy_notional,
                      "tqqq_max_daily_buy_usd": config.max_daily_buy_usd,
-                     "tqqq_max_total_capital_usd": config.max_total_capital_usd},
+                     "tqqq_max_total_capital_usd": config.max_total_capital_usd,
+                     **({"tqqq_conflict_first_buy_evidence": dict(decision.metadata)}
+                        if decision.reason == "CONFLICT_STRONG_RISK_ON_FIRST_BUY" else {})},
         }
         result = route(intent)
         if (decision.action == Action.SELL and state is not None
