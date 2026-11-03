@@ -118,6 +118,8 @@ jobs:
           pytest tests/test_kr_am_pm_session_boundary_20261103.py -q
           pytest tests/kr/test_kr_20261103_mico_neosem_integrity.py -q
           pytest tests/kr/test_kr_20261103_broker_db_position_audit.py -q
+          pytest tests/kr/test_kr_20261103_mico_verified_buy_watermark.py -q
+          python -m compileall -q scripts/kr_certify_buy_application.py trader/kr/verified_buy_watermark.py
           python -m compileall -q scripts/kr_broker_db_position_audit.py trader/kr/broker_db_position_audit.py
           pytest tests/kr/test_kr_cross_day_sell_auto_reconcile.py tests/test_reconcile_execution_claims.py -q
           pytest tests/test_pb1_session_end_policy.py tests/test_trade_session_policy.py tests/test_recovery_control_plane_contracts.py -q
