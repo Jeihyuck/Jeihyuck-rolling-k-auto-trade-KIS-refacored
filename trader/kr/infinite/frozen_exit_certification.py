@@ -268,6 +268,9 @@ def validate_frozen_tp2_proof(
         "gross_realized_krw": str(
             sum(_num(x.get("filled_notional_krw")) for x in sells) - buy_cost
         ),
+        "verified_sell_broker_order_ids": [
+            str(tp1["broker_order_id"]), str(tp2["broker_order_id"]),
+        ],
     }
 
 
@@ -336,6 +339,7 @@ def certify_frozen_infinite_cycle(*, engine, broker_balance, balance_source,
             "source": "ORIGINAL_KIS_FULL_ORDER_CCLD_AND_EXECUTION_CLAIMS",
             "original_cycle": str(state["cycle_id"]),
             "last_exit_date": decision["exit_date"],
+            "verified_sell_broker_order_ids": decision["verified_sell_broker_order_ids"],
             "legacy_mirror_position_id": str(decision["mirror_position_id"]),
             "mirror_cost_gap_krw": decision["mirror_cost_gap_krw"],
             "result": "VERIFIED_FULL_TP2_EXIT",
