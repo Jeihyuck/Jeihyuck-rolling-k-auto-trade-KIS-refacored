@@ -175,12 +175,25 @@ def validate_frozen_tp2_proof(
         if (
             _integer(kis_row.get("tot_ccld_qty")) != req_qty
             or _num(kis_row.get("tot_ccld_amt")) != money
-            or _integer(kis_row.get("rmn_qty")) not in (0, None)
+            or _integer(kis_row.get("rmn_qty")) != 0
             or str(kis_row.get("cncl_yn") or "N").upper() != "N"
         ):
             return block("ORIGINAL_KIS_ECONOMICS_CONFLICT")
         original_proofs.append((intent, kis_row))
 
+    original_ids = {
+        (_iso_day(i["trade_date"]), str(i["broker_order_id"]))
+        for i in intents
+    }
+    for day, payload in original_pages.items():
+        for raw in payload["output1"]:
+            if (
+                isinstance(raw, dict)
+                and str(raw.get("pdno") or "").lstrip("A") == SYMBOL
+                and str(raw.get("ord_dt") or "") == day
+                and (day, str(raw.get("odno") or "").zfill(10)) not in original_ids
+            ):
+                return block("UNATTRIBUTED_ORIGINAL_KIS_SYMBOL_ORDER")
     # This PB1 position was a legacy *mirror* of KR_INFINITE executions, not
     # an independent PB1 trade. Never attach its orders to a new PB1 sell cycle.
     pos = mirror_positions[0]
@@ -209,6 +222,8 @@ def validate_frozen_tp2_proof(
             or str(order.get("trading_epoch_id")) != str(epoch_id)
             or str(order.get("portfolio_epoch_id")) != str(pos.get("portfolio_epoch_id"))
             or order.get("position_cycle_id") is not None
+            or (order.get("side") == "BUY" and str(order.get("status")) not in {"RECONCILED", "FILLED"})
+            or (order.get("side") == "SELL" and str(order.get("status")) != "FILLED")
             or str(_obj(order.get("request_json")).get("strategy_owner") or "") not in ("",)
         ):
             return block("LEGACY_ORDER_NOT_PASSIVE_MIRROR")
@@ -324,6 +339,7 @@ def certify_frozen_infinite_cycle(*, engine, broker_balance, balance_source,
             "legacy_mirror_position_id": str(decision["mirror_position_id"]),
             "mirror_cost_gap_krw": decision["mirror_cost_gap_krw"],
             "result": "VERIFIED_FULL_TP2_EXIT",
+            "closed_time_basis": "KIS_ORIGINAL_ORDER_TIME_PROXY_NOT_INDIVIDUAL_EXECUTION",
         }
         mirror = positions[0]
         next_position_meta = {
