@@ -56,7 +56,8 @@ class ReadOnlyKIS:
         }
 
 
-def _reader(*, kis=None, active=None, debts=None, clock=None, **kwargs):
+def _reader(*, kis=None, active=None, debts=None, debt_dates=None,
+            clock=None, **kwargs):
     provider = kis or ReadOnlyKIS()
     rows = active if active is not None else [CLAIM]
     debt_rows = debts if debts is not None else []
@@ -65,7 +66,7 @@ def _reader(*, kis=None, active=None, debts=None, clock=None, **kwargs):
         provider_factory=lambda: provider,
         load_claims=lambda: list(rows),
         load_debts=lambda **kw: list(debt_rows),
-        load_debt_dates=lambda _debts, **kw: set(),
+        load_debt_dates=lambda _debts, **kw: set(debt_dates or ()),
         load_scope=lambda: dict(SCOPE),
         clock=clock or time.monotonic,
         poll_sec=1.0, ttl_sec=15.0,
@@ -197,13 +198,29 @@ def test_only_deferred_debts_fetch_prefetched_balance_off_writer():
         "account_id": "practice:stub", "trading_epoch_id": "epoch-test",
         "symbol": "TMO", "lifecycle_id": "life",
     }
-    reader = _reader(kis=kis, active=[], debts=[debt])
-    reader._poll_once(kis)
+    reader = _reader(kis=kis, active=[], debts=[debt],
+                     debt_dates={SOURCE_DATE})
+    reader._poll_once(kis)  # original-day book GET
+    reader._poll_once(kis)  # independent balance GET
     snapshot = reader.snapshot_for_claims([])
     proxy = reader.provider_for(snapshot)
-    assert kis.calls == [("GET_BALANCE", True)]
+    assert kis.calls == [("GET_ORDER_BOOK", SOURCE_DATE), ("GET_BALANCE", True)]
     assert proxy.get_balance(force_refresh=True)["positions"] == []
-    assert kis.calls == [("GET_BALANCE", True)]
+    assert kis.calls == [("GET_ORDER_BOOK", SOURCE_DATE), ("GET_BALANCE", True)]
+
+
+def test_stop_debt_without_matching_original_tp_skips_3_exchange_balance():
+    debt = {
+        "account_id": "practice:stub", "trading_epoch_id": "epoch-test",
+        "symbol": "ELV", "lifecycle_id": "life",
+    }
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, active=[], debts=[debt], debt_dates=set())
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([])
+    assert kis.calls == []
+    with pytest.raises(RuntimeError, match="BALANCE_NOT_PREFETCHED"):
+        reader.provider_for(snapshot).get_balance(force_refresh=True)
 
 
 def test_prefetch_active_claims_identity_must_be_complete():
@@ -332,6 +349,40 @@ def test_newer_kis_fill_cannot_be_overwritten_by_old_snapshot():
     kis.rows[0]["filled_qty"] = 1
     kis.rows[0]["remaining_qty"] = 0
     now[0] = 62.0
+    reader._poll_once(kis)
+    with pytest.raises(RuntimeError, match="NEWER_BROKER_FACTS_CHANGED"):
+        reader.assert_still_valid(original, [CLAIM])
+
+
+def test_same_attempt_cumulative_fill_change_fences_old_broker_snapshot():
+    kis = ReadOnlyKIS()
+    original = {
+        **CLAIM, "strategy_owner": "US_STANDARD",
+        "trading_epoch_id": SCOPE["trading_epoch_id"],
+        "requested_qty": 1, "cumulative_filled_qty": 0,
+        "attempt_state": "ACK_PENDING",
+    }
+    reader = _reader(kis=kis, active=[original])
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([original])
+    new_fill = {**original, "cumulative_filled_qty": 1}
+    with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
+        reader.assert_still_valid(snapshot, [new_fill])
+    new_state = {**original, "attempt_state": "PARTIALLY_SATISFIED"}
+    with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
+        reader.assert_still_valid(snapshot, [new_state])
+
+
+def test_zero_filled_and_missing_cumulative_are_different_broker_facts():
+    now = [60.0]
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, clock=lambda: now[0])
+    reader._poll_once(kis)
+    original = reader.snapshot_for_claims([CLAIM])
+    # Treat "filled_qty=0" as actual KIS zero, not an absent unknown.
+    kis.rows[0].pop("filled_qty")
+    kis.rows[0].pop("filled_qty_present")
+    now[0] = 61.0
     reader._poll_once(kis)
     with pytest.raises(RuntimeError, match="NEWER_BROKER_FACTS_CHANGED"):
         reader.assert_still_valid(original, [CLAIM])
