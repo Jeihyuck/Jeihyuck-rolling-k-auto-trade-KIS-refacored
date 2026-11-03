@@ -96,6 +96,7 @@ def audit_us_order_chains(
     statuses: Counter[str] = Counter()
     broker_verified = 0
     missing_5w1h = 0
+    integrity_conflicts = 0
     for order in order_audit:
         if not isinstance(order, dict):
             continue
@@ -149,12 +150,16 @@ def audit_us_order_chains(
         evidence_status = str(order.get("decision_evidence_status") or "").upper()
         if evidence_status != "VERIFIED":
             missing_5w1h += 1
+        # An inconsistent fill quantity is an *integrity discrepancy*, not
+        # automatic proof of a code implementation defect: the KIS evidence,
+        # DB ingestion revision and original event ordering still need review.
+        # Do not collapse implementation bugs and unverified evidence.
+        if broker_status == "BROKER_DB_FILLED_QTY_MISMATCH":
+            integrity_conflicts += 1
         # Owner, entry snapshot, exact signal configuration and risk-gate
         # source must be replayed against the executing revision before any
-        # policy verdict is asserted. Do not invent EXPECTED from reason text.
+        # EXPECTED / IMPLEMENTATION BUG / POLICY REVIEW verdict is asserted.
         policy_status = "PENDING_EVIDENCE"
-        if broker_status == "BROKER_DB_FILLED_QTY_MISMATCH":
-            policy_status = "IMPLEMENTATION BUG"
         statuses[policy_status] += 1
         reports.append({
             "symbol": symbol, "side": side, "strategy_owner": owner,
@@ -176,8 +181,8 @@ def audit_us_order_chains(
             "broker_chain_status": broker_status,
             "policy_verdict": policy_status,
             "policy_verdict_reason": (
-                "KIS_AND_DB_QUANTITY_CONTRADICTION"
-                if policy_status == "IMPLEMENTATION BUG"
+                "KIS_AND_DB_QUANTITY_CONTRADICTION_UNVERIFIED_CAUSE"
+                if broker_status == "BROKER_DB_FILLED_QTY_MISMATCH"
                 else "EXACT_OWNER_POLICY_INPUT_GATE_REPLAY_REQUIRED"
             ),
         })
@@ -192,12 +197,13 @@ def audit_us_order_chains(
     return {
         "status": (
             "VERIFIED" if total and statuses["PENDING_EVIDENCE"] == 0
-            and statuses["IMPLEMENTATION BUG"] == 0
+            and integrity_conflicts == 0
             else "AUDIT_INCOMPLETE" if total else "NO_ORDERS"
         ),
         "order_count": total,
         "kis_broker_chain_verified_count": broker_verified,
         "missing_5w1h_count": missing_5w1h,
+        "broker_db_quantity_conflict_count": integrity_conflicts,
         "safe_pre_http_abort_attempt_count": pre_http_only,
         "broker_ack_by_session": dict(sessions),
         "policy_verdict_counts": dict(statuses),
