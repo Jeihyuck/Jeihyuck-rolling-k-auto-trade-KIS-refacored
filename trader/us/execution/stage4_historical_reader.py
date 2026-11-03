@@ -225,14 +225,21 @@ class HistoricalReadOnlyReader:
         debts = self.load_debts(env="practice")
         if not isinstance(debts, list):
             raise RuntimeError("US_STAGE4_HISTORICAL_DEBTS_UNVERIFIED")
-        source_dates = {k[0] for k in signatures}
-        source_dates.update(
-            self.load_debt_dates(debts, scope=self.scope, max_dates=self.max_dates)
+        debt_dates = self.load_debt_dates(
+            debts, scope=self.scope, max_dates=self.max_dates,
         )
+        if not isinstance(debt_dates, set):
+            raise RuntimeError("US_STAGE4_HISTORICAL_DEBT_DATES_UNVERIFIED")
+        source_dates = {k[0] for k in signatures}
+        source_dates.update(debt_dates)
         if len(source_dates) > self.max_dates:
             raise RuntimeError("US_STAGE4_HISTORICAL_SOURCE_DATES_OVER_BUDGET")
         tasks = [("book", day) for day in sorted(source_dates)]
-        if debts:
+        # Historical stop settlement requires an actual original TP order.
+        # Existing soft-stop-only debts are durable/fenced, but an unrelated
+        # three-exchange balance GET cannot prove those absent TP originals
+        # terminal. Skip that expensive read until the scoped DB proof exists.
+        if debts and debt_dates:
             tasks.append(("balance", None))
         if not tasks:
             with self._lock:
