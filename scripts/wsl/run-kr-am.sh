@@ -110,7 +110,7 @@ export PB1_LOOP_ENABLED="${PB1_LOOP_ENABLED:-1}"
 export PB1_RUN_LOOP="${PB1_RUN_LOOP:-1}"
 export PB1_RUN_LOOP_MINUTES="${PB1_RUN_LOOP_MINUTES:-235}"
 export PB1_LOOP_INTERVAL_SEC="${PB1_LOOP_INTERVAL_SEC:-60}"
-export PB1_AM_SESSION_END="${PB1_AM_SESSION_END:-12:55}"
+export PB1_AM_SESSION_END="12:55"
 # AM-only effective windows. Explicit legacy .env 10:30 values cannot truncate a live AM.
 # Do NOT override PB1_AM_EXPECTED_END: it controls start/recovery classification.
 export PB1_MORNING_WINDOW_END="$PB1_AM_SESSION_END"
