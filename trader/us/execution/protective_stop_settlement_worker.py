@@ -86,14 +86,18 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                            o.qty_requested, o.qty_filled, o.env, o.trading_epoch_id
                     FROM us_orders o
                     JOIN us_execution_claims c
-                      ON c.trading_epoch_id=o.trading_epoch_id
+                      ON c.action_key=o.meta->>'execution_action_key'
+                      AND c.trading_epoch_id=o.trading_epoch_id
                      AND c.env=o.env AND c.trade_date=o.trade_date
                      AND c.lifecycle_id=:life AND c.account_id=:account
                      AND c.strategy_owner='US_STANDARD'
+                     AND c.market='US'
                      AND c.action=upper(o.meta->>'profit_capture_stage')
                     WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                       AND o.symbol=:symbol AND o.side='SELL'
                       AND o.order_no IS NOT NULL
+                    AND o.meta->>'position_lifecycle_id'=:life
+                    AND upper(o.meta->>'strategy_owner')='US_STANDARD'
                     LIMIT 50
                 ) exact_original_tp
             """), {
@@ -161,14 +165,18 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                        o.qty_requested,o.qty_filled,o.env,o.trading_epoch_id
                 FROM us_orders o
                 JOIN us_execution_claims c
-                  ON c.trading_epoch_id=o.trading_epoch_id
+                  ON c.action_key=o.meta->>'execution_action_key'
+                  AND c.trading_epoch_id=o.trading_epoch_id
                  AND c.env=o.env AND c.trade_date=o.trade_date
                  AND c.lifecycle_id=:life AND c.account_id=:account
                  AND c.strategy_owner='US_STANDARD'
+                 AND c.market='US'
                  AND c.action=upper(o.meta->>'profit_capture_stage')
                 WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                   AND o.symbol=:symbol AND o.side='SELL'
                   AND o.order_no IS NOT NULL
+                  AND o.meta->>'position_lifecycle_id'=:life
+                  AND upper(o.meta->>'strategy_owner')='US_STANDARD'
                 ORDER BY o.trade_date
                 LIMIT 50
             """),{"life":life,"account":account_claim,"epoch":epoch,
