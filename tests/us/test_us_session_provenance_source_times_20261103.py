@@ -54,3 +54,28 @@ def test_provenance_rejects_naive_session_event():
             started_at_et="2026-11-02T09:30:00",
             ended_at_et="2026-11-02T12:35:00-05:00",
         )
+
+
+def test_daily_report_provenance_uses_one_event_source_for_three_timezones(monkeypatch):
+    from trader.us.runner.daily_report_runner import _report_provenance
+    monkeypatch.setenv("US_STARTED_AT_ET", "2026-11-02T09:30:00-05:00")
+    monkeypatch.setenv("US_STARTED_AT_UTC", "2026-11-03T06:05:00Z")  # stale
+    monkeypatch.setenv("US_STARTED_AT_KST", "2026-11-03T15:05:00+09:00")  # stale
+    monkeypatch.setenv("US_ENDED_AT_ET", "2026-11-02T12:35:00-05:00")
+    report = _report_provenance("am")
+    assert report["timestamp_provenance_status"] == "OK"
+    assert report["started_at_source"] == "supplied_event"
+    assert report["started_at_utc"] == "2026-11-02T14:30:00Z"
+    assert report["started_at_kst"] == "2026-11-02T23:30:00+09:00"
+    assert report["ended_at_utc"] == "2026-11-02T17:35:00Z"
+    assert report["ended_at_kst"] == "2026-11-03T02:35:00+09:00"
+
+
+def test_daily_report_detects_invalid_time_provenance(monkeypatch):
+    from trader.us.runner.daily_report_runner import _report_provenance
+    monkeypatch.setenv("US_STARTED_AT_ET", "not-a-time")
+    monkeypatch.delenv("US_STARTED_AT_UTC", raising=False)
+    monkeypatch.delenv("US_STARTED_AT_KST", raising=False)
+    report = _report_provenance("close")
+    assert report["timestamp_provenance_status"] == "INVALID_OR_UNVERIFIED_EVENT_TIME"
+    assert report["started_at_source"] == "report_generation_fallback"
