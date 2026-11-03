@@ -110,6 +110,9 @@ jobs:
           pytest tests/kr/test_kr_20261103_manual_sell_kis_price_upgrade.py -q
           pytest tests/kr/test_kr_20261103_legacy_missing_sell_cycle_repair.py -q
           pytest tests/kr/test_kr_20261103_manifest_and_close_status.py -q
+          pytest tests/kr/infinite/test_tp2_exit_lag_regression_20261103.py -q
+          pytest tests/kr/infinite/test_frozen_tp2_certification_20261103.py -q
+          python -m compileall -q trader/kr/infinite/frozen_exit_certification.py scripts/kr_infinite_certify_frozen_exit.py
           python -m compileall -q trader/kr/legacy_missing_cycle_repair.py scripts/kr_restore_legacy_sell_cycle.py
           python -m compileall -q scripts/kr_certify_buy_application.py trader/kr/verified_buy_watermark.py
           python -m compileall -q scripts/kr_broker_db_position_audit.py trader/kr/broker_db_position_audit.py
