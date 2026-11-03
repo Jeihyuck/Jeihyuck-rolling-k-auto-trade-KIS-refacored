@@ -1,4 +1,4 @@
-"""No broker I/O: 122630 original BUY11 and SELL5+6 can only bind exact PB1 cycle."""
+"""No broker I/O: 123456 original BUY11 and SELL5+6 generic PB1-only missing-cycle proof cannot touch the Infinite reserved symbol."""
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -19,7 +19,7 @@ def _fixture():
     pos = PositionsRepo(engine).get_or_create_imported_cycle_for_kis_holding(
         env="practice", strategy="pb1_pullback_close",
         account_id=get_account_key(env="practice"), sid=1, mode=1,
-        code="122630", market="J", qty=11, avg_price=740800/11,
+        code="123456", market="J", qty=11, avg_price=740800/11,
     )[0]
     portfolio = str(pos["portfolio_epoch_id"])
     created = [
@@ -39,9 +39,9 @@ def _fixture():
         for ix,(side,qty,odno,status,when) in enumerate(data):
             conn.execute(sa.insert(schema.orders).values(
                 order_id=str(uuid4()),env="practice",strategy="pb1_pullback_close",
-                sid=1,mode=1,code="122630",market="J",side=side,
+                sid=1,mode=1,code="123456",market="J",side=side,
                 ord_type="LIMIT",qty=qty,stage="PB1",status=status,
-                client_order_key=f"legacy-pb1-122630-{ix}",
+                client_order_key=f"legacy-pb1-123456-{ix}",
                 portfolio_epoch_id=portfolio,trading_epoch_id=str(epoch),
                 position_cycle_id=None,kis_odno=odno,broker_order_id=odno,
                 created_at=when,submitted_at=when,
@@ -49,13 +49,13 @@ def _fixture():
             ))
     pages = {
         "20261026":{"rt_cd":"0","_sep29_complete":True,"output1":[
-            {"ord_dt":"20261026","pdno":"122630","odno":"0000011438",
+            {"ord_dt":"20261026","pdno":"123456","odno":"0000011438",
              "sll_buy_dvsn_cd":"02","tot_ccld_qty":"11","tot_ccld_amt":"740800"},
         ]},
         "20261027":{"rt_cd":"0","_sep29_complete":True,"output1":[
-            {"ord_dt":"20261027","pdno":"122630","odno":"0000008799",
+            {"ord_dt":"20261027","pdno":"123456","odno":"0000008799",
              "sll_buy_dvsn_cd":"01","tot_ccld_qty":"5","tot_ccld_amt":"345000"},
-            {"ord_dt":"20261027","pdno":"122630","odno":"0000017474",
+            {"ord_dt":"20261027","pdno":"123456","odno":"0000017474",
              "sll_buy_dvsn_cd":"01","tot_ccld_qty":"6","tot_ccld_amt":"414000"},
         ]},
     }
@@ -65,12 +65,12 @@ def _fixture():
 
 def _call(engine,pages,broker,**kwargs):
     return certify_legacy_pb1_missing_cycle(
-        engine=engine,code="122630",original_daily_pages=pages,
+        engine=engine,code="123456",original_daily_pages=pages,
         broker_balance=broker,balance_source="api",**kwargs,
     )
 
 
-def test_122630_original_kis_buy11_sell5_6_binds_only_cycle_metadata():
+def test_123456_original_kis_buy11_sell5_6_binds_only_cycle_metadata():
     engine,schema,pos,pages,broker=_fixture()
     before=_call(engine,pages,broker)
     assert before["state"]=="READY_TO_BIND"
@@ -109,7 +109,7 @@ def test_legacy_missing_cycle_fail_closed_without_mutations(change,reason):
     elif change=="wrong_sell_qty":
         pages["20261027"]["output1"][0]["tot_ccld_qty"]="4"
     elif change=="broker_nonzero":
-        broker["output1"]=[{"pdno":"122630","hldg_qty":"11"}]
+        broker["output1"]=[{"pdno":"123456","hldg_qty":"11"}]
     elif change=="broker_diag_stub":
         broker["_diag_stub"]=True
     out=_call(engine,pages,broker,apply=True)
@@ -118,3 +118,17 @@ def test_legacy_missing_cycle_fail_closed_without_mutations(change,reason):
         assert conn.execute(sa.select(sa.func.count()).select_from(schema.orders).where(
             schema.orders.c.position_cycle_id.is_(None)
         )).scalar_one()==3
+
+
+def test_reserved_infinite_symbol_must_not_be_bound_to_pb1_cycle():
+    engine, _schema, _pos, pages, broker = _fixture()
+    result = certify_legacy_pb1_missing_cycle(
+        engine=engine, code="122630",
+        original_daily_pages=pages, broker_balance=broker,
+        balance_source="api", apply=True,
+    )
+    assert result == {
+        "state": "BLOCKED",
+        "reason": "KR_INFINITE_OWNER_RESERVED_USE_DEDICATED_REPAIR",
+        "updated_orders": 0,
+    }
