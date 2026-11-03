@@ -1,7 +1,7 @@
 """Manually invoked, read-only KIS-vs-DB KR PB1 position audit.
 
 Usage (WSL, practice account only):
-  NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_broker_db_position_audit
+  FORCE_HTTP=1 NO_TRADE=1 DRY_RUN=1 KIS_ENV=practice python -m scripts.kr_broker_db_position_audit
 
 No scheduler activation, no broker order POST, and no database writes.
 """
@@ -14,7 +14,8 @@ import sys
 
 def main() -> int:
     # Do not permit the monitoring command to inherit live-order authority.
-    if os.getenv("NO_TRADE") != "1" or os.getenv("DRY_RUN") != "1" or os.getenv("KIS_ENV") != "practice":
+    if (os.getenv("NO_TRADE") != "1" or os.getenv("DRY_RUN") != "1"
+        or os.getenv("KIS_ENV") != "practice" or os.getenv("FORCE_HTTP") != "1"):
         print(json.dumps({"status": "BLOCKED_READONLY_FLAGS_REQUIRED"}))
         return 3
     for key, value in (
