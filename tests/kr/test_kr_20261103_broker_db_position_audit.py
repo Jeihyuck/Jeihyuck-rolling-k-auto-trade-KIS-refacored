@@ -35,6 +35,7 @@ def test_unverified_or_partial_broker_snapshot_never_produces_match():
         (None, "api"),
         (_broker(), "wrapper_cache"),
         ({"rt_cd": "1", "output1": []}, "api"),
+        ({"rt_cd": "0", "output1": [], "_diag_stub": True}, "api"),
         ({"rt_cd": "0"}, "api"),
         (_broker({"pdno": "059090", "hldg_qty": "91"},
                  {"pdno": "059090", "hldg_qty": "91"}), "api"),
