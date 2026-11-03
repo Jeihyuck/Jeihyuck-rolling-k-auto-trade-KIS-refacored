@@ -1869,6 +1869,34 @@ def run_daily_report(
         logger.warning("[US_DAILY_REPORT][TRADE_PNL][WARN] %s", _trade_pnl_exc)
         report["trade_pnl_analysis"] = {"error": str(_trade_pnl_exc), "trade_details": []}
 
+    # Original policy inputs and broker evidence are independent proofs.
+    # Keep all KIS/DB-backed orders visible, but never call a filled order
+    # EXPECTED just because its broker ACK/FILL is confirmed.
+    try:
+        from trader.us.runner.order_chain_verification import audit_us_order_chains
+        from trader.us.execution.order_journal import load_order_events
+        _audit_fills = (
+            locals().get("_fill_rows_for_pnl") if not offline else []
+        )
+        _audit_events = load_order_events(trade_date) if not offline else []
+        report["order_chain_verification"] = audit_us_order_chains(
+            report.get("order_audit") or [], _audit_fills, _audit_events,
+        )
+        if report["order_chain_verification"]["status"] in {
+            "AUDIT_INCOMPLETE", "UNAVAILABLE",
+        }:
+            report["warnings"].append("ORDER_CHAIN_POLICY_EVIDENCE_REVIEW_REQUIRED")
+    except Exception as _chain_exc:
+        logger.exception(
+            "[US_DAILY_REPORT][ORDER_CHAIN_AUDIT_UNAVAILABLE] type=%s",
+            type(_chain_exc).__name__,
+        )
+        report["order_chain_verification"] = {
+            "status": "UNAVAILABLE",
+            "reason": type(_chain_exc).__name__,
+        }
+        report["warnings"].append("ORDER_CHAIN_AUDIT_UNAVAILABLE")
+
     # Budget cap
     try:
         from trader.us.budget import get_us_capital_usd_cap
@@ -2043,6 +2071,26 @@ def run_daily_report(
             f"- Evidence SHA-256: \`{_safe_cell(_evidence.get('evidence_hash'))}\`",
             "",
         ])
+    md_lines.append("")
+    _chain = report.get("order_chain_verification") or {}
+    md_lines.extend([
+        "## Order Chain Proof and Strategy Policy Audit",
+        "",
+        f"- Audit status: {_chain.get('status', 'UNAVAILABLE')}",
+        f"- Broker-confirmed order chains: {_chain.get('kis_broker_chain_verified_count', 0)} / {_chain.get('order_count', 0)}",
+        f"- Pre-HTTP aborts (not submitted orders): {_chain.get('safe_pre_http_abort_attempt_count', 0)}",
+        f"- Missing verified 5W1H decisions: {_chain.get('missing_5w1h_count', 0)}",
+        f"- Broker ACKs by session: {_chain.get('broker_ack_by_session', {})}",
+        f"- Policy verdict counts: {_chain.get('policy_verdict_counts', {})}",
+        "",
+    ])
+    for _verified in _chain.get("orders") or []:
+        md_lines.append(
+            f"- {_verified.get('symbol', '?')} {_verified.get('side', '?')}: "
+            f"owner={_verified.get('strategy_owner', 'UNKNOWN')} "
+            f"broker={_verified.get('broker_chain_status', 'UNKNOWN')} "
+            f"policy={_verified.get('policy_verdict', 'PENDING_EVIDENCE')}"
+        )
     md_lines.append("")
 
     if session:
