@@ -309,3 +309,29 @@ def test_epoch_mismatch_after_read_before_publish_is_fenced():
         reader.assert_still_valid(snapshot, [CLAIM])
     with pytest.raises(RuntimeError, match="ACCOUNT_OR_EPOCH_CHANGED"):
         reader.snapshot_for_claims([CLAIM])
+
+
+def test_identical_newer_readonly_snapshot_does_not_starve_single_writer_ready():
+    now = [60.0]
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, clock=lambda: now[0])
+    reader._poll_once(kis)
+    snapshot = reader.snapshot_for_claims([CLAIM])
+    now[0] = 62.0
+    reader._poll_once(kis)   # refreshed with same KIS status and qty
+    reader.assert_still_valid(snapshot, [CLAIM])
+
+
+def test_newer_kis_fill_cannot_be_overwritten_by_old_snapshot():
+    now = [60.0]
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, clock=lambda: now[0])
+    reader._poll_once(kis)
+    original = reader.snapshot_for_claims([CLAIM])
+    kis.rows[0]["status"] = "FILLED"
+    kis.rows[0]["filled_qty"] = 1
+    kis.rows[0]["remaining_qty"] = 0
+    now[0] = 62.0
+    reader._poll_once(kis)
+    with pytest.raises(RuntimeError, match="NEWER_BROKER_FACTS_CHANGED"):
+        reader.assert_still_valid(original, [CLAIM])
