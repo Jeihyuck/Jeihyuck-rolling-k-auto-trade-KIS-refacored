@@ -7318,6 +7318,7 @@ class PositionsRepo:
         order_id: str,
         pre_order_holding_qty: int | None = None,
         broker_holding_qty: int | None = None,
+        native_original_order_price_proof: bool = False,
         _conn: Any = None,
     ) -> dict[str, Any]:
         """Converge SELL quantity independently from execution-price/PnL truth.
@@ -7343,7 +7344,9 @@ class PositionsRepo:
                     fill_price=fill_price, filled_at=filled_at,
                     position_cycle_id=position_cycle_id, portfolio_epoch_id=portfolio_epoch_id,
                     order_id=order_id, pre_order_holding_qty=pre_order_holding_qty,
-                    broker_holding_qty=broker_holding_qty, _conn=conn,
+                    broker_holding_qty=broker_holding_qty,
+                    native_original_order_price_proof=native_original_order_price_proof,
+                    _conn=conn,
                 )
         conn = _conn
         trading_epoch_id = active_trading_epoch_id(
@@ -7471,7 +7474,37 @@ class PositionsRepo:
                 raise RuntimeError("KR_SELL_RECONCILE_NONFINITE_NEW_PROCEEDS")
             if pnl_accounted_qty == confirmed_qty and pnl_accounted_qty > 0:
                 if abs(new_proceeds - previously_accounted_notional) > 1e-5:
-                    raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
+                    # Old manually entered MTS averages were intentionally
+                    # PROVISIONAL, not authoritative original-day KIS fills.
+                    # Upgrade only a closed, same-order fully accounted
+                    # lifecycle with explicit ORIGINAL KIS order-price proof.
+                    # No quantity, other cycle, or regular confirmed price
+                    # conflict may pass this gate.
+                    provisional = (
+                        native_original_order_price_proof
+                        and str(row.get("status") or "").upper() == "CLOSED"
+                        and str(row.get("closed_reason") or "").upper()
+                        == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING"
+                        and new_qty == 0
+                        and state.get("manual_mts_price_provisional") is True
+                        and bool(state.get("manual_mts_source"))
+                        and qty_accounted == confirmed_qty
+                        and int(state.get("pnl_accounted_qty") or 0) == confirmed_qty
+                    )
+                    if not provisional:
+                        raise RuntimeError("KR_SELL_RECONCILE_CONFIRMED_PRICE_CONFLICT")
+                    next_realized_pnl += new_proceeds - previously_accounted_notional
+                    state["manual_mts_price_provisional"] = False
+                    state["manual_mts_source_superseded_by"] = "KIS_ORIGINAL_ORDER_EXECUTION"
+                    state["manual_mts_original_notional"] = previously_accounted_notional
+                    previously_accounted_notional = new_proceeds
+                    logger.warning(
+                        "[KR_SELL_RECONCILE][PROVISIONAL_MTS_UPGRADED] "
+                        "code=%s order_id=%s prior_notional=%.5f "
+                        "kis_notional=%.5f pnl_delta=%.5f",
+                        code, order_key, state["manual_mts_original_notional"],
+                        new_proceeds, new_proceeds - state["manual_mts_original_notional"],
+                    )
             else:
                 pnl_qty_applied = max(0, confirmed_qty - pnl_accounted_qty)
                 if new_proceeds + 1e-5 < previously_accounted_notional:
@@ -7549,6 +7582,14 @@ class PositionsRepo:
         elif str(row.get("status") or "").upper() == "CLOSED":
             if new_qty != 0:
                 raise RuntimeError("KR_SELL_RECONCILE_CLOSED_POSITION_REOPEN")
+            if (
+                native_original_order_price_proof
+                and str(row.get("closed_reason") or "").upper()
+                == "BROKER_ZERO_ECONOMIC_SETTLEMENT_PENDING"
+                and state.get("manual_mts_source_superseded_by")
+                == "KIS_ORIGINAL_ORDER_EXECUTION"
+            ):
+                values["closed_reason"] = "FULL_SELL"
             # Delayed price reconciliation must not rewrite the economic
             # close time or reopen a completed position.
             values.pop("last_trade_at", None)
