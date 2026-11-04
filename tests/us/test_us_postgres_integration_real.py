@@ -39,6 +39,13 @@ def pg_engine(monkeypatch):
             conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
             )
+        # PR311: shared execution claims must have the same scope columns as
+        # production migration 0062 before any claim/observation code runs.
+        # This fixture runs in a disposable PostgreSQL service only.
+        for column in ("portfolio_epoch_id", "position_cycle_id"):
+            conn.exec_driver_sql(
+                f"ALTER TABLE us_execution_claims ADD COLUMN IF NOT EXISTS {column} TEXT"
+            )
         # PR311: the US fixture is deliberately lean (no KR portfolio tables).
         # Mirror only the additive US claim/order lineage columns of migration
         # 0062. The canonical migration SQL is separately audited/tested.
