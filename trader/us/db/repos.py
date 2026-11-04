@@ -1333,19 +1333,41 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
     from trader.us.execution.order_identity import assert_same_identity, require_identity
     require_identity(row.get("client_order_key"))
     trading_epoch_id = row.get("trading_epoch_id") or _active_us_epoch(conn)
+    order_scope_meta = _parse_json_meta(row.get("meta"))
+    portfolio_epoch_id = str(order_scope_meta.get("portfolio_epoch_id") or row.get("portfolio_epoch_id") or "")
+    position_cycle_id = str(order_scope_meta.get("position_cycle_id") or row.get("position_cycle_id") or "")
+    account_hash = str(order_scope_meta.get("broker_account_hash") or row.get("account_id") or "")
+    scoped = bool(portfolio_epoch_id)
+    if scoped and not (account_hash and position_cycle_id and trading_epoch_id
+                       and str(order_scope_meta.get("trading_epoch_id") or trading_epoch_id) == str(trading_epoch_id)):
+        raise RuntimeError("US_ORDER_ORIGINAL_PORTFOLIO_SCOPE_UNVERIFIED")
     incoming_identity = {**row, "trade_date": td, "trading_epoch_id": trading_epoch_id}
     existing = conn.execute(text("SELECT * FROM us_orders WHERE client_order_key=:cok FOR UPDATE"), {"cok": row["client_order_key"]}).fetchone()
     if existing:
         assert_same_identity(dict(existing._mapping), incoming_identity)
+        if scoped:
+            from trader.us.execution.recovery_identity import assert_recovery_scope
+            assert_recovery_scope(
+                dict(existing._mapping),
+                {**row, "trading_epoch_id": trading_epoch_id,
+                 "portfolio_epoch_id": portfolio_epoch_id,
+                 "position_cycle_id": position_cycle_id,
+                 "broker_account_hash": account_hash},
+                original_meta=_parse_json_meta(existing._mapping.get("meta")),
+                current_meta=order_scope_meta,
+            )
     order_no = str(row.get("order_no") or "").strip()
     if order_no:
+        broker_sql = """SELECT * FROM us_orders
+                        WHERE trade_date=:td AND order_no=:ono AND env=:env
+                          AND trading_epoch_id IS NOT DISTINCT FROM :epoch"""
+        broker_params = {"td": td, "ono": order_no, "env": row.get("env"),
+                         "epoch": trading_epoch_id}
+        if scoped:
+            broker_sql += " AND account_id=:account_hash"
+            broker_params["account_hash"] = account_hash
         broker_existing = conn.execute(
-            text("""SELECT * FROM us_orders
-                    WHERE trade_date=:td AND order_no=:ono AND env=:env
-                      AND trading_epoch_id IS NOT DISTINCT FROM :epoch
-                    FOR UPDATE"""),
-            {"td": td, "ono": order_no, "env": row.get("env"),
-             "epoch": trading_epoch_id},
+            text(broker_sql + " FOR UPDATE"), broker_params,
         ).fetchone()
         if broker_existing:
             assert_same_identity(dict(broker_existing._mapping), incoming_identity)
@@ -1416,6 +1438,29 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
                     updated_at    =NOW()
         """
+    if scoped:
+        # New orders MUST persist exact physical columns, never a weaker
+        # meta-only fallback or a borrowed old position cycle.
+        if not trading_epoch_id or "trading_epoch_id, meta)" not in sql:
+            raise RuntimeError("US_ORDER_MIGRATION_0062_REQUIRED")
+        sql = sql.replace(
+            "trading_epoch_id, meta)",
+            "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
+        ).replace(
+            ":trading_epoch_id, CAST(:meta",
+            ":trading_epoch_id, :account_id, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
+        )
+        params.update({
+            "account_id": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+        })
+        order_meta.update({
+            "broker_account_hash": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+            "position_lifecycle_id": position_cycle_id,
+        })
     params["meta"] = _json_param(order_meta)
     conn.execute(text(sql), params)
 
