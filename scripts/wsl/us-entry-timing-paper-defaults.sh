@@ -30,6 +30,9 @@ if [[ "${KIS_ENV:-}" == "practice" &&
   export US_OPENING_OBSERVER_BAR_FETCH_ENABLED="${US_OPENING_OBSERVER_BAR_FETCH_ENABLED:-1}"
   export US_WS_COLLECTOR_ENABLED="${US_WS_COLLECTOR_ENABLED:-1}"
   export US_OPENING_OBSERVER_INTERVAL_SEC="${US_OPENING_OBSERVER_INTERVAL_SEC:-10}"
+  # Use a per-symbol wall-clock observation in approved practice sessions;
+  # offline/fixed-time replay retains its injected deterministic timestamp.
+  export US_ENTRY_OPPORTUNITY_LIVE_CLOCK="1"
   # Do not make a deliberate operator override into a hidden Shadow test.
   # Even without READY evidence, protective SELL may continue independently.
   if [[ "${US_ENTRY_OPPORTUNITY_MODE}" != "ENFORCE" ||
