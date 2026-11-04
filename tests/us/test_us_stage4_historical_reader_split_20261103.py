@@ -386,3 +386,46 @@ def test_zero_filled_and_missing_cumulative_are_different_broker_facts():
     reader._poll_once(kis)
     with pytest.raises(RuntimeError, match="NEWER_BROKER_FACTS_CHANGED"):
         reader.assert_still_valid(original, [CLAIM])
+
+
+def test_new_claim_set_refreshes_original_book_before_deferred_balance():
+    # Stale identity must not authorize READY while the reader spends its
+    # next GET on an unrelated three-exchange balance.
+    kis = ReadOnlyKIS()
+    debt = {"symbol": "TMO", "lifecycle_id": "life"}
+    reader = _reader(
+        kis=kis, active=[CLAIM], debts=[debt], debt_dates={SOURCE_DATE},
+    )
+    reader._poll_once(kis)  # original-day proof
+    updated = {**CLAIM, "active_attempt_id": "tmo-new-attempt"}
+    reader.load_claims = lambda: [updated]
+    with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
+        reader.snapshot_for_claims([updated])
+    reader._poll_once(kis)  # MUST refresh book before balance
+    assert kis.calls == [
+        ("GET_ORDER_BOOK", SOURCE_DATE),
+        ("GET_ORDER_BOOK", SOURCE_DATE),
+    ]
+    reader.snapshot_for_claims([updated])
+    reader._poll_once(kis)  # balance can proceed after fresh book proof
+    assert kis.calls[-1] == ("GET_BALANCE", True)
+
+
+def test_expired_historical_book_is_refetched_without_extending_evidence_ttl():
+    now = [100.0]
+    kis = ReadOnlyKIS()
+    debt = {"symbol": "TMO", "lifecycle_id": "life"}
+    reader = _reader(
+        kis=kis, active=[CLAIM], debts=[debt], debt_dates={SOURCE_DATE},
+        clock=lambda: now[0],
+    )
+    reader._poll_once(kis)
+    now[0] += 16.0
+    with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
+        reader.snapshot_for_claims([CLAIM])
+    reader._poll_once(kis)
+    assert kis.calls == [
+        ("GET_ORDER_BOOK", SOURCE_DATE),
+        ("GET_ORDER_BOOK", SOURCE_DATE),
+    ]
+    reader.snapshot_for_claims([CLAIM])
