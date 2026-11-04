@@ -323,6 +323,17 @@ def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
 def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
     if fill.get("_fill_idempotency_key_override"):
         return str(fill["_fill_idempotency_key_override"])
+    meta_scope = _parse_json_meta(fill.get("meta"))
+    account_scope = str(fill.get("broker_account_hash") or meta_scope.get("broker_account_hash") or "")
+    epoch_scope = str(fill.get("trading_epoch_id") or meta_scope.get("trading_epoch_id") or "")
+    portfolio_scope = str(fill.get("portfolio_epoch_id") or meta_scope.get("portfolio_epoch_id") or "")
+    cycle_scope = str(fill.get("position_cycle_id") or meta_scope.get("position_cycle_id") or "")
+    if portfolio_scope and not all((account_scope,epoch_scope,cycle_scope)):
+        raise RuntimeError("US_FILL_ORIGINAL_SCOPE_INCOMPLETE")
+    scope_prefix = (
+        "|".join((account_scope,epoch_scope,portfolio_scope,cycle_scope)) + "|"
+        if portfolio_scope else ""
+    )
     order_no = str(fill.get("order_no") or "")
     client_order_key = str(fill.get("client_order_key") or "")
     symbol = str(fill.get("symbol") or "").strip().upper()
@@ -330,8 +341,8 @@ def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
     ident = _fill_execution_identity(fill, trade_date)
     meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
     if _is_actual_evidence(_fill_evidence_type(fill)):
-        return ident
-    return f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{ident}"
+        return scope_prefix + ident
+    return scope_prefix + f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{ident}"
 
 
 def reset_memory_stores() -> None:
@@ -1123,6 +1134,13 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
             }
             if existing_intent:
                 assert_same_identity(dict(existing_intent), incoming_identity)
+                if intent.get("portfolio_epoch_id"):
+                    from trader.us.execution.recovery_identity import assert_recovery_scope
+                    assert_recovery_scope(
+                        existing_intent, intent,
+                        original_meta=_parse_json_meta(existing_intent.get("meta")),
+                        current_meta=intent_meta,
+                    )
             intent_meta_to_store = {
                 **intent_meta,
                 **{field: intent.get(field) for field in (
@@ -1164,6 +1182,34 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                             CAST(:meta AS jsonb))
                     ON CONFLICT (client_order_key) DO NOTHING
                 """
+            if intent.get("portfolio_epoch_id"):
+                # A pre-migration WSL process must FAIL CLOSED instead of
+                # silently persisting a narrower historical identity.
+                from trader.us.execution.recovery_identity import USRecoveryIdentityError
+                scope_hash = str(intent.get("broker_account_hash") or "")
+                portfolio = str(intent.get("portfolio_epoch_id") or "")
+                cycle = str(intent.get("position_cycle_id") or "")
+                supplied_epoch = str(intent.get("trading_epoch_id") or "")
+                if not all((scope_hash, portfolio, cycle, trading_epoch_id)) or supplied_epoch != str(trading_epoch_id):
+                    raise USRecoveryIdentityError("US_INTENT_RECOVERY_SCOPE_UNVERIFIED")
+                if not sql.count("trading_epoch_id, meta)")==1:
+                    raise USRecoveryIdentityError("US_INTENT_EPOCH_REQUIRED")
+                sql = sql.replace(
+                    "trading_epoch_id, meta)",
+                    "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
+                ).replace(
+                    ":trading_epoch_id,\n                            CAST(:meta",
+                    ":trading_epoch_id, :account_id, :portfolio_epoch_id, :position_cycle_id,\n                            CAST(:meta",
+                )
+                params.update({
+                    "account_id": scope_hash, "portfolio_epoch_id": portfolio,
+                    "position_cycle_id": cycle,
+                })
+                intent_meta_to_store.update({
+                    "broker_account_hash": scope_hash,
+                    "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
+                    "position_lifecycle_id": cycle,
+                })
             params["meta"] = _json_param(intent_meta_to_store)
             conn.execute(text(sql), params)
             if standard_buy:
@@ -1298,13 +1344,42 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
     from trader.us.execution.order_identity import assert_same_identity, require_identity
     require_identity(row.get("client_order_key"))
     trading_epoch_id = row.get("trading_epoch_id") or _active_us_epoch(conn)
+    order_scope_meta = _parse_json_meta(row.get("meta"))
+    portfolio_epoch_id = str(order_scope_meta.get("portfolio_epoch_id") or row.get("portfolio_epoch_id") or "")
+    position_cycle_id = str(order_scope_meta.get("position_cycle_id") or row.get("position_cycle_id") or "")
+    account_hash = str(order_scope_meta.get("broker_account_hash") or row.get("account_id") or "")
+    scoped = bool(portfolio_epoch_id)
+    if scoped and not (account_hash and position_cycle_id and trading_epoch_id
+                       and str(order_scope_meta.get("trading_epoch_id") or trading_epoch_id) == str(trading_epoch_id)):
+        raise RuntimeError("US_ORDER_ORIGINAL_PORTFOLIO_SCOPE_UNVERIFIED")
     incoming_identity = {**row, "trade_date": td, "trading_epoch_id": trading_epoch_id}
     existing = conn.execute(text("SELECT * FROM us_orders WHERE client_order_key=:cok FOR UPDATE"), {"cok": row["client_order_key"]}).fetchone()
     if existing:
         assert_same_identity(dict(existing._mapping), incoming_identity)
+        if scoped:
+            from trader.us.execution.recovery_identity import assert_recovery_scope
+            assert_recovery_scope(
+                dict(existing._mapping),
+                {**row, "trading_epoch_id": trading_epoch_id,
+                 "portfolio_epoch_id": portfolio_epoch_id,
+                 "position_cycle_id": position_cycle_id,
+                 "broker_account_hash": account_hash},
+                original_meta=_parse_json_meta(existing._mapping.get("meta")),
+                current_meta=order_scope_meta,
+            )
     order_no = str(row.get("order_no") or "").strip()
     if order_no:
-        broker_existing = conn.execute(text("SELECT * FROM us_orders WHERE trade_date=:td AND order_no=:ono FOR UPDATE"), {"td": td, "ono": order_no}).fetchone()
+        broker_sql = """SELECT * FROM us_orders
+                        WHERE trade_date=:td AND order_no=:ono AND env=:env
+                          AND trading_epoch_id IS NOT DISTINCT FROM :epoch"""
+        broker_params = {"td": td, "ono": order_no, "env": row.get("env"),
+                         "epoch": trading_epoch_id}
+        if scoped:
+            broker_sql += " AND account_id=:account_hash"
+            broker_params["account_hash"] = account_hash
+        broker_existing = conn.execute(
+            text(broker_sql + " FOR UPDATE"), broker_params,
+        ).fetchone()
         if broker_existing:
             assert_same_identity(dict(broker_existing._mapping), incoming_identity)
     params = {
@@ -1374,6 +1449,29 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
                     updated_at    =NOW()
         """
+    if scoped:
+        # New orders MUST persist exact physical columns, never a weaker
+        # meta-only fallback or a borrowed old position cycle.
+        if not trading_epoch_id or "trading_epoch_id, meta)" not in sql:
+            raise RuntimeError("US_ORDER_MIGRATION_0062_REQUIRED")
+        sql = sql.replace(
+            "trading_epoch_id, meta)",
+            "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
+        ).replace(
+            ":trading_epoch_id, CAST(:meta",
+            ":trading_epoch_id, :account_id, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
+        )
+        params.update({
+            "account_id": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+        })
+        order_meta.update({
+            "broker_account_hash": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+            "position_lifecycle_id": position_cycle_id,
+        })
     params["meta"] = _json_param(order_meta)
     conn.execute(text(sql), params)
 
@@ -1394,9 +1492,17 @@ def append_us_order_event(event: dict, *, _conn: Any = None) -> bool:
             return False
     # Caller-owned transaction: failure MUST rollback Claim and DB outbox.
     conn = _conn
-    trading_epoch_id = _active_us_epoch(conn)
+    active_epoch = _active_us_epoch(conn)
     payload = _parse_json_meta(event.get("payload") or {})
     params = {**event}
+    original_epoch = str(event.get("trading_epoch_id") or payload.get("trading_epoch_id") or "")
+    event_type = str(event.get("event_type") or "")
+    if original_epoch and active_epoch and original_epoch != str(active_epoch):
+        # Read-only historical evidence retains its SOURCE epoch. It is never
+        # used as current order execution authority.
+        if not event_type.startswith("JOURNAL_REPLAY_"):
+            raise RuntimeError("US_ORDER_EVENT_ORIGINAL_TRADING_EPOCH_MISMATCH")
+    trading_epoch_id = original_epoch or active_epoch
     if trading_epoch_id:
         payload["trading_epoch_id"] = trading_epoch_id
         params["trading_epoch_id"] = trading_epoch_id
@@ -1425,6 +1531,31 @@ def append_us_order_event(event: dict, *, _conn: Any = None) -> bool:
              :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
             ON CONFLICT (idempotency_key) DO NOTHING
         """
+    portfolio_epoch_id = str(event.get("portfolio_epoch_id") or payload.get("portfolio_epoch_id") or "")
+    if portfolio_epoch_id:
+        account_hash = str(event.get("broker_account_hash") or payload.get("broker_account_hash") or "")
+        position_cycle_id = str(event.get("position_cycle_id") or payload.get("position_cycle_id") or "")
+        if not all((trading_epoch_id, account_hash, position_cycle_id)):
+            raise RuntimeError("US_ORDER_EVENT_ORIGINAL_SCOPE_UNVERIFIED")
+        if "trading_epoch_id,\n" not in sql:
+            raise RuntimeError("US_ORDER_EVENT_MIGRATION_0062_REQUIRED")
+        sql = sql.replace(
+            "session_run_id,tick_id,trading_epoch_id,\n",
+            "session_run_id,tick_id,trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,\n",
+        ).replace(
+            ":tick_id,:trading_epoch_id,:client_order_key",
+            ":tick_id,:trading_epoch_id,:account_id,:portfolio_epoch_id,:position_cycle_id,:client_order_key",
+        )
+        params.update({
+            "account_id": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+        })
+        payload.update({
+            "broker_account_hash": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+        })
     params["payload"] = _json_param(payload)
     conn.execute(text(sql), params)
     return True
@@ -3836,6 +3967,13 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if not order and is_actual_cumulative:
             recovery_status, order = _rebind_broker_fill_to_local_order(f, trade_date=td)
             if recovery_status == "NO_CANDIDATE":
+                if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+                    _mark_unattributed_broker_fill(
+                        f, trade_date=td,
+                        reason="BROKER_ORIGINAL_PORTFOLIO_CYCLE_UNVERIFIED",
+                        candidate_count=0,
+                    )
+                    continue
                 if _get_engine_or_none() is not None:
                     order = _import_broker_actual_order(f, trade_date=td)
                     if not order:
@@ -3861,7 +3999,43 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if valid_identity(order.get("client_order_key")):
             f["client_order_key"] = order.get("client_order_key")
         order_meta = _parse_json_meta(order.get("meta"))
-        fill_meta = {**order_meta, **_parse_json_meta(f.get("meta"))}
+        if (
+            os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+            and str(order_meta.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and not all(str(order_meta.get(k) or "") for k in (
+                "broker_account_hash","trading_epoch_id",
+                "portfolio_epoch_id","position_cycle_id","position_lifecycle_id",
+            ))
+        ):
+            _mark_unattributed_broker_fill(
+                f,trade_date=td,reason="FILL_ORIGINAL_SCOPE_UNVERIFIED",
+                candidate_count=1,
+            )
+            continue
+        supplied_fill_meta = _parse_json_meta(f.get("meta"))
+        if order_meta.get("portfolio_epoch_id"):
+            # A KIS broker row cannot carry the original local portfolio/cycle;
+            # a caller's conflicting metadata cannot impersonate one either.
+            identity_fields = (
+                "broker_account_hash","trading_epoch_id","portfolio_epoch_id",
+                "position_cycle_id","position_lifecycle_id",
+            )
+            if any(
+                str(supplied_fill_meta.get(k)) != str(order_meta[k])
+                for k in identity_fields
+                if supplied_fill_meta.get(k) not in (None,"")
+                and order_meta.get(k) not in (None,"")
+            ):
+                _mark_unattributed_broker_fill(
+                    f,trade_date=td,reason="FILL_ORIGINAL_SCOPE_CONFLICT",
+                    candidate_count=1,
+                )
+                continue
+        fill_meta = {**order_meta, **supplied_fill_meta}
+        if order_meta.get("portfolio_epoch_id"):
+            for k in ("broker_account_hash","trading_epoch_id",
+                      "portfolio_epoch_id","position_cycle_id","position_lifecycle_id"):
+                fill_meta[k] = order_meta.get(k)
         if is_actual_cumulative:
             fill_meta.setdefault("is_synthetic", False)
         f["meta"] = fill_meta
@@ -4068,21 +4242,51 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
 
                 order_epoch_id = trading_epoch_id
                 if trading_epoch_id and _is_actual_evidence(evidence):
-                    order_row = conn.execute(
-                        text("""SELECT trading_epoch_id FROM us_orders
+                    # A broker order number is not globally unique. Scoped
+                    # fills must resolve the ORIGINAL order in the exact
+                    # account/portfolio/cycle, never the newest matching order.
+                    _fill_scope_meta = _parse_json_meta(f.get("meta"))
+                    _fill_portfolio = str(_fill_scope_meta.get("portfolio_epoch_id") or "")
+                    _order_sql = """SELECT trading_epoch_id FROM us_orders
                                 WHERE trade_date=:td
                                   AND ((:cok <> '' AND client_order_key=:cok)
-                                       OR (:order_no <> '' AND order_no=:order_no))
+                                       OR (:order_no <> '' AND order_no=:order_no))"""
+                    _order_params = {
+                        "td": td,
+                        "cok": str(f.get("client_order_key") or ""),
+                        "order_no": str(f.get("order_no") or ""),
+                    }
+                    if _fill_portfolio:
+                        _account = str(_fill_scope_meta.get("broker_account_hash") or "")
+                        _cycle = str(_fill_scope_meta.get("position_cycle_id") or "")
+                        _source_epoch = str(_fill_scope_meta.get("trading_epoch_id") or "")
+                        if not all((_account, _cycle, _source_epoch)) or _source_epoch != str(trading_epoch_id):
+                            f["save_status"] = "FILL_ORIGINAL_SCOPE_UNVERIFIED"
+                            skipped_duplicates += 1
+                            continue
+                        _order_sql += """
+                                  AND account_id=:account
+                                  AND trading_epoch_id=:source_epoch
+                                  AND portfolio_epoch_id=:portfolio
+                                  AND position_cycle_id=:cycle"""
+                        _order_params.update({
+                            "account": _account, "source_epoch": _source_epoch,
+                            "portfolio": _fill_portfolio, "cycle": _cycle,
+                        })
+                    _order_sql += """
                                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-                                LIMIT 1"""),
-                        {
-                            "td": td,
-                            "cok": str(f.get("client_order_key") or ""),
-                            "order_no": str(f.get("order_no") or ""),
-                        },
+                                LIMIT 1"""
+                    order_row = conn.execute(
+                        text(_order_sql), _order_params,
                     ).mappings().first()
-                    if not order_row and str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED":
-                        f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                    if not order_row and (
+                        _fill_portfolio
+                        or str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED"
+                    ):
+                        f["save_status"] = (
+                            "FILL_ORIGINAL_ORDER_NOT_FOUND" if _fill_portfolio
+                            else "FILL_ORDER_NOT_FOUND"
+                        )
                         skipped_duplicates += 1
                         continue
                     if order_row:
@@ -4161,6 +4365,41 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
                               > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
                     """
+                if fill_meta_to_store.get("portfolio_epoch_id"):
+                    account_hash = str(fill_meta_to_store.get("broker_account_hash") or "")
+                    portfolio = str(fill_meta_to_store.get("portfolio_epoch_id") or "")
+                    cycle = str(fill_meta_to_store.get("position_cycle_id") or "")
+                    original_epoch = str(fill_meta_to_store.get("trading_epoch_id") or "")
+                    if not all((account_hash, portfolio, cycle, original_epoch)) or original_epoch != str(order_epoch_id):
+                        f["save_status"] = "FILL_ORIGINAL_SCOPE_UNVERIFIED"
+                        skipped_duplicates += 1
+                        continue
+                    if "trading_epoch_id, meta," not in sql:
+                        raise RuntimeError("US_FILL_MIGRATION_0062_REQUIRED")
+                    sql = sql.replace(
+                        "trading_epoch_id, meta,",
+                        "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta,",
+                    ).replace(
+                        ":trading_epoch_id, CAST(:meta",
+                        ":trading_epoch_id, :account_id, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
+                    ).replace(
+                        "trading_epoch_id = us_fills.trading_epoch_id,",
+                        "trading_epoch_id = us_fills.trading_epoch_id,",
+                    )
+                    # Never adopt a scoped fill-idempotency key belonging to
+                    # another account/epoch/cycle on cumulative refresh.
+                    sql = sql.replace(
+                        "WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer",
+                        "WHERE us_fills.account_id IS NOT DISTINCT FROM EXCLUDED.account_id "
+                        "AND us_fills.portfolio_epoch_id IS NOT DISTINCT FROM EXCLUDED.portfolio_epoch_id "
+                        "AND us_fills.position_cycle_id IS NOT DISTINCT FROM EXCLUDED.position_cycle_id "
+                        "AND COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer",
+                    )
+                    params.update({
+                        "account_id":account_hash,
+                        "portfolio_epoch_id":portfolio,
+                        "position_cycle_id":cycle,
+                    })
                 params["meta"] = _json_param(fill_meta_to_store)
                 result = conn.execute(text(sql), params)
                 if int(result.rowcount or 0) > 0:

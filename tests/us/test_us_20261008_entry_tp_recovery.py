@@ -410,11 +410,16 @@ def test_protective_producer_profit_protect_is_eligible():
     reason="Postgres recovery integration requires CI PostgreSQL",
 )
 def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeypatch):
+    import hashlib
     import os
     from sqlalchemy import create_engine, text
+    import trader.account_state as account_state
     from trader.us import protective_tp_recovery as recovery
     from trader.us.db import repos
 
+    monkeypatch.setattr(account_state, "get_account_key", lambda **kw: "practice:fixture:01")
+    monkeypatch.setattr(account_state, "resolve_env_name", lambda: "practice")
+    account_hash = hashlib.sha256(b"practice:fixture:01").hexdigest()
     engine = create_engine(os.environ["PBCORE_TEST_POSTGRES_URL"], future=True, pool_size=1)
     try:
         with engine.begin() as conn:
@@ -430,7 +435,7 @@ def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeyp
                 CREATE TEMP TABLE us_execution_claims (
                     trading_epoch_id TEXT,trade_date TEXT,env TEXT,market TEXT,
                     strategy_owner TEXT,lifecycle_id TEXT,action TEXT,
-                    account_id TEXT,
+                    account_id TEXT,action_key TEXT,
                     action_state TEXT)
             """)
             conn.execute(text("""
@@ -441,16 +446,17 @@ def test_real_postgres_cross_day_tp_cancel_reservation_is_once_per_claim(monkeyp
                         '0000034237',2,0,'tp2-mrvl','NASDAQ',
                         '{"profit_capture_stage":"tp2",
                           "strategy_owner":"US_STANDARD",
-                          "position_lifecycle_id":"life-MRVL"}'::jsonb,
+                          "position_lifecycle_id":"life-MRVL",
+                          "execution_action_key":"fixture-mrvl-tp2"}'::jsonb,
                         'epoch-ci')
             """))
             conn.execute(text("""
                 INSERT INTO us_execution_claims (
                     trading_epoch_id,trade_date,env,market,strategy_owner,
-                    lifecycle_id,action,action_state)
+                    lifecycle_id,action,account_id,action_key,action_state)
                 VALUES ('epoch-ci','2026-10-06','practice','US','US_STANDARD',
-                        'life-MRVL','TP2','IN_FLIGHT')
-            """))
+                        'life-MRVL','TP2',:account_hash,'fixture-mrvl-tp2','IN_FLIGHT')
+            """), {"account_hash": account_hash})
         monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
         monkeypatch.setattr(repos, "_active_us_epoch", lambda conn: "epoch-ci")
         monkeypatch.setenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "1")

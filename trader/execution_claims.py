@@ -24,6 +24,11 @@ def build_execution_claim_tables(
         sa.Column("account_id", sa.String, nullable=False),
         sa.Column("market", sa.String, nullable=False),
         sa.Column("trading_epoch_id", sa.String, nullable=False),
+        *(
+            [sa.Column("portfolio_epoch_id", sa.String),
+             sa.Column("position_cycle_id", sa.String)]
+            if action_name == "us_execution_claims" else []
+        ),
         sa.Column("strategy_owner", sa.String, nullable=False),
         sa.Column("lifecycle_id", sa.String, nullable=False),
         sa.Column("action", sa.String, nullable=False),
@@ -686,6 +691,11 @@ class DurableExecutionClaimRepo:
                 self.actions.c.account_id,
                 self.actions.c.market,
                 self.actions.c.trading_epoch_id,
+                *(
+                    [self.actions.c.portfolio_epoch_id,
+                     self.actions.c.position_cycle_id]
+                    if "portfolio_epoch_id" in self.actions.c else []
+                ),
                 self.actions.c.strategy_owner,
                 self.actions.c.lifecycle_id,
                 self.actions.c.action,

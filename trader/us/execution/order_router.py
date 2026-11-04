@@ -1254,6 +1254,42 @@ def route_order(
             "intent": intent,
         }
 
+    # Production US_STANDARD writes must have ORIGINAL account + owner-specific
+    # Portfolio Epoch + position-cycle provenance before even saving an Intent.
+    # Other owners (notably TQQQ Infinite) retain their dedicated route/contract.
+    # WSL US is mandatory; offline injected harnesses never gain KIS authority.
+    if (
+        os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
+        and kis_order_allowed
+        and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+    ):
+        try:
+            from trader.account_state import get_account_key
+            from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+            from trader.us.execution.recovery_identity import bind_original_us_order_scope
+            _identity_engine = _get_engine_or_none()
+            if _identity_engine is None:
+                raise RuntimeError("US_SCOPE_DATABASE_UNAVAILABLE")
+            _env = _kis_env()
+            with _identity_engine.connect() as _identity_conn:
+                _epoch = _active_us_epoch(_identity_conn, required=True)
+                bind_original_us_order_scope(
+                    intent, conn=_identity_conn, env=_env,
+                    account_key=get_account_key(env=_env),
+                    trading_epoch_id=str(_epoch or ""),
+                )
+            meta = intent["meta"]
+        except Exception as exc:
+            logger.error(
+                "[US_ORDER][ORIGINAL_RECOVERY_SCOPE_FENCED] symbol=%s "
+                "side=%s type=%s broker_submit=0", symbol, side, type(exc).__name__,
+            )
+            return {
+                "status": "US_RECOVERY_SCOPE_UNVERIFIED",
+                "reason": str(exc), "broker_submit": False,
+                "retry_order": False, "intent": intent,
+            }
+
     # 1. SELL duplicate precheck before saving intent: never grow blocked duplicate intents.
     try:
         db_keys = load_today_order_keys(trade_date=trade_date)
@@ -1895,6 +1931,33 @@ def route_order(
 
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
+        _us_claim_scope = None
+        if (
+            os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
+            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+        ):
+            from trader.us.execution.recovery_identity import (
+                USRecoveryScope, assert_preexisting_us_claim_scope,
+            )
+            from trader.us.db.repos import _get_engine_or_none
+            _us_claim_scope = USRecoveryScope(
+                env=account_env,
+                account_id=str(intent.get("broker_account_hash") or ""),
+                trading_epoch_id=str(intent.get("trading_epoch_id") or ""),
+                portfolio_epoch_id=str(intent.get("portfolio_epoch_id") or ""),
+                position_cycle_id=str(intent.get("position_cycle_id") or ""),
+                strategy_owner="US_STANDARD",
+            )
+            if not all(_us_claim_scope.as_dict().values()):
+                raise RuntimeError("US_CLAIM_ORIGINAL_SCOPE_UNVERIFIED")
+            _preclaim_engine = _get_engine_or_none()
+            if _preclaim_engine is None:
+                raise RuntimeError("US_CLAIM_SCOPE_DB_UNAVAILABLE")
+            with _preclaim_engine.begin() as _preclaim_conn:
+                assert_preexisting_us_claim_scope(
+                    _preclaim_conn, action_key=claim_identity.action_key,
+                    scope=_us_claim_scope,
+                )
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation
         # Stage A: persist the Claim and an immutable PRE-SUBMIT DB outbox
         # marker atomically.  The existing fsync journal below still proves
@@ -1974,6 +2037,12 @@ def route_order(
                         _conn=_outbox_conn,
                     )
                     if claim.acquired:
+                        if _us_claim_scope is not None:
+                            from trader.us.execution.recovery_identity import persist_us_claim_scope
+                            persist_us_claim_scope(
+                                _outbox_conn, action_key=claim.action_key,
+                                scope=_us_claim_scope,
+                            )
                         if _account_reservation_required:
                             _account_authority.reserve(
                                 lease=_account_lease,
@@ -2036,6 +2105,15 @@ def route_order(
                 fresh_validation=True,
                 client_order_key=str(order_key or ""),
             )
+        if _us_claim_scope is not None and claim.acquired and not _atomic_claim_outbox:
+            # Independent transaction is still entirely before native KIS HTTP.
+            # Any failure leaves the Claim fenced for audit, never a submit.
+            from trader.us.execution.recovery_identity import persist_us_claim_scope
+            with _preclaim_engine.begin() as _claim_scope_conn:
+                persist_us_claim_scope(
+                    _claim_scope_conn, action_key=claim.action_key,
+                    scope=_us_claim_scope,
+                )
         if not claim.acquired:
             claim_remainder_audit = None
             if str(claim.reason or "") == "remaining_target_qty_mismatch":
