@@ -342,7 +342,7 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
         candidates, target_accept_count=1, projected_state=state,
         allowed_symbols={"COST", "KO"}, current_positions=[],
     )
-    assert [item["symbol"] for item in accepted] == ["KO"]
+    assert [item["symbol"] for item in accepted] == ["KO"], {"rejected": rejected, "projected_state": state}
     assert rejected[0]["reason"] == "daily_notional_exceeded"
 
     empty = repos.load_today_committed_buy_notional_result("2026-08-01", env="practice")
