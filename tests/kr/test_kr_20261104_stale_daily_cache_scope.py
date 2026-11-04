@@ -116,3 +116,38 @@ def test_stale_cache_cannot_become_order_approval(tmp_path, monkeypatch):
     )
     assert proof["confirmation_state"] == "UNKNOWN"
     assert proof["failure_reason"] == "kis_cumulative_volume_missing"
+
+
+def test_trade_ttl_cache_refreshes_from_db_without_kis_call(monkeypatch):
+    monkeypatch.setattr(mod, "now_kst", lambda: SESSION)
+    monkeypatch.setenv("MODE", "trade")
+    monkeypatch.setenv("TRADE_SKIP_KIS_DAILY_REFRESH", "1")
+    used = {"db": 0, "kis": 0, "set": 0}
+
+    class TTL:
+        def get(self, _key):
+            return OHLCVResult(
+                _bars("2026-10-02"), {"source": "cache", "rows": 60, "volume_missing": False},
+            )
+
+        def set(self, *_args):
+            used["set"] += 1
+
+    class KIS:
+        def get_ohlcv(self, *_args, **_kwargs):
+            used["kis"] += 1
+            raise AssertionError("Trade cache repair must use fresh DB; no KIS fetch")
+
+    def rows(_engine, _symbol, _start, _end):
+        used["db"] += 1
+        return _bars("2026-11-03").to_dict("records")
+
+    monkeypatch.setattr(mod, "daily_cache", TTL())
+    monkeypatch.setattr(mod, "make_engine", lambda: object())
+    monkeypatch.setattr(mod, "load_price_daily", rows)
+    actual = mod.KISOHLCVProvider(KIS()).get_ohlcv(
+        "012750", 60, usage_context="trade",
+    )
+    assert used == {"db": 1, "kis": 0, "set": 1}
+    assert actual.meta["source"] == "db"
+    assert actual.df["date"].max().date() == date(2026, 11, 3)
