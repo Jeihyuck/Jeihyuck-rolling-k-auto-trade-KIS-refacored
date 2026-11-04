@@ -9,6 +9,7 @@ unchanged full pre-exit reconciliation.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+import hashlib
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 import math
@@ -22,6 +23,7 @@ from trader.account_state import get_account_key
 from trader.db.repos import OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
+from trader.kr.recovery_scope_20261104 import resolve_kr_recovery_scope
 from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
 from trader.reconcile_kis import _normalize_code, _parse_side, _parse_date_time
 from trader.time_utils import now_kst
@@ -60,6 +62,19 @@ def _fresh_balance_evidence(balance_snapshot: Any) -> tuple[bool, str]:
     return True, "FRESH_KIS_BALANCE"
 
 
+def _current_account_claim_health(*, engine, kis, env, orders):
+    """Never allow an old account's claim to contaminate SELL-only proof."""
+    scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
+    if scope is None:
+        # Non-trading legacy fixtures; runtime requires WSL_RUN_MARKET scope.
+        return orders.execution_claim_health(market="KR")
+    return orders.execution_claim_health(
+        market="KR", env=env,
+        account_id=hashlib.sha256(scope.account_key.encode("utf-8")).hexdigest(),
+        trading_epoch_id=scope.trading_epoch_id,
+    )
+
+
 def prove_protective_sell_only_preflight(
     *, engine: Any, kis: Any, env: str, strategy: str,
     trade_date: date, balance_snapshot: dict | None,
@@ -93,7 +108,7 @@ def prove_protective_sell_only_preflight(
         orders = OrdersRepo(engine)
         if orders.get_open_orders(env, include_stale=True, fail_open=False):
             return False, "OPEN_OR_UNRESOLVED_ORDER"
-        health = orders.execution_claim_health(market="KR")
+        health = _current_account_claim_health(engine=engine, kis=kis, env=env, orders=orders)
         if not isinstance(health, dict) or health.get("available") is not True:
             return False, "CLAIM_HEALTH_NOT_AUTHORITATIVE"
         for name in ("in_flight", "uncertain", "unresolved"):
@@ -174,7 +189,7 @@ def prove_safe_protective_sell_handoff(
         # lookup is NEVER proof that broker-tracked orders are absent.
         if orders_repo.get_open_orders(env, include_stale=True, fail_open=False):
             return False, "OPEN_OR_UNRESOLVED_ORDER"
-        health = orders_repo.execution_claim_health(market="KR")
+        health = _current_account_claim_health(engine=engine, kis=kis, env=env, orders=orders_repo)
         if not isinstance(health, dict) or health.get("available") is not True:
             return False, "UNRESOLVED_EXECUTION_CLAIM"
         if any(_valid_nonnegative_integral(health.get(k)) is None
