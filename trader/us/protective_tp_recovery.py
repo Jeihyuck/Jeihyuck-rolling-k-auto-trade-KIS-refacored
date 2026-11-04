@@ -361,6 +361,22 @@ def request_protective_tp_cancel(
         for intent in intents
         if str(intent.get("side") or "").upper() == "SELL"
     }
+    portfolio_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("portfolio_epoch_id")
+                or (intent.get("meta") or {}).get("portfolio_epoch_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
+    cycle_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("position_cycle_id")
+                or (intent.get("meta") or {}).get("position_cycle_id")
+                or intent.get("position_lifecycle_id")
+                or (intent.get("meta") or {}).get("position_lifecycle_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
     # Do not let the last of two same-symbol debts silently win the cycle.
     identity_sets: dict[str, set[tuple[str, str, str]]] = {}
     for intent in intents:
@@ -372,6 +388,8 @@ def request_protective_tp_cancel(
             str(intent.get("account_id") or meta.get("account_id") or ""),
             str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
             str(intent.get("trading_epoch_id") or meta.get("trading_epoch_id") or ""),
+            str(intent.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or ""),
+            str(intent.get("position_cycle_id") or meta.get("position_cycle_id") or ""),
         ))
     for symbol in sorted(protective_symbols(intents)):
         if len(identity_sets.get(symbol, set())) != 1:
@@ -402,6 +420,25 @@ def request_protective_tp_cancel(
             if original_epoch and str(order.get("trading_epoch_id") or "") != original_epoch:
                 results.append({"symbol": symbol, "status": "FENCED",
                                 "reason": "original_trading_epoch_mismatch"})
+                continue
+            strict_us = os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+            meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+            source_portfolio = str(order.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "")
+            source_cycle = str(order.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+            expected_portfolio = portfolio_by_symbol.get(symbol) or ""
+            expected_cycle = cycle_by_symbol.get(symbol) or ""
+            if strict_us and not all((original_epoch,source_portfolio,source_cycle,
+                                      expected_portfolio,expected_cycle)):
+                results.append({"symbol":symbol,"status":"FENCED",
+                                "reason":"original_portfolio_or_cycle_unverified"})
+                continue
+            if expected_portfolio and source_portfolio != expected_portfolio:
+                results.append({"symbol":symbol,"status":"FENCED",
+                                "reason":"original_portfolio_epoch_mismatch"})
+                continue
+            if expected_cycle and source_cycle and source_cycle != expected_cycle:
+                results.append({"symbol":symbol,"status":"FENCED",
+                                "reason":"original_position_cycle_mismatch"})
                 continue
             expected_account = account_by_symbol.get(symbol) or ""
             if expected_account:
