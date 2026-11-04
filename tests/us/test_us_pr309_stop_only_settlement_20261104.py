@@ -208,3 +208,19 @@ def test_original_date_discovery_uses_exact_filled_stop_and_original_claim():
             "c.account_id=:account",
         ):
             assert safety_contract in source, (str(path), safety_contract)
+
+
+def test_tmo_historical_open_one_share_never_terminal_or_claim_release():
+    from trader.us.protective_tp_recovery import broker_proves_terminal_after_cancel
+    local = {
+        "trade_date": "2026-10-30", "order_no": "0000036019",
+        "qty_requested": 1, "qty_filled": 0,
+    }
+    original_kis = {
+        "trade_date": "2026-10-30", "order_no": "0000036019",
+        "symbol": "TMO", "side": "SELL", "requested_qty": 1,
+        "filled_qty": 0, "remaining_qty": 1, "status": "OPEN",
+        "filled_qty_present": True, "normalization_result": "normalized",
+    }
+    assert not broker_proves_terminal_after_cancel(local, original_kis)
+    # No claim mutation, cancellation or release is authorized from OPEN proof.
