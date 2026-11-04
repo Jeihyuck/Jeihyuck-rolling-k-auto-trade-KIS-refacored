@@ -271,7 +271,33 @@ class HistoricalReadOnlyReader:
                 self._books.clear()
                 self._balance = None
             return
-        kind, day = tasks[self._cursor % len(tasks)]
+        # A newly changed/expired claim signature is on the critical path
+        # for Stage4 READY. Refresh its ORIGINAL KIS order book ahead of a
+        # less urgent balance/round-robin read; never extend a stale TTL and
+        # never synthesize broker terminality from DB claims.
+        with self._lock:
+            priority_books = []
+            observed_now = self.clock()
+            for source_day in sorted(source_dates):
+                book = self._books.get(source_day)
+                expected_keys = frozenset(
+                    key for key in signatures if key[0] == source_day
+                )
+                if book is None:
+                    priority_books.append((float("-inf"), source_day, "MISSING"))
+                elif book["keys"] != expected_keys:
+                    priority_books.append((float("-inf"), source_day, "CLAIM_SET_CHANGED"))
+                elif observed_now < book["at"] or observed_now - book["at"] > self.ttl_sec:
+                    priority_books.append((float(book["at"]), source_day, "STALE"))
+        if priority_books:
+            _, day, cause = min(priority_books)
+            kind = "book"
+            logger.info(
+                "[US_STAGE4][HISTORICAL_PRIORITY_REFRESH] source_day=%s cause=%s",
+                day, cause,
+            )
+        else:
+            kind, day = tasks[self._cursor % len(tasks)]
         self._cursor += 1
         if kind == "book":
             orders = provider.get_today_orders(trade_date=day)
