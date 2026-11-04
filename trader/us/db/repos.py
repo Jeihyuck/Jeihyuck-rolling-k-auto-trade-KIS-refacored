@@ -1123,6 +1123,13 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
             }
             if existing_intent:
                 assert_same_identity(dict(existing_intent), incoming_identity)
+                if intent.get("portfolio_epoch_id"):
+                    from trader.us.execution.recovery_identity import assert_recovery_scope
+                    assert_recovery_scope(
+                        existing_intent, intent,
+                        original_meta=_parse_json_meta(existing_intent.get("meta")),
+                        current_meta=intent_meta,
+                    )
             intent_meta_to_store = {
                 **intent_meta,
                 **{field: intent.get(field) for field in (
@@ -1164,6 +1171,34 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                             CAST(:meta AS jsonb))
                     ON CONFLICT (client_order_key) DO NOTHING
                 """
+            if intent.get("portfolio_epoch_id"):
+                # A pre-migration WSL process must FAIL CLOSED instead of
+                # silently persisting a narrower historical identity.
+                from trader.us.execution.recovery_identity import USRecoveryIdentityError
+                scope_hash = str(intent.get("broker_account_hash") or "")
+                portfolio = str(intent.get("portfolio_epoch_id") or "")
+                cycle = str(intent.get("position_cycle_id") or "")
+                supplied_epoch = str(intent.get("trading_epoch_id") or "")
+                if not all((scope_hash, portfolio, cycle, trading_epoch_id)) or supplied_epoch != str(trading_epoch_id):
+                    raise USRecoveryIdentityError("US_INTENT_RECOVERY_SCOPE_UNVERIFIED")
+                if not sql.count("trading_epoch_id, meta)")==1:
+                    raise USRecoveryIdentityError("US_INTENT_EPOCH_REQUIRED")
+                sql = sql.replace(
+                    "trading_epoch_id, meta)",
+                    "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
+                ).replace(
+                    ":trading_epoch_id,\n                            CAST(:meta",
+                    ":trading_epoch_id, :account_id, :portfolio_epoch_id, :position_cycle_id,\n                            CAST(:meta",
+                )
+                params.update({
+                    "account_id": scope_hash, "portfolio_epoch_id": portfolio,
+                    "position_cycle_id": cycle,
+                })
+                intent_meta_to_store.update({
+                    "broker_account_hash": scope_hash,
+                    "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
+                    "position_lifecycle_id": cycle,
+                })
             params["meta"] = _json_param(intent_meta_to_store)
             conn.execute(text(sql), params)
             if standard_buy:
