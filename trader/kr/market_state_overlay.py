@@ -368,11 +368,18 @@ def generate_kr_profit_capture_intents(positions: list[dict], overlay: dict) -> 
                 raw_plan={}
         plan=raw_plan if isinstance(raw_plan,dict) else {}
 
-        adoption_verified=is_verified_kr_policy_missing_adoption(p)
+        # Verify a legacy POLICY_MISSING adoption only when the position
+        # actually claims one. Normal SYSTEM Pullback/Momentum Swing contracts
+        # have a different authoritative policy and must not be falsely logged
+        # as a failed adoption on every tick.
+        adoption_claimed = has_kr_policy_missing_adoption_claim(p)
+        adoption_verified = (
+            is_verified_kr_policy_missing_adoption(p) if adoption_claimed else False
+        )
         if plan and isinstance(plan.get("profit_plan"),dict) and "tp1_sell_pct" in plan["profit_plan"] and not adoption_verified:
             logger.info("[KR_PROFIT_CAPTURE][SKIP] symbol=%s reason=entry_exit_plan_authoritative",code)
             continue
-        if has_kr_policy_missing_adoption_claim(p) and not adoption_verified:
+        if adoption_claimed and not adoption_verified:
             logger.warning("[KR_PROFIT_CAPTURE][BLOCK] symbol=%s reason=adoption_contract_unverified",code)
             continue
 
