@@ -28,10 +28,11 @@ def recovery_candidates(pending: list[dict]) -> list[dict]:
         symbol=str(item.get("symbol") or "").upper()
         life=str(item.get("lifecycle_id") or "")
         account=str(item.get("account_id") or "")
+        original_epoch=str(item.get("trading_epoch_id") or "")
         severity=int(item.get("severity") or 0)
         if not life or not account or not symbol or symbol=="TQQQ" or severity<2:
             continue
-        key=(account,symbol,life)
+        key=(account,original_epoch,symbol,life)
         if key in seen:
             continue
         seen.add(key)
@@ -41,8 +42,9 @@ def recovery_candidates(pending: list[dict]) -> list[dict]:
             ),
             "strategy":"us_pb1_exit","strategy_owner":"US_STANDARD",
             "position_lifecycle_id":life,"account_id":account,
+            "trading_epoch_id":original_epoch,
             "meta":{"strategy_owner":"US_STANDARD","position_lifecycle_id":life,
-                    "account_id":account},
+                    "account_id":account,"trading_epoch_id":original_epoch},
         })
     return results
 
