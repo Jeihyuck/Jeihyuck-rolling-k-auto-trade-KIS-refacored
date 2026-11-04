@@ -481,6 +481,18 @@ def reconcile_us_position_lifecycles(
                 identity["strategy_owner"],
             )
             continue
+        if os.getenv("WSL_RUN_MARKET", "").upper() == "US" and (
+            not identity.get("portfolio_epoch_id")
+            or not identity.get("position_lifecycle_id")
+            or (identity.get("position_cycle_id")
+                and identity["position_cycle_id"] != identity["position_lifecycle_id"])
+        ):
+            pos["lifecycle_identity_status"] = "ORIGINAL_PORTFOLIO_CYCLE_UNVERIFIED"
+            logger.error(
+                "[US_POSITION][LIFECYCLE][ORIGINAL_SCOPE_FENCED] "
+                "symbol=%s action=NO_CURRENT_CYCLE_ADOPTION", symbol,
+            )
+            continue
         # Resolve latest lifecycle after binding authoritative identity.
         latest = load_latest_us_position_risk_state(symbol, trade_date)
         lifecycle = dict(((latest.get("state") or {}).get("lifecycle") or {}))
