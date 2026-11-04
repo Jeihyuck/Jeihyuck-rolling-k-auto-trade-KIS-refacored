@@ -114,6 +114,8 @@ def _position_identity(pos: dict, *, env: str | None) -> dict[str, str]:
         "env": resolved_env.lower(),
         "account_id": account_id,
         "trading_epoch_id": value("trading_epoch_id"),
+        "portfolio_epoch_id": value("portfolio_epoch_id"),
+        "position_cycle_id": value("position_cycle_id", "position_lifecycle_id"),
         "strategy_owner": (
             value("strategy_owner", "sleeve_id")
             or str(contract.get("strategy_owner") or contract.get("sleeve_id") or "").strip()
@@ -144,6 +146,12 @@ def _lifecycle_matches_identity(lifecycle: dict, identity: dict[str, str]) -> bo
         return False
     if identity.get("position_lifecycle_id") and str(lifecycle.get("lifecycle_id") or "") != identity["position_lifecycle_id"]:
         return False
+    if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+        portfolio = str(identity.get("portfolio_epoch_id") or "")
+        if not portfolio or str(lifecycle.get("portfolio_epoch_id") or "") != portfolio:
+            return False
+        if str(lifecycle.get("position_cycle_id") or "") != str(lifecycle.get("lifecycle_id") or ""):
+            return False
     return bool(lifecycle.get("lifecycle_id"))
 
 
@@ -227,6 +235,19 @@ def _bind_authoritative_position_identity(
 
     if len(lifecycle_matches) == 1:
         lifecycle_id, (owner, _lifecycle) = next(iter(lifecycle_matches.items()))
+        portfolio = str(_lifecycle.get("portfolio_epoch_id") or "")
+        cycle = str(_lifecycle.get("position_cycle_id") or "")
+        if os.getenv("WSL_RUN_MARKET", "").upper() == "US" and (
+            not portfolio or cycle != lifecycle_id
+            or (identity.get("portfolio_epoch_id")
+                and identity["portfolio_epoch_id"] != portfolio)
+        ):
+            return identity
+        if portfolio:
+            identity["portfolio_epoch_id"] = portfolio
+            identity["position_cycle_id"] = lifecycle_id
+            pos["portfolio_epoch_id"] = portfolio
+            pos["position_cycle_id"] = lifecycle_id
         identity["strategy_owner"] = identity.get("strategy_owner") or owner
         identity["position_lifecycle_id"] = (
             identity.get("position_lifecycle_id") or lifecycle_id
@@ -237,7 +258,7 @@ def _bind_authoritative_position_identity(
             pos["position_lifecycle_id"] = identity["position_lifecycle_id"]
         return identity
 
-    fill_matches: list[tuple[str, str]] = []
+    fill_matches: list[tuple[str, str, str]] = []
     for fill in fills or []:
         meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
         if (
@@ -262,26 +283,39 @@ def _bind_authoritative_position_identity(
             fill.get("position_lifecycle_id") or meta.get("position_lifecycle_id")
             or fill.get("position_cycle_id") or meta.get("position_cycle_id") or ""
         ).strip()
+        portfolio = str(fill.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "")
+        cycle = str(fill.get("position_cycle_id") or meta.get("position_cycle_id") or lifecycle_id)
+        strict = os.getenv("WSL_RUN_MARKET", "").upper() == "US"
         if (
-            owner
+            owner and (not strict or bool(portfolio and lifecycle_id and cycle == lifecycle_id))
+            and (not identity.get("portfolio_epoch_id")
+                 or identity["portfolio_epoch_id"] == portfolio)
             and (not identity.get("strategy_owner") or identity["strategy_owner"] == owner)
             and (
                 not identity.get("position_lifecycle_id")
                 or lifecycle_id == identity["position_lifecycle_id"]
             )
         ):
-            fill_matches.append((owner, lifecycle_id))
+            fill_matches.append((owner, lifecycle_id, portfolio))
 
-    owners = {owner for owner, _ in fill_matches}
-    lifecycle_ids = {lifecycle_id for _, lifecycle_id in fill_matches if lifecycle_id}
+    owners = {owner for owner, _, _ in fill_matches}
+    lifecycle_ids = {lifecycle_id for _, lifecycle_id, _ in fill_matches if lifecycle_id}
+    portfolio_ids = {portfolio for _, _, portfolio in fill_matches if portfolio}
     if len(owners) == 1:
         identity["strategy_owner"] = next(iter(owners))
         if not pos.get("strategy_owner"):
             pos["strategy_owner"] = identity["strategy_owner"]
-        if len(lifecycle_ids) == 1 and all(lifecycle_id for _, lifecycle_id in fill_matches):
+        if len(lifecycle_ids) == 1 and all(lifecycle_id for _, lifecycle_id, _ in fill_matches):
             identity["position_lifecycle_id"] = next(iter(lifecycle_ids))
+            identity["position_cycle_id"] = identity["position_lifecycle_id"]
             if not pos.get("position_lifecycle_id"):
                 pos["position_lifecycle_id"] = identity["position_lifecycle_id"]
+            pos["position_cycle_id"] = identity["position_lifecycle_id"]
+        if len(portfolio_ids) == 1 and len(portfolio_ids) == len(
+            {portfolio for _, _, portfolio in fill_matches}
+        ) and all(portfolio for _, _, portfolio in fill_matches):
+            identity["portfolio_epoch_id"] = next(iter(portfolio_ids))
+            pos["portfolio_epoch_id"] = identity["portfolio_epoch_id"]
     return identity
 
 
@@ -508,11 +542,21 @@ def reconcile_us_position_lifecycles(
                 "env": identity["env"],
                 "account_id": identity["account_id"],
                 "trading_epoch_id": identity["trading_epoch_id"],
+                "portfolio_epoch_id": identity.get("portfolio_epoch_id") or "",
+                "position_cycle_id": lifecycle_id,
                 "strategy_owner": identity["strategy_owner"],
                 "sleeve_id": identity["strategy_owner"],
             })
             identity["position_lifecycle_id"] = lifecycle_id
         else:
+            if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+                if (not identity.get("portfolio_epoch_id")
+                    or str(lifecycle.get("portfolio_epoch_id") or "")
+                       != identity["portfolio_epoch_id"]
+                    or str(lifecycle.get("position_cycle_id") or "")
+                       != str(lifecycle.get("lifecycle_id") or "")):
+                    pos["lifecycle_identity_status"] = "PORTFOLIO_CYCLE_UNVERIFIED"
+                    continue
             lifecycle["last_seen_qty"] = qty
             lifecycle["last_seen_trade_date"] = trade_date
             if lifecycle.get("last_holding_day_counted") != trade_date:
@@ -533,6 +577,8 @@ def reconcile_us_position_lifecycles(
         carried_policy = dict(lifecycle.get("entry_policy") or {})
         pos.update({
             "position_lifecycle_id": lifecycle.get("lifecycle_id"),
+            "position_cycle_id": lifecycle.get("position_cycle_id") or lifecycle.get("lifecycle_id"),
+            "portfolio_epoch_id": lifecycle.get("portfolio_epoch_id"),
             "opened_trade_date": lifecycle.get("opened_trade_date"),
             "opened_at": lifecycle.get("opened_at"),
             "opened_at_source": lifecycle.get("opened_at_source"),
