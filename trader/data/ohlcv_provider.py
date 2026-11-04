@@ -31,6 +31,28 @@ class OHLCVResult:
     meta: dict
 
 
+def _completed_daily_cache_recent(result: OHLCVResult, *, session: date | None = None) -> bool:
+    """Match KR volume-proof's completed-bar age gate before reusing trade cache.
+
+    A long-enough Parquet or in-memory cache can still be weeks out of date.
+    Never count the incomplete current-session bar as historical evidence.
+    This is a *cache* freshness check, not approval to trade: the existing
+    KR BUY volume-proof and KIS intraday confirmation remain authoritative.
+    """
+    if result.df is None or result.df.empty or "date" not in result.df.columns:
+        return False
+    session = session or now_kst().date()
+    try:
+        dates = pd.to_datetime(result.df["date"], errors="coerce").dt.date
+        completed = dates[(dates.notna()) & (dates < session)]
+        if completed.empty:
+            return False
+        age = session - completed.max()
+        return timedelta(0) < age <= timedelta(days=14)
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 class OHLCVProvider(Protocol):
     name: str
 
@@ -69,9 +91,16 @@ class KISOHLCVProvider:
     ) -> OHLCVResult:
         cache_key = ("daily", symbol, days)
         cached = daily_cache.get(cache_key)
-        if cached:
+        if cached and (
+            usage_context != "trade" or _completed_daily_cache_recent(cached)
+        ):
             logger.debug("[OHLCV][CACHE][HIT] symbol=%s days=%d", symbol, days)
             return cached
+        if cached:
+            logger.warning(
+                "[OHLCV][CACHE][STALE_BYPASS] symbol=%s days=%d layer=daily_ttl action=db_first",
+                symbol, days,
+            )
 
         # DB 우선 조회
         db_df_norm = pd.DataFrame()
@@ -535,11 +564,26 @@ class ChainOHLCVProvider:
         
         # 메모리 캐시 확인
         cached = self._memory_cache.get(memory_key)
-        if cached:
+        if cached and (
+            usage_context != "trade" or _completed_daily_cache_recent(cached)
+        ):
             return self._annotate_result(cached, days=days)
-        
-        # 파일 캐시 확인 (DB-first)
+        if cached:
+            logger.warning(
+                "[OHLCV][CACHE][STALE_BYPASS] symbol=%s days=%d layer=memory action=db_first",
+                symbol, days,
+            )
+            self._memory_cache.pop(memory_key, None)
+
+        # Files are only a cache: a complete but stale Parquet must not
+        # short-circuit the DB's latest completed bars during a trading tick.
         cache_result = self._load_cache(symbol, days)
+        if cache_result and usage_context == "trade" and not _completed_daily_cache_recent(cache_result):
+            logger.warning(
+                "[OHLCV][CACHE][STALE_BYPASS] symbol=%s days=%d layer=parquet action=db_first",
+                symbol, days,
+            )
+            cache_result = None
         if cache_result:
             best = self._annotate_result(cache_result, days=days)
             if not cache_result.meta.get("volume_missing") and cache_result.meta.get("rows", 0) >= days:
