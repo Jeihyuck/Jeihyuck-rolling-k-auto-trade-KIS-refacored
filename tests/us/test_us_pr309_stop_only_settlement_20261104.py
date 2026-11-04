@@ -125,7 +125,7 @@ def run_settlement(monkeypatch, broker, *, with_original=True, race=False,
         assert validate_terminal_broker_proof(debt, proof) is True
         assert proof["terminal_orders"][0]["order_no"] == ORDER_NO
         assert proof["terminal_orders"][0]["filled_qty"] == 41
-    assert proof["terminal_orders"][0]["stop_type"] == "hard_stop_full_exit"
+        assert proof["terminal_orders"][0]["stop_type"] == "hard_stop_full_exit"
         receipts.append(proof)
         return True
     monkeypatch.setattr(stop, "satisfy_stop_obligation_from_broker_proof", satisfy)
