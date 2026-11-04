@@ -96,3 +96,69 @@ def test_unavailable_epoch_keeps_reconcile_degraded(monkeypatch):
     assert result["degraded"] == "execution_claim_scope_unavailable"
     assert result["execution_claim_health"]["available"] is False
     assert calls == []
+
+
+def test_reconciled_order_without_broker_filled_qty_is_not_a_fill():
+    # 2026-10-27 293490 is labelled RECONCILED in orders, but the
+    # corresponding execution claim is UNCERTAIN and KIS fill proof is absent.
+    recorded = []
+
+    class Orders:
+        def record_execution_claim_for_order(self, key, **observation):
+            recorded.append((key, observation))
+
+    error = reconcile_kis._record_execution_claim_observation(
+        orders_repo=Orders(),
+        source_order={"client_order_key": "practice:2026-10-27:293490:BUY"},
+        broker_status="RECONCILED",
+        cumulative_filled_qty=None,
+        requested_qty=174,
+    )
+    assert error is None
+    assert recorded == [
+        (
+            "practice:2026-10-27:293490:BUY",
+            {
+                "state": "UNRESOLVED",
+                "cumulative_filled_qty": None,
+                "authoritative": False,
+            },
+        )
+    ]
+
+
+def test_real_execution_claim_repo_isolates_unresolved_accounts_and_epochs():
+    from datetime import date
+
+    from trader.db.schema import schema_for_engine
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.execution_state import SemanticActionIdentity
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(
+        engine, tables=[schema.execution_claims, schema.execution_attempts],
+    )
+    claims = DurableExecutionClaimRepo(
+        engine, schema.execution_claims, schema.execution_attempts,
+    )
+    for account, epoch in (("current-account-hash", "epoch-current"),
+                           ("old-account-hash", "epoch-old")):
+        identity = SemanticActionIdentity(
+            env="practice", account_id=account, market="KR",
+            trading_epoch_id=epoch, strategy_owner="PB1",
+            lifecycle_id=f"293490:{account}", action="BUY_ENTRY:PB1-AM",
+            trade_date=date(2026, 10, 27),
+        )
+        assert claims.acquire(
+            identity, attempt_id=f"attempt:{account}", requested_qty=174,
+        ).acquired
+    assert claims.health(market="KR")["unresolved_execution_actions"] == 2
+    assert claims.health(
+        market="KR", env="practice", account_id="current-account-hash",
+        trading_epoch_id="epoch-current",
+    )["unresolved_execution_actions"] == 1
+    assert claims.health(
+        market="KR", env="practice", account_id="current-account-hash",
+        trading_epoch_id="epoch-old",
+    )["unresolved_execution_actions"] == 0
