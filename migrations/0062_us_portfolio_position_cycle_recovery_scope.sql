@@ -49,6 +49,12 @@ DO $us_scope$ BEGIN
  END IF;
 END $us_scope$;
 
+-- Safety gate: a scoped index is not sufficient while legacy writers still
+-- generate globally-scoped client/fill keys. Explicitly retain those indexes
+-- until the writer and reconciliation paths have been proven scoped as well.
+-- This migration changes broker-number uniqueness only; it does not imply
+-- that us_orders.client_order_id or us_fills.fill_idempotency_key is scoped.
+
 -- A KIS order number is NOT globally unique over account generations.
 -- Preflight uniqueness *before* dropping the old account-blind index.
 DO $us_scoped_index$ BEGIN
