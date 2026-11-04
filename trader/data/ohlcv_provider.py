@@ -619,6 +619,37 @@ class ChainOHLCVProvider:
                 best.meta["kis_trade_daily_blocked"] = 1
                 best.meta.setdefault("kis_trade_daily_fetch", 0)
                 return best
+            # A stale file cache must not turn a valid PREP-backed entry
+            # into 'insufficient_ohlcv'.  The KIS *provider* is DB-first and
+            # its trade_long_blocked branch performs no external KIS request.
+            # Do not try KRX or other network providers on this path.
+            for provider in self.providers:
+                if not isinstance(provider, KISOHLCVProvider):
+                    continue
+                try:
+                    recovered = provider.get_ohlcv(
+                        symbol, days, purpose=purpose,
+                        usage_context=usage_context, allow_long_fetch=False,
+                    )
+                except Exception as exc:
+                    errors.append(f"kr_db_only:{type(exc).__name__}")
+                    logger.warning(
+                        "[OHLCV][TRADE][DB_ONLY_RECOVERY_FAIL] symbol=%s err=%s",
+                        symbol, type(exc).__name__,
+                    )
+                    continue
+                if recovered is None or recovered.df is None or recovered.df.empty:
+                    continue
+                recovered = self._annotate_result(recovered, days=days)
+                recovered.meta["long_fetch_blocked"] = 1
+                recovered.meta["kis_trade_daily_blocked"] = 1
+                recovered.meta.setdefault("kis_trade_daily_fetch", 0)
+                self._memory_cache[memory_key] = recovered
+                logger.info(
+                    "[OHLCV][TRADE][DB_ONLY_RECOVERY] symbol=%s rows=%d source=%s external_kis=0",
+                    symbol, len(recovered.df), recovered.meta.get("source"),
+                )
+                return recovered
             result = OHLCVResult(
                 pd.DataFrame(),
                 {
