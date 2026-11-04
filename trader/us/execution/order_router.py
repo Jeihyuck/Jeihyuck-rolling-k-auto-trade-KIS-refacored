@@ -1992,6 +1992,10 @@ def route_order(
                                 ),
                                 broker_cash_usd=broker_cash if side == "BUY" else None,
                                 broker_available_shares=broker_orderable_qty if side == "SELL" else None,
+                                position_action=str(
+                                    intent.get("position_action")
+                                    or lifecycle_meta.get("position_action") or ""
+                                ),
                                 _conn=_outbox_conn,
                             )
                         _outbox_event = {
