@@ -1481,9 +1481,17 @@ def append_us_order_event(event: dict, *, _conn: Any = None) -> bool:
             return False
     # Caller-owned transaction: failure MUST rollback Claim and DB outbox.
     conn = _conn
-    trading_epoch_id = _active_us_epoch(conn)
+    active_epoch = _active_us_epoch(conn)
     payload = _parse_json_meta(event.get("payload") or {})
     params = {**event}
+    original_epoch = str(event.get("trading_epoch_id") or payload.get("trading_epoch_id") or "")
+    event_type = str(event.get("event_type") or "")
+    if original_epoch and active_epoch and original_epoch != str(active_epoch):
+        # Read-only historical evidence retains its SOURCE epoch. It is never
+        # used as current order execution authority.
+        if not event_type.startswith("JOURNAL_REPLAY_"):
+            raise RuntimeError("US_ORDER_EVENT_ORIGINAL_TRADING_EPOCH_MISMATCH")
+    trading_epoch_id = original_epoch or active_epoch
     if trading_epoch_id:
         payload["trading_epoch_id"] = trading_epoch_id
         params["trading_epoch_id"] = trading_epoch_id
@@ -1512,6 +1520,31 @@ def append_us_order_event(event: dict, *, _conn: Any = None) -> bool:
              :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
             ON CONFLICT (idempotency_key) DO NOTHING
         """
+    portfolio_epoch_id = str(event.get("portfolio_epoch_id") or payload.get("portfolio_epoch_id") or "")
+    if portfolio_epoch_id:
+        account_hash = str(event.get("broker_account_hash") or payload.get("broker_account_hash") or "")
+        position_cycle_id = str(event.get("position_cycle_id") or payload.get("position_cycle_id") or "")
+        if not all((trading_epoch_id, account_hash, position_cycle_id)):
+            raise RuntimeError("US_ORDER_EVENT_ORIGINAL_SCOPE_UNVERIFIED")
+        if "trading_epoch_id,\n" not in sql:
+            raise RuntimeError("US_ORDER_EVENT_MIGRATION_0062_REQUIRED")
+        sql = sql.replace(
+            "session_run_id,tick_id,trading_epoch_id,\n",
+            "session_run_id,tick_id,trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,\n",
+        ).replace(
+            ":tick_id,:trading_epoch_id,:client_order_key",
+            ":tick_id,:trading_epoch_id,:account_id,:portfolio_epoch_id,:position_cycle_id,:client_order_key",
+        )
+        params.update({
+            "account_id": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+        })
+        payload.update({
+            "broker_account_hash": account_hash,
+            "portfolio_epoch_id": portfolio_epoch_id,
+            "position_cycle_id": position_cycle_id,
+        })
     params["payload"] = _json_param(payload)
     conn.execute(text(sql), params)
     return True
