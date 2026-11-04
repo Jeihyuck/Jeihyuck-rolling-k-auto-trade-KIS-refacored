@@ -98,3 +98,23 @@ def test_180_sec_signed_ttl_respects_legacy_120_sec_proof():
     assert pre_submit_timing_check(
         intent, now_epoch=1130, fresh_ws_quote=quote,
     )[1] == "TIMING_SIGNAL_EXPIRED"
+
+
+def test_live_opportunity_clock_is_not_stale_tick_start():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trader.us.entry_timing.opportunity import (
+        opportunity_observation_time,
+    )
+    ny = ZoneInfo("America/New_York")
+    tick_start = datetime(2026, 11, 3, 9, 30, tzinfo=ny)
+    # Historical deterministic replay gets the caller's exact timestamp.
+    assert opportunity_observation_time(
+        tick_start, live_clock=False,
+    ) is tick_start
+    # Live per-symbol evaluation obtains its own observed wall-clock time.
+    before = datetime.now(ny)
+    observed = opportunity_observation_time(tick_start, live_clock=True)
+    after = datetime.now(ny)
+    assert before <= observed <= after
+    assert observed != tick_start
