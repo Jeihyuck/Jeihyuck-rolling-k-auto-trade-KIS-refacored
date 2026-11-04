@@ -67,3 +67,56 @@ def test_replay_never_submits_satisfied_soft_or_unorderable(monkeypatch):
     assert replay_confirmed_protective_intents(
         snapshots=snapshots,pending=debts,existing_intents=[],now=None)==[]
     assert calls==[]
+
+
+def test_wsl_replay_rejects_same_account_and_lifecycle_from_different_epoch(monkeypatch):
+    """A prior portfolio generation is not the current holding, even for same symbol."""
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    builder_calls = []
+    monkeypatch.setattr(
+        "trader.us.pb1.us_exit_engine._make_exit_intent",
+        lambda **kwargs: builder_calls.append(kwargs) or
+        {"side": "SELL", "symbol": kwargs["symbol"], "qty": kwargs["qty"]},
+    )
+    current = {**_snapshot(monkeypatch), "trading_epoch_id": "epoch-current"}
+    debt_old = _debt(trading_epoch_id="epoch-previous")
+    debt_unknown = _debt(trading_epoch_id="")
+    for prior in (debt_old, debt_unknown):
+        assert replay_confirmed_protective_intents(
+            snapshots=[current], pending=[prior],
+            existing_intents=[], now=None,
+        ) == []
+    missing_current_epoch = dict(current)
+    missing_current_epoch.pop("trading_epoch_id")
+    assert replay_confirmed_protective_intents(
+        snapshots=[missing_current_epoch], pending=[_debt(trading_epoch_id="epoch-current")],
+        existing_intents=[], now=None,
+    ) == []
+    assert builder_calls == []
+
+    confirmed = replay_confirmed_protective_intents(
+        snapshots=[current], pending=[_debt(trading_epoch_id="epoch-current")],
+        existing_intents=[], now=None,
+    )
+    assert len(confirmed) == 1
+    assert confirmed[0]["side"] == "SELL"
+    assert builder_calls[0]["position_lifecycle_id"] == "life-a"
+
+
+def test_wsl_replay_rejects_other_account_and_position_cycle_at_matching_epoch(monkeypatch):
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
+    calls = []
+    monkeypatch.setattr(
+        "trader.us.pb1.us_exit_engine._make_exit_intent",
+        lambda **kwargs: calls.append(kwargs) or {"side": "SELL"},
+    )
+    current = {**_snapshot(monkeypatch), "trading_epoch_id": "epoch-current"}
+    prior_debts = [
+        _debt(account_id="wrong-account", trading_epoch_id="epoch-current"),
+        _debt(lifecycle_id="different-position-cycle", trading_epoch_id="epoch-current"),
+    ]
+    assert replay_confirmed_protective_intents(
+        snapshots=[current], pending=prior_debts,
+        existing_intents=[], now=None,
+    ) == []
+    assert calls == []
