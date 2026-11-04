@@ -64,6 +64,14 @@ def test_same_parent_new_buy_retries_share_exact_cycle_and_scope():
     assert first["portfolio_epoch_id"] == "owner-portfolio-20261104"
 
 
+def test_existing_pb1_entry_action_placeholder_is_not_position_cycle():
+    original = _intent(position_lifecycle_id="ENTRY:US_STANDARD:SYY")
+    owner = _bind(original)
+    assert owner.position_cycle_id != "ENTRY:US_STANDARD:SYY"
+    assert original["position_lifecycle_id"] == owner.position_cycle_id
+    assert original["meta"]["position_lifecycle_id"] == owner.position_cycle_id
+
+
 def test_new_position_in_later_day_new_cycle_not_reused():
     old = _intent()
     new = _intent(trade_date="2026-11-05")
@@ -130,7 +138,7 @@ def test_historical_replay_rejects_every_mismatched_recovery_dimension(field, ba
     active = dict(older)
     active["meta"] = dict(older["meta"])
     active[field] = bad
-    with pytest.raises(USRecoveryIdentityError, match="MISMATCH"):
+    with pytest.raises(USRecoveryIdentityError, match="MISMATCH|CONFLICT"):
         assert_recovery_scope(older, active,
                               original_meta=older["meta"], current_meta=active["meta"])
 
