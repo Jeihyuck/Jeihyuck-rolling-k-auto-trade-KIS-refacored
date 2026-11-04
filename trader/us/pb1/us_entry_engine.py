@@ -1211,11 +1211,13 @@ def generate_entry_intents(
                     # bars against the current per-symbol observation time,
                     # never the tick-start timestamp (which may be >120s old).
                     # Explicit injected now stays deterministic in replay/tests.
-                    _op_now = (
-                        datetime.now(ZoneInfo("America/New_York"))
-                        if _opportunity_mode == "ENFORCE"
-                        and os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") == "1"
-                        else (now if now is not None else datetime.now(ZoneInfo("America/New_York")))
+                    from trader.us.entry_timing.opportunity import opportunity_observation_time
+                    _op_now = opportunity_observation_time(
+                        now,
+                        live_clock=(
+                            _opportunity_mode == "ENFORCE"
+                            and os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") == "1"
+                        ),
                     )
                     _price_opportunity = evaluate_price_opportunity(
                         style=_family, trade_date=_resolve_us_trade_date(now),
