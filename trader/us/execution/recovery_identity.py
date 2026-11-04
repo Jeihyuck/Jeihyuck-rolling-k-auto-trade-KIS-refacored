@@ -121,16 +121,35 @@ def bind_original_us_order_scope(
     )
     scope = USRecoveryScope(env, account_hash, str(trading_epoch_id),
                             portfolio_id, cycle_id, owner)
+    # Existing PB1 position snapshots keep the original account key in
+    # metadata. Replacing that with a hash would break lifecycle matching.
+    # Only the independent broker_account_hash is canonical on new orders.
     for key, expected in scope.as_dict().items():
-        actual = _verified_source({"top": intent.get(key), "meta": meta.get(key)}, "top", "meta")
+        if key == "account_id":
+            raw = _verified_source({
+                "top": intent.get("account_id"), "meta": meta.get("account_id"),
+            }, "top", "meta")
+            if raw and raw not in {account_key, account_hash}:
+                raise USRecoveryIdentityError("ACCOUNT_ID_MISMATCH")
+            proof = _verified_source({
+                "top": intent.get("broker_account_hash"),
+                "meta": meta.get("broker_account_hash"),
+            }, "top", "meta")
+            if proof and proof != account_hash:
+                raise USRecoveryIdentityError("ACCOUNT_ID_MISMATCH")
+            continue
+        actual = _verified_source(
+            {"top": intent.get(key), "meta": meta.get(key)}, "top", "meta",
+        )
         if actual and actual != expected:
             raise USRecoveryIdentityError(key.upper() + "_MISMATCH")
-    # A new cycle is authoritative only when taken from explicit lifecycle
-    # or the canonical first-BUY contract, NOT from the latest holding ticker.
+    # Never mutate the original strategy's raw account key.
     new_meta = dict(meta)
-    new_meta.update(scope.as_dict())
+    new_meta.update({k: v for k, v in scope.as_dict().items() if k != "account_id"})
+    new_meta["broker_account_hash"] = account_hash
     new_meta["position_lifecycle_id"] = cycle_id
-    intent.update(scope.as_dict())
+    intent.update({k: v for k, v in scope.as_dict().items() if k != "account_id"})
+    intent["broker_account_hash"] = account_hash
     intent["position_lifecycle_id"] = cycle_id
     intent["meta"] = new_meta
     return scope
@@ -144,9 +163,10 @@ def assert_recovery_scope(original: dict, current: dict, *,
     now = current_meta or {}
     for field in ("env", "account_id", "trading_epoch_id",
                   "portfolio_epoch_id", "position_cycle_id", "strategy_owner"):
-        old = _verified_source({"top": original.get(field), "meta": orig.get(field)},
+        key = "broker_account_hash" if field == "account_id" else field
+        old = _verified_source({"top": original.get(key), "meta": orig.get(key)},
                                "top", "meta")
-        active = _verified_source({"top": current.get(field), "meta": now.get(field)},
+        active = _verified_source({"top": current.get(key), "meta": now.get(key)},
                                   "top", "meta")
         if not old or not active:
             raise USRecoveryIdentityError(field.upper() + "_UNVERIFIED")
