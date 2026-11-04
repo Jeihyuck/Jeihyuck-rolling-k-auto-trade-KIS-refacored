@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import time
@@ -17,7 +18,7 @@ from trader.runtime_paths import runtime_root
 from trader.db.repos import (FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo,
                              ReconcileLogRepo, _assert_kr_buy_entry_contract)
 from trader.db.schema import schema_for_engine, uuid_value_for_url
-from trader.db.trading_epoch import active_trading_epoch_id
+from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
 from trader.reconcile_db import evaluate_stale_db_guard
 from trader.run_context import RunContext
 from trader.time_utils import now_kst
@@ -210,11 +211,22 @@ def _record_execution_claim_observation(
 
 def _execution_claim_health(
     orders_repo: OrdersRepo, *, market: str | None = None,
+    env: str | None = None, account_id: str | None = None,
+    trading_epoch_id: str | None = None,
 ) -> dict[str, Any]:
+    filters: dict[str, str | None] = {"market": market}
+    # Preserve backwards compatibility for legacy diagnostics that have no
+    # trading epoch; production reconciliation always supplies all three.
+    for key, value in (
+        ("env", env), ("account_id", account_id),
+        ("trading_epoch_id", trading_epoch_id),
+    ):
+        if value is not None:
+            filters[key] = value
     try:
         return {
             "available": True,
-            **orders_repo.execution_claim_health(market=market),
+            **orders_repo.execution_claim_health(**filters),
         }
     except Exception as exc:
         logger.error(
@@ -2586,7 +2598,38 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
     if execution_claim_observation_failures:
         degraded_reason = degraded_reason or "execution_claim_observation_failed"
-    execution_claim_health = _execution_claim_health(orders_repo, market="KR")
+    # Execution claims store SHA256(account_key) and the exact active epoch.
+    # A global KR-only count includes unresolved orders belonging to an older
+    # practice account, creating an incorrect current-account DEGRADED signal.
+    # If the enforced account boundary cannot be established, fail closed;
+    # never silently fall back to an unscoped success/health report.
+    try:
+        account_key = get_account_key(env=env, kis=kis)
+        claim_epoch_id = active_trading_epoch_id(
+            engine, env=env, account_id=account_key,
+            required=trading_epoch_enforced(),
+        )
+        claim_scope = (
+            {
+                "env": env,
+                "account_id": hashlib.sha256(account_key.encode("utf-8")).hexdigest(),
+                "trading_epoch_id": str(claim_epoch_id),
+            }
+            if claim_epoch_id else {}
+        )
+        execution_claim_health = _execution_claim_health(
+            orders_repo, market="KR", **claim_scope,
+        )
+    except Exception as exc:
+        logger.error(
+            "[RECONCILE][EXECUTION_CLAIM][SCOPE_UNAVAILABLE] type=%s action=FAIL_CLOSED",
+            type(exc).__name__,
+        )
+        degraded_reason = degraded_reason or "execution_claim_scope_unavailable"
+        execution_claim_health = {
+            "available": False,
+            "error": "execution_claim_scope_unavailable",
+        }
     integrity_reason = _execution_claim_integrity_reason(
         execution_claim_health,
         observation_failures=len(execution_claim_observation_failures),
