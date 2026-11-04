@@ -326,6 +326,19 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     ack_status=str(ack.get("status") or "ERROR").upper()
     if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS","WARN","PARTIAL","UNRESOLVED"}
             or ack_status not in {"OK","WARN"}):
+        # Preserve FAILED / no READY. The previous single generic exception
+        # hid whether the true blocker was historical journal replay or today's
+        # KIS ACK reconciliation. Never log raw broker/account evidence here.
+        logger.error(
+            "[US_STAGE4][BROKER_RECOVERY_UNVERIFIED] "
+            "replay_status=%s ack_status=%s replay_failed=%s "
+            "replay_identity_mismatches=%s replay_unknown=%s "
+            "replay_unresolved=%s ack_unresolved=%s action=FAIL_CLOSED",
+            replay_status, ack_status,
+            replay.get("failed_count"), replay.get("identity_mismatch_count"),
+            replay.get("broker_unknown_count"), replay.get("unresolved_count"),
+            ack.get("unresolved_count"),
+        )
         raise RuntimeError("US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED")
     metrics = phase.summary()
     logger.info(
