@@ -62,7 +62,25 @@ def record_confirmed_stop(position: dict, *, exit_type: str, target_qty: int,
             epoch = _active_us_epoch(conn)
             if not epoch:
                 raise StopObligationUnavailable("STOP_OBLIGATION_EPOCH_MISSING")
-            row = conn.execute(text("""
+            strict_scope = os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+            portfolio_scope = ""
+            if strict_scope:
+                from trader.account_state import get_account_key
+                from trader.us.execution.recovery_identity import current_us_portfolio_epoch
+                meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+                position_epoch = str(position.get("trading_epoch_id") or meta.get("trading_epoch_id") or "")
+                position_portfolio = str(position.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "")
+                position_cycle = str(position.get("position_cycle_id") or meta.get("position_cycle_id") or lifecycle)
+                if (account != get_account_key(env="practice") or position_epoch != str(epoch)
+                        or not position_portfolio or position_cycle != lifecycle):
+                    raise StopObligationUnavailable("STOP_OBLIGATION_ORIGINAL_SCOPE_MISMATCH")
+                portfolio_scope = current_us_portfolio_epoch(
+                    conn, env="practice", account_key=account,
+                    trading_epoch_id=str(epoch), strategy_owner="US_STANDARD",
+                )
+                if portfolio_scope != position_portfolio:
+                    raise StopObligationUnavailable("STOP_OBLIGATION_PORTFOLIO_EPOCH_MISMATCH")
+            sql = """
                 INSERT INTO us_protective_stop_obligations
                 (trading_epoch_id, env, account_id, strategy_owner, symbol, lifecycle_id,
                  stop_family, severity, target_qty, signal_price, signal_pnl_pct,
@@ -83,12 +101,28 @@ def record_confirmed_stop(position: dict, *, exit_type: str, target_qty: int,
                     updated_at=now()
                 WHERE us_protective_stop_obligations.obligation_state<>'SATISFIED'
                 RETURNING obligation_state
-            """), {"epoch":epoch,"account":account,"symbol":symbol,"lifecycle":lifecycle,
-                   "family":exit_type,"severity":severity,"qty":int(target_qty),
-                   "price":signal_price,"pnl":pnl_pct,
-                   "hard":float(policy.get("hard_stop",0.06)),
-                   "soft":float(policy.get("soft_stop",0.03)),
-                   "signal_at":signal_time}).mappings().first()
+            """
+            params = {"epoch":epoch,"account":account,"symbol":symbol,"lifecycle":lifecycle,
+                      "family":exit_type,"severity":severity,"qty":int(target_qty),
+                      "price":signal_price,"pnl":pnl_pct,
+                      "hard":float(policy.get("hard_stop",0.06)),
+                      "soft":float(policy.get("soft_stop",0.03)),
+                      "signal_at":signal_time}
+            if strict_scope:
+                sql = sql.replace(
+                    "symbol, lifecycle_id,",
+                    "symbol, lifecycle_id, portfolio_epoch_id, position_cycle_id,",
+                ).replace(
+                    ":symbol,:lifecycle,",
+                    ":symbol,:lifecycle,:portfolio,:cycle,",
+                ).replace(
+                    "WHERE us_protective_stop_obligations.obligation_state<>'SATISFIED'",
+                    "WHERE us_protective_stop_obligations.obligation_state<>'SATISFIED' "
+                    "AND us_protective_stop_obligations.portfolio_epoch_id=:portfolio "
+                    "AND us_protective_stop_obligations.position_cycle_id=:cycle",
+                )
+                params.update({"portfolio":portfolio_scope,"cycle":lifecycle})
+            row = conn.execute(text(sql), params).mappings().first()
         if not row:
             # A completed lifecycle cannot be silently reactivated by an old signal.
             logger.warning("[US_PROTECTIVE_STOP][ALREADY_TERMINAL] symbol=%s lifecycle=%s",symbol,lifecycle)
@@ -125,8 +159,13 @@ def load_pending_stop_obligations(*, env: str="practice") -> list[dict]:
         # Unresolved stop debt is ACCOUNT+LIFECYCLE durable, not today-Epoch
         # durable. An epoch rollover must not hide yesterday's stop loss.
         # Hard cap and fail closed rather than truncate some protective debts.
+        select_scope = (
+            ",portfolio_epoch_id,position_cycle_id"
+            if os.getenv("WSL_RUN_MARKET", "").upper() == "US" else ""
+        )
         rows=conn.execute(text("""
-            SELECT trading_epoch_id,account_id,symbol,lifecycle_id,
+            SELECT trading_epoch_id,account_id,symbol,lifecycle_id"""
+            + select_scope + """,
                    stop_family,severity,target_qty,
                    confirmed_filled_qty,obligation_state,first_signal_at,last_signal_at,
                    soft_stop_pct,hard_stop_pct
@@ -168,10 +207,13 @@ def replay_confirmed_protective_intents(
         symbol, life, account = scope_for_position(snapshot)
         meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
         position_epoch = str(snapshot.get("trading_epoch_id") or meta.get("trading_epoch_id") or "")
-        # Never attach a debt from the previous portfolio generation to a
-        # live position that merely reuses the same symbol/account/lifecycle.
-        if symbol and life and account and (position_epoch or not require_epoch):
-            by_scope[(symbol,life,account,position_epoch)] = snapshot
+        portfolio_epoch = str(snapshot.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "")
+        position_cycle = str(snapshot.get("position_cycle_id") or meta.get("position_cycle_id") or life)
+        # Missing portfolio evidence is not permission to adopt a prior cycle.
+        if (symbol and life and account and position_cycle == life
+                and (position_epoch or not require_epoch)
+                and (portfolio_epoch or not require_epoch)):
+            by_scope[(symbol,life,account,position_epoch,portfolio_epoch)] = snapshot
 
     emitted=[]
     for debt in pending:
@@ -185,8 +227,10 @@ def replay_confirmed_protective_intents(
         if symbol in existing_symbols:
             continue
         key=(symbol,str(debt.get("lifecycle_id") or ""),str(debt.get("account_id") or ""),
-             str(debt.get("trading_epoch_id") or ""))
-        if require_epoch and not key[3]:
+             str(debt.get("trading_epoch_id") or ""),
+             str(debt.get("portfolio_epoch_id") or ""))
+        source_cycle = str(debt.get("position_cycle_id") or "")
+        if (require_epoch and (not key[3] or not key[4] or source_cycle != key[1])):
             continue
         pos=by_scope.get(key)
         if not pos:
@@ -218,7 +262,10 @@ def replay_confirmed_protective_intents(
             holding_qty=holding,orderable_qty=orderable,now=now,
             policy_cfg=cfg,position_lifecycle_id=key[1],
             meta_extra={"stop_obligation_replay":True,
-                        "stop_obligation_first_signal_at":str(debt.get("first_signal_at") or "")},
+                        "stop_obligation_first_signal_at":str(debt.get("first_signal_at") or ""),
+                        **({"trading_epoch_id":key[3],
+                            "portfolio_epoch_id":key[4],
+                            "position_cycle_id":key[1]} if require_epoch else {})},
         )
         if intent:
             emitted.append(intent)
