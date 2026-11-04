@@ -151,3 +151,42 @@ def test_trade_ttl_cache_refreshes_from_db_without_kis_call(monkeypatch):
     assert used == {"db": 1, "kis": 0, "set": 1}
     assert actual.meta["source"] == "db"
     assert actual.df["date"].max().date() == date(2026, 11, 3)
+
+
+def test_long_trade_fetch_recovers_db_without_any_external_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "now_kst", lambda: SESSION)
+    called = {"db_only": 0, "external": 0}
+
+    class FakeKISDatabase(mod.KISOHLCVProvider):
+        def __init__(self):
+            pass
+
+        def get_ohlcv(self, _symbol, _days, **kwargs):
+            called["db_only"] += 1
+            assert kwargs["allow_long_fetch"] is False
+            assert kwargs["usage_context"] == "trade"
+            return OHLCVResult(
+                _bars("2026-11-03"),
+                {"source": "db_short_only", "volume_missing": False},
+            )
+
+    class NetworkProvider:
+        name = "krx"
+
+        def get_ohlcv(self, *_args, **_kwargs):
+            called["external"] += 1
+            raise AssertionError("No KRX/network fallthrough in protected trade tick")
+
+    chain = ChainOHLCVProvider(
+        [FakeKISDatabase(), NetworkProvider()], env="practice", cache_dir=tmp_path,
+    )
+    monkeypatch.setattr(chain, "_load_cache", lambda *_args: OHLCVResult(
+        _bars("2026-10-02"), {"source": "cache", "rows": 60, "volume_missing": False},
+    ))
+    result = chain.get_ohlcv(
+        "012750", 200, usage_context="trade", allow_long_fetch=False,
+    )
+    assert called == {"db_only": 1, "external": 0}
+    assert result.meta["source"] == "db_short_only"
+    assert result.meta["long_fetch_blocked"] == 1
+    assert result.df["date"].max().date() == date(2026, 11, 3)
