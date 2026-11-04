@@ -1304,7 +1304,14 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
         assert_same_identity(dict(existing._mapping), incoming_identity)
     order_no = str(row.get("order_no") or "").strip()
     if order_no:
-        broker_existing = conn.execute(text("SELECT * FROM us_orders WHERE trade_date=:td AND order_no=:ono FOR UPDATE"), {"td": td, "ono": order_no}).fetchone()
+        broker_existing = conn.execute(
+            text("""SELECT * FROM us_orders
+                    WHERE trade_date=:td AND order_no=:ono AND env=:env
+                      AND trading_epoch_id IS NOT DISTINCT FROM :epoch
+                    FOR UPDATE"""),
+            {"td": td, "ono": order_no, "env": row.get("env"),
+             "epoch": trading_epoch_id},
+        ).fetchone()
         if broker_existing:
             assert_same_identity(dict(broker_existing._mapping), incoming_identity)
     params = {
