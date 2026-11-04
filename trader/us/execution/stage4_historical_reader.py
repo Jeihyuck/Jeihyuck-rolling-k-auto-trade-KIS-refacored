@@ -88,7 +88,7 @@ def _debt_order_source_dates(debts: list[dict], *, scope: dict,
     if engine is None:
         raise RuntimeError("US_STAGE4_HISTORICAL_DEBT_DB_UNAVAILABLE")
     source_dates: set[str] = set()
-    # Read-only bounded lookup of original TP orders. An epoch rollover must
+    # Read-only bounded lookup of original TP orders or fully evidenced stops. An epoch rollover must
     # not silently omit old protective obligations, or use a different account.
     with engine.connect() as conn:
         for debt in debts:
@@ -109,7 +109,36 @@ def _debt_order_source_dates(debts: list[dict], *, scope: dict,
                    AND c.lifecycle_id=:life AND c.account_id=:account
                    AND c.market='US'
                    AND c.strategy_owner='US_STANDARD'
-                   AND c.action=upper(o.meta->>'profit_capture_stage')
+                   AND (
+                       c.action=upper(o.meta->>'profit_capture_stage')
+                       OR (
+                           coalesce(o.meta->>'profit_capture_stage','')=''
+                           AND upper(o.meta->>'exit_family') IN ('HARD_STOP','SOFT_STOP')
+                           AND o.meta->>'stop_type' IN (
+                               'hard_stop_full_exit','hard_stop_loss',
+                               'persistent_soft_stop_full_exit'
+                           )
+                           AND c.action=upper(o.meta->>'reason')
+                           AND c.action_state='SATISFIED'
+                           AND c.cumulative_filled_qty=o.qty_requested
+                           AND c.remaining_target_qty=0
+                           AND o.status='FILLED' AND o.qty_filled=o.qty_requested
+                           AND EXISTS (
+                               SELECT 1 FROM us_fills f
+                               WHERE f.trade_date=o.trade_date
+                                 AND f.trading_epoch_id=o.trading_epoch_id
+                                 AND f.client_order_key=o.client_order_key
+                                 AND f.symbol=o.symbol AND f.side='SELL'
+                                 AND ltrim(f.order_no,'0')=ltrim(o.order_no,'0')
+                                 AND f.meta->>'position_lifecycle_id'=:life
+                                 AND f.meta->>'execution_action_key'=c.action_key
+                                 AND f.meta->>'fill_evidence_type'
+                                     IN ('KIS_ORDER_CUMULATIVE_ACTUAL','KIS_EXECUTION_ACTUAL')
+                                 AND coalesce((f.meta->>'cumulative_filled_qty')::integer,0)
+                                     >= o.qty_requested
+                           )
+                       )
+                   )
                  WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                    AND o.symbol=:symbol AND o.side='SELL'
                    AND o.order_no IS NOT NULL
@@ -271,8 +300,39 @@ class HistoricalReadOnlyReader:
                 self._books.clear()
                 self._balance = None
             return
-        kind, day = tasks[self._cursor % len(tasks)]
-        self._cursor += 1
+        # A newly changed/expired claim signature is on the critical path
+        # for Stage4 READY. Refresh its ORIGINAL KIS order book ahead of a
+        # less urgent balance/round-robin read; never extend a stale TTL and
+        # never synthesize broker terminality from DB claims.
+        with self._lock:
+            priority_books = []
+            observed_now = self.clock()
+            for source_day in sorted(source_dates):
+                book = self._books.get(source_day)
+                expected_keys = frozenset(
+                    key for key in signatures if key[0] == source_day
+                )
+                if book is None:
+                    priority_books.append((float("-inf"), source_day, "MISSING"))
+                elif book["keys"] != expected_keys:
+                    priority_books.append((float("-inf"), source_day, "CLAIM_SET_CHANGED"))
+                elif observed_now < book["at"] or observed_now - book["at"] > self.ttl_sec:
+                    priority_books.append((float(book["at"]), source_day, "STALE"))
+        if priority_books:
+            _, day, cause = min(priority_books)
+            kind = "book"
+            # Advance round-robin only if this critical refresh was also
+            # the next scheduled task; otherwise preserve the deferred
+            # balance task's turn once the book becomes verifiably fresh.
+            if tasks[self._cursor % len(tasks)] == ("book", day):
+                self._cursor += 1
+            logger.info(
+                "[US_STAGE4][HISTORICAL_PRIORITY_REFRESH] source_day=%s cause=%s",
+                day, cause,
+            )
+        else:
+            kind, day = tasks[self._cursor % len(tasks)]
+            self._cursor += 1
         if kind == "book":
             orders = provider.get_today_orders(trade_date=day)
             provenance = provider.get_order_lookup_provenance(day)

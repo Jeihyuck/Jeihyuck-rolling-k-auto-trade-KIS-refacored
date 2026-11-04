@@ -963,6 +963,109 @@ def save_us_watchlist(entries: list[dict], trade_date: str | None = None) -> int
 # Order Intents
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# US_STANDARD BUY re-evaluation (practice ENFORCE): fail-closed proof of UNSENT
+# ---------------------------------------------------------------------------
+
+def _us_standard_buy_retry_evidence(
+    prior_intents: list[dict],
+    *,
+    broker_order_present: bool,
+    attempts_by_key: dict[str, list[dict]],
+) -> tuple[bool, str]:
+    """Only an *authoritatively proven pre-HTTP abort* may get a fresh key.
+
+    No submitted/unknown attempt, absent evidence, or broker order can be
+    promoted into another BUY simply by changing a client_order_key.
+    """
+    if broker_order_present:
+        return False, "US_BUY_RETRY_BROKER_ORDER_EXISTS"
+    if not prior_intents:
+        return True, "FIRST_DECISION"
+    for prior in prior_intents:
+        key = str(prior.get("client_order_key") or "")
+        attempts = attempts_by_key.get(key) or []
+        if not key or not attempts:
+            return False, "US_BUY_RETRY_PREVIOUS_ATTEMPT_UNVERIFIED"
+        if any(
+            str(a.get("attempt_state") or "") != "ABANDONED_PRE_SUBMIT"
+            or a.get("authoritative") is not True
+            for a in attempts
+        ):
+            return False, "US_BUY_RETRY_PREVIOUS_ATTEMPT_UNVERIFIED"
+    return True, "ALL_PRIOR_ATTEMPTS_PROVEN_UNSENT"
+
+
+def resolve_us_standard_new_buy_key(
+    *, symbol: str, trade_date: str, base_key: str, decision_id: str,
+) -> dict:
+    """Resolve an immutable BUY decision identity, never mutate old contracts.
+
+    This function only executes for approved practice live-clock timing.
+    It reads the complete symbol/day/epoch ledger, rather than using only
+    us_orders keys: an unsent intent exists in us_order_intents but not orders.
+    """
+    from hashlib import sha256
+    symbol = str(symbol or "").strip().upper()
+    if not symbol or not trade_date or not base_key or not decision_id:
+        return {"allowed": False, "reason": "US_BUY_RETRY_IDENTITY_MISSING"}
+    engine = _get_engine_or_none()
+    if engine is None:
+        return {"allowed": False, "reason": "US_BUY_RETRY_LEDGER_UNAVAILABLE"}
+    try:
+        with engine.begin() as conn:
+            epoch_id = _active_us_epoch(conn)
+            if not epoch_id:
+                return {"allowed": False, "reason": "US_BUY_RETRY_EPOCH_UNVERIFIED"}
+            params = {"td": trade_date, "symbol": symbol, "epoch": str(epoch_id)}
+            # Rows are locked during the evidence read, but cross-process
+            # submission protection still belongs to the canonical claim and
+            # account reservation gate after this lookup.
+            prior_intents = [
+                dict(row) for row in conn.execute(text("""
+                    SELECT client_order_key, status FROM us_order_intents
+                    WHERE trade_date=:td AND UPPER(symbol)=:symbol AND UPPER(side)='BUY'
+                      AND trading_epoch_id=:epoch
+                    FOR UPDATE
+                """), params).mappings().all()
+            ]
+            order_present = conn.execute(text("""
+                SELECT 1 FROM us_orders
+                WHERE trade_date=:td AND UPPER(symbol)=:symbol AND UPPER(side)='BUY'
+                  AND trading_epoch_id=:epoch
+                LIMIT 1
+            """), params).first() is not None
+            attempts_by_key: dict[str, list[dict]] = {}
+            for prior in prior_intents:
+                key = str(prior["client_order_key"])
+                attempts_by_key[key] = [
+                    dict(row) for row in conn.execute(text("""
+                        SELECT attempt_state, authoritative
+                        FROM us_execution_attempts WHERE client_order_key=:cok
+                    """), {"cok": key}).mappings().all()
+                ]
+            allowed, reason = _us_standard_buy_retry_evidence(
+                prior_intents, broker_order_present=order_present,
+                attempts_by_key=attempts_by_key,
+            )
+            if not allowed:
+                return {"allowed": False, "reason": reason}
+            if not prior_intents:
+                return {"allowed": True, "key": base_key, "reason": reason}
+            # A fresh independent signal after an authoritative pre-submit
+            # abort needs its own signed provenance and immutable DB row.
+            retry_key = sha256(
+                f"US_STANDARD|{symbol}|{trade_date}|{decision_id}".encode()
+            ).hexdigest()[:24]
+            known_keys = {str(row["client_order_key"]) for row in prior_intents}
+            if retry_key in known_keys or retry_key == base_key:
+                return {"allowed": False, "reason": "US_BUY_RETRY_DECISION_ALREADY_SEEN"}
+            return {"allowed": True, "key": retry_key, "reason": reason}
+    except Exception as exc:
+        logger.error("[US_ENTRY][SAFE_RETRY_CHECK_FAILED] symbol=%s type=%s", symbol, type(exc).__name__)
+        return {"allowed": False, "reason": "US_BUY_RETRY_LEDGER_UNAVAILABLE"}
+
+
 def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
     """us_order_intents 저장. schema: trade_date, client_order_key, symbol, exchange,
     side, qty, limit_price_usd, notional_usd, strategy, status, meta"""

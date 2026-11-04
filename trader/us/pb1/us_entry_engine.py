@@ -1207,7 +1207,18 @@ def generate_entry_intents(
                             logger.warning("[US_ENTRY][OPPORTUNITY_WS_MISSING] symbol=%s error=%s",
                                            symbol, type(_ws_exc).__name__)
                     from zoneinfo import ZoneInfo
-                    _op_now = now if now is not None else datetime.now(ZoneInfo("America/New_York"))
+                    # For canonical live practice sessions, evaluate completed
+                    # bars against the current per-symbol observation time,
+                    # never the tick-start timestamp (which may be >120s old).
+                    # Explicit injected now stays deterministic in replay/tests.
+                    from trader.us.entry_timing.opportunity import opportunity_observation_time
+                    _op_now = opportunity_observation_time(
+                        now,
+                        live_clock=(
+                            _opportunity_mode == "ENFORCE"
+                            and os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") == "1"
+                        ),
+                    )
                     _price_opportunity = evaluate_price_opportunity(
                         style=_family, trade_date=_resolve_us_trade_date(now),
                         now_et=_op_now, verified_bars=_observed_bars,
@@ -1494,6 +1505,50 @@ def generate_entry_intents(
 
         key_raw = f"{symbol}_{today_str}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
+
+        # A new READY decision after a proven pre-HTTP abort is a NEW
+        # immutable contract, not an update of the abandoned BUY's old hash.
+        # The whole symbol/day/epoch ledger must prove every prior attempt
+        # was never submitted. Any unknown/ACKed attempt remains fail-closed.
+        if (
+            position_action == "NEW_POSITION_BUY"
+            and _opportunity_mode == "ENFORCE"
+            and os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") == "1"
+            and isinstance(_price_opportunity, dict)
+        ):
+            from trader.us.db.repos import resolve_us_standard_new_buy_key
+            _retry_identity = resolve_us_standard_new_buy_key(
+                symbol=symbol, trade_date=trade_date_for_key,
+                base_key=client_order_key,
+                decision_id=(
+                    str(_price_opportunity.get("evidence_sha256") or "")
+                    + ":" + str(_op_now.timestamp())
+                ),
+            )
+            if not _retry_identity.get("allowed"):
+                track_skip(
+                    symbol, _retry_identity.get("reason", "US_BUY_RETRY_UNVERIFIED"),
+                    {"block_stage": "buy_intent_identity"},
+                )
+                continue
+            if client_order_key != _retry_identity["key"]:
+                logger.info(
+                    "[US_ENTRY][SAFE_RETRY_NEW_IDENTITY] symbol=%s previous_key=%s new_key=%s reason=%s",
+                    symbol, client_order_key, _retry_identity["key"],
+                    _retry_identity.get("reason"),
+                )
+            client_order_key = _retry_identity["key"]
+            if _retry_identity.get("reason") == "ALL_PRIOR_ATTEMPTS_PROVEN_UNSENT":
+                # Router rechecks this exact decision against the live ledger
+                # before claim acquisition; this is not standalone permission.
+                intent_retry_decision_id = (
+                    str(_price_opportunity.get("evidence_sha256") or "")
+                    + ":" + str(_op_now.timestamp())
+                )
+            else:
+                intent_retry_decision_id = None
+        else:
+            intent_retry_decision_id = None
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Duplicate pre-entry skip: DB에 이미 존재하는 client_order_key 차단
@@ -1827,6 +1882,16 @@ def generate_entry_intents(
             identity_proof["volume_proof_status"],
         )
 
+        # Bind a post-abort re-evaluation to its immutable new order identity.
+        # This is informational until the router re-verifies broker-safe retry.
+        if intent_retry_decision_id:
+            durable_meta["us_buy_retry_decision_id"] = intent_retry_decision_id
+            durable_meta["us_buy_retry_resolved_key"] = client_order_key
+            intent.setdefault("meta", {}).update({
+                "us_buy_retry_decision_id": intent_retry_decision_id,
+                "us_buy_retry_resolved_key": client_order_key,
+            })
+
         # Decision evidence is an audit sidecar, never a broker permission gate.
         # Missing deployment SHA or questionable inputs must not delay BUY/SELL.
         if position_action in {"NEW_POSITION_BUY", "ADD_TO_EXISTING_BUY"}:
@@ -1896,8 +1961,11 @@ def generate_entry_intents(
                 from trader.us.entry_timing.opportunity import attach_opportunity_proof
                 attach_opportunity_proof(
                     intent, _price_opportunity, mode=_opportunity_mode,
-                    decision_epoch=(now.timestamp() if now is not None
-                                    else datetime.now().timestamp()),
+                    # The signed TTL starts at the actual verified opportunity
+                    # observation, not at the beginning of a slow tick.
+                    decision_epoch=(_op_now.timestamp() if _opportunity_mode == "ENFORCE"
+                                    else (now.timestamp() if now is not None
+                                          else datetime.now().timestamp())),
                 )
             except (ValueError, TypeError) as _attach_exc:
                 if _opportunity_mode == "ENFORCE":

@@ -242,3 +242,85 @@ def test_concurrent_am_afternoon_across_strategies_never_overspends(authority):
               AND state IN ('RESERVED','UNCERTAIN') AND side='BUY'
         """), {"account": authority.scope["account"]}).scalar_one()
     assert float(total) == 400.0
+
+
+def test_us_standard_retry_cannot_hold_concurrent_same_symbol_new_position(authority):
+    """Different immutable retry keys must still represent one economic new BUY."""
+    lease = authority.acquire_lease(holder_id="pb1-new-position")
+    first = authority.reserve(
+        lease=lease, action_key="US-AMD-original", strategy_owner="US_STANDARD",
+        symbol="AMD", side="BUY", qty=10, price_usd="100",
+        broker_cash_usd="10000", position_action="NEW_POSITION_BUY",
+    )
+    assert first["state"] == "RESERVED"
+    with pytest.raises(ReservationConflict, match="us_standard_same_symbol_new_buy_reserved"):
+        authority.reserve(
+            lease=lease, action_key="US-AMD-new-decision-key",
+            strategy_owner="US_STANDARD", symbol="AMD",
+            side="BUY", qty=9, price_usd="101",
+            broker_cash_usd="10000", position_action="NEW_POSITION_BUY",
+        )
+    # Existing frozen action remains idempotent, and a separate TQQQ owner
+    # retains its own strategy/position logic.
+    repeat = authority.reserve(
+        lease=lease, action_key="US-AMD-original", strategy_owner="US_STANDARD",
+        symbol="AMD", side="BUY", qty=10, price_usd="100",
+        broker_cash_usd="10000", position_action="NEW_POSITION_BUY",
+    )
+    assert repeat["idempotent"] is True
+    tqqq = authority.reserve(
+        lease=lease, action_key="TQQQ-infinite-buy", strategy_owner="TQQQ_INFINITE",
+        symbol="TQQQ", side="BUY", qty=1, price_usd="100",
+        broker_cash_usd="10000", position_action="NEW_POSITION_BUY",
+    )
+    assert tqqq["state"] == "RESERVED"
+    assert authority.terminalize(
+        lease=lease, action_key="US-AMD-original",
+        terminal_evidence="KIS_TERMINAL:verified_zero_fill_cancel",
+        filled=False,
+    )
+    after = authority.reserve(
+        lease=lease, action_key="US-AMD-after-terminal",
+        strategy_owner="US_STANDARD", symbol="AMD", side="BUY",
+        qty=9, price_usd="101", broker_cash_usd="10000",
+        position_action="NEW_POSITION_BUY",
+    )
+    assert after["state"] == "RESERVED"
+
+
+def test_concurrent_new_buy_retries_are_account_fenced_even_across_epochs(authority):
+    """One broker account: parallel distinct action instances cannot double-BUY."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(2, timeout=12)
+
+    def attempt(index):
+        scoped = AccountExecutionAuthority(
+            authority.engine,
+            env="practice",
+            account_fingerprint=authority.scope["account"],
+            trading_epoch_id="concurrent-epoch-" + str(index),
+        )
+        barrier.wait()
+        lease = scoped.acquire_lease(holder_id="new-buy-" + str(index))
+        try:
+            try:
+                scoped.reserve(
+                    lease=lease,
+                    action_key="retry-different-key-" + str(index),
+                    strategy_owner="US_STANDARD",
+                    symbol="AMD", side="BUY", qty=1,
+                    price_usd="100", broker_cash_usd="10000",
+                    position_action="NEW_POSITION_BUY",
+                )
+                return "RESERVED"
+            except ReservationConflict as exc:
+                assert "us_standard_same_symbol_new_buy_reserved" in str(exc)
+                return "FENCED"
+        finally:
+            scoped.release_lease(lease=lease)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(attempt, range(2)))
+    assert sorted(outcomes) == ["FENCED", "RESERVED"]

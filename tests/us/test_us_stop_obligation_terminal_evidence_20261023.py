@@ -48,3 +48,69 @@ def test_unknown_proof_rejected_before_any_db_mutation(monkeypatch):
     with pytest.raises(StopObligationUnavailable,match="TERMINAL_PROOF_UNVERIFIED"):
         satisfy_stop_obligation_from_broker_proof(
             debt=_debt(),proof={**_proof(),"broker_holding_qty":1})
+
+
+def test_terminal_full_stop_persists_real_confirmed_41_qty(monkeypatch):
+    """Existing SYY full KIS execution closes debt with a nonzero audited qty."""
+    import trader.account_state as account
+    import trader.us.db.repos as repos
+
+    debt = {**_debt(), "symbol": "SYY", "target_qty": 41}
+    proof = {**_proof(), "symbol": "SYY", "terminal_orders": [{
+        "trade_date": "2026-11-03", "order_no": "0000038487",
+        "status": "FILLED", "filled_qty": 41, "broker_open_qty": 0,
+        "stop_type": "hard_stop_full_exit", "profit_capture_stage": "",
+    }]}
+    monkeypatch.setattr(account, "get_account_key", lambda **kw: "acct-1")
+    monkeypatch.setattr(account, "resolve_env_name", lambda: "practice")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn: "epoch-1")
+    seen = {}
+    class Db:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def execute(self, stmt, params):
+            seen.update({"sql": str(stmt), "params": params})
+            class Result:
+                def first(self):
+                    return ("life-1",)
+            return Result()
+    class Engine:
+        def begin(self):
+            return Db()
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    assert satisfy_stop_obligation_from_broker_proof(debt=debt, proof=proof)
+    assert seen["params"]["confirmed_stop_fill_qty"] == 41
+    assert "confirmed_filled_qty=GREATEST" in seen["sql"]
+    assert "o.target_qty" in seen["sql"]
+    assert "NOT EXISTS" in seen["sql"]
+
+
+def test_terminal_cancel_without_fill_never_creates_synthetic_stop_qty(monkeypatch):
+    import trader.account_state as account
+    import trader.us.db.repos as repos
+
+    debt = _debt()
+    proof = {**_proof(), "terminal_orders": [{
+        "trade_date": "2026-10-23", "order_no": "0000001234",
+        "status": "CANCELLED", "filled_qty": 0, "broker_open_qty": 0,
+        "stop_type": "hard_stop_full_exit",
+    }]}
+    monkeypatch.setattr(account, "get_account_key", lambda **kw: "acct-1")
+    monkeypatch.setattr(account, "resolve_env_name", lambda: "practice")
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn: "epoch-1")
+    seen = {}
+    class Db:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, stmt, params):
+            seen.update(params)
+            class Result:
+                def first(self): return ("life-1",)
+            return Result()
+    class Engine:
+        def begin(self): return Db()
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    assert satisfy_stop_obligation_from_broker_proof(debt=debt, proof=proof)
+    assert seen["confirmed_stop_fill_qty"] == 0

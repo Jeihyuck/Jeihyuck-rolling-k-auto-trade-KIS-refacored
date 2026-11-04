@@ -121,7 +121,7 @@ class AccountExecutionAuthority:
     def reserve(self, *, lease: Lease, action_key: str, strategy_owner: str,
                 symbol: str, side: str, qty: int, price_usd: Any,
                 broker_cash_usd: Any = None, broker_available_shares: int | None = None,
-                _conn: Any = None) -> dict:
+                position_action: str | None = None, _conn: Any = None) -> dict:
         """Account-global held exposure, not independent per-strategy budgets.
 
         Caller must pass freshly queried account-wide broker quantities.
@@ -130,6 +130,7 @@ class AccountExecutionAuthority:
         if not action_key or not strategy_owner or not symbol or int(qty) <= 0:
             raise ReservationConflict("reservation_identity_invalid")
         side = side.upper()
+        position_action = str(position_action or "").strip().upper()
         if side not in {"BUY", "SELL"}:
             raise ReservationConflict("reservation_side_invalid")
         qty = int(qty)
@@ -156,7 +157,7 @@ class AccountExecutionAuthority:
                     qty=qty, price_usd=price_usd,
                     broker_cash_usd=broker_cash_usd,
                     broker_available_shares=broker_available_shares,
-                    _conn=conn,
+                    position_action=position_action, _conn=conn,
                 )
         conn = _conn
         self._guard(conn, lease)  # row lock serializes every strategy
@@ -182,6 +183,24 @@ class AccountExecutionAuthority:
                 raise ReservationConflict("terminal_action_key_cannot_be_reused")
             return {"action_key": action_key, "state": old["state"],
                     "idempotent": True, "fencing_token": lease.fencing_token}
+        # Separate client keys / claim instances may exist for consecutive
+        # proven-unsent re-evaluations. Serialize the *economic* US_STANDARD
+        # new-position BUY at the same account/symbol while any earlier
+        # RESERVED/UNCERTAIN BUY is awaiting broker evidence. This shares the
+        # existing account advisory transaction lock; no new lease, feature
+        # flag, TQQQ rule or position-ADD policy is introduced.
+        if (side == "BUY" and strategy_owner == "US_STANDARD"
+                and position_action == "NEW_POSITION_BUY"):
+            concurrent = conn.execute(text("""
+                SELECT 1 FROM us_execution_account_reservations
+                WHERE env=:env AND account_fingerprint=:account
+                  AND symbol=:symbol AND side='BUY'
+                  AND strategy_owner='US_STANDARD'
+                  AND state IN ('RESERVED','UNCERTAIN')
+                LIMIT 1
+            """), {**self.scope, "symbol": symbol.upper()}).first()
+            if concurrent is not None:
+                raise ReservationConflict("us_standard_same_symbol_new_buy_reserved")
         held = conn.execute(text("""
             SELECT COALESCE(SUM(reserved_cash_usd),0) AS cash,
                    COALESCE(SUM(reserved_shares),0) AS shares

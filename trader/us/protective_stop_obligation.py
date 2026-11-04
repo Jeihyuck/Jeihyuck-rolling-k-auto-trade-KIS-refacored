@@ -267,6 +267,43 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
     import hashlib
     if not validate_terminal_broker_proof(debt,proof):
         raise StopObligationUnavailable("STOP_OBLIGATION_TERMINAL_PROOF_UNVERIFIED")
+    # Keep the materialized confirmed quantity consistent with the exact
+    # original KIS full-stop fills that the Stage4 writer has already matched
+    # to the immutable claim, order number, lifecycle, account and epoch.
+    # Old TP-only settlement proofs do not imply a stop execution.
+    confirmed_stop_fill_qty = 0
+    unique_stop_orders: set[tuple[str, str]] = set()
+    original_orders = proof.get("terminal_orders")
+    if isinstance(original_orders, list):
+        for original in original_orders:
+            if not isinstance(original, dict):
+                raise StopObligationUnavailable("STOP_OBLIGATION_ORIGINAL_EVIDENCE_INVALID")
+            stop_type = str(original.get("stop_type") or "").lower()
+            if stop_type not in {
+                "hard_stop_full_exit", "hard_stop_loss",
+                "persistent_soft_stop_full_exit",
+            }:
+                continue
+            try:
+                filled = int(original["filled_qty"])
+                open_qty = int(original["broker_open_qty"])
+            except (ValueError, TypeError, KeyError) as exc:
+                raise StopObligationUnavailable("STOP_OBLIGATION_STOP_FILL_INVALID") from exc
+            status = str(original.get("status") or "").upper()
+            if (filled < 0 or open_qty != 0
+                    or status not in {"FILLED", "CANCELLED", "CANCELED"}):
+                raise StopObligationUnavailable("STOP_OBLIGATION_STOP_FILL_UNVERIFIED")
+            # A KIS-proven zero-fill cancellation is terminal but contributes
+            # zero actual executions. Never convert it into a synthetic fill.
+            if filled == 0:
+                continue
+            unique = (str(original.get("trade_date") or ""),
+                      str(original.get("order_no") or "").lstrip("0"))
+            if not all(unique) or unique in unique_stop_orders:
+                raise StopObligationUnavailable("STOP_OBLIGATION_STOP_ORDER_DUPLICATED")
+            unique_stop_orders.add(unique)
+            confirmed_stop_fill_qty += filled
+
     from sqlalchemy import text
     from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
     engine=_get_engine_or_none()
@@ -287,6 +324,10 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
         result=conn.execute(text("""
             UPDATE us_protective_stop_obligations o
                SET obligation_state='SATISFIED',
+                   confirmed_filled_qty=GREATEST(
+                       COALESCE(o.confirmed_filled_qty,0),
+                       LEAST(o.target_qty,:confirmed_stop_fill_qty)
+                   ),
                    terminal_proof=CAST(:proof AS jsonb),updated_at=now()
              WHERE o.trading_epoch_id=:epoch
                AND o.env='practice'
@@ -307,6 +348,7 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
             RETURNING o.lifecycle_id
         """),{
             "proof":json.dumps(proof,sort_keys=True,default=str),
+            "confirmed_stop_fill_qty":confirmed_stop_fill_qty,
             "epoch":debt_epoch,"account":debt["account_id"],
             "account_claim":hashlib.sha256(str(debt["account_id"]).encode("utf-8")).hexdigest(),
             "symbol":debt["symbol"],"lifecycle":debt["lifecycle_id"],
