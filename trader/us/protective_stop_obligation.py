@@ -160,11 +160,18 @@ def replay_confirmed_protective_intents(
         str(i.get("symbol") or "").upper() for i in existing_intents
         if str(i.get("side") or "").upper() == "SELL"
     }
+    from trader.db.trading_epoch import trading_epoch_enforced
+
+    require_epoch = trading_epoch_enforced()
     by_scope = {}
     for snapshot in snapshots:
         symbol, life, account = scope_for_position(snapshot)
-        if symbol and life and account:
-            by_scope[(symbol,life,account)] = snapshot
+        meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+        position_epoch = str(snapshot.get("trading_epoch_id") or meta.get("trading_epoch_id") or "")
+        # Never attach a debt from the previous portfolio generation to a
+        # live position that merely reuses the same symbol/account/lifecycle.
+        if symbol and life and account and (position_epoch or not require_epoch):
+            by_scope[(symbol,life,account,position_epoch)] = snapshot
 
     emitted=[]
     for debt in pending:
@@ -177,7 +184,10 @@ def replay_confirmed_protective_intents(
         symbol = str(debt.get("symbol") or "").upper()
         if symbol in existing_symbols:
             continue
-        key=(symbol,str(debt.get("lifecycle_id") or ""),str(debt.get("account_id") or ""))
+        key=(symbol,str(debt.get("lifecycle_id") or ""),str(debt.get("account_id") or ""),
+             str(debt.get("trading_epoch_id") or ""))
+        if require_epoch and not key[3]:
+            continue
         pos=by_scope.get(key)
         if not pos:
             continue
