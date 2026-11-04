@@ -44,6 +44,8 @@ def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, ...]]:
             str(claim.get("env") or "").lower(),
             str(claim.get("account_id") or ""),
             str(claim.get("trading_epoch_id") or ""),
+            str(claim.get("portfolio_epoch_id") or ""),
+            str(claim.get("position_cycle_id") or ""),
             str(claim.get("lifecycle_id") or ""),
             str(claim.get("action_key") or ""),
             str(claim.get("requested_qty") if claim.get("requested_qty") is not None else ""),
