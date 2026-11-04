@@ -9,6 +9,9 @@ on:
       - "tests/us/test_us_pr243_latency_fail_closed.py"
       - "scripts/us_latency_compare.py"
       - "trader/us/execution/order_router.py"
+      - "trader/us/execution/recovery_identity.py"
+      - "tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py"
+      - "migrations/0062_us_portfolio_position_cycle_recovery_scope.sql"
       - "trader/us/runner/trade_tick_runner.py"
   workflow_dispatch:
 
@@ -76,6 +79,16 @@ jobs:
           print("PR243 CONTROLLED STATUS: 20 mock POSTs; native HTTP boundary measured;"
                 " real WSL latency and real KIS fill NOT CLAIMED")
           PY
+      - name: PR311 scoped recovery regression tests (mock only)
+        if: github.event.pull_request.number == 311
+        run: |
+          set -euo pipefail
+          python -m pytest -q \\
+            tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py \\
+            tests/us/test_us_stage4_historical_reader_split_20261103.py \\
+            tests/us/test_us_stop_debt_replay_20261023.py \\
+            tests/us/test_us_protective_stop_recovery_worker_20261023.py \\
+            tests/us/test_us_20261008_entry_tp_recovery.py
       - name: Preserve mock-only evidence
         if: always()
         uses: actions/upload-artifact@v4
