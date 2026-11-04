@@ -14,6 +14,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 NY = ZoneInfo("America/New_York")
+# Maximum lifetime of an approved, immutable US_STANDARD entry decision.
+MAX_BUY_SIGNAL_AGE_SEC = 180.0
 BAR_SOURCE = "KIS_OVERSEAS_1M"
 FAMILIES = {"ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT"}
 CONFIG_VERSION = "US_OPPORTUNITY_TRIAL_V1"
@@ -333,7 +335,7 @@ def attach_opportunity_proof(intent: dict, decision: dict, *, mode: str,
         intent["meta"] = {}
     proof = {
         **decision, "mode": mode, "decision_epoch": float(decision_epoch),
-        "max_age_sec": 120.0,
+        "max_age_sec": MAX_BUY_SIGNAL_AGE_SEC,
     }
     proof["submission_binding_sha256"] = _submission_binding(intent, proof)
     intent["meta"]["us_entry_opportunity_v1"] = proof
@@ -373,7 +375,12 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     if digest != proof.get("evidence_sha256") or proof.get("state") != "READY":
         return False, "TIMING_PROOF_INVALID"
     observed = finite(proof.get("decision_epoch"))
-    if observed is None or not (0 <= now_epoch - observed <= 120):
+    proof_age_limit = finite(proof.get("max_age_sec"))
+    # Keep older signed 120s decisions at their original lifetime. Never let
+    # an unsigned/overlong TTL become broker permission after deployment.
+    if proof_age_limit is None or not (0 < proof_age_limit <= MAX_BUY_SIGNAL_AGE_SEC):
+        return False, "TIMING_PROOF_INVALID"
+    if observed is None or not (0 <= now_epoch - observed <= proof_age_limit):
         return False, "TIMING_SIGNAL_EXPIRED"
     cap = finite(proof.get("max_entry_price"))
     price = finite(intent.get("limit_price"))
