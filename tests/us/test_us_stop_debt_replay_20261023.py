@@ -78,7 +78,9 @@ def test_wsl_replay_rejects_same_account_and_lifecycle_from_different_epoch(monk
         lambda **kwargs: builder_calls.append(kwargs) or
         {"side": "SELL", "symbol": kwargs["symbol"], "qty": kwargs["qty"]},
     )
-    current = {**_snapshot(monkeypatch), "trading_epoch_id": "epoch-current"}
+    current = {**_snapshot(monkeypatch), "trading_epoch_id": "epoch-current",
+               "portfolio_epoch_id": "portfolio-current",
+               "position_cycle_id": "life-a"}
     debt_old = _debt(trading_epoch_id="epoch-previous")
     debt_unknown = _debt(trading_epoch_id="")
     for prior in (debt_old, debt_unknown):
@@ -89,13 +91,15 @@ def test_wsl_replay_rejects_same_account_and_lifecycle_from_different_epoch(monk
     missing_current_epoch = dict(current)
     missing_current_epoch.pop("trading_epoch_id")
     assert replay_confirmed_protective_intents(
-        snapshots=[missing_current_epoch], pending=[_debt(trading_epoch_id="epoch-current")],
+        snapshots=[missing_current_epoch], pending=[_debt(trading_epoch_id="epoch-current", portfolio_epoch_id="portfolio-current",
+              position_cycle_id="life-a")],
         existing_intents=[], now=None,
     ) == []
     assert builder_calls == []
 
     confirmed = replay_confirmed_protective_intents(
-        snapshots=[current], pending=[_debt(trading_epoch_id="epoch-current")],
+        snapshots=[current], pending=[_debt(trading_epoch_id="epoch-current", portfolio_epoch_id="portfolio-current",
+              position_cycle_id="life-a")],
         existing_intents=[], now=None,
     )
     assert len(confirmed) == 1
@@ -110,10 +114,16 @@ def test_wsl_replay_rejects_other_account_and_position_cycle_at_matching_epoch(m
         "trader.us.pb1.us_exit_engine._make_exit_intent",
         lambda **kwargs: calls.append(kwargs) or {"side": "SELL"},
     )
-    current = {**_snapshot(monkeypatch), "trading_epoch_id": "epoch-current"}
+    current = {**_snapshot(monkeypatch), "trading_epoch_id": "epoch-current",
+               "portfolio_epoch_id": "portfolio-current",
+               "position_cycle_id": "life-a"}
     prior_debts = [
-        _debt(account_id="wrong-account", trading_epoch_id="epoch-current"),
-        _debt(lifecycle_id="different-position-cycle", trading_epoch_id="epoch-current"),
+        _debt(account_id="wrong-account", trading_epoch_id="epoch-current",
+              portfolio_epoch_id="portfolio-current", position_cycle_id="life-a"),
+        _debt(lifecycle_id="different-position-cycle", trading_epoch_id="epoch-current",
+              portfolio_epoch_id="portfolio-current", position_cycle_id="different-position-cycle"),
+        _debt(trading_epoch_id="epoch-current", portfolio_epoch_id="wrong-portfolio",
+              position_cycle_id="life-a"),
     ]
     assert replay_confirmed_protective_intents(
         snapshots=[current], pending=prior_debts,
