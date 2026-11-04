@@ -73,6 +73,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_us_orders_broker_account_epoch_day_0062
   ) WHERE order_no IS NOT NULL AND btrim(order_no)<>'';
 DROP INDEX IF EXISTS public.uq_us_orders_trade_date_order_no_nonblank;
 
+-- Fail before touching the legacy fill uniqueness constraint. This is
+-- deliberately conservative: ambiguous historical fills require manual
+-- broker evidence, not automatic account/epoch backfill.
+DO $us_fill_preflight$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.us_fills
+    GROUP BY COALESCE(NULLIF(account_id,''),'__legacy_account__'),
+             COALESCE(NULLIF(trading_epoch_id,''),'__legacy_epoch__'),
+             trade_date, symbol, side, COALESCE(order_no,''),
+             COALESCE(client_order_key,''), qty, price_usd
+    HAVING count(*) > 1
+  ) THEN
+    RAISE EXCEPTION 'US_FILL_BROKER_SCOPED_DUPLICATES_REQUIRE_MANUAL_EVIDENCE';
+  END IF;
+END $us_fill_preflight$;
+
 -- Fill identity must be account/epoch scoped too. A separate globally
 -- unique fill_idempotency_key remains; writers must include source scope.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_us_fills_broker_account_epoch_0062
