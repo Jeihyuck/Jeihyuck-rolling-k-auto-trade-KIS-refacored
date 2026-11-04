@@ -4384,11 +4384,23 @@ def run_trade_tick(
                     "router_state": _router_input,
                     "changed_fields": canonical_risk_snapshot_changed_fields(_preflight_input, _router_input),
                 }
+                # Persistence rejection is NOT a risk snapshot discrepancy:
+                # the same immutable key was rejected by the DB contract
+                # guard after an otherwise valid preflight. Keep fail-closed,
+                # but expose its own repairable root cause at Tick and Close.
+                if str(result.get("reason") or "") == "intent_persistence_rejected":
+                    mismatch["cause"] = "BUY_INTENT_IMMUTABLE_CONTRACT_PERSISTENCE"
+                    system_invariant_failure = "BUY_INTENT_PERSISTENCE_REJECTED"
+                    logger.error(
+                        "[US_ENTRY][BUY_INTENT_PERSISTENCE_REJECTED] detail=%s",
+                        mismatch,
+                    )
+                else:
+                    system_invariant_failure = "PREFLIGHT_ROUTER_MISMATCH"
+                    logger.error("[US_ENTRY][PREFLIGHT_ROUTER_MISMATCH] detail=%s", mismatch)
                 router_blocked_after_preflight.append(mismatch)
-                system_invariant_failure = "PREFLIGHT_ROUTER_MISMATCH"
                 entry_degraded = True
                 entry_degraded_reason = system_invariant_failure
-                logger.error("[US_ENTRY][PREFLIGHT_ROUTER_MISMATCH] detail=%s", mismatch)
                 break
             if result["status"] in ("DRY_RUN", "ACK"):
                 if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("profit_capture_stage") or ""):
