@@ -292,13 +292,18 @@ class HistoricalReadOnlyReader:
         if priority_books:
             _, day, cause = min(priority_books)
             kind = "book"
+            # Advance round-robin only if this critical refresh was also
+            # the next scheduled task; otherwise preserve the deferred
+            # balance task's turn once the book becomes verifiably fresh.
+            if tasks[self._cursor % len(tasks)] == ("book", day):
+                self._cursor += 1
             logger.info(
                 "[US_STAGE4][HISTORICAL_PRIORITY_REFRESH] source_day=%s cause=%s",
                 day, cause,
             )
         else:
             kind, day = tasks[self._cursor % len(tasks)]
-        self._cursor += 1
+            self._cursor += 1
         if kind == "book":
             orders = provider.get_today_orders(trade_date=day)
             provenance = provider.get_order_lookup_provenance(day)
