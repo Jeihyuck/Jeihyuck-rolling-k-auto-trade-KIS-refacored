@@ -118,3 +118,44 @@ def test_live_opportunity_clock_is_not_stale_tick_start():
     after = datetime.now(ny)
     assert before <= observed <= after
     assert observed != tick_start
+
+
+def test_proven_unsent_new_buy_uses_distinct_semantic_claim_instance():
+    from datetime import date
+    from trader.us.execution.order_router import _semantic_action_instance
+    trade_day = date(2026, 11, 3)
+    order = {
+        "symbol": "CVX", "side": "BUY",
+        "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+    }
+    assert _semantic_action_instance(
+        order, {}, "US_STANDARD_NEW_POSITION_BUY", trade_day,
+    ) == "2026-11-03"
+    assert _semantic_action_instance(
+        order,
+        {"us_buy_retry_resolved_key": "signed-retry-20261103"},
+        "US_STANDARD_NEW_POSITION_BUY", trade_day,
+    ) == "2026-11-03:UNSENT_REEVAL:signed-retry-20261103"
+    # Different immutable decisions may have different quantity/risk targets
+    # while the original action claim remains OPEN but proven pre-HTTP unsent.
+    assert _semantic_action_instance(
+        {**order, "qty": 14},
+        {"us_buy_retry_resolved_key": "new-signed-retry"},
+        "US_STANDARD_NEW_POSITION_BUY", trade_day,
+    ) != _semantic_action_instance(
+        {**order, "qty": 15},
+        {}, "US_STANDARD_NEW_POSITION_BUY", trade_day,
+    )
+
+
+def test_other_strategy_owners_and_sells_never_get_buy_retry_claim_instance():
+    from datetime import date
+    from trader.us.execution.order_router import _semantic_action_instance
+    trade_day = date(2026, 11, 3)
+    buy = {"side": "BUY", "strategy_owner": "TQQQ_INFINITE",
+           "position_action": "NEW_POSITION_BUY"}
+    assert _semantic_action_instance(
+        buy, {"us_buy_retry_resolved_key": "forged"},
+        "ENTRY", trade_day,
+    ) == "2026-11-03"
