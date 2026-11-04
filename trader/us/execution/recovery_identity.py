@@ -182,3 +182,52 @@ def assert_recovery_scope(original: dict, current: dict, *,
     )
     if old_life != original.get("position_cycle_id") or old_life != new_life:
         raise USRecoveryIdentityError("POSITION_LIFECYCLE_MISMATCH")
+
+
+def assert_preexisting_us_claim_scope(conn, *, action_key: str,
+                                      scope: USRecoveryScope) -> None:
+    """Never adopt an unscoped historic claim under a new portfolio generation."""
+    if not action_key:
+        raise USRecoveryIdentityError("EXECUTION_ACTION_UNVERIFIED")
+    row = conn.execute(text("""
+        SELECT env,account_id,trading_epoch_id,strategy_owner,lifecycle_id,
+               portfolio_epoch_id,position_cycle_id
+        FROM us_execution_claims WHERE action_key=:key FOR UPDATE
+    """), {"key": action_key}).mappings().first()
+    if row is None:
+        return
+    old = dict(row)
+    required = scope.as_dict()
+    for column, expected in required.items():
+        if column == "position_cycle_id":
+            original = str(old.get(column) or old.get("lifecycle_id") or "")
+            if not old.get("position_cycle_id"):
+                raise USRecoveryIdentityError("POSITION_CYCLE_UNVERIFIED")
+        else:
+            original = str(old.get(column) or "")
+        if not original or original != expected:
+            raise USRecoveryIdentityError(column.upper() + "_MISMATCH")
+
+
+def persist_us_claim_scope(conn, *, action_key: str,
+                           scope: USRecoveryScope) -> None:
+    """Same original action can only carry one owner portfolio and cycle."""
+    if not action_key:
+        raise USRecoveryIdentityError("EXECUTION_ACTION_UNVERIFIED")
+    result = conn.execute(text("""
+        UPDATE us_execution_claims
+        SET portfolio_epoch_id=:portfolio,
+            position_cycle_id=:cycle
+        WHERE action_key=:key AND env=:env AND account_id=:account
+          AND trading_epoch_id=:epoch AND strategy_owner=:owner
+          AND lifecycle_id=:cycle
+          AND (portfolio_epoch_id IS NULL OR portfolio_epoch_id=:portfolio)
+          AND (position_cycle_id IS NULL OR position_cycle_id=:cycle)
+        RETURNING action_key
+    """), {
+        "key": action_key, "env": scope.env, "account": scope.account_id,
+        "epoch": scope.trading_epoch_id, "owner": scope.strategy_owner,
+        "portfolio": scope.portfolio_epoch_id, "cycle": scope.position_cycle_id,
+    })
+    if result.first() is None:
+        raise USRecoveryIdentityError("EXECUTION_CLAIM_ORIGINAL_SCOPE_MISMATCH")
