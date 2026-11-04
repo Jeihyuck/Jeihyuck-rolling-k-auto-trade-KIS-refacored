@@ -699,7 +699,14 @@ def _semantic_action_instance(
     ):
         if trade_date is None:
             raise ValueError("US_STANDARD new-position BUY requires a valid trade date")
-        return trade_date.isoformat()
+        # New claim target can differ from an authoritatively aborted earlier
+        # decision. The router validates this token against immutable DB
+        # evidence BEFORE acquiring the scoped claim; never trust raw meta.
+        retry_key = str(meta.get("us_buy_retry_resolved_key") or "")
+        return (
+            f"{trade_date.isoformat()}:UNSENT_REEVAL:{retry_key}"
+            if retry_key else trade_date.isoformat()
+        )
     if side != "SELL":
         return None
     # Preserve the existing US_STANDARD trailing partial-sell philosophy:
@@ -1008,6 +1015,48 @@ def route_order(
     intent["meta"] = meta
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
+    # A retry token is not authorization. Re-read every prior attempt and the
+    # same-day broker order ledger at the canonical router boundary. This
+    # protects direct callers and catches changed evidence since signal eval.
+    if side == "BUY" and (
+        meta.get("us_buy_retry_decision_id")
+        or meta.get("us_buy_retry_resolved_key")
+    ):
+        retry_id = str(meta.get("us_buy_retry_decision_id") or "")
+        expected_key = str(meta.get("us_buy_retry_resolved_key") or "")
+        owner = str(intent.get("strategy_owner") or "").upper()
+        if (
+            owner != "US_STANDARD"
+            or str(intent.get("position_action") or "").upper() != "NEW_POSITION_BUY"
+            or str(intent.get("symbol") or "").upper() == "TQQQ"
+            or str(os.getenv("KIS_ENV") or "").lower() != "practice"
+            or os.getenv("US_ENTRY_OPPORTUNITY_MODE", "SHADOW").upper() != "ENFORCE"
+            or os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") != "1"
+            or not retry_id or not expected_key
+            or str(intent.get("client_order_key") or "") != expected_key
+        ):
+            return {"status": "BLOCKED", "reason": "US_BUY_RETRY_SCOPE_UNVERIFIED",
+                    "broker_submit": False, "intent": intent}
+        from hashlib import sha256 as _retry_sha
+        from trader.us.db.repos import resolve_us_standard_new_buy_key
+        td = str(intent.get("trade_date") or "")
+        raw = f"{str(symbol).upper()}_{td.replace('-', '')}_BUY"
+        original_key = _retry_sha(raw.encode()).hexdigest()[:24]
+        retry_check = resolve_us_standard_new_buy_key(
+            symbol=str(symbol), trade_date=td,
+            base_key=original_key, decision_id=retry_id,
+        )
+        if (
+            not retry_check.get("allowed")
+            or retry_check.get("reason") != "ALL_PRIOR_ATTEMPTS_PROVEN_UNSENT"
+            or retry_check.get("key") != expected_key
+        ):
+            logger.error(
+                "[US_ORDER][SAFE_RETRY_REVALIDATION_BLOCK] symbol=%s reason=%s",
+                symbol, retry_check.get("reason"),
+            )
+            return {"status": "BLOCKED", "reason": "US_BUY_RETRY_EVIDENCE_CHANGED",
+                    "broker_submit": False, "intent": intent}
     symbol_upper = str(symbol or "").upper().strip()
     position_action = (
         intent.get("position_action")
