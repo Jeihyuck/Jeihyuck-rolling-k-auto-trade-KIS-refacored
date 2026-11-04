@@ -17,8 +17,8 @@ permissions:
 
 jobs:
   native-kis-stubbed-boundary-only:
-    # Authorize the original #243 gate and the explicit #309 integration
-    # review branch only.  Do not open real KIS/network/order privileges.
+    # Preserve #243/#309 gates; explicitly run mock-only boundary on #311.
+    # No credentials, production DB or real broker privileges.
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
@@ -30,6 +30,10 @@ jobs:
         (
           github.event.pull_request.number == 309 &&
           github.event.pull_request.head.ref == 'fix/us-entry-timing-180s-safe-retry-20261104'
+        ) ||
+        (
+          github.event.pull_request.number == 311 &&
+          github.event.pull_request.head.ref == 'fix/us-broker-epoch-cycle-recovery-fence-20261104'
         )
       )
     runs-on: ubuntu-latest
