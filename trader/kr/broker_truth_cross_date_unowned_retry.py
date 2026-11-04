@@ -155,7 +155,7 @@ def _apply_historical_sell_exact(
             conn=conn, schema=schema, order=order, strategy=strategy, scope=scope,
         ):
             raise RuntimeError("CROSS_DATE_SELL_ACCOUNT_EPOCH_UNPROVEN")
-        if strategy == "pb1_pullback_close" and code == "122630":
+        if scope is not None and strategy == "pb1_pullback_close" and code == "122630":
             raise RuntimeError("CROSS_DATE_SELL_KR_INFINITE_RESERVED")
 
         for fill_id in fill_ids:
@@ -355,7 +355,7 @@ def _retry_historical_unowned_fills(*, engine, env: str, strategy: str) -> dict[
             )
             if not order:
                 continue
-            if strategy == "pb1_pullback_close" and str(order.get("code") or "").zfill(6) == "122630":
+            if scope is not None and strategy == "pb1_pullback_close" and str(order.get("code") or "").zfill(6) == "122630":
                 logger.info(
                     "[KR_BROKER_TRUTH][CROSS_DATE_UNOWNED][OWNER_SKIP] "
                     "code=122630 reason=KR_INFINITE_RESERVED",
