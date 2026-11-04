@@ -64,6 +64,19 @@ def pg_engine(monkeypatch):
             conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
             )
+    # Fail the fixture immediately on missing 0062 columns, rather than
+    # reporting misleading downstream KIS pre-submit/claim failures.
+    with engine.connect() as conn:
+        for table in ("us_orders", "us_fills", "us_execution_claims"):
+            columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name=:table
+                """), {"table": table}).all()
+            }
+            assert {"portfolio_epoch_id", "position_cycle_id"} <= columns, (
+                f"PR311 fixture missing 0062 scope columns: {table}"
+            )
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
     yield engine
     engine.dispose()
