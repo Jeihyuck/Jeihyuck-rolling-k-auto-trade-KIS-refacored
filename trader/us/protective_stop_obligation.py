@@ -289,9 +289,14 @@ def satisfy_stop_obligation_from_broker_proof(*, debt: dict, proof: dict) -> boo
                 open_qty = int(original["broker_open_qty"])
             except (ValueError, TypeError, KeyError) as exc:
                 raise StopObligationUnavailable("STOP_OBLIGATION_STOP_FILL_INVALID") from exc
-            if (filled <= 0 or open_qty != 0
-                    or str(original.get("status") or "").upper() != "FILLED"):
+            status = str(original.get("status") or "").upper()
+            if (filled < 0 or open_qty != 0
+                    or status not in {"FILLED", "CANCELLED", "CANCELED"}):
                 raise StopObligationUnavailable("STOP_OBLIGATION_STOP_FILL_UNVERIFIED")
+            # A KIS-proven zero-fill cancellation is terminal but contributes
+            # zero actual executions. Never convert it into a synthetic fill.
+            if filled == 0:
+                continue
             unique = (str(original.get("trade_date") or ""),
                       str(original.get("order_no") or "").lstrip("0"))
             if not all(unique) or unique in unique_stop_orders:
