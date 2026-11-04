@@ -1504,6 +1504,39 @@ def generate_entry_intents(
         key_raw = f"{symbol}_{today_str}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
+        # A new READY decision after a proven pre-HTTP abort is a NEW
+        # immutable contract, not an update of the abandoned BUY's old hash.
+        # The whole symbol/day/epoch ledger must prove every prior attempt
+        # was never submitted. Any unknown/ACKed attempt remains fail-closed.
+        if (
+            position_action == "NEW_POSITION_BUY"
+            and _opportunity_mode == "ENFORCE"
+            and os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") == "1"
+            and isinstance(_price_opportunity, dict)
+        ):
+            from trader.us.db.repos import resolve_us_standard_new_buy_key
+            _retry_identity = resolve_us_standard_new_buy_key(
+                symbol=symbol, trade_date=trade_date_for_key,
+                base_key=client_order_key,
+                decision_id=(
+                    str(_price_opportunity.get("evidence_sha256") or "")
+                    + ":" + str(_op_now.timestamp())
+                ),
+            )
+            if not _retry_identity.get("allowed"):
+                track_skip(
+                    symbol, _retry_identity.get("reason", "US_BUY_RETRY_UNVERIFIED"),
+                    {"block_stage": "buy_intent_identity"},
+                )
+                continue
+            if client_order_key != _retry_identity["key"]:
+                logger.info(
+                    "[US_ENTRY][SAFE_RETRY_NEW_IDENTITY] symbol=%s previous_key=%s new_key=%s reason=%s",
+                    symbol, client_order_key, _retry_identity["key"],
+                    _retry_identity.get("reason"),
+                )
+            client_order_key = _retry_identity["key"]
+
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Duplicate pre-entry skip: DB에 이미 존재하는 client_order_key 차단
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
