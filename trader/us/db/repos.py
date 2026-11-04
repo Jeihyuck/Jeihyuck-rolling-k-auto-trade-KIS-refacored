@@ -4279,8 +4279,14 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                     order_row = conn.execute(
                         text(_order_sql), _order_params,
                     ).mappings().first()
-                    if not order_row and str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED":
-                        f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                    if not order_row and (
+                        _fill_portfolio
+                        or str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED"
+                    ):
+                        f["save_status"] = (
+                            "FILL_ORIGINAL_ORDER_NOT_FOUND" if _fill_portfolio
+                            else "FILL_ORDER_NOT_FOUND"
+                        )
                         skipped_duplicates += 1
                         continue
                     if order_row:
