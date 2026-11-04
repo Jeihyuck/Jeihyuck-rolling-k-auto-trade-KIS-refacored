@@ -319,6 +319,10 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
     # candidate larger than the remaining daily allowance is skipped while a
     # smaller candidate can still backfill.
     from trader.us.execution.order_router import select_preflight_buy_candidates
+    # Exercise the practice-order preflight, not the CI DRY_RUN=1 guard.
+    # This selection-only test never submits a broker order.
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "1500")
     monkeypatch.setenv("US_MAX_ORDER_USD", "1000")
     state = {
