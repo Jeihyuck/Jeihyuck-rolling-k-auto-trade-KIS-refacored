@@ -17,11 +17,21 @@ permissions:
 
 jobs:
   native-kis-stubbed-boundary-only:
+    # Authorize the original #243 gate and the explicit #309 integration
+    # review branch only.  Do not open real KIS/network/order privileges.
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.pull_request.number == 243 &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'fix/us-20261020-execution-recovery'
+      (
+        (
+          github.event.pull_request.number == 243 &&
+          github.event.pull_request.head.ref == 'fix/us-20261020-execution-recovery'
+        ) ||
+        (
+          github.event.pull_request.number == 309 &&
+          github.event.pull_request.head.ref == 'fix/us-entry-timing-180s-safe-retry-20261104'
+        )
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
