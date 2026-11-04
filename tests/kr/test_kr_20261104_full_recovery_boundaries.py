@@ -63,7 +63,7 @@ def _accounts(monkeypatch):
                 trading_epoch_id=epoch, env="practice",
                 kis_odno="0000001212", trade_id=account + ":trade",
                 code="005930", side="BUY", market="KOSPI",
-                qty=2, price=100000.0, fee=0.0, tax=0.0,
+                qty=2, price=(100000.0 if account == CURRENT else 99999.0), fee=0.0, tax=0.0,
                 filled_at=day,
             ))
     return engine, schema, identities, day
