@@ -39,6 +39,24 @@ def pg_engine(monkeypatch):
             conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
             )
+        # PR311: the US fixture is deliberately lean (no KR portfolio tables).
+        # Mirror only the additive US claim/order lineage columns of migration
+        # 0062. The canonical migration SQL is separately audited/tested.
+        for table in (
+            "us_orders", "us_order_intents", "us_order_events", "us_fills",
+            "us_positions", "us_execution_claims",
+        ):
+            for column in ("portfolio_epoch_id", "position_cycle_id"):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT"
+                )
+        for table in (
+            "us_orders", "us_order_intents", "us_order_events", "us_fills",
+            "us_positions",
+        ):
+            conn.exec_driver_sql(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
+            )
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
     yield engine
     engine.dispose()
