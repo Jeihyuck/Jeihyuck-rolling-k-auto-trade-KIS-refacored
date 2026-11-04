@@ -3967,6 +3967,13 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if not order and is_actual_cumulative:
             recovery_status, order = _rebind_broker_fill_to_local_order(f, trade_date=td)
             if recovery_status == "NO_CANDIDATE":
+                if os.getenv("WSL_RUN_MARKET", "").upper() == "US":
+                    _mark_unattributed_broker_fill(
+                        f, trade_date=td,
+                        reason="BROKER_ORIGINAL_PORTFOLIO_CYCLE_UNVERIFIED",
+                        candidate_count=0,
+                    )
+                    continue
                 if _get_engine_or_none() is not None:
                     order = _import_broker_actual_order(f, trade_date=td)
                     if not order:
@@ -3992,6 +3999,19 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if valid_identity(order.get("client_order_key")):
             f["client_order_key"] = order.get("client_order_key")
         order_meta = _parse_json_meta(order.get("meta"))
+        if (
+            os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+            and str(order_meta.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and not all(str(order_meta.get(k) or "") for k in (
+                "broker_account_hash","trading_epoch_id",
+                "portfolio_epoch_id","position_cycle_id","position_lifecycle_id",
+            ))
+        ):
+            _mark_unattributed_broker_fill(
+                f,trade_date=td,reason="FILL_ORIGINAL_SCOPE_UNVERIFIED",
+                candidate_count=1,
+            )
+            continue
         supplied_fill_meta = _parse_json_meta(f.get("meta"))
         if order_meta.get("portfolio_epoch_id"):
             # A KIS broker row cannot carry the original local portfolio/cycle;
@@ -4315,6 +4335,41 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
                               > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
                     """
+                if fill_meta_to_store.get("portfolio_epoch_id"):
+                    account_hash = str(fill_meta_to_store.get("broker_account_hash") or "")
+                    portfolio = str(fill_meta_to_store.get("portfolio_epoch_id") or "")
+                    cycle = str(fill_meta_to_store.get("position_cycle_id") or "")
+                    original_epoch = str(fill_meta_to_store.get("trading_epoch_id") or "")
+                    if not all((account_hash, portfolio, cycle, original_epoch)) or original_epoch != str(order_epoch_id):
+                        f["save_status"] = "FILL_ORIGINAL_SCOPE_UNVERIFIED"
+                        skipped_duplicates += 1
+                        continue
+                    if "trading_epoch_id, meta," not in sql:
+                        raise RuntimeError("US_FILL_MIGRATION_0062_REQUIRED")
+                    sql = sql.replace(
+                        "trading_epoch_id, meta,",
+                        "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta,",
+                    ).replace(
+                        ":trading_epoch_id, CAST(:meta",
+                        ":trading_epoch_id, :account_id, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
+                    ).replace(
+                        "trading_epoch_id = us_fills.trading_epoch_id,",
+                        "trading_epoch_id = us_fills.trading_epoch_id,",
+                    )
+                    # Never adopt a scoped fill-idempotency key belonging to
+                    # another account/epoch/cycle on cumulative refresh.
+                    sql = sql.replace(
+                        "WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer",
+                        "WHERE us_fills.account_id IS NOT DISTINCT FROM EXCLUDED.account_id "
+                        "AND us_fills.portfolio_epoch_id IS NOT DISTINCT FROM EXCLUDED.portfolio_epoch_id "
+                        "AND us_fills.position_cycle_id IS NOT DISTINCT FROM EXCLUDED.position_cycle_id "
+                        "AND COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer",
+                    )
+                    params.update({
+                        "account_id":account_hash,
+                        "portfolio_epoch_id":portfolio,
+                        "position_cycle_id":cycle,
+                    })
                 params["meta"] = _json_param(fill_meta_to_store)
                 result = conn.execute(text(sql), params)
                 if int(result.rowcount or 0) > 0:
