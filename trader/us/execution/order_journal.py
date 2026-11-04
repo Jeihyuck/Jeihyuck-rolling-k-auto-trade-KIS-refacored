@@ -1269,6 +1269,15 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     else:
                         counts["broker_unknown_count"]+=1; unresolved_symbol_sides.append([symbol,side])
         except Exception as exc:
+            # Journal stores only the hash of raw error payloads. Emit a
+            # credential-free diagnostic so Stage4 recovery failures can be
+            # isolated by error TYPE, symbol/side/source-date, not guessed
+            # from a generic BROKER_RECOVERY_NOT_VERIFIED. Keep the claim.
+            logger.error(
+                "[US_JOURNAL][REPLAY_FAILED_DETAIL] symbol=%s side=%s "
+                "source_trade_date=%s error_type=%s action=KEEP_CLAIM_FENCED",
+                symbol, side, event_trade_date, type(exc).__name__,
+            )
             counts["failed_count"]+=1; unresolved_symbol_sides.append([symbol,side])
             append_order_event("JOURNAL_REPLAY_FAILED",latest,raw_response={"error":str(exc)})
     confirmed=sum(counts[k] for k in ("broker_full_fill_count","broker_partial_fill_count","broker_unfilled_ack_count","broker_rejected_count"))
