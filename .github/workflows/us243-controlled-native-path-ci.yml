@@ -97,3 +97,39 @@ jobs:
           path: artifacts/pr243-stubbed-native-boundary-20.json
           retention-days: 7
           if-no-files-found: ignore
+
+  pr311-postgres-safety:
+    if: github.event_name == 'pull_request' && github.event.pull_request.number == 311
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      DRY_RUN: "1"
+      US_KIS_ORDER_ALLOWED: "0"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r requirements.txt psycopg2-binary pytest
+      - name: PostgreSQL and stop recovery regression
+        run: |
+          python -m pytest -q tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py tests/us/test_us_postgres_integration_real.py tests/us/test_us_20261007_sustained_real_buy_ack.py tests/us/test_us_protective_stop_recovery_worker_20261023.py tests/us/test_us_stop_debt_replay_20261023.py
