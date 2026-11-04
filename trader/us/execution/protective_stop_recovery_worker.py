@@ -29,10 +29,16 @@ def recovery_candidates(pending: list[dict]) -> list[dict]:
         life=str(item.get("lifecycle_id") or "")
         account=str(item.get("account_id") or "")
         original_epoch=str(item.get("trading_epoch_id") or "")
+        original_portfolio=str(item.get("portfolio_epoch_id") or "")
+        original_cycle=str(item.get("position_cycle_id") or "")
         severity=int(item.get("severity") or 0)
         if not life or not account or not symbol or symbol=="TQQQ" or severity<2:
             continue
-        key=(account,original_epoch,symbol,life)
+        if os.getenv("WSL_RUN_MARKET", "").upper()=="US" and (
+            not original_epoch or not original_portfolio or original_cycle != life
+        ):
+            continue
+        key=(account,original_epoch,original_portfolio,original_cycle,symbol,life)
         if key in seen:
             continue
         seen.add(key)
@@ -43,8 +49,12 @@ def recovery_candidates(pending: list[dict]) -> list[dict]:
             "strategy":"us_pb1_exit","strategy_owner":"US_STANDARD",
             "position_lifecycle_id":life,"account_id":account,
             "trading_epoch_id":original_epoch,
+            "portfolio_epoch_id":original_portfolio,
+            "position_cycle_id":original_cycle,
             "meta":{"strategy_owner":"US_STANDARD","position_lifecycle_id":life,
-                    "account_id":account,"trading_epoch_id":original_epoch},
+                    "account_id":account,"trading_epoch_id":original_epoch,
+                    "portfolio_epoch_id":original_portfolio,
+                    "position_cycle_id":original_cycle},
         })
     return results
 
