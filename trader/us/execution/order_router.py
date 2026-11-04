@@ -1254,6 +1254,42 @@ def route_order(
             "intent": intent,
         }
 
+    # Production US_STANDARD writes must have ORIGINAL account + owner-specific
+    # Portfolio Epoch + position-cycle provenance before even saving an Intent.
+    # Other owners (notably TQQQ Infinite) retain their dedicated route/contract.
+    # WSL US is mandatory; offline injected harnesses never gain KIS authority.
+    if (
+        os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
+        and kis_order_allowed
+        and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+    ):
+        try:
+            from trader.account_state import get_account_key
+            from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+            from trader.us.execution.recovery_identity import bind_original_us_order_scope
+            _identity_engine = _get_engine_or_none()
+            if _identity_engine is None:
+                raise RuntimeError("US_SCOPE_DATABASE_UNAVAILABLE")
+            _env = _kis_env()
+            with _identity_engine.connect() as _identity_conn:
+                _epoch = _active_us_epoch(_identity_conn, required=True)
+                bind_original_us_order_scope(
+                    intent, conn=_identity_conn, env=_env,
+                    account_key=get_account_key(env=_env),
+                    trading_epoch_id=str(_epoch or ""),
+                )
+            meta = intent["meta"]
+        except Exception as exc:
+            logger.error(
+                "[US_ORDER][ORIGINAL_RECOVERY_SCOPE_FENCED] symbol=%s "
+                "side=%s type=%s broker_submit=0", symbol, side, type(exc).__name__,
+            )
+            return {
+                "status": "US_RECOVERY_SCOPE_UNVERIFIED",
+                "reason": str(exc), "broker_submit": False,
+                "retry_order": False, "intent": intent,
+            }
+
     # 1. SELL duplicate precheck before saving intent: never grow blocked duplicate intents.
     try:
         db_keys = load_today_order_keys(trade_date=trade_date)
