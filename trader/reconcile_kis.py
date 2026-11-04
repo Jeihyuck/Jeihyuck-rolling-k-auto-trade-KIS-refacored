@@ -3039,7 +3039,34 @@ def reconcile_kis(
         frozen_contract_violations = 1
         logger.exception("[KR_CONTRACT_RECOVERY][POST_RECONCILE_VERIFY_FAILED] err=%s", exc)
     reconcile_result["frozen_contract_invariant_violations"] = frozen_contract_violations
-    execution_claim_health = _execution_claim_health(orders_repo, market="KR")
+    # Production must never read a global KR claim total after account-specific
+    # reconciliation; old practice accounts may retain independent ACTIVE epochs.
+    try:
+        if trading_epoch_enforced():
+            from trader.kr.recovery_scope_20261104 import resolve_kr_recovery_scope
+            recovery_scope = resolve_kr_recovery_scope(
+                engine=engine, env=env, kis=kis,
+            )
+            execution_claim_health = _execution_claim_health(
+                orders_repo, market="KR", env=env,
+                account_id=hashlib.sha256(
+                    recovery_scope.account_key.encode("utf-8")
+                ).hexdigest(),
+                trading_epoch_id=recovery_scope.trading_epoch_id,
+            )
+        else:
+            # Diagnostic/legacy fixtures only. Canonical WSL KR always enforces.
+            execution_claim_health = _execution_claim_health(
+                orders_repo, market="KR",
+            )
+    except Exception as exc:
+        logger.error(
+            "[KR_RECONCILE][EXECUTION_CLAIM][SCOPE_UNAVAILABLE] "
+            "err_type=%s action=FAIL_CLOSED", type(exc).__name__,
+        )
+        execution_claim_health = {
+            "available": False, "error": "execution_claim_scope_unavailable",
+        }
     observation_failure_count = int(reconcile_result.get("execution_claim_observation_failures") or 0)
     integrity_reason = _execution_claim_integrity_reason(
         execution_claim_health,
