@@ -8,6 +8,7 @@ Never cancel on local stale status alone; never release a claim on cancel ACK.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any, Callable
