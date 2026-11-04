@@ -20,6 +20,9 @@ from trader.time_utils import now_kst
 import trader.kr.broker_truth_hardening as base
 import trader.kr.broker_truth_review_fixes as review
 import trader.kr.broker_truth_final_review_fixes as final
+from trader.kr.recovery_scope_20261104 import (
+    resolve_kr_recovery_scope, order_matches_recovery_scope,
+)
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
@@ -125,6 +128,7 @@ def _mirror_exact_observability(
 
 def _retry_owned_buy_fills_all_dates(*, engine, env: str, strategy: str) -> int:
     schema = schema_for_engine(engine)
+    scope = resolve_kr_recovery_scope(engine=engine, env=env)
     groups = _owned_buy_fill_groups(engine=engine, env=env, strategy=strategy)
     promoted = 0
     for order_id, payload in groups.items():
@@ -133,6 +137,25 @@ def _retry_owned_buy_fills_all_dates(*, engine, env: str, strategy: str) -> int:
         cycle = order.get("position_cycle_id")
         epoch = order.get("portfolio_epoch_id")
         code = base._normalize_code(order.get("code"))
+        with engine.connect() as conn:
+            if not order_matches_recovery_scope(
+                conn=conn, schema=schema, order=order,
+                strategy=strategy, scope=scope,
+            ):
+                logger.error(
+                    "[KR_BROKER_TRUTH][HIST_BUY_RETRY][BLOCK] order_id=%s "
+                    "reason=ACCOUNT_EPOCH_CYCLE_UNPROVEN", order_id,
+                )
+                continue
+        if scope and any(
+            str(fill.get("trading_epoch_id") or "") != scope.trading_epoch_id
+            for fill in fills
+        ):
+            logger.error(
+                "[KR_BROKER_TRUTH][HIST_BUY_RETRY][BLOCK] order_id=%s "
+                "reason=FILL_TRADING_EPOCH_MISMATCH", order_id,
+            )
+            continue
         if not cycle or not epoch or not code:
             logger.error(
                 "[KR_BROKER_TRUTH][HIST_BUY_RETRY][BLOCK] order_id=%s reason=ORDER_PROVENANCE_MISSING",
@@ -167,6 +190,8 @@ def _retry_owned_buy_fills_all_dates(*, engine, env: str, strategy: str) -> int:
                             schema.positions.c.code == code,
                             schema.positions.c.position_cycle_id == cycle,
                             schema.positions.c.portfolio_epoch_id == epoch,
+                            *((schema.positions.c.trading_epoch_id == scope.trading_epoch_id,)
+                              if scope else ()),
                             schema.positions.c.status == "OPEN",
                         )
                     )
@@ -253,6 +278,17 @@ def _retry_owned_buy_fills_all_dates(*, engine, env: str, strategy: str) -> int:
         entry_meta, entry_plan = base._entry_contract(order)
         entry_meta = dict(entry_meta)
         entry_meta[final._BUY_APPLIED_KEY] = new_map
+        # Re-read ownership immediately before the economic write.
+        with engine.connect() as conn:
+            if not order_matches_recovery_scope(
+                conn=conn, schema=schema, order=order,
+                strategy=strategy, scope=scope,
+            ):
+                logger.error(
+                    "[KR_BROKER_TRUTH][HIST_BUY_RETRY][BLOCK] order_id=%s "
+                    "reason=PREWRITE_SCOPE_CHANGED", order_id,
+                )
+                continue
         PositionsRepo(engine).apply_fill(
             env=env,
             strategy=strategy,
@@ -282,6 +318,8 @@ def _retry_owned_buy_fills_all_dates(*, engine, env: str, strategy: str) -> int:
                         schema.positions.c.code == code,
                         schema.positions.c.position_cycle_id == cycle,
                         schema.positions.c.portfolio_epoch_id == epoch,
+                        *((schema.positions.c.trading_epoch_id == scope.trading_epoch_id,)
+                          if scope else ()),
                         schema.positions.c.status == "OPEN",
                     )
                 ).limit(1)
@@ -319,6 +357,8 @@ def _retry_owned_buy_fills_all_dates(*, engine, env: str, strategy: str) -> int:
             conn.execute(
                 sa.update(schema.orders)
                 .where(schema.orders.c.order_id == order_id)
+                .where(*((schema.orders.c.trading_epoch_id == scope.trading_epoch_id,)
+                         if scope else ()))
                 .values(status=status, updated_at=sa.func.now())
             )
         promoted += 1
