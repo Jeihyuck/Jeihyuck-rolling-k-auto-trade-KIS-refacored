@@ -85,19 +85,22 @@ def position_cycle_from_order(
          "d": meta.get("position_cycle_id")},
         "a", "b", "c", "d",
     )
-    if lifecycle:
-        return lifecycle
     side = str(intent.get("side") or "").upper()
     action = str(intent.get("position_action") or meta.get("position_action") or "").upper()
-    if owner != "US_STANDARD" or side != "BUY" or action != "NEW_POSITION_BUY":
+    if owner == "US_STANDARD" and side == "BUY" and action == "NEW_POSITION_BUY":
+        symbol = str(intent.get("symbol") or "").strip().upper()
+        day = str(intent.get("trade_date") or "").strip()
+        if not symbol or len(day) != 10:
+            raise USRecoveryIdentityError("POSITION_CYCLE_ENTRY_PROVENANCE_MISSING")
+        material = "|".join((account_id, trading_epoch_id,
+                             portfolio_epoch_id, owner, symbol, day, "NEW_POSITION_BUY"))
+        original_cycle = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+        if lifecycle and lifecycle != original_cycle:
+            raise USRecoveryIdentityError("POSITION_CYCLE_NEW_ENTRY_REUSE_MISMATCH")
+        return original_cycle
+    if not lifecycle:
         raise USRecoveryIdentityError("POSITION_CYCLE_UNVERIFIED")
-    symbol = str(intent.get("symbol") or "").strip().upper()
-    day = str(intent.get("trade_date") or "").strip()
-    if not symbol or len(day) != 10:
-        raise USRecoveryIdentityError("POSITION_CYCLE_ENTRY_PROVENANCE_MISSING")
-    material = "|".join((account_id, trading_epoch_id,
-                         portfolio_epoch_id, owner, symbol, day, "NEW_POSITION_BUY"))
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return lifecycle
 
 
 def bind_original_us_order_scope(
