@@ -1538,6 +1538,17 @@ def generate_entry_intents(
                     _retry_identity.get("reason"),
                 )
             client_order_key = _retry_identity["key"]
+            if _retry_identity.get("reason") == "ALL_PRIOR_ATTEMPTS_PROVEN_UNSENT":
+                # Router rechecks this exact decision against the live ledger
+                # before claim acquisition; this is not standalone permission.
+                intent_retry_decision_id = (
+                    str(_price_opportunity.get("evidence_sha256") or "")
+                    + ":" + str(_op_now.timestamp())
+                )
+            else:
+                intent_retry_decision_id = None
+        else:
+            intent_retry_decision_id = None
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Duplicate pre-entry skip: DB에 이미 존재하는 client_order_key 차단
@@ -1870,6 +1881,16 @@ def generate_entry_intents(
             identity_proof["trigger_source"],
             identity_proof["volume_proof_status"],
         )
+
+        # Bind a post-abort re-evaluation to its immutable new order identity.
+        # This is informational until the router re-verifies broker-safe retry.
+        if intent_retry_decision_id:
+            durable_meta["us_buy_retry_decision_id"] = intent_retry_decision_id
+            durable_meta["us_buy_retry_resolved_key"] = client_order_key
+            intent.setdefault("meta", {}).update({
+                "us_buy_retry_decision_id": intent_retry_decision_id,
+                "us_buy_retry_resolved_key": client_order_key,
+            })
 
         # Decision evidence is an audit sidecar, never a broker permission gate.
         # Missing deployment SHA or questionable inputs must not delay BUY/SELL.
