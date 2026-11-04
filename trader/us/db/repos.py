@@ -4242,18 +4242,42 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
 
                 order_epoch_id = trading_epoch_id
                 if trading_epoch_id and _is_actual_evidence(evidence):
-                    order_row = conn.execute(
-                        text("""SELECT trading_epoch_id FROM us_orders
+                    # A broker order number is not globally unique. Scoped
+                    # fills must resolve the ORIGINAL order in the exact
+                    # account/portfolio/cycle, never the newest matching order.
+                    _fill_scope_meta = _parse_json_meta(f.get("meta"))
+                    _fill_portfolio = str(_fill_scope_meta.get("portfolio_epoch_id") or "")
+                    _order_sql = """SELECT trading_epoch_id FROM us_orders
                                 WHERE trade_date=:td
                                   AND ((:cok <> '' AND client_order_key=:cok)
-                                       OR (:order_no <> '' AND order_no=:order_no))
+                                       OR (:order_no <> '' AND order_no=:order_no))"""
+                    _order_params = {
+                        "td": td,
+                        "cok": str(f.get("client_order_key") or ""),
+                        "order_no": str(f.get("order_no") or ""),
+                    }
+                    if _fill_portfolio:
+                        _account = str(_fill_scope_meta.get("broker_account_hash") or "")
+                        _cycle = str(_fill_scope_meta.get("position_cycle_id") or "")
+                        _source_epoch = str(_fill_scope_meta.get("trading_epoch_id") or "")
+                        if not all((_account, _cycle, _source_epoch)) or _source_epoch != str(trading_epoch_id):
+                            f["save_status"] = "FILL_ORIGINAL_SCOPE_UNVERIFIED"
+                            skipped_duplicates += 1
+                            continue
+                        _order_sql += """
+                                  AND account_id=:account
+                                  AND trading_epoch_id=:source_epoch
+                                  AND portfolio_epoch_id=:portfolio
+                                  AND position_cycle_id=:cycle"""
+                        _order_params.update({
+                            "account": _account, "source_epoch": _source_epoch,
+                            "portfolio": _fill_portfolio, "cycle": _cycle,
+                        })
+                    _order_sql += """
                                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-                                LIMIT 1"""),
-                        {
-                            "td": td,
-                            "cok": str(f.get("client_order_key") or ""),
-                            "order_no": str(f.get("order_no") or ""),
-                        },
+                                LIMIT 1"""
+                    order_row = conn.execute(
+                        text(_order_sql), _order_params,
                     ).mappings().first()
                     if not order_row and str(incoming_meta.get("attribution_status") or "") != "UNATTRIBUTED":
                         f["save_status"] = "FILL_ORDER_NOT_FOUND"
