@@ -16,6 +16,13 @@ from zoneinfo import ZoneInfo
 NY = ZoneInfo("America/New_York")
 # Maximum lifetime of an approved, immutable US_STANDARD entry decision.
 MAX_BUY_SIGNAL_AGE_SEC = 180.0
+
+
+def opportunity_observation_time(tick_now: datetime | None, *, live_clock: bool) -> datetime:
+    """Current observation for live BUYs; preserve injected replay time."""
+    if live_clock:
+        return datetime.now(NY)
+    return tick_now if tick_now is not None else datetime.now(NY)
 BAR_SOURCE = "KIS_OVERSEAS_1M"
 FAMILIES = {"ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT"}
 CONFIG_VERSION = "US_OPPORTUNITY_TRIAL_V1"
