@@ -353,7 +353,30 @@ def request_protective_tp_cancel(
         if str(intent.get("side") or "").upper() == "SELL"
         and str(intent.get("exit_type") or "").lower() in _PROTECTIVE_EXITS
     }
+    original_epoch_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("trading_epoch_id")
+                or (intent.get("meta") or {}).get("trading_epoch_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
+    # Do not let the last of two same-symbol debts silently win the cycle.
+    identity_sets: dict[str, set[tuple[str, str, str]]] = {}
+    for intent in intents:
+        if str(intent.get("side") or "").upper() != "SELL":
+            continue
+        sym = str(intent.get("symbol") or "").upper()
+        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+        identity_sets.setdefault(sym, set()).add((
+            str(intent.get("account_id") or meta.get("account_id") or ""),
+            str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+            str(intent.get("trading_epoch_id") or meta.get("trading_epoch_id") or ""),
+        ))
     for symbol in sorted(protective_symbols(intents)):
+        if len(identity_sets.get(symbol, set())) != 1:
+            results.append({"symbol": symbol, "status": "FENCED",
+                            "reason": "multiple_recovery_cycles_same_symbol"})
+            continue
         try:
             orders = find_open(symbol, trade_date, env=env)
             if not orders:
@@ -374,6 +397,11 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
+            original_epoch = original_epoch_by_symbol.get(symbol) or ""
+            if original_epoch and str(order.get("trading_epoch_id") or "") != original_epoch:
+                results.append({"symbol": symbol, "status": "FENCED",
+                                "reason": "original_trading_epoch_mismatch"})
+                continue
             expected_account = account_by_symbol.get(symbol) or ""
             if expected_account:
                 # Claim account_id is SHA256 of the canonical raw account key.
