@@ -95,7 +95,11 @@ def position_cycle_from_order(
         material = "|".join((account_id, trading_epoch_id,
                              portfolio_epoch_id, owner, symbol, day, "NEW_POSITION_BUY"))
         original_cycle = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
-        if lifecycle and lifecycle != original_cycle:
+        # The existing PB1 producer stores ENTRY:US_STANDARD:SYMBOL as a
+        # pre-submit *action family placeholder*. It is NOT an opened holding
+        # cycle; replace only that exact placeholder with immutable new cycle.
+        producer_placeholder = f"ENTRY:{owner}:{symbol}"
+        if lifecycle and lifecycle not in {original_cycle, producer_placeholder}:
             raise USRecoveryIdentityError("POSITION_CYCLE_NEW_ENTRY_REUSE_MISMATCH")
         return original_cycle
     if not lifecycle:
