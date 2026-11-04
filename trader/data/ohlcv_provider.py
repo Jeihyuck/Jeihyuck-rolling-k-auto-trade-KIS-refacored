@@ -644,6 +644,14 @@ class ChainOHLCVProvider:
                 recovered.meta["long_fetch_blocked"] = 1
                 recovered.meta["kis_trade_daily_blocked"] = 1
                 recovered.meta.setdefault("kis_trade_daily_fetch", 0)
+                # Persist only a validated recent DB result. The next 100-sec
+                # AM tick can reuse this proof baseline instead of querying
+                # the same 200 daily rows again.
+                if (
+                    str(recovered.meta.get("source") or "") in {"db", "db_short_only"}
+                    and _completed_daily_cache_recent(recovered)
+                ):
+                    self._persist_cache(symbol, recovered.df)
                 self._memory_cache[memory_key] = recovered
                 logger.info(
                     "[OHLCV][TRADE][DB_ONLY_RECOVERY] symbol=%s rows=%d source=%s external_kis=0",
