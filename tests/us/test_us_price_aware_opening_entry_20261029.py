@@ -202,9 +202,16 @@ def test_pre_submit_uses_verified_price_cap_and_fresh_quote():
     assert pre_submit_timing_check(
         intent, now_epoch=now_epoch + 3, fresh_ws_quote=quote,
     ) == (True, "TIMING_FRESH_PRICE_CONFIRMED")
+    assert intent["meta"]["us_entry_opportunity_v1"]["max_age_sec"] == 180.0
     assert pre_submit_timing_check(
-        intent, now_epoch=now_epoch + 125, fresh_ws_quote=quote,
+        intent, now_epoch=now_epoch + 185, fresh_ws_quote=quote,
     )[1] == "TIMING_SIGNAL_EXPIRED"
+    # An 180s signal is not invalidated at the old 120s boundary when
+    # its quote is genuinely fresh at the KIS HTTP pre-submit check.
+    fresh_late = {**quote, "received_at": now_epoch + 174}
+    assert pre_submit_timing_check(
+        intent, now_epoch=now_epoch + 175, fresh_ws_quote=fresh_late,
+    ) == (True, "TIMING_FRESH_PRICE_CONFIRMED")
     rebound_failed = {**quote, "last": 95.0, "ask": 95.0, "bid": 94.98}
     assert pre_submit_timing_check(
         intent, now_epoch=now_epoch + 3, fresh_ws_quote=rebound_failed,
