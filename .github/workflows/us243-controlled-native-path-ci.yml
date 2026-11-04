@@ -83,11 +83,11 @@ jobs:
         if: github.event.pull_request.number == 311
         run: |
           set -euo pipefail
-          python -m pytest -q \\
-            tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py \\
-            tests/us/test_us_stage4_historical_reader_split_20261103.py \\
-            tests/us/test_us_stop_debt_replay_20261023.py \\
-            tests/us/test_us_protective_stop_recovery_worker_20261023.py \\
+          python -m pytest -q \
+            tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py \
+            tests/us/test_us_stage4_historical_reader_split_20261103.py \
+            tests/us/test_us_stop_debt_replay_20261023.py \
+            tests/us/test_us_protective_stop_recovery_worker_20261023.py \
             tests/us/test_us_20261008_entry_tp_recovery.py
       - name: Preserve mock-only evidence
         if: always()
