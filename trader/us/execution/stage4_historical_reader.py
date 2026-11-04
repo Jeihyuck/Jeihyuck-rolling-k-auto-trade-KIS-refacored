@@ -41,7 +41,11 @@ def active_claim_signature(claims: list[dict]) -> frozenset[tuple[str, ...]]:
         keys.add((
             day, client_key, attempt_id,
             str(claim.get("strategy_owner") or "").upper(),
+            str(claim.get("env") or "").lower(),
+            str(claim.get("account_id") or ""),
             str(claim.get("trading_epoch_id") or ""),
+            str(claim.get("lifecycle_id") or ""),
+            str(claim.get("action_key") or ""),
             str(claim.get("requested_qty") if claim.get("requested_qty") is not None else ""),
             str(claim.get("cumulative_filled_qty") if claim.get("cumulative_filled_qty") is not None else ""),
             str(claim.get("attempt_state") or "").upper(),
