@@ -323,6 +323,17 @@ def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
 def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
     if fill.get("_fill_idempotency_key_override"):
         return str(fill["_fill_idempotency_key_override"])
+    meta_scope = _parse_json_meta(fill.get("meta"))
+    account_scope = str(fill.get("broker_account_hash") or meta_scope.get("broker_account_hash") or "")
+    epoch_scope = str(fill.get("trading_epoch_id") or meta_scope.get("trading_epoch_id") or "")
+    portfolio_scope = str(fill.get("portfolio_epoch_id") or meta_scope.get("portfolio_epoch_id") or "")
+    cycle_scope = str(fill.get("position_cycle_id") or meta_scope.get("position_cycle_id") or "")
+    if portfolio_scope and not all((account_scope,epoch_scope,cycle_scope)):
+        raise RuntimeError("US_FILL_ORIGINAL_SCOPE_INCOMPLETE")
+    scope_prefix = (
+        "|".join((account_scope,epoch_scope,portfolio_scope,cycle_scope)) + "|"
+        if portfolio_scope else ""
+    )
     order_no = str(fill.get("order_no") or "")
     client_order_key = str(fill.get("client_order_key") or "")
     symbol = str(fill.get("symbol") or "").strip().upper()
@@ -330,8 +341,8 @@ def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
     ident = _fill_execution_identity(fill, trade_date)
     meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
     if _is_actual_evidence(_fill_evidence_type(fill)):
-        return ident
-    return f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{ident}"
+        return scope_prefix + ident
+    return scope_prefix + f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{ident}"
 
 
 def reset_memory_stores() -> None:
@@ -3981,7 +3992,30 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if valid_identity(order.get("client_order_key")):
             f["client_order_key"] = order.get("client_order_key")
         order_meta = _parse_json_meta(order.get("meta"))
-        fill_meta = {**order_meta, **_parse_json_meta(f.get("meta"))}
+        supplied_fill_meta = _parse_json_meta(f.get("meta"))
+        if order_meta.get("portfolio_epoch_id"):
+            # A KIS broker row cannot carry the original local portfolio/cycle;
+            # a caller's conflicting metadata cannot impersonate one either.
+            identity_fields = (
+                "broker_account_hash","trading_epoch_id","portfolio_epoch_id",
+                "position_cycle_id","position_lifecycle_id",
+            )
+            if any(
+                str(supplied_fill_meta.get(k)) != str(order_meta[k])
+                for k in identity_fields
+                if supplied_fill_meta.get(k) not in (None,"")
+                and order_meta.get(k) not in (None,"")
+            ):
+                _mark_unattributed_broker_fill(
+                    f,trade_date=td,reason="FILL_ORIGINAL_SCOPE_CONFLICT",
+                    candidate_count=1,
+                )
+                continue
+        fill_meta = {**order_meta, **supplied_fill_meta}
+        if order_meta.get("portfolio_epoch_id"):
+            for k in ("broker_account_hash","trading_epoch_id",
+                      "portfolio_epoch_id","position_cycle_id","position_lifecycle_id"):
+                fill_meta[k] = order_meta.get(k)
         if is_actual_cumulative:
             fill_meta.setdefault("is_synthetic", False)
         f["meta"] = fill_meta
