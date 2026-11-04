@@ -172,3 +172,13 @@ def test_migration_never_guesses_legacy_epoch_or_deletes_orders():
     assert "UPDATE public.us_orders" not in sql.upper()
     assert "DELETE FROM public.us_" not in sql.upper()
     assert "INSERT INTO public.portfolio_epochs" not in sql.upper()
+
+
+def test_scoped_fill_attribution_requires_exact_original_order():
+    """Guard the SQL lineage gate against account-blind order_no lookup."""
+    source = (Path(__file__).resolve().parents[2] / "trader" / "us" / "db" / "repos.py").read_text(encoding="utf-8")
+    assert "AND account_id=:account" in source
+    assert "AND trading_epoch_id=:source_epoch" in source
+    assert "AND portfolio_epoch_id=:portfolio" in source
+    assert "AND position_cycle_id=:cycle" in source
+    assert '"FILL_ORIGINAL_ORDER_NOT_FOUND"' in source
