@@ -94,7 +94,7 @@ class Broker:
 
 
 def run_settlement(monkeypatch, broker, *, with_original=True, race=False,
-                   balance_authoritative=True):
+                   balance_authoritative=True, must_skip_balance=False):
     from trader.us.execution import protective_stop_settlement_worker as settler
     from trader.us import protective_stop_obligation as stop
     from trader.us.db import repos
@@ -106,13 +106,17 @@ def run_settlement(monkeypatch, broker, *, with_original=True, race=False,
     monkeypatch.setattr(stop, "load_pending_stop_obligations", lambda **kw: [DEBT])
     conn = ReadOnlyConn(with_original=with_original, race=race)
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine(conn))
-    monkeypatch.setattr(recon, "reconcile_positions", lambda **kw: {
-        "status": "OK" if balance_authoritative else "ERROR",
-        "balance_fetch_status": "OK" if balance_authoritative else "ERROR",
-        "authoritative_positions": balance_authoritative,
-        "preserve_previous_positions": not balance_authoritative,
-        "positions": [],
-    })
+    def broker_balance(**kwargs):
+        if must_skip_balance:
+            pytest.fail("unverified original order must skip broker balance")
+        return {
+            "status": "OK" if balance_authoritative else "ERROR",
+            "balance_fetch_status": "OK" if balance_authoritative else "ERROR",
+            "authoritative_positions": balance_authoritative,
+            "preserve_previous_positions": not balance_authoritative,
+            "positions": [],
+        }
+    monkeypatch.setattr(recon, "reconcile_positions", broker_balance)
     receipts = []
     def satisfy(*, debt, proof):
         from trader.us.protective_stop_obligation import validate_terminal_broker_proof
@@ -156,14 +160,8 @@ def test_syy_no_terminal_or_incomplete_kis_stays_pending(
 
 
 def test_missing_exact_original_fill_never_probes_balance(monkeypatch):
-    from trader.us.execution import protective_stop_settlement_worker as settler
-    import trader.us.execution.reconcile as recon
-    monkeypatch.setattr(
-        recon, "reconcile_positions",
-        lambda **kw: pytest.fail("missing original stop proof must skip broker balance"),
-    )
     result, receipts, _ = run_settlement(
-        monkeypatch, Broker(), with_original=False,
+        monkeypatch, Broker(), with_original=False, must_skip_balance=True,
     )
     assert result["settled"] == 0
     assert receipts == []
