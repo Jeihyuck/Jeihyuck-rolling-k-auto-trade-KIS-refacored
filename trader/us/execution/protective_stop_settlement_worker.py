@@ -74,7 +74,7 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
         if int(active or 0)>0:
             blocked+=1
             continue
-        # A terminal stop obligation requires original-date TP broker proof.
+        # A terminal stop obligation requires an original-date TP or completed-stop KIS proof.
         # If this lifecycle has NO original TP order at all, three-exchange
         # balance I/O and another position DB write cannot possibly settle it.
         # This cheap SELECT is not a terminality inference: a missing original
@@ -200,7 +200,36 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                  AND c.lifecycle_id=:life AND c.account_id=:account
                  AND c.strategy_owner='US_STANDARD'
                  AND c.market='US'
-                 AND c.action=upper(o.meta->>'profit_capture_stage')
+                 AND (
+                     c.action=upper(o.meta->>'profit_capture_stage')
+                     OR (
+                         coalesce(o.meta->>'profit_capture_stage','')=''
+                         AND upper(o.meta->>'exit_family') IN ('HARD_STOP','SOFT_STOP')
+                         AND o.meta->>'stop_type' IN (
+                             'hard_stop_full_exit','hard_stop_loss',
+                             'persistent_soft_stop_full_exit'
+                         )
+                         AND c.action=upper(o.meta->>'reason')
+                         AND c.action_state='SATISFIED'
+                         AND c.cumulative_filled_qty=o.qty_requested
+                         AND c.remaining_target_qty=0
+                         AND o.status='FILLED' AND o.qty_filled=o.qty_requested
+                         AND EXISTS (
+                             SELECT 1 FROM us_fills f
+                             WHERE f.trade_date=o.trade_date
+                               AND f.trading_epoch_id=o.trading_epoch_id
+                               AND f.client_order_key=o.client_order_key
+                               AND f.symbol=o.symbol AND f.side='SELL'
+                               AND ltrim(f.order_no,'0')=ltrim(o.order_no,'0')
+                               AND f.meta->>'position_lifecycle_id'=:life
+                               AND f.meta->>'execution_action_key'=c.action_key
+                               AND f.meta->>'fill_evidence_type'
+                                   IN ('KIS_ORDER_CUMULATIVE_ACTUAL','KIS_EXECUTION_ACTUAL')
+                               AND coalesce((f.meta->>'cumulative_filled_qty')::integer,0)
+                                   >= o.qty_requested
+                         )
+                     )
+                 )
                 WHERE o.env='practice' AND o.trading_epoch_id=:epoch
                   AND o.symbol=:symbol AND o.side='SELL'
                   AND o.order_no IS NOT NULL
