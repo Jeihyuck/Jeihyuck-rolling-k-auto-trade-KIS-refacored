@@ -323,6 +323,14 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
     # This selection-only test never submits a broker order.
     monkeypatch.setenv("DRY_RUN", "0")
     monkeypatch.setenv("KIS_ENV", "practice")
+    # Permission gates remain enabled in production; isolate the risk-budget
+    # selector with a fully authorized *mock-only* practice context.
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
+    monkeypatch.setenv("SIGNAL_ONLY", "0")
+    monkeypatch.setenv("RUN_MODE", "TRADE")
     monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "1500")
     monkeypatch.setenv("US_MAX_ORDER_USD", "1000")
     state = {
