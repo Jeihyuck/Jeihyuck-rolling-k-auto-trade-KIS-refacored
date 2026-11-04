@@ -19,6 +19,10 @@ from trader.db.schema import schema_for_engine
 import trader.kr.broker_truth_hardening as base
 import trader.kr.broker_truth_final_review_fixes as final
 import trader.kr.broker_truth_historical_buy_retry as historical
+from trader.kr.recovery_scope_20261104 import (
+    resolve_kr_recovery_scope, scoped_portfolio_predicates,
+    order_matches_recovery_scope,
+)
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
@@ -26,6 +30,7 @@ _INSTALLED = False
 
 def _safe_owned_buy_fill_groups(*, engine, env: str, strategy: str) -> dict[str, dict[str, Any]]:
     schema = schema_for_engine(engine)
+    scope = resolve_kr_recovery_scope(engine=engine, env=env)
     with engine.connect() as conn:
         order_ids = [
             value
@@ -49,6 +54,10 @@ def _safe_owned_buy_fill_groups(*, engine, env: str, strategy: str) -> dict[str,
                         schema.orders.c.strategy == strategy,
                         schema.orders.c.side == "BUY",
                         schema.portfolio_epochs.c.status == "ACTIVE",
+                        *(scoped_portfolio_predicates(schema, scope) if scope else ()),
+                        *((schema.orders.c.trading_epoch_id == scope.trading_epoch_id,
+                           schema.fills.c.trading_epoch_id == scope.trading_epoch_id)
+                          if scope else ()),
                     )
                 )
                 .distinct()
@@ -64,6 +73,11 @@ def _safe_owned_buy_fill_groups(*, engine, env: str, strategy: str) -> dict[str,
             if not order:
                 continue
             order = dict(order)
+            if not order_matches_recovery_scope(
+                conn=conn, schema=schema, order=order,
+                strategy=strategy, scope=scope,
+            ):
+                continue
             cycle = order.get("position_cycle_id")
             epoch = order.get("portfolio_epoch_id")
             code = base._normalize_code(order.get("code"))
@@ -80,6 +94,8 @@ def _safe_owned_buy_fill_groups(*, engine, env: str, strategy: str) -> dict[str,
                             schema.positions.c.code == code,
                             schema.positions.c.position_cycle_id == cycle,
                             schema.positions.c.portfolio_epoch_id == epoch,
+                            *((schema.positions.c.trading_epoch_id == scope.trading_epoch_id,)
+                              if scope else ()),
                         )
                     )
                 ).mappings().all()
@@ -116,6 +132,15 @@ def _safe_owned_buy_fill_groups(*, engine, env: str, strategy: str) -> dict[str,
                     .order_by(schema.fills.c.filled_at.asc())
                 ).mappings().all()
             ]
+            if scope and any(
+                str(fill.get("trading_epoch_id") or "") != scope.trading_epoch_id
+                for fill in fills
+            ):
+                logger.error(
+                    "[KR_BROKER_TRUTH][HIST_BUY_RETRY][BLOCK] order_id=%s "
+                    "reason=FILL_EPOCH_UNPROVEN", raw_order_id,
+                )
+                continue
             if fills:
                 groups[str(raw_order_id)] = {"order": order, "fills": fills}
     return groups
