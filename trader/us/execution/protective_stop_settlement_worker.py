@@ -191,7 +191,9 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                 continue
             orders=conn.execute(text("""
                 SELECT DISTINCT o.trade_date,o.symbol,o.order_no,
-                       o.qty_requested,o.qty_filled,o.env,o.trading_epoch_id
+                       o.qty_requested,o.qty_filled,o.env,o.trading_epoch_id,
+                       o.meta->>'stop_type' AS stop_type,
+                       o.meta->>'profit_capture_stage' AS profit_capture_stage
                 FROM us_orders o
                 JOIN us_execution_claims c
                   ON c.action_key=o.meta->>'execution_action_key'
@@ -257,7 +259,9 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                               "trade_date":str(order["trade_date"]),
                               "status":str(evidence["status"]),
                               "filled_qty":int(evidence["filled_qty"]),
-                              "broker_open_qty":int(evidence["remaining_qty"])})
+                              "broker_open_qty":int(evidence["remaining_qty"]),
+                              "stop_type":str(order.get("stop_type") or ""),
+                              "profit_capture_stage":str(order.get("profit_capture_stage") or "")})
         if not originals:
             blocked+=1
             continue
