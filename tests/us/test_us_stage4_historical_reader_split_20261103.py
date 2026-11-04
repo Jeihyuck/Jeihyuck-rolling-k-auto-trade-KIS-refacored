@@ -429,3 +429,54 @@ def test_expired_historical_book_is_refetched_without_extending_evidence_ttl():
         ("GET_ORDER_BOOK", SOURCE_DATE),
     ]
     reader.snapshot_for_claims([CLAIM])
+
+
+def test_stage4_unverified_replay_reports_exact_failure_class_without_ready(monkeypatch, caplog):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.execution import fills as fill_source
+    from trader.us.db import repos
+    from trader.us.execution import order_journal, reconcile
+    from trader.us.execution import reservation_reconcile_worker as reservation
+    from trader.us.runner import trade_tick_runner as ticks
+
+    monkeypatch.setattr(worker, "_STAGE4_FILL_MEMOS", {})
+    monkeypatch.setattr(
+        fill_source, "get_fills_today",
+        lambda **kw: {"status": "OK", "fills": []},
+    )
+    monkeypatch.setattr(
+        repos, "save_fills_with_result",
+        lambda *a, **kw: {"status": "OK"},
+    )
+    monkeypatch.setattr(
+        order_journal, "replay_order_journal",
+        lambda *a, **kw: {
+            "status": "ERROR", "failed_count": 1,
+            "identity_mismatch_count": 0, "broker_unknown_count": 0,
+            "unresolved_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        reconcile, "reconcile_ack_orders_with_balance",
+        lambda **kw: {"status": "OK", "unresolved_count": 0},
+    )
+    monkeypatch.setattr(
+        reservation, "reconcile_proven_reservations_once",
+        lambda **kw: {"unresolved": 0},
+    )
+    monkeypatch.setattr(
+        ticks, "_mark_trend_stages_from_records",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        ticks, "_mark_soft_stop_stages_from_records",
+        lambda *a, **kw: None,
+    )
+    with pytest.raises(RuntimeError, match="US_STAGE4_BROKER_RECOVERY_NOT_VERIFIED"):
+        worker.run_reconcile_once(
+            provider=object(), trade_date="2026-11-03",
+            session_run_id="offline", writer_generation="g", conn=None,
+            scope={}, historical_provider=object(),
+        )
+    assert "replay_status=ERROR ack_status=OK" in caplog.text
+    assert "action=FAIL_CLOSED" in caplog.text
