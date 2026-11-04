@@ -1207,7 +1207,16 @@ def generate_entry_intents(
                             logger.warning("[US_ENTRY][OPPORTUNITY_WS_MISSING] symbol=%s error=%s",
                                            symbol, type(_ws_exc).__name__)
                     from zoneinfo import ZoneInfo
-                    _op_now = now if now is not None else datetime.now(ZoneInfo("America/New_York"))
+                    # For canonical live practice sessions, evaluate completed
+                    # bars against the current per-symbol observation time,
+                    # never the tick-start timestamp (which may be >120s old).
+                    # Explicit injected now stays deterministic in replay/tests.
+                    _op_now = (
+                        datetime.now(ZoneInfo("America/New_York"))
+                        if _opportunity_mode == "ENFORCE"
+                        and os.getenv("US_ENTRY_OPPORTUNITY_LIVE_CLOCK", "0") == "1"
+                        else (now if now is not None else datetime.now(ZoneInfo("America/New_York")))
+                    )
                     _price_opportunity = evaluate_price_opportunity(
                         style=_family, trade_date=_resolve_us_trade_date(now),
                         now_et=_op_now, verified_bars=_observed_bars,
@@ -1896,8 +1905,11 @@ def generate_entry_intents(
                 from trader.us.entry_timing.opportunity import attach_opportunity_proof
                 attach_opportunity_proof(
                     intent, _price_opportunity, mode=_opportunity_mode,
-                    decision_epoch=(now.timestamp() if now is not None
-                                    else datetime.now().timestamp()),
+                    # The signed TTL starts at the actual verified opportunity
+                    # observation, not at the beginning of a slow tick.
+                    decision_epoch=(_op_now.timestamp() if _opportunity_mode == "ENFORCE"
+                                    else (now.timestamp() if now is not None
+                                          else datetime.now().timestamp())),
                 )
             except (ValueError, TypeError) as _attach_exc:
                 if _opportunity_mode == "ENFORCE":
