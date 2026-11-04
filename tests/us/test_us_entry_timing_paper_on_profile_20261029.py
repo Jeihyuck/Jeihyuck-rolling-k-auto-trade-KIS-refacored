@@ -100,3 +100,24 @@ def test_both_scheduled_wsl_sessions_load_identical_profile():
         assert source.index("source scripts/wsl/us-stage123-paper-defaults.sh") < source.index(
             "source scripts/wsl/us-entry-timing-paper-defaults.sh"
         )
+
+
+def test_live_timing_decisions_use_a_per_symbol_clock_only_in_practice_trade():
+    statement = 'source "$1"; printf "%s\\n" "${US_ENTRY_OPPORTUNITY_LIVE_CLOCK-UNSET}"'
+    base_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "KIS_ENV": "practice", "US_PAPER_TRADING_ENABLED": "1",
+        "DRY_RUN": "0", "US_RUN_MODE": "TRADE",
+    }
+    for overrides, expected in (
+        ({}, "1"),
+        ({"KIS_ENV": "real"}, "UNSET"),
+        ({"DRY_RUN": "1"}, "UNSET"),
+        ({"US_OFFLINE": "1"}, "UNSET"),
+    ):
+        env = {**base_env, **overrides}
+        run = subprocess.run(
+            ["bash", "-c", statement, "bash", str(PROFILE)],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        assert run.stdout.strip().splitlines()[-1] == expected
