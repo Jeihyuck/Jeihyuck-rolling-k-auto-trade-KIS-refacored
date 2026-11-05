@@ -274,9 +274,17 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         and trend.get("daily_history_quality") in {"OK", "DEGRADED_NO_MA200"}
     )
 
-    daily = position.get("v3_completed_daily_bars")
+    # The strategy itself never makes KIS/DB/HTTP calls. Only the PREP
+    # warmer may author the locally verified cache. A position-provided list
+    # is deliberately ignored to prevent an unverified source from claiming
+    # the KIS_DAILY_VERIFIED marker.
+    from trader.us.pb1.v3_atr_readonly_cache import load_verified_kis_daily_cache
+    daily = load_verified_kis_daily_cache(
+        symbol=str(position.get("symbol") or "").upper(),
+        decision_date=decision_date, now=now,
+    )
     atr_evidence = None
-    if isinstance(daily, list):
+    if isinstance(daily, list) and daily:
         atr_evidence = chandelier_from_verified_completed_bars(
             daily, decision_date=decision_date,
             atr_period=int(contract["management"]["runner_exit"]["atr_period"]),
