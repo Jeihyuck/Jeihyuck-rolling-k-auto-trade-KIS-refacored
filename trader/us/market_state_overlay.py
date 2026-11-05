@@ -1137,7 +1137,24 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     stage_target_qty=stage_target_qty, stage_filled_qty=stage_filled_qty,
                 )
                 if qty > 0:
-                    lifecycle = str(p.get("position_lifecycle_id"))
+                    lifecycle = str(
+                        p.get("position_lifecycle_id")
+                        or meta_state.get("position_lifecycle_id")
+                        or ""
+                    ).strip()
+                    # str(None) used to fabricate the literal lifecycle
+                    # "None", silently allowing a PENDING stage (or a
+                    # broker-capable TP intent) on a position without a
+                    # proven original cycle. Do not invent this identity.
+                    if not lifecycle or lifecycle.upper() in {
+                        "NONE", "NULL", "NA", "UNKNOWN",
+                    }:
+                        logger.error(
+                            "[US_PROFIT_CAPTURE][LIFECYCLE_UNVERIFIED] "
+                            "symbol=%s stage=%s action=BLOCK_NO_ORDER",
+                            sym, stage,
+                        )
+                        break
                     base_order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
                     prior_order_keys = list(stage_meta.get(f"{stage}_order_keys") or [])
                     # Historical SQL rows can retain the most recent stage
