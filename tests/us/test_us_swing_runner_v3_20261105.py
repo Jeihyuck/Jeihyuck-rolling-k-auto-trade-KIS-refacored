@@ -127,3 +127,18 @@ def test_v3_position_adapter_blocks_missing_or_conflicting_broker_quantity():
         assert got["reason"] in {
             "V3_BROKER_QUANTITY_UNVERIFIED", "V3_BROKER_QUANTITY_CONFLICT",
         }
+
+
+def test_v3_runner_final_requires_full_orderable_inventory():
+    # Other live SELL reservations must reconcile before a one-time FINAL.
+    for trend in ("EXIT", "TRIM"):
+        decision = sig(
+            current_price=103, trend_state=trend,
+            holding_qty=10, orderable_qty=7,
+        )
+        assert decision["action"] == "HOLD"
+        assert decision["reason"] == "RUNNER_FINAL_RESERVED_INVENTORY_RECONCILE_REQUIRED"
+    # GB1 partial still fits within confirmed orderable inventory.
+    partial = sig(holding_qty=10, orderable_qty=3)
+    assert partial["stage"] == "PROFIT_DEFENSE_PARTIAL"
+    assert partial["qty"] == 3
