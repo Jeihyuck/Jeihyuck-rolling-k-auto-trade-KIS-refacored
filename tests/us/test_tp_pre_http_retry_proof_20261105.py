@@ -53,6 +53,7 @@ def test_old_unknown_attempt_does_not_create_new_r_key():
     state = {
         "meta": {
             "tp1_order_keys": ["old_attempt"],
+            "last_stage": "tp1",
             "last_status": "FAILED",
             "last_evidence_type": "UNVERIFIED",
         },
@@ -66,6 +67,7 @@ def test_proven_pre_http_abort_can_create_new_attempt():
     state = {
         "meta": {
             "tp1_order_keys": ["old_attempt"],
+            "last_stage": "tp1",
             "last_status": "FAILED",
             "last_evidence_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
         },
@@ -76,11 +78,46 @@ def test_proven_pre_http_abort_can_create_new_attempt():
     mark.assert_called_once()
 
 
+def test_broker_confirmed_cancelled_partial_allows_only_remainder():
+    state = {
+        "meta": {
+            "tp1_order_keys": ["old_attempt"],
+            "tp1_qty": 5,
+            "tp1_filled_qty": 2,
+            "last_stage": "tp1",
+            "last_status": "CANCELLED",
+            "last_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        },
+    }
+    out, mark = _evaluate(state)
+    assert len(out) == 1
+    assert out[0]["qty"] == 3
+    assert out[0]["client_order_key"].endswith("_R2")
+    mark.assert_called_once()
+
+
+def test_unverified_cancelled_never_retries():
+    state = {
+        "meta": {
+            "tp1_order_keys": ["old_attempt"],
+            "tp1_qty": 5,
+            "tp1_filled_qty": 2,
+            "last_stage": "tp1",
+            "last_status": "CANCELLED",
+            "last_evidence_type": "UNVERIFIED",
+        },
+    }
+    out, mark = _evaluate(state)
+    assert out == []
+    mark.assert_not_called()
+
+
 def test_ack_with_order_number_blocks_pre_http_retry_even_if_failed_marker():
     state = {
         "tp1_broker_order_no": "0000012345",
         "meta": {
             "tp1_order_keys": ["old_attempt"],
+            "last_stage": "tp1",
             "last_status": "FAILED",
             "last_evidence_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
         },
