@@ -8,7 +8,7 @@ NO = "0000036019"
 def row(*, filled="0", remaining="1", status=None):
     d = {"odno": NO, "pdno": "TMO", "sll_buy_dvsn_cd": "01",
          "ft_ord_qty": "1", "ft_ccld_qty": filled, "nccs_qty": remaining,
-         "ord_dt": "20261030", "ord_tmd": "093010",
+         "ord_dt": "20261030", "ord_tmd": "223010",
          "dmst_ord_dt": "20261030"}
     if status is not None:
         d["ord_sttus"] = status
@@ -59,3 +59,8 @@ def test_missing_raw_remaining_qty_must_not_use_synthetic_open_qty():
     unverified = row(filled="0", remaining="1")
     unverified.pop("nccs_qty")
     assert result([unverified])["classification"] == "UNKNOWN"
+
+def test_impossible_kst_clock_for_us_trade_session_is_unknown():
+    bad = row(filled="1", remaining="0")
+    bad["ord_tmd"] = "093010"  # belongs to preceding US session
+    assert result([bad])["classification"] == "UNKNOWN"
