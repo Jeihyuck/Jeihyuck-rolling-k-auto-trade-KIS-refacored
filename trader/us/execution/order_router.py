@@ -686,6 +686,19 @@ def _semantic_action_instance(
     owner = str(
         intent.get("strategy_owner") or meta.get("strategy_owner") or ""
     ).strip().upper()
+    if side == "SELL" and owner == "US_STANDARD" and action.strip().upper() in {
+        "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+    }:
+        import re
+        from trader.us.entry_exit_contract import US_SWING_V3_CONTRACT_VERSION
+        sha = str(meta.get("source_entry_contract_sha256") or "")
+        if (str(meta.get("source_entry_contract_version") or "")
+                != US_SWING_V3_CONTRACT_VERSION
+                or not re.fullmatch(r"[a-f0-9]{64}", sha)):
+            raise ValueError("US_V3_SEMANTIC_CONTRACT_UNVERIFIED")
+        # Neither price, trade date nor quantity may create a second
+        # discretionary partial/final economic action for this lifecycle.
+        return sha
     if side == "BUY" and owner == "TQQQ_INFINITE":
         if trade_date is None:
             raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
