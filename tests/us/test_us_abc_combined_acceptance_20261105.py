@@ -81,7 +81,9 @@ def test_stage4_worker_ignores_inherited_pin_without_matching_real_head(tmp_path
             trade_date="2026-11-05", expected_sha=expected,
             repo_root=tmp_path,
             git_read=lambda *args: (
-                "dual-agent" if args == ("branch", "--show-current") else other
+                "dual-agent" if args == ("branch", "--show-current")
+                else "" if args and args[0] == "status"
+                else other
             ),
         )
     except RuntimeError as exc:
