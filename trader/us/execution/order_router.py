@@ -2419,22 +2419,31 @@ def route_order(
         # database or rate-limit delays made that TP decision obsolete,
         # abort strictly BEFORE KIS HTTP. The proven-unsent journal/claim
         # release path must complete before a later Tick can re-evaluate.
-        _tp_max_age = max(
-            5.0, min(120.0, float(os.getenv(
-                "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
-            )))
-        )
-        _tp_is_fresh, _tp_reason = _tp_decision_fresh_for_native_http(
-            intent, max_age_sec=_tp_max_age,
-        )
-        if not _tp_is_fresh:
-            logger.warning(
-                "[US_PROFIT_CAPTURE][PRE_HTTP_DECISION_STALE] "
-                "symbol=%s stage=%s reason=%s action=ABORT_NO_POST",
-                symbol_upper, lifecycle_meta.get("profit_capture_stage") or "UNKNOWN",
-                _tp_reason,
+        if (
+            side == "SELL"
+            and str(order_key or "").startswith("US_PC_")
+            and str(lifecycle_meta.get("profit_capture_stage") or "").lower()
+                in {"tp1", "tp2", "tp3"}
+        ):
+            try:
+                _tp_max_age = float(os.getenv(
+                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
+                ))
+                if not (5.0 <= _tp_max_age <= 120.0):
+                    raise ValueError("max age outside safe bound")
+            except (TypeError, ValueError, OverflowError):
+                raise KisUSPreSubmitError("US_TP_DECISION_AGE_CONFIG_INVALID") from None
+            _tp_is_fresh, _tp_reason = _tp_decision_fresh_for_native_http(
+                intent, max_age_sec=_tp_max_age,
             )
-            raise KisUSPreSubmitError(_tp_reason)
+            if not _tp_is_fresh:
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_HTTP_DECISION_STALE] "
+                    "symbol=%s stage=%s reason=%s action=ABORT_NO_POST",
+                    symbol_upper, lifecycle_meta.get("profit_capture_stage") or "UNKNOWN",
+                    _tp_reason,
+                )
+                raise KisUSPreSubmitError(_tp_reason)
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
@@ -2588,6 +2597,7 @@ def route_order(
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
                 "US_TP_DECISION_EXPIRED_BEFORE_HTTP",
                 "US_TP_DECISION_TIME_UNVERIFIED",
+                "US_TP_DECISION_AGE_CONFIG_INVALID",
                 "US_ENTRY_TIMING_POLICY_NOT_APPROVED",
                 "US_ENTRY_TIMING_PROOF_MISSING", "US_ENTRY_TIMING_PROOF_INVALID",
                 "US_ENTRY_TIMING_BINDING_INVALID",
