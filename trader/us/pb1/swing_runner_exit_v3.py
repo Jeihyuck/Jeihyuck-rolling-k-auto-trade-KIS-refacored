@@ -121,9 +121,19 @@ def evaluate_v3_runner(
     ep, high, px = _positive(entry_price), _positive(verified_high), _positive(current_price)
     if ep is None or high is None or px is None or not high_verified or high < ep:
         return hold("LIFECYCLE_PRICE_EVIDENCE_UNVERIFIED")
-    try:
-        held, available = int(holding_qty), int(orderable_qty)
-    except (ValueError, TypeError):
+    # Broker quantities must be exact nonnegative integral observations.
+    # int(2.9), int(True), and int("2.0") silently invent orderable shares.
+    def exact_share_count(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        return None
+
+    held, available = exact_share_count(holding_qty), exact_share_count(orderable_qty)
+    if held is None or available is None or available > held:
         return hold("HOLDING_QTY_UNVERIFIED")
     if held <= 0 or available <= 0:
         return hold("NO_VERIFIED_ORDERABLE_QTY")
@@ -237,10 +247,20 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         orderable_raw = position.get("sellable_qty")
     if holding_raw is None or orderable_raw is None:
         return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_UNVERIFIED"}
-    try:
-        holding = int(holding_raw)
-        orderable = int(orderable_raw)
-    except (TypeError, ValueError, OverflowError):
+    # Do not coerce fractional, floating-point, or boolean broker balances
+    # to whole shares. This runs before both signal and native order routing.
+    def exact_qty(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        return None
+
+    holding = exact_qty(holding_raw)
+    orderable = exact_qty(orderable_raw)
+    if holding is None or orderable is None:
         return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_UNVERIFIED"}
     if holding < 0 or orderable < 0 or orderable > holding:
         return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_CONFLICT"}
