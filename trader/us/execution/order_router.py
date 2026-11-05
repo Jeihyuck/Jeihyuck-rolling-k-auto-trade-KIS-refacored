@@ -1583,6 +1583,15 @@ def route_order(
 
     account_env = _kis_env()
     logger.info("[US_ORDER][BROKER_ENV] env=%s symbol=%s side=%s", account_env, symbol, side)
+    if side == "SELL" and str(intent.get("exit_type") or "") in {
+        "swing_giveback_partial_v3", "swing_runner_final_v3",
+    } and account_env != "practice":
+        logger.error(
+            "[US_ORDER][V3][BLOCK] symbol=%s reason=V3_PRACTICE_ONLY",
+            symbol_upper,
+        )
+        return {"status": "ORDER_DISABLED_V3_PRACTICE_ONLY",
+                "broker_submit": False, "intent": intent}
 
     if side == "BUY":
         tick_key = _cash_tick_key(trade_date, intent)
