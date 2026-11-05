@@ -125,3 +125,47 @@ def test_ack_with_order_number_blocks_pre_http_retry_even_if_failed_marker():
     out, mark = _evaluate(state)
     assert out == []
     mark.assert_not_called()
+
+def test_real_router_ack_persists_exact_tp_lifecycle_not_done():
+    from trader.us.runner.trade_tick_runner import persist_profit_capture_ack_from_route
+    intent = {
+        "symbol": "HCA", "side": "SELL", "qty": 5, "notional_usd": 550,
+        "client_order_key": "US_PC_2026-11-05_HCA_cycle-hca-1_TAKE_PROFIT_TP1",
+        "position_lifecycle_id": "cycle-hca-1",
+        "meta": {"profit_capture_stage": "tp1"},
+    }
+    with patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+        assert persist_profit_capture_ack_from_route(
+            intent, {"status": "ACK", "ack": {"ODNO": "0000099999"}}, DATE,
+        )
+    mark.assert_called_once()
+    assert mark.call_args.kwargs["position_lifecycle_id"] == "cycle-hca-1"
+    assert mark.call_args.kwargs["broker_order_no"] == "0000099999"
+    assert mark.call_args.kwargs["status"] == "ACK"
+
+
+def test_dry_run_never_persists_phantom_tp_ack_or_pending():
+    from trader.us.runner.trade_tick_runner import persist_profit_capture_ack_from_route
+    intent = {
+        "symbol": "HCA", "side": "SELL", "qty": 5,
+        "client_order_key": "dry-run", "position_lifecycle_id": "cycle-hca-1",
+        "meta": {"profit_capture_stage": "tp1"},
+    }
+    with patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+        assert not persist_profit_capture_ack_from_route(
+            intent, {"status": "DRY_RUN"}, DATE,
+        )
+    mark.assert_not_called()
+
+
+def test_ack_missing_lifecycle_is_not_written_under_legacy_or_empty_identity():
+    from trader.us.runner.trade_tick_runner import persist_profit_capture_ack_from_route
+    intent = {
+        "symbol": "HCA", "side": "SELL",
+        "client_order_key": "unknown", "meta": {"profit_capture_stage": "tp1"},
+    }
+    with patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+        assert not persist_profit_capture_ack_from_route(
+            intent, {"status": "ACK", "ack": {"ODNO": "9999"}}, DATE,
+        )
+    mark.assert_not_called()
