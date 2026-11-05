@@ -159,9 +159,20 @@ def evaluate_v3_runner(
     )
     for triggered, reason in is_final:
         if triggered:
+            # R1-R4 are complete Runner liquidation intents, not ordinary
+            # partial sells. If another broker order reserves inventory,
+            # sending only the currently orderable subset and persisting
+            # RUNNER_FINAL as done could strand the rest of the position.
+            # Keep the original order/claim fenced until reconciled.
+            if available < held:
+                return hold(
+                    "RUNNER_FINAL_RESERVED_INVENTORY_RECONCILE_REQUIRED",
+                    confirmed_holding_qty=held, orderable_qty=available,
+                    **evidence,
+                )
             return {"action": "SELL", "stage": V3_FINAL,
                     "exit_type": "swing_runner_final_v3",
-                    "qty": min(held, available), "reason": reason, **evidence}
+                    "qty": held, "reason": reason, **evidence}
     if partial_active != "NOT_TRIGGERED":
         return hold("PARTIAL_STAGE_ALREADY_ACTIVE_OR_UNVERIFIED", **evidence)
     if held <= 1:
