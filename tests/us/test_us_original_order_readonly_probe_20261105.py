@@ -64,3 +64,7 @@ def test_impossible_kst_clock_for_us_trade_session_is_unknown():
     bad = row(filled="1", remaining="0")
     bad["ord_tmd"] = "093010"  # belongs to preceding US session
     assert result([bad])["classification"] == "UNKNOWN"
+
+
+def test_blank_original_order_number_remains_unknown():
+    assert classify_original_order([row()], order_no='', symbol='TMO', expected_qty=1, trade_date=DATE)['classification'] == 'UNKNOWN'
