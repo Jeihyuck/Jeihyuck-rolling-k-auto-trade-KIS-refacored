@@ -21,7 +21,7 @@ def frozen_v3(monkeypatch):
 
 def test_v3_does_not_fall_back_to_old_profit_protect(monkeypatch):
     contract = frozen_v3(monkeypatch)
-    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 10,
+    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 10, "orderable_qty": 10,
            "entry_price": 100, "max_price": 120,
            "position_lifecycle_id": "life-123", "entry_exit_contract": contract}
     monkeypatch.setattr(
@@ -35,7 +35,7 @@ def test_v3_does_not_fall_back_to_old_profit_protect(monkeypatch):
 
 def test_v3_partial_uses_signed_semantic_lifecycle(monkeypatch):
     contract = frozen_v3(monkeypatch)
-    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 10,
+    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 10, "orderable_qty": 10,
            "entry_price": 100, "max_price": 110,
            "position_lifecycle_id": "life-123", "entry_exit_contract": contract}
     monkeypatch.setattr(
@@ -73,9 +73,9 @@ def test_v3_partial_uses_signed_semantic_lifecycle(monkeypatch):
 
 def test_final_preempts_profit_capture_without_changing_legacy_priority():
     tp = {"symbol": "SPY", "side": "SELL", "qty": 2, "reason": "TAKE_PROFIT_TP3"}
-    full = {"symbol": "SPY", "side": "SELL", "qty": 8,
+    full = {"symbol": "SPY", "side": "SELL", "qty": 8, "orderable_qty": 8,
             "exit_type": "swing_runner_final_v3", "reason": "R4"}
-    hard = {"symbol": "SPY", "side": "SELL", "qty": 10,
+    hard = {"symbol": "SPY", "side": "SELL", "qty": 10, "orderable_qty": 10,
             "exit_type": "hard_stop_loss", "reason": "hard_stop_loss"}
     assert merge_exit_intents_by_symbol([tp, full])[0]["exit_type"] == "swing_runner_final_v3"
     assert merge_exit_intents_by_symbol([tp, full, hard])[0]["exit_type"] == "hard_stop_loss"
@@ -83,7 +83,7 @@ def test_final_preempts_profit_capture_without_changing_legacy_priority():
 
 def test_v3_completed_partial_blocks_later_legacy_trend_trim(monkeypatch):
     contract = frozen_v3(monkeypatch)
-    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 8,
+    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 8, "orderable_qty": 8,
            "entry_price": 100, "max_price": 110,
            "position_lifecycle_id": "life-123", "entry_exit_contract": contract,
            "trend": {"trend_state": "TRIM", "lifecycle_id": "life-123"}}
@@ -102,7 +102,7 @@ def test_v3_completed_partial_blocks_later_legacy_trend_trim(monkeypatch):
 
 def test_v3_completed_partial_does_not_block_mandatory_full_trend_exit(monkeypatch):
     contract = frozen_v3(monkeypatch)
-    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 8,
+    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 8, "orderable_qty": 8,
            "entry_price": 100, "max_price": 110,
            "position_lifecycle_id": "life-123", "entry_exit_contract": contract,
            "trend": {"trend_state": "EXIT", "lifecycle_id": "life-123"}}
@@ -132,3 +132,54 @@ def test_v3_completed_partial_does_not_block_mandatory_full_trend_exit(monkeypat
     )
     x = engine.evaluate_exit(pos, 108, include_trend_time=True)
     assert x and x["exit_type"] == "trend_deterioration_exit" and x["qty"] == 8
+
+
+@pytest.mark.parametrize("orderable", [0, None, -1, 11, "NaN", "2.5", True])
+def test_v3_common_exit_engine_does_not_invent_orderable_inventory(monkeypatch, orderable):
+    contract = frozen_v3(monkeypatch)
+    pos = {
+        "symbol": "SPY", "exchange": "AMEX", "qty": 10,
+        "entry_price": 100, "max_price": 110,
+        "position_lifecycle_id": "life-123", "entry_exit_contract": contract,
+    }
+    if orderable is not None:
+        pos["orderable_qty"] = orderable
+    monkeypatch.setattr(
+        "trader.us.pb1.swing_runner_exit_v3.evaluate_v3_from_position",
+        lambda **_kwargs: pytest.fail("No v3 evaluation may occur without broker available shares"),
+    )
+    assert engine.evaluate_exit(
+        pos, current_price=108, include_trend_time=False,
+    ) is None
+
+
+def test_v3_common_exit_engine_respects_verified_broker_orderable_cap(monkeypatch):
+    contract = frozen_v3(monkeypatch)
+    pos = {
+        "symbol": "SPY", "exchange": "AMEX", "qty": 10,
+        "orderable_qty": 3, "entry_price": 100, "max_price": 110,
+        "position_lifecycle_id": "life-123", "entry_exit_contract": contract,
+    }
+    monkeypatch.setattr(
+        "trader.us.pb1.swing_runner_exit_v3.evaluate_v3_from_position",
+        lambda **_kwargs: {
+            "action": "SELL", "stage": "PROFIT_DEFENSE_PARTIAL",
+            "qty": 5, "exit_type": "swing_giveback_partial_v3",
+            "reason": "GB1_PROFIT_GIVEBACK",
+        },
+    )
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        engine, "_make_exit_intent",
+        lambda **kwargs: {
+            "side": "SELL", "qty": kwargs["qty"],
+            "exit_type": kwargs["exit_type"], "meta": kwargs.get("meta_extra", {}),
+        },
+    )
+    result = engine.evaluate_exit(
+        pos, current_price=108, include_trend_time=False,
+    )
+    assert result and result["qty"] == 3
