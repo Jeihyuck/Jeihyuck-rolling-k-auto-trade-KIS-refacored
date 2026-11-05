@@ -71,3 +71,118 @@ def test_runner_allows_comments_before_safe_sql():
     sql = "-- this migration is safe\nCREATE TABLE IF NOT EXISTS test_example (id int);"
     statements = split_postgres_sql(sql)
     assert_no_migration_transaction_control(statements, version="test.sql")
+
+
+@pytest.mark.parametrize("preapplied_schema_without_stamp", [False, True])
+def test_0062_real_postgres_clean_and_orphaned_stamp(
+    tmp_path, preapplied_schema_without_stamp
+):
+    """Run only against GitHub CI's disposable local PostgreSQL instance.
+
+    Never mutate the production database. A separate temporary database is
+    created and destroyed within the CI PostgreSQL 16 service.
+    """
+    import os
+    import shutil
+    import uuid
+
+    import sqlalchemy as sa
+    from sqlalchemy.engine import make_url
+
+    from trader.db.migrate import run_migrations
+
+    test_url = os.getenv("PBCORE_TEST_POSTGRES_URL")
+    if not test_url:
+        pytest.skip("requires CI's PBCORE_TEST_POSTGRES_URL")
+
+    admin_url = make_url(test_url)
+    if admin_url.host not in {"localhost", "127.0.0.1"} or admin_url.database != "kr_ci":
+        pytest.skip("refuse to create a database except on isolated localhost kr_ci")
+
+    name = "nullim_migration_0062_" + uuid.uuid4().hex[:12]
+    admin = sa.create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    temp_db = None
+    created = False
+    try:
+        with admin.connect() as conn:
+            conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
+        created = True
+        temp_db = sa.create_engine(admin_url.set(database=name))
+
+        # Minimal canonical tables required by the US schema-only migration.
+        schema = [
+            "CREATE TABLE public.us_orders (id integer PRIMARY KEY, trade_date date, order_no text, env text, trading_epoch_id text)",
+            "CREATE TABLE public.us_order_intents (id integer PRIMARY KEY)",
+            "CREATE TABLE public.us_order_events (id integer PRIMARY KEY)",
+            "CREATE TABLE public.us_fills (id integer PRIMARY KEY, trade_date date, symbol text, side text, order_no text, client_order_key text, qty integer, price_usd numeric, trading_epoch_id text)",
+            "CREATE TABLE public.us_positions (id integer PRIMARY KEY)",
+            "CREATE TABLE public.us_position_risk_state (id integer PRIMARY KEY)",
+            "CREATE TABLE public.us_execution_claims (id integer PRIMARY KEY, env text, account_id text, trading_epoch_id text, action_key text)",
+            "CREATE TABLE public.us_protective_stop_obligations (id integer PRIMARY KEY, env text, account_id text, trading_epoch_id text)",
+            "CREATE TABLE public.portfolio_epochs (id integer PRIMARY KEY, env text, account_id text, trading_epoch_id text, strategy text, status text, sid integer, mode integer)",
+        ]
+        with temp_db.begin() as conn:
+            for statement in schema:
+                conn.exec_driver_sql(statement)
+            conn.exec_driver_sql(
+                "INSERT INTO public.us_orders "
+                "(id, trade_date, order_no, env, trading_epoch_id) "
+                "VALUES (1, '2026-11-04', '00000042', 'practice', 'legacy-epoch')"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO public.us_fills "
+                "(id, trade_date, symbol, side, order_no, client_order_key, qty, price_usd, trading_epoch_id) "
+                "VALUES (1, '2026-11-04', 'AAPL', 'BUY', '00000042', 'legacy-key', 1, 125, 'legacy-epoch')"
+            )
+
+        if preapplied_schema_without_stamp:
+            # Recreate the exact structural split observed in production:
+            # all DDL present, but schema_migrations lacks version 0062.
+            with temp_db.begin() as conn:
+                for statement in split_postgres_sql(MIGRATION.read_text()):
+                    conn.exec_driver_sql(statement)
+
+        isolated_dir = tmp_path / "migrations"
+        isolated_dir.mkdir()
+        shutil.copyfile(MIGRATION, isolated_dir / MIGRATION.name)
+
+        run_migrations(temp_db, migrations_dir=str(isolated_dir))
+        with temp_db.connect() as conn:
+            versions = conn.execute(sa.text(
+                "SELECT version FROM public.schema_migrations WHERE version = :version"
+            ), {"version": MIGRATION.name}).all()
+            assert len(versions) == 1
+
+            idx = {row[0] for row in conn.execute(sa.text(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+            )).all()}
+            assert "uq_us_orders_broker_account_epoch_day_0062" in idx
+            assert "uq_us_fills_broker_account_epoch_0062" in idx
+            assert "uq_us_portfolio_epoch_owner_0062" in idx
+
+            claim = conn.execute(sa.text(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conname = 'ck_us_order_scope_complete_0062'"
+            )).scalar_one()
+            assert claim == "ck_us_order_scope_complete_0062"
+            assert conn.execute(sa.text("SELECT count(*) FROM public.us_orders")).scalar_one() == 1
+            assert conn.execute(sa.text("SELECT count(*) FROM public.us_fills")).scalar_one() == 1
+
+        # Force an actual replay check (bypassing only the process-local
+        # optimization) while retaining the successfully stamped schema.
+        from trader.db.migrate import _MIGRATION_GUARD
+        key = f"{temp_db.url!s}|{isolated_dir.resolve()}"
+        _MIGRATION_GUARD.discard(key)
+        run_migrations(temp_db, migrations_dir=str(isolated_dir))
+        with temp_db.connect() as conn:
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM schema_migrations WHERE version=:version"
+            ), {"version": MIGRATION.name}).scalar_one() == 1
+            assert conn.execute(sa.text("SELECT count(*) FROM public.us_orders")).scalar_one() == 1
+    finally:
+        if temp_db is not None:
+            temp_db.dispose()
+        if created:
+            with admin.connect() as conn:
+                conn.exec_driver_sql(f'DROP DATABASE "{name}" WITH (FORCE)')
+        admin.dispose()
