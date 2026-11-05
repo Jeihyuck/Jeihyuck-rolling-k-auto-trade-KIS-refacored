@@ -1412,6 +1412,62 @@ def persist_profit_capture_ack_from_route(intent: dict, result: dict, trade_date
     return True
 
 
+def release_proven_tp_pre_submit_block(
+    intent: dict, result: dict, trade_date: str,
+) -> bool:
+    """Release only an exact TP stage proven never to have reached broker HTTP.
+
+    A router-level safety flag is necessary but not sufficient: the durable
+    stage row must still be locked/verified against the exact client key.
+    Unknown submissions, active claims and failed DB updates stay fenced.
+    """
+    if (str(result.get("status") or "").upper() != "BLOCKED"
+            or result.get("pre_submit_tp_block") is not True
+            or result.get("safe_to_release_tp_pending") is not True):
+        return False
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    stage = str(meta.get("profit_capture_stage") or "").lower()
+    lifecycle = str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or "").strip()
+    key = str(intent.get("client_order_key") or "").strip()
+    if (stage not in {"tp1", "tp2", "tp3"} or not lifecycle
+            or not key or not str(trade_date or "").strip()):
+        logger.error(
+            "[US_PROFIT_CAPTURE][PRE_SUBMIT_RELEASE_IDENTITY_MISSING] "
+            "symbol=%s stage=%s action=RECONCILE_REQUIRED",
+            intent.get("symbol"), stage,
+        )
+        return False
+    try:
+        from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+        released = release_us_profit_capture_pre_http_abort(
+            trade_date=str(trade_date),
+            symbol=str(intent.get("symbol") or ""),
+            stage=stage,
+            position_lifecycle_id=lifecycle,
+            client_order_key=key,
+        )
+    except Exception as exc:
+        logger.error(
+            "[US_PROFIT_CAPTURE][PRE_SUBMIT_RELEASE_FAILED] "
+            "symbol=%s stage=%s error_type=%s action=RECONCILE_REQUIRED",
+            intent.get("symbol"), stage, type(exc).__name__,
+        )
+        return False
+    if not released:
+        logger.error(
+            "[US_PROFIT_CAPTURE][PRE_SUBMIT_RELEASE_UNVERIFIED] "
+            "symbol=%s stage=%s action=RECONCILE_REQUIRED",
+            intent.get("symbol"), stage,
+        )
+        return False
+    logger.info(
+        "[US_PROFIT_CAPTURE][PRE_SUBMIT_RELEASE_PROVEN] "
+        "symbol=%s stage=%s action=REEVALUATE_NEXT_TICK",
+        intent.get("symbol"), stage,
+    )
+    return True
+
+
 def _profit_capture_router_status(result: dict) -> str:
     """Map broker routing truth into the TP pending state without fail-open.
 
@@ -1589,16 +1645,31 @@ def route_exit_orders_immediately(
                 # A generic BLOCKED is not proof that this stage has no
                 # broker-open attempt. Only a positively verified pre-submit
                 # block may release this attempt's pending reservation.
-                mapped_status = _profit_capture_router_status(result)
-                sync_profit_capture_stage_from_order(
-                    trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
-                    symbol=str(intent.get("symbol") or ""),
-                    position_lifecycle_id=str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
-                    client_order_key=str(intent.get("client_order_key") or ""),
-                    broker_order_no=result.get("order_no"), profit_capture_stage=stage,
-                    order_status=mapped_status, evidence_type=None, filled_qty=0,
-                    requested_qty=int(intent.get("qty") or 0),
+                routed_trade_date = str(intent.get("trade_date") or getattr(context, "trade_date", ""))
+                pre_submit_tp_block = (
+                    str(result.get("status") or "").upper() == "BLOCKED"
+                    and result.get("pre_submit_tp_block") is True
                 )
+                released = (
+                    release_proven_tp_pre_submit_block(intent, result, routed_trade_date)
+                    if pre_submit_tp_block else False
+                )
+                if not released:
+                    # A safety flag without successful exact-row release is
+                    # NOT proof that PENDING was released. Preserve the fence.
+                    mapped_status = (
+                        "AMBIGUOUS_ACK" if pre_submit_tp_block
+                        else _profit_capture_router_status(result)
+                    )
+                    sync_profit_capture_stage_from_order(
+                        trade_date=routed_trade_date,
+                        symbol=str(intent.get("symbol") or ""),
+                        position_lifecycle_id=str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+                        client_order_key=str(intent.get("client_order_key") or ""),
+                        broker_order_no=result.get("order_no"), profit_capture_stage=stage,
+                        order_status=mapped_status, evidence_type=None, filled_qty=0,
+                        requested_qty=int(intent.get("qty") or 0),
+                    )
             action = "ROUTED" if status in {"ACK", "DRY_RUN", "SIGNAL_ONLY"} else ("DEDUP" if "DUPLICATE" in status else "BLOCKED" if "BLOCK" in status else "SKIPPED")
             decision = {"symbol": str(intent.get("symbol") or "").upper(), "side": "SELL", "qty": int(intent.get("qty") or intent.get("quantity") or 0),
                         "reason": (intent.get("meta") or {}).get("reason") or intent.get("reason") or intent.get("exit_type") or "",
