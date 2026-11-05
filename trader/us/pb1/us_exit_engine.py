@@ -1425,12 +1425,18 @@ def _evaluate_exit_intents_from_snapshots(
                     provenance = contract.get("entry_provenance") or {}
                     intent["source_entry_contract_sha256"] = contract.get("sha256")
                     intent["source_entry_reason"] = provenance.get("entry_reason")
-                    intent["exit_rule_source"] = "ENTRY_EXIT_CONTRACT_V2"
+                    intent["exit_rule_source"] = (
+                        "ENTRY_EXIT_CONTRACT_V3" if contract.get("version") == "us_entry_exit_contract_v3"
+                        else "ENTRY_EXIT_CONTRACT_V2"
+                    )
                     intent.setdefault("meta", {}).update({
                         "source_entry_contract_sha256": contract.get("sha256"),
                         "source_entry_contract_version": contract.get("version"),
                         "source_entry_reason": provenance.get("entry_reason"),
-                        "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2",
+                        "exit_rule_source": (
+                            "ENTRY_EXIT_CONTRACT_V3" if contract.get("version") == "us_entry_exit_contract_v3"
+                            else "ENTRY_EXIT_CONTRACT_V2"
+                        ),
                     })
             except Exception as exc:
                 logger.warning("[US_EXIT][ENTRY_CONTRACT][AUDIT_WARN] symbol=%s err=%s", symbol, exc)
