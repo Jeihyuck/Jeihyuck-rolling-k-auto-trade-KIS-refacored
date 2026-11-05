@@ -75,6 +75,10 @@ _SOFT_EXIT_TYPES: frozenset[str] = frozenset({
     "day_profit_take",
     "day_trailing",
     "day_close_flatten",
+    # Frozen v3 discretionary actions remain subject to 390-minute
+    # SWING_BOOK min-hold and normal market-session gates.
+    "swing_giveback_partial_v3",
+    "swing_runner_final_v3",
 })
 
 # hard exit: 손실 방어/위험 off — 당일이어도 항상 허용

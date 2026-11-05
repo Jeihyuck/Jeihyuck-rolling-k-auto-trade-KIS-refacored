@@ -1524,3 +1524,56 @@ def test_protective_sell_tick_to_native_http_metric_includes_pre_route_time(
     assert samples[attempt] >= 1200
     assert context.metrics["sell_tick_to_broker_boundary_ms"] == samples[attempt]
     assert claims.health()["unresolved_execution_actions"] == 1
+
+
+def test_v3_signed_partial_claim_fences_repeated_crossday_broker_submission(monkeypatch):
+    """Mock KIS submit reaches ACK only once for the frozen v3 stage/lifecycle."""
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.execution import order_router
+
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "V3_ACTIVE_PRACTICE")
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "1")
+    frozen = build_us_entry_exit_contract({
+        "symbol": "SPY", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    })
+    assert frozen["version"] == "us_entry_exit_contract_v3"
+    _engine, claim_repo, broker = _route_fixture(
+        monkeypatch, production_identity=True,
+    )
+    monkeypatch.setattr(
+        order_router, "_get_broker_position",
+        lambda *_a, **_kw: {"qty": 10, "holding_qty": 10, "orderable_qty": 10},
+    )
+    def intent(td, key):
+        value = _intent(
+            td, qty=5, action="PROFIT_DEFENSE_PARTIAL",
+            client_order_key=key, side="SELL",
+        )
+        value.update({
+            "symbol": "SPY", "qty": 5, "available_qty": 5,
+            "holding_qty": 10, "orderable_qty": 10, "sellable_qty": 10,
+            "exit_type": "swing_giveback_partial_v3",
+            "partial_exit_allowed": True,
+            "limit_price": 108, "notional_usd": 540,
+        })
+        value["meta"].update({
+            "semantic_action": "PROFIT_DEFENSE_PARTIAL",
+            "source_entry_contract_sha256": frozen["sha256"],
+            "source_entry_contract_version": frozen["version"],
+            "v3_signed_entry_contract": frozen,
+            "partial_exit_allowed": True,
+            "holding_qty": 10, "orderable_qty": 10,
+        })
+        return value
+
+    first = route_order(intent("2026-11-05", "v3-first"), kis_client=broker)
+    assert first["status"] == "ACK"
+    assert broker.calls == 1
+
+    second = route_order(intent("2026-11-06", "v3-repeat"), kis_client=broker)
+    assert second["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert broker.calls == 1
+    assert claim_repo.health()["unresolved_execution_actions"] == 1

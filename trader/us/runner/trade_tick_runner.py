@@ -1305,6 +1305,10 @@ def _exit_family(intent: dict) -> str:
             return "SOFT_STOP"
         if token in {"DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM", "DEFENSE_TRIM"}:
             return "DEFENSE_TRIM"
+        if token == "SWING_RUNNER_FINAL_V3":
+            return "RUNNER_FINAL"
+        if token == "SWING_GIVEBACK_PARTIAL_V3":
+            return "PROFIT_DEFENSE_PARTIAL"
         if token.startswith("TIME_STOP"):
             return "TIME_STOP"
         if token in {"TREND_TRIM", "TREND_DETERIORATION"} or token.startswith("TREND_"):
@@ -1316,8 +1320,11 @@ def _exit_family(intent: dict) -> str:
 
 def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) -> list[dict]:
     """Select one deterministic SELL per symbol while retaining absorbed reasons."""
-    priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TIME_STOP": 3,
-                "TREND_TRIM": 3, "TAKE_PROFIT": 4}
+    # Preserve every v2 relative priority. Runner FINAL preempts normal
+    # trend/TP, while v3 discretionary partial never outranks risk defense.
+    priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2,
+                "RUNNER_FINAL": 2.5, "TIME_STOP": 3, "TREND_TRIM": 3,
+                "PROFIT_DEFENSE_PARTIAL": 3.5, "TAKE_PROFIT": 4}
     grouped: dict[str, list[tuple[int, dict]]] = {}
     passthrough: list[dict] = []
     for index, intent in enumerate(exit_intents or []):

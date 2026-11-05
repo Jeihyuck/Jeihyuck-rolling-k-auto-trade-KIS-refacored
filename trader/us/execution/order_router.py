@@ -747,6 +747,26 @@ def _semantic_action_instance(
     owner = str(
         intent.get("strategy_owner") or meta.get("strategy_owner") or ""
     ).strip().upper()
+    if side == "SELL" and owner == "US_STANDARD" and action.strip().upper() in {
+        "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+    }:
+        import re
+        from trader.us.entry_exit_contract import (
+            US_SWING_V3_CONTRACT_VERSION, verify_us_entry_exit_contract,
+        )
+        sha = str(meta.get("source_entry_contract_sha256") or "")
+        signed = meta.get("v3_signed_entry_contract")
+        if (str(meta.get("source_entry_contract_version") or "")
+                != US_SWING_V3_CONTRACT_VERSION
+                or not isinstance(signed, dict)
+                or signed.get("version") != US_SWING_V3_CONTRACT_VERSION
+                or signed.get("sha256") != sha
+                or not verify_us_entry_exit_contract(signed)
+                or not re.fullmatch(r"[a-f0-9]{64}", sha)):
+            raise ValueError("US_V3_SEMANTIC_CONTRACT_UNVERIFIED")
+        # Neither price, trade date nor quantity may create a second
+        # discretionary partial/final economic action for this lifecycle.
+        return sha
     if side == "BUY" and owner == "TQQQ_INFINITE":
         if trade_date is None:
             raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
@@ -1624,6 +1644,16 @@ def route_order(
 
     account_env = _kis_env()
     logger.info("[US_ORDER][BROKER_ENV] env=%s symbol=%s side=%s", account_env, symbol, side)
+    if side == "SELL" and str(intent.get("exit_type") or "") in {
+        "swing_giveback_partial_v3", "swing_runner_final_v3",
+    } and account_env != "practice":
+        logger.error(
+            "[US_ORDER][V3][BLOCK] symbol=%s reason=V3_PRACTICE_ONLY",
+            symbol_upper,
+        )
+        return {"status": "ORDER_DISABLED_V3_PRACTICE_ONLY",
+                "broker_submit": False, "intent": intent}
+
 
     if side == "BUY":
         tick_key = _cash_tick_key(trade_date, intent)
