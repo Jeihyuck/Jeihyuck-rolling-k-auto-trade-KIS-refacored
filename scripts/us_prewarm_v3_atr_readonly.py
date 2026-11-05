@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from datetime import date
 
@@ -27,8 +28,14 @@ def _positions_from_complete_practice_balance(payload: dict) -> list[tuple[str, 
         symbol = str(row.get("ovrs_pdno") or row.get("pdno") or "").upper().strip()
         exch = _EXCHANGES.get(str(row.get("ovrs_excg_cd") or "").upper().strip())
         try:
-            count = float(row.get("ovrs_cblc_qty") or row.get("holding_qty") or row.get("qty") or 0)
-        except (TypeError, ValueError):
+            raw_count = next((row[k] for k in ("ovrs_cblc_qty", "holding_qty", "qty")
+                              if k in row and row[k] is not None), None)
+            if raw_count is None or isinstance(raw_count, bool):
+                raise ValueError("missing or boolean quantity")
+            count = float(raw_count)
+            if not math.isfinite(count) or count < 0 or not count.is_integer():
+                raise ValueError("nonfinite or fractional quantity")
+        except (TypeError, ValueError, OverflowError):
             raise RuntimeError("US_V3_ATR_BALANCE_QTY_UNVERIFIED") from None
         if count <= 0:
             continue
