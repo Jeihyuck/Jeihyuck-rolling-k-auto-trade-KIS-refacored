@@ -29,6 +29,8 @@ def classify_original_order(rows: list[dict], *, order_no: str, symbol: str,
     if not isinstance(rows, list) or expected_qty <= 0:
         return result
     expected_order = normalize_us_order_no(order_no)
+    if not expected_order or not str(symbol or "").strip() or not str(trade_date or "").strip():
+        return result
     matched = []
     for raw in rows:
         if not isinstance(raw, dict):
