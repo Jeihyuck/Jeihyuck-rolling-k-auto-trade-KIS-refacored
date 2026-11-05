@@ -3,7 +3,8 @@
 -- SCHEMA-ONLY. Historical rows remain NULL/UNKNOWN, never inferred or
 -- rebound to today's account, portfolio or position. Install before US WSL
 -- enforcement, and separately authorize each owner portfolio epoch.
-BEGIN;
+-- Transaction ownership belongs to trader.db.migrate.run_migrations
+-- (engine.begin + per-statement SAVEPOINT); never BEGIN/COMMIT inside a migration.
 
 ALTER TABLE public.us_orders ADD COLUMN IF NOT EXISTS account_id text;
 ALTER TABLE public.us_orders ADD COLUMN IF NOT EXISTS portfolio_epoch_id text;
@@ -125,4 +126,3 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_us_portfolio_epoch_owner_0062
   WHERE status='ACTIVE' AND sid=0 AND mode=0
     AND strategy IN ('US_STANDARD','TQQQ_INFINITE');
 
-COMMIT;
