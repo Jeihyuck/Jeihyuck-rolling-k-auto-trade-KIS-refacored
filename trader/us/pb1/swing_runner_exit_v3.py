@@ -285,7 +285,25 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         portfolio_epoch_id=portfolio,
         contract_sha=str(contract.get("sha256") or ""),
     )
-    return evaluate_v3_runner(
+    # Legacy trend/time trims are their own durable stages. Within a signed
+    # v3 lifecycle they also consume the discretionary partial budget.
+    # Unknown, pending, and completed legacy partials may not be followed
+    # by a speculative v3 Giveback. Mandatory full exits remain separate.
+    prior_partial = str(stages["PROFIT_DEFENSE_PARTIAL"]).upper()
+    legacy_trim_pending = any(
+        trend.get(f"{name}_pending") is True
+        for name in ("trend_trim", "time_stop_trim")
+    )
+    legacy_trim_done = any(
+        trend.get(f"{name}_done") is True
+        for name in ("trend_trim", "time_stop_trim")
+    )
+    if prior_partial == "NOT_TRIGGERED":
+        if legacy_trim_pending:
+            stages["PROFIT_DEFENSE_PARTIAL"] = "ACTIVE_ORDER"
+        elif legacy_trim_done:
+            stages["PROFIT_DEFENSE_PARTIAL"] = "DONE"
+    decision = evaluate_v3_runner(
         entry_price=entry or 0, verified_high=float(high_record.get("high_watermark") or 0),
         current_price=current_price, holding_qty=holding, orderable_qty=orderable,
         trend_state=trend.get("trend_state") or "UNKNOWN",
@@ -295,3 +313,7 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         final_stage_status=stages["RUNNER_FINAL"],
         policy=dict(contract.get("management", {}).get("runner_exit") or {}),
     )
+    # Keep this diagnostic out of the order intent until the router selects
+    # this exact proposal; do not invent a second action on an unready stage.
+    decision["partial_budget_state"] = stages["PROFIT_DEFENSE_PARTIAL"]
+    return decision
