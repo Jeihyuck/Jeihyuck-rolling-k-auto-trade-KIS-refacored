@@ -244,35 +244,50 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_UNVERIFIED"}
     if holding < 0 or orderable < 0 or orderable > holding:
         return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_CONFLICT"}
-    # The resolver exposes this only after exact account/epoch/lifecycle
-    # DB matching. Do not use fallback_current_or_entry or position_field.
-    high_record = life if (
-        life.get("high_watermark_source") == "us_position_risk_state"
-    ) else position
-    observed = high_record.get("high_watermark_at")
-    recorded_lifecycle = str(
-        high_record.get("lifecycle_id") or high_record.get("high_watermark_lifecycle_id") or ""
-    )
-    high_proof = bool(
-        lid and recorded_lifecycle == lid
-        and high_record.get("high_watermark_source") == "us_position_risk_state"
-        and observed
-    )
-    try:
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
-        at = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
-        high_proof = high_proof and at.tzinfo is not None and at <= now
-    except (TypeError, ValueError):
-        high_proof = False
-    trend = position.get("trend") if isinstance(position.get("trend"), dict) else {}
+    # Resolver-restored HWM or the successfully committed HWM writer result
+    # can be newer than the risk snapshot loaded earlier in this very Tick.
+    # Read the latest *matching* lifecycle observation, never a fallback high.
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    def verified_high(candidate: dict) -> tuple[datetime, float] | None:
+        cid = str(candidate.get("lifecycle_id") or candidate.get("high_watermark_lifecycle_id") or "")
+        if (not lid or cid != lid
+                or candidate.get("high_watermark_source") != "us_position_risk_state"):
+            return None
+        value = _positive(candidate.get("high_watermark"))
+        if value is None:
+            return None
+        try:
+            at = datetime.fromisoformat(str(candidate.get("high_watermark_at") or "").replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        if at.tzinfo is None or at > now:
+            return None
+        return at, value
+
+    proofs = [proof for proof in (
+        verified_high(life), verified_high(position),
+    ) if proof is not None]
+    high_proof = bool(proofs)
+    best_high = max(proofs, key=lambda item: item[0])[1] if proofs else 0.0
+    observed = max(proofs, key=lambda item: item[0])[0].isoformat() if proofs else ""
+
     decision_date = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
-    trend_ok = (
-        lid and str(trend.get("lifecycle_id") or "") == lid
-        and trend.get("last_daily_update_trade_date") == decision_date
-        and trend.get("trend_data_quality") == "ok"
-        and trend.get("daily_history_quality") in {"OK", "DEGRADED_NO_MA200"}
-    )
+    def valid_trend(candidate: dict) -> bool:
+        return bool(
+            lid and str(candidate.get("lifecycle_id") or "") == lid
+            and candidate.get("last_daily_update_trade_date") == decision_date
+            and candidate.get("trend_data_quality") == "ok"
+            and candidate.get("daily_history_quality") in {"OK", "DEGRADED_NO_MA200"}
+            and candidate.get("trend_state") in {"HEALTHY", "WARNING", "TRIM", "EXIT"}
+        )
+    # The persisted us_position_risk_state stores the trend inside state.trend.
+    # Position.trend may be absent, so a legitimate TRIM/EXIT must be carried
+    # from its exact-lifecycle, exact-session evidence rather than inferred.
+    top_trend = position.get("trend") if isinstance(position.get("trend"), dict) else {}
+    persisted_trend = risk_state.get("trend") if isinstance(risk_state.get("trend"), dict) else {}
+    trend = top_trend if valid_trend(top_trend) else persisted_trend
+    trend_ok = valid_trend(trend)
 
     # The strategy itself never makes KIS/DB/HTTP calls. Only the PREP
     # warmer may author the locally verified cache. A position-provided list
@@ -323,7 +338,7 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         elif legacy_trim_done:
             stages["PROFIT_DEFENSE_PARTIAL"] = "DONE"
     decision = evaluate_v3_runner(
-        entry_price=entry or 0, verified_high=float(high_record.get("high_watermark") or 0),
+        entry_price=entry or 0, verified_high=best_high,
         current_price=current_price, holding_qty=holding, orderable_qty=orderable,
         trend_state=trend.get("trend_state") or "UNKNOWN",
         trend_verified=bool(trend_ok), high_verified=high_proof,
