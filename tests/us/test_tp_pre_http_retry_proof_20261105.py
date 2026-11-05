@@ -296,3 +296,62 @@ def test_pre_submit_release_refuses_missing_identity_and_unknown_http():
              "safe_to_release_tp_pending": True}, DATE,
         )
         release.assert_not_called()
+
+
+def test_missing_or_synthetic_position_lifecycle_never_creates_tp(monkeypatch):
+    from trader.us.db import repos
+
+    for bad in (None, "", "None", "NA", "UNKNOWN"):
+        candidate = dict(POSITION)
+        candidate["position_lifecycle_id"] = bad
+        with patch(
+            "trader.us.profit_capture.authoritative_broker_avg",
+            return_value=(
+                __import__("decimal").Decimal("100"),
+                {"broker_avg_price_source": "kis_pchs_avg_pric"},
+            ),
+        ), patch.object(repos, "mark_us_profit_capture_stage") as mark:
+            result = build_profit_capture_intents(
+                [candidate], {"profit_capture_enabled": True},
+                now=NOW, trade_date=DATE, profit_capture_state={"HCA": {}},
+            )
+        assert result == []
+        mark.assert_not_called()
+
+
+def test_failed_db_stage_transaction_never_creates_process_local_pending(monkeypatch):
+    import pytest
+    from trader.us.db import repos
+
+    key = (DATE, "HCA", "cycle-hca-1")
+    # Read the user's real state only through a DB transaction; fake the
+    # failure here. No broker or network is invoked.
+    class RejectWriteEngine:
+        def begin(self):
+            raise RuntimeError("simulated db transaction error")
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: RejectWriteEngine())
+    monkeypatch.setattr(repos, "load_us_profit_capture_state", lambda *_a, **_k: {})
+    repos._MEM_PROFIT_CAPTURE_STATE.pop(key, None)
+    with pytest.raises(RuntimeError, match="simulated db"):
+        repos.mark_us_profit_capture_stage(
+            DATE, "HCA", "tp1", position_lifecycle_id="cycle-hca-1",
+            order_key="first-attempt", qty=5, status="PENDING",
+        )
+    assert key not in repos._MEM_PROFIT_CAPTURE_STATE
+
+
+def test_memory_only_tp_stage_backend_remains_available(monkeypatch):
+    from trader.us.db import repos
+
+    key = (DATE, "HCA", "cycle-hca-1")
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "load_us_profit_capture_state", lambda *_a, **_k: {})
+    try:
+        repos.mark_us_profit_capture_stage(
+            DATE, "HCA", "tp1", position_lifecycle_id="cycle-hca-1",
+            order_key="offline-only", qty=5, status="PENDING",
+        )
+        assert repos._MEM_PROFIT_CAPTURE_STATE[key]["tp1_pending"] is True
+    finally:
+        repos._MEM_PROFIT_CAPTURE_STATE.pop(key, None)
