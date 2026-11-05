@@ -290,6 +290,28 @@ def _log_migration_failure_context(engine: Engine, version: str, exc: Exception)
         )
 
 
+def assert_no_migration_transaction_control(statements: list[str], *, version: str) -> None:
+    """The migration runner owns the transaction and all SAVEPOINT lifecycles.
+
+    A SQL file's standalone COMMIT can silently commit preceding schema
+    changes and then invalidate SQLAlchemy's active SAVEPOINT. Validate all
+    statements in a version before executing any of them.
+    """
+    for statement in statements:
+        normalized = _strip_sql_comments(statement)
+        match = re.match(
+            r"^(?:BEGIN|COMMIT|ROLLBACK|START\\s+TRANSACTION|SAVEPOINT|RELEASE\\s+SAVEPOINT)\\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            raise RuntimeError(
+                f"[DB][MIGRATE][TRANSACTION_CONTROL_FORBIDDEN] "
+                f"version={version} command={match.group(0)} "
+                "reason=SQLAlchemy_owns_transaction_and_savepoints"
+            )
+
+
 def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
     cleaned = statement.strip()
     if not cleaned:
@@ -479,8 +501,9 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             sql = path.read_text(encoding="utf-8")
             logger.info("[DB][MIGRATE][APPLY] version=%s", version)
             try:
-                _preflight_version(conn, version)
                 statements = split_postgres_sql(sql)
+                assert_no_migration_transaction_control(statements, version=version)
+                _preflight_version(conn, version)
                 for statement in statements:
                     try:
                         if _statement_mentions_index(statement, _US_FILLS_IDEMPOTENT_INDEX):
