@@ -79,3 +79,56 @@ def test_final_preempts_profit_capture_without_changing_legacy_priority():
             "exit_type": "hard_stop_loss", "reason": "hard_stop_loss"}
     assert merge_exit_intents_by_symbol([tp, full])[0]["exit_type"] == "swing_runner_final_v3"
     assert merge_exit_intents_by_symbol([tp, full, hard])[0]["exit_type"] == "hard_stop_loss"
+
+
+def test_v3_completed_partial_blocks_later_legacy_trend_trim(monkeypatch):
+    contract = frozen_v3(monkeypatch)
+    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 8,
+           "entry_price": 100, "max_price": 110,
+           "position_lifecycle_id": "life-123", "entry_exit_contract": contract,
+           "trend": {"trend_state": "TRIM", "lifecycle_id": "life-123"}}
+    monkeypatch.setattr(
+        "trader.us.pb1.swing_runner_exit_v3.evaluate_v3_from_position",
+        lambda **_kwargs: {"action": "HOLD",
+                           "reason": "PARTIAL_STAGE_ALREADY_ACTIVE_OR_UNVERIFIED",
+                           "partial_budget_state": "DONE"},
+    )
+    monkeypatch.setattr(
+        "trader.us.position_trend_state.choose_trend_time_exit",
+        lambda *_a, **_k: ("trend_deterioration_trim", 3, "trend_trim"),
+    )
+    assert engine.evaluate_exit(pos, 108, include_trend_time=True) is None
+
+
+def test_v3_completed_partial_does_not_block_mandatory_full_trend_exit(monkeypatch):
+    contract = frozen_v3(monkeypatch)
+    pos = {"symbol": "SPY", "exchange": "AMEX", "qty": 8,
+           "entry_price": 100, "max_price": 110,
+           "position_lifecycle_id": "life-123", "entry_exit_contract": contract,
+           "trend": {"trend_state": "EXIT", "lifecycle_id": "life-123"}}
+    monkeypatch.setattr(
+        "trader.us.pb1.swing_runner_exit_v3.evaluate_v3_from_position",
+        lambda **_kwargs: {"action": "HOLD",
+                           "reason": "V3_RUNNER_HOLD",
+                           "partial_budget_state": "DONE"},
+    )
+    monkeypatch.setattr(
+        "trader.us.position_trend_state.choose_trend_time_exit",
+        lambda *_a, **_k: ("trend_deterioration_exit", 8, "trend_exit"),
+    )
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        engine, "_make_exit_intent",
+        lambda **kwargs: {"side": "SELL", "qty": kwargs["qty"],
+                           "exit_type": kwargs["exit_type"],
+                           "reason": kwargs["reason"], "meta": kwargs.get("meta_extra", {})},
+    )
+    monkeypatch.setattr(
+        "trader.us.db.repos.mark_us_position_exit_stage",
+        lambda *_a, **_kw: None,
+    )
+    x = engine.evaluate_exit(pos, 108, include_trend_time=True)
+    assert x and x["exit_type"] == "trend_deterioration_exit" and x["qty"] == 8
