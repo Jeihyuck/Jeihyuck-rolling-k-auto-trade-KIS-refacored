@@ -1020,8 +1020,15 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             lifecycle_by_symbol = {_symbol(p): str(p.get("position_lifecycle_id") or "") for p in positions or [] if _symbol(p)}
             profit_capture_state = load_us_profit_capture_state(trade_date, symbols, lifecycle_by_symbol)
         except Exception as exc:
-            logger.warning("[US_PROFIT_CAPTURE][STATE_LOAD_WARN] trade_date=%s err=%s", trade_date, exc)
-            profit_capture_state = {}
+            # An unavailable state store cannot prove that a previous TP
+            # attempt is absent. Creating a fresh stage key here would risk
+            # duplicating an unresolved broker order; never fail open.
+            logger.error(
+                "[US_PROFIT_CAPTURE][STATE_LOAD_FAILED] trade_date=%s "
+                "action=BLOCK_NO_ORDER error_type=%s",
+                trade_date, type(exc).__name__,
+            )
+            return []
     if profit_capture_state is None:
         profit_capture_state = {}
     runner_min = _env_float("US_RUNNER_MIN_REMAIN_PCT", 0.40)
@@ -1133,6 +1140,25 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     lifecycle = str(p.get("position_lifecycle_id"))
                     base_order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
                     prior_order_keys = list(stage_meta.get(f"{stage}_order_keys") or [])
+                    # Historical SQL rows can retain the most recent stage
+                    # order/ACK identity even when the JSON attempt list is
+                    # absent or incomplete. Never mistake that for a first TP.
+                    durable_stage_key = str(
+                        state.get(f"{stage}_order_key")
+                        or stage_meta.get(f"{stage}_order_key") or ""
+                    ).strip()
+                    durable_broker_no = str(
+                        state.get(f"{stage}_broker_order_no")
+                        or stage_meta.get(f"{stage}_broker_order_no") or ""
+                    ).strip()
+                    if ((durable_stage_key and durable_stage_key not in prior_order_keys)
+                            or (durable_broker_no and not prior_order_keys)):
+                        logger.error(
+                            "[US_PROFIT_CAPTURE][ATTEMPT_LINEAGE_INCOMPLETE] "
+                            "symbol=%s stage=%s action=BLOCK_RECONCILE_REQUIRED",
+                            sym, stage,
+                        )
+                        break
                     # A prior key alone cannot authorize another HTTP attempt.
                     # A broker-confirmed terminal CANCELLED/REJECTED/EXPIRED
                     # is different from an unknown ACK or a local failure:
