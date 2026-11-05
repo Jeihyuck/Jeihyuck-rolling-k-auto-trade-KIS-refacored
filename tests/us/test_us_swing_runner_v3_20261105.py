@@ -78,3 +78,52 @@ def test_outstanding_partial_blocks_discretionary_final_until_reconciled():
         assert result["action"] == "HOLD"
         assert "RECONCILE" in result["reason"]
     assert sig(current_price=103, trend_state="EXIT", partial_stage_status="DONE")["stage"] == "RUNNER_FINAL"
+
+
+def test_v3_position_adapter_preserves_explicit_zero_broker_orderable(monkeypatch):
+    # A reservation can reduce orderable to zero even when holding is 10.
+    from datetime import datetime, timezone
+    from trader.us.pb1 import swing_runner_exit_v3 as module
+    stages = {"PROFIT_DEFENSE_PARTIAL": "NOT_TRIGGERED",
+              "RUNNER_FINAL": "NOT_TRIGGERED"}
+    monkeypatch.setattr(
+        "trader.us.execution.v3_stage_truth.read_v3_lifecycle_stage_states",
+        lambda **kwargs: stages,
+    )
+    seen = {}
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return {"action": "HOLD", "reason": "NO_VERIFIED_ORDERABLE_QTY"}
+    monkeypatch.setattr(module, "evaluate_v3_runner", capture)
+    got = module.evaluate_v3_from_position(
+        position={"symbol": "SPY", "qty": 10, "holding_qty": 10,
+                  "orderable_qty": 0, "entry_price": 100},
+        current_price=110,
+        now=datetime(2026, 11, 5, 15, tzinfo=timezone.utc),
+        contract={"sha256": "a" * 64,
+                  "management": {"runner_exit": V3_RUNNER_POLICY}},
+    )
+    assert got["action"] == "HOLD"
+    assert seen["holding_qty"] == 10
+    assert seen["orderable_qty"] == 0
+
+
+def test_v3_position_adapter_blocks_missing_or_conflicting_broker_quantity():
+    from datetime import datetime, timezone
+    from trader.us.pb1.swing_runner_exit_v3 import evaluate_v3_from_position
+    now = datetime(2026, 11, 5, 15, tzinfo=timezone.utc)
+    contract = {"sha256": "a" * 64,
+                "management": {"runner_exit": V3_RUNNER_POLICY}}
+    for position in (
+        {"qty": 10, "entry_price": 100},
+        {"qty": 10, "orderable_qty": -1, "entry_price": 100},
+        {"qty": 10, "orderable_qty": 11, "entry_price": 100},
+    ):
+        got = evaluate_v3_from_position(
+            position=position, current_price=110, now=now,
+            contract=contract,
+        )
+        assert got["action"] == "HOLD"
+        assert got["reason"] in {
+            "V3_BROKER_QUANTITY_UNVERIFIED", "V3_BROKER_QUANTITY_CONFLICT",
+        }
