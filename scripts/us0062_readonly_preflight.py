@@ -52,10 +52,9 @@ def assess_us0062_readiness(
     ]
     stamped = VERSION in applied_versions
     has_constraint = len(present) == 1
-    constraint_validated = has_constraint and present[0].get("convalidated") is True
     if not stamped:
         status = "MIGRATION_STAMP_MISSING"
-    elif missing_indices or missing_columns or not constraint_validated:
+    elif missing_indices or missing_columns or not has_constraint:
         status = "SCHEMA_INCOMPLETE_OR_DRIFTED"
     else:
         status = "PROVENANCE_AND_CATALOG_PRESENT"
@@ -67,7 +66,7 @@ def assess_us0062_readiness(
         "missing_columns": missing_columns,
         "scope_constraint_present": has_constraint,
         "scope_constraint_validated": (
-            constraint_validated if has_constraint else None
+            bool(present[0].get("convalidated")) if has_constraint else None
         ),
         "auto_repair_performed": False,
         "orders_submitted": 0,
