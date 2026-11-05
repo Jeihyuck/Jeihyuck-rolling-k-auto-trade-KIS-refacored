@@ -1371,6 +1371,46 @@ def merge_exit_intents_by_symbol(exit_intents: list[dict], *, on_selected=None) 
     return passthrough + merged
 
 
+def persist_profit_capture_ack_from_route(intent: dict, result: dict, trade_date: str) -> bool:
+    """Record a real KIS TP ACK with exact position lifecycle identity.
+
+    A dry-run must not create phantom pending, and ACK is not a Fill/DONE.
+    Caller preserves broker-side reconciliation authority on write failures.
+    """
+    stage = str((intent.get("meta") or {}).get("profit_capture_stage") or "").lower()
+    if (str(result.get("status") or "").upper() != "ACK"
+            or str(intent.get("side") or "").upper() != "SELL"
+            or stage not in {"tp1", "tp2", "tp3"}):
+        return False
+    lifecycle = str(
+        intent.get("position_lifecycle_id")
+        or (intent.get("meta") or {}).get("position_lifecycle_id") or ""
+    ).strip()
+    order_key = str(intent.get("client_order_key") or intent.get("order_key") or "").strip()
+    if not lifecycle or not order_key or not str(trade_date or "").strip():
+        logger.error(
+            "[US_PROFIT_CAPTURE][ACK_IDENTITY_MISSING] symbol=%s stage=%s "
+            "action=RECONCILE_REQUIRED",
+            intent.get("symbol"), stage,
+        )
+        return False
+    ack = result.get("ack") if isinstance(result.get("ack"), dict) else {}
+    broker_order_no = (
+        result.get("broker_order_no") or ack.get("raw_broker_order_no")
+        or ack.get("ODNO") or ack.get("odno") or None
+    )
+    from trader.us.db.repos import mark_us_profit_capture_stage
+    mark_us_profit_capture_stage(
+        trade_date, str(intent.get("symbol") or ""), stage,
+        order_key=order_key, position_lifecycle_id=lifecycle,
+        broker_order_no=broker_order_no,
+        qty=int(intent.get("qty") or intent.get("quantity") or 0),
+        notional_usd=float(intent.get("notional_usd") or 0.0),
+        status="ACK",
+    )
+    return True
+
+
 def _profit_capture_router_status(result: dict) -> str:
     """Map broker routing truth into the TP pending state without fail-open.
 
@@ -4403,20 +4443,19 @@ def run_trade_tick(
                 entry_degraded_reason = system_invariant_failure
                 break
             if result["status"] in ("DRY_RUN", "ACK"):
-                if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("profit_capture_stage") or ""):
+                # Only a real broker ACK may advance a durable TP stage.
+                # DRY_RUN has no KIS submission and must not create PENDING.
+                if (result["status"] == "ACK"
+                        and str(intent.get("side") or "").upper() == "SELL"
+                        and str((intent.get("meta") or {}).get("profit_capture_stage") or "")):
                     try:
-                        from trader.us.db.repos import mark_us_profit_capture_stage
-                        mark_us_profit_capture_stage(
-                            trade_date,
-                            str(intent.get("symbol") or ""),
-                            str((intent.get("meta") or {}).get("profit_capture_stage")),
-                            order_key=str(intent.get("client_order_key") or intent.get("order_key") or "") or None,
-                            qty=int(intent.get("qty") or intent.get("quantity") or 0),
-                            notional_usd=float(intent.get("notional_usd") or 0.0),
-                            status="ACK" if result["status"] == "ACK" else "PENDING",
-                        )
+                        persist_profit_capture_ack_from_route(intent, result, trade_date)
                     except Exception as _pc_ack_exc:
-                        logger.warning("[US_PROFIT_CAPTURE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _pc_ack_exc)
+                        logger.error(
+                            "[US_PROFIT_CAPTURE][ACK_MARK_FAILED] symbol=%s "
+                            "action=RECONCILE_REQUIRED err_type=%s",
+                            intent.get("symbol"), type(_pc_ack_exc).__name__,
+                        )
                 if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("trend_stage") or ""):
                     try:
                         from trader.us.db.repos import mark_us_position_exit_stage
