@@ -239,8 +239,8 @@ class HistoricalReadOnlyReader:
         load_debt_dates: Callable[..., set[str]] = _debt_order_source_dates,
         load_scope: Callable[[], dict] | None = None,
         clock: Callable[[], float] = time.monotonic,
-        poll_sec: float = 2.0, ttl_sec: float = 15.0,
-        max_dates: int = 4,
+        poll_sec: float = 1.0, ttl_sec: float = 15.0,
+        max_dates: int = 8,
     ):
         if (scope.get("env") != "practice"
                 or not scope.get("account_id")
@@ -266,7 +266,11 @@ class HistoricalReadOnlyReader:
         self.clock = clock
         self.poll_sec = max(1.0, float(poll_sec))
         self.ttl_sec = max(1.0, min(float(ttl_sec), 20.0))
-        self.max_dates = max(1, min(4, int(max_dates)))
+        # Historical active claims can span four original dates while
+        # pending protective-stop obligations add separate source dates.
+        # Permit at most eight read-only dates; preserve the 15s freshness
+        # fence and fail closed if KIS GET latency cannot keep all books fresh.
+        self.max_dates = max(1, min(8, int(max_dates)))
         self._lock = threading.Lock()
         self._books: dict[str, dict] = {}
         self._balance: dict | None = None
