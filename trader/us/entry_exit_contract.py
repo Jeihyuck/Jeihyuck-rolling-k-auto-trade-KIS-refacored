@@ -12,6 +12,8 @@ import os
 from typing import Any
 
 US_ENTRY_EXIT_CONTRACT_VERSION = "us_entry_exit_contract_v2"
+US_SWING_V3_CONTRACT_VERSION = "us_entry_exit_contract_v3"
+
 
 _PROVENANCE_FIELDS = (
     "entry_reason", "entry_style_selected", "entry_style_raw", "entry_component", "entry_signal_type",
@@ -115,18 +117,45 @@ def _sha(payload: dict) -> str:
 def verify_us_entry_exit_contract(contract: Any) -> bool:
     data = _dict(contract)
     digest = str(data.pop("sha256", "") or "")
-    return bool(
+    version = data.get("version")
+    if version not in {US_ENTRY_EXIT_CONTRACT_VERSION, US_SWING_V3_CONTRACT_VERSION}:
+        return False
+    management = data.get("management")
+    if not (
         digest
-        and data.get("version") == US_ENTRY_EXIT_CONTRACT_VERSION
         and data.get("strategy_owner") == "US_STANDARD"
-        and isinstance(data.get("management"), dict)
+        and isinstance(management, dict)
         and isinstance(data.get("entry_provenance"), dict)
         and digest == _sha(data)
-    )
+    ):
+        return False
+    if version == US_SWING_V3_CONTRACT_VERSION:
+        from trader.us.pb1.swing_runner_exit_v3 import V3_RUNNER_POLICY
+        tp = (management.get("profit_capture") or {}).get("stages") or []
+        expected = (
+            ("TAKE_PROFIT_TP1", .03, .25),
+            ("TAKE_PROFIT_TP2", .05, .25),
+            ("TAKE_PROFIT_TP3", .08, .20),
+        )
+        if (
+            management.get("book") != "SWING_BOOK"
+            or management.get("horizon") != "SWING_CARRY"
+            or management.get("runner_exit") != V3_RUNNER_POLICY
+            or (management.get("profit_capture") or {}).get("runner_min_remain_pct") != .40
+            or len(tp) != 3
+            or any(
+                not isinstance(row, dict)
+                or (row.get("reason"), row.get("threshold_fraction"),
+                    row.get("sell_fraction")) != target
+                for row, target in zip(tp, expected)
+            )
+        ):
+            return False
+    return True
 
 
 def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
-    """Return NONE, VALID, or INVALID for an explicitly claimed v2 contract."""
+    """Return NONE, VALID, or INVALID for claimed v2/v3 contracts."""
     foreign_owner = _is_infinite_sleeve_context(*sources)
     claimed = False
     for source in sources:
@@ -136,7 +165,7 @@ def us_entry_exit_contract_integrity_state(*sources: Any) -> str:
             candidate = container.get("entry_exit_contract")
             version = str(container.get("entry_exit_contract_version") or "")
             digest = str(container.get("entry_exit_contract_sha256") or "")
-            if candidate is not None or version == US_ENTRY_EXIT_CONTRACT_VERSION or digest:
+            if candidate is not None or version in {US_ENTRY_EXIT_CONTRACT_VERSION, US_SWING_V3_CONTRACT_VERSION} or digest:
                 claimed = True
                 parsed = _dict(candidate)
                 if parsed and verify_us_entry_exit_contract(parsed):
@@ -194,6 +223,17 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
     provenance["entry_reason"] = entry_reason
     provenance["reasons"] = reasons
 
+    # Explicitly approved NEW_POSITION_BUY only. A held v2 lifecycle is
+    # returned unchanged above, and SHADOW mode never changes buy contracts.
+    v3_enabled = (
+        os.getenv("US_SWING_EXIT_MODE", "LEGACY_V2") == "V3_ACTIVE_PRACTICE"
+        and os.getenv("US_SWING_V3_DEPLOY_APPROVED", "0") == "1"
+        and os.getenv("KIS_ENV", "").lower() == "practice"
+        and str(merged.get("position_action") or "").upper() == "NEW_POSITION_BUY"
+        and str(merged.get("book") or os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK")) == "SWING_BOOK"
+        and str(merged.get("horizon") or os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY")) == "SWING_CARRY"
+        and str(merged.get("strategy_owner") or "US_STANDARD").upper() == "US_STANDARD"
+    )
     management = {
         "book": str(merged.get("book") or os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK")),
         "horizon": str(merged.get("horizon") or os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY")),
@@ -241,8 +281,23 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
             ],
         },
     }
+    if v3_enabled:
+        from trader.us.pb1.swing_runner_exit_v3 import V3_RUNNER_POLICY
+        management["runner_exit"] = dict(V3_RUNNER_POLICY)
+        management["profit_capture"].update({
+            "enabled": True, "partial_exit_allowed": True,
+            "runner_min_remain_pct": .40,
+            "stages": [
+                {"flag": "tp1_done", "reason": "TAKE_PROFIT_TP1",
+                 "threshold_fraction": .03, "sell_fraction": .25},
+                {"flag": "tp2_done", "reason": "TAKE_PROFIT_TP2",
+                 "threshold_fraction": .05, "sell_fraction": .25},
+                {"flag": "tp3_done", "reason": "TAKE_PROFIT_TP3",
+                 "threshold_fraction": .08, "sell_fraction": .20},
+            ],
+        })
     payload = {
-        "version": US_ENTRY_EXIT_CONTRACT_VERSION,
+        "version": US_SWING_V3_CONTRACT_VERSION if v3_enabled else US_ENTRY_EXIT_CONTRACT_VERSION,
         "strategy_owner": "US_STANDARD",
         "sleeve_id": str(merged.get("sleeve_id") or "US_STANDARD"),
         "entry_strategy": str(merged.get("entry_strategy") or merged.get("strategy") or "us_pb1"),

@@ -415,12 +415,20 @@ def evaluate_exit(
     """
     cfg = _reload_env()
     contract_integrity_state = "NONE"
+    frozen_contract = {}
+    is_v3_contract = False
     try:
         from trader.us.entry_exit_contract import (
             contract_exit_config,
             us_entry_exit_contract_integrity_state,
+            extract_us_entry_exit_contract, US_SWING_V3_CONTRACT_VERSION,
         )
         contract_integrity_state = us_entry_exit_contract_integrity_state(position, position.get("meta"))
+        frozen_contract = extract_us_entry_exit_contract(position, position.get("meta"))
+        is_v3_contract = (
+            contract_integrity_state == "VALID"
+            and frozen_contract.get("version") == US_SWING_V3_CONTRACT_VERSION
+        )
         frozen_cfg = contract_exit_config(position)
         if frozen_cfg:
             cfg = {**cfg, **frozen_cfg}
@@ -510,13 +518,46 @@ def evaluate_exit(
     # ── orderable_qty clamp ──────────────────────────────────────────────────
     # SELL qty는 orderable_qty를 초과할 수 없다. (한국장 qty_to_close 원칙 이식)
     raw_qty = qty
-    orderable_qty = int(
-        position.get("orderable_qty")
-        or position.get("sellable_qty")
-        or position.get("holding_qty")
-        or qty
-    )
-    exit_qty = min(raw_qty, orderable_qty) if orderable_qty > 0 else raw_qty
+    if is_v3_contract:
+        # v3 is a new, explicitly opted-in policy. A KIS orderable_qty of
+        # exactly ZERO means reserved/unavailable shares, NOT a missing
+        # snapshot. Never resurrect the holding quantity via truthy "or".
+        from decimal import Decimal, InvalidOperation
+        _raw_orderable = position.get("orderable_qty")
+        if _raw_orderable is None:
+            _raw_orderable = position.get("sellable_qty")
+        try:
+            _verified_orderable = Decimal(str(_raw_orderable))
+            if (
+                _raw_orderable is None or isinstance(_raw_orderable, bool)
+                or not _verified_orderable.is_finite()
+                or _verified_orderable != _verified_orderable.to_integral_value()
+                or not 0 <= _verified_orderable <= raw_qty
+            ):
+                raise ValueError("unverified orderable quantity")
+            orderable_qty = int(_verified_orderable)
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            logger.error(
+                "[US_EXIT][V3][ORDERABLE_UNVERIFIED] symbol=%s action=HOLD_NO_ORDER",
+                symbol,
+            )
+            return None
+        if orderable_qty == 0:
+            logger.warning(
+                "[US_EXIT][V3][ORDERABLE_ZERO] symbol=%s action=HOLD_NO_ORDER",
+                symbol,
+            )
+            return None
+        exit_qty = min(raw_qty, orderable_qty)
+    else:
+        # Exact legacy v2 behavior remains untouched by this v3 safety fix.
+        orderable_qty = int(
+            position.get("orderable_qty")
+            or position.get("sellable_qty")
+            or position.get("holding_qty")
+            or qty
+        )
+        exit_qty = min(raw_qty, orderable_qty) if orderable_qty > 0 else raw_qty
 
     logger.info(
         "[US_EXIT][SELL_QTY] symbol=%s holding_qty=%d orderable_qty=%d exit_qty=%d",
@@ -662,7 +703,8 @@ def evaluate_exit(
     # ── profit trailing stop: 수익 경험 후에만 활성화 ────────────────────────
     max_unrealized_profit_pct = ((max_price - entry_price) / entry_price) if entry_price > 0 and max_price > 0 else 0.0
     if (
-        max_price > 0
+        not is_v3_contract
+        and max_price > 0
         and max_unrealized_profit_pct >= cfg["trailing_activation_profit"]
         and current_price <= max_price * (1 - cfg["trailing_stop"])
     ):
@@ -721,8 +763,75 @@ def evaluate_exit(
             trail_high_price=max_price,
         )
 
+    # v3 ONLY: replace legacy discretionary profit trailing/protect/giveback.
+    # Hard stop, persistent/confirmed soft stop above remain unchanged.
+    if is_v3_contract:
+        try:
+            from trader.us.pb1.swing_runner_exit_v3 import evaluate_v3_from_position
+            from trader.us.entry_exit_contract import US_SWING_V3_CONTRACT_VERSION
+            _when = now or datetime.now(timezone.utc)
+            _decision = evaluate_v3_from_position(
+                position=position, current_price=current_price,
+                now=_when, contract=frozen_contract,
+            )
+        except Exception as exc:
+            logger.error(
+                "[US_EXIT][V3][DATA_UNVERIFIED] symbol=%s err_type=%s action=HOLD_PROFIT_ONLY",
+                symbol, type(exc).__name__,
+            )
+            _decision = {"action": "HOLD", "reason": "V3_EVALUATION_UNAVAILABLE"}
+        if _decision.get("action") == "SELL":
+            _stage = str(_decision["stage"])
+            _size = min(qty, int(_decision["qty"]))
+            if _size > 0:
+                _meta = {
+                    "semantic_action": _stage,
+                    "exit_stage": _stage,
+                    "source_entry_contract_sha256": frozen_contract["sha256"],
+                    "source_entry_contract_version": US_SWING_V3_CONTRACT_VERSION,
+                    "v3_signed_entry_contract": frozen_contract,
+                    "v3_policy_name": (frozen_contract.get("management") or {}).get("runner_exit", {}).get("name"),
+                    "v3_peak_gain": _decision.get("peak_gain"),
+                    "v3_current_gain": _decision.get("current_gain"),
+                    "v3_giveback_ratio": _decision.get("giveback"),
+                    "v3_atr14": _decision.get("atr14"),
+                    "v3_atr_data_quality": _decision.get("atr_data_quality"),
+                    "v3_atr_source": _decision.get("atr_source"),
+                    "v3_atr_as_of_date": _decision.get("atr_as_of_date"),
+                    "v3_atr_adjustment_basis": _decision.get("atr_adjustment_basis"),
+                    "v3_high_watermark_observed_at": _decision.get("high_watermark_observed_at"),
+                    "v3_trend_verified": _decision.get("trend_verified"),
+                    "v3_chandelier_stop": _decision.get("chandelier_stop"),
+                    "v3_trend_state": _decision.get("trend_state"),
+                    "v3_stage_target_qty": _size,
+                    "v3_original_decision_at": _when.isoformat(),
+                    "partial_exit_scope": _stage if _stage == "PROFIT_DEFENSE_PARTIAL" else None,
+                    "partial_exit_allowed": _stage == "PROFIT_DEFENSE_PARTIAL",
+                }
+                result = _emit_exit(
+                    symbol=symbol, exchange=exchange, qty=_size,
+                    current_price=current_price, entry_price=entry_price,
+                    exit_type=str(_decision["exit_type"]),
+                    reason=str(_decision["reason"]),
+                    unrealized_pnl_usd=(current_price-entry_price)*_size,
+                    pnl_pct=pnl_pct, holding_qty=raw_qty,
+                    orderable_qty=orderable_qty, now=now, trail_high_price=max_price,
+                    meta_extra=_meta,
+                )
+                if result:
+                    result["strategy_owner"] = "US_STANDARD"
+                    result["exit_policy"] = "US_SWING_TP_GB_ATR_RUNNER_V3"
+                    result["semantic_action"] = _stage
+                    result["partial_exit_allowed"] = _stage == "PROFIT_DEFENSE_PARTIAL"
+                    result["meta"]["strategy_owner"] = "US_STANDARD"
+                    return result
+        logger.info(
+            "[US_EXIT][V3][HOLD] symbol=%s reason=%s",
+            symbol, _decision.get("reason"),
+        )
+
     # ── profit protect ────────────────────────────────────────────────────────
-    if pnl_pct >= cfg["profit_protect"]:
+    if not is_v3_contract and pnl_pct >= cfg["profit_protect"]:
         # 수익 보호: 고점 대비 X% 빠지면 청산
         protect_trail = 0.03
         if max_price > 0 and current_price < max_price * (1 - protect_trail):
@@ -739,7 +848,7 @@ def evaluate_exit(
             )
 
     # ── giveback ──────────────────────────────────────────────────────────────
-    if max_price > entry_price:
+    if not is_v3_contract and max_price > entry_price:
         max_gain = (max_price - entry_price) / entry_price
         current_gain = pnl_pct
         if max_gain > 0.05:  # 최소 5% 수익 있을 때만 giveback 적용
@@ -770,6 +879,19 @@ def evaluate_exit(
     except Exception as exc:
         logger.warning("[US_POSITION][TREND_STATE][EXIT_WARN] symbol=%s err=%s", symbol, exc)
         choice = None
+    if choice and is_v3_contract and choice[2] in {"trend_trim", "time_stop_trim"}:
+        # A prior signed v3 Giveback (ACK, unknown, partial or DONE) already
+        # consumes the one discretionary partial budget. A second legacy
+        # trend/time trim would double-sell that same lifecycle. Preserve
+        # hard/persistent soft stops and final trend/time exits above/below.
+        _budget_state = str(_decision.get("partial_budget_state") or "UNKNOWN").upper()
+        if _budget_state != "NOT_TRIGGERED":
+            logger.warning(
+                "[US_EXIT][V3][TRIM_SUPPRESSED] symbol=%s stage=%s "
+                "partial_budget_state=%s action=HOLD_NO_SECOND_PARTIAL",
+                symbol, choice[2], _budget_state,
+            )
+            choice = None
     if choice:
         exit_type, sell_qty, stage = choice
         if stage.startswith("time_stop"):
@@ -1239,6 +1361,11 @@ def prepare_exit_position_snapshots(
                         pos["high_watermark"] = high_state.get("high_watermark")
                         pos["max_price"] = high_state.get("high_watermark")
                         pos["high_watermark_source"] = "us_position_risk_state"
+                        # The persisted high value and its evidence timestamp
+                        # form one indivisible proof. A newer high without its
+                        # timestamp cannot authorize v3 Giveback/R4.
+                        pos["high_watermark_at"] = high_state.get("high_watermark_at")
+                        pos["high_watermark_lifecycle_id"] = high_state.get("lifecycle_id")
                         pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
                 except Exception as exc:
                     logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
@@ -1256,6 +1383,8 @@ def prepare_exit_position_snapshots(
                     "high_watermark": pos.get("high_watermark", original_pos.get("high_watermark")),
                     "max_price": pos.get("max_price", original_pos.get("max_price")),
                     "high_watermark_source": pos.get("high_watermark_source", original_pos.get("high_watermark_source")),
+                    "high_watermark_at": pos.get("high_watermark_at", original_pos.get("high_watermark_at")),
+                    "high_watermark_lifecycle_id": pos.get("high_watermark_lifecycle_id", original_pos.get("high_watermark_lifecycle_id")),
                     "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
                     "resolved_current_price": current_price,
                     "current_price_usd": current_price,
@@ -1355,12 +1484,18 @@ def _evaluate_exit_intents_from_snapshots(
                     provenance = contract.get("entry_provenance") or {}
                     intent["source_entry_contract_sha256"] = contract.get("sha256")
                     intent["source_entry_reason"] = provenance.get("entry_reason")
-                    intent["exit_rule_source"] = "ENTRY_EXIT_CONTRACT_V2"
+                    intent["exit_rule_source"] = (
+                        "ENTRY_EXIT_CONTRACT_V3" if contract.get("version") == "us_entry_exit_contract_v3"
+                        else "ENTRY_EXIT_CONTRACT_V2"
+                    )
                     intent.setdefault("meta", {}).update({
                         "source_entry_contract_sha256": contract.get("sha256"),
                         "source_entry_contract_version": contract.get("version"),
                         "source_entry_reason": provenance.get("entry_reason"),
-                        "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2",
+                        "exit_rule_source": (
+                            "ENTRY_EXIT_CONTRACT_V3" if contract.get("version") == "us_entry_exit_contract_v3"
+                            else "ENTRY_EXIT_CONTRACT_V2"
+                        ),
                     })
             except Exception as exc:
                 logger.warning("[US_EXIT][ENTRY_CONTRACT][AUDIT_WARN] symbol=%s err=%s", symbol, exc)
