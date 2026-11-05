@@ -142,3 +142,28 @@ def test_v3_runner_final_requires_full_orderable_inventory():
     partial = sig(holding_qty=10, orderable_qty=3)
     assert partial["stage"] == "PROFIT_DEFENSE_PARTIAL"
     assert partial["qty"] == 3
+
+
+def test_v3_runner_rejects_nonintegral_or_boolean_broker_inventory():
+    # Never silently truncate a fractional quantity or treat True as one share.
+    for invalid in (2.5, True, False, "2.0", "-1", " 2", 2 + 0j):
+        assert sig(holding_qty=invalid)["action"] == "HOLD"
+        assert sig(orderable_qty=invalid)["action"] == "HOLD"
+    assert sig(holding_qty="10", orderable_qty="10")["qty"] == 5
+    assert sig(holding_qty=10, orderable_qty=11)["action"] == "HOLD"
+
+
+def test_v3_position_adapter_refuses_fractional_or_boolean_broker_inventory():
+    from datetime import datetime, timezone
+    from trader.us.pb1.swing_runner_exit_v3 import evaluate_v3_from_position
+    now = datetime(2026, 11, 5, 15, tzinfo=timezone.utc)
+    contract = {"sha256": "a" * 64, "management": {"runner_exit": V3_RUNNER_POLICY}}
+    for invalid in (3.7, True, False, "3.0", " 3", "-1"):
+        for field in ("qty", "orderable_qty"):
+            position = {"symbol": "SPY", "qty": 10, "orderable_qty": 10, "entry_price": 100}
+            position[field] = invalid
+            result = evaluate_v3_from_position(
+                position=position, current_price=108, now=now, contract=contract,
+            )
+            assert result["action"] == "HOLD"
+            assert result["reason"] == "V3_BROKER_QUANTITY_UNVERIFIED"
