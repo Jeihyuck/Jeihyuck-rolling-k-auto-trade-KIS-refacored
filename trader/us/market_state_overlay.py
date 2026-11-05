@@ -1133,16 +1133,31 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     lifecycle = str(p.get("position_lifecycle_id"))
                     base_order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
                     prior_order_keys = list(stage_meta.get(f"{stage}_order_keys") or [])
-                    # An old stage key is NOT proof that an HTTP attempt never
-                    # occurred. Only the durable, claim-released PRE_HTTP
-                    # abort path may authorize a fresh key for the same stage.
-                    # This prevents blocked/unknown TP intents from growing
-                    # R2..R34 while Stage4 is not ready.
-                    if prior_order_keys and not (
-                        str(stage_meta.get("last_status") or "").upper() == "FAILED"
-                        and str(stage_meta.get("last_evidence_type") or "").upper()
-                            == "BROKER_SUBMIT_ABORTED_PRE_IO"
+                    # A prior key alone cannot authorize another HTTP attempt.
+                    # A broker-confirmed terminal CANCELLED/REJECTED/EXPIRED
+                    # is different from an unknown ACK or a local failure:
+                    # allow only the remaining unfilled target after actual
+                    # terminal evidence. A proven, claim-released pre-HTTP
+                    # abort may also retry. Never infer terminal from time.
+                    last_status = str(stage_meta.get("last_status") or "").upper()
+                    last_evidence = str(stage_meta.get("last_evidence_type") or "").upper()
+                    last_stage = str(stage_meta.get("last_stage") or "").lower()
+                    pre_http_abort = (
+                        last_status == "FAILED"
+                        and last_evidence == "BROKER_SUBMIT_ABORTED_PRE_IO"
                         and not state.get(f"{stage}_broker_order_no")
+                    )
+                    broker_terminal = (
+                        last_status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
+                        and last_evidence in {
+                            "KIS_ORDER_CUMULATIVE_ACTUAL",
+                            "KIS_EXECUTION_ACTUAL",
+                            "KIS_ORDER_STATUS_ACTUAL",
+                        }
+                        and stage_target_qty > stage_filled_qty
+                    )
+                    if prior_order_keys and not (
+                        last_stage == stage and (pre_http_abort or broker_terminal)
                     ):
                         logger.warning(
                             "[US_PROFIT_CAPTURE][RETRY_FENCED] symbol=%s stage=%s "
