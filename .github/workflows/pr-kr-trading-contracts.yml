@@ -83,6 +83,9 @@ jobs:
       - name: KR Oct-13 and Oct-18 offline execution regressions
         run: pytest tests/kr/test_kr_20261013_*.py tests/kr/test_kr_20261018_*.py -q
 
+      - name: KR Nov-05 migration 0062 SAVEPOINT/partial-retry regression
+        run: pytest tests/test_kr_20261105_migration_0062_guard.py -q
+
       - name: Migration 0050 legacy schema hotfix tests
         run: |
           pytest tests/test_migration_0050_legacy_schema.py -q
