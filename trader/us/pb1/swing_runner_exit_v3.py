@@ -283,7 +283,7 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         symbol=str(position.get("symbol") or "").upper(),
         decision_date=decision_date, now=now,
     )
-    atr_evidence = None
+    atr_evidence = {"valid": False, "reason": "KIS_COMPLETED_CACHE_MISSING_OR_STALE"}
     if isinstance(daily, list) and daily:
         atr_evidence = chandelier_from_verified_completed_bars(
             daily, decision_date=decision_date,
@@ -335,4 +335,13 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
     # Keep this diagnostic out of the order intent until the router selects
     # this exact proposal; do not invent a second action on an unready stage.
     decision["partial_budget_state"] = stages["PROFIT_DEFENSE_PARTIAL"]
+    decision["atr_data_quality"] = (
+        "KIS_COMPLETED_VERIFIED" if atr_evidence.get("valid") is True
+        else str(atr_evidence.get("reason") or "ATR_UNVERIFIED")
+    )
+    decision["atr_source"] = atr_evidence.get("source")
+    decision["atr_as_of_date"] = atr_evidence.get("as_of_date")
+    decision["atr_adjustment_basis"] = atr_evidence.get("adjustment_basis")
+    decision["high_watermark_observed_at"] = str(observed or "")
+    decision["trend_verified"] = bool(trend_ok)
     return decision
