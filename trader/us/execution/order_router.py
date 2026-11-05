@@ -344,6 +344,67 @@ def _kis_env() -> str:
     return (os.getenv("KIS_ENV") or "practice").strip().lower() or "practice"
 
 
+def _tp_decision_fresh_for_native_http(
+    intent: dict, *, now_utc=None, max_age_sec: float = 30.0,
+) -> tuple[bool, str]:
+    """Do not POST a queued old TP based on a prior Tick's executable price.
+
+    An expired decision is a *pre-HTTP abort*, not KIS terminal evidence.
+    Only actual US_PC_* stage intents are gated. Stop, re-evaluate price/TP
+    threshold and broker orderable shares at a later fresh Tick; never cancel
+    or replace a KIS OPEN/unknown order on the strength of a timestamp alone.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    side = str(intent.get("side") or "").upper()
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    stage = str(meta.get("profit_capture_stage") or "").lower()
+    key = str(intent.get("client_order_key") or intent.get("order_key") or "")
+    if side != "SELL" or stage not in {"tp1", "tp2", "tp3"} or not key.startswith("US_PC_"):
+        return True, "NOT_NATIVE_PROFIT_CAPTURE_TP"
+    raw = str(meta.get("last_profit_capture_at") or "")
+    try:
+        decision_at = _dt.fromisoformat(raw.replace("Z", "+00:00"))
+        check_at = now_utc or _dt.now(_tz.utc)
+        if decision_at.tzinfo is None or check_at.tzinfo is None:
+            return False, "US_TP_DECISION_TIME_UNVERIFIED"
+        age = (check_at - decision_at).total_seconds()
+        if not (0 <= age <= max(1.0, float(max_age_sec))):
+            return False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP"
+    except (ValueError, TypeError, OverflowError):
+        return False, "US_TP_DECISION_TIME_UNVERIFIED"
+    return True, "US_TP_DECISION_FRESH"
+
+
+def _tp_live_quote_threshold_proven(intent: dict, quote: dict, *, now_epoch: float) -> tuple[bool, str]:
+    """Fail closed unless a recent KIS quote still satisfies the frozen TP threshold."""
+    from decimal import Decimal, InvalidOperation
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if not isinstance(quote, dict) or quote.get("_quote_quality") not in {"FRESH", "FRESH_CACHE"}:
+        return False, "US_TP_LIVE_QUOTE_UNVERIFIED"
+    if quote.get("_quote_source") not in {"KIS_LIVE", "KIS_CACHE"}:
+        return False, "US_TP_LIVE_QUOTE_SOURCE_UNVERIFIED"
+    try:
+        age = now_epoch - float(quote["_quote_asof_epoch"])
+        if not (0 <= age <= 5):
+            return False, "US_TP_LIVE_QUOTE_EXPIRED"
+        output = quote["output"]
+        if not isinstance(output, dict):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        last = Decimal(str(output["last"]))
+        avg = Decimal(str(meta["broker_avg_price"]))
+        threshold = Decimal(str(meta["tp_threshold_fraction"]))
+        limit = Decimal(str(intent["limit_price"]))
+        if not all(v.is_finite() for v in (last, avg, threshold, limit)):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        if min(last, avg, limit) <= 0 or not (Decimal("0") < threshold < Decimal("1")):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        if (last / avg - 1) < threshold or (limit / avg - 1) < threshold:
+            return False, "US_TP_LIVE_THRESHOLD_LOST"
+    except (KeyError, TypeError, ValueError, InvalidOperation, ZeroDivisionError, OverflowError):
+        return False, "US_TP_LIVE_QUOTE_INVALID"
+    return True, "US_TP_LIVE_THRESHOLD_CONFIRMED"
+
+
 def _is_cash_insufficient_reject(msg: str) -> bool:
     text = str(msg or "").lower()
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
@@ -1593,6 +1654,7 @@ def route_order(
         return {"status": "ORDER_DISABLED_V3_PRACTICE_ONLY",
                 "broker_submit": False, "intent": intent}
 
+
     if side == "BUY":
         tick_key = _cash_tick_key(trade_date, intent)
         if tick_key in _CASH_EXHAUSTED_TICKS:
@@ -2413,6 +2475,50 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
                 ) from _final_stage4_exc
+        # Price and stage were evaluated earlier in the Tick. If Stage4,
+        # database or rate-limit delays made that TP decision obsolete,
+        # abort strictly BEFORE KIS HTTP. The proven-unsent journal/claim
+        # release path must complete before a later Tick can re-evaluate.
+        if (
+            side == "SELL"
+            and str(order_key or "").startswith("US_PC_")
+            and str(lifecycle_meta.get("profit_capture_stage") or "").lower()
+                in {"tp1", "tp2", "tp3"}
+        ):
+            try:
+                _tp_max_age = float(os.getenv(
+                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
+                ))
+                if not (5.0 <= _tp_max_age <= 120.0):
+                    raise ValueError("max age outside safe bound")
+            except (TypeError, ValueError, OverflowError):
+                raise KisUSPreSubmitError("US_TP_DECISION_AGE_CONFIG_INVALID") from None
+            _tp_is_fresh, _tp_reason = _tp_decision_fresh_for_native_http(
+                intent, max_age_sec=_tp_max_age,
+            )
+            if not _tp_is_fresh:
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_HTTP_DECISION_STALE] "
+                    "symbol=%s stage=%s reason=%s action=ABORT_NO_POST",
+                    symbol_upper, lifecycle_meta.get("profit_capture_stage") or "UNKNOWN",
+                    _tp_reason,
+                )
+                raise KisUSPreSubmitError(_tp_reason)
+            # A recent decision timestamp is not current executable-price proof.
+            # GET-only KIS quote; no POST if the quote is missing, stale or below TP.
+            try:
+                _tp_quote = kis_client.get_us_price(symbol_upper, exchange)
+                _tp_quote_ok, _tp_quote_reason = _tp_live_quote_threshold_proven(
+                    intent, _tp_quote, now_epoch=time.time(),
+                )
+            except Exception as _tp_quote_exc:
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_HTTP_QUOTE_UNVERIFIED] symbol=%s error=%s",
+                    symbol_upper, type(_tp_quote_exc).__name__,
+                )
+                raise KisUSPreSubmitError("US_TP_LIVE_QUOTE_UNVERIFIED") from _tp_quote_exc
+            if not _tp_quote_ok:
+                raise KisUSPreSubmitError(_tp_quote_reason)
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
@@ -2564,6 +2670,9 @@ def route_order(
                 "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
                 "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
+                "US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+                "US_TP_DECISION_TIME_UNVERIFIED",
+                "US_TP_DECISION_AGE_CONFIG_INVALID",
                 "US_ENTRY_TIMING_POLICY_NOT_APPROVED",
                 "US_ENTRY_TIMING_PROOF_MISSING", "US_ENTRY_TIMING_PROOF_INVALID",
                 "US_ENTRY_TIMING_BINDING_INVALID",
