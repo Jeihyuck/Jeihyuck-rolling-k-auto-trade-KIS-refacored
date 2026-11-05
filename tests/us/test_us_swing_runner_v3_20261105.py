@@ -71,3 +71,10 @@ def test_ratchet_stop_never_looser_when_highs_decline():
     e = chandelier_from_verified_completed_bars(bars, decision_date="2026-10-01")
     assert e["valid"]
     assert e["stop"] >= e["previous_stop"]
+
+def test_outstanding_partial_blocks_discretionary_final_until_reconciled():
+    for active in ("ACKED", "BROKER_UNKNOWN", "BLOCKED"):
+        result = sig(current_price=103, trend_state="EXIT", partial_stage_status=active)
+        assert result["action"] == "HOLD"
+        assert "RECONCILE" in result["reason"]
+    assert sig(current_price=103, trend_state="EXIT", partial_stage_status="DONE")["stage"] == "RUNNER_FINAL"
