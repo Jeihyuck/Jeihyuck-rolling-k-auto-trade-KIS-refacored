@@ -840,6 +840,19 @@ def evaluate_exit(
     except Exception as exc:
         logger.warning("[US_POSITION][TREND_STATE][EXIT_WARN] symbol=%s err=%s", symbol, exc)
         choice = None
+    if choice and is_v3_contract and choice[2] in {"trend_trim", "time_stop_trim"}:
+        # A prior signed v3 Giveback (ACK, unknown, partial or DONE) already
+        # consumes the one discretionary partial budget. A second legacy
+        # trend/time trim would double-sell that same lifecycle. Preserve
+        # hard/persistent soft stops and final trend/time exits above/below.
+        _budget_state = str(_decision.get("partial_budget_state") or "UNKNOWN").upper()
+        if _budget_state != "NOT_TRIGGERED":
+            logger.warning(
+                "[US_EXIT][V3][TRIM_SUPPRESSED] symbol=%s stage=%s "
+                "partial_budget_state=%s action=HOLD_NO_SECOND_PARTIAL",
+                symbol, choice[2], _budget_state,
+            )
+            choice = None
     if choice:
         exit_type, sell_qty, stage = choice
         if stage.startswith("time_stop"):
