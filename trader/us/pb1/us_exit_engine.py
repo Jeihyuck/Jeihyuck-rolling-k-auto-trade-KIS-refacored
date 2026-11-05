@@ -756,6 +756,7 @@ def evaluate_exit(
                     "exit_stage": _stage,
                     "source_entry_contract_sha256": frozen_contract["sha256"],
                     "source_entry_contract_version": US_SWING_V3_CONTRACT_VERSION,
+                    "v3_signed_entry_contract": frozen_contract,
                     "v3_policy_name": (frozen_contract.get("management") or {}).get("runner_exit", {}).get("name"),
                     "v3_peak_gain": _decision.get("peak_gain"),
                     "v3_current_gain": _decision.get("current_gain"),
