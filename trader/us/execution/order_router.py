@@ -690,10 +690,17 @@ def _semantic_action_instance(
         "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
     }:
         import re
-        from trader.us.entry_exit_contract import US_SWING_V3_CONTRACT_VERSION
+        from trader.us.entry_exit_contract import (
+            US_SWING_V3_CONTRACT_VERSION, verify_us_entry_exit_contract,
+        )
         sha = str(meta.get("source_entry_contract_sha256") or "")
+        signed = meta.get("v3_signed_entry_contract")
         if (str(meta.get("source_entry_contract_version") or "")
                 != US_SWING_V3_CONTRACT_VERSION
+                or not isinstance(signed, dict)
+                or signed.get("version") != US_SWING_V3_CONTRACT_VERSION
+                or signed.get("sha256") != sha
+                or not verify_us_entry_exit_contract(signed)
                 or not re.fullmatch(r"[a-f0-9]{64}", sha)):
             raise ValueError("US_V3_SEMANTIC_CONTRACT_UNVERIFIED")
         # Neither price, trade date nor quantity may create a second
