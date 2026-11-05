@@ -49,8 +49,18 @@ def assert_stage4_worker_code_pin(
     try:
         branch = str(run("branch", "--show-current")).strip()
         head = str(run("rev-parse", "HEAD")).strip().lower()
+        # A matching commit SHA is not sufficient if an operator changed a
+        # tracked file or introduced a new runnable Python/script file after
+        # deploy-preflight. Limit checks to executable source paths (exclude
+        # runtime/log caches); never auto-reset or rewrite any source.
+        dirty = str(run(
+            "status", "--porcelain", "--untracked-files=normal", "--",
+            "trader", "scripts", "migrations",
+        )).strip()
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise RuntimeError("US_STAGE4_CODE_PIN_GIT_UNAVAILABLE") from exc
+    if dirty:
+        raise RuntimeError("US_STAGE4_CODE_PIN_WORKTREE_DIRTY")
     if branch != "dual-agent":
         raise RuntimeError("US_STAGE4_CODE_PIN_BRANCH_MISMATCH")
     if head != expected:
