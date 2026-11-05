@@ -215,8 +215,24 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
     cycle = str(position.get("position_cycle_id") or meta.get("position_cycle_id") or life.get("position_cycle_id") or "")
     portfolio = str(position.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or life.get("portfolio_epoch_id") or "")
     entry = _positive(position.get("entry_price") or position.get("avg_price_usd") or position.get("avg_cost"))
-    holding = int(position.get("qty") or position.get("holding_qty") or 0)
-    orderable = int(position.get("orderable_qty") or position.get("sellable_qty") or holding)
+    # Distinguish an explicit KIS zero from a missing field. In particular,
+    # orderable_qty=0 means all inventory is reserved/unavailable; falling
+    # back to holding_qty here would manufacture permission to sell.
+    holding_raw = position.get("qty")
+    if holding_raw is None:
+        holding_raw = position.get("holding_qty")
+    orderable_raw = position.get("orderable_qty")
+    if orderable_raw is None:
+        orderable_raw = position.get("sellable_qty")
+    if holding_raw is None or orderable_raw is None:
+        return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_UNVERIFIED"}
+    try:
+        holding = int(holding_raw)
+        orderable = int(orderable_raw)
+    except (TypeError, ValueError, OverflowError):
+        return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_UNVERIFIED"}
+    if holding < 0 or orderable < 0 or orderable > holding:
+        return {"action": "HOLD", "reason": "V3_BROKER_QUANTITY_CONFLICT"}
     # The resolver exposes this only after exact account/epoch/lifecycle
     # DB matching. Do not use fallback_current_or_entry or position_field.
     high_record = life if (
