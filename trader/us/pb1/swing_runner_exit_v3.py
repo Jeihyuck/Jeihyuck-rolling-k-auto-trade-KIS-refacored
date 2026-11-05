@@ -189,3 +189,80 @@ V3_RUNNER_POLICY = {
     "chandelier_atr_mult": 3.0,
     "chandelier_ratchet": True,
 }
+
+
+def evaluate_v3_from_position(*, position: dict, current_price: float,
+                              now: datetime, contract: dict) -> dict:
+    """Translate the running position snapshot to strict evidence and stage truth.
+
+    No fallback to an unverified max_price, inferred old trade cycle, or DB
+    failure. ATR is accepted only from an explicitly supplied independently
+    verified *completed* daily feed, never unverified price_daily.
+    """
+    from zoneinfo import ZoneInfo
+    from trader.us.execution.v3_stage_truth import read_v3_lifecycle_stage_states
+
+    meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    risk = position.get("risk_state") if isinstance(position.get("risk_state"), dict) else {}
+    risk_state = risk.get("state") if isinstance(risk.get("state"), dict) else {}
+    life = risk_state.get("lifecycle") if isinstance(risk_state.get("lifecycle"), dict) else {}
+    lid = str(position.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or "")
+    cycle = str(position.get("position_cycle_id") or meta.get("position_cycle_id") or life.get("position_cycle_id") or "")
+    portfolio = str(position.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or life.get("portfolio_epoch_id") or "")
+    entry = _positive(position.get("entry_price") or position.get("avg_price_usd") or position.get("avg_cost"))
+    holding = int(position.get("qty") or position.get("holding_qty") or 0)
+    orderable = int(position.get("orderable_qty") or position.get("sellable_qty") or holding)
+    observed = life.get("high_watermark_at")
+    high_proof = bool(
+        lid and str(life.get("lifecycle_id") or "") == lid
+        and life.get("high_watermark_source") == "us_position_risk_state"
+        and observed
+    )
+    try:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        at = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+        high_proof = high_proof and at.tzinfo is not None and at <= now
+    except (TypeError, ValueError):
+        high_proof = False
+    trend = position.get("trend") if isinstance(position.get("trend"), dict) else {}
+    decision_date = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    trend_ok = (
+        lid and str(trend.get("lifecycle_id") or "") == lid
+        and trend.get("last_daily_update_trade_date") == decision_date
+        and trend.get("trend_data_quality") == "ok"
+        and trend.get("daily_history_quality") in {"OK", "DEGRADED_NO_MA200"}
+    )
+
+    daily = position.get("v3_completed_daily_bars")
+    atr_evidence = None
+    if isinstance(daily, list):
+        atr_evidence = chandelier_from_verified_completed_bars(
+            daily, decision_date=decision_date,
+            atr_period=int(contract["management"]["runner_exit"]["atr_period"]),
+            lookback=int(contract["management"]["runner_exit"]["chandelier_lookback"]),
+            multiplier=float(contract["management"]["runner_exit"]["chandelier_atr_mult"]),
+            ratchet=bool(contract["management"]["runner_exit"]["chandelier_ratchet"]),
+        )
+        if atr_evidence.get("valid"):
+            try:
+                from trader.us.market_calendar import previous_completed_us_session
+                if str(atr_evidence["as_of_date"]) != previous_completed_us_session(decision_date).isoformat():
+                    atr_evidence = {"valid": False, "reason": "STALE_COMPLETED_DAILY_BAR"}
+            except Exception:
+                atr_evidence = {"valid": False, "reason": "DAILY_CALENDAR_UNVERIFIED"}
+    stages = read_v3_lifecycle_stage_states(
+        lifecycle_id=lid, position_cycle_id=cycle,
+        portfolio_epoch_id=portfolio,
+        contract_sha=str(contract.get("sha256") or ""),
+    )
+    return evaluate_v3_runner(
+        entry_price=entry or 0, verified_high=float(life.get("high_watermark") or 0),
+        current_price=current_price, holding_qty=holding, orderable_qty=orderable,
+        trend_state=trend.get("trend_state") or "UNKNOWN",
+        trend_verified=bool(trend_ok), high_verified=high_proof,
+        atr_evidence=atr_evidence,
+        partial_stage_status=stages["PROFIT_DEFENSE_PARTIAL"],
+        final_stage_status=stages["RUNNER_FINAL"],
+        policy=dict(contract.get("management", {}).get("runner_exit") or {}),
+    )
