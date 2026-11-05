@@ -169,3 +169,52 @@ def test_ack_missing_lifecycle_is_not_written_under_legacy_or_empty_identity():
             intent, {"status": "ACK", "ack": {"ODNO": "9999"}}, DATE,
         )
     mark.assert_not_called()
+
+
+def test_missing_tp_state_store_is_fail_closed_before_any_stage_write():
+    with patch(
+        "trader.us.db.repos.load_us_profit_capture_state",
+        side_effect=RuntimeError("db unavailable"),
+    ) as load:
+        with patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+            out = build_profit_capture_intents(
+                [dict(POSITION)], {"profit_capture_enabled": True},
+                now=NOW, trade_date=DATE,
+            )
+    assert out == []
+    load.assert_called_once()
+    mark.assert_not_called()
+
+
+def test_durable_order_key_without_attempt_lineage_never_looks_like_first_tp():
+    out, mark = _evaluate({
+        "tp1_order_key": "US_PC_old_TAKE_PROFIT_TP1",
+        "meta": {"last_stage": "tp1", "last_status": "CANCELLED",
+                 "last_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL"},
+    })
+    assert out == []
+    mark.assert_not_called()
+
+
+def test_durable_broker_order_number_without_attempt_lineage_never_reissues():
+    out, mark = _evaluate({
+        "tp1_broker_order_no": "0000036019",
+        "meta": {"last_stage": "tp1", "last_status": "CANCELLED",
+                 "last_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL"},
+    })
+    assert out == []
+    mark.assert_not_called()
+
+
+def test_disagreeing_durable_key_and_attempt_history_needs_reconciliation():
+    out, mark = _evaluate({
+        "tp1_order_key": "unlisted_latest_attempt",
+        "meta": {
+            "tp1_order_keys": ["older_attempt"],
+            "tp1_qty": 5, "tp1_filled_qty": 2,
+            "last_stage": "tp1", "last_status": "CANCELLED",
+            "last_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        },
+    })
+    assert out == []
+    mark.assert_not_called()
