@@ -307,7 +307,7 @@ def test_source_day_limit_fails_closed_without_truncating_old_claims():
         {"trade_date": f"2026-10-{day:02d}",
          "client_order_key": f"key-{day}",
          "active_attempt_id": f"attempt-{day}"}
-        for day in range(20, 25)
+        for day in range(20, 29)  # nine source dates exceed the bounded cap of eight
     ]
     kis = ReadOnlyKIS()
     reader = _reader(kis=kis, active=claims)
