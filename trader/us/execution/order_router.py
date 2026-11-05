@@ -375,6 +375,36 @@ def _tp_decision_fresh_for_native_http(
     return True, "US_TP_DECISION_FRESH"
 
 
+def _tp_live_quote_threshold_proven(intent: dict, quote: dict, *, now_epoch: float) -> tuple[bool, str]:
+    """Fail closed unless a recent KIS quote still satisfies the frozen TP threshold."""
+    from decimal import Decimal, InvalidOperation
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if not isinstance(quote, dict) or quote.get("_quote_quality") not in {"FRESH", "FRESH_CACHE"}:
+        return False, "US_TP_LIVE_QUOTE_UNVERIFIED"
+    if quote.get("_quote_source") not in {"KIS_LIVE", "KIS_CACHE"}:
+        return False, "US_TP_LIVE_QUOTE_SOURCE_UNVERIFIED"
+    try:
+        age = now_epoch - float(quote["_quote_asof_epoch"])
+        if not (0 <= age <= 5):
+            return False, "US_TP_LIVE_QUOTE_EXPIRED"
+        output = quote["output"]
+        if not isinstance(output, dict):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        last = Decimal(str(output["last"]))
+        avg = Decimal(str(meta["broker_avg_price"]))
+        threshold = Decimal(str(meta["tp_threshold_fraction"]))
+        limit = Decimal(str(intent["limit_price"]))
+        if not all(v.is_finite() for v in (last, avg, threshold, limit)):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        if min(last, avg, limit) <= 0 or not (Decimal("0") < threshold < Decimal("1")):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        if (last / avg - 1) < threshold or (limit / avg - 1) < threshold:
+            return False, "US_TP_LIVE_THRESHOLD_LOST"
+    except (KeyError, TypeError, ValueError, InvalidOperation, ZeroDivisionError, OverflowError):
+        return False, "US_TP_LIVE_QUOTE_INVALID"
+    return True, "US_TP_LIVE_THRESHOLD_CONFIRMED"
+
+
 def _is_cash_insufficient_reject(msg: str) -> bool:
     text = str(msg or "").lower()
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
@@ -2444,6 +2474,21 @@ def route_order(
                     _tp_reason,
                 )
                 raise KisUSPreSubmitError(_tp_reason)
+            # A recent decision timestamp is not current executable-price proof.
+            # GET-only KIS quote; no POST if the quote is missing, stale or below TP.
+            try:
+                _tp_quote = kis_client.get_us_price(symbol_upper, exchange)
+                _tp_quote_ok, _tp_quote_reason = _tp_live_quote_threshold_proven(
+                    intent, _tp_quote, now_epoch=time.time(),
+                )
+            except Exception as _tp_quote_exc:
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_HTTP_QUOTE_UNVERIFIED] symbol=%s error=%s",
+                    symbol_upper, type(_tp_quote_exc).__name__,
+                )
+                raise KisUSPreSubmitError("US_TP_LIVE_QUOTE_UNVERIFIED") from _tp_quote_exc
+            if not _tp_quote_ok:
+                raise KisUSPreSubmitError(_tp_quote_reason)
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
