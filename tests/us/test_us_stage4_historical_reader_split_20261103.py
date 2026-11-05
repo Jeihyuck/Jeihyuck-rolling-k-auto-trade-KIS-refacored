@@ -505,3 +505,51 @@ def test_stage4_original_claim_scope_change_invalidates_ready_snapshot(changed):
     evidence = reader.snapshot_for_claims([original])
     with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
         reader.assert_still_valid(evidence, [updated])
+
+
+def test_six_historical_source_dates_prefetch_without_dropping_proof():
+    """Four unresolved claim dates plus two stop-debt dates must remain provable."""
+    clock = [100.0]
+    claims = [
+        {"trade_date": day, "client_order_key": f"orig-{day}",
+         "active_attempt_id": f"attempt-{day}"}
+        for day in ("2026-10-06", "2026-10-12", "2026-10-15", "2026-10-30")
+    ]
+    kis = ReadOnlyKIS(rows=[])
+    reader = _reader(
+        kis=kis, active=claims, debts=[{"symbol": "SYY"}],
+        debt_dates={"2026-11-02", "2026-11-03"},
+        clock=lambda: clock[0],
+    )
+    assert reader.max_dates == 8
+    assert reader.poll_sec == 1.0
+    assert reader.ttl_sec == 15.0
+    for _ in range(7):  # six original-date GETs and one balance GET
+        reader._poll_once(kis)
+        clock[0] += 0.25
+    snapshot = reader.snapshot_for_claims(claims)
+    assert set(snapshot["books"]) == {
+        "2026-10-06", "2026-10-12", "2026-10-15", "2026-10-30",
+        "2026-11-02", "2026-11-03",
+    }
+    assert len([call for call in kis.calls if call[0] == "GET_ORDER_BOOK"]) == 6
+    assert len([call for call in kis.calls if call[0] == "GET_BALANCE"]) == 1
+    reader.assert_still_valid(snapshot, claims)
+    assert reader.provider_for(snapshot).get_balance()["balance_authoritative"] is True
+    clock[0] += 16.0
+    with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
+        reader.snapshot_for_claims(claims)
+
+
+def test_excess_historical_source_dates_fail_closed_before_any_get():
+    claims = [
+        {"trade_date": f"2026-10-{day:02d}",
+         "client_order_key": f"old-{day}",
+         "active_attempt_id": f"attempt-{day}"}
+        for day in range(1, 10)
+    ]
+    kis = ReadOnlyKIS(rows=[])
+    reader = _reader(kis=kis, active=claims)
+    with pytest.raises(RuntimeError, match="SOURCE_DATES_OVER_BUDGET"):
+        reader._poll_once(kis)
+    assert kis.calls == []
