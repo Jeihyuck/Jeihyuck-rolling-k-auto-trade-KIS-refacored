@@ -102,7 +102,8 @@ jobs:
           if-no-files-found: ignore
 
   pr311-postgres-safety:
-    if: github.event_name == 'push' || github.event.pull_request.number == 311
+    # Migration 0062 was fixed in PR #313; rerun #311 Postgres safety on this follow-up PR.
+    if: github.event_name == 'push' || contains(fromJSON('[311,313]'), github.event.pull_request.number)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
