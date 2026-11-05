@@ -1396,7 +1396,8 @@ def persist_profit_capture_ack_from_route(intent: dict, result: dict, trade_date
         return False
     ack = result.get("ack") if isinstance(result.get("ack"), dict) else {}
     broker_order_no = (
-        result.get("broker_order_no") or ack.get("raw_broker_order_no")
+        result.get("broker_order_no") or result.get("order_no")
+        or ack.get("raw_broker_order_no") or ack.get("order_no")
         or ack.get("ODNO") or ack.get("odno") or None
     )
     from trader.us.db.repos import mark_us_profit_capture_stage
