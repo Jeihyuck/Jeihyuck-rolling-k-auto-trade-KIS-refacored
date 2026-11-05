@@ -17,9 +17,15 @@ def _root(tmp_path: Path, pin: str = SHA) -> Path:
     return tmp_path
 
 
-def _git(branch="dual-agent", sha=SHA):
+def _git(branch="dual-agent", sha=SHA, dirty=""):
     def read(*args):
-        return branch if args == ("branch", "--show-current") else sha
+        if args == ("branch", "--show-current"):
+            return branch
+        if args == ("rev-parse", "HEAD"):
+            return sha
+        if args[:2] == ("status", "--porcelain"):
+            return dirty
+        raise AssertionError("unexpected git contract")
     return read
 
 
@@ -50,4 +56,26 @@ def test_unpinned_worker_never_ready(tmp_path):
         assert_stage4_worker_code_pin(
             trade_date=DAY, expected_sha=SHA,
             repo_root=tmp_path, git_read=_git(),
+        )
+
+
+def test_dirty_worktree_cannot_publish_ready_even_with_matching_commit(tmp_path):
+    with pytest.raises(RuntimeError, match="WORKTREE_DIRTY"):
+        assert_stage4_worker_code_pin(
+            trade_date=DAY, expected_sha=SHA, repo_root=_root(tmp_path),
+            git_read=_git(dirty=" M trader/us/execution/order_router.py"),
+        )
+
+
+def test_later_pin_mutation_blocks_subsequent_ready(tmp_path):
+    root = _root(tmp_path)
+    assert assert_stage4_worker_code_pin(
+        trade_date=DAY, expected_sha=SHA, repo_root=root,
+        git_read=_git(),
+    ) == SHA
+    (root / "runtime/code-pins" / f"US-{DAY}.sha").write_text(OTHER)
+    with pytest.raises(RuntimeError, match="FILE_MISMATCH"):
+        assert_stage4_worker_code_pin(
+            trade_date=DAY, expected_sha=SHA, repo_root=root,
+            git_read=_git(),
         )
