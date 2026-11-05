@@ -355,3 +355,71 @@ def test_memory_only_tp_stage_backend_remains_available(monkeypatch):
         assert repos._MEM_PROFIT_CAPTURE_STATE[key]["tp1_pending"] is True
     finally:
         repos._MEM_PROFIT_CAPTURE_STATE.pop(key, None)
+
+
+def test_native_tp_pre_http_freshness_rejects_historical_276_min_delay():
+    from trader.us.execution.order_router import _tp_decision_fresh_for_native_http
+    from datetime import timedelta
+
+    for stage in ("tp1", "tp2", "tp3"):
+        old = NOW - timedelta(minutes=276)
+        intent = {
+            "symbol": "HCA", "side": "SELL",
+            "client_order_key": f"US_PC_{DATE}_HCA_cycle-hca-1_TAKE_PROFIT_{stage.upper()}",
+            "meta": {
+                "profit_capture_stage": stage,
+                "last_profit_capture_at": old.isoformat(),
+            },
+        }
+        valid, reason = _tp_decision_fresh_for_native_http(
+            intent, now_utc=NOW, max_age_sec=30,
+        )
+        assert valid is False
+        assert reason == "US_TP_DECISION_EXPIRED_BEFORE_HTTP"
+
+
+def test_native_tp_pre_http_accepts_only_recent_aware_original_signal():
+    from trader.us.execution.order_router import _tp_decision_fresh_for_native_http
+    from datetime import timedelta
+
+    intent = {
+        "symbol": "HCA", "side": "SELL",
+        "client_order_key": "US_PC_2026-11-05_HCA_cycle-hca-1_TAKE_PROFIT_TP2",
+        "meta": {
+            "profit_capture_stage": "tp2",
+            "last_profit_capture_at": (NOW - timedelta(seconds=12)).isoformat(),
+        },
+    }
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=NOW, max_age_sec=30,
+    ) == (True, "US_TP_DECISION_FRESH")
+
+    for bad_time in ("", "2026-11-05T14:59:50", "bad-date"):
+        intent["meta"]["last_profit_capture_at"] = bad_time
+        valid, reason = _tp_decision_fresh_for_native_http(
+            intent, now_utc=NOW, max_age_sec=30,
+        )
+        assert not valid and reason == "US_TP_DECISION_TIME_UNVERIFIED"
+
+    intent["meta"]["last_profit_capture_at"] = (
+        NOW + timedelta(minutes=2)
+    ).isoformat()
+    assert _tp_decision_fresh_for_native_http(
+        intent, now_utc=NOW, max_age_sec=30,
+    )[0] is False
+
+
+def test_non_tp_protective_sell_has_no_new_pre_http_age_gate():
+    from trader.us.execution.order_router import _tp_decision_fresh_for_native_http
+    # Hard stops and TQQQ orders do not inherit a TP-specific time fence.
+    for stage_intent in (
+        {"side": "SELL", "client_order_key": "protective-stop",
+         "meta": {"exit_type": "hard_stop_loss"}},
+        {"side": "SELL", "client_order_key": "TQQQ_INFINITE_TP1",
+         "meta": {"profit_capture_stage": "tp1"}},
+        {"side": "BUY", "client_order_key": "US_PC_test",
+         "meta": {"profit_capture_stage": "tp1"}},
+    ):
+        assert _tp_decision_fresh_for_native_http(
+            stage_intent, now_utc=NOW,
+        ) == (True, "NOT_NATIVE_PROFIT_CAPTURE_TP")
