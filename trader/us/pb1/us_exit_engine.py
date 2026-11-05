@@ -1328,6 +1328,11 @@ def prepare_exit_position_snapshots(
                         pos["high_watermark"] = high_state.get("high_watermark")
                         pos["max_price"] = high_state.get("high_watermark")
                         pos["high_watermark_source"] = "us_position_risk_state"
+                        # The persisted high value and its evidence timestamp
+                        # form one indivisible proof. A newer high without its
+                        # timestamp cannot authorize v3 Giveback/R4.
+                        pos["high_watermark_at"] = high_state.get("high_watermark_at")
+                        pos["high_watermark_lifecycle_id"] = high_state.get("lifecycle_id")
                         pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
                 except Exception as exc:
                     logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
@@ -1345,6 +1350,8 @@ def prepare_exit_position_snapshots(
                     "high_watermark": pos.get("high_watermark", original_pos.get("high_watermark")),
                     "max_price": pos.get("max_price", original_pos.get("max_price")),
                     "high_watermark_source": pos.get("high_watermark_source", original_pos.get("high_watermark_source")),
+                    "high_watermark_at": pos.get("high_watermark_at", original_pos.get("high_watermark_at")),
+                    "high_watermark_lifecycle_id": pos.get("high_watermark_lifecycle_id", original_pos.get("high_watermark_lifecycle_id")),
                     "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
                     "resolved_current_price": current_price,
                     "current_price_usd": current_price,
