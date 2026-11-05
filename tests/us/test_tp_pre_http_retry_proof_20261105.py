@@ -233,3 +233,66 @@ def test_router_top_level_order_number_is_persisted_on_tp_ack():
             intent, {"status": "ACK", "order_no": "0000098877"}, DATE,
         )
     assert mark.call_args.kwargs["broker_order_no"] == "0000098877"
+
+
+def test_pre_submit_tp_block_releases_only_after_exact_durable_proof():
+    from trader.us.runner.trade_tick_runner import release_proven_tp_pre_submit_block
+    intent = {
+        "symbol": "HCA", "side": "SELL",
+        "client_order_key": "tp-key", "position_lifecycle_id": "cycle-hca-1",
+        "meta": {"profit_capture_stage": "tp1"},
+    }
+    result = {
+        "status": "BLOCKED", "pre_submit_tp_block": True,
+        "safe_to_release_tp_pending": True,
+    }
+    with patch("trader.us.db.repos.release_us_profit_capture_pre_http_abort", return_value=True) as release:
+        assert release_proven_tp_pre_submit_block(intent, result, DATE)
+    release.assert_called_once_with(
+        trade_date=DATE, symbol="HCA", stage="tp1",
+        position_lifecycle_id="cycle-hca-1", client_order_key="tp-key",
+    )
+
+
+def test_unverified_or_failed_pre_submit_release_never_authorizes_retry():
+    from trader.us.runner.trade_tick_runner import release_proven_tp_pre_submit_block
+    intent = {
+        "symbol": "HCA", "side": "SELL",
+        "client_order_key": "tp-key", "position_lifecycle_id": "cycle-hca-1",
+        "meta": {"profit_capture_stage": "tp1"},
+    }
+    flag = {"status": "BLOCKED", "pre_submit_tp_block": True}
+    with patch("trader.us.db.repos.release_us_profit_capture_pre_http_abort") as release:
+        assert not release_proven_tp_pre_submit_block(
+            intent, {**flag, "safe_to_release_tp_pending": False}, DATE,
+        )
+        release.assert_not_called()
+    with patch("trader.us.db.repos.release_us_profit_capture_pre_http_abort", return_value=False) as release:
+        assert not release_proven_tp_pre_submit_block(
+            intent, {**flag, "safe_to_release_tp_pending": True}, DATE,
+        )
+        release.assert_called_once()
+    with patch("trader.us.db.repos.release_us_profit_capture_pre_http_abort", side_effect=RuntimeError("db down")):
+        assert not release_proven_tp_pre_submit_block(
+            intent, {**flag, "safe_to_release_tp_pending": True}, DATE,
+        )
+
+
+def test_pre_submit_release_refuses_missing_identity_and_unknown_http():
+    from trader.us.runner.trade_tick_runner import release_proven_tp_pre_submit_block
+    intent = {
+        "symbol": "HCA", "side": "SELL", "client_order_key": "tp-key",
+        "meta": {"profit_capture_stage": "tp1"},
+    }
+    with patch("trader.us.db.repos.release_us_profit_capture_pre_http_abort") as release:
+        assert not release_proven_tp_pre_submit_block(
+            intent, {"status": "BLOCKED", "pre_submit_tp_block": True,
+                     "safe_to_release_tp_pending": True}, DATE,
+        )
+        assert not release_proven_tp_pre_submit_block(
+            {**intent, "position_lifecycle_id": "lc"},
+            {"status": "BROKER_SUBMIT_RESULT_UNKNOWN",
+             "pre_submit_tp_block": True,
+             "safe_to_release_tp_pending": True}, DATE,
+        )
+        release.assert_not_called()
