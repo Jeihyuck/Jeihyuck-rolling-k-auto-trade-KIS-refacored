@@ -461,6 +461,17 @@ def main() -> int:
     parser.add_argument("--env",default="practice")
     parser.add_argument("--interval-sec",type=int,default=10)
     args=parser.parse_args()
+    # Prove the actual CHILD process source before it can publish STARTING
+    # or READY. Never silently accept yesterday's WSL code pin.
+    from trader.us.execution.stage4_code_integrity import assert_stage4_worker_code_pin
+    _code_pin = assert_stage4_worker_code_pin(
+        trade_date=args.trade_date,
+        expected_sha=os.getenv("US_CODE_SHA", ""),
+    )
+    logger.info(
+        "[US_STAGE4][CHILD_CODE_PIN_VERIFIED] trade_date=%s head_short=%s",
+        args.trade_date, _code_pin[:12],
+    )
     if (args.env!="practice"
             or os.getenv("KIS_ENV","practice").lower()!="practice"
             or os.getenv("US_RECONCILE_WORKER_MODE")!="WORKER"
@@ -534,6 +545,12 @@ def main() -> int:
                     # claims changed or the reader replaced/expired evidence.
                     historical_reader.assert_still_valid(
                         historical_snapshot, load_active_execution_claim_attempts(),
+                    )
+                    # If the checkout changed after startup, the worker must
+                    # fail closed rather than reporting READY with mixed code.
+                    assert_stage4_worker_code_pin(
+                        trade_date=args.trade_date,
+                        expected_sha=_code_pin,
                     )
                     with engine.begin() as conn:
                         publish_health(conn,scope=scope,generation=generation,
