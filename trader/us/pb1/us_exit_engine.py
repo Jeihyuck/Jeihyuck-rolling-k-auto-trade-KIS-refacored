@@ -415,12 +415,20 @@ def evaluate_exit(
     """
     cfg = _reload_env()
     contract_integrity_state = "NONE"
+    frozen_contract = {}
+    is_v3_contract = False
     try:
         from trader.us.entry_exit_contract import (
             contract_exit_config,
             us_entry_exit_contract_integrity_state,
+            extract_us_entry_exit_contract, US_SWING_V3_CONTRACT_VERSION,
         )
         contract_integrity_state = us_entry_exit_contract_integrity_state(position, position.get("meta"))
+        frozen_contract = extract_us_entry_exit_contract(position, position.get("meta"))
+        is_v3_contract = (
+            contract_integrity_state == "VALID"
+            and frozen_contract.get("version") == US_SWING_V3_CONTRACT_VERSION
+        )
         frozen_cfg = contract_exit_config(position)
         if frozen_cfg:
             cfg = {**cfg, **frozen_cfg}
@@ -662,7 +670,8 @@ def evaluate_exit(
     # ── profit trailing stop: 수익 경험 후에만 활성화 ────────────────────────
     max_unrealized_profit_pct = ((max_price - entry_price) / entry_price) if entry_price > 0 and max_price > 0 else 0.0
     if (
-        max_price > 0
+        not is_v3_contract
+        and max_price > 0
         and max_unrealized_profit_pct >= cfg["trailing_activation_profit"]
         and current_price <= max_price * (1 - cfg["trailing_stop"])
     ):
@@ -721,8 +730,68 @@ def evaluate_exit(
             trail_high_price=max_price,
         )
 
+    # v3 ONLY: replace legacy discretionary profit trailing/protect/giveback.
+    # Hard stop, persistent/confirmed soft stop above remain unchanged.
+    if is_v3_contract:
+        try:
+            from trader.us.pb1.swing_runner_exit_v3 import evaluate_v3_from_position
+            from trader.us.entry_exit_contract import US_SWING_V3_CONTRACT_VERSION
+            _when = now or datetime.now(timezone.utc)
+            _decision = evaluate_v3_from_position(
+                position=position, current_price=current_price,
+                now=_when, contract=frozen_contract,
+            )
+        except Exception as exc:
+            logger.error(
+                "[US_EXIT][V3][DATA_UNVERIFIED] symbol=%s err_type=%s action=HOLD_PROFIT_ONLY",
+                symbol, type(exc).__name__,
+            )
+            _decision = {"action": "HOLD", "reason": "V3_EVALUATION_UNAVAILABLE"}
+        if _decision.get("action") == "SELL":
+            _stage = str(_decision["stage"])
+            _size = min(qty, int(_decision["qty"]))
+            if _size > 0:
+                _meta = {
+                    "semantic_action": _stage,
+                    "exit_stage": _stage,
+                    "source_entry_contract_sha256": frozen_contract["sha256"],
+                    "source_entry_contract_version": US_SWING_V3_CONTRACT_VERSION,
+                    "v3_policy_name": (frozen_contract.get("management") or {}).get("runner_exit", {}).get("name"),
+                    "v3_peak_gain": _decision.get("peak_gain"),
+                    "v3_current_gain": _decision.get("current_gain"),
+                    "v3_giveback_ratio": _decision.get("giveback"),
+                    "v3_atr14": _decision.get("atr14"),
+                    "v3_chandelier_stop": _decision.get("chandelier_stop"),
+                    "v3_trend_state": _decision.get("trend_state"),
+                    "v3_stage_target_qty": _size,
+                    "v3_original_decision_at": _when.isoformat(),
+                    "partial_exit_scope": _stage if _stage == "PROFIT_DEFENSE_PARTIAL" else None,
+                    "partial_exit_allowed": _stage == "PROFIT_DEFENSE_PARTIAL",
+                }
+                result = _emit_exit(
+                    symbol=symbol, exchange=exchange, qty=_size,
+                    current_price=current_price, entry_price=entry_price,
+                    exit_type=str(_decision["exit_type"]),
+                    reason=str(_decision["reason"]),
+                    unrealized_pnl_usd=(current_price-entry_price)*_size,
+                    pnl_pct=pnl_pct, holding_qty=raw_qty,
+                    orderable_qty=orderable_qty, now=now, trail_high_price=max_price,
+                    meta_extra=_meta,
+                )
+                if result:
+                    result["strategy_owner"] = "US_STANDARD"
+                    result["exit_policy"] = "US_SWING_TP_GB_ATR_RUNNER_V3"
+                    result["semantic_action"] = _stage
+                    result["partial_exit_allowed"] = _stage == "PROFIT_DEFENSE_PARTIAL"
+                    result["meta"]["strategy_owner"] = "US_STANDARD"
+                    return result
+        logger.info(
+            "[US_EXIT][V3][HOLD] symbol=%s reason=%s",
+            symbol, _decision.get("reason"),
+        )
+
     # ── profit protect ────────────────────────────────────────────────────────
-    if pnl_pct >= cfg["profit_protect"]:
+    if not is_v3_contract and pnl_pct >= cfg["profit_protect"]:
         # 수익 보호: 고점 대비 X% 빠지면 청산
         protect_trail = 0.03
         if max_price > 0 and current_price < max_price * (1 - protect_trail):
@@ -739,7 +808,7 @@ def evaluate_exit(
             )
 
     # ── giveback ──────────────────────────────────────────────────────────────
-    if max_price > entry_price:
+    if not is_v3_contract and max_price > entry_price:
         max_gain = (max_price - entry_price) / entry_price
         current_gain = pnl_pct
         if max_gain > 0.05:  # 최소 5% 수익 있을 때만 giveback 적용
