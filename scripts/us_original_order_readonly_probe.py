@@ -45,7 +45,17 @@ def classify_original_order(rows: list[dict], *, order_no: str, symbol: str,
     result["cumulative_filled_qty"] = n.get("filled_qty")
     result["remaining_qty"] = n.get("remaining_qty")
     result["requested_qty"] = n.get("requested_qty")
+    # A reused KIS order number from a different session, a cancel-request
+    # row, or an inferred (rather than reported) remaining quantity must NOT
+    # prove original order terminality. Keep UNKNOWN on any missing field.
+    raw_order_day = str(n.get("trade_date") or "").replace("-", "")
+    requested_day = str(trade_date).replace("-", "")
     if (n.get("normalization_result") != "normalized"
+            or n.get("broker_operation") != "ORDER"
+            or not raw_order_day or raw_order_day != requested_day
+            or n.get("requested_qty_present") is not True
+            or n.get("filled_qty_present") is not True
+            or n.get("remaining_qty_present") is not True
             or n.get("requested_qty") != expected_qty
             or n.get("filled_qty") is None or n.get("remaining_qty") is None
             or n.get("filled_qty") < 0 or n.get("remaining_qty") < 0
