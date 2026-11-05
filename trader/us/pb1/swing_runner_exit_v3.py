@@ -142,6 +142,11 @@ def evaluate_v3_runner(
                 "chandelier_stop": bars.get("stop") if bars.get("valid") else None}
     if final_active != "NOT_TRIGGERED":
         return hold("FINAL_STAGE_ALREADY_ACTIVE_OR_UNVERIFIED", **evidence)
+    # A pending/unknown partial has reserved inventory. A later Runner FINAL
+    # must not be submitted over it without authoritative cancel/fill proof.
+    # Existing hard/persistent soft stops are evaluated outside v3 first.
+    if partial_active not in {"NOT_TRIGGERED", "DONE"}:
+        return hold("PARTIAL_ORDER_UNSETTLED_FINAL_REQUIRES_RECONCILE", **evidence)
     is_final = (
         (verified_trend and trend == "EXIT", "R1_TREND_EXIT"),
         (peak_gain >= float(policy["peak_activation"])
