@@ -598,6 +598,10 @@ def _enrich_single_position(
             enriched["high_watermark"] = hwm
             enriched["max_price"] = hwm
             enriched["high_watermark_source"] = "us_position_risk_state"
+            # Original exact-lifecycle proof. v3 must never treat an
+            # inferred max_price as a verified historical watermark.
+            enriched["high_watermark_at"] = lifecycle.get("high_watermark_at")
+            enriched["high_watermark_lifecycle_id"] = lifecycle.get("lifecycle_id")
     except Exception as exc:
         logger.debug("[US_EXIT_RESOLVER][HWM_FAIL] symbol=%s err=%s", symbol, exc)
     if not enriched.get("max_price") and not enriched.get("high_watermark"):

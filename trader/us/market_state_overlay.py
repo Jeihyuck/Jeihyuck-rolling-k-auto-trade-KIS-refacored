@@ -1020,8 +1020,15 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             lifecycle_by_symbol = {_symbol(p): str(p.get("position_lifecycle_id") or "") for p in positions or [] if _symbol(p)}
             profit_capture_state = load_us_profit_capture_state(trade_date, symbols, lifecycle_by_symbol)
         except Exception as exc:
-            logger.warning("[US_PROFIT_CAPTURE][STATE_LOAD_WARN] trade_date=%s err=%s", trade_date, exc)
-            profit_capture_state = {}
+            # An unavailable state store cannot prove that a previous TP
+            # attempt is absent. Creating a fresh stage key here would risk
+            # duplicating an unresolved broker order; never fail open.
+            logger.error(
+                "[US_PROFIT_CAPTURE][STATE_LOAD_FAILED] trade_date=%s "
+                "action=BLOCK_NO_ORDER error_type=%s",
+                trade_date, type(exc).__name__,
+            )
+            return []
     if profit_capture_state is None:
         profit_capture_state = {}
     runner_min = _env_float("US_RUNNER_MIN_REMAIN_PCT", 0.40)
@@ -1133,8 +1140,59 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     lifecycle = str(p.get("position_lifecycle_id"))
                     base_order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
                     prior_order_keys = list(stage_meta.get(f"{stage}_order_keys") or [])
+                    # Historical SQL rows can retain the most recent stage
+                    # order/ACK identity even when the JSON attempt list is
+                    # absent or incomplete. Never mistake that for a first TP.
+                    durable_stage_key = str(
+                        state.get(f"{stage}_order_key")
+                        or stage_meta.get(f"{stage}_order_key") or ""
+                    ).strip()
+                    durable_broker_no = str(
+                        state.get(f"{stage}_broker_order_no")
+                        or stage_meta.get(f"{stage}_broker_order_no") or ""
+                    ).strip()
+                    if ((durable_stage_key and durable_stage_key not in prior_order_keys)
+                            or (durable_broker_no and not prior_order_keys)):
+                        logger.error(
+                            "[US_PROFIT_CAPTURE][ATTEMPT_LINEAGE_INCOMPLETE] "
+                            "symbol=%s stage=%s action=BLOCK_RECONCILE_REQUIRED",
+                            sym, stage,
+                        )
+                        break
+                    # A prior key alone cannot authorize another HTTP attempt.
+                    # A broker-confirmed terminal CANCELLED/REJECTED/EXPIRED
+                    # is different from an unknown ACK or a local failure:
+                    # allow only the remaining unfilled target after actual
+                    # terminal evidence. A proven, claim-released pre-HTTP
+                    # abort may also retry. Never infer terminal from time.
+                    last_status = str(stage_meta.get("last_status") or "").upper()
+                    last_evidence = str(stage_meta.get("last_evidence_type") or "").upper()
+                    last_stage = str(stage_meta.get("last_stage") or "").lower()
+                    pre_http_abort = (
+                        last_status == "FAILED"
+                        and last_evidence == "BROKER_SUBMIT_ABORTED_PRE_IO"
+                        and not state.get(f"{stage}_broker_order_no")
+                    )
+                    broker_terminal = (
+                        last_status in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
+                        and last_evidence in {
+                            "KIS_ORDER_CUMULATIVE_ACTUAL",
+                            "KIS_EXECUTION_ACTUAL",
+                            "KIS_ORDER_STATUS_ACTUAL",
+                        }
+                        and stage_target_qty > stage_filled_qty
+                    )
+                    if prior_order_keys and not (
+                        last_stage == stage and (pre_http_abort or broker_terminal)
+                    ):
+                        logger.warning(
+                            "[US_PROFIT_CAPTURE][RETRY_FENCED] symbol=%s stage=%s "
+                            "prior_attempts=%d reason=NO_PROVEN_PRE_HTTP_ABORT",
+                            sym, stage, len(prior_order_keys),
+                        )
+                        break
                     order_key = base_order_key if not prior_order_keys else f"{base_order_key}_R{len(prior_order_keys) + 1}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": "ENTRY_EXIT_CONTRACT_V2" if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    pending_intent = ({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
                     if trade_date:
                         try:
                             from trader.us.db.repos import mark_us_profit_capture_stage
@@ -1142,7 +1200,16 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                             state[pending_flag] = True
                             profit_capture_state[sym] = state
                         except Exception as exc:
-                            logger.warning("[US_PROFIT_CAPTURE][STATE_MARK_WARN] symbol=%s stage=%s err=%s", sym, flag, exc)
+                            # Previously the intent had already been appended
+                            # and was routed despite the failed stage write.
+                            # A missing durable stage can never authorize HTTP.
+                            logger.error(
+                                "[US_PROFIT_CAPTURE][STATE_MARK_FAILED] symbol=%s stage=%s "
+                                "action=BLOCK_NO_ORDER err_type=%s",
+                                sym, flag, type(exc).__name__,
+                            )
+                            break
+                    intents.append(pending_intent)
                     logger.info("[US_PROFIT_CAPTURE][DECISION] symbol=%s broker_avg_price=%s executable_price=%s return_rate=%s threshold_unit=fraction threshold=%s decision=SUBMIT stage=%s", sym, broker_avg, executable, return_rate, threshold, reason)
                 break
     return intents
