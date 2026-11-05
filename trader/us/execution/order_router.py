@@ -344,6 +344,37 @@ def _kis_env() -> str:
     return (os.getenv("KIS_ENV") or "practice").strip().lower() or "practice"
 
 
+def _tp_decision_fresh_for_native_http(
+    intent: dict, *, now_utc=None, max_age_sec: float = 30.0,
+) -> tuple[bool, str]:
+    """Do not POST a queued old TP based on a prior Tick's executable price.
+
+    An expired decision is a *pre-HTTP abort*, not KIS terminal evidence.
+    Only actual US_PC_* stage intents are gated. Stop, re-evaluate price/TP
+    threshold and broker orderable shares at a later fresh Tick; never cancel
+    or replace a KIS OPEN/unknown order on the strength of a timestamp alone.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    side = str(intent.get("side") or "").upper()
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    stage = str(meta.get("profit_capture_stage") or "").lower()
+    key = str(intent.get("client_order_key") or intent.get("order_key") or "")
+    if side != "SELL" or stage not in {"tp1", "tp2", "tp3"} or not key.startswith("US_PC_"):
+        return True, "NOT_NATIVE_PROFIT_CAPTURE_TP"
+    raw = str(meta.get("last_profit_capture_at") or "")
+    try:
+        decision_at = _dt.fromisoformat(raw.replace("Z", "+00:00"))
+        check_at = now_utc or _dt.now(_tz.utc)
+        if decision_at.tzinfo is None or check_at.tzinfo is None:
+            return False, "US_TP_DECISION_TIME_UNVERIFIED"
+        age = (check_at - decision_at).total_seconds()
+        if not (0 <= age <= max(1.0, float(max_age_sec))):
+            return False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP"
+    except (ValueError, TypeError, OverflowError):
+        return False, "US_TP_DECISION_TIME_UNVERIFIED"
+    return True, "US_TP_DECISION_FRESH"
+
+
 def _is_cash_insufficient_reject(msg: str) -> bool:
     text = str(msg or "").lower()
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
@@ -2384,6 +2415,26 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
                 ) from _final_stage4_exc
+        # Price and stage were evaluated earlier in the Tick. If Stage4,
+        # database or rate-limit delays made that TP decision obsolete,
+        # abort strictly BEFORE KIS HTTP. The proven-unsent journal/claim
+        # release path must complete before a later Tick can re-evaluate.
+        _tp_max_age = max(
+            5.0, min(120.0, float(os.getenv(
+                "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
+            )))
+        )
+        _tp_is_fresh, _tp_reason = _tp_decision_fresh_for_native_http(
+            intent, max_age_sec=_tp_max_age,
+        )
+        if not _tp_is_fresh:
+            logger.warning(
+                "[US_PROFIT_CAPTURE][PRE_HTTP_DECISION_STALE] "
+                "symbol=%s stage=%s reason=%s action=ABORT_NO_POST",
+                symbol_upper, lifecycle_meta.get("profit_capture_stage") or "UNKNOWN",
+                _tp_reason,
+            )
+            raise KisUSPreSubmitError(_tp_reason)
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
@@ -2535,6 +2586,8 @@ def route_order(
                 "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
                 "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
+                "US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+                "US_TP_DECISION_TIME_UNVERIFIED",
                 "US_ENTRY_TIMING_POLICY_NOT_APPROVED",
                 "US_ENTRY_TIMING_PROOF_MISSING", "US_ENTRY_TIMING_PROOF_INVALID",
                 "US_ENTRY_TIMING_BINDING_INVALID",
