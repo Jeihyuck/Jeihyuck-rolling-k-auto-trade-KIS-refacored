@@ -3133,7 +3133,11 @@ def mark_us_profit_capture_stage(
     existing["meta"] = meta
     normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
     engine = _get_engine_or_none()
-    if engine is None or _conn is None:
+    # A real DB write must be durable before the TP state can be observed as
+    # PENDING. Updating the process-local mirror first creates phantom
+    # reservations when the SQL transaction fails and can strand future ticks.
+    # A no-DB test/offline backend retains the existing in-memory behavior.
+    if engine is None:
         _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     if engine is not None:
         stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
