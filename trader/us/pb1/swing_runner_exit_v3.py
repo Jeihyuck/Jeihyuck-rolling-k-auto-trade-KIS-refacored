@@ -217,10 +217,18 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
     entry = _positive(position.get("entry_price") or position.get("avg_price_usd") or position.get("avg_cost"))
     holding = int(position.get("qty") or position.get("holding_qty") or 0)
     orderable = int(position.get("orderable_qty") or position.get("sellable_qty") or holding)
-    observed = life.get("high_watermark_at")
+    # The resolver exposes this only after exact account/epoch/lifecycle
+    # DB matching. Do not use fallback_current_or_entry or position_field.
+    high_record = life if (
+        life.get("high_watermark_source") == "us_position_risk_state"
+    ) else position
+    observed = high_record.get("high_watermark_at")
+    recorded_lifecycle = str(
+        high_record.get("lifecycle_id") or high_record.get("high_watermark_lifecycle_id") or ""
+    )
     high_proof = bool(
-        lid and str(life.get("lifecycle_id") or "") == lid
-        and life.get("high_watermark_source") == "us_position_risk_state"
+        lid and recorded_lifecycle == lid
+        and high_record.get("high_watermark_source") == "us_position_risk_state"
         and observed
     )
     try:
@@ -262,7 +270,7 @@ def evaluate_v3_from_position(*, position: dict, current_price: float,
         contract_sha=str(contract.get("sha256") or ""),
     )
     return evaluate_v3_runner(
-        entry_price=entry or 0, verified_high=float(life.get("high_watermark") or 0),
+        entry_price=entry or 0, verified_high=float(high_record.get("high_watermark") or 0),
         current_price=current_price, holding_qty=holding, orderable_qty=orderable,
         trend_state=trend.get("trend_state") or "UNKNOWN",
         trend_verified=bool(trend_ok), high_verified=high_proof,
