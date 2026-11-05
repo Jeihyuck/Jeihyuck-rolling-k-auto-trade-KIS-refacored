@@ -218,3 +218,18 @@ def test_disagreeing_durable_key_and_attempt_history_needs_reconciliation():
     })
     assert out == []
     mark.assert_not_called()
+
+
+def test_router_top_level_order_number_is_persisted_on_tp_ack():
+    from trader.us.runner.trade_tick_runner import persist_profit_capture_ack_from_route
+    intent = {
+        "symbol": "HCA", "side": "SELL", "qty": 5,
+        "client_order_key": "US_PC_2026-11-05_HCA_cycle-hca-1_TAKE_PROFIT_TP1",
+        "position_lifecycle_id": "cycle-hca-1",
+        "meta": {"profit_capture_stage": "tp1"},
+    }
+    with patch("trader.us.db.repos.mark_us_profit_capture_stage") as mark:
+        assert persist_profit_capture_ack_from_route(
+            intent, {"status": "ACK", "order_no": "0000098877"}, DATE,
+        )
+    assert mark.call_args.kwargs["broker_order_no"] == "0000098877"
