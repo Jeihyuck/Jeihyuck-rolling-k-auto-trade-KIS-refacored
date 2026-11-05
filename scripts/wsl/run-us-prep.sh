@@ -159,4 +159,20 @@ PY
     echo "[US_PREP][POST_COMPLETE_CONTRACT_CHECK] status=NOT_EFFECTIVE marker_preserved=1" >> "$LOG_FILE"
   fi
 fi
+# No order-capable code is added to PREP. Only explicitly approved practice
+# v3 sessions prepare KIS GET-only *completed* daily ATR cache, once before
+# the next trading Tick; any source failure leaves R3 unverified/disabled.
+# Existing v2/TQQQ/DAY/KR behavior and PREP exit code are unchanged.
+if [[ "$prep_rc" == 0 \
+      && "${KIS_ENV:-practice}" == "practice" \
+      && "${US_SWING_EXIT_MODE:-LEGACY_V2}" == "V3_ACTIVE_PRACTICE" \
+      && "${US_SWING_V3_DEPLOY_APPROVED:-0}" == "1" \
+      && "${US_OFFLINE:-0}" != "1" ]]; then
+  if "$PYTHON_BIN" scripts/us_prewarm_v3_atr_readonly.py \
+      --trade-date "$NULLIM_TRADE_DATE" --confirm-practice-readonly >> "$LOG_FILE" 2>&1; then
+    echo "[US_V3_ATR][PREWARM] status=COMPLETE_OR_QUARANTINED orders_submitted=0" >> "$LOG_FILE"
+  else
+    echo "[US_V3_ATR][PREWARM] status=UNVERIFIED action=R3_FAIL_CLOSED orders_submitted=0" >> "$LOG_FILE"
+  fi
+fi
 exit "$prep_rc"
