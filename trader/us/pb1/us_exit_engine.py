@@ -518,13 +518,46 @@ def evaluate_exit(
     # ── orderable_qty clamp ──────────────────────────────────────────────────
     # SELL qty는 orderable_qty를 초과할 수 없다. (한국장 qty_to_close 원칙 이식)
     raw_qty = qty
-    orderable_qty = int(
-        position.get("orderable_qty")
-        or position.get("sellable_qty")
-        or position.get("holding_qty")
-        or qty
-    )
-    exit_qty = min(raw_qty, orderable_qty) if orderable_qty > 0 else raw_qty
+    if is_v3_contract:
+        # v3 is a new, explicitly opted-in policy. A KIS orderable_qty of
+        # exactly ZERO means reserved/unavailable shares, NOT a missing
+        # snapshot. Never resurrect the holding quantity via truthy "or".
+        from decimal import Decimal, InvalidOperation
+        _raw_orderable = position.get("orderable_qty")
+        if _raw_orderable is None:
+            _raw_orderable = position.get("sellable_qty")
+        try:
+            _verified_orderable = Decimal(str(_raw_orderable))
+            if (
+                _raw_orderable is None or isinstance(_raw_orderable, bool)
+                or not _verified_orderable.is_finite()
+                or _verified_orderable != _verified_orderable.to_integral_value()
+                or not 0 <= _verified_orderable <= raw_qty
+            ):
+                raise ValueError("unverified orderable quantity")
+            orderable_qty = int(_verified_orderable)
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            logger.error(
+                "[US_EXIT][V3][ORDERABLE_UNVERIFIED] symbol=%s action=HOLD_NO_ORDER",
+                symbol,
+            )
+            return None
+        if orderable_qty == 0:
+            logger.warning(
+                "[US_EXIT][V3][ORDERABLE_ZERO] symbol=%s action=HOLD_NO_ORDER",
+                symbol,
+            )
+            return None
+        exit_qty = min(raw_qty, orderable_qty)
+    else:
+        # Exact legacy v2 behavior remains untouched by this v3 safety fix.
+        orderable_qty = int(
+            position.get("orderable_qty")
+            or position.get("sellable_qty")
+            or position.get("holding_qty")
+            or qty
+        )
+        exit_qty = min(raw_qty, orderable_qty) if orderable_qty > 0 else raw_qty
 
     logger.info(
         "[US_EXIT][SELL_QTY] symbol=%s holding_qty=%d orderable_qty=%d exit_qty=%d",
