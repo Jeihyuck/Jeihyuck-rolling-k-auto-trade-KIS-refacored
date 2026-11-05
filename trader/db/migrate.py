@@ -300,7 +300,7 @@ def assert_no_migration_transaction_control(statements: list[str], *, version: s
     for statement in statements:
         normalized = _strip_sql_comments(statement)
         match = re.match(
-            r"^(?:BEGIN|COMMIT|ROLLBACK|START\\s+TRANSACTION|SAVEPOINT|RELEASE\\s+SAVEPOINT)\\b",
+            r"^(?:BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION|SAVEPOINT|RELEASE\s+SAVEPOINT)\b",
             normalized,
             flags=re.IGNORECASE,
         )
