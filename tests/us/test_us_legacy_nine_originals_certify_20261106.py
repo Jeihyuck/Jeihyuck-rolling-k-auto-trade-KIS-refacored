@@ -187,3 +187,89 @@ def test_kis_client_account_must_match_exact_practice_db_scope():
         assert_practice_client_matches_current_scope(
             KIS(),{**scope,"trading_epoch_id":""},
         )
+
+
+def _with_original_tmo_sale():
+    positions, fills, orders = _archive()
+    # TMO has 9 source shares in the fixture; a verified 2-share historical
+    # SELL leaves 7. The unresolved 10/30 1-share TP is NOT this fill.
+    positions[-1]["qty"] = 7
+    fills.append({
+        "symbol":"TMO","side":"SELL","trade_date":"2026-11-04",
+        "order_no":"0000099999","qty":2,
+        "meta":{"requested_qty":2,"position_lifecycle_id":"legacy-TMO",
+                "strategy_owner":"US_STANDARD"},
+    })
+    orders.append({
+        "symbol":"TMO","side":"SELL","trade_date":"2026-11-04",
+        "order_no":"0000099999","qty_requested":2,
+        "status":"FILLED","meta":{},
+    })
+    return positions, fills, orders
+
+
+def test_historical_sell_must_share_original_buy_lifecycle():
+    p,f,o=_with_original_tmo_sale()
+    plan=prepare_original_plan(p,f,o)
+    assert not plan["blockers"]
+    assert len(plan["original_sell_entries"])==1
+    sell=plan["original_sell_entries"][0]
+    assert sell["symbol"]=="TMO"
+    assert sell["db_filled_qty"]==2
+    assert sell["db_link_verified"] is True
+    f[-1]["meta"]["position_lifecycle_id"]="different-cycle"
+    bad=prepare_original_plan(p,f,o)
+    assert "TMO_LEGACY_SELL_DB_LINEAGE_UNVERIFIED" in bad["blockers"]
+
+
+def test_historical_sell_broker_fill_must_match_db_terminal_state(monkeypatch):
+    from scripts import us_original_order_readonly_probe as probe
+    p,f,o=_with_original_tmo_sale()
+    plan=prepare_original_plan(p,f,o)
+    class Client:
+        def get_us_today_orders(self,trade_date):
+            return []
+        def get_us_balance(self,force_refresh=False):
+            return {"rt_cd":"0","balance_complete":True,
+                    "balance_authoritative":True,"balance_conflicts":[],
+                    "output1":[{"ovrs_pdno":x["symbol"],
+                                "ovrs_cblc_qty":str(x["qty"])} for x in p]}
+    def same_broker_contract(_rows,*,side,order_no,expected_qty,**kw):
+        if side=="BUY":
+            return {"classification":"PROVEN_FILLED",
+                    "cumulative_filled_qty":expected_qty}
+        if order_no=="0000099999":
+            return {"classification":"PROVEN_FILLED","cumulative_filled_qty":2}
+        return {"classification":"PROVEN_CANCELLED","cumulative_filled_qty":0}
+    monkeypatch.setattr(probe,"classify_original_order",same_broker_contract)
+    ok=certify_get_only(plan,Client())
+    assert ok["broker_originals_and_balance_verified"] is True
+    assert ok["original_sell_results"][0]["status"]=="PROVEN_TERMINAL"
+    assert ok["status"]=="NOT_PROVEN"  # Original portfolio never fabricated.
+
+    def wrong_terminal(_rows,*,side,order_no,expected_qty,**kw):
+        if order_no=="0000099999":
+            return {"classification":"PROVEN_CANCELLED","cumulative_filled_qty":2}
+        return same_broker_contract(
+            _rows,side=side,order_no=order_no,expected_qty=expected_qty,**kw,
+        )
+    monkeypatch.setattr(probe,"classify_original_order",wrong_terminal)
+    bad=certify_get_only(plan,Client())
+    assert bad["broker_originals_and_balance_verified"] is False
+    assert bad["original_sell_results"][0]["status"]=="NOT_PROVEN"
+    assert "TMO_LEGACY_SELL_BROKER_PROOF_MISSING" in bad["blockers"]
+
+
+def test_historical_sell_same_number_wrong_side_is_not_buy_proof():
+    p,f,o=_with_original_tmo_sale()
+    # A same-symbol same-day broker order number is not a unique link
+    # without original side as part of the identity key.
+    sell_no=o[-1]["order_no"]
+    o.append({
+        "symbol":"TMO","side":"BUY","trade_date":"2026-11-04",
+        "order_no":sell_no,"qty_requested":2,
+        "status":"FILLED","meta":{},
+    })
+    out=prepare_original_plan(p,f,o)
+    assert out["original_sell_entries"][0]["db_link_verified"] is True
+    assert len(out["original_sell_entries"])==1
