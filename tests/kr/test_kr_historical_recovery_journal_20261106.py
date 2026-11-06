@@ -138,10 +138,10 @@ def test_retired_september_account_orders_are_not_october_account_blockers():
     )
     scope = KRRecoveryScope(
         env="practice",
-        account_key="practice:50220451:01",
-        trading_epoch_id="09772c87-27ab-412d-b1c7-0a4a55196462",
+        account_key="practice:new-fixture-acct:01",
+        trading_epoch_id="fixture-current-epoch-20261025",
     )
-    old_epoch = "3dc51d8e-61ce-414c-80a9-73f9b4911110"
+    old_epoch = "fixture-retired-epoch-20260921"
     current = scope.trading_epoch_id
     orders = [
         {"order_id": "old-ack", "code": "028050", "env": "practice",
@@ -157,7 +157,7 @@ def test_retired_september_account_orders_are_not_october_account_blockers():
     portfolios = {
         "old-portfolio": {
             "portfolio_epoch_id": "old-portfolio", "env": "practice",
-            "account_id": "practice:50199084:01",
+            "account_id": "practice:old-fixture-acct:01",
             "strategy": "pb1_pullback_close", "trading_epoch_id": old_epoch,
             "status": "ENDED",
         },
