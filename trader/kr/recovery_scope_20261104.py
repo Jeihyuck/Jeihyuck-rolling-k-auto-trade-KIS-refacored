@@ -148,6 +148,8 @@ def current_scope_open_order_blockers(
     """
     scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
     opened = orders_repo.get_open_orders(env, include_stale=True, fail_open=False)
+    if not isinstance(opened, list):
+        raise RuntimeError("KR_OPEN_ORDER_EVIDENCE_INVALID_FAIL_CLOSED")
     if not opened or scope is None:
         return opened
     schema = schema_for_engine(engine)
