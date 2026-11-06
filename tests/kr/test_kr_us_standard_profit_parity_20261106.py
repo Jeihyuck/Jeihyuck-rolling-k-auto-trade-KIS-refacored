@@ -162,3 +162,58 @@ def test_unknown_ack_or_missing_quote_blocks_without_any_broker_intent(monkeypat
         contract=c, stage_states={}, holding_qty=100, orderable_qty=100,
         verified_entry_price=0, executable_price=110,
     ).action == "BLOCK"
+
+
+def _v3_input(monkeypatch):
+    from trader.kr.us_standard_profit_parity import evaluate_v3_runner_shadow
+    c = contract(monkeypatch, runner="US_V3")
+    stages = {
+        stage: {"status": "FILLED", "broker_fill_proven": True}
+        for stage in ("TP1", "TP2", "TP3")
+    }
+    baseline = dict(
+        contract=c, stage_states=stages,
+        verified_entry_price=100.0, verified_high=110.0,
+        executable_price=108.0, holding_qty=46, orderable_qty=46,
+        high_verified=True, trend_state="TRIM", trend_verified=True,
+        atr_evidence={"valid": True, "atr14": 0.5, "stop": 105.0},
+        partial_stage_status="NOT_TRIGGERED", final_stage_status="NOT_TRIGGERED",
+    )
+    return evaluate_v3_runner_shadow, baseline
+
+
+def test_exact_us_v3_partial_runner_shadow_never_submits(monkeypatch):
+    evaluate, params = _v3_input(monkeypatch)
+    result = evaluate(**params)
+    assert result["action"] == "SHADOW_RUNNER"
+    assert result["source_policy_action"] == "SELL"
+    assert result["stage"] == "PROFIT_DEFENSE_PARTIAL"
+    assert result["qty"] == 23
+    assert result["order_authorized"] is False
+
+
+def test_us_v3_final_shadow_respects_unresolved_partial_and_full_holding(monkeypatch):
+    evaluate, params = _v3_input(monkeypatch)
+    params["trend_state"] = "EXIT"
+    assert evaluate(**params)["stage"] == "RUNNER_FINAL"
+    params["partial_stage_status"] = "ACK"
+    result = evaluate(**params)
+    assert result["action"] == "HOLD"
+    assert result["reason"] == "PARTIAL_ORDER_UNSETTLED_FINAL_REQUIRES_RECONCILE"
+    params["partial_stage_status"] = "NOT_TRIGGERED"
+    params["orderable_qty"] = 40
+    result = evaluate(**params)
+    assert result["action"] == "HOLD"
+    assert result["reason"] == "RUNNER_FINAL_RESERVED_INVENTORY_RECONCILE_REQUIRED"
+
+
+def test_runner_requires_completed_tp_and_verified_high(monkeypatch):
+    evaluate, params = _v3_input(monkeypatch)
+    params["stage_states"]["TP3"] = {"status": "ACK"}
+    assert evaluate(**params)["action"] == "BLOCK"
+    params["stage_states"]["TP3"] = {"status": "FILLED", "broker_fill_proven": True}
+    params["high_verified"] = False
+    assert evaluate(**params)["action"] == "HOLD"
+    params["high_verified"] = True
+    params["unresolved_sell"] = True
+    assert evaluate(**params)["action"] == "BLOCK"
