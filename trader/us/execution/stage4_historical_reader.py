@@ -276,6 +276,9 @@ class HistoricalReadOnlyReader:
         # Bound consecutive original-order GETs so historical debt balance
         # cannot be starved by repeatedly expiring KIS order books.
         self._priority_book_streak = 0
+        # A successfully served balance turn reserves one subsequent
+        # original debt-order GET if debt-only books remain incomplete.
+        self._debt_turn_after_balance = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -363,6 +366,14 @@ class HistoricalReadOnlyReader:
             if changed_claim:
                 _, day, cause = min(changed_claim)
                 kind = "book"
+            elif self._debt_turn_after_balance and priority_debts:
+                # A constantly aging claim book cannot indefinitely starve
+                # unrelated original stop debt proof. This debt GET does NOT
+                # authorize READY when the active claim is still stale.
+                _, day, cause = min(priority_debts)
+                kind = "book"
+                cause = "DEBT_AFTER_BALANCE_" + cause
+                self._debt_turn_after_balance = False
             elif balance_turn:
                 kind, day = "balance", None
                 cause = "BALANCE_FAIRNESS"
@@ -389,6 +400,7 @@ class HistoricalReadOnlyReader:
                 self._priority_book_streak += 1
             else:
                 self._priority_book_streak = 0
+                self._debt_turn_after_balance = bool(priority_debts)
         logger.info(
             "[US_STAGE4][HISTORICAL_READONLY_SELECT] kind=%s source_day=%s "
             "cause=%s claim_days=%d debt_days=%d balance_due=%s "
