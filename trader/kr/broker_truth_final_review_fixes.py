@@ -119,10 +119,22 @@ def _baseline_qty(order: dict[str, Any]) -> int | None:
     the zero baseline needed to resurrect a missing BUY lifecycle.
     """
     from decimal import Decimal, InvalidOperation
+    import json
 
-    request = base._json_dict(order.get("request_json"))
-    meta = base._json_dict(request.get("entry_meta"))
-    order_meta = base._json_dict(order.get("entry_meta_json"))
+    def _stored_json_dict(value: Any) -> dict[str, Any]:
+        # public.orders.request_json is TEXT containing serialized JSON in
+        # production. _json_dict intentionally rejects strings; do not lose
+        # an explicit zero pre-order balance merely due to storage encoding.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                return {}
+        return dict(value) if isinstance(value, dict) else {}
+
+    request = _stored_json_dict(order.get("request_json"))
+    meta = _stored_json_dict(request.get("entry_meta"))
+    order_meta = _stored_json_dict(order.get("entry_meta_json"))
     for source in (request, meta, order_meta):
         if "pre_order_holding_qty" in source:
             value = source["pre_order_holding_qty"]
