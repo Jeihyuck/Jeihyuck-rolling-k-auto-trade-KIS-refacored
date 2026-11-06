@@ -60,7 +60,14 @@ SELECT p.symbol, p.qty, p.as_of,
         WHERE r.symbol=p.symbol AND r.account_id=:account
           AND r.trading_epoch_id=:epoch AND r.trade_date <= :trade_date
           AND r.state ? 'lifecycle'
-    ) AS scoped_legacy_lifecycle_rows
+    ) AS scoped_legacy_lifecycle_rows,
+    (SELECT COALESCE(SUM(CASE WHEN f.side='BUY' THEN f.qty
+                              WHEN f.side='SELL' THEN -f.qty ELSE 0 END), 0)
+        FROM public.us_fills f
+        WHERE f.symbol=p.symbol AND f.trading_epoch_id=:epoch
+          AND (f.account_id IS NULL OR f.account_id=:account)
+          AND f.side IN ('BUY','SELL')
+    ) AS legacy_epoch_net_fills
 FROM latest p
 ORDER BY p.symbol
 """
@@ -103,6 +110,17 @@ def classify_readonly_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "legacy_unscoped_buy_fills": int(row.get("legacy_unscoped_buy_fills") or 0),
         "scoped_legacy_lifecycle_rows": int(
             row.get("scoped_legacy_lifecycle_rows") or 0),
+        # A current-epoch net-fill match is diagnostic consistency ONLY.
+        # Unscoped legacy KIS rows must not become account/portfolio proof.
+        "legacy_epoch_net_fills": (
+            int(row["legacy_epoch_net_fills"])
+            if row.get("legacy_epoch_net_fills") is not None else None
+        ),
+        "legacy_epoch_db_net_matches": (
+            row.get("legacy_epoch_net_fills") is not None
+            and row.get("qty") is not None
+            and int(row["legacy_epoch_net_fills"]) == int(row["qty"])
+        ),
         "auto_identity_rebind_allowed": False,
         "claims_released": 0,
         "orders_submitted": 0,
