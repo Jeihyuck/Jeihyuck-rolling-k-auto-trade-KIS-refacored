@@ -221,3 +221,15 @@ def test_sqlite_actual_repo_core_then_aux_db_roundtrip_and_file_parity(tmp_path,
         assert sorted(int(x["meta"]["rank_final30"]) for x in persisted) == list(range(1, 31))
     finally:
         engine.dispose()
+
+
+def test_even_matching_mirrors_reject_inconsistent_rank_or_nonpositive_score():
+    for change in (
+        lambda row: row.update(rank=29),
+        lambda row: row.update(score_final=0),
+        lambda row: row.update(score_final=-3),
+    ):
+        db = rows()
+        change(db[0])
+        with pytest.raises(RuntimeError, match="INVALID_IDENTITY"):
+            assert_kr_final30_db_file_identity(db, deepcopy(db), source="runtime")
