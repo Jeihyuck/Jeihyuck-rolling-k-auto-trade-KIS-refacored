@@ -1,6 +1,8 @@
 """WSL GO evidence collector cannot accidentally arm a practice order."""
 from pathlib import Path
+import os
 import subprocess
+import sys
 
 SCRIPT = (
     Path(__file__).resolve().parents[2]
@@ -32,10 +34,8 @@ def test_bad_or_missing_date_fails_before_any_broker_or_db_io():
         output = subprocess.run(
             ["bash", str(SCRIPT), *args],
             text=True, capture_output=True, check=False, timeout=4,
+            cwd=SCRIPT.parents[2],
+            env={**os.environ, "US_GO_PYTHON": sys.executable},
         )
-        if args == ["2026-13-99"]:
-            # Regex cannot calendar-validate; the Python certificate will
-            # validate before KIS, but an offline test should not run DB.
-            continue
         assert output.returncode == 42
         assert "INVALID_TRADE_DATE" in output.stderr
