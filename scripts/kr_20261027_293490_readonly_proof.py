@@ -164,7 +164,7 @@ def main() -> int:
         "account_epoch": proof, "kis": broker,
         "reconciliation_performed": False,
     }, ensure_ascii=False, indent=2))
-    return 0 if broker.get("broker_cumulative_proven") is True else 2
+    # Complete KIS pagination with a zero or partial fill is useful evidence,\n    # but it is NOT a resolved 174-share economic execution. Signal nonzero.\n    return 0 if broker.get("status") == "KIS_FULL_FILL_PROVEN" else 2
 
 
 if __name__ == "__main__":
