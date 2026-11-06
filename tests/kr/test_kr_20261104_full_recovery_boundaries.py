@@ -16,6 +16,7 @@ import sqlalchemy as sa
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
 from trader.kr import recovery_scope_20261104 as scope
+from trader.db.repos import OrdersRepo
 from trader.kr.broker_truth_historical_retry_safety import _safe_owned_buy_fill_groups
 from trader.kr.broker_truth_cross_date_unowned_retry import _find_exact_order_for_unowned_fill
 
@@ -182,3 +183,82 @@ def test_am_exit_137_is_never_labelled_a_proven_timeout():
     assert 'if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]' in script
     assert 'if [[ "$rc" -eq 124 ]]; then' in script
     assert "elapsed_sec=" in script
+
+
+
+def test_scoped_source_lookup_prefers_current_account_despite_identical_odno(monkeypatch):
+    engine, _schema, ids, day = _accounts(monkeypatch)
+    repo = OrdersRepo(engine)
+    match = repo.get_order_by_kis_odno_scoped(
+        "practice", "0000001212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=CURRENT,
+        trading_epoch_id=ids[CURRENT]["epoch"],
+    )
+    assert match is not None
+    assert match["order_id"] == ids[CURRENT]["order"]
+    previous = repo.get_order_by_kis_odno_scoped(
+        "practice", "1212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=PREVIOUS,
+        trading_epoch_id=ids[PREVIOUS]["epoch"],
+    )
+    assert previous is not None
+    assert previous["order_id"] == ids[PREVIOUS]["order"]
+    assert repo.get_order_by_kis_odno_scoped(
+        "practice", "0000001212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=CURRENT,
+        trading_epoch_id=ids[PREVIOUS]["epoch"],
+    ) is None
+
+
+def test_open_order_scope_ignores_only_proven_foreign_unresolved(monkeypatch):
+    engine, schema, ids, _day = _accounts(monkeypatch)
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.orders).values(status="UNRESOLVED_ACK"))
+    class FakeKIS:
+        CANO = "22222222"
+        ACNT_PRDT_CD = "01"
+    blockers = scope.current_scope_open_order_blockers(
+        engine=engine, env="practice", kis=FakeKIS(),
+        orders_repo=OrdersRepo(engine),
+    )
+    assert {item["order_id"] for item in blockers} == {ids[CURRENT]["order"]}
+
+
+def test_unproven_open_order_never_disappears_from_protective_sell_gate():
+    active = scope.KRRecoveryScope(
+        env="practice", account_key=CURRENT, trading_epoch_id="current-epoch"
+    )
+    foreign = {
+        "order_id": "old", "env": "practice", "strategy": STRATEGY,
+        "portfolio_epoch_id": "p-old", "position_cycle_id": "c-old",
+        "trading_epoch_id": "old-epoch",
+    }
+    current = {
+        "order_id": "current", "env": "practice", "strategy": STRATEGY,
+        "portfolio_epoch_id": "p-current", "position_cycle_id": "c-current",
+        "trading_epoch_id": "current-epoch",
+    }
+    unknown = {**current, "order_id": "unknown", "portfolio_epoch_id": None}
+    foreign_portfolio = {
+        "portfolio_epoch_id": "p-old", "env": "practice",
+        "account_id": PREVIOUS, "strategy": STRATEGY,
+        "trading_epoch_id": "old-epoch",
+    }
+    current_portfolio = {
+        "portfolio_epoch_id": "p-current", "env": "practice",
+        "account_id": CURRENT, "strategy": STRATEGY,
+        "trading_epoch_id": "current-epoch",
+    }
+    relevant = scope.relevant_open_orders_for_scope(
+        orders=[foreign, current, unknown],
+        portfolios={"p-old": foreign_portfolio, "p-current": current_portfolio},
+        scope=active,
+    )
+    assert {item["order_id"] for item in relevant} == {"current", "unknown"}
+    # Tampered foreign ownership is UNKNOWN, not a proven harmless prior order.
+    relevant = scope.relevant_open_orders_for_scope(
+        orders=[foreign],
+        portfolios={"p-old": {**foreign_portfolio, "strategy": "KR_INFINITE"}},
+        scope=active,
+    )
+    assert relevant == [foreign]
