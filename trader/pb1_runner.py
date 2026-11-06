@@ -7882,6 +7882,7 @@ def run_once(
                                 "[KR_RECONCILE_LANES][POST_EXIT_BALANCE_FRESHNESS] "
                                 "verified=0 action=FAIL_CLOSED_TO_FULL"
                             )
+                            raise RuntimeError("POST_EXIT_ORIGINAL_KIS_FETCH_TIME_UNPROVEN")
                         _post_exact, _post_reason = prove_safe_protective_sell_handoff(
                             engine=engine, kis=kis, env=env_effective,
                             strategy="pb1_pullback_close", trade_date=trade_date,
