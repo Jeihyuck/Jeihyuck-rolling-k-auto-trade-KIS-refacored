@@ -6,6 +6,7 @@ real-PostgreSQL integration check before MERGE READY.
 from __future__ import annotations
 
 from datetime import timedelta
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -55,6 +56,10 @@ def _accounts(monkeypatch):
                 code="005930", market="KOSPI", side="BUY",
                 ord_type="MARKET", qty=2, status="FILLED",
                 client_order_key=account + ":order",
+                # Durable immutable pre-order KIS holding evidence. The original
+                # fixture lacked both a lifecycle and this zero baseline;
+                # production correctly rejected it as unsafe recovery.
+                request_json=json.dumps({"pre_order_holding_qty": 0}),
                 kis_odno="0000001212", created_at=day, submitted_at=day,
             ))
             conn.execute(sa.insert(schema.fills).values(
@@ -77,6 +82,26 @@ def test_old_active_account_does_not_enter_current_owned_buy_recovery(monkeypatc
     assert set(groups) == {ids[CURRENT]["order"]}
     assert groups[ids[CURRENT]["order"]]["order"]["position_cycle_id"] == ids[CURRENT]["cycle"]
     assert ids[PREVIOUS]["order"] not in groups
+
+
+
+@pytest.mark.parametrize("unsafe_request", [
+    {},
+    {"pre_order_holding_qty": None},
+    {"pre_order_holding_qty": "unknown"},
+    {"pre_order_holding_qty": 1},
+])
+def test_current_account_without_zero_baseline_is_blocked(monkeypatch, unsafe_request):
+    engine, schema, identities, _day = _accounts(monkeypatch)
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == identities[CURRENT]["order"],
+        ).values(request_json=json.dumps(unsafe_request)))
+    groups = _safe_owned_buy_fill_groups(
+        engine=engine, env="practice", strategy=STRATEGY,
+    )
+    assert identities[CURRENT]["order"] not in groups
+    assert identities[PREVIOUS]["order"] not in groups
 
 
 def test_unowned_fill_lookup_uses_both_active_epoch_and_order_cycle(monkeypatch):
