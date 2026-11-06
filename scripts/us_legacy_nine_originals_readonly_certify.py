@@ -14,6 +14,7 @@ WSL practice invocation (no order/cancel):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from collections import defaultdict
@@ -285,6 +286,29 @@ def certify_get_only(plan: dict, client: Any) -> dict:
     }
 
 
+def assert_practice_client_matches_current_scope(client: Any, scope: dict) -> None:
+    """The authenticated KIS client must belong to the SAME scoped DB account.
+
+    Prior legacy BUY rows have NULL account_id. Matching only their symbol,
+    order number and quantity can otherwise prove an unrelated practice
+    account. Check CANO/product locally, print only an error classification.
+    """
+    from trader.account_state import get_account_key
+
+    if (scope.get("env") != "practice"
+            or scope.get("market") != "US"
+            or not scope.get("trading_epoch_id")):
+        raise RuntimeError("US_GO_DB_SCOPE_UNVERIFIED")
+    cano = str(getattr(client, "_cano", "") or "")
+    product = str(getattr(client, "_acnt_prdt_cd", "") or "")
+    if not cano.isdigit() or not product.isdigit():
+        raise RuntimeError("US_GO_KIS_CLIENT_ACCOUNT_UNVERIFIED")
+    key = get_account_key(env="practice", cano=cano, product_code=product)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    if not scope.get("account_id") or digest != scope["account_id"]:
+        raise RuntimeError("US_GO_KIS_ACCOUNT_SCOPE_MISMATCH")
+
+
 def main() -> int:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trade-date",required=True)
@@ -312,7 +336,9 @@ def main() -> int:
             engine,trading_epoch_id=scope["trading_epoch_id"],
             trade_date=args.trade_date)
         plan=prepare_original_plan(*archive)
-        result=certify_get_only(plan,KisUSClient(env="practice"))
+        client=KisUSClient(env="practice")
+        assert_practice_client_matches_current_scope(client,scope)
+        result=certify_get_only(plan,client)
     except Exception as exc:
         result={"status":"US_ORIGINAL_CERTIFICATION_FAILED",
                 "error_type":type(exc).__name__,"broker_post_count":0,
