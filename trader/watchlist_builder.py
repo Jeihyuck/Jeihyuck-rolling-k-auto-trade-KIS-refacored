@@ -6008,8 +6008,20 @@ def build_and_save_watchlist(
             logger.warning("[WATCHLIST][SAVE_VERIFY][FAIL_SOFT_AFTER_CORE] reason=%s action=continue_core_done", _sv_exc)
             if builder.last_bundle is not None:
                 builder.last_bundle["last_stage"] = "aux_db_roundtrip fail_soft"
+        elif os.getenv("PREP_REQUIRE_SCORED_FINAL30", "1") == "1":
+            # Never mark a scored Final30 as accepted when its exact DB
+            # roundtrip raised a non-transient error. The trade loader's
+            # frozen owner/rank/score proof must be established, not assumed.
+            logger.exception(
+                "[WATCHLIST][SAVE_VERIFY][FAIL_CLOSED] strategy=%s env=%s as_of=%s",
+                _scored_strategy, env, as_of,
+            )
+            raise
         else:
-            logger.warning("[WATCHLIST][SAVE_VERIFY][ERROR] reason=%s -> continuing", _sv_exc)
+            logger.warning(
+                "[WATCHLIST][SAVE_VERIFY][OPT_OUT_WARN] strict=0 reason=%s",
+                _sv_exc,
+            )
     # ─────────────────────────────────────────────────────────────────────────
 
     # Save final30 snapshot to JSON (for fallback)
