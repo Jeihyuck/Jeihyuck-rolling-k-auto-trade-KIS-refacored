@@ -405,6 +405,77 @@ def _tp_live_quote_threshold_proven(intent: dict, quote: dict, *, now_epoch: flo
     return True, "US_TP_LIVE_THRESHOLD_CONFIRMED"
 
 
+
+def _assert_tp_post_quote_submit_authority(
+    intent: dict, quote: dict, *, account_env: str, context: Any,
+    account_authority: Any, attempt_id: str, client_order_key: str,
+    strategy_owner: str, symbol: str, side: str, qty: int,
+    max_decision_age_sec: float,
+    worker_health_reader: Any = None,
+) -> None:
+    """Recheck TP authorization *after* potentially slow quote GET.
+
+    The native KIS callback runs after its own rate-limit wait and immediately
+    before requests.post. No additional KIS GET or durable state transition is
+    permitted after these checks. All failures are proven PRE-HTTP aborts.
+    """
+    from trader.us.execution.kis_us_client import KisUSPreSubmitError
+
+    def _check_stage4() -> None:
+        if os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") != "WORKER":
+            return
+        try:
+            reader = worker_health_reader
+            if reader is None:
+                from trader.us.execution.authoritative_reconcile_worker import read_worker_health
+                reader = read_worker_health
+            proof = reader(env=account_env)
+            if (proof.get("reconcile_status") not in {"OK", "WARN"}
+                    or proof.get("replay_status") not in {
+                        "OK", "RECOVERED", "NO_ACTIVE_CLAIMS",
+                        "WARN", "PARTIAL", "UNRESOLVED",
+                    }):
+                raise RuntimeError("US_STAGE4_RECONCILE_NOT_VERIFIED")
+        except Exception as exc:
+            raise KisUSPreSubmitError(
+                "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
+            ) from exc
+
+    # The earlier authorizations occurred before the TP quote GET and may
+    # have expired during a slow KIS response.
+    _check_stage4()
+    if os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE":
+        try:
+            if account_authority is None:
+                raise RuntimeError("RESERVATION_AUTHORITY_MISSING")
+            account_authority.assert_reserved_submit_authority(
+                attempt_id=attempt_id, client_order_key=client_order_key,
+                strategy_owner=strategy_owner, symbol=symbol,
+                side=side, qty=qty,
+            )
+        except Exception as exc:
+            raise KisUSPreSubmitError(
+                "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP"
+            ) from exc
+        # Even the reservation DB read can consume the remaining 30s READY
+        # window. Recheck after that read, not just before it.
+        _check_stage4()
+    if context is not None and not context.broker_submit_allowed():
+        raise KisUSPreSubmitError("US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP")
+    decision_ok, decision_reason = _tp_decision_fresh_for_native_http(
+        intent, max_age_sec=max_decision_age_sec,
+    )
+    if not decision_ok:
+        raise KisUSPreSubmitError(decision_reason)
+    # The original quote must remain <=5s old at the real HTTP boundary;
+    # no re-query here, because that could stale the Stage4 authorization.
+    quote_ok, quote_reason = _tp_live_quote_threshold_proven(
+        intent, quote, now_epoch=time.time(),
+    )
+    if not quote_ok:
+        raise KisUSPreSubmitError(quote_reason)
+
+
 def _is_cash_insufficient_reject(msg: str) -> bool:
     text = str(msg or "").lower()
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
@@ -2058,6 +2129,10 @@ def route_order(
             os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") == "1"
             and account_env == "practice" and _native_kis
         )
+        # The native TP post-quote gate receives this even when account-wide
+        # reservations are OFF. Never leave the boundary's authority unbound.
+        _account_authority = None
+        _account_lease = None
         if (
             os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
             and not _atomic_claim_outbox
@@ -2519,6 +2594,21 @@ def route_order(
                 raise KisUSPreSubmitError("US_TP_LIVE_QUOTE_UNVERIFIED") from _tp_quote_exc
             if not _tp_quote_ok:
                 raise KisUSPreSubmitError(_tp_quote_reason)
+            # A slow KIS quote GET (or subsequent DB authority check) can
+            # expire Stage4, Tick, reservation or the quote itself. This is
+            # the LAST gate within the native pre-requests.post callback.
+            _assert_tp_post_quote_submit_authority(
+                intent, _tp_quote, account_env=account_env, context=context,
+                account_authority=_account_authority,
+                attempt_id=str(intent["submit_attempt_id"]),
+                client_order_key=str(order_key or ""),
+                strategy_owner=str(
+                    intent.get("strategy_owner")
+                    or lifecycle_meta.get("strategy_owner") or ""
+                ).strip().upper(),
+                symbol=symbol_upper, side=side, qty=qty,
+                max_decision_age_sec=_tp_max_age,
+            )
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
