@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -26,8 +27,8 @@ CURRENT = "practice:22222222:01"
 PREVIOUS = "practice:11111111:01"
 
 
-def _accounts(monkeypatch):
-    engine = sa.create_engine("sqlite:///:memory:")
+def _accounts(monkeypatch, *, engine=None):
+    engine = engine if engine is not None else sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
     monkeypatch.setattr(scope, "trading_epoch_enforced", lambda: True)
@@ -262,3 +263,49 @@ def test_unproven_open_order_never_disappears_from_protective_sell_gate():
         scope=active,
     )
     assert relevant == [foreign]
+
+
+
+def test_postgres_scoped_original_and_protective_open_orders(monkeypatch):
+    """Disposable local PostgreSQL; never production. Assert same ODNO/day."""
+    url = os.getenv("PBCORE_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("requires CI-local PostgreSQL URL")
+    from sqlalchemy.engine import make_url
+
+    target = make_url(url)
+    if target.host not in {"localhost", "127.0.0.1"} or target.database != "kr_ci":
+        pytest.skip("only disposable CI-local PostgreSQL kr_ci is permitted")
+    admin = sa.create_engine(target, isolation_level="AUTOCOMMIT")
+    name = "kr312_scope_" + uuid4().hex[:12]
+    engine = None
+    created = False
+    try:
+        with admin.connect() as conn:
+            conn.exec_driver_sql(f'CREATE DATABASE "{name}"')
+        created = True
+        engine = sa.create_engine(target.set(database=name))
+        _engine, schema, ids, day = _accounts(monkeypatch, engine=engine)
+        repo = OrdersRepo(engine)
+
+        original = repo.get_order_by_kis_odno_scoped(
+            "practice", "0000001212", trade_date=day.date(),
+            code="005930", side="BUY", account_id=CURRENT,
+            trading_epoch_id=ids[CURRENT]["epoch"],
+        )
+        assert original is not None
+        assert str(original["order_id"]) == ids[CURRENT]["order"]
+
+        with engine.begin() as conn:
+            conn.execute(sa.update(schema.orders).values(status="UNRESOLVED_ACK"))
+        blockers = scope.current_scope_open_order_blockers(
+            engine=engine, env="practice", kis=None, orders_repo=repo,
+        )
+        assert {str(row["order_id"]) for row in blockers} == {ids[CURRENT]["order"]}
+    finally:
+        if engine is not None:
+            engine.dispose()
+        if created:
+            with admin.connect() as conn:
+                conn.exec_driver_sql(f'DROP DATABASE "{name}" WITH (FORCE)')
+        admin.dispose()
