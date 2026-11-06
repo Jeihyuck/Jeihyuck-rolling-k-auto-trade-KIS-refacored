@@ -4214,6 +4214,33 @@ def get_balance_state(
             raise KisBalanceUnavailable("balance_output1_not_list")
         if not isinstance(balance_snapshot_raw.get("output2"), dict):
             raise KisBalanceUnavailable("balance_output2_not_dict")
+        # Only the KIS wrapper's timestamp from a successful original HTTP
+        # balance fetch may certify freshness.  In particular, a cached or
+        # precheck snapshot must not become "fresh" merely because this runner
+        # reads or copies it on a later tick.
+        verified_at = getattr(kis, "_balance_cache_at", None)
+        if (
+            balance_source in {"api", "wrapper_cache"}
+            and isinstance(verified_at, datetime)
+            and verified_at.tzinfo is not None
+        ):
+            age_sec = (now_kst() - verified_at).total_seconds()
+            if 0 <= age_sec <= 20:
+                balance_snapshot_raw["_kr_verified_fresh_at_kst"] = verified_at.isoformat()
+                logger.info(
+                    "[KR_BALANCE][FRESHNESS] source=%s age_sec=%.3f verified=1",
+                    balance_source, age_sec,
+                )
+            else:
+                logger.warning(
+                    "[KR_BALANCE][FRESHNESS] source=%s verified=0 reason=STALE_OR_FUTURE_CACHE",
+                    balance_source,
+                )
+        else:
+            logger.warning(
+                "[KR_BALANCE][FRESHNESS] source=%s verified=0 reason=UNPROVEN_KIS_FETCH_TIME",
+                balance_source,
+            )
         return BALANCE_STATE_OK, balance_snapshot_raw, balance_source
     except KisBalanceUnavailable as exc:
         logger.warning("[PB1][BALANCE][UNAVAILABLE] %s", exc)
