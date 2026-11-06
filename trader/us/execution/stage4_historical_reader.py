@@ -273,6 +273,9 @@ class HistoricalReadOnlyReader:
         self._balance_at = 0.0
         self._last_error: str | None = "NOT_STARTED"
         self._cursor = 0
+        # Bound consecutive original-order GETs so historical debt balance
+        # cannot be starved by repeatedly expiring KIS order books.
+        self._priority_book_streak = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -306,12 +309,16 @@ class HistoricalReadOnlyReader:
                 self._books.clear()
                 self._balance = None
             return
-        # A newly changed/expired claim signature is on the critical path
-        # for Stage4 READY. Refresh its ORIGINAL KIS order book ahead of a
-        # less urgent balance/round-robin read; never extend a stale TTL and
-        # never synthesize broker terminality from DB claims.
+        # A changed active claim MUST refresh its original KIS book first.
+        # Expiring debt-only books are lower priority: Stage4 READY requires
+        # the active claim evidence, whereas deferred settlement keeps its
+        # existing fence until separate original-date evidence is available.
+        # Every KIS poll performs at most one GET; an older/expired book
+        # cannot repeatedly steal all balance turns.
+        claim_dates = {key[0] for key in signatures}
         with self._lock:
-            priority_books = []
+            priority_claims = []
+            priority_debts = []
             observed_now = self.clock()
             for source_day in sorted(source_dates):
                 book = self._books.get(source_day)
@@ -319,26 +326,77 @@ class HistoricalReadOnlyReader:
                     key for key in signatures if key[0] == source_day
                 )
                 if book is None:
-                    priority_books.append((float("-inf"), source_day, "MISSING"))
+                    priority = (float("-inf"), source_day, "MISSING")
                 elif book["keys"] != expected_keys:
-                    priority_books.append((float("-inf"), source_day, "CLAIM_SET_CHANGED"))
-                elif observed_now < book["at"] or observed_now - book["at"] > self.ttl_sec:
-                    priority_books.append((float(book["at"]), source_day, "STALE"))
-        if priority_books:
-            _, day, cause = min(priority_books)
-            kind = "book"
-            # Advance round-robin only if this critical refresh was also
-            # the next scheduled task; otherwise preserve the deferred
-            # balance task's turn once the book becomes verifiably fresh.
-            if tasks[self._cursor % len(tasks)] == ("book", day):
-                self._cursor += 1
-            logger.info(
-                "[US_STAGE4][HISTORICAL_PRIORITY_REFRESH] source_day=%s cause=%s",
-                day, cause,
+                    priority = (float("-inf"), source_day, "CLAIM_SET_CHANGED")
+                else:
+                    age = observed_now - book["at"]
+                    # Refresh active claim proof *before* it becomes stale.
+                    # An identical new response cannot extend an already
+                    # adopted writer snapshot's original TTL.
+                    if age < 0 or age > self.ttl_sec:
+                        priority = (float(book["at"]), source_day, "STALE")
+                    elif source_day in claim_dates and age >= self.ttl_sec / 2:
+                        priority = (float(book["at"]), source_day, "CLAIM_TTL_AT_RISK")
+                    else:
+                        continue
+                if source_day in claim_dates:
+                    priority_claims.append(priority)
+                else:
+                    priority_debts.append(priority)
+            balance_due = (
+                ("balance", None) in tasks
+                and (self._balance is None
+                     or observed_now < self._balance_at
+                     or observed_now - self._balance_at >= self.ttl_sec / 2)
             )
-        else:
-            kind, day = tasks[self._cursor % len(tasks)]
-            self._cursor += 1
+            # A genuinely changed claim signature takes precedence even
+            # over balance fairness; never present its old book as READY.
+            changed_claim = [item for item in priority_claims
+                             if item[2] == "CLAIM_SET_CHANGED"]
+            # At most one claim-book pass can preempt an overdue balance.
+            # Debt-only refreshes cannot starve the balance either.
+            balance_turn = (
+                balance_due and self._priority_book_streak >= max(1, len(claim_dates))
+                and not changed_claim
+            )
+            if changed_claim:
+                _, day, cause = min(changed_claim)
+                kind = "book"
+            elif balance_turn:
+                kind, day = "balance", None
+                cause = "BALANCE_FAIRNESS"
+            elif priority_claims:
+                _, day, cause = min(priority_claims)
+                kind = "book"
+            elif priority_debts and (
+                not balance_due or self._priority_book_streak == 0
+            ):
+                _, day, cause = min(priority_debts)
+                kind = "book"
+            elif balance_due:
+                kind, day = "balance", None
+                cause = "BALANCE_DUE"
+            elif priority_debts:
+                _, day, cause = min(priority_debts)
+                kind = "book"
+            else:
+                kind, day = tasks[self._cursor % len(tasks)]
+                cause = "ROUND_ROBIN"
+            if tasks[self._cursor % len(tasks)] == (kind, day):
+                self._cursor += 1
+            if kind == "book":
+                self._priority_book_streak += 1
+            else:
+                self._priority_book_streak = 0
+        logger.info(
+            "[US_STAGE4][HISTORICAL_READONLY_SELECT] kind=%s source_day=%s "
+            "cause=%s claim_days=%d debt_days=%d balance_due=%s "
+            "consecutive_books=%d max_dates=%d",
+            kind, day or "NONE", cause, len(claim_dates),
+            len(debt_dates), bool(balance_due),
+            self._priority_book_streak, self.max_dates,
+        )
         if kind == "book":
             orders = provider.get_today_orders(trade_date=day)
             provenance = provider.get_order_lookup_provenance(day)
@@ -467,6 +525,15 @@ class HistoricalReadOnlyReader:
             raise RuntimeError("US_STAGE4_HISTORICAL_GENERATION_MISMATCH")
         if snapshot["active_keys"] != active_claim_signature(claims):
             raise RuntimeError("US_STAGE4_HISTORICAL_CLAIM_SET_CHANGED")
+        # Replay MUST be committed while its *adopted* original snapshot
+        # is still fresh. A newer, identical GET cannot retroactively renew
+        # proof used during an already-running reconciliation.
+        now = self.clock()
+        for day in {k[0] for k in snapshot["active_keys"]}:
+            original = snapshot["books"].get(day)
+            if (original is None or now < original["at"]
+                    or now - original["at"] > self.ttl_sec):
+                raise RuntimeError("US_STAGE4_HISTORICAL_BROKER_EVIDENCE_STALE")
         current = self.snapshot_for_claims(claims)
         for day in {k[0] for k in snapshot["active_keys"]}:
             if day not in current["books"]:
