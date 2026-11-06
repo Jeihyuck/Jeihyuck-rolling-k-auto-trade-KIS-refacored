@@ -11,7 +11,7 @@ from scripts.us_original_position_lineage_readonly_audit import (
 
 BASE = {
     "symbol": "TMO", "qty": 5, "as_of": "2026-11-05",
-    "account_matches": True, "epoch_matches": True,
+    "account_matches": True, "account_absent": False, "epoch_matches": True,
     "portfolio_present": True, "cycle_present": True,
     "owner_present": True, "scoped_buy_orders": 2,
     "scoped_buy_fills": 2, "scoped_legacy_lifecycle_rows": 12,
@@ -19,7 +19,8 @@ BASE = {
 
 
 @pytest.mark.parametrize("changes,expected", [
-    ({"account_matches": False}, "ORIGINAL_ACCOUNT_SCOPE_UNVERIFIED"),
+    ({"account_matches": False}, "ORIGINAL_ACCOUNT_SCOPE_MISMATCH_OR_UNKNOWN"),
+    ({"account_matches": None, "account_absent": True}, "LEGACY_ORIGINAL_ACCOUNT_SCOPE_ABSENT"),
     ({"epoch_matches": False}, "TRADING_EPOCH_MISMATCH"),
     ({"portfolio_present": False}, "ORIGINAL_PORTFOLIO_CYCLE_UNVERIFIED"),
     ({"cycle_present": False}, "ORIGINAL_PORTFOLIO_CYCLE_UNVERIFIED"),
@@ -34,6 +35,8 @@ def test_readonly_lineage_never_infers_unverified_identity(changes, expected):
     assert assessed["auto_identity_rebind_allowed"] is False
     assert assessed["claims_released"] == assessed["orders_submitted"] == 0
     assert assessed["db_rows_modified"] == 0
+    assert assessed["legacy_unscoped_buy_orders"] >= 0
+    assert assessed["legacy_unscoped_buy_fills"] >= 0
 
 
 def test_disallow_unlisted_symbol():
@@ -46,6 +49,8 @@ def test_readonly_query_is_account_and_epoch_scoped():
     assert "o.trading_epoch_id=:epoch" in READONLY_SQL
     assert "f.account_id=:account" in READONLY_SQL
     assert "r.trading_epoch_id=:epoch" in READONLY_SQL
+    assert "o.account_id IS NULL" in READONLY_SQL
+    assert "f.account_id IS NULL" in READONLY_SQL
     assert "UPDATE " not in READONLY_SQL.upper()
     assert "DELETE " not in READONLY_SQL.upper()
 
