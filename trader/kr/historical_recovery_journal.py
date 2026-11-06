@@ -49,19 +49,20 @@ def lane_enabled(env: str) -> bool:
     )
 
 
-def _key(*, scope: Any, strategy: str, trading_date: date) -> str:
+def _key(*, scope: Any, strategy: str, trading_date: date, lane_name: str = "AM") -> str:
     proof = {
         "version": VERSION, "env": scope.env,
         "account_sha256": hashlib.sha256(scope.account_key.encode()).hexdigest(),
         "epoch": scope.trading_epoch_id,
         "strategy": strategy, "trade_date": trading_date.isoformat(),
+        "lane_name": lane_name,
     }
     return f"KR_HIST_RECOVERY:{hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest()}"
 
 
 def choose_historical_lane(
     *, engine: Any, kis: Any, env: str,
-    strategy: str, trading_date: date,
+    strategy: str, trading_date: date, lane_name: str = "AM",
 ) -> RecoveryLane:
     """Transactional claim via row FOR UPDATE, with a nonce fencing token.
 
@@ -69,6 +70,8 @@ def choose_historical_lane(
     worker we fence new BUY until CLOSE's dedicated broker recovery. This is
     deliberately conservative to avoid duplicate historical economic writes.
     """
+    if lane_name not in {"AM", "CLOSE"}:
+        return RecoveryLane("CURRENT_ONLY_BLOCK", reason="UNKNOWN_RECOVERY_LANE")
     if not lane_enabled(env):
         return RecoveryLane("LEGACY", reason="NOT_ACTIVATED")
     try:
@@ -77,7 +80,7 @@ def choose_historical_lane(
             return RecoveryLane("LEGACY", reason="EPOCH_SCOPE_UNPROVEN")
         if engine.dialect.name != "postgresql":
             return RecoveryLane("LEGACY", reason="NO_POSTGRES_ADVISORY_PROOF")
-        key = _key(scope=scope, strategy=strategy, trading_date=trading_date)
+        key = _key(scope=scope, strategy=strategy, trading_date=trading_date, lane_name=lane_name)
         table = schema_for_engine(engine).job_checkpoints
         nonce = str(uuid4())
         with engine.begin() as conn:
@@ -109,6 +112,7 @@ def choose_historical_lane(
                         "status": "CHECKING", "version": VERSION,
                         "fencing_token": nonce,
                         "trade_date": trading_date.isoformat(),
+                        "lane_name": lane_name,
                         "trading_epoch_id": scope.trading_epoch_id,
                         "account_sha256": hashlib.sha256(scope.account_key.encode()).hexdigest(),
                     },
