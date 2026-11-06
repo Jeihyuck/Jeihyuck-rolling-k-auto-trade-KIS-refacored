@@ -2759,7 +2759,12 @@ def reconcile_kis(
     tick_ts: datetime,
     balance_snapshot: dict | None = None,
     runtime_dir: str | None = None,
+    historical_recovery: bool = True,
 ) -> dict[str, object]:
+    # CURRENT_ONLY reconciles today's actual KIS originals/fills and verifies
+    # current account truth; it NEVER repairs historical BUYs/positions/meta.
+    # The calling lane must prove a durable same-account/epoch full recovery
+    # before using this mode for any new BUY.
     reconcile_run_id = _resolve_reconcile_run_id(
         engine,
         run_id,
@@ -2818,15 +2823,13 @@ def reconcile_kis(
     fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
     _kr_promotion_started = time.monotonic()
-    promoted = _promote_open_buy_orders_from_holdings(
-        env=env,
-        strategy=strategy,
-        ctx_run_id=reconcile_run_id,
-        tick_ts=tick_ts,
-        holdings_rows=holdings_rows,
-        orders_repo=orders_repo,
-        fills_repo=fills_repo,
-        positions_repo=positions_repo,
+    promoted = (
+        _promote_open_buy_orders_from_holdings(
+            env=env, strategy=strategy, ctx_run_id=reconcile_run_id,
+            tick_ts=tick_ts, holdings_rows=holdings_rows,
+            orders_repo=orders_repo, fills_repo=fills_repo,
+            positions_repo=positions_repo,
+        ) if historical_recovery else {"orders": 0, "fills": 0, "codes": []}
     )
     logger.info(
         "[KR_RECONCILE][PROMOTION_AFTER_BROKER] elapsed_ms=%.1f",
@@ -2861,7 +2864,7 @@ def reconcile_kis(
     # P1: restore exact source BUY lifecycle before any historical holdings
     # import or exit-policy evaluation. Only fresh KIS holdings + unique BUY
     # order + broker-satisfied PB1 claim + verified SHA authorize recovery.
-    if not reset_mode and fresh_balance_proven:
+    if historical_recovery and not reset_mode and fresh_balance_proven:
         try:
             from trader.kr.frozen_contract_recovery_260 import restore_verified_imported_buy_contracts
             recovered_contracts = restore_verified_imported_buy_contracts(
@@ -2911,7 +2914,15 @@ def reconcile_kis(
                 int(repair_fastpath), repair_fastpath_reason, int(fresh_balance_proven))
     _kr_history_started = time.monotonic()
     restored = 0
-    if repair_fastpath:
+    if not historical_recovery:
+        logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=CURRENT_ORDERS_ONLY")
+        if not repair_fastpath:
+            # Today's order source can be reconciled safely, but an unknown
+            # account-wide holding/claim parity cannot license another BUY.
+            reconcile_result["ok"] = False
+            reconcile_result["reason"] = "CURRENT_ONLY_ACCOUNT_PARITY_NOT_PROVEN"
+            reconcile_result["degraded"] = "CURRENT_ONLY_ACCOUNT_PARITY_NOT_PROVEN"
+    elif repair_fastpath:
         logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=EXACT_BROKER_ACTIVE_CYCLE_PARITY")
     elif reset_mode:
         allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
@@ -2976,7 +2987,9 @@ def reconcile_kis(
     # [2026-05-21] entry meta 복원 (KIS holdings 복구 포지션 대상)
     meta_restored = 0
     try:
-        if repair_fastpath:
+        if not historical_recovery:
+            logger.info("[KR_RECONCILE][META_RESTORE][SKIP] reason=CURRENT_ORDERS_ONLY")
+        elif repair_fastpath:
             logger.info("[KR_RECONCILE][META_RESTORE][SKIP] reason=FROZEN_CONTRACT_ALREADY_VERIFIED")
         else:
             ledger_repo = LedgerEventsRepo(engine)
@@ -2993,8 +3006,9 @@ def reconcile_kis(
     except Exception as _meta_exc:
         logger.warning("[RECONCILE][META_RESTORE][SKIP] err=%s", _meta_exc)
 
-    logger.info("[KR_RECONCILE][HISTORICAL_REPAIR] elapsed_ms=%.1f skipped=%s",
-                1000 * (time.monotonic() - _kr_history_started), int(repair_fastpath))
+    logger.info("[KR_RECONCILE][HISTORICAL_REPAIR] elapsed_ms=%.1f skipped=%s current_only=%s",
+                1000 * (time.monotonic() - _kr_history_started),
+                int(repair_fastpath or not historical_recovery), int(not historical_recovery))
     guard_result = None
     guard_reason = None
     allow_purge = None
@@ -3054,6 +3068,7 @@ def reconcile_kis(
             "holdings": len(holdings_rows),
             "restored_positions": restored,
             "historical_repair_fastpath": repair_fastpath,
+            "historical_recovery_executed": bool(historical_recovery),
             "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
@@ -3073,6 +3088,7 @@ def reconcile_kis(
             "filled_codes": refresh_codes,
             "restored_positions": restored,
             "historical_repair_fastpath": repair_fastpath,
+            "historical_recovery_executed": bool(historical_recovery),
             "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
