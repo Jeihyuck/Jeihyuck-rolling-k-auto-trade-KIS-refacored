@@ -26,5 +26,9 @@ def broker_reconcile_guard_blocks(result: Mapping[str, Any] | None) -> bool:
         return (
             isinstance(qty, bool) or not isinstance(qty, int) or qty < 1
             or bool(result.get("holdings_error"))
+            # Mere presence of KIS shares says nothing about whether an
+            # imported DB cycle owns those shares. Require independently
+            # proven exact active-account/epoch/cycle/holdings parity.
+            or result.get("historical_repair_fastpath") is not True
         )
     return True
