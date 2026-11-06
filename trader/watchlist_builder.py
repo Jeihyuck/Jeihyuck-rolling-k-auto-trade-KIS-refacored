@@ -190,9 +190,9 @@ def canonicalize_final30_aux_db_payload(
         code = str(row.get("code") or meta.get("code") or "").strip()
         if code.isdigit():
             code = code.zfill(6)
-        style = str(
-            row.get("entry_style_selected") or meta.get("entry_style_selected") or ""
-        ).strip().upper()
+        style = _normalize_entry_style_value(
+            row.get("entry_style_selected") or meta.get("entry_style_selected")
+        )
         if not (len(code) == 6 and code.isdigit()) or code in seen:
             raise RuntimeError(f"KR_FINAL30_AUX_INVALID_CODE:{source}:{code}")
         # A component or score is evidence of a candidate, NOT proof of which
