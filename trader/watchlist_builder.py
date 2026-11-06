@@ -5721,15 +5721,12 @@ def build_and_save_watchlist(
                     ohlcv_provider=ohlcv_provider,
                     source="build_and_save_watchlist_cache",
                 )
+                if strategy == "pb1_watchlist_final_scored":
+                    existing = canonicalize_final30_aux_db_payload(
+                        existing, source="CACHE_DIRECT_DB_SAVE",
+                    )
                 repo.save_watchlist(
-                    env=env,
-                    strategy=strategy,
-                    as_of=as_of,
-                    members=(
-                        canonicalize_final30_aux_db_payload(
-                            existing, source="CACHE_DIRECT_DB_SAVE",
-                        ) if strategy == "pb1_watchlist_final_scored" else existing
-                    ),
+                    env=env, strategy=strategy, as_of=as_of, members=existing,
                 )
                 
                 if return_bundle:
@@ -5907,13 +5904,13 @@ def build_and_save_watchlist(
     if builder.last_bundle is not None:
         builder.last_bundle["last_stage"] = "aux_db_save_final30 start"
     try:
+        # Canonicalize the SAME selected rows used by all downstream
+        # snapshot/bundle exports, not only the DB insert payload.
+        watchlist = canonicalize_final30_aux_db_payload(
+            watchlist, source="BUILDER_AUX_DB_SAVE",
+        )
         repo.save_watchlist(
-            env=env,
-            strategy=_scored_strategy,
-            as_of=as_of,
-            members=canonicalize_final30_aux_db_payload(
-                watchlist, source="BUILDER_AUX_DB_SAVE",
-            ),
+            env=env, strategy=_scored_strategy, as_of=as_of, members=watchlist,
         )
     except Exception as exc:
         if core_artifact_saved and _is_transient_db_exception(exc):
