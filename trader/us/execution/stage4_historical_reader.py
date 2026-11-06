@@ -354,10 +354,10 @@ class HistoricalReadOnlyReader:
             # over balance fairness; never present its old book as READY.
             changed_claim = [item for item in priority_claims
                              if item[2] == "CLAIM_SET_CHANGED"]
-            # At most one claim-book pass can preempt an overdue balance.
+            # At most a bounded claim-book pass can preempt an overdue balance.
             # Debt-only refreshes cannot starve the balance either.
             balance_turn = (
-                balance_due and self._priority_book_streak >= max(1, len(claim_dates))
+                balance_due and self._priority_book_streak >= max(2, len(claim_dates))
                 and not changed_claim
             )
             if changed_claim:
