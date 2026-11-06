@@ -7829,6 +7829,9 @@ def run_once(
 
         def _kr_after_protective_exit():
             nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result, balance_snapshot_raw
+            # This callback is AST-exercised on its own in SELL-first tests;
+            # keep source-verified balance timestamp type available locally.
+            from datetime import datetime as _kr_datetime
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
@@ -7869,7 +7872,7 @@ def run_once(
                         _post_snapshot.pop("_kr_verified_fresh_at_kst", None)
                         _post_fetch_at = getattr(kis, "_balance_cache_at", None)
                         if (
-                            isinstance(_post_fetch_at, datetime)
+                            isinstance(_post_fetch_at, _kr_datetime)
                             and _post_fetch_at.tzinfo is not None
                             and 0 <= (now_kst() - _post_fetch_at).total_seconds() <= 20
                         ):
@@ -8017,7 +8020,7 @@ def run_once(
                             raise RuntimeError("AFTER_SELL_KIS_BALANCE_NOT_AUTHORITATIVE")
                         _after_sell_at = getattr(kis, "_balance_cache_at", None)
                         if (
-                            not isinstance(_after_sell_at, datetime)
+                            not isinstance(_after_sell_at, _kr_datetime)
                             or _after_sell_at.tzinfo is None
                             or not 0 <= (now_kst() - _after_sell_at).total_seconds() <= 20
                         ):
