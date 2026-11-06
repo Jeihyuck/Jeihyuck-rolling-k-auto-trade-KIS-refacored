@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 SYMBOLS = frozenset({"ABBV","DHR","HCA","KO","KR","MCK","PFE","PG","TMO"})
@@ -56,6 +58,7 @@ def build_forward_only_v2_carry_review(
         return blocked("US_LEGACY_CARRY_NINE_POSITION_SET_INCOMPLETE")
     canonical=[]
     seen=set()
+    seen_lifecycles=set()
     for item in entries:
         if not isinstance(item,dict):
             return blocked("US_LEGACY_CARRY_ENTRY_INVALID")
@@ -65,10 +68,27 @@ def build_forward_only_v2_carry_review(
         seen.add(symbol)
         try:
             original_day=date.fromisoformat(str(item.get("trade_date") or ""))
-            qty=int(item.get("db_qty"))
-            requested=int(item.get("requested_qty"))
-        except (ValueError,TypeError):
+            raw_qty=item.get("db_qty")
+            raw_requested=item.get("requested_qty")
+            if isinstance(raw_qty,bool) or isinstance(raw_requested,bool):
+                raise ValueError("BOOL_QUANTITY")
+            qty_decimal=Decimal(str(raw_qty))
+            requested_decimal=Decimal(str(raw_requested))
+            if (not qty_decimal.is_finite()
+                    or not requested_decimal.is_finite()
+                    or qty_decimal != qty_decimal.to_integral_value()
+                    or requested_decimal != requested_decimal.to_integral_value()):
+                raise ValueError("FRACTIONAL_QUANTITY")
+            qty=int(qty_decimal)
+            requested=int(requested_decimal)
+        except (ValueError,TypeError,InvalidOperation):
             return blocked("US_LEGACY_CARRY_SOURCE_QUANTITY_INVALID")
+        life=str(item.get("original_lifecycle_id") or "").strip()
+        contract_hash=str(item.get("original_contract_sha256") or "").strip().lower()
+        if (not life or life in seen_lifecycles
+                or not re.fullmatch(r"[0-9a-f]{64}",contract_hash)):
+            return blocked("US_LEGACY_CARRY_IMMUTABLE_CONTRACT_UNVERIFIED")
+        seen_lifecycles.add(life)
         if (not (started <= original_day < portfolio_start)
                 or qty <= 0 or requested < qty
                 or item.get("strategy_owner") != OWNER
@@ -79,8 +99,11 @@ def build_forward_only_v2_carry_review(
             return blocked("US_LEGACY_CARRY_FROZEN_V2_SOURCE_UNVERIFIED")
         canonical.append({
             "symbol":symbol,"original_buy_date":str(original_day),
+            "original_lifecycle_id":life,
+            "frozen_contract_sha256":contract_hash,
             "carry_quantity":qty, "original_order_quantity":requested,
-            "new_management_effective_not_before":str(portfolio_start),
+            "current_portfolio_started_on":str(portfolio_start),
+            "future_management_effective_at_requires_new_approval":True,
         })
     if seen != SYMBOLS:
         return blocked("US_LEGACY_CARRY_NINE_POSITION_SET_INCOMPLETE")
