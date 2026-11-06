@@ -7849,10 +7849,24 @@ def run_once(
                                 or not isinstance(_post_snapshot.get("output1"), list)
                                 or not _post_snapshot.get("output2")):
                             raise RuntimeError("POST_EXIT_BROKER_BALANCE_NOT_AUTHORITATIVE")
-                        _post_snapshot = {
-                            **_post_snapshot,
-                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
-                        }
+                        _post_snapshot = dict(_post_snapshot)
+                        # Force=True should fetch KIS, but proof must still
+                        # come from the wrapper's ORIGINAL fetch timestamp.
+                        # Never refresh a stale/fabricated cache marker by
+                        # stamping the time we happened to read this dict.
+                        _post_snapshot.pop("_kr_verified_fresh_at_kst", None)
+                        _post_fetch_at = getattr(kis, "_balance_cache_at", None)
+                        if (
+                            isinstance(_post_fetch_at, datetime)
+                            and _post_fetch_at.tzinfo is not None
+                            and 0 <= (now_kst() - _post_fetch_at).total_seconds() <= 20
+                        ):
+                            _post_snapshot["_kr_verified_fresh_at_kst"] = _post_fetch_at.isoformat()
+                        else:
+                            logger.warning(
+                                "[KR_RECONCILE_LANES][POST_EXIT_BALANCE_FRESHNESS] "
+                                "verified=0 action=FAIL_CLOSED_TO_FULL"
+                            )
                         _post_exact, _post_reason = prove_safe_protective_sell_handoff(
                             engine=engine, kis=kis, env=env_effective,
                             strategy="pb1_pullback_close", trade_date=trade_date,
