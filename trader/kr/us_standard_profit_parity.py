@@ -97,11 +97,14 @@ def build_new_swing_parity_contract(
         raise ValueError("KR_PROFIT_PARITY_RUNNER_VERSION_UNVERIFIED")
     if not (str(code).isdigit() and len(str(code)) == 6):
         raise ValueError("KR_PROFIT_PARITY_SYMBOL_UNVERIFIED")
-    if mode == "ACTIVE_PRACTICE" and (
-        os.getenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "0") != "1"
-        or os.getenv("KIS_ENV", "").lower() != "practice"
-    ):
-        raise ValueError("KR_PROFIT_PARITY_DEPLOY_NOT_APPROVED")
+    if mode == "ACTIVE_PRACTICE":
+        if (os.getenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "0") != "1"
+                or os.getenv("KIS_ENV", "").lower() != "practice"):
+            raise ValueError("KR_PROFIT_PARITY_DEPLOY_NOT_APPROVED")
+        # No KR native order-router claim/submit/fill path is wired yet.
+        # An ENV approval must not make this SHADOW library appear ACTIVE.
+        # Remove this fence only with a new versioned, fully tested router.
+        raise ValueError("KR_PROFIT_PARITY_ROUTER_NOT_WIRED")
     payload: dict[str, Any] = {
         "version": POLICY_VERSION,
         "strategy_owner": "PB1",
