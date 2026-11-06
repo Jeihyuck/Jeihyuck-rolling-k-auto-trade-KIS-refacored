@@ -70,6 +70,8 @@ def test_three_real_source_days_cannot_starve_historical_balance():
     assert ("BALANCE", True) in kis.calls
     assert kis.calls.index(("BALANCE", True)) < 4
     # A completed balance GET does NOT magically refresh stale old orders.
+    # After the newest claim proof ages out, readiness must fail closed.
+    clock[0] += 16.0
     with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
         reader.snapshot_for_claims([CLAIM])
 
