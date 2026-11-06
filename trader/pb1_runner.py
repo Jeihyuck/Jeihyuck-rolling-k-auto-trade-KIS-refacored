@@ -7711,6 +7711,10 @@ def run_once(
         # and preserve the KR_INFINITE owner and risk/sizing policy unchanged.
         kr_inf_run_result = None
         kr_inf_invoked = False
+        # The callback is also exercised independently by sell-first
+        # integration tests; keep metrics on the engine instead of closing
+        # over a runner-local variable.
+        engine_runner._kr_reconcile_perf = kr_reconcile_perf
 
         def _kr_after_protective_exit():
             nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result, balance_snapshot_raw
@@ -7800,7 +7804,9 @@ def run_once(
                     db_write_reasons.append("two_sided_exact_proof_skip_historical_reconcile")
                 else:
                     _post_full_started = time_mod.monotonic()
-                    kr_reconcile_perf["post_full_calls"] += 1
+                    _post_perf = getattr(engine_runner, "_kr_reconcile_perf", None)
+                    if isinstance(_post_perf, dict):
+                        _post_perf["post_full_calls"] += 1
                     try:
                         reconcile_result = reconcile_kis(
                             engine=engine, kis=kis, env=env_effective,
@@ -7820,11 +7826,14 @@ def run_once(
                         logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
                                          "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
                     finally:
-                        kr_reconcile_perf["post_full_ms"] += 1000.0 * (time_mod.monotonic() - _post_full_started)
+                        _post_elapsed_ms = 1000.0 * (time_mod.monotonic() - _post_full_started)
+                        _post_perf = getattr(engine_runner, "_kr_reconcile_perf", None)
+                        if isinstance(_post_perf, dict):
+                            _post_perf["post_full_ms"] += _post_elapsed_ms
                         logger.info(
                             "[KR_RECONCILE_LANES][HISTORICAL_RECOVERY_CALL] lane=post "
-                            "calls=%s elapsed_ms=%.1f",
-                            kr_reconcile_perf["post_full_calls"], kr_reconcile_perf["post_full_ms"],
+                            "elapsed_ms=%.1f",
+                            _post_elapsed_ms,
                         )
                 # After an actually submitted protected SELL, a successful
                 # reconciliation does not by itself prove the *old*
