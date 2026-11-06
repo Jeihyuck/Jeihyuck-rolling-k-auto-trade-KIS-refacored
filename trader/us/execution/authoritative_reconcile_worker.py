@@ -248,7 +248,8 @@ def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "p
 def run_reconcile_once(*, provider: Any, trade_date: str,
                        session_run_id: str, writer_generation: str,
                        conn: Any, scope: dict,
-                       historical_provider: Any | None = None) -> dict:
+                       historical_provider: Any | None = None,
+                       prefetched_fills: dict | None = None) -> dict:
     """One serial authoritative reconciliation cycle, no order submissions."""
     from trader.us.execution.fills import get_fills_today
     from trader.us.db.repos import save_fills_with_result
@@ -256,8 +257,12 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
     from trader.us.execution.stage4_phase_latency import Stage4PhaseTimer
     phase = Stage4PhaseTimer()
-    fills=get_fills_today(provider=provider,signal_only=False,trade_date=trade_date)
-    phase.mark("kis_fill_fetch")
+    # The Stage4 worker can fetch current KIS fills BEFORE latching original
+    # historical evidence. The read-only GET cannot mutate DB, so it does
+    # not consume the historical snapshot's strict 15s replay/READY budget.
+    fills=(prefetched_fills if prefetched_fills is not None
+           else get_fills_today(provider=provider,signal_only=False,trade_date=trade_date))
+    phase.mark("kis_fill_fetch_or_prefetch")
     logger.info("[US_STAGE4][CYCLE_BROKER_EVIDENCE] cycle_id=%s observed_at_utc=%s status=%s", _stage4_cycle_id.get(), datetime.now(timezone.utc).isoformat(), fills.get("status"))
     if fills.get("status")!="OK":
         raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
@@ -542,6 +547,32 @@ def main() -> int:
                     # Read-only broker GETs for old orders never run on this
                     # authoritative writer. A missing or stale historical
                     # snapshot blocks READY; no synthetic terminality.
+                    # Current-session KIS fills are authenticated READ-ONLY
+                    # evidence. Fetch them BEFORE adopting historical books:
+                    # their p95 GET latency previously spent most of the
+                    # 15-second historical TTL without needing those books.
+                    # The account-wide single writer and existing status checks
+                    # remain in force; no DB/claim mutation precedes the
+                    # original-scope historical snapshot.
+                    from trader.us.execution.fills import get_fills_today
+                    current_get_started = time.monotonic()
+                    prefetched_fills = get_fills_today(
+                        provider=provider, signal_only=False,
+                        trade_date=args.trade_date,
+                    )
+                    current_get_ms = (time.monotonic()-current_get_started)*1000.0
+                    logger.info(
+                        "[US_STAGE4][CURRENT_FILL_PREBOOK_GET] cycle_id=%s "
+                        "elapsed_ms=%.1f status=%s",
+                        cycle_id, current_get_ms,
+                        (prefetched_fills.get("status") if isinstance(prefetched_fills, dict)
+                         else "INVALID"),
+                    )
+                    if (not isinstance(prefetched_fills, dict)
+                            or prefetched_fills.get("status") != "OK"):
+                        raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
+                    # Bind the latest claim signatures *after* the independent
+                    # current KIS GET. Recheck them again at READY publication.
                     active_before = load_active_execution_claim_attempts()
                     historical_snapshot = historical_reader.snapshot_for_claims(active_before)
                     historical_provider = historical_reader.provider_for(historical_snapshot)
@@ -550,6 +581,7 @@ def main() -> int:
                         session_run_id=args.session_run_id,
                         writer_generation=generation,conn=lease,scope=scope,
                         historical_provider=historical_provider,
+                        prefetched_fills=prefetched_fills,
                     )
                     # Verify both the current DB claim set and snapshot age at
                     # the point of publishing, including any mutations the
