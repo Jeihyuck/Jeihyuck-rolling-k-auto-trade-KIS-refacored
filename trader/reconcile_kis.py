@@ -1950,6 +1950,21 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     "code=%s action=KEEP_INDIVIDUAL_FILLS_NO_AGGREGATE", code,
                 )
                 cumulative_buy_evidence = None
+        if cumulative_buy_evidence is not None and status in {
+            "RECONCILED", "ACK", "ACKED", "ACCEPTED",
+        }:
+            # Only an exact attributed broker cumulative qty + notional can
+            # upgrade a status inferred from a missing broker state field.
+            # Explicit CANCELLED/REJECTED and partial-cancel semantics remain
+            # unchanged; do not infer a fill from a quote or holdings alone.
+            source_requested_qty = int((source_order or {}).get("qty") or 0)
+            verified_buy_qty = int(cumulative_buy_evidence["qty"])
+            if not 0 < verified_buy_qty <= source_requested_qty:
+                raise RuntimeError("KR_BUY_CUMULATIVE_ORDER_QTY_CONFLICT")
+            status = (
+                "FILLED" if verified_buy_qty == source_requested_qty
+                else "PARTIAL_FILLED"
+            )
         if strict_sell_targets is not None and cumulative_sell_evidence is None:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_ECONOMIC_PROOF_MISSING")
         if cumulative_sell_evidence is not None:

@@ -4912,8 +4912,41 @@ class OrdersRepo:
                 "submitted_at": submitted_at,
                 "acked_at": acked_at,
             }
+            # The source history sometimes lacks a broker order status and
+            # supplies RECONCILED. That is an observation, not fill evidence.
+            # Enforce monotonicity INSIDE the SQL UPDATE: a separate settlement
+            # transaction may promote this same order after our initial SELECT.
+            # A Python-only read/if/write guard would then use a stale status.
+            update_status = status
+            if existing_row is not None:
+                observed = str(status or "").upper()
+                if observed == "RECONCILED":
+                    # No broker state = no authority to replace *any*
+                    # existing source-order state, including ACKED/SUBMITTED.
+                    # Losing an open status could incorrectly permit a retry.
+                    update_status = self._schema.orders.c.status
+                elif observed == "PARTIAL_FILLED":
+                    update_status = sa.case(
+                        (
+                            self._schema.orders.c.status.in_({
+                                "FILLED", "CANCELLED", "CANCELED", "REJECTED",
+                            }),
+                            self._schema.orders.c.status,
+                        ),
+                        else_=status,
+                    )
+                elif observed in {"CANCELLED", "CANCELED", "REJECTED"}:
+                    # An already fully executed source cannot become a
+                    # zero-fill cancellation/rejection on a late status row.
+                    update_status = sa.case(
+                        (
+                            self._schema.orders.c.status == "FILLED",
+                            self._schema.orders.c.status,
+                        ),
+                        else_=status,
+                    )
             update_cols = {
-                "status": status,
+                "status": update_status,
                 "kis_odno": kis_odno,
                 "broker_order_id": broker_order_id,
                 "response_json": safe_response_json,
