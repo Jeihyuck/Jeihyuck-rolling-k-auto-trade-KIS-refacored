@@ -61,7 +61,7 @@ def _accounts(monkeypatch, *, engine=None):
                 # Durable immutable pre-order KIS holding evidence. The original
                 # fixture lacked both a lifecycle and this zero baseline;
                 # production correctly rejected it as unsafe recovery.
-                request_json=json.dumps({"pre_order_holding_qty": 0}),
+                entry_meta_json={"pre_order_holding_qty": 0},
                 kis_odno="0000001212", created_at=day, submitted_at=day,
             ))
             conn.execute(sa.insert(schema.fills).values(
@@ -98,7 +98,7 @@ def test_current_account_without_zero_baseline_is_blocked(monkeypatch, unsafe_re
     with engine.begin() as conn:
         conn.execute(sa.update(schema.orders).where(
             schema.orders.c.order_id == identities[CURRENT]["order"],
-        ).values(request_json=json.dumps(unsafe_request)))
+        ).values(entry_meta_json=unsafe_request))
     groups = _safe_owned_buy_fill_groups(
         engine=engine, env="practice", strategy=STRATEGY,
     )
