@@ -13,6 +13,7 @@ import sqlalchemy as sa
 
 from trader.account_state import get_account_key
 from trader.db.trading_epoch import active_trading_epoch_id, trading_epoch_enforced
+from trader.db.schema import schema_for_engine
 
 
 @dataclass(frozen=True)
@@ -97,3 +98,66 @@ def unowned_fill_matches_recovery_scope(
         if value and str(value) != str(order.get(field) or ""):
             return False
     return True
+
+
+def relevant_open_orders_for_scope(
+    *, orders: list[dict[str, Any]], portfolios: dict[str, dict[str, Any]],
+    scope: KRRecoveryScope,
+) -> list[dict[str, Any]]:
+    """Ignore only *proven* other-account/epoch orders; unknown still blocks.
+
+    The orders table carries no account_id. Never interpret an unjoined legacy
+    order as belonging to another account, and never hide the current account's
+    unresolved order. This is a proof filter, not a broker/order mutation.
+    """
+    relevant = []
+    for order in orders:
+        portfolio_id = str(order.get("portfolio_epoch_id") or "")
+        portfolio = portfolios.get(portfolio_id)
+        proven = bool(
+            portfolio_id and order.get("order_id")
+            and order.get("position_cycle_id")
+            and order.get("trading_epoch_id")
+            and portfolio
+            and str(order.get("env") or "") == scope.env
+            and str(portfolio.get("env") or "") == scope.env
+            and str(portfolio.get("portfolio_epoch_id") or "") == portfolio_id
+            and str(portfolio.get("strategy") or "") == str(order.get("strategy") or "")
+            and str(portfolio.get("trading_epoch_id") or "") == str(order.get("trading_epoch_id") or "")
+            and str(portfolio.get("account_id") or "").strip()
+        )
+        if not proven:
+            relevant.append(order)  # Unknown ownership is NOT safe to ignore.
+            continue
+        if (
+            str(portfolio["account_id"]) != scope.account_key
+            or str(portfolio["trading_epoch_id"]) != scope.trading_epoch_id
+        ):
+            continue  # Foreign account or superseded epoch, with positive proof.
+        relevant.append(order)
+    return relevant
+
+
+def current_scope_open_order_blockers(
+    *, engine: Any, env: str, kis: Any, orders_repo: Any,
+) -> list[dict[str, Any]]:
+    """One fail-closed open-order read + one portfolio-owner batch lookup.
+
+    All order states and all strategy owners remain in the blockers set for
+    the current account/epoch, including KR_INFINITE; no cross-owner bypass.
+    """
+    scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
+    opened = orders_repo.get_open_orders(env, include_stale=True, fail_open=False)
+    if not opened or scope is None:
+        return opened
+    schema = schema_for_engine(engine)
+    ids = {str(row.get("portfolio_epoch_id") or "") for row in opened}
+    ids.discard("")
+    with engine.connect() as conn:
+        portfolio_rows = conn.execute(sa.select(schema.portfolio_epochs).where(
+            schema.portfolio_epochs.c.portfolio_epoch_id.in_(ids)
+        )).mappings().all() if ids else []
+    portfolios = {str(item["portfolio_epoch_id"]): dict(item) for item in portfolio_rows}
+    return relevant_open_orders_for_scope(
+        orders=opened, portfolios=portfolios, scope=scope,
+    )
