@@ -3153,8 +3153,12 @@ def reconcile_kis(
         integrity_reason = integrity_reason or "frozen_buy_contract_invariant_broken"
     if reconcile_result.get("unresolved_broker_activity"):
         integrity_reason = integrity_reason or "unresolved_broker_activity"
-    if reconcile_result.get("guard_reason"):
-        integrity_reason = integrity_reason or str(reconcile_result["guard_reason"])
+    # Stale-DB purge guard and broker order/fill safety are distinct.
+    # KIS holdings are NORMAL and only forbid deleting DB positions;
+    # unresolved claims, daily-ccld failure and unproven parity still block.
+    from trader.kr.reconcile_guard_classification import broker_reconcile_guard_blocks
+    if broker_reconcile_guard_blocks(reconcile_result):
+        integrity_reason = integrity_reason or str(reconcile_result.get("guard_reason") or "broker_guard_unproven")
     if reconcile_result.get("ok") is not True:
         # A failed daily-ccld pass is degraded even when balance parity appears
         # healthy. Accepted broker orders are not economic settlement evidence.
