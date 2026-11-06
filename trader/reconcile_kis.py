@@ -974,16 +974,6 @@ def _promote_open_buy_orders_from_holdings(
             except Exception:
                 logger.exception("[SETTLEMENT_SHADOW][KR_PROBE_ERROR] code=%s", code)
 
-        if kr_scope is not None and source_order is not None:
-            # Recheck exact ownership immediately before the first write.
-            with engine.connect() as owner_conn:
-                if not order_matches_recovery_scope(
-                    conn=owner_conn, schema=schema_for_engine(engine),
-                    order=dict(source_order),
-                    strategy=str(source_order.get("strategy") or ""),
-                    scope=kr_scope,
-                ):
-                    raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=ctx_run_id,
@@ -1969,6 +1959,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
                     code, cumulative_sell_evidence["qty"], cumulative_sell_evidence["notional"],
                 )
+        if kr_scope is not None and source_order is not None:
+            # Recheck exact ownership immediately before the first write.
+            with engine.connect() as owner_conn:
+                if not order_matches_recovery_scope(
+                    conn=owner_conn, schema=schema_for_engine(engine),
+                    order=dict(source_order),
+                    strategy=str(source_order.get("strategy") or ""),
+                    scope=kr_scope,
+                ):
+                    raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=reconcile_run_id,
