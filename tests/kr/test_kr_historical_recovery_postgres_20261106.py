@@ -38,7 +38,8 @@ def _select(engine, *, day=date(2026, 11, 6)):
 
 def _success():
     return dict(
-        ok=True, historical_repair_fastpath=True,
+        ok=True, historical_recovery_executed=True,
+        historical_repair_fastpath=False,
         unresolved_broker_activity=False,
         holdings_error=None, guard_reason=None,
         frozen_contract_invariant_violations=0,
