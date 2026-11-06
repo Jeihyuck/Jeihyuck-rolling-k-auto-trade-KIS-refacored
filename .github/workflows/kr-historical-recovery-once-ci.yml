@@ -7,6 +7,7 @@ on:
       - "trader/pb1_runner.py"
       - "trader/reconcile_kis.py"
       - "trader/kr/historical_recovery_journal.py"
+      - "trader/kr/close_historical_reconcile.py"
       - "tests/kr/test_kr_historical_recovery*.py"
       - "tests/kr/test_kr_balance_freshness_provenance_20261106.py"
       - ".github/workflows/kr-historical-recovery-once-ci.yml"
@@ -57,11 +58,12 @@ jobs:
         run: python -m pip install -r requirements.txt pytest psycopg2-binary
       - name: Verify new source compiles
         run: |
-          python -m py_compile trader/pb1_runner.py trader/reconcile_kis.py trader/kr/historical_recovery_journal.py
+          python -m py_compile trader/pb1_runner.py trader/reconcile_kis.py trader/kr/historical_recovery_journal.py trader/kr/close_historical_reconcile.py
       - name: Strict journal, KIS freshness, and sell-first integration tests
         run: |
           python -m pytest -q \
             tests/kr/test_kr_historical_recovery_journal_20261106.py \
             tests/kr/test_kr_historical_recovery_postgres_20261106.py \
+            tests/kr/test_kr_close_historical_reconcile_20261106.py \
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \
             tests/kr/test_kr257_sell_first_runner_integration.py
