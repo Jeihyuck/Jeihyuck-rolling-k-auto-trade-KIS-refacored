@@ -7287,13 +7287,19 @@ def run_once(
                 else:
                     kr_reconcile_perf["current_order_reconcile_ms"] += _pre_elapsed_ms
                 if _pre_lane is not None:
-                    from trader.kr.historical_recovery_journal import record_historical_result
+                    from trader.kr.historical_recovery_journal import (
+                        record_historical_result, current_tick_reconcile_proves_buy_safe,
+                    )
                     _pre_durable_ok = (
                         record_historical_result(
                             engine=engine, lane=_pre_lane, result=reconcile_result,
                         ) if _pre_lane.mode == "FULL" else _pre_lane.allow_buy_from_recovery
                     )
-                    if not _pre_durable_ok or _pre_lane.mode == "LEGACY":
+                    _pre_verified = current_tick_reconcile_proves_buy_safe(
+                        lane=_pre_lane, result=reconcile_result,
+                        durable_record_ok=_pre_durable_ok,
+                    )
+                    if not _pre_verified:
                         # A missing or contradictory recovery journal is NOT
                         # evidence that the account has no historical orders.
                         order_allowed = False
@@ -7965,14 +7971,20 @@ def run_once(
                     finally:
                         _post_elapsed_ms = 1000.0 * (time_mod.monotonic() - _post_full_started)
                         if _post_lane is not None:
-                            from trader.kr.historical_recovery_journal import record_historical_result
+                            from trader.kr.historical_recovery_journal import (
+                                record_historical_result, current_tick_reconcile_proves_buy_safe,
+                            )
                             _post_durable_ok = (
                                 record_historical_result(
                                     engine=engine, lane=_post_lane, result=reconcile_result,
                                 ) if _post_lane.mode == "FULL"
                                 else _post_lane.allow_buy_from_recovery
                             )
-                            if not _post_durable_ok or _post_lane.mode == "LEGACY":
+                            _post_verified = current_tick_reconcile_proves_buy_safe(
+                                lane=_post_lane, result=reconcile_result,
+                                durable_record_ok=_post_durable_ok,
+                            )
+                            if not _post_verified:
                                 engine_runner._kr_post_exit_reconcile_ok = False
                                 logger.error(
                                     "[KR_HIST_RECOVERY][POST_BUY_BLOCK] mode=%s reason=%s",
