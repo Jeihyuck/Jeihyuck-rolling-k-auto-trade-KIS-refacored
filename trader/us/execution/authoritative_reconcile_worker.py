@@ -362,7 +362,8 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     }
 
 
-def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
+def run_deferred_recovery_once(*, provider: Any,trade_date: str,
+                               historical_balance_available: bool | None = None) -> dict:
     """Bound deferred stop repair to one historical phase per writer cycle.
 
     The previous implementation processed 3 TP candidates *and* up to 2
@@ -386,6 +387,17 @@ def run_deferred_recovery_once(*, provider: Any,trade_date: str) -> dict:
         )
         return {"tp":tp,"settlement":{"status":"DEFERRED_NEXT_CYCLE"},
                 "phase":"tp"}
+    # The historical GET-only facade cannot acquire a missing/expired balance
+    # on the writer. Do not enter settlement just to throw
+    # HISTORICAL_BALANCE_NOT_PREFETCHED repeatedly after publishing READY.
+    # Keep each obligation fenced until the reader supplies fresh evidence.
+    if historical_balance_available is False:
+        return {
+            "tp": {"status": "DEFERRED_NEXT_CYCLE"},
+            "settlement": {"status": "DEFERRED_NO_FRESH_EVIDENCE",
+                           "checked": 0, "settled": 0},
+            "phase": "settlement",
+        }
     from trader.us.execution.protective_stop_settlement_worker import (
         settle_verified_stop_debts_once,
     )
@@ -605,7 +617,17 @@ def main() -> int:
                         deferred=run_deferred_recovery_once(
                             provider=provider if _operator_cancel else historical_provider,
                             trade_date=args.trade_date,
+                            historical_balance_available=(
+                                None if _operator_cancel else
+                                historical_snapshot.get("balance") is not None
+                            ),
                         )
+                        if (deferred.get("settlement") or {}).get("status") == "DEFERRED_NO_FRESH_EVIDENCE":
+                            logger.warning(
+                                "[US_STAGE4][DEFERRED_NO_FRESH_EVIDENCE] "
+                                "cycle_id=%s reason=historical_balance_missing "
+                                "action=KEEP_PROTECTIVE_FENCE", cycle_id,
+                            )
                         logger.info("[US_STAGE4][DEFERRED_RECOVERY] cycle_id=%s elapsed_ms=%.1f result=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,deferred)
                     except Exception as recovery_exc:
                         # Keep the confirmed stop obligation and old TP fence.
