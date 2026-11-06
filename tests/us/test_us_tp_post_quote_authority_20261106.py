@@ -174,3 +174,30 @@ def test_native_kis_post_uses_valid_final_tp_authority_once(monkeypatch):
     assert result["rt_cd"] == "0"
     assert len(calls) == 1
     assert client._before_order_http is None
+
+
+def test_native_post_rechecks_tick_budget_after_callback(monkeypatch):
+    """No HTTP when authoritative DB checks consume the remaining deadline."""
+    import requests
+    from trader.us.execution.kis_us_client import KisUSTemporaryError
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    would_post = []
+    monkeypatch.setattr(
+        requests, "post",
+        lambda *args, **kwargs: would_post.append((args, kwargs)),
+    )
+    client = _stub_native_transport()
+    budgets = []
+    def budget():
+        budgets.append("CHECK")
+        if len(budgets) == 2:
+            raise KisUSTemporaryError("tick deadline exhausted after callback")
+        return 10.0
+    client._request_budget = budget
+    client.set_before_order_http(lambda: _call(health=_ready))
+    with pytest.raises(KisUSPreSubmitError, match="failed before broker HTTP"):
+        client._post("/uapi/overseas-stock/v1/trading/order",
+                     headers={}, body={"symbol": "HCA"})
+    assert budgets == ["CHECK", "CHECK"]
+    assert would_post == []
