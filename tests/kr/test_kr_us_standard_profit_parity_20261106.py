@@ -125,7 +125,8 @@ def test_active_practice_requires_approved_environment(monkeypatch):
     with pytest.raises(ValueError, match="DEPLOY_NOT_APPROVED"):
         contract(monkeypatch, mode="ACTIVE_PRACTICE")
     monkeypatch.setenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "1")
-    assert verified_contract(contract(monkeypatch, mode="ACTIVE_PRACTICE"))
+    with pytest.raises(ValueError, match="ROUTER_NOT_WIRED"):
+        contract(monkeypatch, mode="ACTIVE_PRACTICE")
     monkeypatch.setenv("KIS_ENV", "real")
     with pytest.raises(ValueError, match="DEPLOY_NOT_APPROVED"):
         contract(monkeypatch, mode="ACTIVE_PRACTICE")
