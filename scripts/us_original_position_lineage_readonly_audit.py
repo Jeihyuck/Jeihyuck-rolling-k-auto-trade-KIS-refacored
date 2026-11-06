@@ -34,6 +34,7 @@ WITH latest AS (
 )
 SELECT p.symbol, p.qty, p.as_of,
     (p.account_id = :account) AS account_matches,
+    (p.account_id IS NULL) AS account_absent,
     (p.trading_epoch_id = :epoch) AS epoch_matches,
     (p.portfolio_epoch_id IS NOT NULL) AS portfolio_present,
     (p.position_cycle_id IS NOT NULL) AS cycle_present,
@@ -46,6 +47,15 @@ SELECT p.symbol, p.qty, p.as_of,
         WHERE f.symbol=p.symbol AND f.side='BUY'
           AND f.account_id=:account AND f.trading_epoch_id=:epoch
     ) AS scoped_buy_fills,
+    (SELECT COUNT(*) FROM public.us_orders o
+        WHERE o.symbol=p.symbol AND o.side='BUY' AND o.dry_run IS FALSE
+          AND o.env='practice' AND o.trading_epoch_id=:epoch
+          AND o.account_id IS NULL
+    ) AS legacy_unscoped_buy_orders,
+    (SELECT COUNT(*) FROM public.us_fills f
+        WHERE f.symbol=p.symbol AND f.side='BUY'
+          AND f.trading_epoch_id=:epoch AND f.account_id IS NULL
+    ) AS legacy_unscoped_buy_fills,
     (SELECT COUNT(*) FROM public.us_position_risk_state r
         WHERE r.symbol=p.symbol AND r.account_id=:account
           AND r.trading_epoch_id=:epoch AND r.trade_date <= :trade_date
@@ -61,8 +71,12 @@ def classify_readonly_candidate(row: dict[str, Any]) -> dict[str, Any]:
     symbol = str(row.get("symbol") or "").upper()
     if symbol not in SYMBOLS:
         raise ValueError("US_LINEAGE_SYMBOL_NOT_IN_ALLOWLIST")
-    if row.get("account_matches") is not True:
-        reason = "ORIGINAL_ACCOUNT_SCOPE_UNVERIFIED"
+    # A NULL legacy account column is *absence of provenance*, not proof
+    # that the original order belonged to a different broker account.
+    if row.get("account_absent") is True:
+        reason = "LEGACY_ORIGINAL_ACCOUNT_SCOPE_ABSENT"
+    elif row.get("account_matches") is not True:
+        reason = "ORIGINAL_ACCOUNT_SCOPE_MISMATCH_OR_UNKNOWN"
     elif row.get("epoch_matches") is not True:
         reason = "TRADING_EPOCH_MISMATCH"
     elif (row.get("portfolio_present") is not True
@@ -83,6 +97,10 @@ def classify_readonly_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "evidence_status": "READONLY_DB_CANDIDATE_NOT_BROKER_PROOF",
         "scoped_buy_orders": int(row.get("scoped_buy_orders") or 0),
         "scoped_buy_fills": int(row.get("scoped_buy_fills") or 0),
+        # Historical legacy BUY rows are only leads for a KIS original-date
+        # probe; they can NEVER substitute for account-scoped broker proof.
+        "legacy_unscoped_buy_orders": int(row.get("legacy_unscoped_buy_orders") or 0),
+        "legacy_unscoped_buy_fills": int(row.get("legacy_unscoped_buy_fills") or 0),
         "scoped_legacy_lifecycle_rows": int(
             row.get("scoped_legacy_lifecycle_rows") or 0),
         "auto_identity_rebind_allowed": False,
