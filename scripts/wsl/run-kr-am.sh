@@ -136,18 +136,30 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
   echo "[KR_AM][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
   KR_AM_SESSION_TIMEOUT_SEC="${KR_AM_SESSION_TIMEOUT_SEC:-3600}"
   echo "[KR_AM][EFFECTIVE_ENV] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC}"
+  # Exit 137 can be SIGKILL/OOM/external termination as well as a timeout
+  # kill escalation. Do not claim a timer expired without authoritative proof.
+  start_epoch=$(date +%s)
   set +e
   timeout --kill-after=30s "${KR_AM_SESSION_TIMEOUT_SEC}" python -m trader.kr.runner.trade_session_runner --session am --env "$STRATEGY_ENV"
   rc=$?
   set -e
+  elapsed_sec=$(( $(date +%s) - start_epoch ))
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
     LAST_STAGE_FILE="runtime/state/kr/session_last_stage_am.json"
     LAST_STAGE=""
     if [[ -f "$LAST_STAGE_FILE" ]]; then LAST_STAGE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true); fi
-    export NULLIM_SESSION_FINAL_STATUS=TIMEOUT NULLIM_SESSION_FINAL_REASON=SESSION_TIMEOUT
-    echo "[KR_AM][TIMEOUT] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
-    echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=SESSION_TIMEOUT orders_intent=unknown orders_ack=unknown blocked=0"
+    if [[ "$rc" -eq 124 ]]; then
+      export NULLIM_SESSION_FINAL_STATUS=TIMEOUT NULLIM_SESSION_FINAL_REASON=SESSION_TIMEOUT
+      reason=SESSION_TIMEOUT
+    else
+      # A 137 exit alone cannot distinguish external SIGKILL, OOM, or
+      # timeout --kill-after. Preserve the uncertainty for kernel/task logs.
+      export NULLIM_SESSION_FINAL_STATUS=FAILED NULLIM_SESSION_FINAL_REASON=SESSION_KILLED_UNVERIFIED
+      reason=SESSION_KILLED_UNVERIFIED
+    fi
+    echo "[KR_AM][ABNORMAL_EXIT] reason=${reason} rc=${rc} elapsed_sec=${elapsed_sec} timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
+    echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=${reason} orders_intent=unknown orders_ack=unknown blocked=0"
   fi
-  echo "[KR_AM][EXIT] ts=$(date -Is) exit_code=$rc"
+  echo "[KR_AM][EXIT] ts=$(date -Is) exit_code=$rc elapsed_sec=${elapsed_sec}"
   exit $rc
 } >> "$LOG_FILE" 2>&1

@@ -38,6 +38,7 @@ def main() -> int:
     from trader.db.engine import get_engine
     from trader.kis_wrapper import KisAPI
     from trader.run_context import RunContext
+    from trader.db.repos import RunsRepo
     from trader.kr.cross_day_sell_auto_reconcile import run_all_historical_sell_recovery
 
     engine = get_engine()
@@ -49,9 +50,33 @@ def main() -> int:
             run_id=str(uuid4()), env="practice", strategy="pb1_pullback_close",
             started_at=now_kst(), dry_run=False,
         )
-        outcome = run_all_historical_sell_recovery(
-            engine=engine, kis=kis, env="practice",
-            strategy="pb1_pullback_close", tick_ts=now_kst(), ctx=ctx,
+        # A fabricated RunContext UUID was not durable in public.runs and
+        # produced RUN_ID_ORPHAN during original-day SELL reconciliation.
+        # Record this maintenance operation before any broker evidence writes.
+        runs = RunsRepo(engine)
+        runs.upsert_run(
+            run_id=ctx.run_id, env=ctx.env, strategy=ctx.strategy,
+            ts_start=ctx.started_at, run_window="day", phase="reconcile",
+            event_name="kr_close_historical_sell_recovery",
+            dry_run=False, workflow="wsl:kr-close-recovery",
+        )
+        try:
+            outcome = run_all_historical_sell_recovery(
+                engine=engine, kis=kis, env="practice",
+                strategy="pb1_pullback_close", tick_ts=now_kst(), ctx=ctx,
+            )
+        except BaseException:
+            runs.finish_run(
+                ctx.run_id, status="ERROR",
+                notes="HISTORICAL_SELL_RECOVERY_INTERRUPTED",
+            )
+            raise
+        runs.finish_run(
+            ctx.run_id,
+            status=("OK" if outcome.get("state") in
+                    {"BATCH_COMPLETE", "NO_PRIOR_DAY_PENDING_SELL"}
+                    else "PENDING_SETTLEMENT"),
+            notes=str(outcome.get("state") or "UNKNOWN"),
         )
         print("[KR_CROSS_DAY_SELL][RESULT] " + json.dumps(
             outcome, ensure_ascii=False, default=str, sort_keys=True,

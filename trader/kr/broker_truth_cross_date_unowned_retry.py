@@ -25,6 +25,10 @@ import sqlalchemy as sa
 from trader.db.schema import schema_for_engine
 from trader.time_utils import now_kst
 import trader.kr.broker_truth_hardening as base
+from trader.kr.recovery_scope_20261104 import (
+    resolve_kr_recovery_scope, scoped_portfolio_predicates,
+    order_matches_recovery_scope, unowned_fill_matches_recovery_scope,
+)
 
 logger = logging.getLogger(__name__)
 _INSTALLED = False
@@ -56,7 +60,10 @@ def _order_trade_date(order: dict[str, Any]):
     return None
 
 
-def _find_exact_order_for_unowned_fill(*, conn, schema, env: str, strategy: str, fill: dict[str, Any]):
+def _find_exact_order_for_unowned_fill(
+    *, conn, schema, env: str, strategy: str, fill: dict[str, Any],
+    scope=None,
+):
     code = base._normalize_code(fill.get("code"))
     side = str(fill.get("side") or "").upper()
     kis_odno = str(fill.get("kis_odno") or "").strip()
@@ -67,12 +74,18 @@ def _find_exact_order_for_unowned_fill(*, conn, schema, env: str, strategy: str,
     rows = [
         dict(row)
         for row in conn.execute(
-            sa.select(schema.orders).where(
+            sa.select(schema.orders).join(
+                schema.portfolio_epochs,
+                schema.portfolio_epochs.c.portfolio_epoch_id == schema.orders.c.portfolio_epoch_id,
+            ).where(
                 sa.and_(
                     schema.orders.c.env == env,
                     schema.orders.c.strategy == strategy,
                     schema.orders.c.code == code,
                     schema.orders.c.side == side,
+                    *(scoped_portfolio_predicates(schema, scope) if scope else ()),
+                    *((schema.orders.c.trading_epoch_id == scope.trading_epoch_id,)
+                      if scope else ()),
                     sa.or_(
                         schema.orders.c.kis_odno == kis_odno,
                         schema.orders.c.broker_order_id == kis_odno,
@@ -94,6 +107,14 @@ def _find_exact_order_for_unowned_fill(*, conn, schema, env: str, strategy: str,
         )
         return None
     order = exact[0]
+    if not order_matches_recovery_scope(
+        conn=conn, schema=schema, order=order, strategy=strategy, scope=scope,
+    ) or not unowned_fill_matches_recovery_scope(fill=fill, order=order, scope=scope):
+        logger.error(
+            "[KR_BROKER_TRUTH][CROSS_DATE_UNOWNED][BLOCK] code=%s "
+            "reason=ACCOUNT_EPOCH_CYCLE_UNPROVEN", code,
+        )
+        return None
     if not order.get("order_id") or not order.get("position_cycle_id") or not order.get("portfolio_epoch_id"):
         logger.error(
             "[KR_BROKER_TRUTH][CROSS_DATE_UNOWNED][BLOCK] code=%s side=%s kis_odno=%s order_id=%s reason=ORDER_PROVENANCE_MISSING",
@@ -106,7 +127,10 @@ def _find_exact_order_for_unowned_fill(*, conn, schema, env: str, strategy: str,
     return order
 
 
-def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict[str, Any], fill_ids: list[Any]) -> tuple[int, int]:
+def _apply_historical_sell_exact(
+    *, engine, env: str, strategy: str, order: dict[str, Any],
+    fill_ids: list[Any], scope=None,
+) -> tuple[int, int]:
     """Claim prior-day SELL fills and update the exact lifecycle in one transaction."""
     schema = schema_for_engine(engine)
     order_id = order.get("order_id")
@@ -127,6 +151,24 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
         if not live_order:
             raise RuntimeError(f"CROSS_DATE_SELL_ORDER_MISSING order_id={order_id}")
         order = dict(live_order)
+        if not order_matches_recovery_scope(
+            conn=conn, schema=schema, order=order, strategy=strategy, scope=scope,
+        ):
+            raise RuntimeError("CROSS_DATE_SELL_ACCOUNT_EPOCH_UNPROVEN")
+        if scope is not None and strategy == "pb1_pullback_close" and code == "122630":
+            raise RuntimeError("CROSS_DATE_SELL_KR_INFINITE_RESERVED")
+
+        for fill_id in fill_ids:
+            stored_fill = conn.execute(
+                sa.select(schema.fills).where(
+                    schema.fills.c.fill_id == fill_id,
+                    schema.fills.c.order_id.is_(None),
+                ).limit(1)
+            ).mappings().first()
+            if not stored_fill or not unowned_fill_matches_recovery_scope(
+                fill=dict(stored_fill), order=order, scope=scope,
+            ):
+                raise RuntimeError("CROSS_DATE_SELL_FILL_SCOPE_UNPROVEN")
 
         positions = [
             dict(row)
@@ -138,6 +180,8 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
                         schema.positions.c.code == code,
                         schema.positions.c.position_cycle_id == cycle,
                         schema.positions.c.portfolio_epoch_id == epoch,
+                        *((schema.positions.c.trading_epoch_id == scope.trading_epoch_id,)
+                          if scope else ()),
                         schema.positions.c.status == "OPEN",
                     )
                 )
@@ -157,6 +201,8 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
                     sa.and_(
                         schema.fills.c.fill_id == fill_id,
                         schema.fills.c.order_id.is_(None),
+                        *((schema.fills.c.trading_epoch_id == scope.trading_epoch_id,)
+                          if scope else ()),
                     )
                 )
                 .values(
@@ -177,6 +223,11 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
                 .order_by(schema.fills.c.filled_at.asc())
             ).mappings().all()
         ]
+        if scope and any(
+            str(row.get("trading_epoch_id") or "") != scope.trading_epoch_id
+            for row in attributed
+        ):
+            raise RuntimeError("CROSS_DATE_SELL_ATTRIBUTED_FILL_EPOCH_MISMATCH")
         cumulative_qty = sum(base._qty(row.get("qty")) for row in attributed)
         cumulative_notional = sum(base._qty(row.get("qty")) * base._px(row.get("price")) for row in attributed)
         cumulative_fee = sum(base._px(row.get("fee")) for row in attributed)
@@ -235,6 +286,8 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
                         schema.positions.c.code == code,
                         schema.positions.c.position_cycle_id == cycle,
                         schema.positions.c.portfolio_epoch_id == epoch,
+                        *((schema.positions.c.trading_epoch_id == scope.trading_epoch_id,)
+                          if scope else ()),
                         schema.positions.c.status == "OPEN",
                         schema.positions.c.qty == current_qty,
                     )
@@ -256,6 +309,8 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
         conn.execute(
             sa.update(schema.orders)
             .where(schema.orders.c.order_id == order_id)
+            .where(*((schema.orders.c.trading_epoch_id == scope.trading_epoch_id,)
+                     if scope else ()))
             .values(status=status, response_json=response, updated_at=sa.func.now())
         )
         return linked_now, position_applied
@@ -263,6 +318,7 @@ def _apply_historical_sell_exact(*, engine, env: str, strategy: str, order: dict
 
 def _retry_historical_unowned_fills(*, engine, env: str, strategy: str) -> dict[str, int]:
     schema = schema_for_engine(engine)
+    scope = resolve_kr_recovery_scope(engine=engine, env=env)
     today = now_kst().date()
     with engine.connect() as conn:
         rows = [
@@ -274,6 +330,8 @@ def _retry_historical_unowned_fills(*, engine, env: str, strategy: str) -> dict[
                         schema.fills.c.order_id.is_(None),
                         schema.fills.c.kis_odno.is_not(None),
                         schema.fills.c.side.in_(["BUY", "SELL"]),
+                        *((schema.fills.c.trading_epoch_id == scope.trading_epoch_id,)
+                          if scope else ()),
                     )
                 ).order_by(schema.fills.c.filled_at.asc())
             ).mappings().all()
@@ -293,8 +351,15 @@ def _retry_historical_unowned_fills(*, engine, env: str, strategy: str) -> dict[
                 env=env,
                 strategy=strategy,
                 fill=fill,
+                scope=scope,
             )
             if not order:
+                continue
+            if scope is not None and strategy == "pb1_pullback_close" and str(order.get("code") or "").zfill(6) == "122630":
+                logger.info(
+                    "[KR_BROKER_TRUTH][CROSS_DATE_UNOWNED][OWNER_SKIP] "
+                    "code=122630 reason=KR_INFINITE_RESERVED",
+                )
                 continue
             if str(fill.get("side") or "").upper() == "BUY":
                 buy_links.append((fill.get("fill_id"), order))
@@ -307,12 +372,29 @@ def _retry_historical_unowned_fills(*, engine, env: str, strategy: str) -> dict[
     applied = 0
     for fill_id, order in buy_links:
         with engine.begin() as conn:
+            if not order_matches_recovery_scope(
+                conn=conn, schema=schema, order=order,
+                strategy=strategy, scope=scope,
+            ):
+                raise RuntimeError("CROSS_DATE_BUY_PREWRITE_SCOPE_CHANGED")
+            stored_fill = conn.execute(
+                sa.select(schema.fills).where(
+                    schema.fills.c.fill_id == fill_id,
+                    schema.fills.c.order_id.is_(None),
+                ).limit(1)
+            ).mappings().first()
+            if not stored_fill or not unowned_fill_matches_recovery_scope(
+                fill=dict(stored_fill), order=order, scope=scope,
+            ):
+                raise RuntimeError("CROSS_DATE_BUY_FILL_SCOPE_UNPROVEN")
             result = conn.execute(
                 sa.update(schema.fills)
                 .where(
                     sa.and_(
                         schema.fills.c.fill_id == fill_id,
                         schema.fills.c.order_id.is_(None),
+                        *((schema.fills.c.trading_epoch_id == scope.trading_epoch_id,)
+                          if scope else ()),
                     )
                 )
                 .values(
@@ -339,6 +421,7 @@ def _retry_historical_unowned_fills(*, engine, env: str, strategy: str) -> dict[
                 strategy=strategy,
                 order=order,
                 fill_ids=list(group["fill_ids"]),
+                scope=scope,
             )
             linked += linked_now
             applied += applied_now

@@ -4251,6 +4251,7 @@ class OrdersRepo:
 
     def get_order_by_kis_odno_scoped(
         self, env: str, kis_odno: str, *, trade_date: date, code: str, side: str,
+        account_id: str | None = None, trading_epoch_id: str | None = None,
     ) -> dict | None:
         """Bind actual KIS execution ONLY to a unique same-day KR source order.
 
@@ -4263,16 +4264,44 @@ class OrdersRepo:
         direction = str(side or "").strip().upper()
         if not broker_id or not isinstance(trade_date, date) or not symbol or direction not in {"BUY", "SELL"}:
             return None
-        # An ACK may be written to DB after midnight or on a later retry.
-        # The broker's original submitted_at is the trade-day evidence.
-        stmt = select(self._schema.orders).where(and_(
+        if (account_id is None) != (trading_epoch_id is None):
+            raise ValueError("KR_SOURCE_ORDER_ACCOUNT_EPOCH_SCOPE_INCOMPLETE")
+        # KIS may render order numbers with or without leading zeros.
+        variants = {broker_id, broker_id.zfill(10), broker_id.lstrip("0") or "0"}
+        # Reconciled shadow rows are not original source orders. A duplicate
+        # source order is still ambiguous and must fail closed.
+        conditions = [
             self._schema.orders.c.env == env,
             self._schema.orders.c.side == direction,
             self._schema.orders.c.code == symbol,
             self._kr_broker_trade_day_expr() == trade_date,
-            or_(self._schema.orders.c.kis_odno == broker_id,
-                self._schema.orders.c.broker_order_id == broker_id),
-        )).limit(2)
+            or_(self._schema.orders.c.kis_odno.in_(variants),
+                self._schema.orders.c.broker_order_id.in_(variants)),
+        ]
+        stmt = select(self._schema.orders)
+        if account_id is not None:
+            # This scoped API is used for authoritative original broker
+            # source attribution. Shadow RECONCILE records are not original
+            # orders. Preserve legacy unscoped offline diagnostic lookups.
+            conditions.append(or_(self._schema.orders.c.stage.is_(None),
+                                  self._schema.orders.c.stage != "RECONCILE"))
+            if not str(account_id).strip() or not str(trading_epoch_id).strip():
+                raise RuntimeError("KR_SOURCE_ORDER_ACCOUNT_EPOCH_UNPROVEN")
+            stmt = stmt.join(
+                self._schema.portfolio_epochs,
+                self._schema.portfolio_epochs.c.portfolio_epoch_id ==
+                self._schema.orders.c.portfolio_epoch_id,
+            )
+            conditions.extend((
+                self._schema.orders.c.trading_epoch_id == trading_epoch_id,
+                self._schema.orders.c.position_cycle_id.is_not(None),
+                self._schema.portfolio_epochs.c.env == env,
+                self._schema.portfolio_epochs.c.account_id == account_id,
+                self._schema.portfolio_epochs.c.trading_epoch_id == trading_epoch_id,
+                self._schema.portfolio_epochs.c.strategy == self._schema.orders.c.strategy,
+                self._schema.portfolio_epochs.c.status == "ACTIVE",
+            ))
+        stmt = stmt.where(and_(*conditions)).limit(2)
         matches = self._read_mappings_with_guard(
             stmt, op_name="orders.get_order_by_kis_odno_scoped", fail_open=False,
         )
