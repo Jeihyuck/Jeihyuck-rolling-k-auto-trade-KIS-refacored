@@ -114,3 +114,63 @@ def test_unknown_replay_still_blocks_post(monkeypatch):
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     with pytest.raises(KisUSPreSubmitError, match="US_STAGE4_WRITER_FENCED_BEFORE_HTTP"):
         _call(health=lambda **kw: {"reconcile_status": "FAILED", "replay_status": "ERROR"})
+
+
+def _stub_native_transport():
+    from trader.us.execution.kis_us_client import KisUSClient
+    client = KisUSClient.__new__(KisUSClient)
+    client._base_url = "https://broker.invalid"
+    client._assert_not_offline = lambda _name: None
+    client._apply_rate_limit = lambda _path: None
+    client._request_budget = lambda: 10.0
+    client._check_rt_cd = lambda _response: None
+    client.stats = {}
+    return client
+
+
+def test_native_kis_post_never_runs_after_tp_quote_authority_expires(monkeypatch):
+    """Exercise the real KisUSClient._post callback, not just helper logic."""
+    import requests
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    would_post = []
+    monkeypatch.setattr(
+        requests, "post",
+        lambda *args, **kwargs: would_post.append((args, kwargs)),
+    )
+    client = _stub_native_transport()
+    # A quote was GET-fresh when received but aged past 5s while the native
+    # submitter waited for its rate limiter. It MUST not become HTTP POST.
+    client.set_before_order_http(lambda: _call(quote=_quote(age=6), health=_ready))
+    with pytest.raises(KisUSPreSubmitError, match="US_TP_LIVE_QUOTE_EXPIRED"):
+        client._post("/uapi/overseas-stock/v1/trading/order",
+                     headers={}, body={"symbol": "HCA"})
+    assert would_post == []
+    assert client._before_order_http is None
+
+
+def test_native_kis_post_uses_valid_final_tp_authority_once(monkeypatch):
+    """Valid authority reaches exactly one synthetic requests.post call."""
+    import requests
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "WORKER")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    calls = []
+    class StubResponse:
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"rt_cd": "0", "msg1": "SIMULATED"}
+    def simulated_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return StubResponse()
+    monkeypatch.setattr(requests, "post", simulated_post)
+    from trader.us.execution import kis_us_client as client_module
+    monkeypatch.setattr(client_module, "record_kis_http_call",
+                        lambda *_args, **_kw: None)
+    client = _stub_native_transport()
+    client.set_before_order_http(lambda: _call(health=_ready))
+    result = client._post("/uapi/overseas-stock/v1/trading/order",
+                          headers={}, body={"symbol": "HCA"})
+    assert result["rt_cd"] == "0"
+    assert len(calls) == 1
+    assert client._before_order_http is None
