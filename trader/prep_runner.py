@@ -1116,6 +1116,13 @@ def save_final30_scored_core(
             f"rows={scored_contract.get('rows')} uniq_codes={scored_contract.get('uniq_codes')} missing={critical_missing_fields}"
         )
     logger.info("[FINAL30_SCORED][CORE_SAVE][DB_OK] rows=%s", int(scored_contract.get("rows") or 0))
+    # Fail *before* replacing canonical disk artifacts when a seemingly valid
+    # 30-row DB payload diverged in its selected style/rank/code from source.
+    assert_kr_final30_db_file_identity(
+        list(scored_contract.get("rows_data") or []),
+        final30_df.to_dict(orient="records"),
+        source="CORE_SAVE_SOURCE",
+    )
 
     mirror_sync = sync_prep_final30_file_mirror(
         env=env,
