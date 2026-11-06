@@ -1,0 +1,43 @@
+name: KR Nov06 Cumulative Status Monotonic
+
+on:
+  pull_request:
+    branches:
+      - dual-agent
+      - fix/kr-20261104-full-incident-scope-settlement-runtime
+    paths:
+      - "trader/reconcile_kis.py"
+      - "trader/db/repos.py"
+      - "tests/kr/test_kr_20261106_cumulative_buy_status_monotonic.py"
+      - ".github/workflows/kr-20261106-status-monotonic.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kr-status-monotonic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      NO_TRADE: "1"
+      PBCORE_DB_URL: ""
+      DATABASE_URL: ""
+      KIS_APP_KEY: ""
+      KIS_APP_SECRET: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install offline test dependencies
+        run: |
+          python -m pip install -r requirements.txt pytest
+      - name: Compile and enforce source-status monotonicity
+        run: |
+          python -m compileall -q trader/reconcile_kis.py trader/db/repos.py
+          python -m pytest tests/kr/test_kr_20261106_cumulative_buy_status_monotonic.py -q
