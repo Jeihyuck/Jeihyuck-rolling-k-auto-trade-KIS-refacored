@@ -128,6 +128,32 @@ def choose_historical_lane(
         return RecoveryLane("LEGACY", reason="JOURNAL_UNAVAILABLE")
 
 
+
+def current_tick_reconcile_proves_buy_safe(
+    *, lane: RecoveryLane, result: dict | None, durable_record_ok: bool,
+) -> bool:
+    """A historical COMPLETE marker is never a current-tick BUY permit.
+
+    The per-tick broker order/fill check, account/claim scope and frozen
+    contracts must independently succeed. A raised exception, missing
+    result, stale parity or degraded daily-ccld always blocks new BUYs.
+    """
+    return bool(
+        lane.mode in {"FULL", "CURRENT_ONLY"}
+        and durable_record_ok is True
+        and isinstance(result, dict)
+        and result.get("ok") is True
+        and not result.get("degraded")
+        and not result.get("guard_reason")
+        and not result.get("unresolved_broker_activity")
+        and result.get("frozen_contract_invariant_violations") == 0
+        and result.get("historical_recovery_executed") is lane.historical_recovery
+        and (
+            lane.historical_recovery
+            or result.get("historical_repair_fastpath") is True
+        )
+    )
+
 def record_historical_result(
     *, engine: Any, lane: RecoveryLane, result: dict | None,
 ) -> bool:
