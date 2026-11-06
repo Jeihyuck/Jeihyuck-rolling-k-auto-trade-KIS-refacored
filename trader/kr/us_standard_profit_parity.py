@@ -188,3 +188,62 @@ def calculate_next_tp_stage(
                              reason="REQUIRES_KR_DURABLE_BROKER_STAGE_GATE",
                              order_authorized=False)
     return StageDecision("RUNNER", reason="ALL_TP_STAGES_PROVEN_FILLED")
+
+
+def evaluate_v3_runner_shadow(
+    *,
+    contract: Mapping[str, Any],
+    stage_states: Mapping[str, Mapping[str, Any]],
+    verified_entry_price: float,
+    verified_high: float,
+    executable_price: float,
+    holding_qty: int,
+    orderable_qty: int,
+    high_verified: bool,
+    trend_state: str,
+    trend_verified: bool,
+    atr_evidence: Mapping[str, Any] | None,
+    partial_stage_status: str,
+    final_stage_status: str,
+    unresolved_sell: bool = False,
+) -> dict[str, Any]:
+    """KR shadow uses the *exact* US V3 pure policy, not a reimplementation.
+
+    Only a trusted, account/epoch/cycle-frozen contract and complete TP fills
+    may reach Runner. This function cannot create a KR broker order or advance
+    a durable stage.
+    """
+    if not verified_contract(contract):
+        return {"action": "BLOCK", "reason": "FROZEN_CONTRACT_INVALID",
+                "order_authorized": False}
+    if contract.get("runner_version") != "US_V3":
+        return {"action": "BLOCK", "reason": "V2_RUNNER_REQUIRES_VERIFIED_POLICY",
+                "order_authorized": False}
+    if unresolved_sell:
+        return {"action": "BLOCK", "reason": "UNRESOLVED_SELL_OR_ACK",
+                "order_authorized": False}
+    for stage, *_ in STAGES:
+        evidence = dict(stage_states.get(stage) or {})
+        if evidence.get("status") != "FILLED" or evidence.get("broker_fill_proven") is not True:
+            return {"action": "BLOCK", "reason": "TP_STAGES_NOT_BROKER_PROVEN",
+                    "stage": stage, "order_authorized": False}
+    from trader.us.pb1.swing_runner_exit_v3 import evaluate_v3_runner
+    raw = evaluate_v3_runner(
+        entry_price=verified_entry_price,
+        verified_high=verified_high,
+        current_price=executable_price,
+        holding_qty=holding_qty,
+        orderable_qty=orderable_qty,
+        trend_state=trend_state, trend_verified=trend_verified,
+        high_verified=high_verified,
+        atr_evidence=dict(atr_evidence or {}),
+        partial_stage_status=partial_stage_status,
+        final_stage_status=final_stage_status,
+        policy=dict(contract.get("runner_policy") or {}),
+    )
+    # A proposal from US policy is never the permission to submit in KR.
+    out = dict(raw)
+    out["source_policy_action"] = str(raw.get("action") or "")
+    out["action"] = "SHADOW_RUNNER" if raw.get("action") == "SELL" else "HOLD"
+    out["order_authorized"] = False
+    return out
