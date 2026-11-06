@@ -127,3 +127,19 @@ def test_aux_and_cache_db_writers_both_apply_new_final30_contract():
     assert source.count("canonicalize_final30_aux_db_payload(") >= 2
     assert "CACHE_DIRECT_DB_SAVE" in source
     assert "BUILDER_AUX_DB_SAVE" in source
+
+
+def test_core_parity_rejects_unrecognized_style_even_when_both_sources_agree():
+    db = rows()
+    db[0]["entry_style_selected"] = "UNKNOWN_STRATEGY"
+    with pytest.raises(RuntimeError, match="INVALID_IDENTITY"):
+        assert_kr_final30_db_file_identity(db, deepcopy(db), source="file")
+
+
+def test_aux_writer_normalizes_proven_entry_style_alias_without_inference():
+    from trader.watchlist_builder import canonicalize_final30_aux_db_payload
+    data = rows()
+    out = canonicalize_final30_aux_db_payload(data, source="source_entry_contract")
+    assert out[0]["entry_style_selected"] == "PULLBACK"
+    assert out[2]["entry_style_selected"] == "MOMENTUM"
+    assert all(out[i]["rank_final30"] == i+1 for i in range(30))
