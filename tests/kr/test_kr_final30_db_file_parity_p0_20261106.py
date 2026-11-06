@@ -47,3 +47,39 @@ def test_rejects_file_or_db_contract_divergence(change, expected):
 def test_rejects_missing_db_row_even_when_file_is_complete():
     with pytest.raises(RuntimeError, match="COUNT"):
         assert_kr_final30_db_file_identity(rows()[:-1], rows(), source="ledger")
+
+
+
+def test_rejects_20261105_production_shape_rank_zero_and_033790_style_null():
+    """Read-only observed 2026-11-05 incident: 30 codes but zero meta ranks.
+
+    The 2026-11-05 authoritative DB rows had rank outside 1..30 and all
+    meta.rank_final30=0; 033790 (rank 44) had no selected entry style.
+    Never invent ENTRY_MOMENTUM from its entry_component=momentum.
+    """
+    db = rows()
+    for index, row in enumerate(db):
+        row["rank"] = index + 6
+        row["rank_final30"] = 0.0
+        row["meta"] = {
+            "rank_final30": 0.0,
+            "entry_style_selected": row["entry_style_selected"],
+        }
+    db[21]["code"] = "033790"
+    db[21]["rank"] = 44
+    db[21]["entry_style_selected"] = None
+    db[21]["meta"]["entry_style_selected"] = None
+    db[21]["entry_component"] = "momentum"
+    with pytest.raises(RuntimeError, match="INVALID_IDENTITY"):
+        assert_kr_final30_db_file_identity(db, deepcopy(db), source="production_20261105")
+
+
+def test_no_style_fallback_from_entry_component():
+    db = rows()
+    mirror = deepcopy(db)
+    db[0]["entry_style_selected"] = None
+    db[0]["entry_component"] = "momentum"
+    mirror[0]["entry_style_selected"] = None
+    mirror[0]["entry_component"] = "momentum"
+    with pytest.raises(RuntimeError, match="INVALID_IDENTITY"):
+        assert_kr_final30_db_file_identity(db, mirror, source="runtime")
