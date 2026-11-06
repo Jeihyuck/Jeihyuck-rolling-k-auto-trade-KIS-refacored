@@ -7995,10 +7995,16 @@ def run_once(
                                 or not isinstance(_after_sell_balance.get("output1"), list)
                                 or not _after_sell_balance.get("output2")):
                             raise RuntimeError("AFTER_SELL_KIS_BALANCE_NOT_AUTHORITATIVE")
-                        balance_snapshot_raw = {
-                            **_after_sell_balance,
-                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
-                        }
+                        _after_sell_at = getattr(kis, "_balance_cache_at", None)
+                        if (
+                            not isinstance(_after_sell_at, datetime)
+                            or _after_sell_at.tzinfo is None
+                            or not 0 <= (now_kst() - _after_sell_at).total_seconds() <= 20
+                        ):
+                            raise RuntimeError("AFTER_SELL_ORIGINAL_KIS_FETCH_TIME_UNPROVEN")
+                        balance_snapshot_raw = dict(_after_sell_balance)
+                        balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+                        balance_snapshot_raw["_kr_verified_fresh_at_kst"] = _after_sell_at.isoformat()
                         engine_runner._authoritative_balance = BrokerBalanceSnapshot.from_kis(
                             _after_sell_balance, source="api",
                         )
