@@ -6098,6 +6098,31 @@ def run_once(
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled emergency_path=1")
 
     def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
+        _close_lane = None
+        if (
+            kis_obj is not None
+            and env_effective == "practice"
+            and getattr(kis_obj, "env", None) == "practice"
+        ):
+            from trader.kr.historical_recovery_journal import (
+                choose_historical_lane, lane_enabled,
+            )
+            if lane_enabled(env_effective):
+                _close_lane = choose_historical_lane(
+                    engine=engine, kis=kis_obj, env=env_effective,
+                    strategy="pb1_pullback_close", trading_date=now.date(),
+                    lane_name="CLOSE",
+                )
+                logger.info(
+                    "[KR_CLOSE][HISTORICAL_RECOVERY][LANE] mode=%s reason=%s",
+                    _close_lane.mode, _close_lane.reason,
+                )
+                if _close_lane.mode == "CURRENT_ONLY":
+                    # Journal proves CLOSE fully completed on this account,
+                    # epoch, strategy and trade date (including stale closure).
+                    return True, True
+                if _close_lane.mode == "CURRENT_ONLY_BLOCK":
+                    return False, False
         checkpoint_key = _close_reconcile_checkpoint_key(
             env=(os.getenv("KIS_ENV") or "practice").lower(),
             trade_date=now.date(),
@@ -6107,7 +6132,7 @@ def run_once(
         except Exception as exc:
             logger.warning("[PB1][CLOSE][RECONCILE][CHECKPOINT_LOAD_FAIL] err=%s", exc)
             checkpoint = {}
-        if checkpoint.get("done"):
+        if checkpoint.get("done") and _close_lane is None:
             logger.info("[PB1][CLOSE][RECONCILE][SKIP] reason=already_done")
             return bool(checkpoint.get("reconcile_ok")), bool(checkpoint.get("close_stale_ok"))
 
@@ -6123,11 +6148,26 @@ def run_once(
                     started_at=now,
                     dry_run=False,
                 )
-                reconcile_result = reconcile_today(
-                    engine=engine,
-                    kis=kis_obj,
-                    ctx=ctx,
-                ) or {}
+                if _close_lane is not None and _close_lane.mode == "FULL":
+                    # CLOSE is independently fenced; a successful AM journal
+                    # never substitutes for a full end-of-day reconciliation.
+                    reconcile_result = reconcile_kis(
+                        engine=engine, kis=kis_obj, env=env_effective,
+                        run_id=ctx.run_id, strategy="pb1_pullback_close",
+                        tick_ts=now, runtime_dir=str(runtime_root_dir),
+                        historical_recovery=True,
+                    ) or {}
+                    logger.info(
+                        "[KR_CLOSE][HISTORICAL_RECOVERY][FULL] ok=%s reason=%s",
+                        int(bool(reconcile_result.get("ok"))),
+                        reconcile_result.get("reason"),
+                    )
+                else:
+                    reconcile_result = reconcile_today(
+                        engine=engine,
+                        kis=kis_obj,
+                        ctx=ctx,
+                    ) or {}
                 reconcile_ok_local = bool(reconcile_result.get("ok"))
             except Exception:
                 logger.exception("[PB1][%s] reconcile_today failed", reason_label.upper())
@@ -6154,12 +6194,27 @@ def run_once(
             close_stale_ok_local = True
         except Exception:
             logger.exception("[PB1][%s] close_stale_positions failed", reason_label.upper())
+        if _close_lane is not None and _close_lane.mode == "FULL":
+            from trader.kr.historical_recovery_journal import record_historical_result
+            _close_completed = record_historical_result(
+                engine=engine, lane=_close_lane,
+                result=(
+                    reconcile_result if reconcile_ok_local and close_stale_ok_local
+                    else {"ok": False, "reason": "CLOSE_SETTLEMENT_INCOMPLETE"}
+                ),
+            )
+            reconcile_ok_local = reconcile_ok_local and _close_completed
+            if not _close_completed:
+                logger.error(
+                    "[KR_CLOSE][SETTLEMENT_COMPLETE][NO] "
+                    "reason=HISTORICAL_OR_STALE_RECONCILIATION_UNVERIFIED"
+                )
         try:
             save_job_checkpoint(
                 engine,
                 checkpoint_key,
                 {
-                    "done": True,
+                    "done": bool(reconcile_ok_local and close_stale_ok_local),
                     "reconcile_ok": bool(reconcile_ok_local),
                     "close_stale_ok": bool(close_stale_ok_local),
                     "reason": reason_label,
