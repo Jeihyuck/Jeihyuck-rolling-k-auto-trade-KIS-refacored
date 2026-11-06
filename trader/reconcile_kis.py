@@ -974,6 +974,16 @@ def _promote_open_buy_orders_from_holdings(
             except Exception:
                 logger.exception("[SETTLEMENT_SHADOW][KR_PROBE_ERROR] code=%s", code)
 
+        if kr_scope is not None and source_order is not None:
+            # Recheck exact ownership immediately before the first write.
+            with engine.connect() as owner_conn:
+                if not order_matches_recovery_scope(
+                    conn=owner_conn, schema=schema_for_engine(engine),
+                    order=dict(source_order),
+                    strategy=str(source_order.get("strategy") or ""),
+                    scope=kr_scope,
+                ):
+                    raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=ctx_run_id,
@@ -1703,6 +1713,13 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         env_run_id,
     )
     strategy = ctx.strategy
+    # One authenticated KIS account/ACTIVE trading-epoch boundary for the
+    # entire KR reconciliation. Legacy offline fixtures may have no enforced
+    # epoch; production must never silently downgrade a failed lookup.
+    from trader.kr.recovery_scope_20261104 import (
+        resolve_kr_recovery_scope, order_matches_recovery_scope,
+    )
+    kr_scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
     if trade_date is not None and not isinstance(trade_date, date):
         raise TypeError("trade_date must be a datetime.date")
     today = (trade_date or now_kst().date()).strftime("%Y%m%d")
@@ -1805,6 +1822,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     source_order = orders_repo.get_order_by_kis_odno_scoped(
                         env, kis_odno,
                         trade_date=order_time.date(), code=code, side=side,
+                        **({
+                            "account_id": kr_scope.account_key,
+                            "trading_epoch_id": kr_scope.trading_epoch_id,
+                        } if kr_scope is not None else {}),
                     )
                 else:
                     # Compatibility with isolated legacy/mock repositories;
@@ -1815,6 +1836,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     "[RECONCILE][SOURCE_LOOKUP_FAIL] side=%s code=%s kis_odno=%s err=%s",
                     side, code, kis_odno, exc,
                 )
+                if kr_scope is not None:
+                    raise RuntimeError("KR_RECONCILE_SOURCE_LOOKUP_UNVERIFIED") from exc
         if strict_sell_targets is not None and not source_order:
             # A KIS ACK may have succeeded while orders.kis_odno failed to
             # persist (2026-10-30 NeoSem). The strict original-day all-pages
@@ -1842,6 +1865,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 }
         if strict_sell_targets is not None and not source_order:
             raise RuntimeError("KR_CUMULATIVE_REPAIR_DURABLE_SELL_ORDER_NOT_FOUND")
+        if kr_scope is not None:
+            # Never synthesize a current-account source identity from only a
+            # symbol/ODNO; in particular, a prior-account order is not ours.
+            if source_order is None:
+                raise RuntimeError("KR_RECONCILE_SOURCE_UNATTRIBUTED_KEEP_UNRESOLVED")
+            with engine.connect() as owner_conn:
+                if not order_matches_recovery_scope(
+                    conn=owner_conn, schema=schema_for_engine(engine),
+                    order=dict(source_order),
+                    strategy=str(source_order.get("strategy") or ""),
+                    scope=kr_scope,
+                ):
+                    raise RuntimeError("KR_RECONCILE_SOURCE_OWNER_EPOCH_CHANGED")
         if strict_sell_order_ids is not None:
             if (
                 str((source_order or {}).get("order_id") or "") !=
