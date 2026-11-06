@@ -44,6 +44,11 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
     if (data.get("version") != POLICY_VERSION
             or data.get("strategy_owner") != "PB1"
             or data.get("exit_policy_family") != "SWING_STAGED_EXIT"
+            or data.get("trade_horizon") != "SWING"
+            or data.get("position_action") != "NEW_POSITION_BUY"
+            or not str(data.get("account_sha256") or "").strip()
+            or not str(data.get("trading_epoch_id") or "").strip()
+            or not str(data.get("position_cycle_id") or "").strip()
             or data.get("runner_version") not in VALID_RUNNER_VERSIONS
             or data.get("stages") != [dict(stage=s[0], threshold_fraction=s[1],
                                            sell_fraction=s[2], reason=s[3]) for s in STAGES]):
@@ -142,10 +147,19 @@ def calculate_next_tp_stage(
     """
     if not verified_contract(contract):
         return StageDecision("BLOCK", reason="FROZEN_CONTRACT_INVALID")
+    def _exact_qty(value: Any) -> int:
+        # Match US V3 strict broker qty semantics: canonical nonnegative int
+        # or ASCII decimal string, never a rounded float/bool/"2.0".
+        if isinstance(value, bool):
+            raise ValueError("boolean quantity")
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        raise ValueError("quantity evidence not integral")
+
     try:
-        if any(isinstance(x, bool) or int(x) != x for x in (holding_qty, orderable_qty)):
-            raise ValueError("fractional qty")
-        q, orderable = int(holding_qty), int(orderable_qty)
+        q, orderable = _exact_qty(holding_qty), _exact_qty(orderable_qty)
         basis, px = float(verified_entry_price), float(executable_price)
         if q < 0 or orderable < 0 or orderable > q:
             raise ValueError("qty out of range")
@@ -155,6 +169,8 @@ def calculate_next_tp_stage(
         return StageDecision("BLOCK", reason="QUANTITY_OR_PRICE_NOT_VERIFIED")
     if unresolved_sell:
         return StageDecision("BLOCK", reason="UNRESOLVED_SELL_OR_ACK")
+    if not isinstance(stage_states, Mapping):
+        return StageDecision("BLOCK", reason="STAGE_STORAGE_UNAVAILABLE")
     gain = (px / basis) - 1.0
     for name, threshold, frac, _ in STAGES:
         state = dict(stage_states.get(name) or {})
@@ -166,7 +182,12 @@ def calculate_next_tp_stage(
             continue
         if status in BLOCKING_STATES:
             return StageDecision("BLOCK", name, reason="PREVIOUS_STAGE_NOT_FILLED")
-        if status not in {"NOT_TRIGGERED", "REJECTED", "CANCELLED"}:
+        if status in {"REJECTED", "CANCELLED"}:
+            # A rejected/cancelled broker ACK is not proof that a previously
+            # accepted or partially-filled TP is absent. Require a separate
+            # exact broker cancellation + cumulative fill observation first.
+            return StageDecision("BLOCK", name, reason="RETRY_REQUIRES_BROKER_PROOF")
+        if status != "NOT_TRIGGERED":
             return StageDecision("BLOCK", name, reason="STAGE_STATE_UNKNOWN")
         if gain + 1e-12 < threshold:
             return StageDecision("HOLD", name, reason="TP_THRESHOLD_NOT_MET")
@@ -174,10 +195,14 @@ def calculate_next_tp_stage(
         target = state.get("target_qty") or 0
         filled = state.get("filled_qty") or 0
         try:
+            target_qty = _exact_qty(target)
+            filled_qty = _exact_qty(filled)
+            if filled_qty > target_qty and target_qty > 0:
+                raise ValueError("stage filled > target")
             quantity = resolve_profit_capture_stage_quantity(
                 holding_qty=q, sell_fraction=frac,
                 runner_min_remain_pct=RUNNER_MIN_REMAIN_PCT,
-                stage_target_qty=int(target), stage_filled_qty=int(filled),
+                stage_target_qty=target_qty, stage_filled_qty=filled_qty,
             )
         except (TypeError, ValueError, OverflowError):
             return StageDecision("BLOCK", name, reason="STAGE_QUANTITY_INVALID")
