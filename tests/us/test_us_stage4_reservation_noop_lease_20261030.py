@@ -39,7 +39,7 @@ class _ReadOnlyConnection:
 
     def execute(self, statement, params):
         sql = str(statement)
-        if "SELECT DISTINCT trading_epoch_id" in sql:
+        if "SELECT DISTINCT r.trading_epoch_id" in sql:
             return _Rows(["epoch-current"])
         if "NULL::DATE AS source_trade_date" in sql:
             return _Rows(self.abandoned_candidates)

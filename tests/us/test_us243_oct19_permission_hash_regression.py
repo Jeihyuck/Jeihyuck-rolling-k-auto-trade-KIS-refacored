@@ -118,7 +118,7 @@ def test_native_kis_router_missing_paper_authority_blocks_before_submit(monkeypa
     )
     _db,claims,_broker=_route_fixture(monkeypatch)
     events=[]
-    native=_native_kis_client(monkeypatch,events)
+    native=_native_kis_client(monkeypatch,events,_db)
     monkeypatch.setattr(
         order_router, "_get_broker_position",
         lambda *_args,**_kwargs: {

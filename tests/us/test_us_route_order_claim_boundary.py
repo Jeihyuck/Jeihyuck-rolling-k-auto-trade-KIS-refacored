@@ -233,12 +233,35 @@ def _enable_in_memory_reconciliation(monkeypatch, claim_repo, save_ack):
     return repos
 
 
-def _native_kis_client(monkeypatch, http_events):
+def _native_kis_client(monkeypatch, http_events, engine):
     from trader.us.execution import kis_us_client
+    from trader.us.execution import recovery_identity
     import requests
 
+    monkeypatch.setattr("trader.account_state.get_account_key",
+                        lambda **_kwargs: "practice:12345678:01")
+    monkeypatch.setattr(recovery_identity, "require_us_recovery_engine", lambda: engine)
+    monkeypatch.setattr(recovery_identity, "assert_no_crossday_us_order_conflict",
+                        lambda *_a, **_kw: None)
+    monkeypatch.setattr(recovery_identity, "assert_preexisting_us_claim_scope",
+                        lambda *_a, **_kw: None)
+    monkeypatch.setattr(recovery_identity, "persist_us_claim_scope",
+                        lambda *_a, **_kw: None)
+    monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch",
+                        lambda *_a, **_kw: "route-test-portfolio")
+    # The older native fixtures mock claim identity. Keep the real router's
+    # account equality check in these fixtures by using the same digest.
+    from dataclasses import replace
+    from hashlib import sha256
+    from trader.us.execution import order_router
+    original_identity = order_router._semantic_action_identity
+    monkeypatch.setattr(order_router, "_semantic_action_identity",
+        lambda intent, **kwargs: replace(original_identity(intent, **kwargs),
+            account_id=sha256(b"practice:12345678:01").hexdigest()))
     client = kis_us_client.KisUSClient(env="practice", offline=True)
     client._offline = False
+    client._cano = "12345678"
+    client._acnt_prdt_cd = "01"
     monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
     monkeypatch.setattr(client, "_assert_not_offline", lambda _operation: None)
     monkeypatch.setattr(client, "_build_headers", lambda _tr_id: {})
@@ -1270,7 +1293,7 @@ def test_kis_order_post_throttle_failure_is_identified_as_pre_http(monkeypatch):
 def test_route_records_submitted_at_native_kis_http_boundary(monkeypatch):
     _engine, claim_repo, _broker = _route_fixture(monkeypatch)
     events = []
-    client = _native_kis_client(monkeypatch, events)
+    client = _native_kis_client(monkeypatch, events, _engine)
 
     def record_observation(identity, **kwargs):
         if kwargs["state"] == "SUBMITTED":
@@ -1294,7 +1317,7 @@ def test_route_records_submitted_at_native_kis_http_boundary(monkeypatch):
 def test_native_kis_http_is_blocked_when_submitted_observation_fails(monkeypatch):
     _engine, claim_repo, _broker = _route_fixture(monkeypatch)
     events = []
-    client = _native_kis_client(monkeypatch, events)
+    client = _native_kis_client(monkeypatch, events, _engine)
     record_observation = claim_repo.record_observation
 
     def fail_submitted(identity, **kwargs):
@@ -1407,7 +1430,7 @@ def test_oct19_native_practice_guard_reaches_http_ack_and_duplicate_is_fenced(mo
     native_guard = config.assert_us_paper_order_allowed
     _engine, claim_repo, _broker = _route_fixture(monkeypatch)
     http_events = []
-    client = _native_kis_client(monkeypatch, http_events)
+    client = _native_kis_client(monkeypatch, http_events, _engine)
     monkeypatch.setattr(config, 'assert_us_paper_order_allowed', native_guard)
     for key, value in dict(TRADING_REGION='US', KIS_ENV='practice',
                            US_PAPER_TRADING_ENABLED=True, US_LIVE_TRADING_ENABLED=True,
@@ -1456,9 +1479,10 @@ def test_native_practice_ack_partial_full_fill_position_and_restart(monkeypatch,
     _enable_in_memory_reconciliation(monkeypatch, claim_repo, real_ack)
     monkeypatch.setattr(repos, '_MEM_POSITIONS', [])
     monkeypatch.setattr(order_journal, 'append_order_event', real_journal)
+    monkeypatch.setattr(repos, 'append_us_order_event', lambda _event: True)
     monkeypatch.setenv('US_ORDER_JOURNAL_DIR', str(tmp_path / 'journal'))
     http_events = []
-    client = _native_kis_client(monkeypatch, http_events)
+    client = _native_kis_client(monkeypatch, http_events, _engine)
     monkeypatch.setattr(config, 'assert_us_paper_order_allowed', native_guard)
     for key,value in dict(TRADING_REGION='US', KIS_ENV='practice',
         US_PAPER_TRADING_ENABLED=True, US_LIVE_TRADING_ENABLED=True,
@@ -1477,7 +1501,8 @@ def test_native_practice_ack_partial_full_fill_position_and_restart(monkeypatch,
     intent=_intent('2026-10-19',qty=2,side=side,action='CONNECTED',client_order_key='connected-'+side)
     assert route_order(intent,kis_client=client)['status']=='ACK'
     assert http_events==['HTTP']
-    identity=_identity('2026-10-19','CONNECTED')
+    from trader.us.execution import order_router
+    identity = order_router._semantic_action_identity(intent, account_env="practice")
     for qty in (1,2,2):
         applied=repos.apply_broker_order_observation(trade_date='2026-10-19',
             client_order_key=intent['client_order_key'],raw_order_no='CONNECTED-1',
@@ -1577,3 +1602,77 @@ def test_v3_signed_partial_claim_fences_repeated_crossday_broker_submission(monk
     assert second["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
     assert broker.calls == 1
     assert claim_repo.health()["unresolved_execution_actions"] == 1
+
+
+@pytest.mark.parametrize("missing", ["portfolio", "journal"])
+def test_native_buy_requires_committed_scope_before_http(monkeypatch, tmp_path, missing):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal, recovery_identity
+
+    real_journal = order_journal.append_order_event
+    engine, _, _ = _route_fixture(monkeypatch)
+    events = []
+    client = _native_kis_client(monkeypatch, events, engine)
+    monkeypatch.setattr(order_journal, "append_order_event", real_journal)
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path))
+    written = []
+    monkeypatch.setattr(repos, "append_us_order_event", lambda event: written.append(event) or False)
+    if missing == "portfolio":
+        def missing_portfolio(*args, **kwargs):
+            raise recovery_identity.USRecoveryIdentityError("PORTFOLIO_EPOCH_MISSING")
+        monkeypatch.setattr(recovery_identity, "current_us_portfolio_epoch", missing_portfolio)
+
+    result = route_order(_intent("2026-11-06"), kis_client=client)
+
+    assert not events
+    assert result["broker_submit"] is False
+    if missing == "portfolio":
+        assert result["reason"] == "PORTFOLIO_EPOCH_MISSING"
+        assert not written
+    else:
+        assert result["reason"] == "durable_journal_write_failed"
+        assert len(written) == 1
+        assert written[0]["require_buy_submit_identity"] is True
+        assert written[0]["payload"]["portfolio_epoch_id"] == "route-test-portfolio"
+        assert written[0]["payload"]["position_cycle_id"] == "route-test-lifecycle"
+        assert not list(tmp_path.iterdir())  # no fallback under pytest
+
+
+def test_old_order_conflict_fences_only_matching_native_order(monkeypatch):
+    from trader.us.execution import recovery_identity
+
+    engine, _, _ = _route_fixture(monkeypatch)
+    events = []
+    client = _native_kis_client(monkeypatch, events, engine)
+
+    from trader.us.execution import order_router
+    import requests
+
+    monkeypatch.setattr(order_router, "_get_broker_position",
+                        lambda *_a, **_kw: {"qty": 1, "holding_qty": 1, "orderable_qty": 1})
+    monkeypatch.setattr(requests, "get", lambda *_a, **_kw: pytest.fail("unexpected KIS GET"))
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"rt_cd": "0", "order_no": "OFFLINE-ACK"}
+
+    monkeypatch.setattr(requests, "post", lambda *_a, **_kw: events.append("HTTP") or Response())
+
+    def check_conflict(conn, **scope):
+        if scope["symbol"] == "TMO" and scope["side"] == "SELL":
+            raise recovery_identity.USRecoveryIdentityError("CROSSDAY_ORDER_CONFLICT_UNRESOLVED")
+    monkeypatch.setattr(recovery_identity, "assert_no_crossday_us_order_conflict", check_conflict)
+
+    tmo_sell = _intent("2026-11-06", side="SELL", action="HARD_STOP", client_order_key="tmo-sell")
+    tmo_sell["symbol"] = "TMO"
+    result = route_order(tmo_sell, kis_client=client)
+    assert result["status"] == "ORDER_FENCED_UNRESOLVED_ACTION"
+    assert result["reason"] == "CROSSDAY_ORDER_CONFLICT_UNRESOLVED"
+    assert not events
+
+    other_sell = _intent("2026-11-06", side="SELL", action="HARD_STOP", client_order_key="other-sell")
+    assert route_order(other_sell, kis_client=client)["status"] == "ACK"
+    assert events == ["HTTP"]

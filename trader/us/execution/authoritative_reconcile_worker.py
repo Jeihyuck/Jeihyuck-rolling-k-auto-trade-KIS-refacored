@@ -1,6 +1,6 @@
 """Stage4 practice-only authoritative broker reconciliation process.
 
-Owns historical replay, broker fills persistence and ACK reconciliation while
+Owns current-day claim replay, broker fills persistence and ACK reconciliation while
 the main trading tick is in WORKER mode. Its account-wide PostgreSQL advisory
 lock excludes a second Stage4 writer; runner-side startup readiness and SQL
 health fencing must be checked before a trading tick trusts its evidence.
@@ -29,7 +29,8 @@ _STAGE4_FILL_MEMOS: dict[str, Any] = {}
 
 
 def recover_stop_tp_conflicts_once(*, provider: Any,trade_date: str,
-                                   max_candidates: int=3) -> dict:
+                                   max_candidates: int=3, current_date_only: bool=False,
+                                   read_only: bool=False) -> dict:
     """Independent TP repair: original-date READ-ONLY query by default.
 
     Cancel requests require both the existing cancel gate and explicit
@@ -50,7 +51,7 @@ def recover_stop_tp_conflicts_once(*, provider: Any,trade_date: str,
     ]
     _RECOVERY_CURSOR=(_RECOVERY_CURSOR+len(selected))%len(candidates)
     cancel_authorized=(
-        os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED","0")=="1"
+        not read_only and os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED","0")=="1"
         and os.getenv("US_STOP_RECOVERY_AUTHORIZED","0")=="1"
     )
     class _NoOrderSubmit:
@@ -61,13 +62,16 @@ def recover_stop_tp_conflicts_once(*, provider: Any,trade_date: str,
     results=request_protective_tp_cancel(
         intents=selected,provider=provider,
         kis_client=provider._get_client() if cancel_authorized else _NoOrderSubmit(),
-        trade_date=trade_date,env="practice",
+        trade_date=trade_date,env="practice", current_date_only=current_date_only,
         **({} if cancel_authorized else {
             "reserve":lambda order:False,
             "read_only_terminal_reconcile":True,
         }),
     )
-    return {"checked":len(selected),"total":len(candidates),
+    remaining = len(candidates) - sum(
+        str(item.get("status") or "") == "CANCEL_TERMINAL_RECONCILED" for item in results
+    )
+    return {"checked":len(selected),"total":len(candidates),"remaining":remaining,
             "cancel_authorized":cancel_authorized,
             "statuses":[str(x.get("status") or "") for x in results]}
 
@@ -248,7 +252,6 @@ def mark_stopped_after_confirmed_exit(*, expected_generation: str, env: str = "p
 def run_reconcile_once(*, provider: Any, trade_date: str,
                        session_run_id: str, writer_generation: str,
                        conn: Any, scope: dict,
-                       historical_provider: Any | None = None,
                        prefetched_fills: dict | None = None) -> dict:
     """One serial authoritative reconciliation cycle, no order submissions."""
     from trader.us.execution.fills import get_fills_today
@@ -257,9 +260,6 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
     from trader.us.execution.stage4_phase_latency import Stage4PhaseTimer
     phase = Stage4PhaseTimer()
-    # The Stage4 worker can fetch current KIS fills BEFORE latching original
-    # historical evidence. The read-only GET cannot mutate DB, so it does
-    # not consume the historical snapshot's strict 15s replay/READY budget.
     fills=(prefetched_fills if prefetched_fills is not None
            else get_fills_today(provider=provider,signal_only=False,trade_date=trade_date))
     phase.mark("kis_fill_fetch")
@@ -303,8 +303,8 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     replay=replay_order_journal(
         trade_date,session_run_id=session_run_id,
         tick_id="stage4-"+writer_generation,
-        provider=historical_provider if historical_provider is not None else provider,
-        include_active_claims=True, active_claims_only=True,
+        provider=provider, include_active_claims=True, active_claims_only=True,
+        active_claim_dates="current",
     )
     phase.mark("active_claim_replay")
     ack=reconcile_ack_orders_with_balance(
@@ -319,21 +319,19 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         reconcile_proven_reservations_once,
     )
     reservation=reconcile_proven_reservations_once(
-        env="practice",trade_date=trade_date,
+        env="practice",trade_date=trade_date,date_scope="current",
     )
     phase.mark("reservation_reconcile_and_stage_updates")
     if int(reservation.get("unresolved") or 0)>0:
         logger.warning("[US_STAGE4][RESERVATION_DEFERRED] unresolved=%s",
                        reservation.get("unresolved"))
-    # Failed or partial historical recovery must remain visible as an unsafe
-    # observation; an HTTP request returning is not an order terminal proof.
+    # A failed read of current execution evidence must still fence READY.
     replay_status=str(replay.get("status") or "ERROR").upper()
     ack_status=str(ack.get("status") or "ERROR").upper()
     if (replay_status not in {"OK","RECOVERED","NO_ACTIVE_CLAIMS","WARN","PARTIAL","UNRESOLVED"}
             or ack_status not in {"OK","WARN"}):
         # Preserve FAILED / no READY. The previous single generic exception
-        # hid whether the true blocker was historical journal replay or today's
-        # KIS ACK reconciliation. Never log raw broker/account evidence here.
+        # hid whether current journal replay or KIS ACK reconciliation failed.
         logger.error(
             "[US_STAGE4][BROKER_RECOVERY_UNVERIFIED] "
             "replay_status=%s ack_status=%s replay_failed=%s "
@@ -351,9 +349,6 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
         _stage4_cycle_id.get(),
         metrics["total_ms"], metrics["phases_ms"],
     )
-    # Publish fresh critical-path proof first. Expensive original-date TP
-    # lookups and stop terminal cleanup are after that publication and can
-    # never delay this cycle's broker-evidence handoff to a clean SELL.
     return {
         "reconcile_status":ack_status,
         "replay_status":replay_status,
@@ -411,6 +406,84 @@ def run_deferred_recovery_once(*, provider: Any,trade_date: str,
     )
     return {"tp":{"status":"DEFERRED_NEXT_CYCLE"},"settlement":settled,
             "phase":"settlement"}
+
+
+def run_historical_recovery_at_boundary(*, trade_date: str, env: str,
+                                        boundary: str, provider: Any = None) -> dict:
+    """Attempt old-order repair once; leave unresolved durable fences in place."""
+    from trader.us.execution.order_journal import replay_order_journal
+
+    result = {"status": "UNRESOLVED", "unresolved_count": 0}
+    deadline = time.monotonic() + 10.0
+    recovery_provider = None
+    try:
+        if provider is None:
+            from trader.us.data_provider import USDataProvider
+            provider = USDataProvider(offline=False, env=env)
+        recovery_provider = (
+            provider.fork_for_stage(stage_deadline=deadline)
+            if callable(getattr(provider, "fork_for_stage", None)) else provider
+        )
+        result.update(replay_order_journal(
+            trade_date, provider=recovery_provider, include_active_claims=True,
+            active_claims_only=True, active_claim_dates="historical",
+            deadline_monotonic=deadline,
+        ))
+    except Exception as exc:
+        result.update(status="ERROR", failed_count=1, unresolved_count=1,
+                      error_type=type(exc).__name__)
+
+    if (env == "practice" and recovery_provider is not None and (
+            os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") == "WORKER"
+            or os.getenv("US_PROTECTIVE_STOP_LEDGER_MODE", "OFF") == "ENFORCE"
+    )):
+        from trader.us.execution.protective_stop_settlement_worker import (
+            settle_verified_stop_debts_once,
+        )
+        for name, recover in (
+            ("tp", lambda: recover_stop_tp_conflicts_once(
+                provider=recovery_provider, trade_date=trade_date, read_only=True,
+            )),
+            ("stop_settlement", lambda: settle_verified_stop_debts_once(
+                provider=recovery_provider, trade_date=trade_date,
+            )),
+        ):
+            if time.monotonic() >= deadline:
+                result[name] = {"status": "DEFERRED_BUDGET"}
+                continue
+            try:
+                result[name] = recover()
+            except Exception as exc:
+                result[name] = {"status": "ERROR", "error_type": type(exc).__name__}
+    if env == "practice" and os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE":
+        try:
+            from trader.us.execution.reservation_reconcile_worker import (
+                reconcile_proven_reservations_once,
+            )
+            result["reservations"] = reconcile_proven_reservations_once(
+                env=env, trade_date=trade_date, date_scope="historical",
+            )
+        except Exception as exc:
+            result["reservations"] = {"status": "ERROR", "error_type": type(exc).__name__}
+    reservations = result.get("reservations") or {}
+    tp = result.get("tp") or {}
+    settlement = result.get("stop_settlement") or {}
+    recovery_incomplete = (
+        result["status"] != "OK" or result["unresolved_count"] > 0
+        or tp.get("status") in {"ERROR", "DEFERRED_BUDGET"}
+        or tp.get("remaining", 0) > 0
+        or settlement.get("status") in {"ERROR", "DEFERRED_BUDGET"}
+        or settlement.get("total_pending", 0) > settlement.get("settled", 0)
+        or reservations.get("status") == "ERROR" or reservations.get("unresolved", 0) > 0
+    )
+    result["boundary_status"] = "HISTORICAL_UNRESOLVED" if recovery_incomplete else "OK"
+    log = logger.warning if recovery_incomplete else logger.info
+    log("[US_STAGE4][HISTORICAL_BOUNDARY] boundary=%s trade_date=%s "
+        "status=%s replay_status=%s unresolved=%s affected=%s tp=%s settlement=%s reservations=%s",
+        boundary, trade_date, result["boundary_status"], result["status"],
+        result["unresolved_count"], result.get("unresolved_symbol_sides", []),
+        tp, settlement, reservations)
+    return result
 
 
 def publish_health(conn: Any, *, scope: dict, generation: str,
@@ -511,7 +584,6 @@ def main() -> int:
     from trader.us.execution.stage4_phase_latency import RollingStage4Latency
     ready_window = RollingStage4Latency(size=128)
     last_ready_mono: float | None = None
-    historical_reader = None
     # Hold only the dedicated one-writer advisory lock. It is distinct from
     # the short-lived trade reservation leases, so it does not hold KIS HTTP.
     with engine.connect() as lease:
@@ -529,69 +601,17 @@ def main() -> int:
                 publish_health(conn, scope=scope, generation=generation, state="STARTING")
             logger.info("[US_STAGE4][WORKER_STARTING] generation=%s", generation)
             provider=USDataProvider(offline=False,env="practice")
-            from trader.us.execution.stage4_historical_reader import HistoricalReadOnlyReader
-            historical_reader = HistoricalReadOnlyReader(
-                scope=scope, generation=generation,
-                # The reader creates a separate read-only KIS client. It has
-                # no execution / cancel / claim-release / health-write API.
-                provider_factory=lambda: USDataProvider(offline=False, env="practice"),
-            )
-            historical_reader.start()
             while not _STOP:
                 started=time.monotonic()
                 cycle_id=uuid.uuid4().hex
                 token=_stage4_cycle_id.set(cycle_id)
                 logger.info("[US_STAGE4][CYCLE_START] cycle_id=%s observed_at_utc=%s generation=%s",cycle_id,datetime.now(timezone.utc).isoformat(),generation)
                 try:
-                    from trader.us.db.repos import load_active_execution_claim_attempts
-                    # Read-only broker GETs for old orders never run on this
-                    # authoritative writer. A missing or stale historical
-                    # snapshot blocks READY; no synthetic terminality.
-                    # Current-session KIS fills are authenticated READ-ONLY
-                    # evidence. Fetch them BEFORE adopting historical books:
-                    # their p95 GET latency previously spent most of the
-                    # 15-second historical TTL without needing those books.
-                    # The account-wide single writer and existing status checks
-                    # remain in force; no DB/claim mutation precedes the
-                    # original-scope historical snapshot.
-                    from trader.us.execution.fills import get_fills_today
-                    current_get_started = time.monotonic()
-                    prefetched_fills = get_fills_today(
-                        provider=provider, signal_only=False,
-                        trade_date=args.trade_date,
-                    )
-                    current_get_ms = (time.monotonic()-current_get_started)*1000.0
-                    logger.info(
-                        "[US_STAGE4][CURRENT_FILL_PREBOOK_GET] cycle_id=%s "
-                        "elapsed_ms=%.1f status=%s",
-                        cycle_id, current_get_ms,
-                        (prefetched_fills.get("status") if isinstance(prefetched_fills, dict)
-                         else "INVALID"),
-                    )
-                    if (not isinstance(prefetched_fills, dict)
-                            or prefetched_fills.get("status") != "OK"):
-                        raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
-                    # Bind the latest claim signatures *after* the independent
-                    # current KIS GET. Recheck them again at READY publication.
-                    active_before = load_active_execution_claim_attempts()
-                    historical_snapshot = historical_reader.snapshot_for_claims(active_before)
-                    historical_provider = historical_reader.provider_for(historical_snapshot)
                     result=run_reconcile_once(
                         provider=provider,trade_date=args.trade_date,
                         session_run_id=args.session_run_id,
                         writer_generation=generation,conn=lease,scope=scope,
-                        historical_provider=historical_provider,
-                        prefetched_fills=prefetched_fills,
                     )
-                    # Verify both the current DB claim set and snapshot age at
-                    # the point of publishing, including any mutations the
-                    # writer just committed during the replay. Fail closed if
-                    # claims changed or the reader replaced/expired evidence.
-                    historical_reader.assert_still_valid(
-                        historical_snapshot, load_active_execution_claim_attempts(),
-                    )
-                    # If the checkout changed after startup, the worker must
-                    # fail closed rather than reporting READY with mixed code.
                     assert_stage4_worker_code_pin(
                         trade_date=args.trade_date,
                         expected_sha=_code_pin,
@@ -630,41 +650,22 @@ def main() -> int:
                          "pending_order_count":result["pending_count"],
                          "active_claim_count":result["unresolved_count"]},
                     )
-                    # Slow historical broker inquiries are outside the main
-                    # Tick and after the READY evidence publication.
-                    try:
-                        deferred_started=time.monotonic()
-                        logger.info("[US_STAGE4][DEFERRED_RECOVERY_START] cycle_id=%s observed_at_utc=%s",cycle_id,datetime.now(timezone.utc).isoformat())
-                        # Deferred DB mutations remain owned by this writer.
-                        # Normal historical KIS reads were prefetched without
-                        # holding the authoritative writer. Preserve the
-                        # *explicitly operator-authorized* cancel flow: never
-                        # substitute a GET-only facade for an authorized KIS
-                        # cancel client. That exceptional operator path remains
-                        # synchronous and must be measured separately.
-                        _operator_cancel = (
-                            os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
-                            and os.getenv("US_STOP_RECOVERY_AUTHORIZED", "0") == "1"
-                        )
-                        deferred=run_deferred_recovery_once(
-                            provider=provider if _operator_cancel else historical_provider,
-                            trade_date=args.trade_date,
-                            historical_balance_available=(
-                                None if _operator_cancel else
-                                historical_snapshot.get("balance") is not None
-                            ),
-                        )
-                        if (deferred.get("settlement") or {}).get("status") == "DEFERRED_NO_FRESH_EVIDENCE":
-                            logger.warning(
-                                "[US_STAGE4][DEFERRED_NO_FRESH_EVIDENCE] "
-                                "cycle_id=%s reason=historical_balance_missing "
-                                "action=KEEP_PROTECTIVE_FENCE", cycle_id,
+                    # A current-day TP can still require an explicitly
+                    # authorized protective cancel. Past orders are handled
+                    # at AM startup and Close and never queried here.
+                    if (os.getenv("US_PROTECTIVE_TP_CANCEL_RECOVERY_ENABLED", "0") == "1"
+                            and os.getenv("US_STOP_RECOVERY_AUTHORIZED", "0") == "1"):
+                        try:
+                            recovery_provider = provider.fork_for_stage(
+                                stage_deadline=time.monotonic() + 5.0,
                             )
-                        logger.info("[US_STAGE4][DEFERRED_RECOVERY] cycle_id=%s elapsed_ms=%.1f result=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,deferred)
-                    except Exception as recovery_exc:
-                        # Keep the confirmed stop obligation and old TP fence.
-                        # Do not falsify earlier *confirmed* ACK/Fill proof.
-                        logger.exception("[US_STAGE4][DEFERRED_RECOVERY_FAILED] cycle_id=%s elapsed_ms=%.1f type=%s",cycle_id,(time.monotonic()-deferred_started)*1000.0,type(recovery_exc).__name__)
+                            recover_stop_tp_conflicts_once(
+                                provider=recovery_provider, trade_date=args.trade_date,
+                                max_candidates=1, current_date_only=True,
+                            )
+                        except Exception as exc:
+                            logger.warning("[US_STAGE4][CURRENT_TP_RECOVERY_FAILED] type=%s",
+                                           type(exc).__name__)
                 except Exception as exc:
                     logger.exception("[US_STAGE4][RECONCILE_FAILURE] cycle_id=%s elapsed_ms=%.1f type=%s",cycle_id,(time.monotonic()-started)*1000.0,type(exc).__name__)
                     with engine.begin() as conn:
@@ -682,8 +683,6 @@ def main() -> int:
                         break
                     time.sleep(min(0.25,remaining))
         finally:
-            if historical_reader is not None:
-                historical_reader.stop()
             with engine.begin() as conn:
                 publish_health(conn,scope=scope,generation=generation,state="STOPPED")
             lease.execute(text("SELECT pg_advisory_unlock(:key)"),

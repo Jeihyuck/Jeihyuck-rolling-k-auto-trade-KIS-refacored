@@ -1556,8 +1556,41 @@ def append_us_order_event(event: dict, *, _conn: Any = None) -> bool:
             "portfolio_epoch_id": portfolio_epoch_id,
             "position_cycle_id": position_cycle_id,
         })
+    strict_buy = bool(event.get("require_buy_submit_identity"))
+    if strict_buy:
+        from trader.us.execution.recovery_identity import OWNERS
+        required = (
+            "client_order_key", "submit_attempt_id", "symbol", "exchange",
+            "requested_qty", "limit_price", "broker_account_hash", "trading_epoch_id",
+            "portfolio_epoch_id", "position_cycle_id", "position_lifecycle_id",
+        )
+        if (event_type != "BROKER_SUBMIT_STARTED" or not original_epoch or not active_epoch
+                or payload.get("side") != "BUY" or payload.get("env") != "practice"
+                or payload.get("strategy_owner") not in OWNERS
+                or payload.get("position_cycle_id") != payload.get("position_lifecycle_id")
+                or any(not str(payload.get(field) or "").strip() for field in required)):
+            raise RuntimeError("US_BUY_SUBMIT_EVENT_IDENTITY_INCOMPLETE")
+        if (int(payload["requested_qty"]) <= 0 or not math.isfinite(float(payload["limit_price"]))
+                or float(payload["limit_price"]) <= 0):
+            raise RuntimeError("US_BUY_SUBMIT_EVENT_ORDER_TERMS_INVALID")
     params["payload"] = _json_param(payload)
-    conn.execute(text(sql), params)
+    write = conn.execute(text(sql), params)
+    if strict_buy and write.rowcount != 1:
+        # ON CONFLICT is only success when the committed event is the same
+        # attempt, identity, and order terms. Its timestamp can differ.
+        identity = {
+            key: payload[key] for key in (
+                *required, "side", "env", "trade_date", "strategy_owner",
+            )
+        }
+        existing = conn.execute(text("""
+            SELECT 1 FROM us_order_events
+            WHERE idempotency_key=:idempotency_key AND event_type=:event_type
+              AND payload @> CAST(:identity AS jsonb)
+        """), {**params, "identity": _json_param(identity)}).first()
+        if existing is None:
+            raise RuntimeError("US_BUY_SUBMIT_EVENT_IDENTITY_CONFLICT")
+
     return True
 
 

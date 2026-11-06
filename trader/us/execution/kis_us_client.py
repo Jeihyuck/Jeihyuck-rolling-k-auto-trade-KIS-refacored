@@ -1043,6 +1043,8 @@ class KisUSClient:
                 raise RuntimeError(
                     "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
                 )
+            if self._before_order_http is None:
+                raise KisUSPreSubmitError("US_BUY_REQUIRES_DURABLE_ROUTER_BOUNDARY")
             tr = get_tr_info("us_buy_order")
         except Exception as exc:
             if isinstance(exc, KisUSPreSubmitError):

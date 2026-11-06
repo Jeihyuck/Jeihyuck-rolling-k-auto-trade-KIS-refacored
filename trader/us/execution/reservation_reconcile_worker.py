@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 def reconcile_proven_reservations_once(
     *, env: str, trade_date: str, max_candidates: int = 50,
+    date_scope: str = "all",
 ) -> dict[str, Any]:
     """Reconcile exact terminal evidence for ALL epochs of one broker account.
 
@@ -32,6 +33,9 @@ def reconcile_proven_reservations_once(
     earlier epoch's unresolved reservation when AM turns into Afternoon.
     This worker cannot place/cancel any KIS order or fabricate terminality.
     """
+    if date_scope not in {"all", "current", "historical"}:
+        raise ValueError("invalid_reservation_date_scope")
+    date_filter = {"all": "<=", "current": "=", "historical": "<"}[date_scope]
     if str(env or "").strip().lower() != "practice":
         raise RuntimeError("US_RESERVATION_RECONCILER_PRACTICE_ONLY")
     if os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") != "ENFORCE":
@@ -55,14 +59,19 @@ def reconcile_proven_reservations_once(
     }
     limit = min(100, max(1, int(max_candidates)))
     with engine.connect() as conn:
-        all_epochs = conn.execute(text("""
-            SELECT DISTINCT trading_epoch_id
-            FROM us_execution_account_reservations
-            WHERE env=:env AND account_fingerprint=:account
-              AND state IN ('RESERVED','UNCERTAIN')
-            ORDER BY trading_epoch_id
+        all_epochs = conn.execute(text(f"""
+            SELECT DISTINCT r.trading_epoch_id
+            FROM us_execution_account_reservations r
+            JOIN us_execution_attempts a ON a.attempt_id=r.action_key
+            JOIN us_execution_claims c ON c.action_key=a.action_key
+            WHERE r.env=:env AND r.account_fingerprint=:account
+              AND r.state IN ('RESERVED','UNCERTAIN')
+              AND (c.trade_date {date_filter} CAST(:trade_date AS date)
+                   OR (:include_undated AND c.trade_date IS NULL))
+            ORDER BY r.trading_epoch_id
             LIMIT 9
-        """), {"env": "practice", "account": scope["account_id"]}).scalars().all()
+        """), {"env": "practice", "account": scope["account_id"],
+               "trade_date": trade_date, "include_undated": date_scope != "current"}).scalars().all()
     # Unbounded stale epochs must not silently become an empty/clean read.
     if len(all_epochs) > 8:
         result["unresolved"] += 1
@@ -80,9 +89,10 @@ def reconcile_proven_reservations_once(
         params = {
             "env": "practice", "account": scope["account_id"],
             "epoch": epoch, "trade_date": trade_date, "limit": limit,
+            "include_undated": date_scope != "current",
         }
         with engine.connect() as conn:
-            rows = conn.execute(text("""
+            rows = conn.execute(text(f"""
                 SELECT r.action_key AS attempt_id, a.client_order_key,
                        o.trade_date AS source_trade_date,
                        a.attempt_state
@@ -104,10 +114,10 @@ def reconcile_proven_reservations_once(
                       'FILLED','CANCELLED_ZERO_FILL','CANCELLED_PARTIAL_FILL'
                   )
                   AND a.client_order_key IS NOT NULL
-                  AND o.trade_date<=CAST(:trade_date AS DATE)
+                  AND o.trade_date {date_filter} CAST(:trade_date AS DATE)
                 ORDER BY r.created_at LIMIT :limit
             """), params).mappings().all()
-            abandoned = conn.execute(text("""
+            abandoned = conn.execute(text(f"""
                 SELECT r.action_key AS attempt_id, a.client_order_key,
                        NULL::DATE AS source_trade_date,
                        a.attempt_state
@@ -125,6 +135,8 @@ def reconcile_proven_reservations_once(
                   AND a.attempt_state='ABANDONED_PRE_SUBMIT'
                   AND c.active_attempt_id IS DISTINCT FROM a.attempt_id
                   AND a.client_order_key IS NOT NULL
+                  AND (c.trade_date {date_filter} CAST(:trade_date AS date)
+                       OR (:include_undated AND c.trade_date IS NULL))
                 ORDER BY r.created_at LIMIT :limit
             """), params).mappings().all()
         # No terminal/pre-submit proof candidates means there is no account
@@ -252,7 +264,7 @@ def run_reservation_loop(
     while not state["stop"]:
         try:
             payload = reconcile_proven_reservations_once(
-                env=env, trade_date=trade_date,
+                env=env, trade_date=trade_date, date_scope="current",
             )
             payload["read_status"] = "OK" if payload["unresolved"] == 0 else "DEGRADED"
         except Exception as exc:

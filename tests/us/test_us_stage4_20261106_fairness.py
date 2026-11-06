@@ -195,8 +195,8 @@ def test_slow_claim_book_cannot_starve_debt_only_original_day_books():
         reader.snapshot_for_claims([CLAIM])
 
 
-def test_stage4_current_fill_prefetch_is_not_fetched_again_after_book_latch(monkeypatch):
-    """Current broker fills GET occurs before original proof, not twice."""
+def test_stage4_current_fill_prefetch_is_not_fetched_again(monkeypatch):
+    """An explicitly prefetched current-day fills result is used once."""
     from trader.us.execution import authoritative_reconcile_worker as worker
     from trader.us.execution import fills as fill_source
     from trader.us.execution import order_journal, reconcile
@@ -215,10 +215,10 @@ def test_stage4_current_fill_prefetch_is_not_fetched_again_after_book_latch(monk
     monkeypatch.setattr(
         repos, "save_fills_with_result", lambda *a, **k: {"status": "OK"},
     )
-    order_book = object()
-    original_replays = []
+    provider = object()
+    current_replays = []
     monkeypatch.setattr(order_journal, "replay_order_journal",
-                        lambda *a, **kw: original_replays.append(kw["provider"]) or
+                        lambda *a, **kw: current_replays.append((kw["provider"], kw["active_claim_dates"])) or
                         {"status": "UNRESOLVED", "unresolved_count": 1})
     monkeypatch.setattr(reconcile, "reconcile_ack_orders_with_balance",
                         lambda **kw: {"status": "OK", "pending_count": 0,
@@ -230,13 +230,12 @@ def test_stage4_current_fill_prefetch_is_not_fetched_again_after_book_latch(monk
     monkeypatch.setattr(ticks, "_mark_soft_stop_stages_from_records",
                         lambda *a, **kw: None)
     result = worker.run_reconcile_once(
-        provider=object(), trade_date="2026-11-05", session_run_id="unit",
+        provider=provider, trade_date="2026-11-05", session_run_id="unit",
         writer_generation="g", conn=None, scope={},
-        historical_provider=order_book,
         prefetched_fills={"status": "OK", "fills": []},
     )
     assert not fetches
-    assert original_replays == [order_book]
+    assert current_replays == [(provider, "current")]
     assert result["replay_status"] == "UNRESOLVED"
 
 
@@ -254,7 +253,6 @@ def test_stage4_rejects_invalid_current_fill_prefetch_without_db_writes(monkeypa
         worker.run_reconcile_once(
             provider=object(), trade_date="2026-11-05", session_run_id="unit",
             writer_generation="g", conn=None, scope={},
-            historical_provider=object(),
             prefetched_fills={"status": "UNVERIFIED", "fills": []},
         )
     assert saves == []

@@ -1406,28 +1406,39 @@ def route_order(
             "intent": intent,
         }
 
-    # Production US_STANDARD writes must have ORIGINAL account + owner-specific
-    # Portfolio Epoch + position-cycle provenance before even saving an Intent.
-    # Other owners (notably TQQQ Infinite) retain their dedicated route/contract.
-    # WSL US is mandatory; offline injected harnesses never gain KIS authority.
-    if (
+    from trader.us.execution.kis_us_client import KisUSClient
+    dry_run_resolved = resolve_dry_run_for_us_order()
+    native_buy = (
+        side == "BUY" and not dry_run_resolved
+        and (kis_client is None or isinstance(kis_client, KisUSClient))
+    )
+    scoped_order = native_buy or (
         os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
-        and kis_order_allowed
         and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
-    ):
+    )
+    if scoped_order:
         try:
             from trader.account_state import get_account_key
-            from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
-            from trader.us.execution.recovery_identity import bind_original_us_order_scope
-            _identity_engine = _get_engine_or_none()
-            if _identity_engine is None:
-                raise RuntimeError("US_SCOPE_DATABASE_UNAVAILABLE")
+            from trader.us.db.repos import _active_us_epoch
+            from trader.us.execution.recovery_identity import (
+                bind_original_us_order_scope, require_us_recovery_engine,
+            )
+            _identity_engine = require_us_recovery_engine()
             _env = _kis_env()
+            account_key = get_account_key(env=_env)
+            if native_buy:
+                cano = kis_client._cano if kis_client is not None else us_cfg.CANO
+                product = kis_client._acnt_prdt_cd if kis_client is not None else us_cfg.ACNT_PRDT_CD
+                if (not str(cano or "").strip() or not str(product or "").strip()
+                        or account_key != get_account_key(env=_env, cano=cano, product_code=product)
+                        or "unknown" in account_key.split(":")):
+                    raise RuntimeError("US_BUY_KIS_ACCOUNT_UNVERIFIED")
+                intent.update(client_order_key=order_key, exchange=exchange)
             with _identity_engine.connect() as _identity_conn:
                 _epoch = _active_us_epoch(_identity_conn, required=True)
                 bind_original_us_order_scope(
                     intent, conn=_identity_conn, env=_env,
-                    account_key=get_account_key(env=_env),
+                    account_key=account_key,
                     trading_epoch_id=str(_epoch or ""),
                 )
             meta = intent["meta"]
@@ -1652,9 +1663,7 @@ def route_order(
                 audit_meta["expected_post_order_qty"] = holding - int(qty)
                 audit_meta["post_order_expected_qty"] = holding - int(qty)
 
-    # 4. DRY_RUN resolve with runtime guard
-    dry_run_resolved = resolve_dry_run_for_us_order()
-    
+    # 4. DRY_RUN
     if dry_run_resolved:
         logger.info("[US_ORDER][DRY_RUN] symbol=%s side=%s qty=%s", symbol, side, qty)
         dry_intent = {**intent, "client_order_key": order_key}
@@ -1708,7 +1717,6 @@ def route_order(
 
     # 5. Paper order via KIS
     if kis_client is None:
-        from trader.us.execution.kis_us_client import KisUSClient
         kis_client = KisUSClient(env=_kis_env())
     if context is not None and hasattr(kis_client, "bind_tick_context"):
         kis_client.bind_tick_context(context)
@@ -2065,14 +2073,10 @@ def route_order(
     # when the *native* KIS client would refuse the order. Do not weaken or
     # auto-clear DISABLE_REAL_TRADING; also protect direct tick/router callers
     # that did not run the session permission precheck.
-    from trader.us.execution.kis_us_client import KisUSClient
     # Synthetic broker adapters (including injected harness clients) are
     # not a KIS HTTP submitter; they preserve their explicit test semantics.
     # Only the genuine KIS client must pass the native HTTP gate.
-    _native_kis = (
-        type(kis_client).__module__ == KisUSClient.__module__
-        and type(kis_client).__name__ == "KisUSClient"
-    )
+    _native_kis = isinstance(kis_client, KisUSClient)
     if _native_kis:
         try:
             us_cfg.assert_us_paper_order_allowed()
@@ -2094,32 +2098,46 @@ def route_order(
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
         _us_claim_scope = None
-        if (
-            os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
-            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
-        ):
+        if scoped_order or _native_kis:
             from trader.us.execution.recovery_identity import (
-                USRecoveryScope, assert_preexisting_us_claim_scope,
+                USRecoveryIdentityError, USRecoveryScope, assert_no_crossday_us_order_conflict,
+                assert_preexisting_us_claim_scope, require_us_recovery_engine,
             )
-            from trader.us.db.repos import _get_engine_or_none
-            _us_claim_scope = USRecoveryScope(
-                env=account_env,
-                account_id=str(intent.get("broker_account_hash") or ""),
-                trading_epoch_id=str(intent.get("trading_epoch_id") or ""),
-                portfolio_epoch_id=str(intent.get("portfolio_epoch_id") or ""),
-                position_cycle_id=str(intent.get("position_cycle_id") or ""),
-                strategy_owner="US_STANDARD",
-            )
-            if not all(_us_claim_scope.as_dict().values()):
-                raise RuntimeError("US_CLAIM_ORIGINAL_SCOPE_UNVERIFIED")
-            _preclaim_engine = _get_engine_or_none()
-            if _preclaim_engine is None:
-                raise RuntimeError("US_CLAIM_SCOPE_DB_UNAVAILABLE")
+            _preclaim_engine = require_us_recovery_engine()
             with _preclaim_engine.begin() as _preclaim_conn:
-                assert_preexisting_us_claim_scope(
-                    _preclaim_conn, action_key=claim_identity.action_key,
-                    scope=_us_claim_scope,
-                )
+                if _native_kis:
+                    try:
+                        assert_no_crossday_us_order_conflict(
+                            _preclaim_conn, env=account_env,
+                            account_id=claim_identity.account_id,
+                            trade_date=trade_date, symbol=symbol_upper, side=side,
+                        )
+                    except USRecoveryIdentityError as exc:
+                        logger.warning(
+                            "[US_ORDER][HISTORICAL_CONFLICT] symbol=%s side=%s reason=%s",
+                            symbol_upper, side, exc,
+                        )
+                        return {
+                            "status": "ORDER_FENCED_UNRESOLVED_ACTION",
+                            "reason": str(exc), "requires_reconcile": True,
+                            "broker_submit": False, "retry_order": False, "intent": intent,
+                        }
+                if scoped_order:
+                    _us_claim_scope = USRecoveryScope(
+                        env=account_env, account_id=claim_identity.account_id,
+                        trading_epoch_id=claim_identity.trading_epoch_id,
+                        portfolio_epoch_id=str(intent.get("portfolio_epoch_id") or ""),
+                        position_cycle_id=str(intent.get("position_cycle_id") or ""),
+                        strategy_owner=claim_identity.strategy_owner,
+                    )
+                    if not all(_us_claim_scope.as_dict().values()):
+                        raise RuntimeError("US_CLAIM_ORIGINAL_SCOPE_UNVERIFIED")
+                    if _us_claim_scope.account_id != intent.get("broker_account_hash"):
+                        raise RuntimeError("US_CLAIM_ACCOUNT_SCOPE_MISMATCH")
+                    assert_preexisting_us_claim_scope(
+                        _preclaim_conn, action_key=claim_identity.action_key,
+                        scope=_us_claim_scope,
+                    )
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation
         # Stage A: persist the Claim and an immutable PRE-SUBMIT DB outbox
         # marker atomically.  The existing fsync journal below still proves
@@ -2249,6 +2267,13 @@ def route_order(
                             "raw_broker_order_no": None,
                             "canonical_broker_order_no": None,
                             "position_lifecycle_id": str(intent.get("position_lifecycle_id") or lifecycle_meta.get("position_lifecycle_id") or ""),
+                            **({
+                                "trading_epoch_id": _us_claim_scope.trading_epoch_id,
+                                "portfolio_epoch_id": _us_claim_scope.portfolio_epoch_id,
+                                "position_cycle_id": _us_claim_scope.position_cycle_id,
+                                "broker_account_hash": _us_claim_scope.account_id,
+                                "strategy_owner": _us_claim_scope.strategy_owner,
+                            } if _us_claim_scope is not None else {}),
                             "profit_capture_stage": str(lifecycle_meta.get("profit_capture_stage") or ""),
                             "cumulative_filled_qty": 0,
                             "payload": {
@@ -2354,7 +2379,12 @@ def route_order(
 
     from trader.us.execution.order_journal import append_order_event
     try:
-        append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
+        if native_buy:
+            intent.update(qty=qty, limit_price=float(f"{price:.2f}"), exchange=exchange)
+        append_order_event(
+            "BROKER_SUBMIT_STARTED", intent, context=context,
+            **({"require_postgres": True} if native_buy else {}),
+        )
     except Exception as exc:
         try:
             from trader.us.db.repos import release_execution_action_before_submit
@@ -2957,7 +2987,8 @@ def route_order(
                 "execution_integrity_error": observation_error, "intent": intent}
     try:
         append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no,
-                           broker_status="ACK", raw_response=resp)
+                           broker_status="ACK", raw_response=resp,
+                           **({"require_postgres": True} if native_buy else {}))
     except Exception as exc:
         logger.critical("[US_ORDER][ACK_JOURNAL_FAILED] symbol=%s order_no=%s err=%s", symbol, order_no, exc)
         return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,

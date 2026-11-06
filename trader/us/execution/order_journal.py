@@ -234,7 +234,8 @@ def journal_path(trade_date: str) -> Path:
 
 
 def append_order_event(event_type: str, intent: dict, *, context: Any | None = None,
-                       broker_order_no: str = "", broker_status: str = "", raw_response: Any = None) -> dict:
+                       broker_order_no: str = "", broker_status: str = "", raw_response: Any = None,
+                       require_postgres: bool = False) -> dict:
     td = str(intent.get("trade_date") or getattr(context, "trade_date", ""))
     if not td:
         raise OSError("journal event requires trade_date")
@@ -314,6 +315,7 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
 
     event = {
         "event_id": str(uuid.uuid4()), "event_type": event_type, "trade_date": td,
+        "env": intent.get("env") or meta.get("env"),
         "session": intent.get("session") or getattr(context, "session", ""),
         "session_run_id": intent.get("session_run_id") or getattr(context, "session_run_id", ""),
         "session_generation": intent.get("session_generation") or getattr(context, "session_generation", 0),
@@ -396,9 +398,11 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "cumulative_filled_qty": event.get("cumulative_filled_qty"),
         "payload": event, "idempotency_key": event["idempotency_key"],
     }
+    if require_postgres and event_type == "BROKER_SUBMIT_STARTED":
+        db_event["require_buy_submit_identity"] = True
     db_saved = append_us_order_event(db_event)
     fallback_allowed = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("US_OFFLINE") == "1" or os.getenv("OFFLINE") == "1")
-    if not db_saved and not fallback_allowed:
+    if not db_saved and (require_postgres or not fallback_allowed):
         raise OSError("durable_order_event_ledger_unavailable")
     event["ledger_source"] = "postgres" if db_saved else "jsonl_test_fallback"
     path = journal_path(td)
@@ -631,7 +635,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                          include_active_claims: bool = False,
                          active_claims_only: bool = False,
                          deadline_monotonic: float | None = None,
-                         active_claim_offset: int = 0) -> dict:
+                         active_claim_offset: int = 0,
+                         active_claim_dates: str = "all") -> dict:
     """Restore broker truth without resubmission.
 
     An optional pre-route deadline defers work, never resolves a claim. Full
@@ -640,7 +645,14 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     def budget_available() -> bool:
         return deadline_monotonic is None or time.monotonic() < deadline_monotonic
 
-    events = load_order_events(trade_date, session_run_id=session_run_id)
+    if active_claim_dates not in {"all", "current", "historical"}:
+        raise ValueError("invalid_active_claim_date_scope")
+    if active_claim_dates == "historical" and not (include_active_claims and active_claims_only):
+        raise ValueError("historical_replay_requires_active_claims_only")
+    events = (
+        [] if active_claim_dates == "historical"
+        else load_order_events(trade_date, session_run_id=session_run_id)
+    )
     if tick_id:
         events = [e for e in events if e.get("tick_id") == tick_id]
     # Full submit/ACK history is used ONLY for conflicting-order detection.
@@ -662,6 +674,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 source_date = str(claim.get("trade_date") or "")
                 key = str(claim.get("client_order_key") or "")
                 attempt_id = str(claim.get("active_attempt_id") or "")
+                if ((active_claim_dates == "current" and source_date != trade_date)
+                        or (active_claim_dates == "historical" and source_date >= trade_date)):
+                    continue
                 if not source_date or not key or not attempt_id:
                     active_claim_errors.append({
                         "symbol": "", "side": "", "reason": "active_claim_identity_incomplete",
@@ -887,18 +902,13 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         # Later ORDER_OPEN/REPLAY snapshots may have empty original session,
         # generation=0 or qty=0. They cannot overwrite submitted identity.
         latest = submitted
-        if (
-            os.getenv("WSL_RUN_MARKET", "").upper() == "US"
-            and str(submitted.get("strategy_owner") or
-                    (submitted.get("meta") or {}).get("strategy_owner") or
-                    "").upper() == "US_STANDARD"
-        ):
+        original_meta = submitted.get("meta") if isinstance(submitted.get("meta"), dict) else {}
+        owner = str(submitted.get("strategy_owner") or original_meta.get("strategy_owner") or "").upper()
+        if (submitted.get("portfolio_epoch_id") or original_meta.get("portfolio_epoch_id")
+                or (os.getenv("WSL_RUN_MARKET", "").upper() == "US" and owner == "US_STANDARD")):
             # An authenticated KIS query proves broker account/date/order,
             # NOT today's local portfolio/cycle ownership of a historical
             # order. Never silently bind legacy replay to the active epoch.
-            original_meta = submitted.get("meta") if isinstance(
-                submitted.get("meta"), dict,
-            ) else {}
             try:
                 from trader.account_state import get_account_key, resolve_env_name
                 from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
@@ -917,7 +927,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     active_portfolio = current_us_portfolio_epoch(
                         scope_conn, env=env, account_key=account_key,
                         trading_epoch_id=active_epoch,
-                        strategy_owner="US_STANDARD",
+                        strategy_owner=owner,
                     )
                 actual_cycle = str(
                     submitted.get("position_cycle_id")
@@ -930,7 +940,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     trading_epoch_id=active_epoch,
                     portfolio_epoch_id=active_portfolio,
                     position_cycle_id=actual_cycle,
-                    strategy_owner="US_STANDARD",
+                    strategy_owner=owner,
                 ).as_dict()
                 current_scope["broker_account_hash"] = current_scope.pop("account_id")
                 current_scope["position_lifecycle_id"] = actual_cycle
@@ -947,9 +957,10 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 ])
                 logger.error(
                     "[US_ORDER_JOURNAL][ORIGINAL_SCOPE_UNVERIFIED] symbol=%s "
-                    "side=%s type=%s action=KEEP_CLAIM_FENCED_NO_REBIND",
+                    "side=%s source_day=%s reason=%s action=KEEP_CLAIM_FENCED_NO_REBIND",
                     submitted.get("symbol"), submitted.get("side"),
-                    type(exc).__name__,
+                    submitted.get("trade_date"),
+                    str(exc) if isinstance(exc, USRecoveryIdentityError) else type(exc).__name__,
                 )
                 continue
         if not budget_available():

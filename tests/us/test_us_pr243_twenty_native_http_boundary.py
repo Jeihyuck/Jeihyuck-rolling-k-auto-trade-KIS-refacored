@@ -38,7 +38,7 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
     monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
     monkeypatch.setenv("DRY_RUN", "0")
     # All broker HTTP is intercepted locally; no DNS or network I/O is made.
-    _, claim_repo, _broker = _route_fixture(monkeypatch)
+    engine, claim_repo, _broker = _route_fixture(monkeypatch)
     monkeypatch.setattr(
         order_router, "_semantic_action_identity",
         lambda intent, *, account_env: replace(
@@ -48,7 +48,7 @@ def test_pr243_twenty_native_sell_http_and_restart_fence(monkeypatch, tmp_path):
         ),
     )
     events=[]
-    client = _native_kis_client(monkeypatch, events)
+    client = _native_kis_client(monkeypatch, events, engine)
     client._base_url = "https://openapivts.koreainvestment.com:29443"
     from trader.us.execution import kis_us_client
     monkeypatch.setattr(
