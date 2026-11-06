@@ -4214,6 +4214,9 @@ def get_balance_state(
             raise KisBalanceUnavailable("balance_output1_not_list")
         if not isinstance(balance_snapshot_raw.get("output2"), dict):
             raise KisBalanceUnavailable("balance_output2_not_dict")
+        # A marker received *inside* a cached snapshot is not independent
+        # evidence. Rebuild it exclusively from the wrapper's original fetch.
+        balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
         # Only the KIS wrapper's timestamp from a successful original HTTP
         # balance fetch may certify freshness.  In particular, a cached or
         # precheck snapshot must not become "fresh" merely because this runner
