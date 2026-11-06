@@ -58,3 +58,21 @@ def test_missing_or_unzoned_kis_fetch_time_fails_closed(fetched_at):
     assert state == BALANCE_STATE_OK
     assert "_kr_verified_fresh_at_kst" not in snapshot
     assert _fresh_balance_evidence(snapshot) == (False, "KIS_BALANCE_FRESHNESS_NOT_PROVEN")
+
+
+def test_inherited_fresh_marker_is_not_trusted_without_original_kis_proof():
+    class MarkedSnapshot(FakeKis):
+        def get_balance_cached(self, *, force, return_source, return_raw):
+            snapshot, source, raw = super().get_balance_cached(
+                force=force, return_source=return_source, return_raw=return_raw,
+            )
+            snapshot["_kr_verified_fresh_at_kst"] = now_kst().isoformat()
+            return snapshot, source, snapshot
+
+    state, snapshot, _ = get_balance_state(
+        kis=MarkedSnapshot("wrapper_cache", now_kst() - timedelta(minutes=10)),
+        now=now_kst(),
+    )
+    assert state == BALANCE_STATE_OK
+    assert "_kr_verified_fresh_at_kst" not in snapshot
+    assert _fresh_balance_evidence(snapshot) == (False, "KIS_BALANCE_FRESHNESS_NOT_PROVEN")
