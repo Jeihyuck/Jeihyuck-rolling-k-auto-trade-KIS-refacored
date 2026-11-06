@@ -74,3 +74,43 @@ def test_concurrent_journal_claims_only_one_full_recovery(pg_lane):
         modes = list(pool.map(lambda _: _select(engine).mode, range(5)))
     assert modes.count("FULL") == 1
     assert modes.count("CURRENT_ONLY_BLOCK") == 4
+
+
+def test_independent_am_and_close_only_one_each(pg_lane):
+    engine, _ = pg_lane
+    am = _select(engine)
+    assert am.mode == "FULL"
+    close = journal.choose_historical_lane(
+        engine=engine, kis=object(), env="practice",
+        strategy="pb1_pullback_close", trading_date=date(2026, 11, 6),
+        lane_name="CLOSE",
+    )
+    assert close.mode == "FULL"
+    assert am.job_key != close.job_key
+    assert journal.record_historical_result(engine=engine, lane=am, result=_success())
+    assert journal.record_historical_result(engine=engine, lane=close, result=_success())
+    assert _select(engine).mode == "CURRENT_ONLY"
+    assert journal.choose_historical_lane(
+        engine=engine, kis=object(), env="practice",
+        strategy="pb1_pullback_close", trading_date=date(2026, 11, 6),
+        lane_name="CLOSE",
+    ).mode == "CURRENT_ONLY"
+
+
+def test_close_failed_does_not_mark_completed(pg_lane):
+    engine, _ = pg_lane
+    close = journal.choose_historical_lane(
+        engine=engine, kis=object(), env="practice",
+        strategy="pb1_pullback_close", trading_date=date(2026, 11, 6),
+        lane_name="CLOSE",
+    )
+    assert close.mode == "FULL"
+    assert not journal.record_historical_result(
+        engine=engine, lane=close,
+        result={"ok": True, "historical_repair_fastpath": False},
+    )
+    assert journal.choose_historical_lane(
+        engine=engine, kis=object(), env="practice",
+        strategy="pb1_pullback_close", trading_date=date(2026, 11, 6),
+        lane_name="CLOSE",
+    ).mode == "CURRENT_ONLY_BLOCK"
