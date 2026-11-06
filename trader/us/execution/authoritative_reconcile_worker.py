@@ -262,7 +262,7 @@ def run_reconcile_once(*, provider: Any, trade_date: str,
     # not consume the historical snapshot's strict 15s replay/READY budget.
     fills=(prefetched_fills if prefetched_fills is not None
            else get_fills_today(provider=provider,signal_only=False,trade_date=trade_date))
-    phase.mark("kis_fill_fetch_or_prefetch")
+    phase.mark("kis_fill_fetch")
     logger.info("[US_STAGE4][CYCLE_BROKER_EVIDENCE] cycle_id=%s observed_at_utc=%s status=%s", _stage4_cycle_id.get(), datetime.now(timezone.utc).isoformat(), fills.get("status"))
     if fills.get("status")!="OK":
         raise RuntimeError("US_STAGE4_KIS_FILLS_UNVERIFIED")
