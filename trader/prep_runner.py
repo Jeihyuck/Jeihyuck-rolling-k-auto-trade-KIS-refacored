@@ -726,9 +726,12 @@ def assert_kr_final30_db_file_identity(
                 "ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_VCP",
             }
             rank_raw = row.get("rank_final30")
+            db_rank_raw = row.get("rank")
             try:
                 rank = int(rank_raw)
-                if rank_raw is None or float(rank_raw) != rank:
+                db_rank = int(db_rank_raw)
+                if (rank_raw is None or float(rank_raw) != rank
+                        or db_rank_raw is None or float(db_rank_raw) != db_rank):
                     raise ValueError("fractional or missing rank")
                 score = float(row.get("score_final"))
             except (TypeError, ValueError, OverflowError) as exc:
@@ -736,8 +739,9 @@ def assert_kr_final30_db_file_identity(
             if (
                 len(code) != 6 or not code.isdigit() or style not in allowed_styles
                 or rank < 1 or rank > FINAL30_SCORED_REQUIRED_ROWS
+                or db_rank != rank
                 or code in by_code or rank in ranks
-                or not __import__("math").isfinite(score)
+                or not __import__("math").isfinite(score) or score <= 0
             ):
                 raise RuntimeError(f"KR_FINAL30_PARITY_INVALID_IDENTITY:{label}:{code}:{rank}:{style}")
             by_code[code] = (rank, style, score)
