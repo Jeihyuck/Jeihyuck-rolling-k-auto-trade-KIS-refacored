@@ -170,6 +170,65 @@ def _env_bool(key: str, default: bool) -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def canonicalize_final30_aux_db_payload(
+    rows: List[Dict[str, Any]], *, source: str,
+) -> List[Dict[str, Any]]:
+    """Guard the auxiliary/cache Final30 DB writer against candidate ranks.
+
+    The direct WatchlistRepo.save_watchlist() path previously preserved
+    candidate ranks (e.g. 6..53) and meta.rank_final30=0, overwriting the
+    1..30 scored contract saved by PREP core. Reindex ONLY the same ordered
+    final 30; never re-select candidates or infer missing entry strategies.
+    """
+    if len(rows or []) != 30:
+        raise RuntimeError(f"KR_FINAL30_AUX_INVALID_COUNT:{source}:{len(rows or [])}")
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for i, original in enumerate(rows, 1):
+        row = dict(original or {})
+        meta = dict(row.get("meta") or {}) if isinstance(row.get("meta"), dict) else {}
+        code = str(row.get("code") or meta.get("code") or "").strip()
+        if code.isdigit():
+            code = code.zfill(6)
+        style = str(
+            row.get("entry_style_selected") or meta.get("entry_style_selected") or ""
+        ).strip().upper()
+        if not (len(code) == 6 and code.isdigit()) or code in seen:
+            raise RuntimeError(f"KR_FINAL30_AUX_INVALID_CODE:{source}:{code}")
+        # A component or score is evidence of a candidate, NOT proof of which
+        # entry style finally won the strategy arbitration.
+        if style not in ALLOWED_ENTRY_STYLES:
+            raise RuntimeError(f"KR_FINAL30_AUX_STYLE_NOT_SELECTED:{source}:{code}")
+        raw_score = next(
+            (v for v in (
+                row.get("score_final"), row.get("final_score"),
+                meta.get("score_final"), row.get("score"),
+            ) if v is not None and v != ""),
+            None,
+        )
+        try:
+            score = float(raw_score)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise RuntimeError(f"KR_FINAL30_AUX_SCORE_UNVERIFIED:{source}:{code}") from exc
+        if not math.isfinite(score) or score <= 0:
+            raise RuntimeError(f"KR_FINAL30_AUX_SCORE_UNVERIFIED:{source}:{code}")
+        seen.add(code)
+        row.update({
+            "code": code, "rank": i, "rank_final30": i,
+            "entry_style_selected": style, "score": score,
+            "score_final": score, "final_score": score,
+        })
+        meta.update({
+            "code": code, "rank": i, "rank_final30": i,
+            "entry_style_selected": style, "score": score,
+            "score_final": score, "final_score": score,
+        })
+        row["meta"] = meta
+        result.append(row)
+    logger.info("[KR_PREP][FINAL30_AUX_CANONICAL] source=%s rows=30 rank=1..30", source)
+    return result
+
+
 def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     raw_keys = set()
     for row in rows or []:
@@ -5666,7 +5725,11 @@ def build_and_save_watchlist(
                     env=env,
                     strategy=strategy,
                     as_of=as_of,
-                    members=existing,
+                    members=(
+                        canonicalize_final30_aux_db_payload(
+                            existing, source="CACHE_DIRECT_DB_SAVE",
+                        ) if strategy == "pb1_watchlist_final_scored" else existing
+                    ),
                 )
                 
                 if return_bundle:
@@ -5848,7 +5911,9 @@ def build_and_save_watchlist(
             env=env,
             strategy=_scored_strategy,
             as_of=as_of,
-            members=watchlist,
+            members=canonicalize_final30_aux_db_payload(
+                watchlist, source="BUILDER_AUX_DB_SAVE",
+            ),
         )
     except Exception as exc:
         if core_artifact_saved and _is_transient_db_exception(exc):
