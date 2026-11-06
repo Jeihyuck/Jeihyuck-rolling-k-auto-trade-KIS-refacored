@@ -9,7 +9,9 @@ from trader.kr.historical_recovery_journal import (
 
 @pytest.mark.parametrize("proof,expected", [
     ({"guard_reason": None, "holdings": 3}, False),
-    ({"guard_reason": "kis_has_holdings", "holdings": 3}, False),
+    ({"guard_reason": "kis_has_holdings", "holdings": 3, "historical_repair_fastpath": True}, False),
+    ({"guard_reason": "kis_has_holdings", "holdings": 3}, True),
+    ({"guard_reason": "kis_has_holdings", "holdings": 3, "historical_repair_fastpath": False}, True),
     ({"guard_reason": "kis_has_holdings", "holdings": 0}, True),
     ({"guard_reason": "kis_has_holdings"}, True),
     ({"guard_reason": "kis_has_holdings", "holdings": 3, "holdings_error": "AUTH"}, True),
@@ -60,6 +62,7 @@ def test_full_historical_lane_requires_current_reconcile_and_frozen_contract():
     result = {
         "ok": True, "guard_reason": "kis_has_holdings",
         "holdings": 2, "historical_recovery_executed": True,
+        "historical_repair_fastpath": True,
         "frozen_contract_invariant_violations": 0,
     }
     assert current_tick_reconcile_proves_buy_safe(
