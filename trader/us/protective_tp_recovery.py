@@ -8,6 +8,7 @@ Never cancel on local stale status alone; never release a claim on cancel ACK.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any, Callable
@@ -105,8 +106,12 @@ def broker_proves_terminal_after_cancel(order: dict, broker: dict) -> bool:
 def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -> list[dict]:
     """Only the active epoch and matching strategy-owned broker-order rows."""
     from sqlalchemy import text
+    from trader.account_state import get_account_key, resolve_env_name
     from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
 
+    if resolve_env_name() != env:
+        raise RuntimeError("US TP recovery account environment mismatch")
+    account_hash = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
     engine = _get_engine_or_none()
     if engine is None:
         raise RuntimeError("US TP recovery requires durable database")
@@ -122,7 +127,9 @@ def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -
                    c.account_id AS claim_account_id
             FROM us_orders o
             LEFT JOIN us_execution_claims c
-              ON c.trading_epoch_id=o.trading_epoch_id
+              ON c.action_key=o.meta->>'execution_action_key'
+             AND c.account_id=:account_hash
+             AND c.trading_epoch_id=o.trading_epoch_id
              AND c.trade_date=o.trade_date
              AND c.env=o.env AND c.market='US'
              AND c.strategy_owner='US_STANDARD'
@@ -139,7 +146,8 @@ def load_conflicting_open_tp_orders(symbol: str, trade_date: str, *, env: str) -
               )
             ORDER BY o.created_at
         """), {"symbol": symbol, "env": env,
-                "trade_date": trade_date, "epoch": epoch}).mappings()]
+                "trade_date": trade_date, "epoch": epoch,
+                 "account_hash": account_hash}).mappings()]
 
 
 
@@ -153,8 +161,12 @@ def has_unresolved_tp_claim(
     order. Without broker terminal reconciliation, an orphan claim is fenced.
     """
     from sqlalchemy import text
+    from trader.account_state import get_account_key, resolve_env_name
     from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
 
+    if resolve_env_name() != env:
+        raise RuntimeError("US TP claim recovery account environment mismatch")
+    account_hash = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
     if not symbol or not lifecycle_id:
         raise ValueError("US TP claim recovery requires explicit symbol and lifecycle")
     engine = _get_engine_or_none()
@@ -168,6 +180,7 @@ def has_unresolved_tp_claim(
             SELECT EXISTS (
                 SELECT 1 FROM us_execution_claims c
                 WHERE c.trading_epoch_id=:epoch
+                  AND c.account_id=:account_hash
                   AND c.env=:env AND c.market='US'
                   AND c.strategy_owner='US_STANDARD'
                   AND c.lifecycle_id=:lifecycle
@@ -176,7 +189,7 @@ def has_unresolved_tp_claim(
                   AND c.action_state IN ('IN_FLIGHT','UNCERTAIN')
             )
         """), {
-            "epoch": epoch, "env": env,
+            "epoch": epoch, "env": env, "account_hash": account_hash,
             "lifecycle": lifecycle_id, "trade_date": trade_date,
         }).scalar())
 
@@ -194,8 +207,12 @@ def load_crossday_unresolved_tp_lifecycles(
     order gate remain authoritative rather than inventing an empty claim set.
     """
     from sqlalchemy import text
+    from trader.account_state import get_account_key, resolve_env_name
     from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
 
+    if resolve_env_name() != env:
+        raise RuntimeError("US TP crossday account environment mismatch")
+    account_hash = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
     ids = sorted({str(value or "").strip() for value in lifecycle_ids if str(value or "").strip()})
     if not ids:
         return set()
@@ -210,12 +227,12 @@ def load_crossday_unresolved_tp_lifecycles(
             SELECT DISTINCT lifecycle_id
             FROM us_execution_claims
             WHERE trading_epoch_id=:epoch AND env=:env AND market='US'
-              AND strategy_owner='US_STANDARD'
+              AND account_id=:account_hash AND strategy_owner='US_STANDARD'
               AND lifecycle_id = ANY(:lifecycles)
               AND action IN ('TP1','TP2','TP3')
               AND action_state IN ('IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED')
               AND trade_date < CAST(:trade_date AS date)
-        """), {"epoch": epoch, "env": env, "lifecycles": ids,
+        """), {"epoch": epoch, "env": env, "account_hash": account_hash, "lifecycles": ids,
                 "trade_date": str(trade_date)}).scalars().all()
     return {str(row) for row in rows if row}
 
@@ -223,12 +240,20 @@ def load_crossday_unresolved_tp_lifecycles(
 def reserve_cancel_request(order: dict) -> bool:
     """One durable write before KIS cancel. No repeated cancel after ambiguity."""
     from sqlalchemy import text
-    from trader.us.db.repos import _get_engine_or_none
+    from trader.account_state import get_account_key, resolve_env_name
+    from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
 
+    env = str(order.get("env") or "practice").lower()
+    if resolve_env_name() != env:
+        return False
+    account_hash = hashlib.sha256(get_account_key(env=env).encode("utf-8")).hexdigest()
     engine = _get_engine_or_none()
     if engine is None:
         return False
     with engine.begin() as conn:
+        epoch = _active_us_epoch(conn)
+        if not epoch or str(order.get("trading_epoch_id") or "") != str(epoch):
+            return False
         result = conn.execute(text("""
             UPDATE us_orders
             SET meta = COALESCE(meta,'{}'::jsonb)
@@ -247,6 +272,8 @@ def reserve_cancel_request(order: dict) -> bool:
                   WHERE c.trading_epoch_id=us_orders.trading_epoch_id
                     AND c.trade_date=us_orders.trade_date
                     AND c.env=us_orders.env
+                    AND c.account_id=:account_hash
+                    AND c.action_key=us_orders.meta->>'execution_action_key'
                     AND c.market='US'
                     AND c.strategy_owner='US_STANDARD'
                     AND c.lifecycle_id=:lifecycle
@@ -254,7 +281,7 @@ def reserve_cancel_request(order: dict) -> bool:
                     AND c.action_state IN ('IN_FLIGHT','UNCERTAIN','PARTIALLY_SATISFIED')
               )
             RETURNING id
-        """), {"id": order["id"], "epoch": order["trading_epoch_id"],
+        """), {"id": order["id"], "epoch": epoch, "account_hash": account_hash,
                  "symbol": order["symbol"], "order_key": order["client_order_key"],
                  "lifecycle": str((order.get("meta") or {}).get("position_lifecycle_id") or "")})
         return result.first() is not None
@@ -327,7 +354,48 @@ def request_protective_tp_cancel(
         if str(intent.get("side") or "").upper() == "SELL"
         and str(intent.get("exit_type") or "").lower() in _PROTECTIVE_EXITS
     }
+    original_epoch_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("trading_epoch_id")
+                or (intent.get("meta") or {}).get("trading_epoch_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
+    portfolio_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("portfolio_epoch_id")
+                or (intent.get("meta") or {}).get("portfolio_epoch_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
+    cycle_by_symbol = {
+        str(intent.get("symbol") or "").upper():
+            str(intent.get("position_cycle_id")
+                or (intent.get("meta") or {}).get("position_cycle_id")
+                or intent.get("position_lifecycle_id")
+                or (intent.get("meta") or {}).get("position_lifecycle_id") or "")
+        for intent in intents
+        if str(intent.get("side") or "").upper() == "SELL"
+    }
+    # Do not let the last of two same-symbol debts silently win the cycle.
+    identity_sets: dict[str, set[tuple[str, str, str]]] = {}
+    for intent in intents:
+        if str(intent.get("side") or "").upper() != "SELL":
+            continue
+        sym = str(intent.get("symbol") or "").upper()
+        meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+        identity_sets.setdefault(sym, set()).add((
+            str(intent.get("account_id") or meta.get("account_id") or ""),
+            str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+            str(intent.get("trading_epoch_id") or meta.get("trading_epoch_id") or ""),
+            str(intent.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or ""),
+            str(intent.get("position_cycle_id") or meta.get("position_cycle_id") or ""),
+        ))
     for symbol in sorted(protective_symbols(intents)):
+        if len(identity_sets.get(symbol, set())) != 1:
+            results.append({"symbol": symbol, "status": "FENCED",
+                            "reason": "multiple_recovery_cycles_same_symbol"})
+            continue
         try:
             orders = find_open(symbol, trade_date, env=env)
             if not orders:
@@ -348,6 +416,30 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
+            original_epoch = original_epoch_by_symbol.get(symbol) or ""
+            if original_epoch and str(order.get("trading_epoch_id") or "") != original_epoch:
+                results.append({"symbol": symbol, "status": "FENCED",
+                                "reason": "original_trading_epoch_mismatch"})
+                continue
+            strict_us = os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+            meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+            source_portfolio = str(order.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id") or "")
+            source_cycle = str(order.get("position_cycle_id") or meta.get("position_cycle_id") or "")
+            expected_portfolio = portfolio_by_symbol.get(symbol) or ""
+            expected_cycle = cycle_by_symbol.get(symbol) or ""
+            if strict_us and not all((original_epoch,source_portfolio,source_cycle,
+                                      expected_portfolio,expected_cycle)):
+                results.append({"symbol":symbol,"status":"FENCED",
+                                "reason":"original_portfolio_or_cycle_unverified"})
+                continue
+            if expected_portfolio and source_portfolio != expected_portfolio:
+                results.append({"symbol":symbol,"status":"FENCED",
+                                "reason":"original_portfolio_epoch_mismatch"})
+                continue
+            if expected_cycle and source_cycle and source_cycle != expected_cycle:
+                results.append({"symbol":symbol,"status":"FENCED",
+                                "reason":"original_position_cycle_mismatch"})
+                continue
             expected_account = account_by_symbol.get(symbol) or ""
             if expected_account:
                 # Claim account_id is SHA256 of the canonical raw account key.

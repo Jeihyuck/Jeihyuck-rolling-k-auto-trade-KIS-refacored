@@ -1,6 +1,8 @@
 name: US243 Controlled Native Order Path and 20-Sample Gate
 
 on:
+  push:
+    branches: [fix/us-broker-epoch-cycle-recovery-fence-20261104]
   pull_request:
     branches: [dual-agent]
     paths:
@@ -9,6 +11,9 @@ on:
       - "tests/us/test_us_pr243_latency_fail_closed.py"
       - "scripts/us_latency_compare.py"
       - "trader/us/execution/order_router.py"
+      - "trader/us/execution/recovery_identity.py"
+      - "tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py"
+      - "migrations/0062_us_portfolio_position_cycle_recovery_scope.sql"
       - "trader/us/runner/trade_tick_runner.py"
   workflow_dispatch:
 
@@ -17,10 +22,11 @@ permissions:
 
 jobs:
   native-kis-stubbed-boundary-only:
-    # Authorize the original #243 gate and the explicit #309 integration
-    # review branch only.  Do not open real KIS/network/order privileges.
+    # Preserve #243/#309 gates and run mock-only #311 regression on #313.
+    # No credentials, production DB or real broker privileges.
     if: >-
-      github.event_name == 'pull_request' &&
+      (github.event_name == 'push' && github.ref == 'refs/heads/fix/us-broker-epoch-cycle-recovery-fence-20261104') ||
+      (github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       (
         (
@@ -30,8 +36,16 @@ jobs:
         (
           github.event.pull_request.number == 309 &&
           github.event.pull_request.head.ref == 'fix/us-entry-timing-180s-safe-retry-20261104'
+        ) ||
+        (
+          github.event.pull_request.number == 311 &&
+          github.event.pull_request.head.ref == 'fix/us-broker-epoch-cycle-recovery-fence-20261104'
+        ) ||
+        (
+          github.event.pull_request.number == 313 &&
+          github.event.pull_request.head.ref == 'fix/kr-20261105-p0-migration-0062-transaction'
         )
-      )
+      ))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -72,6 +86,16 @@ jobs:
           print("PR243 CONTROLLED STATUS: 20 mock POSTs; native HTTP boundary measured;"
                 " real WSL latency and real KIS fill NOT CLAIMED")
           PY
+      - name: PR311 scoped recovery regression tests (mock only)
+        if: github.event_name == 'push' || contains(fromJSON('[311,313]'), github.event.pull_request.number)
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py \
+            tests/us/test_us_stage4_historical_reader_split_20261103.py \
+            tests/us/test_us_stop_debt_replay_20261023.py \
+            tests/us/test_us_protective_stop_recovery_worker_20261023.py \
+            tests/us/test_us_20261008_entry_tp_recovery.py
       - name: Preserve mock-only evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -80,3 +104,40 @@ jobs:
           path: artifacts/pr243-stubbed-native-boundary-20.json
           retention-days: 7
           if-no-files-found: ignore
+
+  pr311-postgres-safety:
+    # Migration 0062 was fixed in PR #313; rerun #311 Postgres safety on this follow-up PR.
+    if: github.event_name == 'push' || contains(fromJSON('[311,313]'), github.event.pull_request.number)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PYTHONPATH: .
+      KIS_ENV: practice
+      DRY_RUN: "1"
+      US_KIS_ORDER_ALLOWED: "0"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r requirements.txt psycopg2-binary pytest
+      - name: PostgreSQL and stop recovery regression
+        run: |
+          python -m pytest -q tests/us/test_us_pr311_portfolio_cycle_recovery_scope.py tests/us/test_us_postgres_integration_real.py tests/us/test_us_20261007_sustained_real_buy_ack.py tests/us/test_us_protective_stop_recovery_worker_20261023.py tests/us/test_us_stop_debt_replay_20261023.py

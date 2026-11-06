@@ -334,6 +334,11 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "expected_post_order_qty": meta.get("expected_post_order_qty"),
         "pre_order_position_source": intent.get("pre_order_position_source") or meta.get("pre_order_position_source"),
         "position_lifecycle_id": position_lifecycle_id,
+        "position_cycle_id": intent.get("position_cycle_id") or meta.get("position_cycle_id"),
+        "portfolio_epoch_id": intent.get("portfolio_epoch_id") or meta.get("portfolio_epoch_id"),
+        "broker_account_hash": intent.get("broker_account_hash") or meta.get("broker_account_hash"),
+        "trading_epoch_id": intent.get("trading_epoch_id") or meta.get("trading_epoch_id"),
+        "strategy_owner": intent.get("strategy_owner") or meta.get("strategy_owner"),
         "limit_price": limit_price, "order_price": intent.get("order_price") or meta.get("order_price"),
         "notional_usd": intent.get("notional_usd") or meta.get("notional_usd"),
         **sell_audit,
@@ -382,6 +387,11 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "symbol": event.get("symbol"), "side": event.get("side"), "requested_qty": event.get("requested_qty"),
         "raw_broker_order_no": broker_order_no, "canonical_broker_order_no": canonical_no,
         "position_lifecycle_id": event.get("position_lifecycle_id"),
+        "position_cycle_id": event.get("position_cycle_id"),
+        "portfolio_epoch_id": event.get("portfolio_epoch_id"),
+        "broker_account_hash": event.get("broker_account_hash"),
+        "trading_epoch_id": event.get("trading_epoch_id"),
+        "strategy_owner": event.get("strategy_owner"),
         "profit_capture_stage": event.get("profit_capture_stage"),
         "cumulative_filled_qty": event.get("cumulative_filled_qty"),
         "payload": event, "idempotency_key": event["idempotency_key"],
@@ -877,6 +887,71 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
         # Later ORDER_OPEN/REPLAY snapshots may have empty original session,
         # generation=0 or qty=0. They cannot overwrite submitted identity.
         latest = submitted
+        if (
+            os.getenv("WSL_RUN_MARKET", "").upper() == "US"
+            and str(submitted.get("strategy_owner") or
+                    (submitted.get("meta") or {}).get("strategy_owner") or
+                    "").upper() == "US_STANDARD"
+        ):
+            # An authenticated KIS query proves broker account/date/order,
+            # NOT today's local portfolio/cycle ownership of a historical
+            # order. Never silently bind legacy replay to the active epoch.
+            original_meta = submitted.get("meta") if isinstance(
+                submitted.get("meta"), dict,
+            ) else {}
+            try:
+                from trader.account_state import get_account_key, resolve_env_name
+                from trader.us.db.repos import _get_engine_or_none, _active_us_epoch
+                from trader.us.execution.recovery_identity import (
+                    USRecoveryIdentityError, USRecoveryScope,
+                    current_us_portfolio_epoch, assert_recovery_scope,
+                )
+                env = resolve_env_name()
+                account_key = get_account_key(env=env)
+                account_hash = hashlib.sha256(account_key.encode("utf-8")).hexdigest()
+                engine = _get_engine_or_none()
+                if engine is None:
+                    raise USRecoveryIdentityError("REPLAY_DATABASE_UNAVAILABLE")
+                with engine.connect() as scope_conn:
+                    active_epoch = str(_active_us_epoch(scope_conn, required=True) or "")
+                    active_portfolio = current_us_portfolio_epoch(
+                        scope_conn, env=env, account_key=account_key,
+                        trading_epoch_id=active_epoch,
+                        strategy_owner="US_STANDARD",
+                    )
+                actual_cycle = str(
+                    submitted.get("position_cycle_id")
+                    or original_meta.get("position_cycle_id") or ""
+                )
+                if not actual_cycle:
+                    raise USRecoveryIdentityError("POSITION_CYCLE_UNVERIFIED")
+                current_scope = USRecoveryScope(
+                    env=env, account_id=account_hash,
+                    trading_epoch_id=active_epoch,
+                    portfolio_epoch_id=active_portfolio,
+                    position_cycle_id=actual_cycle,
+                    strategy_owner="US_STANDARD",
+                ).as_dict()
+                current_scope["broker_account_hash"] = current_scope.pop("account_id")
+                current_scope["position_lifecycle_id"] = actual_cycle
+                assert_recovery_scope(
+                    submitted, current_scope,
+                    original_meta=original_meta,
+                )
+            except Exception as exc:
+                counts["identity_mismatch_count"] += 1
+                counts["broker_unknown_count"] += 1
+                unresolved_symbol_sides.append([
+                    str(submitted.get("symbol") or "").upper(),
+                    str(submitted.get("side") or "").upper(),
+                ])
+                logger.error(
+                    "[US_ORDER_JOURNAL][ORIGINAL_SCOPE_UNVERIFIED] symbol=%s "
+                    "side=%s type=%s action=KEEP_CLAIM_FENCED_NO_REBIND",
+                    submitted.get("symbol"), submitted.get("side"),
+                    type(exc).__name__,
+                )
+                continue
         if not budget_available():
             # Keep the durable fence and expose every deferred identity. No
             # fabricated cancellation/fill/terminal state and no journal churn.

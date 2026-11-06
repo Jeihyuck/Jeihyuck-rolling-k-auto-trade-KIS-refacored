@@ -39,6 +39,44 @@ def pg_engine(monkeypatch):
             conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
             )
+        # PR311: shared execution claims must have the same scope columns as
+        # production migration 0062 before any claim/observation code runs.
+        # This fixture runs in a disposable PostgreSQL service only.
+        for column in ("portfolio_epoch_id", "position_cycle_id"):
+            conn.exec_driver_sql(
+                f"ALTER TABLE us_execution_claims ADD COLUMN IF NOT EXISTS {column} TEXT"
+            )
+        # PR311: the US fixture is deliberately lean (no KR portfolio tables).
+        # Mirror only the additive US claim/order lineage columns of migration
+        # 0062. The canonical migration SQL is separately audited/tested.
+        for table in (
+            "us_orders", "us_order_intents", "us_order_events", "us_fills",
+            "us_positions", "us_execution_claims",
+        ):
+            for column in ("portfolio_epoch_id", "position_cycle_id"):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT"
+                )
+        for table in (
+            "us_orders", "us_order_intents", "us_order_events", "us_fills",
+            "us_positions",
+        ):
+            conn.exec_driver_sql(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
+            )
+    # Fail the fixture immediately on missing 0062 columns, rather than
+    # reporting misleading downstream KIS pre-submit/claim failures.
+    with engine.connect() as conn:
+        for table in ("us_orders", "us_fills", "us_execution_claims"):
+            columns = {
+                row[0] for row in conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = current_schema() AND table_name=:table
+                """), {"table": table}).all()
+            }
+            assert {"portfolio_epoch_id", "position_cycle_id"} <= columns, (
+                f"PR311 fixture missing 0062 scope columns: {table}"
+            )
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
     yield engine
     engine.dispose()
@@ -281,6 +319,18 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
     # candidate larger than the remaining daily allowance is skipped while a
     # smaller candidate can still backfill.
     from trader.us.execution.order_router import select_preflight_buy_candidates
+    # Exercise the practice-order preflight, not the CI DRY_RUN=1 guard.
+    # This selection-only test never submits a broker order.
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    # Permission gates remain enabled in production; isolate the risk-budget
+    # selector with a fully authorized *mock-only* practice context.
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
+    monkeypatch.setenv("SIGNAL_ONLY", "0")
+    monkeypatch.setenv("RUN_MODE", "TRADE")
     monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "1500")
     monkeypatch.setenv("US_MAX_ORDER_USD", "1000")
     state = {
@@ -304,7 +354,7 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
         candidates, target_accept_count=1, projected_state=state,
         allowed_symbols={"COST", "KO"}, current_positions=[],
     )
-    assert [item["symbol"] for item in accepted] == ["KO"]
+    assert [item["symbol"] for item in accepted] == ["KO"], {"rejected": rejected, "projected_state": state}
     assert rejected[0]["reason"] == "daily_notional_exceeded"
 
     empty = repos.load_today_committed_buy_notional_result("2026-08-01", env="practice")

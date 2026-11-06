@@ -344,6 +344,67 @@ def _kis_env() -> str:
     return (os.getenv("KIS_ENV") or "practice").strip().lower() or "practice"
 
 
+def _tp_decision_fresh_for_native_http(
+    intent: dict, *, now_utc=None, max_age_sec: float = 30.0,
+) -> tuple[bool, str]:
+    """Do not POST a queued old TP based on a prior Tick's executable price.
+
+    An expired decision is a *pre-HTTP abort*, not KIS terminal evidence.
+    Only actual US_PC_* stage intents are gated. Stop, re-evaluate price/TP
+    threshold and broker orderable shares at a later fresh Tick; never cancel
+    or replace a KIS OPEN/unknown order on the strength of a timestamp alone.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    side = str(intent.get("side") or "").upper()
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    stage = str(meta.get("profit_capture_stage") or "").lower()
+    key = str(intent.get("client_order_key") or intent.get("order_key") or "")
+    if side != "SELL" or stage not in {"tp1", "tp2", "tp3"} or not key.startswith("US_PC_"):
+        return True, "NOT_NATIVE_PROFIT_CAPTURE_TP"
+    raw = str(meta.get("last_profit_capture_at") or "")
+    try:
+        decision_at = _dt.fromisoformat(raw.replace("Z", "+00:00"))
+        check_at = now_utc or _dt.now(_tz.utc)
+        if decision_at.tzinfo is None or check_at.tzinfo is None:
+            return False, "US_TP_DECISION_TIME_UNVERIFIED"
+        age = (check_at - decision_at).total_seconds()
+        if not (0 <= age <= max(1.0, float(max_age_sec))):
+            return False, "US_TP_DECISION_EXPIRED_BEFORE_HTTP"
+    except (ValueError, TypeError, OverflowError):
+        return False, "US_TP_DECISION_TIME_UNVERIFIED"
+    return True, "US_TP_DECISION_FRESH"
+
+
+def _tp_live_quote_threshold_proven(intent: dict, quote: dict, *, now_epoch: float) -> tuple[bool, str]:
+    """Fail closed unless a recent KIS quote still satisfies the frozen TP threshold."""
+    from decimal import Decimal, InvalidOperation
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if not isinstance(quote, dict) or quote.get("_quote_quality") not in {"FRESH", "FRESH_CACHE"}:
+        return False, "US_TP_LIVE_QUOTE_UNVERIFIED"
+    if quote.get("_quote_source") not in {"KIS_LIVE", "KIS_CACHE"}:
+        return False, "US_TP_LIVE_QUOTE_SOURCE_UNVERIFIED"
+    try:
+        age = now_epoch - float(quote["_quote_asof_epoch"])
+        if not (0 <= age <= 5):
+            return False, "US_TP_LIVE_QUOTE_EXPIRED"
+        output = quote["output"]
+        if not isinstance(output, dict):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        last = Decimal(str(output["last"]))
+        avg = Decimal(str(meta["broker_avg_price"]))
+        threshold = Decimal(str(meta["tp_threshold_fraction"]))
+        limit = Decimal(str(intent["limit_price"]))
+        if not all(v.is_finite() for v in (last, avg, threshold, limit)):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        if min(last, avg, limit) <= 0 or not (Decimal("0") < threshold < Decimal("1")):
+            return False, "US_TP_LIVE_QUOTE_INVALID"
+        if (last / avg - 1) < threshold or (limit / avg - 1) < threshold:
+            return False, "US_TP_LIVE_THRESHOLD_LOST"
+    except (KeyError, TypeError, ValueError, InvalidOperation, ZeroDivisionError, OverflowError):
+        return False, "US_TP_LIVE_QUOTE_INVALID"
+    return True, "US_TP_LIVE_THRESHOLD_CONFIRMED"
+
+
 def _is_cash_insufficient_reject(msg: str) -> bool:
     text = str(msg or "").lower()
     return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
@@ -686,6 +747,26 @@ def _semantic_action_instance(
     owner = str(
         intent.get("strategy_owner") or meta.get("strategy_owner") or ""
     ).strip().upper()
+    if side == "SELL" and owner == "US_STANDARD" and action.strip().upper() in {
+        "PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL",
+    }:
+        import re
+        from trader.us.entry_exit_contract import (
+            US_SWING_V3_CONTRACT_VERSION, verify_us_entry_exit_contract,
+        )
+        sha = str(meta.get("source_entry_contract_sha256") or "")
+        signed = meta.get("v3_signed_entry_contract")
+        if (str(meta.get("source_entry_contract_version") or "")
+                != US_SWING_V3_CONTRACT_VERSION
+                or not isinstance(signed, dict)
+                or signed.get("version") != US_SWING_V3_CONTRACT_VERSION
+                or signed.get("sha256") != sha
+                or not verify_us_entry_exit_contract(signed)
+                or not re.fullmatch(r"[a-f0-9]{64}", sha)):
+            raise ValueError("US_V3_SEMANTIC_CONTRACT_UNVERIFIED")
+        # Neither price, trade date nor quantity may create a second
+        # discretionary partial/final economic action for this lifecycle.
+        return sha
     if side == "BUY" and owner == "TQQQ_INFINITE":
         if trade_date is None:
             raise ValueError("TQQQ Infinite BUY action requires a valid trade date")
@@ -1254,6 +1335,42 @@ def route_order(
             "intent": intent,
         }
 
+    # Production US_STANDARD writes must have ORIGINAL account + owner-specific
+    # Portfolio Epoch + position-cycle provenance before even saving an Intent.
+    # Other owners (notably TQQQ Infinite) retain their dedicated route/contract.
+    # WSL US is mandatory; offline injected harnesses never gain KIS authority.
+    if (
+        os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
+        and kis_order_allowed
+        and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+    ):
+        try:
+            from trader.account_state import get_account_key
+            from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
+            from trader.us.execution.recovery_identity import bind_original_us_order_scope
+            _identity_engine = _get_engine_or_none()
+            if _identity_engine is None:
+                raise RuntimeError("US_SCOPE_DATABASE_UNAVAILABLE")
+            _env = _kis_env()
+            with _identity_engine.connect() as _identity_conn:
+                _epoch = _active_us_epoch(_identity_conn, required=True)
+                bind_original_us_order_scope(
+                    intent, conn=_identity_conn, env=_env,
+                    account_key=get_account_key(env=_env),
+                    trading_epoch_id=str(_epoch or ""),
+                )
+            meta = intent["meta"]
+        except Exception as exc:
+            logger.error(
+                "[US_ORDER][ORIGINAL_RECOVERY_SCOPE_FENCED] symbol=%s "
+                "side=%s type=%s broker_submit=0", symbol, side, type(exc).__name__,
+            )
+            return {
+                "status": "US_RECOVERY_SCOPE_UNVERIFIED",
+                "reason": str(exc), "broker_submit": False,
+                "retry_order": False, "intent": intent,
+            }
+
     # 1. SELL duplicate precheck before saving intent: never grow blocked duplicate intents.
     try:
         db_keys = load_today_order_keys(trade_date=trade_date)
@@ -1527,6 +1644,16 @@ def route_order(
 
     account_env = _kis_env()
     logger.info("[US_ORDER][BROKER_ENV] env=%s symbol=%s side=%s", account_env, symbol, side)
+    if side == "SELL" and str(intent.get("exit_type") or "") in {
+        "swing_giveback_partial_v3", "swing_runner_final_v3",
+    } and account_env != "practice":
+        logger.error(
+            "[US_ORDER][V3][BLOCK] symbol=%s reason=V3_PRACTICE_ONLY",
+            symbol_upper,
+        )
+        return {"status": "ORDER_DISABLED_V3_PRACTICE_ONLY",
+                "broker_submit": False, "intent": intent}
+
 
     if side == "BUY":
         tick_key = _cash_tick_key(trade_date, intent)
@@ -1895,6 +2022,33 @@ def route_order(
 
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
+        _us_claim_scope = None
+        if (
+            os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
+            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+        ):
+            from trader.us.execution.recovery_identity import (
+                USRecoveryScope, assert_preexisting_us_claim_scope,
+            )
+            from trader.us.db.repos import _get_engine_or_none
+            _us_claim_scope = USRecoveryScope(
+                env=account_env,
+                account_id=str(intent.get("broker_account_hash") or ""),
+                trading_epoch_id=str(intent.get("trading_epoch_id") or ""),
+                portfolio_epoch_id=str(intent.get("portfolio_epoch_id") or ""),
+                position_cycle_id=str(intent.get("position_cycle_id") or ""),
+                strategy_owner="US_STANDARD",
+            )
+            if not all(_us_claim_scope.as_dict().values()):
+                raise RuntimeError("US_CLAIM_ORIGINAL_SCOPE_UNVERIFIED")
+            _preclaim_engine = _get_engine_or_none()
+            if _preclaim_engine is None:
+                raise RuntimeError("US_CLAIM_SCOPE_DB_UNAVAILABLE")
+            with _preclaim_engine.begin() as _preclaim_conn:
+                assert_preexisting_us_claim_scope(
+                    _preclaim_conn, action_key=claim_identity.action_key,
+                    scope=_us_claim_scope,
+                )
         from trader.us.db.repos import claim_execution_action, record_execution_action_observation
         # Stage A: persist the Claim and an immutable PRE-SUBMIT DB outbox
         # marker atomically.  The existing fsync journal below still proves
@@ -1974,6 +2128,12 @@ def route_order(
                         _conn=_outbox_conn,
                     )
                     if claim.acquired:
+                        if _us_claim_scope is not None:
+                            from trader.us.execution.recovery_identity import persist_us_claim_scope
+                            persist_us_claim_scope(
+                                _outbox_conn, action_key=claim.action_key,
+                                scope=_us_claim_scope,
+                            )
                         if _account_reservation_required:
                             _account_authority.reserve(
                                 lease=_account_lease,
@@ -2036,6 +2196,15 @@ def route_order(
                 fresh_validation=True,
                 client_order_key=str(order_key or ""),
             )
+        if _us_claim_scope is not None and claim.acquired and not _atomic_claim_outbox:
+            # Independent transaction is still entirely before native KIS HTTP.
+            # Any failure leaves the Claim fenced for audit, never a submit.
+            from trader.us.execution.recovery_identity import persist_us_claim_scope
+            with _preclaim_engine.begin() as _claim_scope_conn:
+                persist_us_claim_scope(
+                    _claim_scope_conn, action_key=claim.action_key,
+                    scope=_us_claim_scope,
+                )
         if not claim.acquired:
             claim_remainder_audit = None
             if str(claim.reason or "") == "remaining_target_qty_mismatch":
@@ -2306,6 +2475,50 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
                 ) from _final_stage4_exc
+        # Price and stage were evaluated earlier in the Tick. If Stage4,
+        # database or rate-limit delays made that TP decision obsolete,
+        # abort strictly BEFORE KIS HTTP. The proven-unsent journal/claim
+        # release path must complete before a later Tick can re-evaluate.
+        if (
+            side == "SELL"
+            and str(order_key or "").startswith("US_PC_")
+            and str(lifecycle_meta.get("profit_capture_stage") or "").lower()
+                in {"tp1", "tp2", "tp3"}
+        ):
+            try:
+                _tp_max_age = float(os.getenv(
+                    "US_TP_PRE_HTTP_MAX_DECISION_AGE_SEC", "30"
+                ))
+                if not (5.0 <= _tp_max_age <= 120.0):
+                    raise ValueError("max age outside safe bound")
+            except (TypeError, ValueError, OverflowError):
+                raise KisUSPreSubmitError("US_TP_DECISION_AGE_CONFIG_INVALID") from None
+            _tp_is_fresh, _tp_reason = _tp_decision_fresh_for_native_http(
+                intent, max_age_sec=_tp_max_age,
+            )
+            if not _tp_is_fresh:
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_HTTP_DECISION_STALE] "
+                    "symbol=%s stage=%s reason=%s action=ABORT_NO_POST",
+                    symbol_upper, lifecycle_meta.get("profit_capture_stage") or "UNKNOWN",
+                    _tp_reason,
+                )
+                raise KisUSPreSubmitError(_tp_reason)
+            # A recent decision timestamp is not current executable-price proof.
+            # GET-only KIS quote; no POST if the quote is missing, stale or below TP.
+            try:
+                _tp_quote = kis_client.get_us_price(symbol_upper, exchange)
+                _tp_quote_ok, _tp_quote_reason = _tp_live_quote_threshold_proven(
+                    intent, _tp_quote, now_epoch=time.time(),
+                )
+            except Exception as _tp_quote_exc:
+                logger.warning(
+                    "[US_PROFIT_CAPTURE][PRE_HTTP_QUOTE_UNVERIFIED] symbol=%s error=%s",
+                    symbol_upper, type(_tp_quote_exc).__name__,
+                )
+                raise KisUSPreSubmitError("US_TP_LIVE_QUOTE_UNVERIFIED") from _tp_quote_exc
+            if not _tp_quote_ok:
+                raise KisUSPreSubmitError(_tp_quote_reason)
         _http_boundary_mono = time.monotonic()
         # Monotonic readiness is deliberately process-local (not persisted).
         _selected_ready = getattr(context, "_sell_selected_ready_by_symbol", None)
@@ -2457,6 +2670,9 @@ def route_order(
                 "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
                 "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
+                "US_TP_DECISION_EXPIRED_BEFORE_HTTP",
+                "US_TP_DECISION_TIME_UNVERIFIED",
+                "US_TP_DECISION_AGE_CONFIG_INVALID",
                 "US_ENTRY_TIMING_POLICY_NOT_APPROVED",
                 "US_ENTRY_TIMING_PROOF_MISSING", "US_ENTRY_TIMING_PROOF_INVALID",
                 "US_ENTRY_TIMING_BINDING_INVALID",

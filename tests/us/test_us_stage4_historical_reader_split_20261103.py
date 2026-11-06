@@ -480,3 +480,28 @@ def test_stage4_unverified_replay_reports_exact_failure_class_without_ready(monk
         )
     assert "replay_status=ERROR ack_status=OK" in caplog.text
     assert "action=FAIL_CLOSED" in caplog.text
+
+
+@pytest.mark.parametrize("changed", [
+    {"account_id": "another-account-hash"},
+    {"env": "real"},
+    {"trading_epoch_id": "epoch-other"},
+    {"lifecycle_id": "cycle-other"},
+    {"action_key": "another-original-action"},
+])
+def test_stage4_original_claim_scope_change_invalidates_ready_snapshot(changed):
+    """An identical attempt ID cannot rebind to another account or position cycle."""
+    original = {
+        **CLAIM, "account_id": SCOPE["account_id"], "env": "practice",
+        "trading_epoch_id": SCOPE["trading_epoch_id"],
+        "strategy_owner": "US_STANDARD", "lifecycle_id": "cycle-original",
+        "action_key": "action-original",
+    }
+    updated = {**original, **changed}
+    assert active_claim_signature([original]) != active_claim_signature([updated])
+    kis = ReadOnlyKIS()
+    reader = _reader(kis=kis, active=[original])
+    reader._poll_once(kis)
+    evidence = reader.snapshot_for_claims([original])
+    with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
+        reader.assert_still_valid(evidence, [updated])
