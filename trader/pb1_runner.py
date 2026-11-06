@@ -7171,6 +7171,8 @@ def run_once(
         kr_reconcile_perf = {
             "pre_full_calls": 0, "pre_full_ms": 0.0,
             "post_full_calls": 0, "post_full_ms": 0.0,
+            "current_order_reconcile_calls": 0,
+            "current_order_reconcile_ms": 0.0,
         }
         reconcile_result: dict | None = None
         # Opt-in only after full CI, paper simulations and operator approval.
@@ -7251,6 +7253,8 @@ def run_once(
                 )
             if not _pre_lane or _pre_lane.historical_recovery:
                 kr_reconcile_perf["pre_full_calls"] += 1
+            else:
+                kr_reconcile_perf["current_order_reconcile_calls"] += 1
             try:
                 reconcile_result = reconcile_kis(
                     engine=engine,
@@ -7280,6 +7284,8 @@ def run_once(
                 _pre_elapsed_ms = 1000.0 * (time_mod.monotonic() - _pre_full_started)
                 if not _pre_lane or _pre_lane.historical_recovery:
                     kr_reconcile_perf["pre_full_ms"] += _pre_elapsed_ms
+                else:
+                    kr_reconcile_perf["current_order_reconcile_ms"] += _pre_elapsed_ms
                 if _pre_lane is not None:
                     from trader.kr.historical_recovery_journal import record_historical_result
                     _pre_durable_ok = (
@@ -7932,10 +7938,11 @@ def run_once(
                         logger.info("[KR_HIST_RECOVERY][POST_ROUTE] mode=%s reason=%s",
                                     _post_lane.mode, _post_lane.reason)
                     _post_perf = getattr(engine_runner, "_kr_reconcile_perf", None)
-                    if isinstance(_post_perf, dict) and (
-                        _post_lane is None or _post_lane.historical_recovery
-                    ):
-                        _post_perf["post_full_calls"] += 1
+                    if isinstance(_post_perf, dict):
+                        if _post_lane is None or _post_lane.historical_recovery:
+                            _post_perf["post_full_calls"] += 1
+                        else:
+                            _post_perf["current_order_reconcile_calls"] += 1
                     try:
                         reconcile_result = reconcile_kis(
                             engine=engine, kis=kis, env=env_effective,
@@ -7972,10 +7979,11 @@ def run_once(
                                     _post_lane.mode, _post_lane.reason,
                                 )
                         _post_perf = getattr(engine_runner, "_kr_reconcile_perf", None)
-                        if isinstance(_post_perf, dict) and (
-                            _post_lane is None or _post_lane.historical_recovery
-                        ):
-                            _post_perf["post_full_ms"] += _post_elapsed_ms
+                        if isinstance(_post_perf, dict):
+                            if _post_lane is None or _post_lane.historical_recovery:
+                                _post_perf["post_full_ms"] += _post_elapsed_ms
+                            else:
+                                _post_perf["current_order_reconcile_ms"] += _post_elapsed_ms
                         logger.info(
                             "[KR_RECONCILE_LANES][POST_RECONCILE_CALL] full=%s elapsed_ms=%.1f",
                             int(_post_lane is None or _post_lane.historical_recovery),
@@ -8085,12 +8093,15 @@ def run_once(
         logger.info(
             "[KR_RECONCILE_LANES][PERF] historical_recovery_calls=%s "
             "historical_recovery_ms=%.1f pre_calls=%s post_calls=%s "
-            "historical_recovery_skipped=%s",
+            "historical_recovery_skipped=%s current_order_reconcile_calls=%s "
+            "current_order_reconcile_ms=%.1f",
             kr_reconcile_perf["pre_full_calls"] + kr_reconcile_perf["post_full_calls"],
             kr_reconcile_perf["pre_full_ms"] + kr_reconcile_perf["post_full_ms"],
             kr_reconcile_perf["pre_full_calls"],
             kr_reconcile_perf["post_full_calls"],
             int(not (kr_reconcile_perf["pre_full_calls"] or kr_reconcile_perf["post_full_calls"])),
+            kr_reconcile_perf["current_order_reconcile_calls"],
+            kr_reconcile_perf["current_order_reconcile_ms"],
         )
         logger.info(
             "[PB1][RUN_ONCE][FAIL_OPEN_FLAG] runs_ledger_fail_open=%s loop_mode=%s",
