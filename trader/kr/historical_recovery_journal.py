@@ -140,7 +140,10 @@ def record_historical_result(
         isinstance(result, dict) and result.get("ok") is True
         and not result.get("degraded")
         and result.get("frozen_contract_invariant_violations", 0) == 0
-        and result.get("historical_repair_fastpath") is True
+        # A successfully repaired historical position is still a successful
+        # FULL recovery. The parity fastpath is an optimization, not the
+        # completion criterion: it can be false precisely when work was done.
+        and result.get("historical_recovery_executed") is True
         and not result.get("unresolved_broker_activity")
         and not result.get("holdings_error")
         and not result.get("guard_reason")
