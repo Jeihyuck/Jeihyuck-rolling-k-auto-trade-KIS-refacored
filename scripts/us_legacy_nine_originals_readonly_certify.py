@@ -356,11 +356,23 @@ def certify_get_only(plan: dict, client: Any) -> dict:
         and tmo["classification"] in {"PROVEN_FILLED","PROVEN_CANCELLED"}
         and balance["status"]=="PASS"
     )
+    # Report when the KIS source-day/BALANCE evidence is complete but the
+    # portfolio's historical scope never existed in the legacy DB schema.
+    # This makes read-only verification useful without conferring a broker
+    # POST, claim-release or retroactive epoch adoption privilege.
+    only_legacy_policy_pending=(
+        broker_originals_and_balance_verified
+        and set(blockers)=={"ORIGINAL_PORTFOLIO_CYCLE_UNPROVEN_POLICY_REVIEW"}
+    )
+    status=(
+        "BROKER_SOURCE_PROVEN_LEGACY_POLICY_REQUIRED"
+        if only_legacy_policy_pending
+        else "READONLY_EVIDENCE_PASS" if not blockers else "NOT_PROVEN"
+    )
     return {
-        # A broker-authenticated match is useful, but it is not permission to
-        # create a historical portfolio or silently unlock a legacy position.
         "broker_originals_and_balance_verified":broker_originals_and_balance_verified,
-        "status":"READONLY_EVIDENCE_PASS" if not blockers else "NOT_PROVEN",
+        "operational_order_go":False,
+        "status":status,
         "broker_readonly_only":True,"broker_post_count":0,
         "db_update_count":0,"claims_released":0,
         "original_buy_results":output,
@@ -430,9 +442,13 @@ def main() -> int:
                 "error_type":type(exc).__name__,"broker_post_count":0,
                 "db_update_count":0,"claims_released":0}
     print(json.dumps(result,sort_keys=True,ensure_ascii=False,default=str))
-    # Always nonzero if the original portfolio is unproven, even when all
-    # KIS BUY and current balance rows are authentic and internally match.
-    return 0 if result.get("status")=="READONLY_EVIDENCE_PASS" else 44
+    # Exit zero only for authenticated GET evidence, NOT for actual trading.
+    # operational_order_go stays False until an independently authorized
+    # forward-only carry policy and native practice POST/ACK/FILL/CLOSE prove it.
+    return 0 if result.get("status") in {
+        "READONLY_EVIDENCE_PASS",
+        "BROKER_SOURCE_PROVEN_LEGACY_POLICY_REQUIRED",
+    } else 44
 
 
 if __name__=="__main__":
