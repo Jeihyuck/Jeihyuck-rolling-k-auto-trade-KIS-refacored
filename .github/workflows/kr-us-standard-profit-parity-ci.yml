@@ -5,7 +5,9 @@ on:
     branches: [codex/kr-reconcile-performance-20261106, dual-agent]
     paths:
       - "trader/kr/us_standard_profit_parity.py"
+      - "trader/kr/us_profit_stage_journal.py"
       - "tests/kr/test_kr_us_standard_profit_parity_20261106.py"
+      - "tests/kr/test_kr_us_profit_stage_postgres_20261106.py"
       - ".github/workflows/kr-us-standard-profit-parity-ci.yml"
   workflow_dispatch:
 
@@ -15,7 +17,21 @@ permissions:
 jobs:
   kr-parity-shadow-no-broker:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       PYTHONPATH: "."
       STRATEGY_ENV: practice
@@ -27,6 +43,7 @@ jobs:
       KIS_APP_SECRET: ""
       KR_SWING_US_PROFIT_MODE: LEGACY
       KR_SWING_US_PROFIT_DEPLOY_APPROVED: "0"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,9 +52,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Offline Python dependencies
-        run: python -m pip install -r requirements.txt pytest
+        run: python -m pip install -r requirements.txt pytest psycopg2-binary
       - name: Compile policy modules
         run: |
-          python -m py_compile trader/kr/us_standard_profit_parity.py trader/us/market_state_overlay.py trader/us/pb1/swing_runner_exit_v3.py
+          python -m py_compile trader/kr/us_standard_profit_parity.py trader/kr/us_profit_stage_journal.py trader/us/market_state_overlay.py trader/us/pb1/swing_runner_exit_v3.py
       - name: US/KR parity math, contract integrity and owner exclusion
-        run: python -m pytest -q tests/kr/test_kr_us_standard_profit_parity_20261106.py
+        run: python -m pytest -q tests/kr/test_kr_us_standard_profit_parity_20261106.py tests/kr/test_kr_us_profit_stage_postgres_20261106.py
