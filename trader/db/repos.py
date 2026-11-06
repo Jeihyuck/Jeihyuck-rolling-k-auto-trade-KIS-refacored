@@ -4791,6 +4791,14 @@ class OrdersRepo:
             # The KIS ODNO may be reused on another trading day, including
             # across legacy NULL epochs. Never bind a global ODNO match.
             # A source execution timestamp is preferred to a DB insertion day.
+            if self.engine.dialect.name == "sqlite":
+                # SQLite strips offsets on binding and returns naive UTC
+                # when an existing order is read back for reconciliation.
+                submitted_at, acked_at = (
+                    (stamp if stamp.tzinfo else pytz.UTC.localize(stamp)).astimezone(pytz.UTC)
+                    if stamp is not None else None
+                    for stamp in (submitted_at, acked_at)
+                )
             source_time = submitted_at or acked_at or now_kst()
             broker_day = (
                 source_time.astimezone(pytz.timezone("Asia/Seoul")).date()
@@ -4886,16 +4894,6 @@ class OrdersRepo:
                         "reconcile_run_id_orphan": str(run_id),
                         "reconcile_run_id_action": "NULL_RUN_ID",
                     })
-
-            if self.engine.dialect.name == "sqlite":
-                # SQLite drops timezone offsets on datetime binding. Store
-                # broker timestamps on the same UTC clock as CURRENT_TIMESTAMP.
-                seoul = pytz.timezone("Asia/Seoul")
-                submitted_at, acked_at = (
-                    (stamp if stamp.tzinfo else seoul.localize(stamp)).astimezone(pytz.UTC)
-                    if stamp is not None else None
-                    for stamp in (submitted_at, acked_at)
-                )
 
             payload = {
                 "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
