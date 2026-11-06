@@ -170,6 +170,65 @@ def _env_bool(key: str, default: bool) -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def canonicalize_final30_aux_db_payload(
+    rows: List[Dict[str, Any]], *, source: str,
+) -> List[Dict[str, Any]]:
+    """Guard the auxiliary/cache Final30 DB writer against candidate ranks.
+
+    The direct WatchlistRepo.save_watchlist() path previously preserved
+    candidate ranks (e.g. 6..53) and meta.rank_final30=0, overwriting the
+    1..30 scored contract saved by PREP core. Reindex ONLY the same ordered
+    final 30; never re-select candidates or infer missing entry strategies.
+    """
+    if len(rows or []) != 30:
+        raise RuntimeError(f"KR_FINAL30_AUX_INVALID_COUNT:{source}:{len(rows or [])}")
+    result: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for i, original in enumerate(rows, 1):
+        row = dict(original or {})
+        meta = dict(row.get("meta") or {}) if isinstance(row.get("meta"), dict) else {}
+        code = str(row.get("code") or meta.get("code") or "").strip()
+        if code.isdigit():
+            code = code.zfill(6)
+        style = _normalize_entry_style_value(
+            row.get("entry_style_selected") or meta.get("entry_style_selected")
+        )
+        if not (len(code) == 6 and code.isdigit()) or code in seen:
+            raise RuntimeError(f"KR_FINAL30_AUX_INVALID_CODE:{source}:{code}")
+        # A component or score is evidence of a candidate, NOT proof of which
+        # entry style finally won the strategy arbitration.
+        if style not in ALLOWED_ENTRY_STYLES:
+            raise RuntimeError(f"KR_FINAL30_AUX_STYLE_NOT_SELECTED:{source}:{code}")
+        raw_score = next(
+            (v for v in (
+                row.get("score_final"), row.get("final_score"),
+                meta.get("score_final"), row.get("score"),
+            ) if v is not None and v != ""),
+            None,
+        )
+        try:
+            score = float(raw_score)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise RuntimeError(f"KR_FINAL30_AUX_SCORE_UNVERIFIED:{source}:{code}") from exc
+        if not math.isfinite(score) or score <= 0:
+            raise RuntimeError(f"KR_FINAL30_AUX_SCORE_UNVERIFIED:{source}:{code}")
+        seen.add(code)
+        row.update({
+            "code": code, "rank": i, "rank_final30": i,
+            "entry_style_selected": style, "score": score,
+            "score_final": score, "final_score": score,
+        })
+        meta.update({
+            "code": code, "rank": i, "rank_final30": i,
+            "entry_style_selected": style, "score": score,
+            "score_final": score, "final_score": score,
+        })
+        row["meta"] = meta
+        result.append(row)
+    logger.info("[KR_PREP][FINAL30_AUX_CANONICAL] source=%s rows=30 rank=1..30", source)
+    return result
+
+
 def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     raw_keys = set()
     for row in rows or []:
@@ -5662,11 +5721,12 @@ def build_and_save_watchlist(
                     ohlcv_provider=ohlcv_provider,
                     source="build_and_save_watchlist_cache",
                 )
+                if strategy == "pb1_watchlist_final_scored":
+                    existing = canonicalize_final30_aux_db_payload(
+                        existing, source="CACHE_DIRECT_DB_SAVE",
+                    )
                 repo.save_watchlist(
-                    env=env,
-                    strategy=strategy,
-                    as_of=as_of,
-                    members=existing,
+                    env=env, strategy=strategy, as_of=as_of, members=existing,
                 )
                 
                 if return_bundle:
@@ -5844,11 +5904,13 @@ def build_and_save_watchlist(
     if builder.last_bundle is not None:
         builder.last_bundle["last_stage"] = "aux_db_save_final30 start"
     try:
+        # Canonicalize the SAME selected rows used by all downstream
+        # snapshot/bundle exports, not only the DB insert payload.
+        watchlist = canonicalize_final30_aux_db_payload(
+            watchlist, source="BUILDER_AUX_DB_SAVE",
+        )
         repo.save_watchlist(
-            env=env,
-            strategy=_scored_strategy,
-            as_of=as_of,
-            members=watchlist,
+            env=env, strategy=_scored_strategy, as_of=as_of, members=watchlist,
         )
     except Exception as exc:
         if core_artifact_saved and _is_transient_db_exception(exc):
@@ -5876,18 +5938,31 @@ def build_and_save_watchlist(
         _verify_scored = int(
             _verify_df["score_final"].fillna(0).astype(float).gt(0).any()
         ) if not _verify_df.empty and "score_final" in _verify_df.columns else 0
-        _verify_entry_invalid = 0
+        # A NULL style is INVALID, not a valid uncounted row. Explicit
+        # strategy VCP remains valid; never guess missing styles from scores.
+        _verify_entry_invalid = len(_verify_rows)
         if not _verify_df.empty and "entry_style_selected" in _verify_df.columns:
-            _valid_s = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
             _verify_entry_invalid = int(
                 _verify_df["entry_style_selected"].apply(
-                    lambda v: bool(pd.notna(v) and str(v).upper() not in _valid_s)
+                    lambda v: str(v or "").strip().upper() not in ALLOWED_ENTRY_STYLES
                 ).sum()
             )
+        try:
+            _verify_ranks = [int(row.get("rank_final30") or 0) for row in _verify_rows]
+            _verify_rank_ok = bool(
+                sorted(_verify_ranks) == list(range(1, 31))
+                and all(
+                    int(row.get("rank") or 0) == int(row.get("rank_final30") or 0)
+                    for row in _verify_rows
+                )
+            )
+        except (ValueError, TypeError, OverflowError):
+            _verify_rank_ok = False
         _verify_ma20_null = int(
             _verify_df["ma20"].isna().sum()
         ) if not _verify_df.empty and "ma20" in _verify_df.columns else -1
-        if _verify_n == 30 and _verify_uniq == 30 and _verify_entry_invalid == 0:
+        if (_verify_n == 30 and _verify_uniq == 30
+                and _verify_entry_invalid == 0 and _verify_rank_ok):
             logger.info(
                 "[WATCHLIST][SAVE_VERIFY][OK] strategy=%s env=%s as_of=%s rows=%s uniq_code=%s scored=%s entry_style_invalid=%s ma20_null=%s",
                 _scored_strategy,
@@ -5906,6 +5981,8 @@ def build_and_save_watchlist(
                 else f"uniq_code={_verify_uniq}/30"
                 if _verify_uniq != 30
                 else f"entry_style_invalid={_verify_entry_invalid}"
+                if _verify_entry_invalid
+                else "rank_final30_not_contiguous_1_to_30"
             )
             logger.error(
                 "[WATCHLIST][SAVE_VERIFY][FAIL] strategy=%s env=%s as_of=%s rows=%s reason=%s",
@@ -5931,8 +6008,20 @@ def build_and_save_watchlist(
             logger.warning("[WATCHLIST][SAVE_VERIFY][FAIL_SOFT_AFTER_CORE] reason=%s action=continue_core_done", _sv_exc)
             if builder.last_bundle is not None:
                 builder.last_bundle["last_stage"] = "aux_db_roundtrip fail_soft"
+        elif os.getenv("PREP_REQUIRE_SCORED_FINAL30", "1") == "1":
+            # Never mark a scored Final30 as accepted when its exact DB
+            # roundtrip raised a non-transient error. The trade loader's
+            # frozen owner/rank/score proof must be established, not assumed.
+            logger.exception(
+                "[WATCHLIST][SAVE_VERIFY][FAIL_CLOSED] strategy=%s env=%s as_of=%s",
+                _scored_strategy, env, as_of,
+            )
+            raise
         else:
-            logger.warning("[WATCHLIST][SAVE_VERIFY][ERROR] reason=%s -> continuing", _sv_exc)
+            logger.warning(
+                "[WATCHLIST][SAVE_VERIFY][OPT_OUT_WARN] strict=0 reason=%s",
+                _sv_exc,
+            )
     # ─────────────────────────────────────────────────────────────────────────
 
     # Save final30 snapshot to JSON (for fallback)
