@@ -42,11 +42,11 @@ WHERE trading_epoch_id=:epoch AND symbol=ANY(:symbols)
 AND side IN ('BUY','SELL') AND trade_date<=:trade_date
 ORDER BY symbol,trade_date,order_no
 """
-SELECT_BUY_ORDERS = """
-SELECT symbol,side,trade_date,order_no,qty_requested,meta
+SELECT_ORIGINAL_ORDERS = """
+SELECT symbol,side,trade_date,order_no,qty_requested,status,meta
 FROM public.us_orders
 WHERE trading_epoch_id=:epoch AND symbol=ANY(:symbols)
-AND side='BUY' AND trade_date<=:trade_date AND env='practice'
+AND side IN ('BUY','SELL') AND trade_date<=:trade_date AND env='practice'
 ORDER BY symbol,trade_date,order_no
 """
 
@@ -79,7 +79,7 @@ def load_readonly_archive(engine: Any, *, trading_epoch_id: str,
         fills = [_plain(x) for x in conn.execute(
             text(SELECT_FILLS),args).mappings().all()]
         orders = [_plain(x) for x in conn.execute(
-            text(SELECT_BUY_ORDERS),args).mappings().all()]
+            text(SELECT_ORIGINAL_ORDERS),args).mappings().all()]
     return positions, fills, orders
 
 
@@ -94,13 +94,15 @@ def prepare_original_plan(
     grouped: dict[str,list[dict]] = defaultdict(list)
     for row in fills:
         grouped[str(row.get("symbol") or "")].append(row)
-    matching_orders: dict[tuple[str,str,str],list[dict]] = defaultdict(list)
+    matching_orders: dict[tuple[str,str,str,str],list[dict]] = defaultdict(list)
     for order in orders:
         key = (str(order.get("symbol") or ""),
+               str(order.get("side") or "").upper(),
                str(order.get("trade_date") or ""),
                str(order.get("order_no") or "").lstrip("0"))
         matching_orders[key].append(order)
     entries = []
+    original_sell_entries = []
     for symbol in SYMBOLS:
         position = pmap.get(symbol)
         if not position:
@@ -127,7 +129,7 @@ def prepare_original_plan(
         meta = buy.get("meta") if isinstance(buy.get("meta"),dict) else {}
         order_no = str(buy.get("order_no") or "").strip()
         original_day = str(buy.get("trade_date") or "")
-        key = (symbol,original_day,order_no.lstrip("0"))
+        key = (symbol,"BUY",original_day,order_no.lstrip("0"))
         matched = matching_orders.get(key,[])
         if len(matched) != 1:
             blockers.append(f"{symbol}_ORIGINAL_DB_ORDER_NOT_UNIQUE")
@@ -149,6 +151,45 @@ def prepare_original_plan(
             requested != q or order_requested != q or owner != "US_STANDARD" or
             not life or not contract or contract != order_contract):
             blockers.append(f"{symbol}_FROZEN_BUY_CONTRACT_NOT_PROVEN")
+        for sale in sells:
+            sale_day = str(sale.get("trade_date") or "")
+            sale_no = str(sale.get("order_no") or "").strip()
+            sale_meta = sale.get("meta") if isinstance(sale.get("meta"),dict) else {}
+            sale_key = (symbol,"SELL",sale_day,sale_no.lstrip("0"))
+            sale_orders = matching_orders.get(sale_key,[])
+            try:
+                sold = _count(sale.get("qty"))
+                requested_sell = _count(sale_meta.get("requested_qty"))
+                db_requested_sell = (
+                    _count(sale_orders[0].get("qty_requested"))
+                    if len(sale_orders)==1 else 0
+                )
+            except ValueError:
+                sold=requested_sell=db_requested_sell=0
+            # The original sell must belong to the original BUY's lifecycle.
+            # All sale proofs are new KIS GETs; an existing DB FILLED status
+            # without authenticated source-day broker quantity is not proof.
+            sell_identity_matches = bool(
+                sale_meta.get("position_lifecycle_id") == life and life
+                and str(sale_meta.get("strategy_owner") or "").upper() == owner
+            )
+            sale_ok = bool(
+                sale_no and len(sale_day)==10 and len(sale_orders)==1
+                and 0 < sold <= requested_sell == db_requested_sell
+                and sell_identity_matches
+            )
+            if not sale_ok:
+                blockers.append(f"{symbol}_LEGACY_SELL_DB_LINEAGE_UNVERIFIED")
+            original_sell_entries.append({
+                "symbol":symbol, "trade_date":sale_day,
+                "order_no":sale_no, "requested_qty":requested_sell,
+                "db_filled_qty":sold, "db_order_status": (
+                    str(sale_orders[0].get("status") or "").upper()
+                    if len(sale_orders)==1 else "UNVERIFIED"
+                ),
+                "original_buy_lifecycle_matches":sell_identity_matches,
+                "db_link_verified":sale_ok,
+            })
         entries.append({
             "symbol":symbol, "trade_date":original_day, "order_no":order_no,
             "requested_qty":requested, "filled_qty":q,
@@ -167,7 +208,8 @@ def prepare_original_plan(
             ),
             "original_portfolio_proven":False,
         })
-    return {"entries":entries,"blockers":sorted(set(blockers)),
+    return {"entries":entries,"original_sell_entries":original_sell_entries,
+            "blockers":sorted(set(blockers)),
             "all_legacy_scope_proven":all(
                 item.get("original_portfolio_proven") for item in entries)}
 
@@ -241,6 +283,39 @@ def certify_get_only(plan: dict, client: Any) -> dict:
         output.append({"symbol":item["symbol"],
                        "status":"PROVEN_FILLED" if good else "NOT_PROVEN",
                        "original_day":day})
+    verified_sells=[]
+    for sale in plan.get("original_sell_entries",[]):
+        symbol=str(sale.get("symbol") or "")
+        day=str(sale.get("trade_date") or "")
+        if not sale.get("db_link_verified") or not day or not sale.get("order_no"):
+            blockers.append(f"{symbol}_LEGACY_SELL_DB_LINEAGE_UNVERIFIED")
+            verified_sells.append({"symbol":symbol,"status":"NOT_PROVEN"})
+            continue
+        if day not in cache:
+            try:
+                cache[day]=client.get_us_today_orders(trade_date=day)
+            except Exception as exc:
+                cache[day]=None
+                blockers.append("KIS_ORIGINAL_SELL_GET_"+type(exc).__name__)
+        try:
+            proof=classify_original_order(
+                cache[day],order_no=sale["order_no"],
+                symbol=symbol,expected_qty=sale["requested_qty"],
+                trade_date=day,side="SELL",
+            )
+            verified=bool(
+                proof["classification"] in {"PROVEN_FILLED","PROVEN_CANCELLED"}
+                and proof.get("cumulative_filled_qty")==sale["db_filled_qty"]
+                and sale.get("db_order_status") in {"FILLED","RECONCILED"}
+            )
+        except Exception:
+            verified=False
+        if not verified:
+            blockers.append(f"{symbol}_LEGACY_SELL_BROKER_PROOF_MISSING")
+        verified_sells.append({
+            "symbol":symbol,"original_day":day,
+            "status":"PROVEN_TERMINAL" if verified else "NOT_PROVEN",
+        })
     if TMO_ORIGINAL_ORDER_DATE not in cache:
         try:
             cache[TMO_ORIGINAL_ORDER_DATE]=client.get_us_today_orders(
@@ -279,7 +354,9 @@ def certify_get_only(plan: dict, client: Any) -> dict:
         "status":"READONLY_EVIDENCE_PASS" if not blockers else "NOT_PROVEN",
         "broker_readonly_only":True,"broker_post_count":0,
         "db_update_count":0,"claims_released":0,
-        "original_buy_results":output,"original_trade_dates_queried":sorted(cache),
+        "original_buy_results":output,
+        "original_sell_results":verified_sells,
+        "original_trade_dates_queried":sorted(cache),
         "tmo_original_sell":tmo["classification"],"balance":balance,
         "legacy_scope_rebind_approved":False,
         "blockers":sorted(set(blockers)),
