@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from trader.db.schema import schema_for_engine
 from trader.kr.recovery_scope_20261104 import resolve_kr_recovery_scope
+from trader.kr.reconcile_guard_classification import broker_reconcile_guard_blocks
 
 logger = logging.getLogger(__name__)
 VERSION = "kr_historical_recovery_once_v1"
@@ -144,7 +145,7 @@ def current_tick_reconcile_proves_buy_safe(
         and isinstance(result, dict)
         and result.get("ok") is True
         and not result.get("degraded")
-        and not result.get("guard_reason")
+        and not broker_reconcile_guard_blocks(result)
         and not result.get("unresolved_broker_activity")
         and result.get("frozen_contract_invariant_violations") == 0
         and result.get("historical_recovery_executed") is lane.historical_recovery
@@ -172,7 +173,7 @@ def record_historical_result(
         and result.get("historical_recovery_executed") is True
         and not result.get("unresolved_broker_activity")
         and not result.get("holdings_error")
-        and not result.get("guard_reason")
+        and not broker_reconcile_guard_blocks(result)
     )
     try:
         table = schema_for_engine(engine).job_checkpoints
