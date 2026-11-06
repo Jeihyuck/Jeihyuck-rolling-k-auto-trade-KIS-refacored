@@ -15,6 +15,7 @@ BASE = {
     "portfolio_present": True, "cycle_present": True,
     "owner_present": True, "scoped_buy_orders": 2,
     "scoped_buy_fills": 2, "scoped_legacy_lifecycle_rows": 12,
+    "legacy_epoch_net_fills": 5,
 }
 
 
@@ -89,3 +90,20 @@ def test_db_first_statement_is_transaction_read_only():
     assert out["orders_submitted"] == out["claims_released"] == 0
     assert out["db_rows_modified"] == 0
     assert out["kis_original_order_verified"] is False
+
+
+def test_current_epoch_db_net_matches_but_never_proves_original_account():
+    row = classify_readonly_candidate({
+        **BASE, "account_absent": True, "account_matches": None,
+        "legacy_epoch_net_fills": 5,
+    })
+    assert row["classification"] == "LEGACY_ORIGINAL_ACCOUNT_SCOPE_ABSENT"
+    assert row["legacy_epoch_db_net_matches"] is True
+    assert row["auto_identity_rebind_allowed"] is False
+    assert row["evidence_status"] == "READONLY_DB_CANDIDATE_NOT_BROKER_PROOF"
+    altered = classify_readonly_candidate({
+        **BASE, "account_absent": True, "account_matches": None,
+        "legacy_epoch_net_fills": 4,
+    })
+    assert altered["legacy_epoch_db_net_matches"] is False
+    assert altered["auto_identity_rebind_allowed"] is False
