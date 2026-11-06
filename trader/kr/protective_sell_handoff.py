@@ -23,7 +23,11 @@ from trader.account_state import get_account_key
 from trader.db.repos import OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.kr.reconcile_parity_fastpath import historical_repair_unnecessary
-from trader.kr.recovery_scope_20261104 import resolve_kr_recovery_scope
+from trader.kr.recovery_scope_20261104 import (
+    resolve_kr_recovery_scope,
+    current_scope_open_order_blockers,
+    relevant_open_orders_for_scope,
+)
 from trader.kr.runtime_integrity_20260929 import _daily_ccld_all_pages_for_date
 from trader.reconcile_kis import _normalize_code, _parse_side, _parse_date_time
 from trader.time_utils import now_kst
@@ -106,7 +110,9 @@ def prove_protective_sell_only_preflight(
         if not other_owner_clean:
             return False, other_reason
         orders = OrdersRepo(engine)
-        if orders.get_open_orders(env, include_stale=True, fail_open=False):
+        if current_scope_open_order_blockers(
+            engine=engine, env=env, kis=kis, orders_repo=orders,
+        ):
             return False, "OPEN_OR_UNRESOLVED_ORDER"
         health = _current_account_claim_health(engine=engine, kis=kis, env=env, orders=orders)
         if not isinstance(health, dict) or health.get("available") is not True:
@@ -187,7 +193,9 @@ def prove_safe_protective_sell_handoff(
         # The global practice default can return [] on a DB timeout.
         # This proof authorizes deferring full reconciliation; an unknown
         # lookup is NEVER proof that broker-tracked orders are absent.
-        if orders_repo.get_open_orders(env, include_stale=True, fail_open=False):
+        if current_scope_open_order_blockers(
+            engine=engine, env=env, kis=kis, orders_repo=orders_repo,
+        ):
             return False, "OPEN_OR_UNRESOLVED_ORDER"
         health = _current_account_claim_health(engine=engine, kis=kis, env=env, orders=orders_repo)
         if not isinstance(health, dict) or health.get("available") is not True:
@@ -240,6 +248,28 @@ def prove_safe_protective_sell_handoff(
                 if key in broker_rows:
                     return False, "BROKER_ORDER_MULTIPLE_ROWS_REQUIRE_RECONCILE"
                 broker_rows[key] = row
+            # Full-handoff parity must not be vetoed by a different proved
+            # broker account or expired epoch on the same KST trading day.
+            # Any ambiguous/unowned order remains in the proof set and blocks.
+            recovery_scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
+            if recovery_scope is not None:
+                all_portfolio_ids = {
+                    str(row.get("portfolio_epoch_id") or "") for row in stored
+                }
+                all_portfolio_ids.discard("")
+                all_portfolios = {}
+                if all_portfolio_ids:
+                    all_portfolios = {
+                        str(ep["portfolio_epoch_id"]): dict(ep)
+                        for ep in conn.execute(sa.select(schema.portfolio_epochs).where(
+                            schema.portfolio_epochs.c.portfolio_epoch_id.in_(all_portfolio_ids)
+                        )).mappings().all()
+                    }
+                stored = relevant_open_orders_for_scope(
+                    orders=[dict(row) for row in stored],
+                    portfolios=all_portfolios,
+                    scope=recovery_scope,
+                )
             db_by_key: dict[tuple[str, str, str], dict] = {}
             # orders intentionally has no account_id column: its durable
             # account/strategy scope is owned by portfolio_epochs. Query in
