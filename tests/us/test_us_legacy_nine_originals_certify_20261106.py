@@ -93,6 +93,7 @@ def test_all_kis_buys_and_balance_proven_still_block_original_scope(monkeypatch)
     assert all(x["status"]=="PROVEN_FILLED" for x in out["original_buy_results"])
     assert out["balance"]["status"]=="PASS"
     assert out["tmo_original_sell"]=="PROVEN_CANCELLED"
+    assert out["broker_originals_and_balance_verified"] is True
     assert out["status"]=="NOT_PROVEN"
     assert "ORIGINAL_PORTFOLIO_CYCLE_UNPROVEN_POLICY_REVIEW" in out["blockers"]
     assert Counter(client.days)==Counter({"2026-10-27":1,"2026-10-29":1,
@@ -141,3 +142,15 @@ def test_archive_first_statement_readonly_and_epoch_scoped():
     assert len(calls)==4
     assert all(x[1]["epoch"]=="epoch" for x in calls[1:])
     assert [len(x) for x in out]==[9,9,9]
+
+
+def test_populated_columns_cannot_fabricate_original_portfolio_proof():
+    positions, fills, orders = _archive()
+    for row in positions:
+        row["account_id"] = "a" * 64
+        row["portfolio_epoch_id"] = "NEWER_2026_11_04_EPOCH"
+        row["position_cycle_id"] = "FABRICATED_CYCLE"
+    plan = prepare_original_plan(positions, fills, orders)
+    assert all(x["scope_columns_present"] for x in plan["entries"])
+    assert all(x["original_portfolio_proven"] is False for x in plan["entries"])
+    assert plan["all_legacy_scope_proven"] is False
