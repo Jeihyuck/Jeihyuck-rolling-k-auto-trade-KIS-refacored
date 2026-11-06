@@ -217,3 +217,46 @@ def test_runner_requires_completed_tp_and_verified_high(monkeypatch):
     params["high_verified"] = True
     params["unresolved_sell"] = True
     assert evaluate(**params)["action"] == "BLOCK"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("100", "SHADOW_TP"),
+    (100, "SHADOW_TP"),
+    ("2.0", "BLOCK"),
+    (2.5, "BLOCK"),
+    (True, "BLOCK"),
+    (-1, "BLOCK"),
+])
+def test_verified_kis_orderable_quantity_never_rounds(value, expected, monkeypatch):
+    c = contract(monkeypatch)
+    out = calculate_next_tp_stage(
+        contract=c, stage_states={}, holding_qty=value, orderable_qty=value,
+        verified_entry_price=100, executable_price=103,
+    )
+    assert out.action == expected
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "CANCELLED", "UNRESOLVED_ACK"])
+def test_failed_or_ambiguous_stage_requires_exact_broker_recheck(status, monkeypatch):
+    c = contract(monkeypatch)
+    result = calculate_next_tp_stage(
+        contract=c, stage_states={"TP1": {"status": status}},
+        holding_qty=100, orderable_qty=100,
+        verified_entry_price=100, executable_price=108,
+    )
+    assert result.action == "BLOCK"
+    assert result.order_authorized is False
+
+
+def test_frozen_contract_horizon_and_lifecycle_tamper_blocks(monkeypatch):
+    import hashlib
+    import json
+
+    c = contract(monkeypatch)
+    c["position_cycle_id"] = ""
+    payload = dict(c)
+    payload.pop("sha256")
+    c["sha256"] = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    assert not verified_contract(c)
