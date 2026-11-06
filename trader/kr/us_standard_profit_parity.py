@@ -49,6 +49,8 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
             or not str(data.get("account_sha256") or "").strip()
             or not str(data.get("trading_epoch_id") or "").strip()
             or not str(data.get("position_cycle_id") or "").strip()
+            or not (str(data.get("code") or "").isdigit()
+                    and len(str(data.get("code") or "")) == 6)
             or data.get("runner_version") not in VALID_RUNNER_VERSIONS
             or data.get("stages") != [dict(stage=s[0], threshold_fraction=s[1],
                                            sell_fraction=s[2], reason=s[3]) for s in STAGES]):
@@ -67,7 +69,7 @@ def build_new_swing_parity_contract(
     *,
     strategy_owner: str, exit_policy_family: str, trade_horizon: str,
     position_action: str, account_id: str, trading_epoch_id: str,
-    position_cycle_id: str, runner_version: str,
+    position_cycle_id: str, runner_version: str, code: str,
     existing_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Only a positively identified NEW PB1 SWING can receive a new contract.
@@ -93,6 +95,8 @@ def build_new_swing_parity_contract(
         raise ValueError("KR_PROFIT_PARITY_LIFECYCLE_UNVERIFIED")
     if runner_version not in VALID_RUNNER_VERSIONS:
         raise ValueError("KR_PROFIT_PARITY_RUNNER_VERSION_UNVERIFIED")
+    if not (str(code).isdigit() and len(str(code)) == 6):
+        raise ValueError("KR_PROFIT_PARITY_SYMBOL_UNVERIFIED")
     if mode == "ACTIVE_PRACTICE" and (
         os.getenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "0") != "1"
         or os.getenv("KIS_ENV", "").lower() != "practice"
@@ -107,6 +111,7 @@ def build_new_swing_parity_contract(
         "account_sha256": hashlib.sha256(account_id.encode("utf-8")).hexdigest(),
         "trading_epoch_id": trading_epoch_id,
         "position_cycle_id": position_cycle_id,
+        "code": str(code),
         "runner_version": runner_version,
         "runner_min_remain_pct": RUNNER_MIN_REMAIN_PCT,
         "stages": [dict(stage=s[0], threshold_fraction=s[1],
