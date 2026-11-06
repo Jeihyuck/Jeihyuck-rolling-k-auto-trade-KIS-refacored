@@ -143,3 +143,70 @@ def test_aux_writer_normalizes_proven_entry_style_alias_without_inference():
     assert out[0]["entry_style_selected"] == "PULLBACK"
     assert out[2]["entry_style_selected"] == "MOMENTUM"
     assert all(out[i]["rank_final30"] == i+1 for i in range(30))
+
+
+def test_sqlite_actual_repo_core_then_aux_db_roundtrip_and_file_parity(tmp_path, monkeypatch):
+    """Two consecutive real repository upserts must preserve exact Final30.
+
+    Replays the 11/05 candidate-rank overwrite shape with a disposable DB:
+    30 source rows -> canonical CORE save -> AUX overwrite -> exact DB
+    reload -> file mirror identity. No KIS/network/production database.
+    """
+    from datetime import date
+
+    import sqlalchemy as sa
+
+    from trader.db.repos import WatchlistRepo
+    from trader.db.schema import schema_for_engine
+    from trader.watchlist_builder import canonicalize_final30_aux_db_payload
+
+    monkeypatch.setenv("PB1_WATCHLIST_SAVE_ALIAS_LEGACY", "0")
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'final30.db'}")
+    try:
+        schema_for_engine(engine).metadata.create_all(engine)
+        repo = WatchlistRepo(engine)
+        as_of = date(2026, 11, 5)
+        scored = rows()
+        canonical_core = canonicalize_final30_aux_db_payload(
+            scored, source="CORE_DB_UPSERT",
+        )
+        repo.save_watchlist(
+            env="practice", strategy="pb1_watchlist_final_scored",
+            as_of=as_of, members=canonical_core,
+        )
+        candidate_ranked = deepcopy(scored)
+        for i, row in enumerate(candidate_ranked, 1):
+            row["rank"] = i + 5
+            row["rank_final30"] = 0.0
+            row["meta"] = {"rank_final30": 0.0,
+                           "entry_style_selected": row["entry_style_selected"]}
+        canonical_aux = canonicalize_final30_aux_db_payload(
+            candidate_ranked, source="AUX_AFTER_CORE_DB_UPSERT",
+        )
+        repo.save_watchlist(
+            env="practice", strategy="pb1_watchlist_final_scored",
+            as_of=as_of, members=canonical_aux,
+        )
+        saved, used_as_of = repo.load_watchlist_scored(
+            env="practice", strategy="pb1_watchlist_final_scored",
+            as_of=as_of, allow_latest_fallback=False,
+            require_exact_rows=30, require_scored=False,
+        )
+        assert used_as_of == as_of
+        assert len(saved) == 30
+        assert_kr_final30_db_file_identity(saved, canonical_aux, source="final30.json")
+        assert_kr_final30_db_file_identity(
+            saved, list(reversed(deepcopy(canonical_core))), source="bundle",
+        )
+        with engine.connect() as conn:
+            persisted = conn.execute(
+                sa.select(schema_for_engine(engine).pb1_watchlist).where(
+                    schema_for_engine(engine).pb1_watchlist.c.env == "practice",
+                    schema_for_engine(engine).pb1_watchlist.c.strategy == "pb1_watchlist_final_scored",
+                    schema_for_engine(engine).pb1_watchlist.c.as_of == as_of,
+                )
+            ).mappings().all()
+        assert sorted(int(x["rank"]) for x in persisted) == list(range(1, 31))
+        assert sorted(int(x["meta"]["rank_final30"]) for x in persisted) == list(range(1, 31))
+    finally:
+        engine.dispose()
