@@ -67,3 +67,6 @@ jobs:
             tests/kr/test_kr_close_historical_reconcile_20261106.py \
             tests/kr/test_kr_balance_freshness_provenance_20261106.py \
             tests/kr/test_kr257_sell_first_runner_integration.py
+      - name: After PR327 merge verify exact Final30 parity still holds
+        run: |
+          python -m pytest -q tests/kr/test_kr_final30_db_file_parity_p0_20261106.py
