@@ -5941,18 +5941,31 @@ def build_and_save_watchlist(
         _verify_scored = int(
             _verify_df["score_final"].fillna(0).astype(float).gt(0).any()
         ) if not _verify_df.empty and "score_final" in _verify_df.columns else 0
-        _verify_entry_invalid = 0
+        # A NULL style is INVALID, not a valid uncounted row. Explicit
+        # strategy VCP remains valid; never guess missing styles from scores.
+        _verify_entry_invalid = len(_verify_rows)
         if not _verify_df.empty and "entry_style_selected" in _verify_df.columns:
-            _valid_s = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
             _verify_entry_invalid = int(
                 _verify_df["entry_style_selected"].apply(
-                    lambda v: bool(pd.notna(v) and str(v).upper() not in _valid_s)
+                    lambda v: str(v or "").strip().upper() not in ALLOWED_ENTRY_STYLES
                 ).sum()
             )
+        try:
+            _verify_ranks = [int(row.get("rank_final30") or 0) for row in _verify_rows]
+            _verify_rank_ok = bool(
+                sorted(_verify_ranks) == list(range(1, 31))
+                and all(
+                    int(row.get("rank") or 0) == int(row.get("rank_final30") or 0)
+                    for row in _verify_rows
+                )
+            )
+        except (ValueError, TypeError, OverflowError):
+            _verify_rank_ok = False
         _verify_ma20_null = int(
             _verify_df["ma20"].isna().sum()
         ) if not _verify_df.empty and "ma20" in _verify_df.columns else -1
-        if _verify_n == 30 and _verify_uniq == 30 and _verify_entry_invalid == 0:
+        if (_verify_n == 30 and _verify_uniq == 30
+                and _verify_entry_invalid == 0 and _verify_rank_ok):
             logger.info(
                 "[WATCHLIST][SAVE_VERIFY][OK] strategy=%s env=%s as_of=%s rows=%s uniq_code=%s scored=%s entry_style_invalid=%s ma20_null=%s",
                 _scored_strategy,
@@ -5971,6 +5984,8 @@ def build_and_save_watchlist(
                 else f"uniq_code={_verify_uniq}/30"
                 if _verify_uniq != 30
                 else f"entry_style_invalid={_verify_entry_invalid}"
+                if _verify_entry_invalid
+                else "rank_final30_not_contiguous_1_to_30"
             )
             logger.error(
                 "[WATCHLIST][SAVE_VERIFY][FAIL] strategy=%s env=%s as_of=%s rows=%s reason=%s",
