@@ -136,6 +136,10 @@ def record_historical_result(
         isinstance(result, dict) and result.get("ok") is True
         and not result.get("degraded")
         and result.get("frozen_contract_invariant_violations", 0) == 0
+        and result.get("historical_repair_fastpath") is True
+        and not result.get("unresolved_broker_activity")
+        and not result.get("holdings_error")
+        and not result.get("guard_reason")
     )
     try:
         table = schema_for_engine(engine).job_checkpoints
