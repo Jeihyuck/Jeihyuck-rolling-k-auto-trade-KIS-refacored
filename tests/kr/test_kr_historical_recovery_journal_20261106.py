@@ -124,3 +124,53 @@ def test_runner_pre_and_post_sell_paths_use_current_tick_reconciliation_gate():
     assert "if not _pre_verified:" in source
     assert "if not _post_verified:" in source
     assert "_kr_post_exit_reconcile_ok = False" in source
+
+
+def test_retired_september_account_orders_are_not_october_account_blockers():
+    """2026-11-06 retirement: only proven foreign Epoch orders are ignored.
+
+    The September practice account is ENDED, while an old ACKED order and
+    open positions remain for audit. A missing/ambiguous owner must still
+    block; the October live account must never inherit the old ACK.
+    """
+    from trader.kr.recovery_scope_20261104 import (
+        KRRecoveryScope, relevant_open_orders_for_scope,
+    )
+    scope = KRRecoveryScope(
+        env="practice",
+        account_key="practice:50220451:01",
+        trading_epoch_id="09772c87-27ab-412d-b1c7-0a4a55196462",
+    )
+    old_epoch = "3dc51d8e-61ce-414c-80a9-73f9b4911110"
+    current = scope.trading_epoch_id
+    orders = [
+        {"order_id": "old-ack", "code": "028050", "env": "practice",
+         "strategy": "pb1_pullback_close", "position_cycle_id": "old-cycle",
+         "portfolio_epoch_id": "old-portfolio", "trading_epoch_id": old_epoch},
+        {"order_id": "new-ack", "code": "122630", "env": "practice",
+         "strategy": "pb1_pullback_close", "position_cycle_id": "new-cycle",
+         "portfolio_epoch_id": "new-portfolio", "trading_epoch_id": current},
+        {"order_id": "unowned-ack", "code": "293490", "env": "practice",
+         "strategy": "pb1_pullback_close", "position_cycle_id": None,
+         "portfolio_epoch_id": "", "trading_epoch_id": old_epoch},
+    ]
+    portfolios = {
+        "old-portfolio": {
+            "portfolio_epoch_id": "old-portfolio", "env": "practice",
+            "account_id": "practice:50199084:01",
+            "strategy": "pb1_pullback_close", "trading_epoch_id": old_epoch,
+            "status": "ENDED",
+        },
+        "new-portfolio": {
+            "portfolio_epoch_id": "new-portfolio", "env": "practice",
+            "account_id": scope.account_key,
+            "strategy": "pb1_pullback_close", "trading_epoch_id": current,
+            "status": "ACTIVE",
+        },
+    }
+    filtered = relevant_open_orders_for_scope(
+        orders=orders, portfolios=portfolios, scope=scope,
+    )
+    assert [x["order_id"] for x in filtered] == ["new-ack", "unowned-ack"]
+    # Only known old account/epoch evidence can be safely filtered;
+    # an unscoped historical order is NOT proof of another account.
