@@ -20,7 +20,7 @@ def contract(monkeypatch, mode="SHADOW", runner="US_V2"):
         strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
         trade_horizon="SWING", position_action="NEW_POSITION_BUY",
         account_id="practice:12345678:01", trading_epoch_id="epoch1",
-        position_cycle_id="cycle1", runner_version=runner,
+        position_cycle_id="cycle1", runner_version=runner, code="005930",
     )
 
 
@@ -30,7 +30,7 @@ def test_default_legacy_never_replaces_existing_v1(monkeypatch):
         strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
         trade_horizon="SWING", position_action="NEW_POSITION_BUY",
         account_id="practice:12345678:01", trading_epoch_id="epoch1",
-        position_cycle_id="cycle1", runner_version="US_V2",
+        position_cycle_id="cycle1", runner_version="US_V2", code="005930",
     ) is None
 
 
@@ -116,7 +116,7 @@ def test_separate_owner_and_horizon_never_inherit(monkeypatch, owner, family, ho
             strategy_owner=owner, exit_policy_family=family,
             trade_horizon=horizon, position_action="NEW_POSITION_BUY",
             account_id="acc", trading_epoch_id="epoch", position_cycle_id="cycle",
-            runner_version="US_V2",
+            runner_version="US_V2", code="005930",
         )
 
 
@@ -146,7 +146,7 @@ def test_signed_contract_cannot_be_rewritten_or_used_as_order_authorization(monk
             strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
             trade_horizon="SWING", position_action="NEW_POSITION_BUY",
             account_id="acc", trading_epoch_id="epoch", position_cycle_id="cycle",
-            runner_version="US_V2", existing_contract=c,
+            runner_version="US_V2", code="005930", existing_contract=c,
         )
 
 
