@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 import sqlalchemy as sa
@@ -234,7 +235,8 @@ def test_reused_odno_mark_filled_affects_only_current_day_and_epoch(monkeypatch)
         engine, env="practice", account_id="practice:kr-incident",
         reason="STATUS_DAY_FENCE",
     )
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 11, 6, 16, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(repos_module, "now_kst", lambda: now.astimezone(ZoneInfo("Asia/Seoul")))
     old_ts = now - timedelta(days=3)
     with engine.begin() as conn:
         old = _insert_existing(
@@ -267,7 +269,8 @@ def test_reused_odno_mark_acked_affects_only_current_day(monkeypatch):
         engine, env="practice", account_id="practice:kr-incident",
         reason="ACK_DAY_FENCE",
     )
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 11, 6, 16, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(repos_module, "now_kst", lambda: now.astimezone(ZoneInfo("Asia/Seoul")))
     with engine.begin() as conn:
         old = _insert_existing(
             schema, conn, code="005830", key="ack-old", odno="0000013020",

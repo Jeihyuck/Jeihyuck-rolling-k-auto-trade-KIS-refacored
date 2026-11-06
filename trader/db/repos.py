@@ -4731,7 +4731,8 @@ class OrdersRepo:
         )
         if self.engine.dialect.name == "postgresql":
             return sa.cast(sa.func.timezone("Asia/Seoul", stamp), sa.Date)
-        return sa.func.date(stamp)
+        # SQLite CURRENT_TIMESTAMP is UTC. Match the Seoul day used by PostgreSQL.
+        return sa.func.date(stamp, "+9 hours")
 
     def upsert_reconciled_order(
         self,

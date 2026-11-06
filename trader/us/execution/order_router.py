@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from trader.us import config as us_cfg
+from trader.us.execution.kis_us_client import KisUSClient as NativeKisUSClient
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed, assert_tqqq_infinite_order_allowed
 from trader.us.runner.status_contract import is_no_balance_sell_reject
 from trader.us.market_state_overlay import FORBIDDEN_HEDGE_SYMBOLS
@@ -1724,7 +1725,7 @@ def route_order(
 
     if kis_client is None:
         kis_client = KisUSClient(env=_kis_env())
-    _native_kis = isinstance(kis_client, KisUSClient)
+    _native_kis = isinstance(kis_client, NativeKisUSClient)
     if side == "BUY" and not _native_kis:
         intent.setdefault("meta", {})
         if isinstance(intent.get("meta"), dict):
