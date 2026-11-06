@@ -116,11 +116,19 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "failed_count": 0,
         }
         active_claim_recovery_result: dict = {"status": "SKIP", "unresolved_count": 0}
+        historical_recovery = {"boundary_status": "SKIP"}
         if not offline:
+            from trader.us.execution.authoritative_reconcile_worker import (
+                run_historical_recovery_at_boundary,
+            )
+            historical_recovery = run_historical_recovery_at_boundary(
+                trade_date=trade_date, env=env, boundary="CLOSE", provider=provider,
+            )
             try:
                 from trader.us.execution.order_journal import replay_order_journal
                 active_claim_recovery_result = replay_order_journal(
                     trade_date, provider=provider, include_active_claims=True,
+                    active_claim_dates="current",
                 )
                 logger.info("[US_TRADE_CLOSE][ACTIVE_CLAIM_RECOVERY] result=%s", active_claim_recovery_result)
             except Exception as exc:
@@ -433,6 +441,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "reconcile_status": reconcile_status,
             "ack_reconcile_status": ack_reconcile_status,
             "ack_reconcile_result": ack_reconcile_result,
+            "historical_recovery": historical_recovery,
             "balance": balance,
             "close_entry_enabled": close_entry_enabled,
             "order_final_classification": close_order_classification.get("orders", []),

@@ -1496,6 +1496,14 @@ def run_trade_session(
         # execution Claims. Default LEGACY remains unchanged.
         from trader.us.execution.reconcile_shadow_worker import parse_mode
         _reconcile_mode = parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))
+        historical_recovery = {"boundary_status": "SKIP"}
+        if str(session).lower() == "am" and not offline and not resolved_signal_only:
+            from trader.us.execution.authoritative_reconcile_worker import (
+                run_historical_recovery_at_boundary,
+            )
+            historical_recovery = run_historical_recovery_at_boundary(
+                trade_date=trade_date, env=env, boundary="AM_START",
+            )
         if _reconcile_mode in {"SHADOW", "RESERVATION_ONLY", "WORKER"}:
             if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
                 raise RuntimeError("US_RECONCILE_CHILD_PRACTICE_ONLY")
@@ -2843,6 +2851,7 @@ def run_trade_session(
             or (final_reason if final_status in {"FAILED", "SKIP"} else "")
         )
         report_payload = {
+            "historical_recovery": historical_recovery,
             "session_run_id": session_run_id,
             "session_generation": session_generation,
             "prep_run_id": str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),

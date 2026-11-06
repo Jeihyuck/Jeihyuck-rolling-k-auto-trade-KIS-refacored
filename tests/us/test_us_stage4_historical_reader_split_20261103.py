@@ -228,7 +228,7 @@ def test_prefetch_active_claims_identity_must_be_complete():
         active_claim_signature([{"trade_date": "2026-10-30"}])
 
 
-def test_writer_uses_prefetched_historical_book_but_critical_fills_remain_kis(monkeypatch):
+def test_writer_replays_current_day_and_publishes_current_evidence(monkeypatch):
     from trader.us.execution import authoritative_reconcile_worker as worker
     from trader.us.execution import fills as fill_source
     from trader.us.db import repos
@@ -237,11 +237,6 @@ def test_writer_uses_prefetched_historical_book_but_critical_fills_remain_kis(mo
     from trader.us.runner import trade_tick_runner as ticks
 
     main_kis = object()
-    kis = ReadOnlyKIS()
-    reader = _reader(kis=kis)
-    reader._poll_once(kis)
-    snapshot = reader.snapshot_for_claims([CLAIM])
-    historical_provider = reader.provider_for(snapshot)
     observed = []
 
     def fetch_critical(**kwargs):
@@ -250,11 +245,9 @@ def test_writer_uses_prefetched_historical_book_but_critical_fills_remain_kis(mo
         return {"status": "OK", "fills": []}
 
     def replay(*args, **kwargs):
-        assert kwargs["provider"] is historical_provider
-        # The writer may read the frozen GET-only original source day; it
-        # cannot make additional original KIS network requests.
-        assert kwargs["provider"].get_today_orders(SOURCE_DATE)[0]["status"] == "OPEN"
-        observed.append("ORIGINAL_DATE_REPLAY")
+        assert kwargs["provider"] is main_kis
+        assert kwargs["active_claim_dates"] == "current"
+        observed.append("CURRENT_REPLAY")
         return {"status": "UNRESOLVED", "unresolved_count": 1}
 
     def ack(**kwargs):
@@ -277,13 +270,12 @@ def test_writer_uses_prefetched_historical_book_but_critical_fills_remain_kis(mo
     result = worker.run_reconcile_once(
         provider=main_kis, trade_date="2026-11-02",
         session_run_id="offline-split", writer_generation="g",
-        conn=None, scope={}, historical_provider=historical_provider,
+        conn=None, scope={},
     )
     assert result["reconcile_status"] == "OK"
     assert result["replay_status"] == "UNRESOLVED"
     assert result["unresolved_count"] == 1
-    assert observed == ["CURRENT_KIS_FILL", "ORIGINAL_DATE_REPLAY", "CURRENT_ACK"]
-    assert kis.calls == [("GET_ORDER_BOOK", SOURCE_DATE)]
+    assert observed == ["CURRENT_KIS_FILL", "CURRENT_REPLAY", "CURRENT_ACK"]
 
 
 def test_writer_snapshot_get_rechecks_expiration_at_exact_use_boundary():
@@ -476,7 +468,7 @@ def test_stage4_unverified_replay_reports_exact_failure_class_without_ready(monk
         worker.run_reconcile_once(
             provider=object(), trade_date="2026-11-03",
             session_run_id="offline", writer_generation="g", conn=None,
-            scope={}, historical_provider=object(),
+            scope={},
         )
     assert "replay_status=ERROR ack_status=OK" in caplog.text
     assert "action=FAIL_CLOSED" in caplog.text
@@ -505,3 +497,30 @@ def test_stage4_original_claim_scope_change_invalidates_ready_snapshot(changed):
     evidence = reader.snapshot_for_claims([original])
     with pytest.raises(RuntimeError, match="CLAIM_SET_CHANGED"):
         reader.assert_still_valid(evidence, [updated])
+
+
+def test_old_claims_are_read_only_at_boundary_and_remain_unresolved(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.execution import order_journal
+
+    day = "2026-11-06"
+    reads = []
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+    monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [CLAIM])
+    monkeypatch.setattr(order_journal, "load_order_events",
+                        lambda date, **kw: reads.append(date) or [])
+    for _ in range(3):
+        current = order_journal.replay_order_journal(
+            day, include_active_claims=True, active_claims_only=True,
+            active_claim_dates="current",
+        )
+        assert current["status"] == "OK"
+    assert reads == [day] * 3
+    for boundary in ("AM_START", "CLOSE"):
+        report = worker.run_historical_recovery_at_boundary(
+            trade_date=day, env="practice", boundary=boundary, provider=object(),
+        )
+        assert report["boundary_status"] == "HISTORICAL_UNRESOLVED"
+        assert report["unresolved_count"] == 1
+    assert reads == [day] * 3 + [SOURCE_DATE] * 2

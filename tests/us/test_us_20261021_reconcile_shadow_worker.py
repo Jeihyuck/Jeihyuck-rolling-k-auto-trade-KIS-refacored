@@ -154,7 +154,7 @@ def test_reservation_worker_is_brokerless_and_has_separate_health_file(
         trade_date="2026-10-20", session_run_id="R-123",
         env="practice", max_cycles=1,
     ) == 0
-    assert calls == [{"env": "practice", "trade_date": "2026-10-20"}]
+    assert calls == [{"env": "practice", "trade_date": "2026-10-20", "date_scope": "current"}]
     report = reserve_worker.reservation_report_path("2026-10-20", "R-123")
     data = json.loads(report.read_text(encoding="utf-8"))
     assert data["released"] == 1 and data["read_status"] == "OK"

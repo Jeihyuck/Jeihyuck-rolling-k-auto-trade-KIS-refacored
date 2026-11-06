@@ -35,6 +35,14 @@ class USRecoveryScope:
         )}
 
 
+def require_us_recovery_engine():
+    from trader.us.db.repos import _get_engine_or_none
+    engine = _get_engine_or_none()
+    if engine is None:
+        raise USRecoveryIdentityError("US_SCOPE_DATABASE_UNAVAILABLE")
+    return engine
+
+
 def _verified_source(value: dict, *keys: str) -> str:
     present = [str(value.get(k) or "").strip() for k in keys if value.get(k) not in (None, "")]
     if not present:
@@ -189,6 +197,36 @@ def assert_recovery_scope(original: dict, current: dict, *,
     )
     if old_life != original.get("position_cycle_id") or old_life != new_life:
         raise USRecoveryIdentityError("POSITION_LIFECYCLE_MISMATCH")
+
+
+def assert_no_crossday_us_order_conflict(conn, *, env: str, account_id: str,
+                                         trade_date: str, symbol: str, side: str) -> None:
+    """Keep only relevant historical claims fenced without a KIS recovery call."""
+    conflict = conn.execute(text("""
+        SELECT 1
+        FROM us_execution_claims c
+        JOIN us_execution_attempts a ON a.action_key=c.action_key
+             AND a.attempt_id=c.active_attempt_id
+        LEFT JOIN us_order_events e ON e.submit_attempt_id=a.attempt_id
+             AND e.trade_date=c.trade_date AND e.client_order_key=a.client_order_key
+             AND e.event_type IN ('BROKER_SUBMIT_STARTED','BROKER_CLAIM_PREPARED')
+        LEFT JOIN us_orders o ON o.client_order_key=a.client_order_key
+             AND o.trade_date=c.trade_date AND o.trading_epoch_id=c.trading_epoch_id
+             AND o.env=c.env AND o.meta->>'submit_attempt_id'=a.attempt_id
+        WHERE c.env=:env AND c.account_id=:account AND c.market='US'
+          AND (c.trade_date < CAST(:trade_date AS date) OR c.trade_date IS NULL)
+          AND (
+              (upper(coalesce(nullif(e.symbol,''),o.symbol))=:symbol
+               AND upper(coalesce(nullif(e.side,''),o.side))=:side)
+              OR (a.attempt_state <> 'CREATED'
+                  AND (coalesce(nullif(e.symbol,''),o.symbol) IS NULL
+                       OR coalesce(nullif(e.side,''),o.side) IS NULL))
+          )
+        LIMIT 1
+    """), {"env": env, "account": account_id, "trade_date": trade_date,
+           "symbol": symbol, "side": side}).first()
+    if conflict is not None:
+        raise USRecoveryIdentityError("CROSSDAY_ORDER_CONFLICT_UNRESOLVED")
 
 
 def assert_preexisting_us_claim_scope(conn, *, action_key: str,
