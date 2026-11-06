@@ -14,17 +14,21 @@ from datetime import date
 
 
 def classify_original_order(rows: list[dict], *, order_no: str, symbol: str,
-                            expected_qty: int, trade_date: str) -> dict:
+                            expected_qty: int, trade_date: str,
+                            side: str = "SELL") -> dict:
     from trader.us.data_provider import normalize_us_order_status_row
     from trader.us.utils.order_no import normalize_us_order_no
 
+    side = str(side or "").upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("ORIGINAL_KIS_ORDER_SIDE_INVALID")
     result = {
         "classification": "UNKNOWN", "symbol": symbol,
         "trade_date": trade_date,
         "broker_order_no_canonical": normalize_us_order_no(order_no),
         "expected_qty": expected_qty,
         "matched_rows": 0, "source": "KIS_PRACTICE_ORIGINAL_DATE_READONLY",
-        "side": "SELL", "orders_submitted": 0, "cancels_submitted": 0,
+        "side": side, "orders_submitted": 0, "cancels_submitted": 0,
     }
     if not isinstance(rows, list) or expected_qty <= 0:
         return result
@@ -37,7 +41,7 @@ def classify_original_order(rows: list[dict], *, order_no: str, symbol: str,
             continue
         n = normalize_us_order_status_row(raw)
         if (normalize_us_order_no(n.get("order_no")) == expected_order
-                and n.get("symbol") == symbol and n.get("side") == "SELL"):
+                and n.get("symbol") == symbol and n.get("side") == side):
             matched.append(n)
     result["matched_rows"] = len(matched)
     if len(matched) != 1:
@@ -80,6 +84,8 @@ def main() -> int:
     p.add_argument("--symbol", required=True)
     p.add_argument("--order-no", required=True)
     p.add_argument("--expected-qty", required=True, type=int)
+    p.add_argument("--side", choices=("BUY", "SELL"), default="SELL",
+                   help="Original KIS order direction. Defaults to SELL for legacy TMO probe")
     p.add_argument("--confirm-readonly", action="store_true")
     args = p.parse_args()
     date.fromisoformat(args.trade_date)
@@ -93,6 +99,7 @@ def main() -> int:
         result = classify_original_order(
             rows, order_no=args.order_no, symbol=args.symbol.upper(),
             expected_qty=args.expected_qty, trade_date=args.trade_date,
+            side=args.side,
         )
     except Exception as exc:
         result = {"classification": "UNKNOWN", "read_error_type": type(exc).__name__,

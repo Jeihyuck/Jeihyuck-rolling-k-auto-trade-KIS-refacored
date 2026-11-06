@@ -1594,6 +1594,12 @@ class KisUSClient:
                     callback = self._before_order_http
                     self._before_order_http = None
                     callback()
+                if is_order_submit:
+                    # The callback can perform authoritative Stage4 and
+                    # reservation DB checks. Its elapsed time counts toward
+                    # the same Tick deadline; a timeout measured *before*
+                    # those checks must not authorize a late native POST.
+                    timeout = self._request_budget()
                 # A pre-HTTP callback may fence the attempt; a logged POST
                 # must not be fabricated when requests.post was never reached.
                 record_kis_http_call("POST", path)
