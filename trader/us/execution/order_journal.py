@@ -234,7 +234,8 @@ def journal_path(trade_date: str) -> Path:
 
 
 def append_order_event(event_type: str, intent: dict, *, context: Any | None = None,
-                       broker_order_no: str = "", broker_status: str = "", raw_response: Any = None) -> dict:
+                       broker_order_no: str = "", broker_status: str = "", raw_response: Any = None,
+                       require_db: bool = False) -> dict:
     td = str(intent.get("trade_date") or getattr(context, "trade_date", ""))
     if not td:
         raise OSError("journal event requires trade_date")
@@ -339,6 +340,10 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "broker_account_hash": intent.get("broker_account_hash") or meta.get("broker_account_hash"),
         "trading_epoch_id": intent.get("trading_epoch_id") or meta.get("trading_epoch_id"),
         "strategy_owner": intent.get("strategy_owner") or meta.get("strategy_owner"),
+        "strategy_name": intent.get("strategy_name") or meta.get("strategy_name"),
+        "strategy_version": intent.get("strategy_version") or meta.get("strategy_version"),
+        "position_action": intent.get("position_action") or meta.get("position_action"),
+        "reason": intent.get("reason") or meta.get("reason"),
         "limit_price": limit_price, "order_price": intent.get("order_price") or meta.get("order_price"),
         "notional_usd": intent.get("notional_usd") or meta.get("notional_usd"),
         **sell_audit,
@@ -379,13 +384,65 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
     event["raw_broker_order_no"] = broker_order_no
     event["canonical_broker_order_no"] = canonical_no
     from trader.us.db.repos import append_us_order_event
-    db_event = {
-        "event_id": event["event_id"], "trade_date": td, "event_type": event_type,
+    fallback_allowed = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("US_OFFLINE") == "1" or os.getenv("OFFLINE") == "1")
+    db_required = require_db or not fallback_allowed
+    durable_buy_ack = db_required and event["side"] == "BUY" and event_type == "BROKER_ACK_RECEIVED"
+    local_ack_saved = False
+    path = journal_path(td)
+    if durable_buy_ack:
+        # Preserve the actual broker order number before a slow or failed DB
+        # commit. The spool is read only by replay and matched to DB STARTED.
+        try:
+            _append_local_order_event(
+                path.with_suffix(".buy-ack-pending.jsonl"),
+                {**event, "ledger_source": "jsonl_db_pending"},
+            )
+            local_ack_saved = True
+        except OSError:
+            logger.error("[US_ORDER_JOURNAL][BUY_ACK_LOCAL_WRITE_FAILED] attempt=%s",
+                         event["submit_attempt_id"])
+
+    db_saved = append_us_order_event(_db_event_from_journal(event))
+    if not db_saved and db_required:
+        reason = (
+            "durable_order_event_db_unavailable_local_ack_preserved" if local_ack_saved
+            else "durable_order_event_ledger_unavailable"
+        )
+        raise OSError(reason)
+    event["ledger_source"] = "postgres" if db_saved else "jsonl_test_fallback"
+    _append_local_order_event(path, event)
+    return event
+
+
+def _append_local_order_event(path: Path, event: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+    new_file = not path.exists()
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        encoded = line.encode()
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError("short_order_journal_write")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if new_file:
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+def _db_event_from_journal(event: dict) -> dict:
+    return {
+        "event_id": event["event_id"], "trade_date": event["trade_date"], "event_type": event["event_type"],
         "event_timestamp": event["timestamp"], "session": event.get("session"),
         "session_run_id": event.get("session_run_id"), "tick_id": event.get("tick_id"),
         "client_order_key": event.get("client_order_key"), "submit_attempt_id": event.get("submit_attempt_id"),
         "symbol": event.get("symbol"), "side": event.get("side"), "requested_qty": event.get("requested_qty"),
-        "raw_broker_order_no": broker_order_no, "canonical_broker_order_no": canonical_no,
+        "raw_broker_order_no": event.get("raw_broker_order_no"),
+        "canonical_broker_order_no": event.get("canonical_broker_order_no"),
         "position_lifecycle_id": event.get("position_lifecycle_id"),
         "position_cycle_id": event.get("position_cycle_id"),
         "portfolio_epoch_id": event.get("portfolio_epoch_id"),
@@ -396,21 +453,47 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "cumulative_filled_qty": event.get("cumulative_filled_qty"),
         "payload": event, "idempotency_key": event["idempotency_key"],
     }
-    db_saved = append_us_order_event(db_event)
-    fallback_allowed = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("US_OFFLINE") == "1" or os.getenv("OFFLINE") == "1")
-    if not db_saved and not fallback_allowed:
-        raise OSError("durable_order_event_ledger_unavailable")
-    event["ledger_source"] = "postgres" if db_saved else "jsonl_test_fallback"
-    path = journal_path(td)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str) + "\n"
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+
+
+def _restore_local_buy_acks(trade_date: str, db_events: list[dict]) -> list[dict]:
+    """Replay fsynced ACKs only when their original DB submit event is present."""
+    from trader.us.db.repos import append_us_order_event
+
     try:
-        os.write(fd, line.encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    return event
+        content = journal_path(trade_date).with_suffix(".buy-ack-pending.jsonl").read_bytes()
+    except FileNotFoundError:
+        return db_events
+    # A writer may have the next line in flight. A line without its final
+    # newline is never treated as an ACK.
+    lines = content.split(b"\n")[:-1]
+    identity_fields = (
+        "trade_date", "client_order_key", "submit_attempt_id", "symbol", "side",
+        "requested_qty", "broker_account_hash", "portfolio_epoch_id",
+        "position_cycle_id", "trading_epoch_id", "strategy_owner",
+    )
+    def identity(event: dict) -> tuple:
+        return tuple(event.get(field) for field in identity_fields)
+
+    started = {
+        identity(event) for event in db_events
+        if event.get("event_type") == "BROKER_SUBMIT_STARTED" and event.get("side") == "BUY"
+    }
+    saved_keys = {event.get("idempotency_key") for event in db_events}
+    recovered = []
+    for line in lines:
+        if not line:
+            continue
+        event = json.loads(line)
+        key = event.get("idempotency_key")
+        if (event.get("event_type") != "BROKER_ACK_RECEIVED" or not key
+                or key in saved_keys or identity(event) not in started):
+            continue
+        event["ledger_source"] = "postgres"
+        if not append_us_order_event(_db_event_from_journal(event)):
+            raise OSError("buy_ack_replay_db_write_failed")
+        recovered.append(event)
+        saved_keys.add(key)
+    return [*db_events, *recovered]
 
 
 def load_order_events(trade_date: str, *, session_run_id: str | None = None) -> list[dict]:
@@ -631,7 +714,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                          include_active_claims: bool = False,
                          active_claims_only: bool = False,
                          deadline_monotonic: float | None = None,
-                         active_claim_offset: int = 0) -> dict:
+                         active_claim_offset: int = 0,
+                         active_claim_date_scope: str = "all") -> dict:
     """Restore broker truth without resubmission.
 
     An optional pre-route deadline defers work, never resolves a claim. Full
@@ -640,7 +724,15 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
     def budget_available() -> bool:
         return deadline_monotonic is None or time.monotonic() < deadline_monotonic
 
-    events = load_order_events(trade_date, session_run_id=session_run_id)
+    if active_claim_date_scope not in {"all", "current", "historical"}:
+        raise ValueError("invalid_active_claim_date_scope")
+    if active_claim_date_scope == "historical" and not active_claims_only:
+        raise ValueError("historical_replay_requires_active_claims_only")
+    events = []
+    if not active_claims_only or active_claim_date_scope == "all":
+        events = _restore_local_buy_acks(
+            trade_date, load_order_events(trade_date, session_run_id=session_run_id),
+        )
     if tick_id:
         events = [e for e in events if e.get("tick_id") == tick_id]
     # Full submit/ACK history is used ONLY for conflicting-order detection.
@@ -660,6 +752,10 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             reused_source_dates = 0
             for claim in active_claims:
                 source_date = str(claim.get("trade_date") or "")
+                if active_claim_date_scope == "current" and source_date != trade_date:
+                    continue
+                if active_claim_date_scope == "historical" and source_date >= trade_date:
+                    continue
                 key = str(claim.get("client_order_key") or "")
                 attempt_id = str(claim.get("active_attempt_id") or "")
                 if not source_date or not key or not attempt_id:
@@ -671,7 +767,9 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 if source_date == trade_date and not active_claims_only:
                     continue
                 if source_date not in source_events_by_date:
-                    source_events_by_date[source_date] = load_order_events(source_date)
+                    source_events_by_date[source_date] = _restore_local_buy_acks(
+                        source_date, load_order_events(source_date),
+                    )
                 else:
                     reused_source_dates += 1
                 source_events = source_events_by_date[source_date]
@@ -851,6 +949,8 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
 
     def position_from_authoritative_balance(symbol: str) -> dict | None:
         nonlocal balance, balance_checked
+        if active_claim_date_scope == "historical":
+            return None
         if not balance_checked:
             balance_checked = True
             if provider is not None and budget_available():
@@ -1363,3 +1463,33 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             "broker_confirmed_count":confirmed,"unresolved_count":unresolved,
             "unresolved_symbol_sides":unresolved_symbol_sides,"events_scanned":len(events),
             "balance_fetched":balance is not None}
+
+
+def report_historical_order_recovery(*, provider: Any, trade_date: str, phase: str) -> dict:
+    """Attempt old claims once at a session boundary and report unresolved debt."""
+    try:
+        deadline = time.monotonic() + 10.0
+        fork = getattr(provider, "fork_for_stage", None)
+        result = replay_order_journal(
+            trade_date,
+            provider=fork(stage_deadline=deadline) if callable(fork) else provider,
+            include_active_claims=True,
+            active_claims_only=True,
+            active_claim_date_scope="historical",
+            deadline_monotonic=deadline,
+        )
+    except Exception as exc:
+        result = {"status": "ERROR", "unresolved_count": 1, "error": type(exc).__name__}
+    unresolved = (
+        result.get("status") not in {"OK", "RECOVERED", "NO_ACTIVE_CLAIMS"}
+        or bool(result.get("unresolved_count"))
+    )
+    logger.log(
+        logging.WARNING if unresolved else logging.INFO,
+        "[US_ORDER_JOURNAL][HISTORICAL_RECOVERY] phase=%s trade_date=%s "
+        "status=%s replay_status=%s unresolved_count=%s action=%s",
+        phase, trade_date, "RECOVERY_UNRESOLVED" if unresolved else "OK",
+        result.get("status"), result.get("unresolved_count"),
+        "KEEP_ORDER_FENCES_AND_CONTINUE" if unresolved else "CONTINUE",
+    )
+    return result

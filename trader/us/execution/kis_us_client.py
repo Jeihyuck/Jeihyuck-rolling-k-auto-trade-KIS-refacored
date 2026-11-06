@@ -1043,6 +1043,8 @@ class KisUSClient:
                 raise RuntimeError(
                     "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
                 )
+            if not callable(self._before_order_http):
+                raise KisUSPreSubmitError("BUY requires the durable order router before broker HTTP")
             tr = get_tr_info("us_buy_order")
         except Exception as exc:
             if isinstance(exc, KisUSPreSubmitError):
