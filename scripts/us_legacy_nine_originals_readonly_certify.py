@@ -303,10 +303,17 @@ def certify_get_only(plan: dict, client: Any) -> dict:
                 symbol=symbol,expected_qty=sale["requested_qty"],
                 trade_date=day,side="SELL",
             )
+            broker_classification=proof.get("classification")
+            db_status=sale.get("db_order_status")
+            terminal_contract_matches=(
+                broker_classification=="PROVEN_FILLED"
+                and db_status in {"FILLED","RECONCILED"}
+                or broker_classification=="PROVEN_CANCELLED"
+                and db_status in {"CANCELLED","EXPIRED"}
+            )
             verified=bool(
-                proof["classification"] in {"PROVEN_FILLED","PROVEN_CANCELLED"}
+                terminal_contract_matches
                 and proof.get("cumulative_filled_qty")==sale["db_filled_qty"]
-                and sale.get("db_order_status") in {"FILLED","RECONCILED"}
             )
         except Exception:
             verified=False
@@ -344,6 +351,8 @@ def certify_get_only(plan: dict, client: Any) -> dict:
     broker_originals_and_balance_verified=(
         len(output)==len(SYMBOLS)
         and all(item.get("status")=="PROVEN_FILLED" for item in output)
+        and len(verified_sells)==len(plan.get("original_sell_entries", []))
+        and all(item.get("status")=="PROVEN_TERMINAL" for item in verified_sells)
         and tmo["classification"] in {"PROVEN_FILLED","PROVEN_CANCELLED"}
         and balance["status"]=="PASS"
     )
