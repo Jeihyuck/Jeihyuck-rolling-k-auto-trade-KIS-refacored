@@ -194,6 +194,11 @@ def prepare_original_plan(
             "symbol":symbol, "trade_date":original_day, "order_no":order_no,
             "requested_qty":requested, "filled_qty":q,
             "strategy_owner":owner, "lifecycle_present":bool(life),
+            # Kept in private in-process review plan; never log raw order,
+            # account or contract. The proposal digest must bind the exact
+            # immutable lifecycle and frozen entry-exit policy.
+            "original_lifecycle_id":life,
+            "original_contract_sha256":contract,
             "frozen_contract_match":bool(contract and contract==order_contract),
             "epoch_db_net_matches":net == quantity if net is not None else False,
             "db_qty":quantity,
