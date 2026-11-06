@@ -167,6 +167,17 @@ def test_sqlite_actual_repo_core_then_aux_db_roundtrip_and_file_parity(tmp_path,
         repo = WatchlistRepo(engine)
         as_of = date(2026, 11, 5)
         scored = rows()
+        # Real scored DB saver requires technical/price contract evidence,
+        # not only code/rank/style fields used by pure parity unit tests.
+        for row in scored:
+            row.update({
+                "tech_score": 72.0, "breakout_score": 15.0,
+                "pullback_score": 20.0, "momentum_score": 12.0,
+                "rs_percentile": 82.0, "vcp_score": 60.0,
+                "ma20": 10000.0, "ma50": 9800.0,
+                "ma150": 9000.0, "close": 10500.0,
+                "atr_pct": 0.025,
+            })
         canonical_core = canonicalize_final30_aux_db_payload(
             scored, source="CORE_DB_UPSERT",
         )
