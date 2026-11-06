@@ -174,3 +174,22 @@ def test_deferred_settlement_with_balance_preserves_authoritative_writer(monkeyp
     )
     assert result["settlement"]["status"] == "OK"
     assert calls == [(provider, "2026-11-05", 1)]
+
+
+def test_slow_claim_book_cannot_starve_debt_only_original_day_books():
+    """Original stop-debt dates must eventually receive bounded GET turns."""
+    clock = [200.0]
+    kis = StubClockKIS(clock, latency=16.0)
+    reader = _reader(
+        kis, clock, debts=[DEBT], dates={"2026-11-02", "2026-11-03"},
+    )
+    for _ in range(10):
+        reader._poll_once(kis)
+    assert ("BALANCE", True) in kis.calls
+    assert ("BOOK", "2026-10-30") in kis.calls
+    assert ("BOOK", "2026-11-02") in kis.calls
+    assert ("BOOK", "2026-11-03") in kis.calls
+    # This is progress only, NOT a valid READY claim on expired originals.
+    clock[0] += 16.0
+    with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
+        reader.snapshot_for_claims([CLAIM])
