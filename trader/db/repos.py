@@ -4912,23 +4912,37 @@ class OrdersRepo:
                 "submitted_at": submitted_at,
                 "acked_at": acked_at,
             }
-            # A KIS daily-ccld row frequently omits the broker status. The
-            # caller then supplies RECONCILED, which is *not* execution proof
-            # and must never demote durable FILLED/partial/unknown-ACK evidence.
+            # The source history sometimes lacks a broker order status and
+            # supplies RECONCILED. That is an observation, not fill evidence.
+            # Enforce monotonicity INSIDE the SQL UPDATE: a separate settlement
+            # transaction may promote this same order after our initial SELECT.
+            # A Python-only read/if/write guard would then use a stale status.
+            update_status = status
             if existing_row is not None:
-                recorded_status = str(existing_row.get("status") or "").upper()
-                observed_status = str(status or "").upper()
-                if (
-                    observed_status == "RECONCILED"
-                    and recorded_status in {
-                        "FILLED", "PARTIAL_FILLED",
-                        "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
-                        "UNRESOLVED_ACK", "CANCELLED", "CANCELED", "REJECTED",
-                    }
-                ) or (recorded_status == "FILLED" and observed_status == "PARTIAL_FILLED"):
-                    status = recorded_status
+                observed = str(status or "").upper()
+                if observed == "RECONCILED":
+                    update_status = sa.case(
+                        (
+                            self._schema.orders.c.status.in_({
+                                "FILLED", "PARTIAL_FILLED",
+                                "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+                                "UNRESOLVED_ACK", "CANCELLED", "CANCELED",
+                                "REJECTED",
+                            }),
+                            self._schema.orders.c.status,
+                        ),
+                        else_=status,
+                    )
+                elif observed == "PARTIAL_FILLED":
+                    update_status = sa.case(
+                        (
+                            self._schema.orders.c.status == "FILLED",
+                            self._schema.orders.c.status,
+                        ),
+                        else_=status,
+                    )
             update_cols = {
-                "status": status,
+                "status": update_status,
                 "kis_odno": kis_odno,
                 "broker_order_id": broker_order_id,
                 "response_json": safe_response_json,
