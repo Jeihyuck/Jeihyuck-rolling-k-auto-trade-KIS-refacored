@@ -83,3 +83,47 @@ def test_no_style_fallback_from_entry_component():
     mirror[0]["entry_component"] = "momentum"
     with pytest.raises(RuntimeError, match="INVALID_IDENTITY"):
         assert_kr_final30_db_file_identity(db, mirror, source="runtime")
+
+
+
+def test_auxiliary_writer_does_not_overwrite_final30_with_candidate_rank():
+    from trader.watchlist_builder import canonicalize_final30_aux_db_payload
+
+    initial = rows()
+    for i, row in enumerate(initial, 1):
+        row["rank"] = i + 5
+        row["rank_final30"] = 0.0
+        row["entry_style_selected"] = "MOMENTUM" if i % 3 == 0 else "PULLBACK"
+        row["meta"] = {"rank_final30": 0.0, "entry_style_selected": row["entry_style_selected"]}
+    source = deepcopy(initial)
+    canonical = canonicalize_final30_aux_db_payload(source, source="test_candidate_rank")
+    assert [x["rank"] for x in canonical] == list(range(1, 31))
+    assert [x["rank_final30"] for x in canonical] == list(range(1, 31))
+    assert [x["meta"]["rank_final30"] for x in canonical] == list(range(1, 31))
+    assert all(x["entry_style_selected"] == y["entry_style_selected"]
+               for x, y in zip(canonical, initial))
+    assert [x["rank"] for x in source] == [i + 5 for i in range(1, 31)]
+    assert_kr_final30_db_file_identity(canonical, deepcopy(canonical), source="aux_db")
+
+
+def test_auxiliary_writer_refuses_missing_style_even_if_component_is_momentum():
+    from trader.watchlist_builder import canonicalize_final30_aux_db_payload
+
+    data = rows()
+    for x in data:
+        x["entry_style_selected"] = "PULLBACK"
+    data[21]["code"] = "033790"
+    data[21]["entry_style_selected"] = None
+    data[21]["entry_component"] = "momentum"
+    with pytest.raises(RuntimeError, match="STYLE_NOT_SELECTED.*033790"):
+        canonicalize_final30_aux_db_payload(data, source="20261105")
+
+
+def test_aux_and_cache_db_writers_both_apply_new_final30_contract():
+    import inspect
+    from trader.watchlist_builder import build_and_save_watchlist
+
+    source = inspect.getsource(build_and_save_watchlist)
+    assert source.count("canonicalize_final30_aux_db_payload(") >= 2
+    assert "CACHE_DIRECT_DB_SAVE" in source
+    assert "BUILDER_AUX_DB_SAVE" in source
