@@ -4909,6 +4909,21 @@ class OrdersRepo:
                 "submitted_at": submitted_at,
                 "acked_at": acked_at,
             }
+            # A KIS daily-ccld row frequently omits the broker status. The
+            # caller then supplies RECONCILED, which is *not* execution proof
+            # and must never demote durable FILLED/partial/unknown-ACK evidence.
+            if existing_row is not None:
+                recorded_status = str(existing_row.get("status") or "").upper()
+                observed_status = str(status or "").upper()
+                if (
+                    observed_status == "RECONCILED"
+                    and recorded_status in {
+                        "FILLED", "PARTIAL_FILLED",
+                        "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
+                        "UNRESOLVED_ACK", "CANCELLED", "CANCELED", "REJECTED",
+                    }
+                ) or (recorded_status == "FILLED" and observed_status == "PARTIAL_FILLED"):
+                    status = recorded_status
             update_cols = {
                 "status": status,
                 "kis_odno": kis_odno,
