@@ -85,10 +85,13 @@ def _has_unresolved_broker_activity(*, engine, orders_repo: OrdersRepo, env: str
     open_states = {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
     try:
         # Economic readiness must never reinterpret a DB timeout as no orders.
-        rows = orders_repo.get_open_orders(
-            env, trade_date=trade_date, fail_open=False,
+        # Pending activity from a *proven* previous account or epoch is not
+        # current-account exposure. Unknown provenance continues to block.
+        from trader.kr.recovery_scope_20261104 import current_scope_open_order_blockers
+        rows = current_scope_open_order_blockers(
+            engine=engine, env=env, kis=None, orders_repo=orders_repo,
         )
-        if any(str(row.get("status") or "").upper() in open_states for row in rows or []):
+        if any(str(row.get("status") or "").upper() in open_states for row in rows):
             return True
     except Exception as exc:
         logger.warning(
