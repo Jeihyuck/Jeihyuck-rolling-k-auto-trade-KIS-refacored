@@ -155,10 +155,16 @@ def prepare_original_plan(
             "frozen_contract_match":bool(contract and contract==order_contract),
             "epoch_db_net_matches":net == quantity if net is not None else False,
             "db_qty":quantity,
-            "original_portfolio_proven":bool(
+            # Populated scope columns are not authenticated ORIGINAL scope
+            # proof: they might have been copied from a newer portfolio.
+            # Historical ownership requires a separately reviewed provenance
+            # transition, including source-day KIS proof and immutable
+            # portfolio registry timing. A GET-only audit never authorizes it.
+            "scope_columns_present":bool(
                 position.get("portfolio_epoch_id") and
                 position.get("position_cycle_id") and position.get("account_id")
             ),
+            "original_portfolio_proven":False,
         })
     return {"entries":entries,"blockers":sorted(set(blockers)),
             "all_legacy_scope_proven":all(
@@ -259,7 +265,16 @@ def certify_get_only(plan: dict, client: Any) -> dict:
         blockers.append(balance["status"])
     if not plan["all_legacy_scope_proven"]:
         blockers.append("ORIGINAL_PORTFOLIO_CYCLE_UNPROVEN_POLICY_REVIEW")
+    broker_originals_and_balance_verified=(
+        len(output)==len(SYMBOLS)
+        and all(item.get("status")=="PROVEN_FILLED" for item in output)
+        and tmo["classification"] in {"PROVEN_FILLED","PROVEN_CANCELLED"}
+        and balance["status"]=="PASS"
+    )
     return {
+        # A broker-authenticated match is useful, but it is not permission to
+        # create a historical portfolio or silently unlock a legacy position.
+        "broker_originals_and_balance_verified":broker_originals_and_balance_verified,
         "status":"READONLY_EVIDENCE_PASS" if not blockers else "NOT_PROVEN",
         "broker_readonly_only":True,"broker_post_count":0,
         "db_update_count":0,"claims_released":0,
