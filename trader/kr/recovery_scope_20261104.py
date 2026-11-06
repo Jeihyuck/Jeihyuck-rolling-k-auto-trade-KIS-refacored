@@ -140,14 +140,21 @@ def relevant_open_orders_for_scope(
 
 def current_scope_open_order_blockers(
     *, engine: Any, env: str, kis: Any, orders_repo: Any,
+    preloaded_open_orders: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """One fail-closed open-order read + one portfolio-owner batch lookup.
 
-    All order states and all strategy owners remain in the blockers set for
-    the current account/epoch, including KR_INFINITE; no cross-owner bypass.
+    A caller that already performed a strict trade-day lookup may reuse that
+    exact snapshot without an extra DB read or changing the original filter.
+    All strategy owners remain blockers in the current account and epoch.
     """
     scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
-    opened = orders_repo.get_open_orders(env, include_stale=True, fail_open=False)
+    opened = (
+        preloaded_open_orders if preloaded_open_orders is not None
+        else orders_repo.get_open_orders(env, include_stale=True, fail_open=False)
+    )
+    if not isinstance(opened, list):
+        raise RuntimeError("KR_OPEN_ORDER_EVIDENCE_INVALID_FAIL_CLOSED")
     if not opened or scope is None:
         return opened
     schema = schema_for_engine(engine)

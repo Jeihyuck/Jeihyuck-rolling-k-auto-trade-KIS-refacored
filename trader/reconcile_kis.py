@@ -85,10 +85,20 @@ def _has_unresolved_broker_activity(*, engine, orders_repo: OrdersRepo, env: str
     open_states = {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}
     try:
         # Economic readiness must never reinterpret a DB timeout as no orders.
+        # Preserve the original trade-date strict read (no fail-open and no
+        # second call), then disregard only proven foreign-account orders.
         rows = orders_repo.get_open_orders(
             env, trade_date=trade_date, fail_open=False,
         )
-        if any(str(row.get("status") or "").upper() in open_states for row in rows or []):
+        if not isinstance(rows, list):
+            return True  # Unknown evidence never means zero pending orders.
+        if rows:
+            from trader.kr.recovery_scope_20261104 import current_scope_open_order_blockers
+            rows = current_scope_open_order_blockers(
+                engine=engine, env=env, kis=None, orders_repo=orders_repo,
+                preloaded_open_orders=rows,
+            )
+        if any(str(row.get("status") or "").upper() in open_states for row in rows):
             return True
     except Exception as exc:
         logger.warning(
@@ -974,16 +984,6 @@ def _promote_open_buy_orders_from_holdings(
             except Exception:
                 logger.exception("[SETTLEMENT_SHADOW][KR_PROBE_ERROR] code=%s", code)
 
-        if kr_scope is not None and source_order is not None:
-            # Recheck exact ownership immediately before the first write.
-            with engine.connect() as owner_conn:
-                if not order_matches_recovery_scope(
-                    conn=owner_conn, schema=schema_for_engine(engine),
-                    order=dict(source_order),
-                    strategy=str(source_order.get("strategy") or ""),
-                    scope=kr_scope,
-                ):
-                    raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=ctx_run_id,
@@ -1984,6 +1984,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                     "notional=%s price_from=tot_ccld_amt_div_tot_ccld_qty",
                     code, cumulative_sell_evidence["qty"], cumulative_sell_evidence["notional"],
                 )
+        if kr_scope is not None and source_order is not None:
+            # Recheck exact ownership immediately before the first write.
+            with engine.connect() as owner_conn:
+                if not order_matches_recovery_scope(
+                    conn=owner_conn, schema=schema_for_engine(engine),
+                    order=dict(source_order),
+                    strategy=str(source_order.get("strategy") or ""),
+                    scope=kr_scope,
+                ):
+                    raise RuntimeError("KR_RECONCILE_SOURCE_SCOPE_PREWRITE_REJECTED")
         orders_repo.upsert_reconciled_order(
             env=env,
             run_id=reconcile_run_id,

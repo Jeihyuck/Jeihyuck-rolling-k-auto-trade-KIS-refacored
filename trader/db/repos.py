@@ -4277,11 +4277,14 @@ class OrdersRepo:
             self._kr_broker_trade_day_expr() == trade_date,
             or_(self._schema.orders.c.kis_odno.in_(variants),
                 self._schema.orders.c.broker_order_id.in_(variants)),
-            or_(self._schema.orders.c.stage.is_(None),
-                self._schema.orders.c.stage != "RECONCILE"),
         ]
         stmt = select(self._schema.orders)
         if account_id is not None:
+            # This scoped API is used for authoritative original broker
+            # source attribution. Shadow RECONCILE records are not original
+            # orders. Preserve legacy unscoped offline diagnostic lookups.
+            conditions.append(or_(self._schema.orders.c.stage.is_(None),
+                                  self._schema.orders.c.stage != "RECONCILE"))
             if not str(account_id).strip() or not str(trading_epoch_id).strip():
                 raise RuntimeError("KR_SOURCE_ORDER_ACCOUNT_EPOCH_UNPROVEN")
             stmt = stmt.join(
