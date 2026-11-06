@@ -92,6 +92,9 @@ def test_old_active_account_does_not_enter_current_owned_buy_recovery(monkeypatc
     {"pre_order_holding_qty": None},
     {"pre_order_holding_qty": "unknown"},
     {"pre_order_holding_qty": 1},
+    {"pre_order_holding_qty": True},
+    {"pre_order_holding_qty": "0.5"},
+    {"pre_order_holding_qty": "NaN"},
 ])
 def test_current_account_without_zero_baseline_is_blocked(monkeypatch, unsafe_request):
     engine, schema, identities, _day = _accounts(monkeypatch)
