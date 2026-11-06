@@ -1120,14 +1120,17 @@ def save_final30_scored_core(
     # 30-row DB payload diverged in its selected style/rank/code from source.
     assert_kr_final30_db_file_identity(
         list(scored_contract.get("rows_data") or []),
-        final30_df.to_dict(orient="records"),
-        source="CORE_SAVE_SOURCE",
+        scored_members,
+        source="CORE_SAVE_CANONICAL",
     )
 
+    # Source DF can lack assigned rank_final30 while the exact DB INSERT uses
+    # _build_scored_members' canonical 1..30 ranks. Publish the same
+    # canonical snapshot to disk, rather than reproducing a stale raw DF.
     mirror_sync = sync_prep_final30_file_mirror(
         env=env,
         as_of=as_of.isoformat(),
-        df=final30_df,
+        df=pd.DataFrame(scored_members),
     )
     file_results = dict(mirror_sync.get("file_results") or {})
     validation = dict(mirror_sync.get("validation") or {})
