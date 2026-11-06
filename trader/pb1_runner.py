@@ -7109,6 +7109,12 @@ def run_once(
         # The per-tick runs row is the authoritative FK lineage for this tick.
         ctx.run_id = str(run_record_id)
         db_write_reasons.append("run_start")
+        # Count real FULL reconciliation invocations at the runner boundary.
+        # The nested reconcile_today() call is NOT another historical recovery.
+        kr_reconcile_perf = {
+            "pre_full_calls": 0, "pre_full_ms": 0.0,
+            "post_full_calls": 0, "post_full_ms": 0.0,
+        }
         reconcile_result: dict | None = None
         deferred_full_reconcile = False
         pre_exit_exact_proof = False
@@ -7163,6 +7169,8 @@ def run_once(
                 "deferred_to": "AFTER_PROTECTIVE_SELL_BEFORE_ANY_BUY",
             }
         if kis and not nontrading_eval_mode and not deferred_full_reconcile:
+            _pre_full_started = time_mod.monotonic()
+            kr_reconcile_perf["pre_full_calls"] += 1
             try:
                 reconcile_result = reconcile_kis(
                     engine=engine,
@@ -7187,6 +7195,13 @@ def run_once(
                 if not dry_run and mode_resolved == "LIVE":
                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
+            finally:
+                kr_reconcile_perf["pre_full_ms"] += 1000.0 * (time_mod.monotonic() - _pre_full_started)
+                logger.info(
+                    "[KR_RECONCILE_LANES][HISTORICAL_RECOVERY_CALL] lane=pre "
+                    "calls=%s elapsed_ms=%.1f",
+                    kr_reconcile_perf["pre_full_calls"], kr_reconcile_perf["pre_full_ms"],
+                )
         elif nontrading_eval_mode:
             logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
 
@@ -7784,6 +7799,8 @@ def run_once(
                     }
                     db_write_reasons.append("two_sided_exact_proof_skip_historical_reconcile")
                 else:
+                    _post_full_started = time_mod.monotonic()
+                    kr_reconcile_perf["post_full_calls"] += 1
                     try:
                         reconcile_result = reconcile_kis(
                             engine=engine, kis=kis, env=env_effective,
@@ -7802,6 +7819,13 @@ def run_once(
                         engine_runner._kr_post_exit_reconcile_ok = False
                         logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
                                          "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
+                    finally:
+                        kr_reconcile_perf["post_full_ms"] += 1000.0 * (time_mod.monotonic() - _post_full_started)
+                        logger.info(
+                            "[KR_RECONCILE_LANES][HISTORICAL_RECOVERY_CALL] lane=post "
+                            "calls=%s elapsed_ms=%.1f",
+                            kr_reconcile_perf["post_full_calls"], kr_reconcile_perf["post_full_ms"],
+                        )
                 # After an actually submitted protected SELL, a successful
                 # reconciliation does not by itself prove the *old*
                 # pre-exit buying balance is still valid. Refresh KIS balance
@@ -7897,6 +7921,16 @@ def run_once(
                 logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
 
         postprocess_stage = "result_postprocess"
+        logger.info(
+            "[KR_RECONCILE_LANES][PERF] historical_recovery_calls=%s "
+            "historical_recovery_ms=%.1f pre_calls=%s post_calls=%s "
+            "historical_recovery_skipped=%s",
+            kr_reconcile_perf["pre_full_calls"] + kr_reconcile_perf["post_full_calls"],
+            kr_reconcile_perf["pre_full_ms"] + kr_reconcile_perf["post_full_ms"],
+            kr_reconcile_perf["pre_full_calls"],
+            kr_reconcile_perf["post_full_calls"],
+            int(not (kr_reconcile_perf["pre_full_calls"] or kr_reconcile_perf["post_full_calls"])),
+        )
         logger.info(
             "[PB1][RUN_ONCE][FAIL_OPEN_FLAG] runs_ledger_fail_open=%s loop_mode=%s",
             int(bool(runs_ledger_fail_open)),
