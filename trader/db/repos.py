@@ -4921,19 +4921,23 @@ class OrdersRepo:
             if existing_row is not None:
                 observed = str(status or "").upper()
                 if observed == "RECONCILED":
+                    # No broker state = no authority to replace *any*
+                    # existing source-order state, including ACKED/SUBMITTED.
+                    # Losing an open status could incorrectly permit a retry.
+                    update_status = self._schema.orders.c.status
+                elif observed == "PARTIAL_FILLED":
                     update_status = sa.case(
                         (
                             self._schema.orders.c.status.in_({
-                                "FILLED", "PARTIAL_FILLED",
-                                "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
-                                "UNRESOLVED_ACK", "CANCELLED", "CANCELED",
-                                "REJECTED",
+                                "FILLED", "CANCELLED", "CANCELED", "REJECTED",
                             }),
                             self._schema.orders.c.status,
                         ),
                         else_=status,
                     )
-                elif observed == "PARTIAL_FILLED":
+                elif observed in {"CANCELLED", "CANCELED", "REJECTED"}:
+                    # An already fully executed source cannot become a
+                    # zero-fill cancellation/rejection on a late status row.
                     update_status = sa.case(
                         (
                             self._schema.orders.c.status == "FILLED",
