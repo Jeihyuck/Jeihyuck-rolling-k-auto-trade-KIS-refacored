@@ -2129,6 +2129,10 @@ def route_order(
             os.getenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0") == "1"
             and account_env == "practice" and _native_kis
         )
+        # The native TP post-quote gate receives this even when account-wide
+        # reservations are OFF. Never leave the boundary's authority unbound.
+        _account_authority = None
+        _account_lease = None
         if (
             os.getenv("US_ACCOUNT_RESERVATION_MODE", "OFF") == "ENFORCE"
             and not _atomic_claim_outbox
