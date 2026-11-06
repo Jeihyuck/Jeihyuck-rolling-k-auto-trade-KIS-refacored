@@ -36,6 +36,12 @@ from trader.db import repos as repos_module
     ("FILLED", "REJECTED", "FILLED"),
     ("ACKED", "PARTIAL_FILLED", "PARTIAL_FILLED"),
     ("ACKED", "FILLED", "FILLED"),
+    # Proven broker fill events must still upgrade an unresolved/open source.
+    # The atomic guard restricts *unproven* RECONCILED and stale terminal
+    # observations, not correctly attributed later real fill observations.
+    ("RECONCILED", "PARTIAL_FILLED", "PARTIAL_FILLED"),
+    ("RECONCILED", "FILLED", "FILLED"),
+    ("UNRESOLVED_ACK", "FILLED", "FILLED"),
 ])
 def test_same_source_reconciled_observation_never_downgrades_order(
     monkeypatch, recorded, observed, expected,
