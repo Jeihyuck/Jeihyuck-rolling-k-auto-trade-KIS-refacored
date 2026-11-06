@@ -721,6 +721,10 @@ def assert_kr_final30_db_file_identity(
             row = normalize_final30_contract_row(raw)
             code = str(row.get("code") or "").strip()
             style = str(row.get("entry_style_selected") or "").strip().upper()
+            allowed_styles = {
+                "BREAKOUT", "PULLBACK", "MOMENTUM", "VCP",
+                "ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_VCP",
+            }
             rank_raw = row.get("rank_final30")
             try:
                 rank = int(rank_raw)
@@ -730,7 +734,7 @@ def assert_kr_final30_db_file_identity(
             except (TypeError, ValueError, OverflowError) as exc:
                 raise RuntimeError(f"KR_FINAL30_PARITY_INVALID_FIELDS:{label}:{code}") from exc
             if (
-                len(code) != 6 or not code.isdigit() or not style
+                len(code) != 6 or not code.isdigit() or style not in allowed_styles
                 or rank < 1 or rank > FINAL30_SCORED_REQUIRED_ROWS
                 or code in by_code or rank in ranks
                 or not __import__("math").isfinite(score)
