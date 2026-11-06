@@ -27,6 +27,10 @@ if [[ ! -x "$python_bin" ]]; then
     echo 'US_GO_PYTHON_NOT_AVAILABLE' >&2
     exit 42
 fi
+if ! "$python_bin" -c 'from datetime import date; import sys; date.fromisoformat(sys.argv[1])' "$trade_date" >/dev/null 2>&1; then
+    echo 'US_GO_READONLY_INVALID_TRADE_DATE' >&2
+    exit 42
+fi
 branch="$(git branch --show-current)"
 head="$(git rev-parse HEAD)"
 dirty="$(git status --porcelain --untracked-files=normal -- trader scripts migrations)"
