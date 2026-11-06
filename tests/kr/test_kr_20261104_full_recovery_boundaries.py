@@ -214,6 +214,50 @@ def test_scoped_source_lookup_prefers_current_account_despite_identical_odno(mon
     ) is None
 
 
+
+def test_scoped_source_excludes_reconcile_shadow_even_when_identity_matches(monkeypatch):
+    """A reconciled shadow row cannot become an original broker order."""
+    engine, schema, ids, day = _accounts(monkeypatch)
+    repo = OrdersRepo(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == ids[CURRENT]["order"],
+        ).values(stage="RECONCILE"))
+    assert repo.get_order_by_kis_odno_scoped(
+        "practice", "0000001212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=CURRENT,
+        trading_epoch_id=ids[CURRENT]["epoch"],
+    ) is None
+    # A prior-account original with the same broker ODNO must not be selected.
+    foreign = repo.get_order_by_kis_odno_scoped(
+        "practice", "0000001212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=PREVIOUS,
+        trading_epoch_id=ids[PREVIOUS]["epoch"],
+    )
+    assert foreign is not None
+    assert foreign["order_id"] == ids[PREVIOUS]["order"]
+
+
+def test_scoped_source_ambiguous_candidates_fail_closed(monkeypatch):
+    """Even identical broker identities cannot authorize an arbitrary source."""
+    engine, _schema, ids, day = _accounts(monkeypatch)
+    repo = OrdersRepo(engine)
+    original = repo.get_order_by_kis_odno_scoped(
+        "practice", "0000001212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=CURRENT,
+        trading_epoch_id=ids[CURRENT]["epoch"],
+    )
+    assert original is not None
+    monkeypatch.setattr(
+        repo, "_read_mappings_with_guard",
+        lambda *_args, **_kwargs: [original, {**original, "order_id": str(uuid4())}],
+    )
+    assert repo.get_order_by_kis_odno_scoped(
+        "practice", "0000001212", trade_date=day.date(),
+        code="005930", side="BUY", account_id=CURRENT,
+        trading_epoch_id=ids[CURRENT]["epoch"],
+    ) is None
+
 def test_open_order_scope_ignores_only_proven_foreign_unresolved(monkeypatch):
     engine, schema, ids, _day = _accounts(monkeypatch)
     with engine.begin() as conn:
