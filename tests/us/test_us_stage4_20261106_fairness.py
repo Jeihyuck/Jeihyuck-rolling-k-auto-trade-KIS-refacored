@@ -121,3 +121,54 @@ def test_no_budget_bypass_for_five_source_days():
     with pytest.raises(RuntimeError, match="SOURCE_DATES_OVER_BUDGET"):
         reader._poll_once(kis)
     assert kis.calls == []
+
+
+def test_deferred_settlement_with_no_balance_keeps_fence_without_io(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us import protective_stop_obligation as stops
+    from trader.us.execution import protective_stop_settlement_worker as settlement
+
+    monkeypatch.setattr(worker, "_DEFERRED_PHASE_CURSOR", 1)
+    monkeypatch.setattr(
+        stops, "load_pending_stop_obligations",
+        lambda *, env: [{"symbol": "SYY", "status": "PENDING"}],
+    )
+    calls = []
+    monkeypatch.setattr(
+        settlement, "settle_verified_stop_debts_once",
+        lambda **kw: calls.append(kw),
+    )
+    result = worker.run_deferred_recovery_once(
+        provider=object(), trade_date="2026-11-05",
+        historical_balance_available=False,
+    )
+    assert result["phase"] == "settlement"
+    assert result["settlement"]["status"] == "DEFERRED_NO_FRESH_EVIDENCE"
+    assert result["settlement"]["settled"] == 0
+    assert calls == []
+
+
+def test_deferred_settlement_with_balance_preserves_authoritative_writer(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us import protective_stop_obligation as stops
+    from trader.us.execution import protective_stop_settlement_worker as settlement
+
+    monkeypatch.setattr(worker, "_DEFERRED_PHASE_CURSOR", 1)
+    monkeypatch.setattr(
+        stops, "load_pending_stop_obligations",
+        lambda *, env: [{"symbol": "SYY", "status": "PENDING"}],
+    )
+    provider = object()
+    calls = []
+    def settle_verified(*, provider, trade_date, limit):
+        calls.append((provider, trade_date, limit))
+        return {"status": "OK", "settled": 0}
+    monkeypatch.setattr(
+        settlement, "settle_verified_stop_debts_once", settle_verified,
+    )
+    result = worker.run_deferred_recovery_once(
+        provider=provider, trade_date="2026-11-05",
+        historical_balance_available=True,
+    )
+    assert result["settlement"]["status"] == "OK"
+    assert calls == [(provider, "2026-11-05", 1)]
