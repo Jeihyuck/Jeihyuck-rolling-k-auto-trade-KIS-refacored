@@ -154,3 +154,36 @@ def test_populated_columns_cannot_fabricate_original_portfolio_proof():
     assert all(x["scope_columns_present"] for x in plan["entries"])
     assert all(x["original_portfolio_proven"] is False for x in plan["entries"])
     assert plan["all_legacy_scope_proven"] is False
+
+
+def test_kis_client_account_must_match_exact_practice_db_scope():
+    import hashlib
+    import pytest
+    from trader.account_state import get_account_key
+    from scripts.us_legacy_nine_originals_readonly_certify import (
+        assert_practice_client_matches_current_scope,
+    )
+    class KIS:
+        _cano = "12345678"
+        _acnt_prdt_cd = "01"
+    account_hash=hashlib.sha256(
+        get_account_key(env="practice",cano="12345678",
+                        product_code="01").encode()
+    ).hexdigest()
+    scope={"env":"practice","market":"US",
+           "trading_epoch_id":"exact-epoch",
+           "account_id":account_hash}
+    assert assert_practice_client_matches_current_scope(KIS(),scope) is None
+    with pytest.raises(RuntimeError,match="KIS_ACCOUNT_SCOPE_MISMATCH"):
+        assert_practice_client_matches_current_scope(
+            KIS(),{**scope,"account_id":"b"*64},
+        )
+    with pytest.raises(RuntimeError,match="CLIENT_ACCOUNT_UNVERIFIED"):
+        assert_practice_client_matches_current_scope(
+            type("Broken",(),{"_cano":"", "_acnt_prdt_cd":"01"})(),
+            scope,
+        )
+    with pytest.raises(RuntimeError,match="DB_SCOPE_UNVERIFIED"):
+        assert_practice_client_matches_current_scope(
+            KIS(),{**scope,"trading_epoch_id":""},
+        )
