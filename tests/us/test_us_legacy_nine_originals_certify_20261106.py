@@ -94,7 +94,8 @@ def test_all_kis_buys_and_balance_proven_still_block_original_scope(monkeypatch)
     assert out["balance"]["status"]=="PASS"
     assert out["tmo_original_sell"]=="PROVEN_CANCELLED"
     assert out["broker_originals_and_balance_verified"] is True
-    assert out["status"]=="NOT_PROVEN"
+    assert out["status"]=="BROKER_SOURCE_PROVEN_LEGACY_POLICY_REQUIRED"
+    assert out["operational_order_go"] is False
     assert "ORIGINAL_PORTFOLIO_CYCLE_UNPROVEN_POLICY_REVIEW" in out["blockers"]
     assert Counter(client.days)==Counter({"2026-10-27":1,"2026-10-29":1,
                                           "2026-10-30":1})
@@ -245,7 +246,8 @@ def test_historical_sell_broker_fill_must_match_db_terminal_state(monkeypatch):
     ok=certify_get_only(plan,Client())
     assert ok["broker_originals_and_balance_verified"] is True
     assert ok["original_sell_results"][0]["status"]=="PROVEN_TERMINAL"
-    assert ok["status"]=="NOT_PROVEN"  # Original portfolio never fabricated.
+    assert ok["status"]=="BROKER_SOURCE_PROVEN_LEGACY_POLICY_REQUIRED"
+    assert ok["operational_order_go"] is False
 
     def wrong_terminal(_rows,*,side,order_no,expected_qty,**kw):
         if order_no=="0000099999":
