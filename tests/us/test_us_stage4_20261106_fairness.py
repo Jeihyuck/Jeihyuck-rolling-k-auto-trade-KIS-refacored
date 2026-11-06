@@ -193,3 +193,68 @@ def test_slow_claim_book_cannot_starve_debt_only_original_day_books():
     clock[0] += 16.0
     with pytest.raises(RuntimeError, match="BROKER_EVIDENCE_STALE"):
         reader.snapshot_for_claims([CLAIM])
+
+
+def test_stage4_current_fill_prefetch_is_not_fetched_again_after_book_latch(monkeypatch):
+    """Current broker fills GET occurs before original proof, not twice."""
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.execution import fills as fill_source
+    from trader.us.execution import order_journal, reconcile
+    from trader.us.execution import reservation_reconcile_worker as reservation
+    from trader.us.runner import trade_tick_runner as ticks
+    from trader.us.db import repos
+
+    fetches = []
+    monkeypatch.setattr(
+        fill_source, "get_fills_today",
+        lambda **kw: fetches.append(kw) or (_ for _ in ()).throw(
+            AssertionError("unexpected KIS fills re-fetch after historical latch")
+        ),
+    )
+    monkeypatch.setattr(worker, "_STAGE4_FILL_MEMOS", {})
+    monkeypatch.setattr(
+        repos, "save_fills_with_result", lambda *a, **k: {"status": "OK"},
+    )
+    order_book = object()
+    original_replays = []
+    monkeypatch.setattr(order_journal, "replay_order_journal",
+                        lambda *a, **kw: original_replays.append(kw["provider"]) or
+                        {"status": "UNRESOLVED", "unresolved_count": 1})
+    monkeypatch.setattr(reconcile, "reconcile_ack_orders_with_balance",
+                        lambda **kw: {"status": "OK", "pending_count": 0,
+                                      "unresolved_count": 0})
+    monkeypatch.setattr(reservation, "reconcile_proven_reservations_once",
+                        lambda **kw: {"unresolved": 0})
+    monkeypatch.setattr(ticks, "_mark_trend_stages_from_records",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(ticks, "_mark_soft_stop_stages_from_records",
+                        lambda *a, **kw: None)
+    result = worker.run_reconcile_once(
+        provider=object(), trade_date="2026-11-05", session_run_id="unit",
+        writer_generation="g", conn=None, scope={},
+        historical_provider=order_book,
+        prefetched_fills={"status": "OK", "fills": []},
+    )
+    assert not fetches
+    assert original_replays == [order_book]
+    assert result["replay_status"] == "UNRESOLVED"
+
+
+def test_stage4_rejects_invalid_current_fill_prefetch_without_db_writes(monkeypatch):
+    from trader.us.execution import authoritative_reconcile_worker as worker
+    from trader.us.execution import fills as fill_source
+    from trader.us.db import repos
+    monkeypatch.setattr(fill_source, "get_fills_today",
+                        lambda **kw: (_ for _ in ()).throw(
+                            AssertionError("invalid prefetched GET must not be repeated")))
+    saves = []
+    monkeypatch.setattr(repos, "save_fills_with_result",
+                        lambda *a, **kw: saves.append(kw))
+    with pytest.raises(RuntimeError, match="US_STAGE4_KIS_FILLS_UNVERIFIED"):
+        worker.run_reconcile_once(
+            provider=object(), trade_date="2026-11-05", session_run_id="unit",
+            writer_generation="g", conn=None, scope={},
+            historical_provider=object(),
+            prefetched_fills={"status": "UNVERIFIED", "fills": []},
+        )
+    assert saves == []
