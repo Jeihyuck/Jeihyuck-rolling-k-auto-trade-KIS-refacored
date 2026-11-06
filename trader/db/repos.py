@@ -4887,6 +4887,16 @@ class OrdersRepo:
                         "reconcile_run_id_action": "NULL_RUN_ID",
                     })
 
+            if self.engine.dialect.name == "sqlite":
+                # SQLite drops timezone offsets on datetime binding. Store
+                # broker timestamps on the same UTC clock as CURRENT_TIMESTAMP.
+                seoul = pytz.timezone("Asia/Seoul")
+                submitted_at, acked_at = (
+                    (stamp if stamp.tzinfo else seoul.localize(stamp)).astimezone(pytz.UTC)
+                    if stamp is not None else None
+                    for stamp in (submitted_at, acked_at)
+                )
+
             payload = {
                 "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
                 "position_cycle_id": position_cycle_id,
