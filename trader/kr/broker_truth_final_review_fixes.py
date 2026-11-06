@@ -113,14 +113,27 @@ def _install_order_response_merge_guard() -> None:
 
 
 def _baseline_qty(order: dict[str, Any]) -> int | None:
+    """Require an explicit, finite integral pre-order balance observation.
+
+    None, bool, NaN and fractional values must never be silently coerced to
+    the zero baseline needed to resurrect a missing BUY lifecycle.
+    """
+    from decimal import Decimal, InvalidOperation
+
     request = base._json_dict(order.get("request_json"))
     meta = base._json_dict(request.get("entry_meta"))
     order_meta = base._json_dict(order.get("entry_meta_json"))
     for source in (request, meta, order_meta):
         if "pre_order_holding_qty" in source:
+            value = source["pre_order_holding_qty"]
+            if value is None or isinstance(value, bool) or str(value).strip() == "":
+                return None
             try:
-                return int(float(source.get("pre_order_holding_qty") or 0))
-            except Exception:
+                quantity = Decimal(str(value))
+                if not quantity.is_finite() or quantity < 0 or quantity != quantity.to_integral_value():
+                    return None
+                return int(quantity)
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
                 return None
     return None
 
