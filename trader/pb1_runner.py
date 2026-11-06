@@ -6151,11 +6151,13 @@ def run_once(
                 if _close_lane is not None and _close_lane.mode == "FULL":
                     # CLOSE is independently fenced; a successful AM journal
                     # never substitutes for a full end-of-day reconciliation.
-                    reconcile_result = reconcile_kis(
+                    from trader.kr.close_historical_reconcile import (
+                        reconcile_close_historical_once,
+                    )
+                    reconcile_result = reconcile_close_historical_once(
                         engine=engine, kis=kis_obj, env=env_effective,
-                        run_id=ctx.run_id, strategy="pb1_pullback_close",
-                        tick_ts=now, runtime_dir=str(runtime_root_dir),
-                        historical_recovery=True,
+                        run_id=ctx.run_id, tick_ts=now,
+                        runtime_root_dir=runtime_root_dir,
                     ) or {}
                     logger.info(
                         "[KR_CLOSE][HISTORICAL_RECOVERY][FULL] ok=%s reason=%s",
