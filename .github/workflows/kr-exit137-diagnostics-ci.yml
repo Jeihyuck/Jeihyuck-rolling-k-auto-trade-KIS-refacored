@@ -1,0 +1,23 @@
+name: KR exit137 read-only diagnostics syntax
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "scripts/wsl/collect-kr-exit137-evidence.sh"
+      - "docs/incidents/kr-am-exit137-readonly-evidence-20261106.md"
+      - ".github/workflows/kr-exit137-diagnostics-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  safe-diagnostics-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Syntax validation only (DO NOT execute workstation diagnostics in CI)
+        run: bash -n scripts/wsl/collect-kr-exit137-evidence.sh
