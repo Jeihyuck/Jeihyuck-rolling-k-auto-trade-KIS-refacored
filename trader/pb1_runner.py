@@ -6120,7 +6120,9 @@ def run_once(
                 if _close_lane.mode == "CURRENT_ONLY":
                     # Journal proves CLOSE fully completed on this account,
                     # epoch, strategy and trade date (including stale closure).
-                    return True, True
+                    # Repeated CLOSE should not pretend a historically
+                    # unresolved journal has been economically settled.
+                    return _close_lane.reason == "FULL_RECOVERY_DURABLY_PROVEN", True
                 if _close_lane.mode == "CURRENT_ONLY_BLOCK":
                     return False, False
         checkpoint_key = _close_reconcile_checkpoint_key(
