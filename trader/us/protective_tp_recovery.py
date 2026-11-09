@@ -319,6 +319,7 @@ def request_protective_tp_cancel(
     apply_observation: Callable[..., dict] | None = None,
     unresolved_claim: Callable[..., bool] = has_unresolved_tp_claim,
     read_only_terminal_reconcile: bool = False,
+    current_orders_only: bool = False,
 ) -> list[dict]:
     """Reconcile independently broker-proven TP terminal states without a cancel.
 
@@ -416,6 +417,12 @@ def request_protective_tp_cancel(
                 results.append({"symbol": symbol, "status": "FENCED", "reason": "multiple_tp_open_or_claims"})
                 continue
             order = orders[0]
+            if current_orders_only and str(order.get("trade_date") or "") != trade_date:
+                # A prior-day claim still fences this SELL. Only a session
+                # boundary may query its original KIS order book.
+                results.append({"symbol": symbol, "status": "FENCED",
+                                "reason": "historical_tp_recovery_deferred"})
+                continue
             original_epoch = original_epoch_by_symbol.get(symbol) or ""
             if original_epoch and str(order.get("trading_epoch_id") or "") != original_epoch:
                 results.append({"symbol": symbol, "status": "FENCED",

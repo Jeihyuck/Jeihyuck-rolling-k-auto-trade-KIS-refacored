@@ -700,6 +700,76 @@ def _as_dataframe(value: Any) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def assert_kr_final30_db_file_identity(
+    db_rows: list[dict[str, Any]],
+    file_rows: list[dict[str, Any]],
+    *,
+    source: str,
+) -> None:
+    """P0: prove the exact selected code/rank/strategy survived DB->file.
+
+    Neither 30 independently valid rows nor a matching code *set* proves the
+    same portfolio: a swapped rank or a missing entry style changes the frozen
+    entry/exit owner. This checker never infers a strategy from numeric scores.
+    """
+    def snapshot(rows: list[dict[str, Any]], label: str) -> dict[str, tuple[int, str, float]]:
+        if len(rows) != FINAL30_SCORED_REQUIRED_ROWS:
+            raise RuntimeError(f"KR_FINAL30_PARITY_COUNT:{label}:{len(rows)}")
+        by_code: dict[str, tuple[int, str, float]] = {}
+        ranks: set[int] = set()
+        for raw in rows:
+            row = normalize_final30_contract_row(raw)
+            code = str(row.get("code") or "").strip()
+            style = str(row.get("entry_style_selected") or "").strip().upper()
+            allowed_styles = {
+                "BREAKOUT", "PULLBACK", "MOMENTUM", "VCP",
+                "ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_VCP",
+            }
+            rank_raw = row.get("rank_final30")
+            db_rank_raw = row.get("rank")
+            try:
+                rank = int(rank_raw)
+                db_rank = int(db_rank_raw)
+                if (rank_raw is None or float(rank_raw) != rank
+                        or db_rank_raw is None or float(db_rank_raw) != db_rank):
+                    raise ValueError("fractional or missing rank")
+                score = float(row.get("score_final"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(f"KR_FINAL30_PARITY_INVALID_FIELDS:{label}:{code}") from exc
+            if (
+                len(code) != 6 or not code.isdigit() or style not in allowed_styles
+                or rank < 1 or rank > FINAL30_SCORED_REQUIRED_ROWS
+                or db_rank != rank
+                or code in by_code or rank in ranks
+                or not __import__("math").isfinite(score) or score <= 0
+            ):
+                raise RuntimeError(f"KR_FINAL30_PARITY_INVALID_IDENTITY:{label}:{code}:{rank}:{style}")
+            by_code[code] = (rank, style, score)
+            ranks.add(rank)
+        if ranks != set(range(1, FINAL30_SCORED_REQUIRED_ROWS + 1)):
+            raise RuntimeError(f"KR_FINAL30_PARITY_NONCONTIGUOUS_RANK:{label}")
+        return by_code
+
+    db = snapshot(db_rows, "DB")
+    artifact = snapshot(file_rows, source)
+    if db.keys() != artifact.keys():
+        raise RuntimeError(f"KR_FINAL30_PARITY_CODES_MISMATCH:{source}")
+    mismatches = [
+        code for code, (rank, style, score) in db.items()
+        if artifact[code][0] != rank
+        or artifact[code][1] != style
+        or abs(artifact[code][2] - score) > 0.00001
+    ]
+    if mismatches:
+        raise RuntimeError(
+            f"KR_FINAL30_PARITY_CONTRACT_MISMATCH:{source}:codes={sorted(mismatches)}"
+        )
+    logger.info(
+        "[KR_PREP][FINAL30_DB_FILE_PARITY][OK] source=%s rows=%s codes=%s",
+        source, len(db), len(artifact),
+    )
+
+
 def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
@@ -1054,11 +1124,21 @@ def save_final30_scored_core(
             f"rows={scored_contract.get('rows')} uniq_codes={scored_contract.get('uniq_codes')} missing={critical_missing_fields}"
         )
     logger.info("[FINAL30_SCORED][CORE_SAVE][DB_OK] rows=%s", int(scored_contract.get("rows") or 0))
+    # Fail *before* replacing canonical disk artifacts when a seemingly valid
+    # 30-row DB payload diverged in its selected style/rank/code from source.
+    assert_kr_final30_db_file_identity(
+        list(scored_contract.get("rows_data") or []),
+        scored_members,
+        source="CORE_SAVE_CANONICAL",
+    )
 
+    # Source DF can lack assigned rank_final30 while the exact DB INSERT uses
+    # _build_scored_members' canonical 1..30 ranks. Publish the same
+    # canonical snapshot to disk, rather than reproducing a stale raw DF.
     mirror_sync = sync_prep_final30_file_mirror(
         env=env,
         as_of=as_of.isoformat(),
-        df=final30_df,
+        df=pd.DataFrame(scored_members),
     )
     file_results = dict(mirror_sync.get("file_results") or {})
     validation = dict(mirror_sync.get("validation") or {})
@@ -1102,6 +1182,18 @@ def save_final30_scored_core(
         required_fields=REQUIRED_FINAL30_SCORED_COLS,
         source="PREP_DB_ROUNDTRIP",
     )
+    # Do not publish PREP success simply because DB and files each have 30
+    # valid rows. Require the same code, rank, selected strategy and score in
+    # every canonical mirror read back after the DB save.
+    for _mirror_label, _mirror_path in build_final30_scored_paths(
+        repo_root(), env, as_of.isoformat()
+    ).items():
+        _mirror_rows, _mirror_json_ok = read_final30_file_rows(_mirror_path)
+        if not _mirror_json_ok:
+            raise RuntimeError(f"KR_FINAL30_PARITY_FILE_INVALID:{_mirror_label}")
+        assert_kr_final30_db_file_identity(
+            reload_rows, _mirror_rows, source=_mirror_label,
+        )
     usable_roundtrip = bool(trade_validator.get("ok")) and not reload_missing
     # [2026-04-30] roundtrip rank_final30 검증
     if reload_rows:

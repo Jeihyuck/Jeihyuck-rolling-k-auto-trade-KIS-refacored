@@ -118,9 +118,12 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         active_claim_recovery_result: dict = {"status": "SKIP", "unresolved_count": 0}
         if not offline:
             try:
-                from trader.us.execution.order_journal import replay_order_journal
+                from trader.us.execution.order_journal import (
+                    replay_order_journal, report_historical_order_recovery,
+                )
                 active_claim_recovery_result = replay_order_journal(
-                    trade_date, provider=provider, include_active_claims=True,
+                    trade_date, provider=provider,
+                    include_active_claims=True, active_claim_date_scope="current",
                 )
                 logger.info("[US_TRADE_CLOSE][ACTIVE_CLAIM_RECOVERY] result=%s", active_claim_recovery_result)
             except Exception as exc:
@@ -128,6 +131,14 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                     "status": "ERROR", "error": str(exc), "failed_count": 1, "unresolved_count": 1,
                 }
                 logger.error("[US_TRADE_CLOSE][ACTIVE_CLAIM_RECOVERY_ERROR] %s", exc)
+            historical_recovery = report_historical_order_recovery(
+                provider=provider, trade_date=trade_date, phase="CLOSE",
+            )
+            active_claim_recovery_result["historical_recovery"] = historical_recovery
+            if os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY") == "WORKER" and env == "practice":
+                from trader.us.execution.authoritative_reconcile_worker import report_stop_recovery_at_boundary
+
+                report_stop_recovery_at_boundary(provider=provider, trade_date=trade_date, phase="CLOSE")
             ack_reconcile_result["active_claim_recovery"] = active_claim_recovery_result
             try:
                 from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
@@ -272,6 +283,22 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 }
                 logger.error("[US_TRADE_CLOSE][BROKER_RECOVERY_HEALTH_ERROR] %s", exc)
             try:
+                broker_recovery_health["historical_recovery_unresolved"] = int(
+                    historical_recovery.get("unresolved_count") or 0
+                )
+                if broker_recovery_health.get("execution_claim_source_date_breakdown_available") is True:
+                    broker_recovery_health["historical_recovery_unresolved"] = max(
+                        int(broker_recovery_health.get("unresolved_source_date_prior") or 0),
+                        int(historical_recovery.get("unresolved_count") or 0),
+                    )
+                    broker_recovery_health["unresolved_execution_actions"] = (
+                        int(broker_recovery_health.get("unresolved_source_date_current") or 0)
+                        + int(broker_recovery_health.get("unresolved_source_date_other_or_unknown") or 0)
+                    )
+                    broker_recovery_health["duplicate_semantic_submit_detection_count"] = (
+                        int(broker_recovery_health.get("claim_conflicts_source_date_current") or 0)
+                        + int(broker_recovery_health.get("claim_conflicts_source_date_other_or_unknown") or 0)
+                    )
                 broker_recovery_health["unresolved_execution_actions"] = max(
                     int(broker_recovery_health.get("unresolved_execution_actions") or 0),
                     int(active_claim_recovery_result.get("unresolved_count") or 0),
@@ -403,7 +430,10 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 ack_reconcile_result.get("balance_reconcile_count", 0), open_order_pending_count,
                 ack_reconcile_result.get("cancelled_count", 0), ack_reconcile_result.get("expired_count", 0),
             )
-        elif fills_status not in ("OK", "SKIP") or reconcile_status not in ("OK", "SKIP"):
+        elif (
+            fills_status not in ("OK", "SKIP") or reconcile_status not in ("OK", "SKIP")
+            or broker_recovery_health.get("historical_recovery_unresolved")
+        ):
             status = "OK_WITH_WARNINGS"
 
         # 10. Final 로그

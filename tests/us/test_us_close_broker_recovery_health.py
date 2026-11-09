@@ -144,6 +144,23 @@ def test_close_requires_manual_reconcile_for_active_claim_recovery_unresolved(
     assert result["reconcile_required"] is True
 
 
+def test_known_prior_claim_debt_is_a_close_warning(monkeypatch, tmp_path):
+    health = {
+        **_clean_health(),
+        "unresolved_execution_actions": 2,
+        "execution_claim_source_date_breakdown_available": True,
+        "unresolved_source_date_current": 0,
+        "unresolved_source_date_prior": 2,
+        "unresolved_source_date_other_or_unknown": 0,
+    }
+    result, report_health = _configure_close(monkeypatch, tmp_path, health)
+
+    assert result["status"] == "OK_WITH_WARNINGS"
+    assert report_health["historical_recovery_unresolved"] == 2
+    assert report_health["unresolved_execution_actions"] == 0
+    assert result["manual_reconcile_required"] is False
+
+
 def test_close_fails_when_authoritative_sell_lacks_recoverable_cost_basis(
     monkeypatch, tmp_path,
 ):

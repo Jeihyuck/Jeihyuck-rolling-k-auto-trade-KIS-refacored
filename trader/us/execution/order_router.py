@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from trader.us import config as us_cfg
+from trader.us.execution.kis_us_client import KisUSClient as NativeKisUSClient
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed, assert_tqqq_infinite_order_allowed
 from trader.us.runner.status_contract import is_no_balance_sell_reject
 from trader.us.market_state_overlay import FORBIDDEN_HEDGE_SYMBOLS
@@ -668,6 +669,52 @@ def _get_broker_position(kis_client: Any, symbol: str, context: Any | None = Non
         if str(pos.get("symbol") or "").upper().strip() == str(symbol or "").upper().strip():
             return pos
     return {}
+
+
+def _capture_native_buy_baseline(intent: dict, kis_client: Any, context: Any) -> None:
+    """Capture an authoritative holding quantity before persisting the BUY."""
+    meta = intent["meta"]
+    if (
+        intent.get("strategy_owner") == "TQQQ_INFINITE"
+        and intent.get("pre_order_balance_source") == "kis_balance_authoritative"
+        and intent.get("pre_order_balance_asof")
+    ):
+        # Infinite supplies a fresh cycle-specific broker baseline.
+        holding = intent["pre_order_holding_qty"]
+    else:
+        snapshot = getattr(context, "balance_snapshot", None) or {}
+        symbol = str(intent["symbol"]).upper()
+        if not (
+            snapshot.get("authoritative_positions") is True
+            and snapshot.get("balance_fetch_status") == "OK"
+            and snapshot.get("balance_parse_status") == "OK"
+            and snapshot.get("preserve_previous_positions") is False
+            and symbol not in (getattr(context, "invalidated_symbols", None) or ())
+        ):
+            from trader.us.data_provider import normalize_us_balance
+
+            raw = kis_client.get_us_balance(force_refresh=True)
+            if not isinstance(raw, dict) or raw.get("balance_authoritative") is not True:
+                raise ValueError("BUY_BROKER_BALANCE_UNVERIFIED")
+            snapshot = normalize_us_balance(raw)
+            if (
+                snapshot.get("balance_authoritative") is not True
+                or snapshot.get("balance_parse_status") != "OK"
+            ):
+                raise ValueError("BUY_BROKER_BALANCE_UNVERIFIED")
+        positions = snapshot["positions"]
+        holding = sum(int(row["qty"]) for row in positions if row["symbol"].upper() == symbol)
+    if isinstance(holding, bool) or int(holding) != holding or holding < 0:
+        raise ValueError("BUY_BROKER_HOLDING_QTY_INVALID")
+    intent["pre_order_position_qty"] = int(holding)
+    intent["pre_order_holding_qty"] = int(holding)
+    intent["pre_order_position_source"] = "kis_balance_authoritative"
+    meta.update(
+        pre_order_position_qty=int(holding),
+        pre_order_holding_qty=int(holding),
+        pre_order_position_source="kis_balance_authoritative",
+        was_new_position_before_order=holding == 0,
+    )
 
 
 def _normalize_exchange_code(exchange: str) -> str:
@@ -1674,7 +1721,12 @@ def route_order(
     # Capture BUY pre-order position qty before KIS ACK so balance reconciliation
     # can verify a same-symbol position delta instead of treating existing holdings
     # as proof of fill.
-    if side == "BUY":
+    from trader.us.execution.kis_us_client import KisUSClient
+
+    if kis_client is None:
+        kis_client = KisUSClient(env=_kis_env())
+    _native_kis = isinstance(kis_client, NativeKisUSClient)
+    if side == "BUY" and not _native_kis:
         intent.setdefault("meta", {})
         if isinstance(intent.get("meta"), dict):
             meta = intent["meta"]
@@ -1707,9 +1759,6 @@ def route_order(
                     )
 
     # 5. Paper order via KIS
-    if kis_client is None:
-        from trader.us.execution.kis_us_client import KisUSClient
-        kis_client = KisUSClient(env=_kis_env())
     if context is not None and hasattr(kis_client, "bind_tick_context"):
         kis_client.bind_tick_context(context)
 
@@ -2065,14 +2114,6 @@ def route_order(
     # when the *native* KIS client would refuse the order. Do not weaken or
     # auto-clear DISABLE_REAL_TRADING; also protect direct tick/router callers
     # that did not run the session permission precheck.
-    from trader.us.execution.kis_us_client import KisUSClient
-    # Synthetic broker adapters (including injected harness clients) are
-    # not a KIS HTTP submitter; they preserve their explicit test semantics.
-    # Only the genuine KIS client must pass the native HTTP gate.
-    _native_kis = (
-        type(kis_client).__module__ == KisUSClient.__module__
-        and type(kis_client).__name__ == "KisUSClient"
-    )
     if _native_kis:
         try:
             us_cfg.assert_us_paper_order_allowed()
@@ -2091,8 +2132,34 @@ def route_order(
                 "intent": intent,
             }
 
+    if side == "BUY" and _native_kis:
+        try:
+            if not all((order_key, symbol_upper, exchange, intent.get("strategy_owner"),
+                        intent.get("strategy_name"), intent.get("submit_attempt_id"))):
+                raise ValueError("BUY_INTENT_IDENTITY_INCOMPLETE")
+            _capture_native_buy_baseline(intent, kis_client, context)
+            intent.update(
+                client_order_key=order_key, symbol=symbol, side=side, exchange=exchange,
+                order_price=float(f"{price:.2f}"), position_action=position_action,
+            )
+        except Exception as exc:
+            logger.error("[US_ORDER][BUY_PERSISTENCE_CONTRACT][BLOCK] symbol=%s error_type=%s",
+                         symbol_upper, type(exc).__name__)
+            return {"status": "ORDER_DISABLED_BUY_PERSISTENCE_CONTRACT",
+                    "reason": "buy_pre_submit_evidence_unverified", "broker_submit": False,
+                    "retry_order": False, "intent": intent}
+
     try:
         claim_identity = _semantic_action_identity(intent, account_env=account_env)
+        if side == "BUY" and _native_kis:
+            for field, value in (
+                ("broker_account_hash", claim_identity.account_id),
+                ("trading_epoch_id", claim_identity.trading_epoch_id),
+            ):
+                if any(row.get(field) not in (None, "", value) for row in (intent, lifecycle_meta)):
+                    raise RuntimeError("BUY_INTENT_SCOPE_MISMATCH")
+                intent[field] = value
+                lifecycle_meta[field] = value
         _us_claim_scope = None
         if (
             os.getenv("WSL_RUN_MARKET", "").strip().upper() == "US"
@@ -2255,6 +2322,7 @@ def route_order(
                                 "execution_action_key": claim.action_key,
                                 "strategy_owner": str(intent.get("strategy_owner") or lifecycle_meta.get("strategy_owner") or ""),
                                 "submission_status": "NOT_YET_AT_HTTP_BOUNDARY",
+                                **({"buy_intent": dict(intent)} if side == "BUY" else {}),
                             },
                             "idempotency_key": "us-claim-prepared:" + _outbox_attempt,
                         }
@@ -2354,7 +2422,8 @@ def route_order(
 
     from trader.us.execution.order_journal import append_order_event
     try:
-        append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
+        append_order_event("BROKER_SUBMIT_STARTED", intent, context=context,
+                           require_db=side == "BUY" and _native_kis)
     except Exception as exc:
         try:
             from trader.us.db.repos import release_execution_action_before_submit
@@ -2957,7 +3026,8 @@ def route_order(
                 "execution_integrity_error": observation_error, "intent": intent}
     try:
         append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no,
-                           broker_status="ACK", raw_response=resp)
+                           broker_status="ACK", raw_response=resp,
+                           require_db=side == "BUY" and _native_kis)
     except Exception as exc:
         logger.critical("[US_ORDER][ACK_JOURNAL_FAILED] symbol=%s order_no=%s err=%s", symbol, order_no, exc)
         return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,

@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import sqlalchemy as sa
@@ -86,8 +86,27 @@ def _broker_confirmed_nonexecution(order: dict, requested: int) -> int:
     return cancelled + rejected
 
 
+def _broker_order_day(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        timestamp = value
+    elif isinstance(value, date):
+        return value
+    elif isinstance(value, str):
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if timestamp.tzinfo is None:
+        # A naive date cannot identify a broker trade-day boundary.
+        return None
+    return timestamp.astimezone(timezone(timedelta(hours=9))).date()
+
+
 def audit_sell_settlement(
     *, orders: list[dict], fills: list[dict], positions: list[dict],
+    trade_date: date | None = None,
 ) -> dict[str, Any]:
     """Return missing priced SELL fill quantities, never synthesize executions."""
     by_order: dict[str, list[dict]] = defaultdict(list)
@@ -101,6 +120,7 @@ def audit_sell_settlement(
     gaps = []
     inspected = 0
     excluded_infinite_mirror_orders = 0
+    bucket_counts = {"today": 0, "historical": 0, "undated": 0}
     certified_mirror_sell_ids = set()
     for position in positions:
         if (
@@ -138,6 +158,14 @@ def audit_sell_settlement(
             excluded_infinite_mirror_orders += 1
             continue
         inspected += 1
+        dated = _broker_order_day(order.get("created_at"))
+        bucket = (
+            "undated" if dated is None
+            else "today" if dated == trade_date
+            else "historical" if dated < trade_date
+            else "undated"
+        ) if trade_date is not None else "undated"
+        bucket_counts[bucket] += 1
         order_id = str(order.get("order_id") or "")
         requested = _number(order.get("qty"))
         broker_nonexecution = _broker_confirmed_nonexecution(order, requested)
@@ -172,6 +200,8 @@ def audit_sell_settlement(
                 "order_id": order_id,
                 "kis_odno": order.get("kis_odno"),
                 "order_status": order.get("status"),
+                "trade_day_bucket": bucket,
+                "source_order_day": dated.isoformat() if dated else None,
                 "requested_sell_qty": requested,
                 "broker_confirmed_nonexecution_qty": broker_nonexecution,
                 "required_priced_sell_qty": required_priced_qty,
@@ -181,8 +211,28 @@ def audit_sell_settlement(
                 "db_economic_pending": pending_reason,
                 "reason": "MISSING_NATIVE_KIS_PRICE_OR_QTY" if missing_qty else "MANUAL_SETTLEMENT_NOT_PROVEN",
             })
+    per_bucket_gaps = {
+        bucket: sum(gap["trade_day_bucket"] == bucket for gap in gaps)
+        for bucket in bucket_counts
+    }
     return {
         "status": "ECONOMIC_SETTLEMENT_PENDING" if gaps else "PRICED_SELL_EVIDENCE_MATCHED",
+        "trade_date": trade_date.isoformat() if trade_date else None,
+        "today_sell_orders_checked": bucket_counts["today"],
+        "historical_sell_orders_checked": bucket_counts["historical"],
+        "undated_sell_orders_checked": bucket_counts["undated"],
+        "today_gap_count": per_bucket_gaps["today"],
+        "historical_gap_count": per_bucket_gaps["historical"],
+        "undated_gap_count": per_bucket_gaps["undated"],
+        "today_settlement_status": (
+            "UNVERIFIED_TRADE_DATE" if trade_date is None or bucket_counts["undated"]
+            else "ECONOMIC_SETTLEMENT_PENDING" if per_bucket_gaps["today"]
+            else "TODAY_PRICED_SELL_EVIDENCE_MATCHED"
+        ),
+        "historical_settlement_status": (
+            "HISTORICAL_ECONOMIC_PENDING" if per_bucket_gaps["historical"] or per_bucket_gaps["undated"]
+            else "HISTORICAL_PRICED_SELL_EVIDENCE_MATCHED"
+        ),
         "sell_orders_checked": inspected,
         "certified_infinite_mirror_sells_excluded": excluded_infinite_mirror_orders,
         "gap_count": len(gaps),
@@ -201,7 +251,7 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
     with engine.connect() as conn:
         orders = [dict(x) for x in conn.execute(text("""
             SELECT order_id, code, side, status, qty, kis_odno,
-                   position_cycle_id, response_json
+                   position_cycle_id, response_json, created_at
             FROM public.orders
             WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
               AND created_at < :end_utc
@@ -251,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     engine = get_engine()
     report = audit_sell_settlement(**load_snapshot(
         engine, env=args.env, epoch=args.epoch, day=date.fromisoformat(args.trade_date),
-    ))
+    ), trade_date=date.fromisoformat(args.trade_date))
     print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     return 0 if report["gap_count"] == 0 else 2
 

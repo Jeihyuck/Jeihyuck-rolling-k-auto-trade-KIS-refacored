@@ -244,6 +244,9 @@ def _native_kis_client(monkeypatch, http_events):
     monkeypatch.setattr(client, "_build_headers", lambda _tr_id: {})
     monkeypatch.setattr(client, "_apply_rate_limit", lambda _path: None)
     monkeypatch.setattr(client, "_request_budget", lambda: 1.0)
+    monkeypatch.setattr(client, "get_us_balance", lambda **_kwargs: {
+        "rt_cd": "0", "balance_authoritative": True, "output1": [], "output2": {},
+    })
     monkeypatch.setattr(client, "_is_temporary_error", lambda *_args: False)
     monkeypatch.setattr(
         client, "get_us_orderable_cash",
@@ -1291,6 +1294,39 @@ def test_route_records_submitted_at_native_kis_http_boundary(monkeypatch):
     assert claim_repo.health()["unresolved_execution_actions"] == 1
 
 
+def test_native_buy_cannot_reach_http_if_exact_submit_record_fails(monkeypatch, tmp_path):
+    from trader.us.db import repos
+    from trader.us.execution import order_journal
+
+    real_journal = order_journal.append_order_event
+    _route_fixture(monkeypatch)
+    http_events = []
+    client = _native_kis_client(monkeypatch, http_events)
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path))
+    monkeypatch.setattr(order_journal, "append_order_event", real_journal)
+    attempts = []
+
+    def db_rejects_submit(event):
+        attempts.append(event)
+        return False
+
+    monkeypatch.setattr(repos, "append_us_order_event", db_rejects_submit)
+    result = route_order(_intent("2026-10-02", qty=2), kis_client=client)
+
+    assert result["status"] == "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE"
+    assert result["broker_submit"] is False
+    assert not http_events
+    [event] = attempts
+    assert event["event_type"] == "BROKER_SUBMIT_STARTED"
+    assert event["requested_qty"] == 2
+    assert event["payload"]["order_price"] == 10
+    assert event["payload"]["exchange"] == "NASDAQ"
+    assert event["payload"]["pre_order_position_qty"] == 0
+    assert event["payload"]["pre_order_position_source"] == "kis_balance_authoritative"
+    assert event["strategy_owner"] == "US_STANDARD"
+    assert event["submit_attempt_id"]
+
+
 def test_native_kis_http_is_blocked_when_submitted_observation_fails(monkeypatch):
     _engine, claim_repo, _broker = _route_fixture(monkeypatch)
     events = []
@@ -1456,6 +1492,7 @@ def test_native_practice_ack_partial_full_fill_position_and_restart(monkeypatch,
     _enable_in_memory_reconciliation(monkeypatch, claim_repo, real_ack)
     monkeypatch.setattr(repos, '_MEM_POSITIONS', [])
     monkeypatch.setattr(order_journal, 'append_order_event', real_journal)
+    monkeypatch.setattr(repos, 'append_us_order_event', lambda *_args, **_kwargs: True)
     monkeypatch.setenv('US_ORDER_JOURNAL_DIR', str(tmp_path / 'journal'))
     http_events = []
     client = _native_kis_client(monkeypatch, http_events)

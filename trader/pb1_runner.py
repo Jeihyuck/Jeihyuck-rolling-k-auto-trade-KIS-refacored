@@ -6098,6 +6098,33 @@ def run_once(
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled emergency_path=1")
 
     def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
+        _close_lane = None
+        if (
+            kis_obj is not None
+            and env_effective == "practice"
+            and getattr(kis_obj, "env", None) == "practice"
+        ):
+            from trader.kr.historical_recovery_journal import (
+                choose_historical_lane, lane_enabled,
+            )
+            if lane_enabled(env_effective):
+                _close_lane = choose_historical_lane(
+                    engine=engine, kis=kis_obj, env=env_effective,
+                    strategy="pb1_pullback_close", trading_date=now.date(),
+                    lane_name="CLOSE",
+                )
+                logger.info(
+                    "[KR_CLOSE][HISTORICAL_RECOVERY][LANE] mode=%s reason=%s",
+                    _close_lane.mode, _close_lane.reason,
+                )
+                if _close_lane.mode == "CURRENT_ONLY":
+                    # Journal proves CLOSE fully completed on this account,
+                    # epoch, strategy and trade date (including stale closure).
+                    # Repeated CLOSE should not pretend a historically
+                    # unresolved journal has been economically settled.
+                    return _close_lane.reason == "FULL_RECOVERY_DURABLY_PROVEN", True
+                if _close_lane.mode == "CURRENT_ONLY_BLOCK":
+                    return False, False
         checkpoint_key = _close_reconcile_checkpoint_key(
             env=(os.getenv("KIS_ENV") or "practice").lower(),
             trade_date=now.date(),
@@ -6107,7 +6134,7 @@ def run_once(
         except Exception as exc:
             logger.warning("[PB1][CLOSE][RECONCILE][CHECKPOINT_LOAD_FAIL] err=%s", exc)
             checkpoint = {}
-        if checkpoint.get("done"):
+        if checkpoint.get("done") and _close_lane is None:
             logger.info("[PB1][CLOSE][RECONCILE][SKIP] reason=already_done")
             return bool(checkpoint.get("reconcile_ok")), bool(checkpoint.get("close_stale_ok"))
 
@@ -6123,11 +6150,28 @@ def run_once(
                     started_at=now,
                     dry_run=False,
                 )
-                reconcile_result = reconcile_today(
-                    engine=engine,
-                    kis=kis_obj,
-                    ctx=ctx,
-                ) or {}
+                if _close_lane is not None and _close_lane.mode == "FULL":
+                    # CLOSE is independently fenced; a successful AM journal
+                    # never substitutes for a full end-of-day reconciliation.
+                    from trader.kr.close_historical_reconcile import (
+                        reconcile_close_historical_once,
+                    )
+                    reconcile_result = reconcile_close_historical_once(
+                        engine=engine, kis=kis_obj, env=env_effective,
+                        run_id=ctx.run_id, tick_ts=now,
+                        runtime_root_dir=runtime_root_dir,
+                    ) or {}
+                    logger.info(
+                        "[KR_CLOSE][HISTORICAL_RECOVERY][FULL] ok=%s reason=%s",
+                        int(bool(reconcile_result.get("ok"))),
+                        reconcile_result.get("reason"),
+                    )
+                else:
+                    reconcile_result = reconcile_today(
+                        engine=engine,
+                        kis=kis_obj,
+                        ctx=ctx,
+                    ) or {}
                 reconcile_ok_local = bool(reconcile_result.get("ok"))
             except Exception:
                 logger.exception("[PB1][%s] reconcile_today failed", reason_label.upper())
@@ -6154,12 +6198,27 @@ def run_once(
             close_stale_ok_local = True
         except Exception:
             logger.exception("[PB1][%s] close_stale_positions failed", reason_label.upper())
+        if _close_lane is not None and _close_lane.mode == "FULL":
+            from trader.kr.historical_recovery_journal import record_historical_result
+            _close_completed = record_historical_result(
+                engine=engine, lane=_close_lane,
+                result=(
+                    reconcile_result if reconcile_ok_local and close_stale_ok_local
+                    else {"ok": False, "reason": "CLOSE_SETTLEMENT_INCOMPLETE"}
+                ),
+            )
+            reconcile_ok_local = reconcile_ok_local and _close_completed
+            if not _close_completed:
+                logger.error(
+                    "[KR_CLOSE][SETTLEMENT_COMPLETE][NO] "
+                    "reason=HISTORICAL_OR_STALE_RECONCILIATION_UNVERIFIED"
+                )
         try:
             save_job_checkpoint(
                 engine,
                 checkpoint_key,
                 {
-                    "done": True,
+                    "done": bool(reconcile_ok_local and close_stale_ok_local),
                     "reconcile_ok": bool(reconcile_ok_local),
                     "close_stale_ok": bool(close_stale_ok_local),
                     "reason": reason_label,
@@ -7114,8 +7173,17 @@ def run_once(
         kr_reconcile_perf = {
             "pre_full_calls": 0, "pre_full_ms": 0.0,
             "post_full_calls": 0, "post_full_ms": 0.0,
+            "current_order_reconcile_calls": 0,
+            "current_order_reconcile_ms": 0.0,
         }
         reconcile_result: dict | None = None
+        # Opt-in only after full CI, paper simulations and operator approval.
+        # LEGACY remains the default and the real-money environment is excluded.
+        kr_reconcile_once_enabled = (
+            os.getenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "0") == "1"
+            and env_effective == "practice"
+            and kis is not None and kis.env == "practice"
+        )
         deferred_full_reconcile = False
         pre_exit_exact_proof = False
         sell_only_lane = False
@@ -7170,7 +7238,25 @@ def run_once(
             }
         if kis and not nontrading_eval_mode and not deferred_full_reconcile:
             _pre_full_started = time_mod.monotonic()
-            kr_reconcile_perf["pre_full_calls"] += 1
+            _pre_lane = None
+            _pre_reconcile_kwargs = {}
+            if kr_reconcile_once_enabled:
+                from trader.kr.historical_recovery_journal import choose_historical_lane
+                _pre_lane = choose_historical_lane(
+                    engine=engine, kis=kis, env=env_effective,
+                    strategy="pb1_pullback_close", trading_date=trade_date,
+                )
+                _pre_reconcile_kwargs = {
+                    "historical_recovery": _pre_lane.historical_recovery,
+                }
+                logger.info(
+                    "[KR_HIST_RECOVERY][PRE_ROUTE] mode=%s reason=%s",
+                    _pre_lane.mode, _pre_lane.reason,
+                )
+            if not _pre_lane or _pre_lane.historical_recovery:
+                kr_reconcile_perf["pre_full_calls"] += 1
+            else:
+                kr_reconcile_perf["current_order_reconcile_calls"] += 1
             try:
                 reconcile_result = reconcile_kis(
                     engine=engine,
@@ -7181,6 +7267,7 @@ def run_once(
                     tick_ts=now,
                     balance_snapshot=balance_snapshot_raw,
                     runtime_dir=str(runtime_root_dir),
+                    **_pre_reconcile_kwargs,
                 )
                 db_write_reasons.append("reconcile")
                 if not reconcile_result.get("ok", True):
@@ -7196,11 +7283,36 @@ def run_once(
                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
             finally:
-                kr_reconcile_perf["pre_full_ms"] += 1000.0 * (time_mod.monotonic() - _pre_full_started)
+                _pre_elapsed_ms = 1000.0 * (time_mod.monotonic() - _pre_full_started)
+                if not _pre_lane or _pre_lane.historical_recovery:
+                    kr_reconcile_perf["pre_full_ms"] += _pre_elapsed_ms
+                else:
+                    kr_reconcile_perf["current_order_reconcile_ms"] += _pre_elapsed_ms
+                if _pre_lane is not None:
+                    from trader.kr.historical_recovery_journal import (
+                        record_historical_result, current_tick_reconcile_proves_buy_safe,
+                    )
+                    _pre_durable_ok = (
+                        record_historical_result(
+                            engine=engine, lane=_pre_lane, result=reconcile_result,
+                        ) if _pre_lane.mode == "FULL" else _pre_lane.allow_buy_from_recovery
+                    )
+                    _pre_verified = current_tick_reconcile_proves_buy_safe(
+                        lane=_pre_lane, result=reconcile_result,
+                        durable_record_ok=_pre_durable_ok,
+                    )
+                    if not _pre_verified:
+                        # A missing or contradictory recovery journal is NOT
+                        # evidence that the account has no historical orders.
+                        order_allowed = False
+                        entry_block_reason = entry_block_reason or "historical_recovery_unverified"
+                        logger.error(
+                            "[KR_HIST_RECOVERY][BUY_BLOCK] mode=%s reason=%s",
+                            _pre_lane.mode, _pre_lane.reason,
+                        )
                 logger.info(
-                    "[KR_RECONCILE_LANES][HISTORICAL_RECOVERY_CALL] lane=pre "
-                    "calls=%s elapsed_ms=%.1f",
-                    kr_reconcile_perf["pre_full_calls"], kr_reconcile_perf["pre_full_ms"],
+                    "[KR_RECONCILE_LANES][PRE_RECONCILE_CALL] full=%s elapsed_ms=%.1f",
+                    int(not _pre_lane or _pre_lane.historical_recovery), _pre_elapsed_ms,
                 )
         elif nontrading_eval_mode:
             logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
@@ -7711,6 +7823,7 @@ def run_once(
         # and preserve the KR_INFINITE owner and risk/sizing policy unchanged.
         kr_inf_run_result = None
         kr_inf_invoked = False
+        engine_runner._kr_historical_lanes_enabled = kr_reconcile_once_enabled
         # The callback is also exercised independently by sell-first
         # integration tests; keep metrics on the engine instead of closing
         # over a runner-local variable.
@@ -7718,6 +7831,9 @@ def run_once(
 
         def _kr_after_protective_exit():
             nonlocal kr_inf_run_result, kr_inf_invoked, reconcile_result, balance_snapshot_raw
+            # This callback is AST-exercised on its own in SELL-first tests;
+            # keep source-verified balance timestamp type available locally.
+            from datetime import datetime as _kr_datetime
             if kr_inf_invoked:
                 return
             kr_inf_invoked = True
@@ -7739,7 +7855,8 @@ def run_once(
                     exit_summary=getattr(engine_runner, "_exit_summary_payload", None),
                 )
                 if ((pre_exit_exact_proof or sell_only_lane)
-                        and _zero_sell):
+                        and _zero_sell
+                        and not getattr(engine_runner, "_kr_historical_lanes_enabled", False)):
                     try:
                         from trader.account_state import account_reset_mode
                         from trader.kr.reconcile_lanes_257 import can_skip_post_exit_full_reconcile
@@ -7749,10 +7866,25 @@ def run_once(
                                 or not isinstance(_post_snapshot.get("output1"), list)
                                 or not _post_snapshot.get("output2")):
                             raise RuntimeError("POST_EXIT_BROKER_BALANCE_NOT_AUTHORITATIVE")
-                        _post_snapshot = {
-                            **_post_snapshot,
-                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
-                        }
+                        _post_snapshot = dict(_post_snapshot)
+                        # Force=True should fetch KIS, but proof must still
+                        # come from the wrapper's ORIGINAL fetch timestamp.
+                        # Never refresh a stale/fabricated cache marker by
+                        # stamping the time we happened to read this dict.
+                        _post_snapshot.pop("_kr_verified_fresh_at_kst", None)
+                        _post_fetch_at = getattr(kis, "_balance_cache_at", None)
+                        if (
+                            isinstance(_post_fetch_at, _kr_datetime)
+                            and _post_fetch_at.tzinfo is not None
+                            and 0 <= (now_kst() - _post_fetch_at).total_seconds() <= 20
+                        ):
+                            _post_snapshot["_kr_verified_fresh_at_kst"] = _post_fetch_at.isoformat()
+                        else:
+                            logger.warning(
+                                "[KR_RECONCILE_LANES][POST_EXIT_BALANCE_FRESHNESS] "
+                                "verified=0 action=FAIL_CLOSED_TO_FULL"
+                            )
+                            raise RuntimeError("POST_EXIT_ORIGINAL_KIS_FETCH_TIME_UNPROVEN")
                         _post_exact, _post_reason = prove_safe_protective_sell_handoff(
                             engine=engine, kis=kis, env=env_effective,
                             strategy="pb1_pullback_close", trade_date=trade_date,
@@ -7804,15 +7936,32 @@ def run_once(
                     db_write_reasons.append("two_sided_exact_proof_skip_historical_reconcile")
                 else:
                     _post_full_started = time_mod.monotonic()
+                    _post_lane = None
+                    _post_reconcile_kwargs = {}
+                    if getattr(engine_runner, "_kr_historical_lanes_enabled", False):
+                        from trader.kr.historical_recovery_journal import choose_historical_lane
+                        _post_lane = choose_historical_lane(
+                            engine=engine, kis=kis, env=env_effective,
+                            strategy="pb1_pullback_close", trading_date=trade_date,
+                        )
+                        _post_reconcile_kwargs = {
+                            "historical_recovery": _post_lane.historical_recovery,
+                        }
+                        logger.info("[KR_HIST_RECOVERY][POST_ROUTE] mode=%s reason=%s",
+                                    _post_lane.mode, _post_lane.reason)
                     _post_perf = getattr(engine_runner, "_kr_reconcile_perf", None)
                     if isinstance(_post_perf, dict):
-                        _post_perf["post_full_calls"] += 1
+                        if _post_lane is None or _post_lane.historical_recovery:
+                            _post_perf["post_full_calls"] += 1
+                        else:
+                            _post_perf["current_order_reconcile_calls"] += 1
                     try:
                         reconcile_result = reconcile_kis(
                             engine=engine, kis=kis, env=env_effective,
                             run_id=run_record_id, strategy="pb1_pullback_close",
                             tick_ts=now, balance_snapshot=balance_snapshot_raw,
                             runtime_dir=str(runtime_root_dir),
+                            **_post_reconcile_kwargs,
                         )
                         engine_runner._kr_post_exit_reconcile_ok = bool(reconcile_result.get("ok", False))
                         if engine_runner._kr_post_exit_reconcile_ok:
@@ -7827,12 +7976,35 @@ def run_once(
                                          "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
                     finally:
                         _post_elapsed_ms = 1000.0 * (time_mod.monotonic() - _post_full_started)
+                        if _post_lane is not None:
+                            from trader.kr.historical_recovery_journal import (
+                                record_historical_result, current_tick_reconcile_proves_buy_safe,
+                            )
+                            _post_durable_ok = (
+                                record_historical_result(
+                                    engine=engine, lane=_post_lane, result=reconcile_result,
+                                ) if _post_lane.mode == "FULL"
+                                else _post_lane.allow_buy_from_recovery
+                            )
+                            _post_verified = current_tick_reconcile_proves_buy_safe(
+                                lane=_post_lane, result=reconcile_result,
+                                durable_record_ok=_post_durable_ok,
+                            )
+                            if not _post_verified:
+                                engine_runner._kr_post_exit_reconcile_ok = False
+                                logger.error(
+                                    "[KR_HIST_RECOVERY][POST_BUY_BLOCK] mode=%s reason=%s",
+                                    _post_lane.mode, _post_lane.reason,
+                                )
                         _post_perf = getattr(engine_runner, "_kr_reconcile_perf", None)
                         if isinstance(_post_perf, dict):
-                            _post_perf["post_full_ms"] += _post_elapsed_ms
+                            if _post_lane is None or _post_lane.historical_recovery:
+                                _post_perf["post_full_ms"] += _post_elapsed_ms
+                            else:
+                                _post_perf["current_order_reconcile_ms"] += _post_elapsed_ms
                         logger.info(
-                            "[KR_RECONCILE_LANES][HISTORICAL_RECOVERY_CALL] lane=post "
-                            "elapsed_ms=%.1f",
+                            "[KR_RECONCILE_LANES][POST_RECONCILE_CALL] full=%s elapsed_ms=%.1f",
+                            int(_post_lane is None or _post_lane.historical_recovery),
                             _post_elapsed_ms,
                         )
                 # After an actually submitted protected SELL, a successful
@@ -7849,10 +8021,16 @@ def run_once(
                                 or not isinstance(_after_sell_balance.get("output1"), list)
                                 or not _after_sell_balance.get("output2")):
                             raise RuntimeError("AFTER_SELL_KIS_BALANCE_NOT_AUTHORITATIVE")
-                        balance_snapshot_raw = {
-                            **_after_sell_balance,
-                            "_kr_verified_fresh_at_kst": now_kst().isoformat(),
-                        }
+                        _after_sell_at = getattr(kis, "_balance_cache_at", None)
+                        if (
+                            not isinstance(_after_sell_at, _kr_datetime)
+                            or _after_sell_at.tzinfo is None
+                            or not 0 <= (now_kst() - _after_sell_at).total_seconds() <= 20
+                        ):
+                            raise RuntimeError("AFTER_SELL_ORIGINAL_KIS_FETCH_TIME_UNPROVEN")
+                        balance_snapshot_raw = dict(_after_sell_balance)
+                        balance_snapshot_raw.pop("_kr_verified_fresh_at_kst", None)
+                        balance_snapshot_raw["_kr_verified_fresh_at_kst"] = _after_sell_at.isoformat()
                         engine_runner._authoritative_balance = BrokerBalanceSnapshot.from_kis(
                             _after_sell_balance, source="api",
                         )
@@ -7933,12 +8111,15 @@ def run_once(
         logger.info(
             "[KR_RECONCILE_LANES][PERF] historical_recovery_calls=%s "
             "historical_recovery_ms=%.1f pre_calls=%s post_calls=%s "
-            "historical_recovery_skipped=%s",
+            "historical_recovery_skipped=%s current_order_reconcile_calls=%s "
+            "current_order_reconcile_ms=%.1f",
             kr_reconcile_perf["pre_full_calls"] + kr_reconcile_perf["post_full_calls"],
             kr_reconcile_perf["pre_full_ms"] + kr_reconcile_perf["post_full_ms"],
             kr_reconcile_perf["pre_full_calls"],
             kr_reconcile_perf["post_full_calls"],
             int(not (kr_reconcile_perf["pre_full_calls"] or kr_reconcile_perf["post_full_calls"])),
+            kr_reconcile_perf["current_order_reconcile_calls"],
+            kr_reconcile_perf["current_order_reconcile_ms"],
         )
         logger.info(
             "[PB1][RUN_ONCE][FAIL_OPEN_FLAG] runs_ledger_fail_open=%s loop_mode=%s",

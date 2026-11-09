@@ -3193,6 +3193,7 @@ class OrdersRepo:
     def execution_claim_health(
         self, *, market: str | None = None, env: str | None = None,
         account_id: str | None = None, trading_epoch_id: str | None = None,
+        trade_date: date | None = None,
     ) -> dict[str, int]:
         """Report unresolved actions within an explicit account generation.
 
@@ -3201,7 +3202,7 @@ class OrdersRepo:
         """
         return self._execution_claim_repo.health(
             market=market, env=env, account_id=account_id,
-            trading_epoch_id=trading_epoch_id,
+            trading_epoch_id=trading_epoch_id, trade_date=trade_date,
         )
 
     def release_execution_claim_before_submit_for_order(self, client_order_key: str) -> None:
@@ -4731,7 +4732,8 @@ class OrdersRepo:
         )
         if self.engine.dialect.name == "postgresql":
             return sa.cast(sa.func.timezone("Asia/Seoul", stamp), sa.Date)
-        return sa.func.date(stamp)
+        # SQLite CURRENT_TIMESTAMP is UTC. Match the Seoul day used by PostgreSQL.
+        return sa.func.date(stamp, "+9 hours")
 
     def upsert_reconciled_order(
         self,
@@ -4790,6 +4792,14 @@ class OrdersRepo:
             # The KIS ODNO may be reused on another trading day, including
             # across legacy NULL epochs. Never bind a global ODNO match.
             # A source execution timestamp is preferred to a DB insertion day.
+            if self.engine.dialect.name == "sqlite":
+                # SQLite strips offsets on binding and returns naive UTC
+                # when an existing order is read back for reconciliation.
+                submitted_at, acked_at = (
+                    (stamp if stamp.tzinfo else pytz.UTC.localize(stamp)).astimezone(pytz.UTC)
+                    if stamp is not None else None
+                    for stamp in (submitted_at, acked_at)
+                )
             source_time = submitted_at or acked_at or now_kst()
             broker_day = (
                 source_time.astimezone(pytz.timezone("Asia/Seoul")).date()
