@@ -62,8 +62,9 @@ def _accounts(monkeypatch, *, engine=None):
                 # fixture lacked both a lifecycle and this zero baseline;
                 # production correctly rejected it as unsafe recovery.
                 request_json=json.dumps({"pre_order_holding_qty": 0}),
-                # SQLite strips the timezone when storing DateTime.
-                # Store the UTC instant, then the broker-day SQL adds KST.
+                # SQLite drops tzinfo when binding DateTime; persist UTC
+                # as production PostgreSQL does. The broker-day expression
+                # then converts the timestamp to KST exactly once.
                 kis_odno="0000001212",
                 created_at=day.astimezone(timezone.utc),
                 submitted_at=day.astimezone(timezone.utc),
