@@ -216,12 +216,12 @@ class InfiniteRepository:
         with self.engine.connect() as conn:
             epoch_id = self._epoch_id(conn)
             if epoch_id:
-                rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
+                rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,limit_price,unit_sequence,
                     broker_order_id,status,filled_qty,filled_notional_krw,metadata FROM kr_infinite_order_intents
                     WHERE trading_epoch_id=:epoch_id AND status=ANY(:statuses) ORDER BY id"""),
                     {"epoch_id": epoch_id, "statuses": list(PENDING)}).mappings().all()
             else:
-                rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
+                rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,limit_price,unit_sequence,
                     broker_order_id,status,filled_qty,filled_notional_krw,metadata FROM kr_infinite_order_intents
                     WHERE status=ANY(:statuses) ORDER BY id"""), {"statuses": list(PENDING)}).mappings().all()
         result: list[OrderIntent] = []

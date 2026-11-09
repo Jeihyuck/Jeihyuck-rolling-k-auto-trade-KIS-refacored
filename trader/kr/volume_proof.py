@@ -65,6 +65,12 @@ def build_kr_volume_proof(
         "proof_date": None,
         "quote_as_of": None,
         "quote_received_at": observed_at.isoformat(),
+        "exchange_time_raw": None,
+        "exchange_quote_age_seconds": None,
+        "quote_volume_field": None,
+        "completed_bar_age_calendar_days": None,
+        "completed_bar_count": None,
+        "failure_category": "DATA_UNVERIFIED",
         "daily_avg_volume20": None,
         "daily_avg_volume50": None,
         "previous_day_volume": None,
@@ -88,6 +94,11 @@ def build_kr_volume_proof(
     def reject(reason: str, *, failed: bool = False) -> dict[str, Any]:
         proof["confirmation_state"] = "FAILED" if failed else "UNKNOWN"
         proof["failure_reason"] = reason
+        proof["failure_category"] = (
+            "STRATEGY_TRIGGER_NOT_MET"
+            if reason in {"breakout_price_trigger_missing", "breakout_volume_trigger_missing"}
+            else "DATA_UNVERIFIED"
+        )
         return proof
 
     session = _day(trade_date)
@@ -115,13 +126,15 @@ def build_kr_volume_proof(
             return reject("invalid_completed_bar_volume")
         history.append((candle_day, volume))
     history.sort(key=lambda item: item[0])
+    proof["completed_bar_count"] = len(history)
     if len(history) < 20:
         return reject("insufficient_completed_bars")
     if len({day for day, _ in history}) != len(history):
         return reject("duplicate_completed_bar_date", failed=True)
+    proof["proof_date"] = history[-1][0].isoformat()
+    proof["completed_bar_age_calendar_days"] = (session - history[-1][0]).days
     if session - history[-1][0] > timedelta(days=14):
         return reject("completed_bar_stale")
-    proof["proof_date"] = history[-1][0].isoformat()
     proof["previous_day_volume"] = history[-1][1]
     proof["daily_avg_volume20"] = sum(vol for _, vol in history[-20:]) / 20
     if len(history) >= 50:
@@ -138,8 +151,18 @@ def build_kr_volume_proof(
             return reject("kis_quote_trade_date_mismatch", failed=True)
     if quoted_code and quoted_code.zfill(6) != str(code).zfill(6):
         return reject("quote_symbol_mismatch", failed=True)
-    # stck_vol is not a substitute: it can represent a single trade.
-    cumulative = _positive(quote.get("acml_vol") or raw.get("acml_vol"))
+    # stck_vol is NOT cumulative. An explicitly invalid top-level acml_vol
+    # must never be replaced by an unrelated cached raw copy.
+    # Retain which source supplied the quote for post-incident audit.
+    if "acml_vol" in quote:
+        proof["quote_volume_field"] = "snapshot.acml_vol"
+        cumulative_raw = quote["acml_vol"]
+    elif "acml_vol" in raw:
+        proof["quote_volume_field"] = "snapshot.raw.acml_vol"
+        cumulative_raw = raw["acml_vol"]
+    else:
+        cumulative_raw = None
+    cumulative = _positive(cumulative_raw)
     if cumulative is None:
         return reject("kis_cumulative_volume_missing")
     proof["intraday_cumulative_volume"] = cumulative
@@ -150,7 +173,11 @@ def build_kr_volume_proof(
         if cumulative < previous:
             return reject("cumulative_volume_decreased", failed=True)
 
-    trade_clock = quote.get("stck_cntg_hour") or raw.get("stck_cntg_hour")
+    trade_clock = (
+        quote["stck_cntg_hour"] if "stck_cntg_hour" in quote
+        else raw.get("stck_cntg_hour")
+    )
+    proof["exchange_time_raw"] = str(trade_clock) if trade_clock is not None else None
     clock = str(trade_clock or "").zfill(6)
     if len(clock) != 6 or not clock.isdigit():
         return reject("kis_exchange_quote_time_missing")
@@ -162,6 +189,7 @@ def build_kr_volume_proof(
         return reject("kis_exchange_quote_time_invalid", failed=True)
     proof["quote_as_of"] = exchange_ts.isoformat()
     age_seconds = (received - exchange_ts).total_seconds()
+    proof["exchange_quote_age_seconds"] = round(age_seconds, 3)
     if age_seconds < -10 or age_seconds > 600:
         return reject("kis_exchange_quote_stale_or_future")
 
@@ -188,4 +216,5 @@ def build_kr_volume_proof(
         proof["breakout_volume_confirmed"] = True
     proof["confirmation_state"] = "VERIFIED"
     proof["failure_reason"] = None
+    proof["failure_category"] = None
     return proof

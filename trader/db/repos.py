@@ -3193,6 +3193,7 @@ class OrdersRepo:
     def execution_claim_health(
         self, *, market: str | None = None, env: str | None = None,
         account_id: str | None = None, trading_epoch_id: str | None = None,
+        trade_date: date | None = None,
     ) -> dict[str, int]:
         """Report unresolved actions within an explicit account generation.
 
@@ -3201,7 +3202,7 @@ class OrdersRepo:
         """
         return self._execution_claim_repo.health(
             market=market, env=env, account_id=account_id,
-            trading_epoch_id=trading_epoch_id,
+            trading_epoch_id=trading_epoch_id, trade_date=trade_date,
         )
 
     def release_execution_claim_before_submit_for_order(self, client_order_key: str) -> None:
