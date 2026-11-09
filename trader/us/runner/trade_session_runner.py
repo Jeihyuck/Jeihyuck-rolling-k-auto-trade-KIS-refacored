@@ -1496,6 +1496,27 @@ def run_trade_session(
         # execution Claims. Default LEGACY remains unchanged.
         from trader.us.execution.reconcile_shadow_worker import parse_mode
         _reconcile_mode = parse_mode(os.getenv("US_RECONCILE_WORKER_MODE", "LEGACY"))
+        if session == "am" and not offline and not resolved_signal_only:
+            try:
+                from trader.us.data_provider import USDataProvider
+                from trader.us.execution.order_journal import report_historical_order_recovery
+
+                recovery_provider = USDataProvider(offline=False, env=env)
+                report_historical_order_recovery(
+                    provider=recovery_provider, trade_date=trade_date, phase="AM_START",
+                )
+                if _reconcile_mode == "WORKER" and env == "practice":
+                    from trader.us.execution.authoritative_reconcile_worker import report_stop_recovery_at_boundary
+
+                    report_stop_recovery_at_boundary(
+                        provider=recovery_provider, trade_date=trade_date, phase="AM_START",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[US_ORDER_JOURNAL][HISTORICAL_RECOVERY] phase=AM_START "
+                    "status=RECOVERY_UNRESOLVED error_type=%s action=CONTINUE",
+                    type(exc).__name__,
+                )
         if _reconcile_mode in {"SHADOW", "RESERVATION_ONLY", "WORKER"}:
             if str(env).lower() != "practice" or os.getenv("KIS_ENV", "practice").lower() != "practice":
                 raise RuntimeError("US_RECONCILE_CHILD_PRACTICE_ONLY")

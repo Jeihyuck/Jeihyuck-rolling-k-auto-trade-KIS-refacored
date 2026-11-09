@@ -2106,6 +2106,9 @@ def run_daily_report(
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
         report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
+    historical_unresolved = (report.get("broker_recovery_health") or {}).get("historical_recovery_unresolved")
+    if session == "close" and historical_unresolved:
+        report["warnings"].append(f"HISTORICAL_RECOVERY_UNRESOLVED:{historical_unresolved}")
     broker_health_errors = (
         _broker_recovery_health_errors(report.get("broker_recovery_health"))
         if session == "close" and not offline else []

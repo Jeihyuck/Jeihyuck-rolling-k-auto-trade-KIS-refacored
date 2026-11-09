@@ -18,7 +18,7 @@ _DEFERRED_SETTLEMENT_CURSOR=0
 
 
 def settle_verified_stop_debts_once(*, provider, trade_date: str,
-                                    limit: int=4) -> dict:
+                                    limit: int=4, current_orders_only: bool=False) -> dict:
     from trader.account_state import get_account_key, resolve_env_name
     from trader.us.db.repos import _get_engine_or_none
     from trader.us.execution.reconcile import reconcile_positions
@@ -81,7 +81,10 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
         # order leaves the stop obligation and every fence unchanged.
         with engine.connect() as conn:
             candidate_originals = conn.execute(text("""
-                SELECT COUNT(*) FROM (
+                SELECT CASE
+                    WHEN :current_orders_only AND bool_or(trade_date <> CAST(:trade_date AS DATE))
+                    THEN 0 ELSE COUNT(*) END
+                FROM (
                     SELECT DISTINCT o.trade_date, o.symbol, o.order_no,
                            o.qty_requested, o.qty_filled, o.env, o.trading_epoch_id
                     FROM us_orders o
@@ -131,7 +134,8 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
                 ) exact_original_tp
             """), {
                 "life":life, "account":account_claim,
-                "epoch":epoch, "symbol":symbol,
+                "epoch":epoch, "symbol":symbol, "trade_date":trade_date,
+                "current_orders_only":current_orders_only,
             }).scalar_one()
         if not (0 < int(candidate_originals or 0) < 50):
             blocked+=1
@@ -242,7 +246,10 @@ def settle_verified_stop_debts_once(*, provider, trade_date: str,
             """),{"life":life,"account":account_claim,"epoch":epoch,
                    "symbol":symbol}).mappings().all()
         # No KIS original-order coverage is NOT broker-open-orders=0 proof.
-        if not orders or len(orders)>=50:
+        if (
+            not orders or len(orders) >= 50
+            or (current_orders_only and any(str(order["trade_date"]) != trade_date for order in orders))
+        ):
             blocked+=1
             continue
         originals=[]

@@ -6,7 +6,7 @@ remains broker-ACKED and KIS returns repeated cumulative order snapshots.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -63,8 +63,7 @@ def _accepted_sell(engine, *, code, ordered_qty, pre_qty, avg_price, odno, order
         conn.execute(sa.update(schema.orders).where(
             schema.orders.c.order_id == order_id
         ).values(
-            kis_odno=odno, created_at=datetime(2026, 10, 22, 15, 18,
-                                             tzinfo=ZoneInfo("Asia/Seoul")),
+            kis_odno=odno, created_at=datetime(2026, 10, 22, 6, 18, tzinfo=timezone.utc),
         ))
     return pos, str(order_id)
 

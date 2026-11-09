@@ -335,13 +335,18 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         post_position = executor.position(config.symbol)
         for intent, broker_state in post_updates:
             reconciliation = reconcile_order_fill_prices(
-                order_price=position.current_price,
+                order_price=getattr(intent, "limit_price", None),
                 order_qty=int(getattr(intent, "requested_qty", 0) or 0),
                 broker_order_no=getattr(intent, "broker_order_id", None),
                 fill_price=getattr(broker_state, "filled_avg_price", None),
                 fill_qty=getattr(broker_state, "filled_qty", None),
                 broker_avg_after=post_position.average_price,
                 close_avg_price=post_position.average_price,
+                order_side=str(getattr(intent, "side", "") or ""),
+                # KR_INFINITE sells use kis.sell_stock(...), which submits
+                # a market order. Persisted limit_price on these intents
+                # is only a pre-submit estimate, never an exchange limit.
+                order_is_market=str(getattr(intent, "side", "") or "").upper().startswith("SELL"),
             )
             logger.info("[KR_INF][ORDER_RECONCILIATION] %s", reconciliation)
             if state is not None:

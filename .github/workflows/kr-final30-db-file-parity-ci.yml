@@ -1,0 +1,44 @@
+name: KR Final30 DB File Parity Strict CI
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "trader/prep_runner.py"
+      - "trader/watchlist_builder.py"
+      - "trader/final30_quality.py"
+      - "tests/kr/test_kr_final30_db_file_parity_p0_20261106.py"
+      - ".github/workflows/kr-final30-db-file-parity-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  final30-parity-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: "."
+      KIS_ENV: practice
+      STRATEGY_ENV: practice
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      DISABLE_LIVE_TRADING: "1"
+      KIS_APP_KEY: ""
+      KIS_APP_SECRET: ""
+      PBCORE_DB_URL: ""
+      DATABASE_URL: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install offline dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Static compile and exact Nov06 regression suite
+        run: |
+          python -m py_compile trader/prep_runner.py trader/watchlist_builder.py
+          python -m pytest -q tests/kr/test_kr_final30_db_file_parity_p0_20261106.py
