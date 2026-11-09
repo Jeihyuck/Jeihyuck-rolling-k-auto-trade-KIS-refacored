@@ -1,6 +1,6 @@
 """KR practice account/epoch claim health must be scoped at reconciliation."""
 import hashlib
-from datetime import datetime
+from datetime import date, datetime
 
 import sqlalchemy as sa
 
@@ -67,6 +67,9 @@ def _mock_empty_reconcile(monkeypatch, *, epoch="active-epoch", fail=False):
     monkeypatch.setattr(reconcile_kis, "active_trading_epoch_id", active_epoch)
     monkeypatch.setattr(reconcile_kis, "trading_epoch_enforced", lambda: True)
     monkeypatch.setattr(reconcile_kis, "get_account_key", lambda **_kwargs: account)
+    # Account-scoped claim health now requires a deterministic KR trade date.
+    # Do not remove this date filter: it isolates old debt from current risk.
+    monkeypatch.setattr(reconcile_kis, "now_kst", lambda: datetime(2026, 11, 4, 10))
 
     result = reconcile_kis.reconcile_today(
         engine=sa.create_engine("sqlite:///:memory:"),
@@ -87,6 +90,7 @@ def test_current_account_does_not_count_prior_account_claims(monkeypatch):
         "market": "KR", "env": "practice",
         "account_id": hashlib.sha256(account.encode("utf-8")).hexdigest(),
         "trading_epoch_id": "active-epoch",
+        "trade_date": date(2026, 11, 4),
     }]
 
 
