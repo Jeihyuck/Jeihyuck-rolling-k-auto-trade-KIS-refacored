@@ -144,3 +144,37 @@ def test_missing_kis_order_number_cannot_pass_as_native_proof():
                                     positions=[_position(order)])
     assert report["status"] == "CHAIN_INCOMPLETE"
     assert "ORIGINAL_KIS_ORDER_NUMBER_UNPROVEN" in report["issues"]
+
+
+def test_priced_buy_claim_is_deferred_before_fill_even_if_qty_already_promoted():
+    from trader.reconcile_kis import _defer_native_priced_buy_claim
+
+    values = dict(
+        atomic_writer_active=False, side="BUY",
+        source_order={"order_id": "mico-20261029"},
+        request_json={"enforce_entry_contract": True},
+        filled_qty=79, filled_price=26050,
+    )
+    assert _defer_native_priced_buy_claim(**values)
+    # The predicate intentionally does not depend on incremental quantity.
+    assert _defer_native_priced_buy_claim(**values)
+
+
+def test_non_native_or_atomic_or_unowned_order_never_uses_legacy_claim_deferral():
+    from trader.reconcile_kis import _defer_native_priced_buy_claim
+
+    base = dict(
+        atomic_writer_active=False, side="BUY",
+        source_order={"order_id": "mico"},
+        request_json={"enforce_entry_contract": True},
+        filled_qty=79, filled_price=26050,
+    )
+    for overrides in (
+        {"atomic_writer_active": True},
+        {"side": "SELL"},
+        {"source_order": None},
+        {"request_json": {"enforce_entry_contract": False}},
+        {"filled_qty": None},
+        {"filled_price": None},
+    ):
+        assert not _defer_native_priced_buy_claim(**{**base, **overrides})
