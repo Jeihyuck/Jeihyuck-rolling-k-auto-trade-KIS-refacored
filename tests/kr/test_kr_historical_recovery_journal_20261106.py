@@ -83,6 +83,7 @@ def test_pr326_buy_requires_both_durable_history_and_fresh_current_tick(lane_nam
         "ok": True,
         "historical_recovery_executed": full,
         "historical_repair_fastpath": True,
+        "current_only_fresh_broker_proven": not full,
         "frozen_contract_invariant_violations": 0,
         "guard_reason": None,
         "degraded": None,
@@ -104,12 +105,15 @@ def test_pr326_buy_requires_both_durable_history_and_fresh_current_tick(lane_nam
         {"unresolved_broker_activity": True},
         {"frozen_contract_invariant_violations": 1},
         {"historical_recovery_executed": not full},
+        {"current_only_fresh_broker_proven": False} if not full else {"ok": False},
     ):
         assert not current_tick_reconcile_proves_buy_safe(
             lane=lane, result={**proof, **change}, durable_record_ok=True,
         ), change
     if not full:
-        assert not current_tick_reconcile_proves_buy_safe(
+        # Current-day fresh authenticated broker truth replaces historical
+        # imported-cycle parity as the only all-account BUY gate.
+        assert current_tick_reconcile_proves_buy_safe(
             lane=lane, result={**proof, "historical_repair_fastpath": False},
             durable_record_ok=True,
         )
