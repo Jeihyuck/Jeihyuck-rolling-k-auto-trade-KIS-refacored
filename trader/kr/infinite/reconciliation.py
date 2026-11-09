@@ -22,7 +22,10 @@ def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
     """
     base = float(order_price or 0)
     execution = float(fill_price or 0)
-    priced_proof = execution > 0 and (order_is_market or base > 0)
+    qty_requested = int(order_qty or 0)
+    qty_native = int(fill_qty or 0)
+    qty_proven = qty_requested > 0 and 0 < qty_native <= qty_requested
+    priced_proof = qty_proven and execution > 0 and (order_is_market or base > 0)
     side = str(order_side or "").upper()
     if not priced_proof:
         price_gap = 0.0
@@ -43,7 +46,8 @@ def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
     )
     return {
         "order_price": base,
-        "order_qty": int(order_qty or 0),
+        "order_qty": qty_requested,
+        "native_fill_qty_proven": qty_proven,
         "broker_order_no": broker_order_no,
         "fill_price": fill_price,
         "fill_qty": fill_qty,
