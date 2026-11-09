@@ -1,5 +1,6 @@
 """No historical KIS BUY/SELL can be repaired from account balance or HASH alone."""
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from scripts.kr_20261109_original_kis_proof import (
     Target, review_original_kr_trades, _match_db_source,
@@ -16,6 +17,7 @@ def _order():
         "strategy": "pb1_pullback_close", "code": "059090", "side": "BUY",
         "kis_odno": "0000011865", "qty": 79,
         "position_cycle_id": "mico-cycle", "portfolio_epoch_id": "portfolio",
+        "submitted_at": datetime(2026, 10, 29, 9, 31, tzinfo=ZoneInfo("Asia/Seoul")),
     }
 
 
@@ -70,7 +72,8 @@ def test_mico_and_infinite_order_originals_proven_but_no_db_mutation():
 def test_kakao_mts_qty_cannot_make_zero_fill_original_verified():
     kakao = Target("293490", "PB1", date(2026, 10, 27), "BUY", 174, "0000011280")
     order = {**_order(), "code": "293490", "qty": 174,
-             "kis_odno": kakao.odno, "position_cycle_id": "kakao-cycle"}
+             "kis_odno": kakao.odno, "position_cycle_id": "kakao-cycle",
+             "submitted_at": datetime(2026, 10, 27, 9, 31, tzinfo=ZoneInfo("Asia/Seoul"))}
     page = _page(kakao.trade_date, "293490", "02", 174, 1740000, 10000, kakao.odno)
     page["output1"][0]["tot_ccld_qty"] = "0"
     page["output1"][0]["tot_ccld_amt"] = "0"
@@ -96,3 +99,25 @@ def test_same_broker_order_number_from_other_symbol_cannot_prove_mico():
     result = _report({PB1.trade_date: fake_page}, targets=(PB1,))
     assert result["status"] == "RECOVERY_UNRESOLVED_ORIGINAL_KIS_PROOF"
     assert result["results"][0]["reason"] == "MISSING_OR_AMBIGUOUS_ORIGINAL_KIS_ORDER"
+
+
+def test_recycled_same_order_number_from_different_trade_day_is_not_original():
+    wrong_date = {**_order(),
+                  "submitted_at": datetime(2026, 10, 30, 9, 31,
+                                           tzinfo=ZoneInfo("Asia/Seoul"))}
+    ok, reason = _match_db_source(
+        PB1, scoped_orders=[wrong_date], infinite_intents=[],
+        active_epoch="epoch", active_account="practice:acct:01",
+    )
+    assert ok is False
+    assert reason == "ORIGINAL_PB1_ACCOUNT_ORDER_OR_CYCLE_NOT_UNIQUE"
+
+
+def test_naive_order_timestamp_cannot_authorize_historical_repair():
+    missing_tz = {**_order(), "submitted_at": datetime(2026, 10, 29, 9, 31)}
+    ok, reason = _match_db_source(
+        PB1, scoped_orders=[missing_tz], infinite_intents=[],
+        active_epoch="epoch", active_account="practice:acct:01",
+    )
+    assert ok is False
+    assert reason == "ORIGINAL_PB1_ACCOUNT_ORDER_OR_CYCLE_NOT_UNIQUE"
