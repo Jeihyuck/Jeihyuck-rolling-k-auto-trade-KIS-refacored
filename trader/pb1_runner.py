@@ -7955,6 +7955,13 @@ def run_once(
                             _post_perf["post_full_calls"] += 1
                         else:
                             _post_perf["current_order_reconcile_calls"] += 1
+                    # A failed post-SELL broker call must never reuse a
+                    # successful pre-SELL reconciliation as fresh BUY proof.
+                    reconcile_result = {
+                        "ok": False,
+                        "degraded": "POST_EXIT_RECONCILE_NOT_COMPLETED",
+                        "reason": "POST_EXIT_RECONCILE_NOT_COMPLETED",
+                    }
                     try:
                         reconcile_result = reconcile_kis(
                             engine=engine, kis=kis, env=env_effective,
@@ -7971,6 +7978,11 @@ def run_once(
                                          "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS",
                                          reconcile_result.get("degraded") or reconcile_result.get("reason"))
                     except Exception as _deferred_exc:
+                        reconcile_result = {
+                            "ok": False,
+                            "degraded": "POST_EXIT_RECONCILE_EXCEPTION",
+                            "reason": "POST_EXIT_RECONCILE_EXCEPTION",
+                        }
                         engine_runner._kr_post_exit_reconcile_ok = False
                         logger.exception("[KR_RECONCILE_LANES][POST_EXIT][FAIL_CLOSED] type=%s "
                                          "action=BLOCK_ALL_NEW_BUY_KEEP_SELL_RECEIPTS", type(_deferred_exc).__name__)
