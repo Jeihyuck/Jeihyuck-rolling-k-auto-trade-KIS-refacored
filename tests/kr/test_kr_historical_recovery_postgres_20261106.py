@@ -43,6 +43,13 @@ def _success():
         unresolved_broker_activity=False,
         holdings_error=None, guard_reason=None,
         frozen_contract_invariant_violations=0,
+        current_only_fresh_broker_proven=True,
+        execution_claim_health={
+            "available": True, "unresolved_execution_actions": 0,
+            "unresolved_source_date_current": 0,
+            "unresolved_source_date_prior": 0,
+            "unresolved_source_date_other_or_unknown": 0,
+        },
     )
 
 
@@ -115,3 +122,41 @@ def test_close_failed_does_not_mark_completed(pg_lane):
         strategy="pb1_pullback_close", trading_date=date(2026, 11, 6),
         lane_name="CLOSE",
     ).mode == "CURRENT_ONLY"
+
+
+def test_durably_journaled_prior_debt_does_not_prove_historical_complete(pg_lane):
+    from trader.kr.historical_recovery_journal import current_tick_reconcile_proves_buy_safe
+    engine, _ = pg_lane
+    lane = _select(engine)
+    assert lane.mode == "FULL"
+    proof = _success()
+    proof["execution_claim_health"] = {
+        **proof["execution_claim_health"],
+        "unresolved_execution_actions": 1,
+        "unresolved_source_date_prior": 1,
+    }
+    assert not journal.record_historical_result(
+        engine=engine, lane=lane, result=proof
+    )
+    assert proof["historical_debt_only_recorded"] is True
+    assert _select(engine).mode == "CURRENT_ONLY"
+    assert current_tick_reconcile_proves_buy_safe(
+        lane=lane, result=proof, durable_record_ok=False,
+    )
+
+
+def test_undated_claim_does_not_license_buy_after_failed_historical_recovery(pg_lane):
+    from trader.kr.historical_recovery_journal import current_tick_reconcile_proves_buy_safe
+    engine, _ = pg_lane
+    lane = _select(engine)
+    proof = _success()
+    proof["execution_claim_health"] = {
+        **proof["execution_claim_health"],
+        "unresolved_execution_actions": 1,
+        "unresolved_source_date_other_or_unknown": 1,
+    }
+    assert not journal.record_historical_result(engine=engine, lane=lane, result=proof)
+    assert not proof.get("historical_debt_only_recorded")
+    assert not current_tick_reconcile_proves_buy_safe(
+        lane=lane, result=proof, durable_record_ok=False,
+    )
