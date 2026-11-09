@@ -233,7 +233,12 @@ def _execution_claim_health(
     ):
         if value is not None:
             filters[key] = value
-    if trade_date is not None:
+    # Only an authenticated account+epoch scope can make origin-date
+    # classification a safe trading decision. Legacy/offline diagnostic
+    # mocks deliberately retain the old market-only health signature.
+    if trade_date is not None and all(filters.get(k) for k in (
+        "env", "account_id", "trading_epoch_id"
+    )):
         filters["trade_date"] = trade_date
     try:
         return {
@@ -270,7 +275,7 @@ def _execution_claim_integrity_reason(
     current, prior, unknown = (int(health[k] or 0) for k in expected_keys)
     if min(current, prior, unknown) < 0 or current + prior + unknown != total:
         return "execution_claim_date_breakdown_invalid"
-    return "unresolved_execution_actions_current_or_unscoped" if current or unknown else None
+    return "unresolved_execution_actions" if current or unknown else None
 
 
 def _project_pb1_exit_stage_truth(
