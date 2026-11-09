@@ -143,9 +143,19 @@ def current_tick_reconcile_proves_buy_safe(
     contracts must independently succeed. A raised exception, missing
     result, stale parity or degraded daily-ccld always blocks new BUYs.
     """
+    # If the AM historical pass found ONLY dated previous-day debt, the
+    # journal must first DURABLY record UNRESOLVED; then independently proven
+    # today's orders can proceed without re-running that failed historical
+    # recovery. Any journal error, current/unknown claim, stale broker balance,
+    # claim write failure, or broker conflict remains fail-closed.
+    historical_debt_recorded = bool(
+        lane.mode == "FULL"
+        and isinstance(result, dict)
+        and result.get("historical_debt_only_recorded") is True
+    )
     return bool(
         lane.mode in {"FULL", "CURRENT_ONLY"}
-        and durable_record_ok is True
+        and (durable_record_ok is True or historical_debt_recorded)
         and isinstance(result, dict)
         and result.get("ok") is True
         and not result.get("degraded")
@@ -154,8 +164,8 @@ def current_tick_reconcile_proves_buy_safe(
         and result.get("frozen_contract_invariant_violations") == 0
         and result.get("historical_recovery_executed") is lane.historical_recovery
         and (
-            lane.historical_recovery or
             result.get("current_only_fresh_broker_proven") is True
+            or lane.mode == "FULL" and durable_record_ok is True
         )
     )
 
@@ -167,8 +177,40 @@ def record_historical_result(
         return lane.mode == "CURRENT_ONLY"
     if not lane.job_key or not lane.fencing_token:
         return False
+    health = (
+        result.get("execution_claim_health")
+        if isinstance(result, dict) and isinstance(result.get("execution_claim_health"), dict)
+        else {}
+    )
+    required_dates = (
+        "unresolved_source_date_current", "unresolved_source_date_prior",
+        "unresolved_source_date_other_or_unknown",
+    )
+    dated = bool(
+        health.get("available") is True
+        and all(k in health for k in required_dates)
+        and int(health.get("unresolved_execution_actions") or 0)
+        == sum(int(health[k] or 0) for k in required_dates)
+        and all(int(health[k] or 0) >= 0 for k in required_dates)
+    )
+    history_debt_only = bool(
+        dated and int(health["unresolved_source_date_prior"] or 0) > 0
+        and int(health["unresolved_source_date_current"] or 0) == 0
+        and int(health["unresolved_source_date_other_or_unknown"] or 0) == 0
+        and isinstance(result, dict)
+        and result.get("ok") is True and not result.get("degraded")
+        and result.get("historical_recovery_executed") is True
+        and result.get("current_only_fresh_broker_proven") is True
+        and result.get("frozen_contract_invariant_violations", 0) == 0
+        and not result.get("unresolved_broker_activity")
+        and not result.get("holdings_error")
+        and not broker_reconcile_guard_blocks(result)
+    )
     success = bool(
-        isinstance(result, dict) and result.get("ok") is True
+        dated and int(health["unresolved_source_date_prior"] or 0) == 0
+        and int(health["unresolved_source_date_current"] or 0) == 0
+        and int(health["unresolved_source_date_other_or_unknown"] or 0) == 0
+        and isinstance(result, dict) and result.get("ok") is True
         and not result.get("degraded")
         and result.get("frozen_contract_invariant_violations", 0) == 0
         # A successfully repaired historical position is still a successful
@@ -204,6 +246,13 @@ def record_historical_result(
             conn.execute(sa.update(table).where(table.c.job_key == lane.job_key).values(
                 updated_ts=datetime.now(timezone.utc), payload=current,
             ))
+        # The marker is issued only AFTER the DB transaction committed.
+        # A failed journal write must not authorize BUY based on an in-memory
+        # inference. Failed historical economics remain unresolved.
+        if isinstance(result, dict):
+            result["historical_debt_only_recorded"] = bool(
+                history_debt_only and not success
+            )
         logger.info("[KR_HIST_RECOVERY][RESULT] state=%s key=%s", current["status"], lane.job_key)
         return success
     except Exception as exc:
