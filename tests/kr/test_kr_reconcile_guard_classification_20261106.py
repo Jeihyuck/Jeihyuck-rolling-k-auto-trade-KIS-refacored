@@ -36,12 +36,20 @@ def test_current_tick_allows_only_healthy_claims_and_normal_holdings():
         "holdings_error": None,
         "historical_repair_fastpath": True,
         "historical_recovery_executed": False,
+        "current_only_fresh_broker_proven": True,
         "frozen_contract_invariant_violations": 0,
         "unresolved_broker_activity": False,
         "degraded": None,
     }
     assert current_tick_reconcile_proves_buy_safe(
         lane=lane, result=proof, durable_record_ok=True
+    )
+    # Historical imported-cycle parity can remain false without globally
+    # contaminating an unrelated current-day order.
+    assert current_tick_reconcile_proves_buy_safe(
+        lane=lane,
+        result={**proof, "historical_repair_fastpath": False},
+        durable_record_ok=True,
     )
     for change in (
         {"degraded": "KIS_DAILY_CCLD_TIMEOUT"},
@@ -50,7 +58,7 @@ def test_current_tick_allows_only_healthy_claims_and_normal_holdings():
         {"frozen_contract_invariant_violations": 1},
         {"guard_reason": "unresolved_broker_activity"},
         {"holdings": 0},
-        {"historical_repair_fastpath": False},
+        {"current_only_fresh_broker_proven": False},
     ):
         assert not current_tick_reconcile_proves_buy_safe(
             lane=lane, result={**proof, **change}, durable_record_ok=True
