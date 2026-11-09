@@ -19,6 +19,34 @@ def broker_reconcile_guard_blocks(result: Mapping[str, Any] | None) -> bool:
     if not reason:
         return False
     if reason == "kis_has_holdings":
+        # FULL AM recovery can find an old, exactly dated unresolved claim.
+        # It is not today's missing KIS balance. Only a fresh authenticated
+        # current broker snapshot and a complete, scoped prior-only origin
+        # breakdown can make this a purge-only reason. The historical journal
+        # still records UNRESOLVED; the same-order fence remains active.
+        health = result.get("execution_claim_health")
+        prior_only = False
+        if (
+            result.get("historical_recovery_executed") is True
+            and result.get("current_only_fresh_broker_proven") is True
+            and isinstance(health, Mapping)
+            and health.get("available") is True
+        ):
+            fields = (
+                "unresolved_execution_actions",
+                "unresolved_source_date_current",
+                "unresolved_source_date_prior",
+                "unresolved_source_date_other_or_unknown",
+            )
+            try:
+                if all(k in health and type(health[k]) is int for k in fields):
+                    total, current, prior, unknown = (health[k] for k in fields)
+                    prior_only = bool(
+                        total == prior and prior > 0
+                        and current == 0 and unknown == 0
+                    )
+            except (TypeError, ValueError):
+                prior_only = False
         # Only the direct presence of a valid broker holdings snapshot
         # can establish this as a purge-only reason; never allow spoofed
         # stale/corrupt/missing balance evidence to bypass the claim gates.
@@ -35,6 +63,7 @@ def broker_reconcile_guard_blocks(result: Mapping[str, Any] | None) -> bool:
                     result.get("historical_recovery_executed") is False
                     and result.get("current_only_fresh_broker_proven") is True
                 )
+                and not prior_only
             )
         )
     return True
