@@ -9,16 +9,33 @@ def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
                                 fill_price: float|None = None,
                                 fill_qty: int|None = None,
                                 broker_avg_after: float|None = None,
-                                close_avg_price: float|None = None) -> dict:
-    """Join KR infinite order, fill, and balance-average evidence."""
-    # A post-trade BUY cost basis is NOT evidence of the execution price
-    # of this SELL. Compare the persisted order limit with the price of the
-    # same broker execution. No priced fill -> UNVERIFIED, never a false OK.
+                                close_avg_price: float|None = None,
+                                order_side: str = "",
+                                order_is_market: bool = False) -> dict:
+    """Compare the original order's economic constraints to its own KIS fill.
+
+    KR_INFINITE sells are MARKET orders, not limit sells: an indicative
+    decision price is not a limit bound. No difference from the original
+    BUY average can prove a SELL-price mismatch. A LIMIT BUY may execute
+    favorably below its limit; only an adverse violation is a mismatch.
+    A missing native fill price is UNVERIFIED in either lane.
+    """
     base = float(order_price or 0)
     execution = float(fill_price or 0)
-    priced_proof = base > 0 and execution > 0
-    price_gap = abs(base - execution) / base if priced_proof else 0.0
-    mismatch = priced_proof and price_gap >= 0.01
+    priced_proof = execution > 0 and (order_is_market or base > 0)
+    side = str(order_side or "").upper()
+    if not priced_proof:
+        price_gap = 0.0
+    elif order_is_market:
+        price_gap = 0.0  # No order limit exists, hence no comparable price gap.
+    elif side.startswith("BUY"):
+        price_gap = max(0.0, execution - base) / base
+    elif side.startswith("SELL"):
+        price_gap = max(0.0, base - execution) / base
+    else:
+        # Compatibility for callers without a side; NEVER compare cost basis.
+        price_gap = abs(base - execution) / base
+    mismatch = priced_proof and not order_is_market and price_gap >= 0.01
     status = (
         "KR_INF_ORDER_FILL_PRICE_UNVERIFIED" if not priced_proof
         else "KR_INF_ORDER_FILL_PRICE_MISMATCH" if mismatch
@@ -33,7 +50,10 @@ def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
         "broker_avg_after": broker_avg_after,
         "close_avg_price": close_avg_price,
         "reconciliation_status": status,
-        "price_comparison_basis": "PERSISTED_LIMIT_VS_KIS_EXECUTION",
+        "price_comparison_basis": (
+            "MARKET_ORDER_NATIVE_FILL_ONLY" if order_is_market
+            else "PERSISTED_LIMIT_VS_KIS_EXECUTION"
+        ),
         "price_mismatch_pct": price_gap,
         "warning": None if status == "OK" else status,
     }
