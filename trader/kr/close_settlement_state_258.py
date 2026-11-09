@@ -67,4 +67,5 @@ def audit_close_priced_sell_evidence(*, engine, env: str, day: date) -> dict[str
     if not epoch:
         raise RuntimeError("KR_CLOSE_SETTLEMENT_ACTIVE_EPOCH_REQUIRED")
     snapshot = load_snapshot(engine, env=env, epoch=str(epoch), day=day)
-    return audit_sell_settlement(**snapshot)
+    from scripts.kr_close_settlement_audit import audit_sell_settlement_by_day
+    return audit_sell_settlement_by_day(**snapshot, trade_date=day)
