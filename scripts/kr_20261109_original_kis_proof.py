@@ -53,6 +53,24 @@ def _safe_qty(value: Any) -> int | None:
         return None
 
 
+def _original_order_day(row: Mapping[str, Any]) -> date | None:
+    """Resolve the broker submission's calendar day without guessing timezone."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    # submitted_at is the actual original order submission boundary. Prefer
+    # that over a later DB reconciliation timestamp or an imported position.
+    stamp = row.get("submitted_at") or row.get("acked_at") or row.get("created_at")
+    if isinstance(stamp, str):
+        try:
+            stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(stamp, datetime) or stamp.tzinfo is None:
+        return None
+    return stamp.astimezone(ZoneInfo("Asia/Seoul")).date()
+
+
 def _match_db_source(
     target: Target, *, scoped_orders: list[Mapping[str, Any]],
     infinite_intents: list[Mapping[str, Any]], active_epoch: str,
@@ -64,6 +82,7 @@ def _match_db_source(
             if str(row.get("trading_epoch_id") or "") == active_epoch
             and str(row.get("account_id") or "") == active_account
             and str(row.get("strategy") or "") == "pb1_pullback_close"
+            and _original_order_day(row) == target.trade_date
             and str(row.get("code") or "").zfill(6) == target.code
             and str(row.get("side") or "").upper() == target.side
             and str(row.get("kis_odno") or "").zfill(10) == target.odno
@@ -221,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
                     schema.orders.c.code, schema.orders.c.side,
                     schema.orders.c.qty, schema.orders.c.kis_odno,
                     schema.orders.c.strategy, schema.orders.c.trading_epoch_id,
+                    schema.orders.c.created_at, schema.orders.c.submitted_at,
+                    schema.orders.c.acked_at,
                     schema.orders.c.position_cycle_id, schema.orders.c.portfolio_epoch_id,
                     schema.portfolio_epochs.c.account_id,
                 ).join(
