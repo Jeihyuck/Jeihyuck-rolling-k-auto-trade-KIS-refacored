@@ -222,7 +222,7 @@ def _record_execution_claim_observation(
 def _execution_claim_health(
     orders_repo: OrdersRepo, *, market: str | None = None,
     env: str | None = None, account_id: str | None = None,
-    trading_epoch_id: str | None = None,
+    trading_epoch_id: str | None = None, trade_date: date | None = None,
 ) -> dict[str, Any]:
     filters: dict[str, str | None] = {"market": market}
     # Preserve backwards compatibility for legacy diagnostics that have no
@@ -233,6 +233,8 @@ def _execution_claim_health(
     ):
         if value is not None:
             filters[key] = value
+    if trade_date is not None:
+        filters["trade_date"] = trade_date
     try:
         return {
             "available": True,
@@ -253,9 +255,22 @@ def _execution_claim_integrity_reason(
         return "execution_claim_observation_failed"
     if not health.get("available"):
         return "execution_claim_health_unavailable"
-    if int(health.get("unresolved_execution_actions") or 0) > 0:
-        return "unresolved_execution_actions"
-    return None
+    total = int(health.get("unresolved_execution_actions") or 0)
+    if total <= 0:
+        return None
+    # The durable health API reports the original trade_date of each claim.
+    # Historical debt is still reported, but it is not a new-day account-wide
+    # BUY veto. Exact-order/current-day duplicate fences remain independent.
+    expected_keys = (
+        "unresolved_source_date_current", "unresolved_source_date_prior",
+        "unresolved_source_date_other_or_unknown",
+    )
+    if not all(k in health for k in expected_keys):
+        return "unresolved_execution_actions"  # No proven date breakdown.
+    current, prior, unknown = (int(health[k] or 0) for k in expected_keys)
+    if min(current, prior, unknown) < 0 or current + prior + unknown != total:
+        return "execution_claim_date_breakdown_invalid"
+    return "unresolved_execution_actions_current_or_unscoped" if current or unknown else None
 
 
 def _project_pb1_exit_stage_truth(
@@ -2679,7 +2694,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             if claim_epoch_id else {}
         )
         execution_claim_health = _execution_claim_health(
-            orders_repo, market="KR", **claim_scope,
+            orders_repo, market="KR", trade_date=now_kst().date(),
+            **claim_scope,
         )
     except Exception as exc:
         logger.error(
@@ -2916,12 +2932,17 @@ def reconcile_kis(
     restored = 0
     if not historical_recovery:
         logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=CURRENT_ORDERS_ONLY")
-        if not repair_fastpath:
-            # Today's order source can be reconciled safely, but an unknown
-            # account-wide holding/claim parity cannot license another BUY.
+        # Legacy imported historical positions may disagree with current broker
+        # quantity forever. They are disclosed at AM/CLOSE, not a per-tick
+        # account-wide veto. A fresh authenticated KIS balance is still
+        # mandatory for new orders and every exact-order fence remains live.
+        reconcile_result["current_only_fresh_broker_proven"] = bool(
+            fresh_balance_proven and not holdings_error
+        )
+        if not reconcile_result["current_only_fresh_broker_proven"]:
             reconcile_result["ok"] = False
-            reconcile_result["reason"] = "CURRENT_ONLY_ACCOUNT_PARITY_NOT_PROVEN"
-            reconcile_result["degraded"] = "CURRENT_ONLY_ACCOUNT_PARITY_NOT_PROVEN"
+            reconcile_result["reason"] = "CURRENT_ONLY_FRESH_BROKER_UNVERIFIED"
+            reconcile_result["degraded"] = "CURRENT_ONLY_FRESH_BROKER_UNVERIFIED"
     elif repair_fastpath:
         logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=EXACT_BROKER_ACTIVE_CYCLE_PARITY")
     elif reset_mode:
@@ -3074,6 +3095,12 @@ def reconcile_kis(
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "current_only_fresh_broker_proven": bool(
+                fresh_balance_proven and not holdings_error
+            ),
+            "historical_unresolved_claims": int(
+                execution_claim_health.get("unresolved_source_date_prior") or 0
+            ),
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
@@ -3094,6 +3121,12 @@ def reconcile_kis(
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "current_only_fresh_broker_proven": bool(
+                fresh_balance_proven and not holdings_error
+            ),
+            "historical_unresolved_claims": int(
+                execution_claim_health.get("unresolved_source_date_prior") or 0
+            ),
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
@@ -3130,11 +3163,12 @@ def reconcile_kis(
                     recovery_scope.account_key.encode("utf-8")
                 ).hexdigest(),
                 trading_epoch_id=recovery_scope.trading_epoch_id,
+                trade_date=tick_ts.date(),
             )
         else:
             # Diagnostic/legacy fixtures only. Canonical WSL KR always enforces.
             execution_claim_health = _execution_claim_health(
-                orders_repo, market="KR",
+                orders_repo, market="KR", trade_date=tick_ts.date(),
             )
     except Exception as exc:
         logger.error(
