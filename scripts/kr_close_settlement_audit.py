@@ -191,6 +191,74 @@ def audit_sell_settlement(
     }
 
 
+
+def _order_trade_day(order: dict) -> date | None:
+    """Classify an order's original trading day, not its reconciliation time.
+
+    A missing source timestamp stays UNKNOWN; it must never be counted as
+    a confirmed *today* trade. In practice original order creation timestamps
+    are durable and independent of the later CLOSE audit.
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    value = order.get("created_at")
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str):
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if stamp.tzinfo is None:
+        return None  # Never guess whether a naive timestamp is UTC or KST.
+    return stamp.astimezone(ZoneInfo("Asia/Seoul")).date()
+
+
+def audit_sell_settlement_by_day(
+    *, orders: list[dict], fills: list[dict], positions: list[dict],
+    trade_date: date,
+) -> dict[str, Any]:
+    """Expose today versus historical economic gaps without masking either.
+
+    The original all-epoch result remains authoritative for overall economic
+    settlement. This is a read-only reporting split, not an order permission.
+    """
+    original = audit_sell_settlement(orders=orders, fills=fills, positions=positions)
+    today_orders, historical_orders, unknown_orders = [], [], []
+    for order in orders:
+        order_day = _order_trade_day(order)
+        if order_day == trade_date:
+            today_orders.append(order)
+        elif order_day is not None and order_day < trade_date:
+            historical_orders.append(order)
+        else:
+            # Future and unprovable date are never silently marked settled.
+            unknown_orders.append(order)
+    today = audit_sell_settlement(orders=today_orders, fills=fills, positions=positions)
+    historical = audit_sell_settlement(
+        orders=historical_orders, fills=fills, positions=positions,
+    )
+    unknown = audit_sell_settlement(orders=unknown_orders, fills=fills, positions=positions)
+    if (
+        original["gap_count"] !=
+        today["gap_count"] + historical["gap_count"] + unknown["gap_count"]
+    ):
+        raise RuntimeError("KR_CLOSE_SETTLEMENT_PARTITION_NOT_EXHAUSTIVE")
+    return {
+        **original,
+        "trade_date": trade_date.isoformat(),
+        "today_settlement": today,
+        "historical_settlement_debt": historical,
+        "unknown_source_day_settlement": unknown,
+        "today_priced_sell_gap_count": today["gap_count"],
+        "historical_priced_sell_gap_count": historical["gap_count"],
+        "unknown_source_day_gap_count": unknown["gap_count"],
+    }
+
+
 def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict[str, list[dict]]:
     if not epoch or not day:
         raise ValueError("Trading epoch and local trade date are mandatory")
@@ -201,7 +269,7 @@ def load_snapshot(engine: sa.Engine, *, env: str, epoch: str, day: date) -> dict
     with engine.connect() as conn:
         orders = [dict(x) for x in conn.execute(text("""
             SELECT order_id, code, side, status, qty, kis_odno,
-                   position_cycle_id, response_json
+                   position_cycle_id, response_json, created_at
             FROM public.orders
             WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
               AND created_at < :end_utc
@@ -249,9 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     from trader.db.engine import get_engine
     engine = get_engine()
-    report = audit_sell_settlement(**load_snapshot(
+    report = audit_sell_settlement_by_day(**load_snapshot(
         engine, env=args.env, epoch=args.epoch, day=date.fromisoformat(args.trade_date),
-    ))
+    ), trade_date=date.fromisoformat(args.trade_date))
     print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     return 0 if report["gap_count"] == 0 else 2
 
