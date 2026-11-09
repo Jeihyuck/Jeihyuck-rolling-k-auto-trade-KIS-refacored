@@ -50,7 +50,7 @@ def test_single_owner_then_durable_complete_after_restart(pg_lane):
     engine, scope = pg_lane
     first = _select(engine)
     assert first.mode == "FULL" and first.fencing_token
-    assert _select(engine).mode == "CURRENT_ONLY_BLOCK"
+    assert _select(engine).mode == "CURRENT_ONLY"
     assert journal.record_historical_result(engine=engine, lane=first, result=_success())
     assert _select(engine).mode == "CURRENT_ONLY"
     # An old nonce is fenced even after the exact broker evidence is recorded.
@@ -59,14 +59,14 @@ def test_single_owner_then_durable_complete_after_restart(pg_lane):
     assert _select(engine).mode == "FULL"
 
 
-def test_unverified_full_result_never_authorizes_future_buy(pg_lane):
+def test_unverified_full_result_requires_fresh_current_buy_proof(pg_lane):
     engine, _ = pg_lane
     first = _select(engine)
     assert first.mode == "FULL"
     assert not journal.record_historical_result(
         engine=engine, lane=first, result={"ok": True, "historical_repair_fastpath": False},
     )
-    assert _select(engine).mode == "CURRENT_ONLY_BLOCK"
+    assert _select(engine).mode == "CURRENT_ONLY"
 
 
 def test_concurrent_journal_claims_only_one_full_recovery(pg_lane):
@@ -74,7 +74,7 @@ def test_concurrent_journal_claims_only_one_full_recovery(pg_lane):
     with ThreadPoolExecutor(max_workers=5) as pool:
         modes = list(pool.map(lambda _: _select(engine).mode, range(5)))
     assert modes.count("FULL") == 1
-    assert modes.count("CURRENT_ONLY_BLOCK") == 4
+    assert modes.count("CURRENT_ONLY") == 4
 
 
 def test_independent_am_and_close_only_one_each(pg_lane):
@@ -114,4 +114,4 @@ def test_close_failed_does_not_mark_completed(pg_lane):
         engine=engine, kis=object(), env="practice",
         strategy="pb1_pullback_close", trading_date=date(2026, 11, 6),
         lane_name="CLOSE",
-    ).mode == "CURRENT_ONLY_BLOCK"
+    ).mode == "CURRENT_ONLY"
