@@ -2147,7 +2147,9 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             and side == "BUY"
             and source_order
             and request_json.get("enforce_entry_contract") is True
-            and incremental_daily_qty > 0
+            # Even if holdings previously promoted all shares, a late KIS
+            # priced fill must be persisted BEFORE finalizing the claim.
+            # Otherwise a failed price-only upsert can leave SATISFIED+fills=0.
             and filled_qty
             and filled_price is not None
         )
