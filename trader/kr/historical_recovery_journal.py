@@ -78,9 +78,9 @@ def choose_historical_lane(
     try:
         scope = resolve_kr_recovery_scope(engine=engine, env=env, kis=kis)
         if scope is None or not scope.account_key or not scope.trading_epoch_id:
-            return RecoveryLane("LEGACY", reason="EPOCH_SCOPE_UNPROVEN")
+            return RecoveryLane("CURRENT_ONLY_BLOCK", reason="EPOCH_SCOPE_UNPROVEN")
         if engine.dialect.name != "postgresql":
-            return RecoveryLane("LEGACY", reason="NO_POSTGRES_ADVISORY_PROOF")
+            return RecoveryLane("CURRENT_ONLY_BLOCK", reason="NO_POSTGRES_ADVISORY_PROOF")
         key = _key(scope=scope, strategy=strategy, trading_date=trading_date, lane_name=lane_name)
         table = schema_for_engine(engine).job_checkpoints
         nonce = str(uuid4())
@@ -104,7 +104,11 @@ def choose_historical_lane(
                     return RecoveryLane("CURRENT_ONLY", key, reason="FULL_RECOVERY_DURABLY_PROVEN")
                 return RecoveryLane("CURRENT_ONLY_BLOCK", key, reason="COMPLETION_PROOF_INVALID")
             if status in {"CHECKING", "UNRESOLVED"}:
-                return RecoveryLane("CURRENT_ONLY_BLOCK", key, reason=status)
+                # One AM/CLOSE attempt only. A failed old execution remains
+                # visible in the journal, never replays on every trading tick.
+                # Today's independent orders still require fresh broker and
+                # exact-order duplicate proofs; the old order stays fenced.
+                return RecoveryLane("CURRENT_ONLY", key, reason="HISTORICAL_" + status)
             # A single claimant moves PENDING -> CHECKING atomically.
             conn.execute(
                 sa.update(table).where(table.c.job_key == key).values(
@@ -123,10 +127,10 @@ def choose_historical_lane(
     except Exception as exc:
         # Error reading/writing journal cannot authorize skipping recovery.
         logger.error(
-            "[KR_HIST_RECOVERY][JOURNAL_FAIL] type=%s action=LEGACY_FULL_NO_SKIP",
+            "[KR_HIST_RECOVERY][JOURNAL_FAIL] type=%s action=CURRENT_ONLY_BLOCK_NO_RETRY",
             type(exc).__name__, exc_info=True,
         )
-        return RecoveryLane("LEGACY", reason="JOURNAL_UNAVAILABLE")
+        return RecoveryLane("CURRENT_ONLY_BLOCK", reason="JOURNAL_UNAVAILABLE")
 
 
 
@@ -150,8 +154,8 @@ def current_tick_reconcile_proves_buy_safe(
         and result.get("frozen_contract_invariant_violations") == 0
         and result.get("historical_recovery_executed") is lane.historical_recovery
         and (
-            lane.historical_recovery
-            or result.get("historical_repair_fastpath") is True
+            lane.historical_recovery or
+            result.get("current_only_fresh_broker_proven") is True
         )
     )
 
