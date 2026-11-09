@@ -2137,8 +2137,22 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 atomic_release = None
                 atomic_writer_active = False
 
+        # A priced native BUY claim must not become SATISFIED before its
+        # fill and exact-cycle position are durable. Previously, claim
+        # observation ran first: a subsequent fills.upsert_fill SQL error
+        # could leave SATISFIED with zero priced fills (2026-10-29 Mico).
+        # Other observations and atomic-writer claims keep their own lanes.
+        defer_priced_buy_claim = bool(
+            not atomic_writer_active
+            and side == "BUY"
+            and source_order
+            and request_json.get("enforce_entry_contract") is True
+            and incremental_daily_qty > 0
+            and filled_qty
+            and filled_price is not None
+        )
         observation_error = None
-        if not atomic_writer_active:
+        if not atomic_writer_active and not defer_priced_buy_claim:
             observation_error = _record_execution_claim_observation(
                 orders_repo=orders_repo,
                 source_order=source_order,
@@ -2412,6 +2426,25 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         filled_at=order_time,
                         pre_order_avg_buy_price=_to_float(request_json.get("pre_order_avg_buy_price")),
                         pre_order_stop_price=_to_float(request_json.get("pre_order_stop_price")),
+                    )
+            if defer_priced_buy_claim:
+                # Reached only after native fill persistence and the
+                # original BUY's position application have both succeeded.
+                observation_error = _record_execution_claim_observation(
+                    orders_repo=orders_repo,
+                    source_order=source_order,
+                    broker_status=status,
+                    cumulative_filled_qty=claim_filled_qty,
+                    requested_qty=_to_int((source_order or {}).get("qty")) or qty,
+                )
+                if observation_error:
+                    execution_claim_observation_failures.append(
+                        {
+                            "client_order_key": str(
+                                (source_order or {}).get("client_order_key") or ""
+                            ),
+                            "error": observation_error,
+                        }
                     )
             # Reconstruct cumulative economics from *all* exactly attributed
             # KIS execution rows. This handles the case where holdings
