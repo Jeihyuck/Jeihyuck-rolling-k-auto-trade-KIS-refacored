@@ -3099,7 +3099,9 @@ def reconcile_kis(
                 fresh_balance_proven and not holdings_error
             ),
             "historical_unresolved_claims": int(
-                execution_claim_health.get("unresolved_source_date_prior") or 0
+                (reconcile_result.get("execution_claim_health") or {}).get(
+                    "unresolved_source_date_prior"
+                ) or 0
             ),
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
@@ -3125,7 +3127,9 @@ def reconcile_kis(
                 fresh_balance_proven and not holdings_error
             ),
             "historical_unresolved_claims": int(
-                execution_claim_health.get("unresolved_source_date_prior") or 0
+                (reconcile_result.get("execution_claim_health") or {}).get(
+                    "unresolved_source_date_prior"
+                ) or 0
             ),
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
