@@ -143,7 +143,20 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
   timeout --kill-after=30s "${KR_AM_SESSION_TIMEOUT_SEC}" python -m trader.kr.runner.trade_session_runner --session am --env "$STRATEGY_ENV"
   rc=$?
   set -e
-  elapsed_sec=$(( $(date +%s) - start_epoch ))
+  child_end_epoch=$(date +%s)
+  elapsed_sec=$(( child_end_epoch - start_epoch ))
+  # The synchronous AM child has returned and this WSL wrapper still holds
+  # the exclusive lock. Terminalize only this child's unfinished run-ledger
+  # records, never broker orders/fills/positions. A SIGKILL of the wrapper
+  # itself cannot be repaired here: the next start must use stale takeover.
+  if [[ "${KIS_ENV:-}" == "practice" && "${STRATEGY_ENV:-}" == "practice" && "${LOCK_DELEGATED:-0}" != "1" ]]; then
+    python -m scripts.kr_20261109_am_child_run_finalizer \
+      --env practice --start-epoch "$start_epoch" --end-epoch "$child_end_epoch" \
+      --child-rc "$rc" --exclusive-wrapper-lock --child-returned \
+      || echo "[KR_AM][RUN_TERMINALIZE][FAIL] reason=DB_OR_SCOPE_UNAVAILABLE rc=$rc"
+  else
+    echo "[KR_AM][RUN_TERMINALIZE][SKIP] reason=UNPROVEN_EXCLUSIVE_LOCK_OR_NON_PRACTICE"
+  fi
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
     LAST_STAGE_FILE="runtime/state/kr/session_last_stage_am.json"
     LAST_STAGE=""
