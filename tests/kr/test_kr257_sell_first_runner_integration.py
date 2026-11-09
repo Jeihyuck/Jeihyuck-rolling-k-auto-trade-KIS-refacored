@@ -70,13 +70,21 @@ return reconcile_result
 
 
 class FakeKis:
-    def __init__(self, balance):
+    def __init__(self, balance, *, original_fetch_proven=True):
         self.balance = balance
         self.refreshes = 0
+        self.original_fetch_proven = original_fetch_proven
+        self._balance_cache_at = None
 
     def get_balance_cached(self, *, force):
         assert force is True
         self.refreshes += 1
+        # This fake must emulate the real KIS wrapper: original HTTP fetch
+        # provenance is separate from the balance dictionary itself.
+        self._balance_cache_at = (
+            datetime(2026, 10, 26, 9, 46, tzinfo=KST)
+            if self.original_fetch_proven else None
+        )
         return copy.deepcopy(self.balance)
 
 
@@ -93,11 +101,11 @@ def _account_balance(quantity=12, leverage_quantity=7):
 def _call_real_runner_fragment(
     monkeypatch, *, post_exact=True, pre_exact=False, sell_only=True,
     post_balance=None, pre_balance=None, attempt=0, blocked=0,
-    reset=False, exit_ok=True,
+    reset=False, exit_ok=True, original_fetch_proven=True,
 ):
     before = pre_balance or _account_balance()
     after = post_balance or _account_balance()
-    kis = FakeKis(after)
+    kis = FakeKis(after, original_fetch_proven=original_fetch_proven)
     full_calls = []
     summaries = dict(
         holdings=1, checked=1, submit_attempt_count=attempt,
@@ -187,4 +195,25 @@ def test_actual_runner_never_skips_with_no_pre_exit_authorization(monkeypatch):
     assert len(calls) == 1
     assert len(proofs) == 0
     assert kis.refreshes == 0
+    assert result["status"] == "FULL_DONE"
+
+
+def test_real_runner_no_original_kis_fetch_timestamp_falls_back_to_full(monkeypatch):
+    # A local time stamp is NOT valid broker freshness evidence.
+    result, calls, proofs, kis, runner, writes = _call_real_runner_fragment(
+        monkeypatch, original_fetch_proven=False,
+    )
+    assert len(calls) == 1
+    assert len(proofs) == 0
+    assert kis.refreshes == 1
+    assert result["status"] == "FULL_DONE"
+    assert "two_sided_exact_proof_skip_historical_reconcile" not in writes
+
+
+def test_real_runner_after_sell_no_original_fetch_timestamp_blocks_new_buy(monkeypatch):
+    result, calls, proofs, kis, runner, _ = _call_real_runner_fragment(
+        monkeypatch, attempt=1, original_fetch_proven=False,
+    )
+    assert len(calls) == 1
+    assert runner._kr_post_exit_reconcile_ok is False
     assert result["status"] == "FULL_DONE"
