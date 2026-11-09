@@ -45,6 +45,7 @@ class OrderIntent:
     filled_notional_krw: float = 0
     unit_sequence: int|None = None
     metadata: dict[str, Any]=field(default_factory=dict)
+    limit_price: float|None = None  # Persisted intent price, not a live quote.
 
 @dataclass(frozen=True)
 class BrokerOrderState:
