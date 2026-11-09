@@ -222,7 +222,7 @@ def _record_execution_claim_observation(
 def _execution_claim_health(
     orders_repo: OrdersRepo, *, market: str | None = None,
     env: str | None = None, account_id: str | None = None,
-    trading_epoch_id: str | None = None,
+    trading_epoch_id: str | None = None, trade_date: date | None = None,
 ) -> dict[str, Any]:
     filters: dict[str, str | None] = {"market": market}
     # Preserve backwards compatibility for legacy diagnostics that have no
@@ -233,6 +233,13 @@ def _execution_claim_health(
     ):
         if value is not None:
             filters[key] = value
+    # Only an authenticated account+epoch scope can make origin-date
+    # classification a safe trading decision. Legacy/offline diagnostic
+    # mocks deliberately retain the old market-only health signature.
+    if trade_date is not None and all(filters.get(k) for k in (
+        "env", "account_id", "trading_epoch_id"
+    )):
+        filters["trade_date"] = trade_date
     try:
         return {
             "available": True,
@@ -253,9 +260,22 @@ def _execution_claim_integrity_reason(
         return "execution_claim_observation_failed"
     if not health.get("available"):
         return "execution_claim_health_unavailable"
-    if int(health.get("unresolved_execution_actions") or 0) > 0:
-        return "unresolved_execution_actions"
-    return None
+    total = int(health.get("unresolved_execution_actions") or 0)
+    if total <= 0:
+        return None
+    # The durable health API reports the original trade_date of each claim.
+    # Historical debt is still reported, but it is not a new-day account-wide
+    # BUY veto. Exact-order/current-day duplicate fences remain independent.
+    expected_keys = (
+        "unresolved_source_date_current", "unresolved_source_date_prior",
+        "unresolved_source_date_other_or_unknown",
+    )
+    if not all(k in health for k in expected_keys):
+        return "unresolved_execution_actions"  # No proven date breakdown.
+    current, prior, unknown = (int(health[k] or 0) for k in expected_keys)
+    if min(current, prior, unknown) < 0 or current + prior + unknown != total:
+        return "execution_claim_date_breakdown_invalid"
+    return "unresolved_execution_actions" if current or unknown else None
 
 
 def _project_pb1_exit_stage_truth(
@@ -2728,7 +2748,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             if claim_epoch_id else {}
         )
         execution_claim_health = _execution_claim_health(
-            orders_repo, market="KR", **claim_scope,
+            orders_repo, market="KR", trade_date=now_kst().date(),
+            **claim_scope,
         )
     except Exception as exc:
         logger.error(
@@ -2808,7 +2829,12 @@ def reconcile_kis(
     tick_ts: datetime,
     balance_snapshot: dict | None = None,
     runtime_dir: str | None = None,
+    historical_recovery: bool = True,
 ) -> dict[str, object]:
+    # CURRENT_ONLY reconciles today's actual KIS originals/fills and verifies
+    # current account truth; it NEVER repairs historical BUYs/positions/meta.
+    # The calling lane must prove a durable same-account/epoch full recovery
+    # before using this mode for any new BUY.
     reconcile_run_id = _resolve_reconcile_run_id(
         engine,
         run_id,
@@ -2867,15 +2893,13 @@ def reconcile_kis(
     fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
     _kr_promotion_started = time.monotonic()
-    promoted = _promote_open_buy_orders_from_holdings(
-        env=env,
-        strategy=strategy,
-        ctx_run_id=reconcile_run_id,
-        tick_ts=tick_ts,
-        holdings_rows=holdings_rows,
-        orders_repo=orders_repo,
-        fills_repo=fills_repo,
-        positions_repo=positions_repo,
+    promoted = (
+        _promote_open_buy_orders_from_holdings(
+            env=env, strategy=strategy, ctx_run_id=reconcile_run_id,
+            tick_ts=tick_ts, holdings_rows=holdings_rows,
+            orders_repo=orders_repo, fills_repo=fills_repo,
+            positions_repo=positions_repo,
+        ) if historical_recovery else {"orders": 0, "fills": 0, "codes": []}
     )
     logger.info(
         "[KR_RECONCILE][PROMOTION_AFTER_BROKER] elapsed_ms=%.1f",
@@ -2910,7 +2934,7 @@ def reconcile_kis(
     # P1: restore exact source BUY lifecycle before any historical holdings
     # import or exit-policy evaluation. Only fresh KIS holdings + unique BUY
     # order + broker-satisfied PB1 claim + verified SHA authorize recovery.
-    if not reset_mode and fresh_balance_proven:
+    if historical_recovery and not reset_mode and fresh_balance_proven:
         try:
             from trader.kr.frozen_contract_recovery_260 import restore_verified_imported_buy_contracts
             recovered_contracts = restore_verified_imported_buy_contracts(
@@ -2960,7 +2984,20 @@ def reconcile_kis(
                 int(repair_fastpath), repair_fastpath_reason, int(fresh_balance_proven))
     _kr_history_started = time.monotonic()
     restored = 0
-    if repair_fastpath:
+    if not historical_recovery:
+        logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=CURRENT_ORDERS_ONLY")
+        # Legacy imported historical positions may disagree with current broker
+        # quantity forever. They are disclosed at AM/CLOSE, not a per-tick
+        # account-wide veto. A fresh authenticated KIS balance is still
+        # mandatory for new orders and every exact-order fence remains live.
+        reconcile_result["current_only_fresh_broker_proven"] = bool(
+            fresh_balance_proven and not holdings_error
+        )
+        if not reconcile_result["current_only_fresh_broker_proven"]:
+            reconcile_result["ok"] = False
+            reconcile_result["reason"] = "CURRENT_ONLY_FRESH_BROKER_UNVERIFIED"
+            reconcile_result["degraded"] = "CURRENT_ONLY_FRESH_BROKER_UNVERIFIED"
+    elif repair_fastpath:
         logger.info("[KR_RECONCILE][HISTORICAL_REPAIR][SKIP] reason=EXACT_BROKER_ACTIVE_CYCLE_PARITY")
     elif reset_mode:
         allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
@@ -3025,7 +3062,9 @@ def reconcile_kis(
     # [2026-05-21] entry meta 복원 (KIS holdings 복구 포지션 대상)
     meta_restored = 0
     try:
-        if repair_fastpath:
+        if not historical_recovery:
+            logger.info("[KR_RECONCILE][META_RESTORE][SKIP] reason=CURRENT_ORDERS_ONLY")
+        elif repair_fastpath:
             logger.info("[KR_RECONCILE][META_RESTORE][SKIP] reason=FROZEN_CONTRACT_ALREADY_VERIFIED")
         else:
             ledger_repo = LedgerEventsRepo(engine)
@@ -3042,8 +3081,9 @@ def reconcile_kis(
     except Exception as _meta_exc:
         logger.warning("[RECONCILE][META_RESTORE][SKIP] err=%s", _meta_exc)
 
-    logger.info("[KR_RECONCILE][HISTORICAL_REPAIR] elapsed_ms=%.1f skipped=%s",
-                1000 * (time.monotonic() - _kr_history_started), int(repair_fastpath))
+    logger.info("[KR_RECONCILE][HISTORICAL_REPAIR] elapsed_ms=%.1f skipped=%s current_only=%s",
+                1000 * (time.monotonic() - _kr_history_started),
+                int(repair_fastpath or not historical_recovery), int(not historical_recovery))
     guard_result = None
     guard_reason = None
     allow_purge = None
@@ -3103,11 +3143,20 @@ def reconcile_kis(
             "holdings": len(holdings_rows),
             "restored_positions": restored,
             "historical_repair_fastpath": repair_fastpath,
+            "historical_recovery_executed": bool(historical_recovery),
             "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "current_only_fresh_broker_proven": bool(
+                fresh_balance_proven and not holdings_error
+            ),
+            "historical_unresolved_claims": int(
+                (reconcile_result.get("execution_claim_health") or {}).get(
+                    "unresolved_source_date_prior"
+                ) or 0
+            ),
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
@@ -3122,11 +3171,20 @@ def reconcile_kis(
             "filled_codes": refresh_codes,
             "restored_positions": restored,
             "historical_repair_fastpath": repair_fastpath,
+            "historical_recovery_executed": bool(historical_recovery),
             "historical_repair_reason": repair_fastpath_reason,
             "account_key": account_key,
             "masked_account": masked_account,
             "reset_mode": reset_mode,
             "holdings_error": holdings_error,
+            "current_only_fresh_broker_proven": bool(
+                fresh_balance_proven and not holdings_error
+            ),
+            "historical_unresolved_claims": int(
+                (reconcile_result.get("execution_claim_health") or {}).get(
+                    "unresolved_source_date_prior"
+                ) or 0
+            ),
             "unresolved_broker_activity": unresolved_broker_activity,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
@@ -3163,11 +3221,12 @@ def reconcile_kis(
                     recovery_scope.account_key.encode("utf-8")
                 ).hexdigest(),
                 trading_epoch_id=recovery_scope.trading_epoch_id,
+                trade_date=tick_ts.date(),
             )
         else:
             # Diagnostic/legacy fixtures only. Canonical WSL KR always enforces.
             execution_claim_health = _execution_claim_health(
-                orders_repo, market="KR",
+                orders_repo, market="KR", trade_date=tick_ts.date(),
             )
     except Exception as exc:
         logger.error(
@@ -3186,8 +3245,12 @@ def reconcile_kis(
         integrity_reason = integrity_reason or "frozen_buy_contract_invariant_broken"
     if reconcile_result.get("unresolved_broker_activity"):
         integrity_reason = integrity_reason or "unresolved_broker_activity"
-    if reconcile_result.get("guard_reason"):
-        integrity_reason = integrity_reason or str(reconcile_result["guard_reason"])
+    # Stale-DB purge guard and broker order/fill safety are distinct.
+    # KIS holdings are NORMAL and only forbid deleting DB positions;
+    # unresolved claims, daily-ccld failure and unproven parity still block.
+    from trader.kr.reconcile_guard_classification import broker_reconcile_guard_blocks
+    if broker_reconcile_guard_blocks(reconcile_result):
+        integrity_reason = integrity_reason or str(reconcile_result.get("guard_reason") or "broker_guard_unproven")
     if reconcile_result.get("ok") is not True:
         # A failed daily-ccld pass is degraded even when balance parity appears
         # healthy. Accepted broker orders are not economic settlement evidence.

@@ -49,7 +49,7 @@ def _runner_post_exit_callback_code():
     outer_init = ast.parse("""
 kr_inf_run_result = None
 kr_inf_invoked = False
-reconcile_result = None
+reconcile_result = _initial_reconcile_result
 balance_snapshot_raw = _initial_balance
 """).body
     outer_done = ast.parse("""
@@ -70,13 +70,21 @@ return reconcile_result
 
 
 class FakeKis:
-    def __init__(self, balance):
+    def __init__(self, balance, *, original_fetch_proven=True):
         self.balance = balance
         self.refreshes = 0
+        self.original_fetch_proven = original_fetch_proven
+        self._balance_cache_at = None
 
     def get_balance_cached(self, *, force):
         assert force is True
         self.refreshes += 1
+        # This fake must emulate the real KIS wrapper: original HTTP fetch
+        # provenance is separate from the balance dictionary itself.
+        self._balance_cache_at = (
+            datetime(2026, 10, 26, 9, 46, tzinfo=KST)
+            if self.original_fetch_proven else None
+        )
         return copy.deepcopy(self.balance)
 
 
@@ -93,11 +101,13 @@ def _account_balance(quantity=12, leverage_quantity=7):
 def _call_real_runner_fragment(
     monkeypatch, *, post_exact=True, pre_exact=False, sell_only=True,
     post_balance=None, pre_balance=None, attempt=0, blocked=0,
-    reset=False, exit_ok=True,
+    reset=False, exit_ok=True, original_fetch_proven=True,
+    post_reconcile_raise=False, historical_current_only=False,
+    initial_reconcile_result=None,
 ):
     before = pre_balance or _account_balance()
     after = post_balance or _account_balance()
-    kis = FakeKis(after)
+    kis = FakeKis(after, original_fetch_proven=original_fetch_proven)
     full_calls = []
     summaries = dict(
         holdings=1, checked=1, submit_attempt_count=attempt,
@@ -109,6 +119,7 @@ def _call_real_runner_fragment(
         _exit_summary_payload=summaries,
         _authoritative_balance=None,
         _kr_post_exit_reconcile_ok=True,
+        _kr_historical_lanes_enabled=historical_current_only,
     )
     evidence_calls = []
 
@@ -121,6 +132,8 @@ def _call_real_runner_fragment(
 
     def full_reconcile(**kw):
         full_calls.append(kw)
+        if post_reconcile_raise:
+            raise RuntimeError("SYNTHETIC_POST_SELL_KIS_FAILURE")
         return {"ok": True, "status": "FULL_DONE"}
 
     class BalanceRepresentation:
@@ -129,7 +142,24 @@ def _call_real_runner_fragment(
             assert source == "api"
             return snapshot
 
+    if historical_current_only:
+        from trader.kr import historical_recovery_journal as journal
+        runner._post_proof_observed = []
+        monkeypatch.setattr(
+            journal, "choose_historical_lane",
+            lambda **kw: SimpleNamespace(
+                mode="CURRENT_ONLY", historical_recovery=False,
+                reason="TEST_PRIOR_JOURNAL", allow_buy_from_recovery=True,
+            ),
+        )
+        def _check_current_tick_proof(**kw):
+            runner._post_proof_observed.append(kw["result"])
+            return isinstance(kw["result"], dict) and kw["result"].get("ok") is True
+        monkeypatch.setattr(journal, "current_tick_reconcile_proves_buy_safe",
+                            _check_current_tick_proof)
+
     context = dict(
+        _initial_reconcile_result=initial_reconcile_result,
         _initial_balance=before,
         kis=kis, engine=object(), engine_runner=runner,
         deferred_full_reconcile=True,
@@ -188,3 +218,48 @@ def test_actual_runner_never_skips_with_no_pre_exit_authorization(monkeypatch):
     assert len(proofs) == 0
     assert kis.refreshes == 0
     assert result["status"] == "FULL_DONE"
+
+
+def test_real_runner_no_original_kis_fetch_timestamp_falls_back_to_full(monkeypatch):
+    # A local time stamp is NOT valid broker freshness evidence.
+    result, calls, proofs, kis, runner, writes = _call_real_runner_fragment(
+        monkeypatch, original_fetch_proven=False,
+    )
+    assert len(calls) == 1
+    assert len(proofs) == 0
+    assert kis.refreshes == 1
+    assert result["status"] == "FULL_DONE"
+    assert "two_sided_exact_proof_skip_historical_reconcile" not in writes
+
+
+def test_real_runner_after_sell_no_original_fetch_timestamp_blocks_new_buy(monkeypatch):
+    result, calls, proofs, kis, runner, _ = _call_real_runner_fragment(
+        monkeypatch, attempt=1, original_fetch_proven=False,
+    )
+    assert len(calls) == 1
+    assert runner._kr_post_exit_reconcile_ok is False
+    assert result["status"] == "FULL_DONE"
+
+
+def test_post_sell_kis_exception_cannot_reuse_previous_successful_reconcile(monkeypatch):
+    # A prior AM KIS success must never be substituted for failed post-SELL
+    # original KIS evidence when historical CURRENT_ONLY lane is active.
+    before = {
+        "ok": True,
+        "current_only_fresh_broker_proven": True,
+        "historical_recovery_executed": False,
+        "frozen_contract_invariant_violations": 0,
+    }
+    result, calls, _, kis, runner, writes = _call_real_runner_fragment(
+        monkeypatch, attempt=1, post_reconcile_raise=True,
+        historical_current_only=True, initial_reconcile_result=before,
+    )
+    assert len(calls) == 1
+    assert calls[0]["historical_recovery"] is False
+    assert result["ok"] is False
+    assert result["degraded"] == "POST_EXIT_RECONCILE_EXCEPTION"
+    assert result is not before
+    assert runner._post_proof_observed
+    assert runner._post_proof_observed[0]["ok"] is False
+    assert runner._kr_post_exit_reconcile_ok is False
+    assert "reconcile_after_protective_sell" not in writes
