@@ -99,3 +99,27 @@ def test_infinite_limit_buy_adverse_execution_is_price_mismatch():
     )
     assert result["reconciliation_status"] == "KR_INF_ORDER_FILL_PRICE_MISMATCH"
     assert result["price_mismatch_pct"] > 0.01
+
+
+def test_market_fill_price_without_executed_qty_is_not_settled():
+    from trader.kr.infinite.reconciliation import reconcile_order_fill_prices
+
+    result = reconcile_order_fill_prices(
+        order_price=72085, order_qty=6, broker_order_no="0000017474",
+        fill_price=72090, fill_qty=0, order_side="SELL_ALL",
+        order_is_market=True,
+    )
+    assert result["reconciliation_status"] == "KR_INF_ORDER_FILL_PRICE_UNVERIFIED"
+    assert result["native_fill_qty_proven"] is False
+
+
+def test_broker_quantity_above_original_order_cannot_be_price_verified():
+    from trader.kr.infinite.reconciliation import reconcile_order_fill_prices
+
+    result = reconcile_order_fill_prices(
+        order_price=72085, order_qty=6,
+        fill_price=72090, fill_qty=7,
+        order_side="SELL_ALL", order_is_market=True,
+    )
+    assert result["reconciliation_status"] == "KR_INF_ORDER_FILL_PRICE_UNVERIFIED"
+    assert result["native_fill_qty_proven"] is False
