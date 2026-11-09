@@ -53,3 +53,49 @@ def test_infinite_intent_keeps_immutable_limit_price():
                          side="SELL_ALL", idempotency_key="key", requested_qty=6,
                          limit_price=72085)
     assert intent.limit_price == 72085
+
+
+def test_infinite_market_sell_does_not_compare_indicative_or_buy_cost_price():
+    from trader.kr.infinite.reconciliation import reconcile_order_fill_prices
+
+    result = reconcile_order_fill_prices(
+        order_price=72085, order_qty=6, broker_order_no="0000017474",
+        fill_price=67500, fill_qty=6,
+        broker_avg_after=67345.454, close_avg_price=67345.454,
+        order_side="SELL_ALL", order_is_market=True,
+    )
+    assert result["reconciliation_status"] == "OK"
+    assert result["price_comparison_basis"] == "MARKET_ORDER_NATIVE_FILL_ONLY"
+    assert result["price_mismatch_pct"] == 0.0
+
+
+def test_infinite_market_sell_still_requires_native_fill_price():
+    from trader.kr.infinite.reconciliation import reconcile_order_fill_prices
+
+    result = reconcile_order_fill_prices(
+        order_price=72085, order_qty=6, broker_order_no="0000017474",
+        fill_price=None, fill_qty=6, order_side="SELL_PARTIAL", order_is_market=True,
+    )
+    assert result["reconciliation_status"] == "KR_INF_ORDER_FILL_PRICE_UNVERIFIED"
+
+
+def test_infinite_limit_buy_favorable_execution_is_not_price_mismatch():
+    from trader.kr.infinite.reconciliation import reconcile_order_fill_prices
+
+    result = reconcile_order_fill_prices(
+        order_price=72000, order_qty=11,
+        fill_price=70000, fill_qty=11, order_side="BUY",
+    )
+    assert result["reconciliation_status"] == "OK"
+    assert result["price_mismatch_pct"] == 0.0
+
+
+def test_infinite_limit_buy_adverse_execution_is_price_mismatch():
+    from trader.kr.infinite.reconciliation import reconcile_order_fill_prices
+
+    result = reconcile_order_fill_prices(
+        order_price=70000, order_qty=11,
+        fill_price=71000, fill_qty=11, order_side="BUY",
+    )
+    assert result["reconciliation_status"] == "KR_INF_ORDER_FILL_PRICE_MISMATCH"
+    assert result["price_mismatch_pct"] > 0.01
