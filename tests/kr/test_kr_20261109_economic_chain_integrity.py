@@ -24,7 +24,8 @@ def _order(code="293490", qty=174):
         "env": "practice", "order_id": "order-" + code,
         "code": code, "side": "BUY", "qty": qty,
         "status": "RECONCILED", "kis_odno": "0000011280",
-        "trading_epoch_id": EPOCH, "position_cycle_id": "exact-" + code,
+        "trading_epoch_id": EPOCH, "portfolio_epoch_id": "portfolio-demo",
+        "position_cycle_id": "exact-" + code,
         "request_json": request,
         "response_json": {
             "_kr_buy_entry_contract": {
@@ -41,6 +42,7 @@ def _fill(order):
         "code": order["code"], "side": "BUY", "qty": order["qty"],
         "price": 11750, "kis_odno": order["kis_odno"],
         "trading_epoch_id": EPOCH,
+        "portfolio_epoch_id": "portfolio-demo",
         "position_cycle_id": order["position_cycle_id"],
         "fill_meta_json": {
             "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
@@ -52,7 +54,7 @@ def _fill(order):
 def _position(order, *, imported=False):
     return {
         "code": order["code"], "qty": order["qty"],
-        "status": "OPEN", "trading_epoch_id": EPOCH,
+        "status": "OPEN", "trading_epoch_id": EPOCH, "portfolio_epoch_id": "portfolio-demo",
         "position_cycle_id": "imported-other-cycle" if imported else order["position_cycle_id"],
         "position_origin": "IMPORTED" if imported else "SYSTEM",
     }
@@ -115,3 +117,30 @@ def test_native_fill_with_wrong_epoch_is_not_applied():
     )
     assert "FILL_IDENTITY_OR_CYCLE_MISMATCH" in report["issues"]
     assert "ORIGINAL_PRICED_BUY_FILL_MISSING" in report["issues"]
+
+
+def test_orphaned_fill_without_position_cannot_pass_as_complete():
+    order = _order()
+    report = audit_kr_buy_identity(order=order, fills=[_fill(order)], positions=[],
+                                    claim={"action_state": "SATISFIED"})
+    assert report["status"] == "CHAIN_INCOMPLETE"
+    assert "POSITION_CYCLE_NOT_BOUND_TO_BUY" in report["issues"]
+
+
+def test_cross_portfolio_fill_is_never_credited():
+    order = _order()
+    wrong = {**_fill(order), "portfolio_epoch_id": "foreign-portfolio"}
+    report = audit_kr_buy_identity(order=order, fills=[wrong],
+                                    positions=[_position(order)],
+                                    claim={"action_state": "SATISFIED"})
+    assert report["status"] == "CHAIN_INCOMPLETE"
+    assert "FILL_IDENTITY_OR_CYCLE_MISMATCH" in report["issues"]
+
+
+def test_missing_kis_order_number_cannot_pass_as_native_proof():
+    order = _order()
+    order["kis_odno"] = None
+    report = audit_kr_buy_identity(order=order, fills=[_fill(order)],
+                                    positions=[_position(order)])
+    assert report["status"] == "CHAIN_INCOMPLETE"
+    assert "ORIGINAL_KIS_ORDER_NUMBER_UNPROVEN" in report["issues"]
