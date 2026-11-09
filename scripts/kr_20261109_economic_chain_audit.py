@@ -53,13 +53,13 @@ def collect_readonly_identity_audit(
         """, env, epoch, codes)
         fills = _select(conn, """
             SELECT order_id, code, side, qty, price, kis_odno,
-                   trading_epoch_id, position_cycle_id, fill_meta_json
+                   trading_epoch_id, portfolio_epoch_id, position_cycle_id, fill_meta_json
             FROM public.fills WHERE env=:env AND trading_epoch_id=:epoch
               AND code IN :codes AND side='BUY'
         """, env, epoch, codes)
         positions = _select(conn, """
             SELECT code, qty, status, position_origin, position_cycle_id,
-                   trading_epoch_id, exit_policy_family
+                   trading_epoch_id, portfolio_epoch_id, exit_policy_family
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
               AND code IN :codes
         """, env, epoch, codes)
