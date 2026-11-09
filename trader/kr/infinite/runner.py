@@ -335,7 +335,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         post_position = executor.position(config.symbol)
         for intent, broker_state in post_updates:
             reconciliation = reconcile_order_fill_prices(
-                order_price=position.current_price,
+                order_price=getattr(intent, "limit_price", None),
                 order_qty=int(getattr(intent, "requested_qty", 0) or 0),
                 broker_order_no=getattr(intent, "broker_order_id", None),
                 fill_price=getattr(broker_state, "filled_avg_price", None),
