@@ -56,11 +56,17 @@ def audit_kr_buy_identity(
     code = str(order.get("code") or "").zfill(6)
     cycle = str(order.get("position_cycle_id") or "")
     epoch = str(order.get("trading_epoch_id") or "")
-    odno = str(order.get("kis_odno") or "").zfill(10)
+    portfolio = str(order.get("portfolio_epoch_id") or "")
+    original_odno = str(order.get("kis_odno") or "").strip()
+    odno = original_odno.zfill(10)
     request = _obj(order.get("request_json"))
     response = _obj(order.get("response_json"))
     echo = _obj(response.get("_kr_buy_entry_contract"))
     issues: list[str] = []
+    if not cycle or not epoch or not portfolio:
+        issues.append("ORDER_SCOPE_OR_CYCLE_UNPROVEN")
+    if not original_odno or not original_odno.isdigit() or not int(original_odno):
+        issues.append("ORIGINAL_KIS_ORDER_NUMBER_UNPROVEN")
 
     try:
         _assert_kr_buy_entry_contract(request)
@@ -83,6 +89,8 @@ def audit_kr_buy_identity(
             or str(fill.get("side") or "").upper() != "BUY"
             or str(fill.get("position_cycle_id") or "") != cycle
             or str(fill.get("trading_epoch_id") or "") != epoch
+            or str(fill.get("portfolio_epoch_id") or "") != portfolio
+            or not str(fill.get("kis_odno") or "").strip()
             or str(fill.get("kis_odno") or "").zfill(10) != odno
         ):
             issues.append("FILL_IDENTITY_OR_CYCLE_MISMATCH")
@@ -119,8 +127,12 @@ def audit_kr_buy_identity(
         if str(p.get("code") or "").zfill(6) == code
         and str(p.get("trading_epoch_id") or "") == epoch
     ]
-    exact_cycle = any(str(p.get("position_cycle_id") or "") == cycle for p in symbol_positions)
-    if not exact_cycle and symbol_positions:
+    exact_cycle = bool(cycle) and any(
+        str(p.get("position_cycle_id") or "") == cycle
+        and str(p.get("portfolio_epoch_id") or "") == portfolio
+        for p in symbol_positions
+    )
+    if not exact_cycle:
         issues.append("POSITION_CYCLE_NOT_BOUND_TO_BUY")
         if any(
             str(p.get("position_origin") or "").upper() == "IMPORTED"
