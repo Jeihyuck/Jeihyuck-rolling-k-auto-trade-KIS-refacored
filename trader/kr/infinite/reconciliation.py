@@ -11,9 +11,19 @@ def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
                                 broker_avg_after: float|None = None,
                                 close_avg_price: float|None = None) -> dict:
     """Join KR infinite order, fill, and balance-average evidence."""
+    # A post-trade BUY cost basis is NOT evidence of the execution price
+    # of this SELL. Compare the persisted order limit with the price of the
+    # same broker execution. No priced fill -> UNVERIFIED, never a false OK.
     base = float(order_price or 0)
-    after = float(broker_avg_after or 0)
-    mismatch = bool(base > 0 and after > 0 and abs(base - after) / base >= 0.01)
+    execution = float(fill_price or 0)
+    priced_proof = base > 0 and execution > 0
+    price_gap = abs(base - execution) / base if priced_proof else 0.0
+    mismatch = priced_proof and price_gap >= 0.01
+    status = (
+        "KR_INF_ORDER_FILL_PRICE_UNVERIFIED" if not priced_proof
+        else "KR_INF_ORDER_FILL_PRICE_MISMATCH" if mismatch
+        else "OK"
+    )
     return {
         "order_price": base,
         "order_qty": int(order_qty or 0),
@@ -22,9 +32,10 @@ def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
         "fill_qty": fill_qty,
         "broker_avg_after": broker_avg_after,
         "close_avg_price": close_avg_price,
-        "reconciliation_status": "KR_INF_ORDER_FILL_PRICE_MISMATCH" if mismatch else "OK",
-        "price_mismatch_pct": abs(base - after) / base if mismatch else 0.0,
-        "warning": "KR_INF_ORDER_FILL_PRICE_MISMATCH" if mismatch else None,
+        "reconciliation_status": status,
+        "price_comparison_basis": "PERSISTED_LIMIT_VS_KIS_EXECUTION",
+        "price_mismatch_pct": price_gap,
+        "warning": None if status == "OK" else status,
     }
 
 def reconcile(state:State|None,position:BrokerPosition,trade_date:date,pending_sell:bool=False,
