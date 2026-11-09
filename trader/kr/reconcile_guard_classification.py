@@ -29,6 +29,12 @@ def broker_reconcile_guard_blocks(result: Mapping[str, Any] | None) -> bool:
             # Mere presence of KIS shares says nothing about whether an
             # imported DB cycle owns those shares. Require independently
             # proven exact active-account/epoch/cycle/holdings parity.
-            or result.get("historical_repair_fastpath") is not True
+            or (
+                result.get("historical_repair_fastpath") is not True
+                and not (
+                    result.get("historical_recovery_executed") is False
+                    and result.get("current_only_fresh_broker_proven") is True
+                )
+            )
         )
     return True
