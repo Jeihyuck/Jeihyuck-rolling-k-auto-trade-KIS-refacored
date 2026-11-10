@@ -64,11 +64,36 @@ class CloseMailDateContract(unittest.TestCase):
             ("OK", 0), ("OK_WITH_WARNINGS", 0),
             ("ERROR", 1), ("SKIP", 1),
         ):
-            with self.subTest(status=status), patch.object(
+            # GitHub PR CI sets GITHUB_EVENT_NAME=pull_request. This test
+            # checks the normal scheduler Close path, not the PR execution
+            # safety guard; do not weaken the production dispatcher guard.
+            with self.subTest(status=status), patch.dict(
+                "os.environ", {"GITHUB_EVENT_NAME": "schedule"},
+            ), patch.object(
                 trade_close_runner, "run_trade_close", return_value={"status": status},
             ):
-                self.assertEqual(dispatch(
-                    "close", env="practice", offline=True), expected)
+                self.assertEqual(
+                    dispatch("close", env="practice", offline=True), expected
+                )
+
+    def test_close_pr_event_requires_explicit_offline_smoke_scope(self):
+        from trader.us.runner.dispatcher import dispatch
+        from trader.us.runner import trade_close_runner
+        with patch.dict("os.environ", {
+            "GITHUB_EVENT_NAME": "pull_request", "ALLOW_REAL_ORDER": "0",
+        }), patch.object(
+            trade_close_runner, "run_trade_close", return_value={"status": "OK"},
+        ) as run_close:
+            # A PR event without forced scope must never execute a Close.
+            self.assertEqual(dispatch("close", env="practice", offline=True), 1)
+            run_close.assert_not_called()
+            # Explicit offline smoke context is permitted by the existing
+            # gate and exercises the Close status under PR CI.
+            self.assertEqual(dispatch(
+                "close", env="practice", offline=True,
+                force_now="2026-11-09T17:00:00-05:00",
+            ), 0)
+            run_close.assert_called_once()
 
     def test_windows_installer_cannot_schedule_close_before_est_end(self):
         for name in ("update-nullim-scheduler.ps1", "verify-scheduler.ps1"):
