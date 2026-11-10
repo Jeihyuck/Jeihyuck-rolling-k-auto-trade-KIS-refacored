@@ -377,3 +377,65 @@ def test_observer_poll_period_is_start_to_start_and_below_proof_ttl():
     subsequent_start = scan_duration_sec + max(1.0, interval_sec - scan_duration_sec)
     assert subsequent_start == 120.0
     assert subsequent_start < proof_ttl_sec
+
+
+def test_20261110_actual_prep_contract_directory_and_actual_as_of(tmp_path):
+    """Based on uploaded 2026-11-10 session log archive's canonical PREP layout.
+
+    PREP stored contract under YYYY-MM-DD/YYYY-MM-DD/prep_contract.json,
+    and uses 'actual_as_of' / 'expected_as_of', not 'as_of'.
+    No user account or real financial records are included in this fixture.
+    """
+    import json
+    from scripts.kr_opening_observer import final30_codes
+    trade_date = "2026-11-10"
+    folder = tmp_path / "runtime" / "kr" / "watchlist" / trade_date
+    folder.mkdir(parents=True)
+    rows = [{"code": f"{i:06d}", "rank": i} for i in range(1, 31)]
+    (folder / "final30_scored.json").write_text(json.dumps({
+        "schema_version": "kr_final30_v1", "market": "KR", "env": "practice",
+        "trade_date": trade_date, "expected_as_of": "2026-11-09",
+        "as_of": "2026-11-09", "rows": rows,
+    }), encoding="utf-8")
+    nested = folder / trade_date
+    nested.mkdir()
+    contract = {
+        "schema_version": "kr_prep_contract_v1",
+        "market": "KR", "env": "practice",
+        "trade_date": trade_date, "expected_as_of": "2026-11-09",
+        "actual_as_of": "2026-11-09", "final30_rows": 30,
+        "contract_ok": True, "trade_can_proceed": 1,
+        "contract_hash": "fixture-canonical-consistent",
+    }
+    (nested / "prep_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+    assert final30_codes(
+        trade_date=trade_date, filename=str(folder / "final30_scored.json"),
+    ) == [f"{i:06d}" for i in range(1, 31)]
+    # An unverified date mismatch must never allow new BUY proof collection.
+    contract["actual_as_of"] = "2026-11-06"
+    (nested / "prep_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="SCOPE_MISMATCH"):
+        final30_codes(trade_date=trade_date, filename=str(folder / "final30_scored.json"))
+
+
+def test_nested_prep_contract_conflict_with_sibling_is_rejected(tmp_path):
+    import json
+    from scripts.kr_opening_observer import final30_codes
+    trade_date = "2026-11-10"
+    folder = tmp_path / trade_date
+    folder.mkdir()
+    (folder / "final30_scored.json").write_text(json.dumps([
+        {"code": f"{i:06d}"} for i in range(1, 31)
+    ]), encoding="utf-8")
+    dated = {"market": "KR", "env": "practice", "trade_date": trade_date,
+             "actual_as_of": "2026-11-09", "final30_rows": 30,
+             "contract_ok": True, "trade_can_proceed": True,
+             "contract_hash": "canonical"}
+    (folder / "prep_contract.json").write_text(json.dumps(dated), encoding="utf-8")
+    nested = folder / trade_date
+    nested.mkdir()
+    (nested / "prep_contract.json").write_text(json.dumps(
+        {**dated, "contract_hash": "other-contract"}
+    ), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="CONFLICTING_CONTRACTS"):
+        final30_codes(trade_date=trade_date, filename=str(folder / "final30_scored.json"))
