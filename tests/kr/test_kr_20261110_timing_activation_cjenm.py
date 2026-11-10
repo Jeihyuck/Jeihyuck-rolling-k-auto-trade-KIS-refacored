@@ -360,3 +360,20 @@ def test_native_kis_api_envelope_to_observer_to_ready_proof_contract(tmp_path, m
     )
     assert decision["state"] == "READY_SHADOW", decision
     assert decision["vwap_proven"] is True, decision
+
+
+def test_observer_poll_period_is_start_to_start_and_below_proof_ttl():
+    """Guard against stale proofs caused by scan duration + full interval sleep."""
+    source = Path("scripts/kr_opening_observer.py").read_text(encoding="utf-8")
+    helper = Path("scripts/wsl/kr-entry-timing-activation.sh").read_text(encoding="utf-8")
+    assert "cycle_started = time.monotonic()" in source
+    assert "elapsed = time.monotonic() - cycle_started" in source
+    assert "float(args.interval_sec)) - elapsed" in source
+    assert 'default=120.0' in source
+    assert "KR_PB1_OPENING_OBSERVER_INTERVAL_SEC:-120" in helper
+    # With 75s elapsed scanning 30 tickers, next cycle starts at T+120,
+    # rather than at T+195 where all 180s proofs are guaranteed stale.
+    scan_duration_sec, interval_sec, proof_ttl_sec = 75.0, 120.0, 180.0
+    subsequent_start = scan_duration_sec + max(1.0, interval_sec - scan_duration_sec)
+    assert subsequent_start == 120.0
+    assert subsequent_start < proof_ttl_sec
