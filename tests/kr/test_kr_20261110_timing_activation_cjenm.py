@@ -439,3 +439,25 @@ def test_nested_prep_contract_conflict_with_sibling_is_rejected(tmp_path):
     ), encoding="utf-8")
     with pytest.raises(RuntimeError, match="CONFLICTING_CONTRACTS"):
         final30_codes(trade_date=trade_date, filename=str(folder / "final30_scored.json"))
+
+
+def test_observer_no_filename_uses_actual_repo_prep_artifacts_not_tmp_runtime(tmp_path, monkeypatch):
+    """The real AM wrapper calls observer --date but not --final30-file."""
+    import json
+    import scripts.kr_opening_observer as observer
+    monkeypatch.setattr(observer, "repo_root", lambda: tmp_path)
+    day = "2026-11-10"
+    canonical = tmp_path / "runtime" / "kr" / "watchlist" / day
+    canonical.mkdir(parents=True)
+    codes = [f"{i:06d}" for i in range(1, 31)]
+    (canonical / "final30_scored.json").write_text(json.dumps({
+        "market": "KR", "env": "practice", "trade_date": day,
+        "as_of": "2026-11-09", "rows": [{"code": c} for c in codes],
+    }), encoding="utf-8")
+    (canonical / day).mkdir()
+    (canonical / day / "prep_contract.json").write_text(json.dumps({
+        "market": "KR", "env": "practice", "trade_date": day,
+        "actual_as_of": "2026-11-09", "expected_as_of": "2026-11-09",
+        "final30_rows": 30, "contract_ok": True, "trade_can_proceed": True,
+    }), encoding="utf-8")
+    assert observer.final30_codes(trade_date=day) == codes
