@@ -12,13 +12,18 @@ ROOT = Path(__file__).parents[1]
 
 def _copy_calendar_runtime(root: Path) -> None:
     (root / "scripts/wsl").mkdir(parents=True, exist_ok=True)
-    for name in ("check-nullim-trading-day.py", "resolve-nullim-python.sh"):
+    for name in ("check-nullim-trading-day.py", "resolve-nullim-python.sh",
+                 "resolve-us-mail-trade-date.py"):
         shutil.copy2(ROOT / "scripts/wsl" / name, root / "scripts/wsl" / name)
     (root / "trader").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "trader/__init__.py", root / "trader/__init__.py")
     shutil.copy2(ROOT / "trader/time_utils.py", root / "trader/time_utils.py")
+    (root / "trader/us").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "trader/us/__init__.py", root / "trader/us/__init__.py")
+    shutil.copy2(ROOT / "trader/us/market_calendar.py", root / "trader/us/market_calendar.py")
     (root / "config").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "config/krx_holidays.json", root / "config/krx_holidays.json")
+    shutil.copy2(ROOT / "config/us_market_holidays.yaml", root / "config/us_market_holidays.yaml")
 
 
 def fixture_us_repo(tmp_path: Path, trade_date: str, *, missing_purposes=()) -> Path:
@@ -135,7 +140,9 @@ def test_us_missing_edt_prewarm_sends_degraded_mail(tmp_path):
     marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
     assert marker["status"] == "DEGRADED"
     assert marker["mail_sent"] is True
-    assert marker["mail_delivered"] is True
+    # SMTP accepted != mailbox delivery confirmed.
+    assert marker["mail_delivered"] is False
+    assert marker["delivery_status"] == "UNCONFIRMED_AFTER_SMTP_ACCEPT"
     assert marker["mail_complete"] is False
     assert marker["required_missing_count"] == 1
     assert marker["missing_evidence"] == [{
@@ -244,16 +251,21 @@ def test_newly_arrived_missing_log_changes_digest_and_allows_complete_resend(tmp
     assert second_marker["source_evidence_sha256"] != first_marker["source_evidence_sha256"]
 
 
-def test_us_delayed_mail_uses_latest_completed_partition(tmp_path):
-    reference = datetime.now(ZoneInfo("America/New_York")).date()
-    completed = (reference - timedelta(days=1)).isoformat()
+def test_us_delayed_mail_uses_latest_completed_exchange_session(tmp_path):
+    # Calendar decides the intended completed session; no prior Close folder
+    # can substitute for a current trading day's missing Close evidence.
+    import runpy
+    resolve = runpy.run_path(str(ROOT / "scripts/wsl/resolve-us-mail-trade-date.py"))
+    completed = resolve["latest_completed_us_trade_date"](
+        datetime.now(ZoneInfo("America/New_York"))
+    )
     run_date = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
     root = fixture_us_repo(tmp_path, completed)
 
     result, _ = run_us_mail(root, None, kst_run_date=run_date)
 
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "[LOG_MAIL][TRADE_DATE_RECOVERY]" in result.stdout
+    assert "[LOG_MAIL][TRADE_DATE_RESOLVED]" in result.stdout
     marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
     assert marker["trade_date"] == completed
 
