@@ -134,6 +134,10 @@ LATEST_LINK="runtime/logs/kr/wsl-kr-am.latest.log"
 ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_LOG")" "$LATEST_LINK"
 {
   echo "[KR_AM][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
+  echo "[KR_AM][HISTORICAL_RECOVERY][CONFIG] flag=${KR_HISTORICAL_RECOVERY_ONCE_ENABLED-<default-on>} effective=${KR_HISTORICAL_RECOVERY_ONCE_ENABLED-1}"
+  if [[ "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" && "${KR_HISTORICAL_RECOVERY_ONCE_ENABLED-1}" != "1" ]]; then
+    echo "[KR_AM][HISTORICAL_RECOVERY][WARNING] practice default overridden; per-tick legacy recovery may execute"
+  fi
   KR_AM_SESSION_TIMEOUT_SEC="${KR_AM_SESSION_TIMEOUT_SEC:-3600}"
   echo "[KR_AM][EFFECTIVE_ENV] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC}"
   # Exit 137 can be SIGKILL/OOM/external termination as well as a timeout
