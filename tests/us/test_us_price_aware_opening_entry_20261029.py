@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -195,7 +196,8 @@ def test_pre_submit_uses_verified_price_cap_and_fresh_quote():
     now_epoch = datetime(2026, 10, 28, 10, 5, tzinfo=NY).timestamp()
     intent = {"symbol": "ELV", "side": "BUY",
               "strategy_owner": "US_STANDARD", "position_action": "NEW_POSITION_BUY",
-              "limit_price": result["max_entry_price"], "meta": {}}
+              "limit_price": float(Decimal(str(result["max_entry_price"])).quantize(
+                   Decimal("0.01"), rounding=ROUND_DOWN)), "meta": {}}
     attach_opportunity_proof(intent, result, mode="ENFORCE", decision_epoch=now_epoch)
     quote = {"last": 96.05, "bid": 96.0, "ask": 96.05,
              "received_at": now_epoch + 2}
@@ -309,7 +311,8 @@ def test_stale_approved_signal_cannot_be_refreshed_by_mutating_timestamp_or_orde
         "symbol": "ELV", "side": "BUY", "strategy_owner": "US_STANDARD",
         "position_action": "NEW_POSITION_BUY", "client_order_key": "k1",
         "position_lifecycle_id": "cycle-1",
-        "limit_price": decision["max_entry_price"], "meta": {},
+        "limit_price": float(Decimal(str(decision["max_entry_price"])).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN)), "meta": {},
     }
     attach_opportunity_proof(intent, decision, mode="ENFORCE", decision_epoch=epoch)
     quote = {"received_at": epoch + 3, "last": 96.05, "bid": 96.0, "ask": 96.05}

@@ -126,6 +126,26 @@ def bind_original_us_order_scope(
         intent, account_id=account_hash, trading_epoch_id=trading_epoch_id,
         portfolio_epoch_id=portfolio_id, owner=owner,
     )
+    # The PB1 producer signed the placeholder lifecycle. Never simply recompute
+    # its hash after replacing the ID: verify the ORIGINAL immutable signal
+    # first, and allow only the exact placeholder -> deterministic cycle.
+    original_timing_intent = None
+    if (owner == "US_STANDARD"
+            and str(intent.get("side") or "").upper() == "BUY"
+            and str(intent.get("position_action") or meta.get("position_action") or "").upper()
+                == "NEW_POSITION_BUY"
+            and isinstance(meta.get("us_entry_opportunity_v1"), dict)):
+        from trader.us.entry_timing.opportunity import _verify_timing_signal_and_binding
+        original_timing_intent = {**intent, "meta": dict(meta)}
+        original_proof = meta["us_entry_opportunity_v1"]
+        if not _verify_timing_signal_and_binding(original_timing_intent, original_proof):
+            raise USRecoveryIdentityError("US_ENTRY_TIMING_ORIGINAL_PROOF_UNVERIFIED")
+        placeholder = f"ENTRY:{owner}:{str(intent.get('symbol') or '').strip().upper()}"
+        if original_proof.get("submission_binding_version") is None:
+            if str(intent.get("position_lifecycle_id") or "") != placeholder:
+                raise USRecoveryIdentityError("US_ENTRY_TIMING_SCOPE_TRANSITION_FORBIDDEN")
+        elif str(intent.get("position_lifecycle_id") or "") != cycle_id:
+            raise USRecoveryIdentityError("US_ENTRY_TIMING_ALREADY_SCOPED_ID_MISMATCH")
     scope = USRecoveryScope(env, account_hash, str(trading_epoch_id),
                             portfolio_id, cycle_id, owner)
     # Existing PB1 position snapshots keep the original account key in
@@ -159,6 +179,14 @@ def bind_original_us_order_scope(
     intent["broker_account_hash"] = account_hash
     intent["position_lifecycle_id"] = cycle_id
     intent["meta"] = new_meta
+    if original_timing_intent is not None:
+        from trader.us.entry_timing.opportunity import finalize_verified_buy_scope_binding
+        if original_proof.get("submission_binding_version") is None:
+            finalize_verified_buy_scope_binding(
+                intent, original=original_timing_intent, placeholder=placeholder,
+            )
+        elif not _verify_timing_signal_and_binding(intent, original_proof):
+            raise USRecoveryIdentityError("US_ENTRY_TIMING_SCOPED_PROOF_INVALID")
     return scope
 
 
