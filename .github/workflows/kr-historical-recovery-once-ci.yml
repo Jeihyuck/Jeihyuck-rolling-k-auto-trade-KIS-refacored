@@ -14,6 +14,12 @@ on:
       - "trader/kr/reconcile_guard_classification.py"
       - "tests/kr/test_kr_reconcile_guard_classification_20261106.py"
       - "tests/kr/test_kr_20261027_broker_readonly_proof.py"
+      - ".env.example"
+      - "scripts/wsl/run-kr-am.sh"
+      - "scripts/wsl/run-kr-afternoon.sh"
+      - "scripts/wsl/kr-entry-timing-activation.sh"
+      - "scripts/kr_opening_observer.py"
+      - "tests/kr/test_kr_20261110_timing_activation_cjenm.py"
       - ".github/workflows/kr-historical-recovery-once-ci.yml"
   workflow_dispatch:
 
@@ -45,7 +51,7 @@ jobs:
       DRY_RUN: "1"
       ALLOW_REAL_ORDER: "0"
       DISABLE_LIVE_TRADING: "1"
-      KR_HISTORICAL_RECOVERY_ONCE_ENABLED: "0"
+      # Deliberately unset: exercise the KR practice default-on path.
       KIS_APP_KEY: ""
       KIS_APP_SECRET: ""
       PBCORE_DB_URL: ""
@@ -63,6 +69,15 @@ jobs:
       - name: Verify new source compiles
         run: |
           python -m py_compile trader/pb1_runner.py trader/reconcile_kis.py trader/kr/historical_recovery_journal.py trader/kr/close_historical_reconcile.py trader/kr/reconcile_guard_classification.py scripts/kr_20261027_293490_readonly_proof.py
+      - name: Validate KR timing shell wrappers and minute observer syntax
+        run: |
+          bash -n scripts/wsl/kr-entry-timing-activation.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh
+          python -m py_compile scripts/kr_opening_observer.py trader/kr/opening_bar_contract.py
+      - name: KR entry timing ON and CJ ENM offline counterfactual
+        run: |
+          python -m pytest -q \
+            tests/kr/test_kr_20261029_price_aware_opening.py \
+            tests/kr/test_kr_20261110_timing_activation_cjenm.py
       - name: Strict journal, KIS freshness, and sell-first integration tests
         run: |
           python -m pytest -q \

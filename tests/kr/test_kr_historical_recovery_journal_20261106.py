@@ -1,4 +1,4 @@
-"""KR historical recovery lanes: explicit opt-in, durable proof or fail-closed."""
+"""KR historical recovery lanes: practice default-on, durable proof or fail-closed."""
 
 import os
 from datetime import date
@@ -18,8 +18,19 @@ class UnexpectedEngine:
         raise AssertionError("Disabled lane must not touch the DB")
 
 
-def test_default_legacy_no_extra_db_or_broker_io(monkeypatch):
+def test_practice_default_on_and_real_off(monkeypatch):
     monkeypatch.delenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", raising=False)
+    monkeypatch.setenv("KIS_ENV", "practice")
+    assert lane_enabled("practice")
+    assert not lane_enabled("real")
+    monkeypatch.setenv("KIS_ENV", "real")
+    assert not lane_enabled("practice")
+    monkeypatch.delenv("KIS_ENV")
+    assert not lane_enabled("practice")
+
+
+def test_explicit_zero_emergency_legacy_no_extra_db_or_broker_io(monkeypatch):
+    monkeypatch.setenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "0")
     monkeypatch.setenv("KIS_ENV", "practice")
     assert not lane_enabled("practice")
     lane = choose_historical_lane(

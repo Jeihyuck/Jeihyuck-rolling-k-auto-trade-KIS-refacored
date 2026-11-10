@@ -5778,6 +5778,23 @@ class PB1Engine:
             and _is_kr_stock_code(cf.code)
             and _timing_style in KR_TIMING_STYLES
         )
+        # An explicitly unapproved ENFORCE request must not silently
+        # downgrade to the old setup-only BUY path. This applies only to
+        # standard PB1 new BUY, never protective SELL, ADD, or independent owners.
+        if (
+            _timing_eligible and _timing_mode == "ENFORCE"
+            and os.getenv("KR_PB1_ENTRY_TIMING_APPROVED", "0") != "1"
+        ):
+            logger.error(
+                "[KR][ENTRY][PRICE_AWARE_TIMING][BLOCK] code=%s mode=ENFORCE "
+                "approved=0 reason=TIMING_POLICY_NOT_APPROVED", cf.code,
+            )
+            return UnifiedGateDecision(
+                ok=False,
+                reason_codes=["KR_ENTRY_TIMING_POLICY_NOT_APPROVED"],
+                blocking_stage="pre_submit_timing",
+                context={"code": cf.code, "mode": "ENFORCE", "approved": False},
+            )
         if _timing_eligible and _timing_mode in {"SHADOW", "ENFORCE"}:
             _timing = evaluate_proof_for_candidate(
                 env=self.env,

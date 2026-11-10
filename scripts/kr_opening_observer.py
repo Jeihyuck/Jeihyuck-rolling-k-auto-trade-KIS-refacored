@@ -18,31 +18,105 @@ import time
 
 from trader.account_state import get_account_key
 from trader.kr.opening_bar_contract import KST, save_opening_proof
-from trader.runtime_paths import runtime_path
+from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
 
 
 def final30_codes(*, trade_date: str, filename: str | None = None) -> list[str]:
-    file = Path(filename) if filename else runtime_path(
-        "runtime", "kr", "watchlist", trade_date, "final30_scored.json"
-    )
-    payload = json.loads(file.read_text(encoding="utf-8"))
-    if (not isinstance(payload, dict)
-            or payload.get("trade_date") != trade_date
-            or payload.get("market") != "KR"
-            or payload.get("env") != "practice"):
-        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
-    rows = payload.get("rows") or []
-    codes = sorted({
-        str(r.get("code") or "").zfill(6)
-        for r in rows if isinstance(r, dict) and str(r.get("code") or "").strip()
-    })
-    if len(codes) != len(rows) or not 1 <= len(codes) <= 30:
-        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
-    return codes
+    """Read the exact PREP canonical Final30 with its sibling dated contract.
 
+    The canonical Final30 payload may be an array, or a dict with items/rows.
+    The source file is not itself the authority for the trade date/market/env:
+    `prep_contract.json` is. Do not infer scope from the file's directory.
+    """
+    # PREP writes the canonical mirrored file under the REPOSITORY runtime
+    # directory. The generic ephemeral runtime_path() defaults to
+    # /tmp/trader_runtime, which has no Final30 in actual WSL AM sessions.
+    # Do not silently accept a different artifact root/date.
+    file = (
+        Path(filename) if filename else
+        repo_root() / "runtime" / "kr" / "watchlist" / trade_date / "final30_scored.json"
+    )
+    # PREP's production canonical artifact is sometimes mirrored under an
+    # extra trade-date directory. The 2026-11-10 AM archive proves:
+    #   runtime/kr/watchlist/YYYY-MM-DD/final30_scored.json
+    #   runtime/kr/watchlist/YYYY-MM-DD/YYYY-MM-DD/prep_contract.json
+    # Search only these two same-day canonical locations, never stale latest
+    # aliases. If both exist, reject conflicting date/as_of/contract hash.
+    contract_paths = (
+        file.with_name("prep_contract.json"),
+        file.parent / trade_date / "prep_contract.json",
+    )
+    existing = [p for p in contract_paths if p.is_file()]
+    if not existing:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+    try:
+        payload = json.loads(file.read_text(encoding="utf-8"))
+        contracts = [json.loads(p.read_text(encoding="utf-8")) for p in existing]
+        contract = contracts[0]
+        for other in contracts[1:]:
+            for field in ("trade_date", "market", "env", "contract_hash"):
+                if (contract.get(field) is not None and other.get(field) is not None
+                        and str(contract[field]) != str(other[field])):
+                    raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_CONFLICTING_CONTRACTS")
+            left_asof = str(contract.get("actual_as_of") or contract.get("as_of") or contract.get("expected_as_of") or "")[:10]
+            right_asof = str(other.get("actual_as_of") or other.get("as_of") or other.get("expected_as_of") or "")[:10]
+            if not left_asof or left_asof != right_asof:
+                raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_CONFLICTING_CONTRACTS")
+    except (ValueError, OSError, TypeError) as exc:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH") from exc
+    if (
+        not isinstance(contract, dict)
+        or str(contract.get("trade_date") or "")[:10] != trade_date
+        or str(contract.get("market") or "").upper() != "KR"
+        or str(contract.get("env") or "").lower() != "practice"
+        or not bool(contract.get("contract_ok"))
+        or not bool(contract.get("trade_can_proceed"))
+        or int(contract.get("final30_rows") or 0) != 30
+    ):
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+    contract_asof = str(
+        contract.get("actual_as_of") or contract.get("as_of")
+        or contract.get("expected_as_of") or ""
+    )[:10]
+    if not contract_asof:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+    # PREP contract can have 'actual_as_of' instead of 'as_of'; do not reject
+    # valid production artifacts or silently allow a mismatched scoring date.
+    expected_asof = str(contract.get("expected_as_of") or "")[:10]
+    if expected_asof and expected_asof != contract_asof:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+    if isinstance(payload, dict):
+        for field, expected in (
+            ("trade_date", trade_date),
+            ("market", "KR"),
+            ("env", "practice"),
+            ("as_of", contract_asof),
+            ("expected_as_of", contract_asof),
+        ):
+            if payload.get(field) is not None and str(payload[field])[:10] != expected:
+                raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+        rows = (payload.get("rows") or payload.get("items")
+                or payload.get("data") or payload.get("final30") or [])
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+    if not isinstance(rows, list) or len(rows) != 30:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+    codes = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+        code = str(row.get("code") or "").strip()
+        if not code.isdigit() or len(code) > 6 or not code:
+            raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+        codes.append(code.zfill(6))
+    if len(set(codes)) != 30:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+    return sorted(codes)
 
 def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
@@ -56,7 +130,29 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             # Separate owner: never collect KR_INFINITE by PB1 proof route.
             continue
         try:
-            data = kis.get_intraday_candles_today(code, start_hhmm="090000")
+            # KIS time-itemchart returns bounded minute windows. Read both
+            # the opening anchor and the latest anchor; a fixed 09:00 query
+            # alone cannot prove a post-09:30 rebound. Never fill gaps with
+            # synthetic open/high/low/close or an inferred business date.
+            anchors = (
+                ("092900", observed_at.strftime("%H%M%S"))
+                if observed_at.time() >= dtime(9, 30)
+                else (observed_at.strftime("%H%M%S"),)
+            )
+            data: list[dict] = []
+            for anchor in dict.fromkeys(anchors):
+                try:
+                    rows = kis.get_intraday_candles_today(code, start_hhmm=anchor)
+                    if isinstance(rows, list):
+                        data.extend(row for row in rows if isinstance(row, dict))
+                except Exception as minute_exc:
+                    logger.warning(
+                        "[KR][OPENING_OBSERVER][PARTIAL_MINUTE_FETCH] code=%s "
+                        "anchor=%s error_type=%s",
+                        code, anchor, type(minute_exc).__name__,
+                    )
+            if not data:
+                raise RuntimeError("NO_KIS_NATIVE_INTRADAY_MINUTE_ROWS")
             quote = kis.get_price_snapshot(code, market="J")
             if not isinstance(quote, dict):
                 quote = {}
@@ -113,7 +209,7 @@ def main() -> None:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--final30-file")
     parser.add_argument("--date")
-    parser.add_argument("--interval-sec", type=float, default=180.0)
+    parser.add_argument("--interval-sec", type=float, default=120.0)
     args = parser.parse_args()
     if args.once == args.loop:
         parser.error("select exactly one of --once or --loop")
@@ -129,10 +225,25 @@ def main() -> None:
         now = now_kst()
         if now.date().isoformat() != today or now.time() > dtime(15, 5):
             break
-        if now.time() >= dtime(9, 0):
-            result = run_once(kis=kis, codes=codes, observed_at=now)
-            logger.info("[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s", result["completed"], result["unknown"])
-        time.sleep(max(60.0, float(args.interval_sec)))
+        if now.time() < dtime(9, 0):
+            # An AM wrapper may start before the cash session: wake near 09:00
+            # rather than sleeping the entire polling interval before the
+            # first native opening-minute collection.
+            time.sleep(2.0)
+            continue
+        cycle_started = time.monotonic()
+        result = run_once(kis=kis, codes=codes, observed_at=now)
+        elapsed = time.monotonic() - cycle_started
+        logger.info(
+            "[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s "
+            "elapsed_sec=%.1f target_period_sec=%.1f",
+            result["completed"], result["unknown"], elapsed,
+            max(60.0, float(args.interval_sec)),
+        )
+        # Schedule from the *start* of the last 30-symbol scan, not from
+        # its end. Otherwise every proof expires during the guaranteed
+        # 'cycle work + 180sec sleep' blind spot while the BUY gate is ON.
+        time.sleep(max(1.0, max(60.0, float(args.interval_sec)) - elapsed))
 
 
 if __name__ == "__main__":
