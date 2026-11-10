@@ -260,3 +260,37 @@ def test_verified_positive_pullback_rebound_roundtrips_from_collector_to_new_buy
         now=now, style="ENTRY_PULLBACK", setup_ok=True, trigger_ok=False,
         pivot=None, order_price=96.1,
     )["state"] != "READY_SHADOW"
+
+
+def test_practice_wsl_legacy_shadow_is_upgraded_but_emergency_off_survives():
+    """Read-only shell profile evaluation; neither code path runs a broker."""
+    import os
+    import subprocess
+    root = Path("scripts/wsl/kr-entry-timing-activation.sh")
+    script = (
+        'source "$1"; kr_pb1_entry_timing_defaults; '
+        'printf "RESULT:%s|%s|%s\\n" '
+        '"$KR_PB1_ENTRY_TIMING_MODE" "$KR_PB1_ENTRY_TIMING_APPROVED" '
+        '"$KR_PB1_OPENING_OBSERVER_ENABLED"'
+    )
+    base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "STRATEGY_ENV": "practice", "KIS_ENV": "practice"}
+    def _run(overrides):
+        env = {**base, **overrides}
+        return subprocess.run(
+            ["bash", "-c", script, "bash", str(root)],
+            env=env, text=True, capture_output=True, check=True,
+        )
+    assert "RESULT:ENFORCE|1|1" in _run({}).stdout
+    old_shadow = _run({"KR_PB1_ENTRY_TIMING_MODE": "SHADOW"})
+    assert "legacy_SHADOW_to_ENFORCE=1" in old_shadow.stdout
+    assert "RESULT:ENFORCE|1|1" in old_shadow.stdout
+    safety_off = _run({"KR_PB1_ENTRY_TIMING_MODE": "OFF"})
+    assert "RESULT:OFF|1|0" in safety_off.stdout
+    invalid = _run({"KR_PB1_ENTRY_TIMING_MODE": "typo-unrecognized"})
+    assert "RESULT:ENFORCE|0|1" in invalid.stdout
+    assert "CONFIG_ERROR" in invalid.stderr
+    explicit_unapproved = _run({"KR_PB1_ENTRY_TIMING_APPROVED": "0"})
+    assert "RESULT:ENFORCE|0|1" in explicit_unapproved.stdout
+    real = _run({"STRATEGY_ENV": "real", "KIS_ENV": "real"})
+    assert "RESULT:SHADOW|0|0" in real.stdout
