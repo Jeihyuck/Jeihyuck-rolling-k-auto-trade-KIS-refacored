@@ -53,6 +53,8 @@ kr_pb1_opening_observer_start() {
     unset NULLIM_SESSION_LOCK_FD NULLIM_SESSION_LOCK_FILE NULLIM_SESSION_LOCK_TOKEN
     exec flock -n "runtime/locks/kr-pb1-opening-observer-${trade_date}.lock" \
       timeout --kill-after=15s 24000 \
+      env NO_TRADE=1 DISABLE_REAL_TRADING=1 DISABLE_LIVE_TRADING=1 \
+          LIVE_TRADING_ENABLED=0 KR_LIVE_TRADING_ENABLED=0 KR_ORDER_ARMED=0 \
       python -m scripts.kr_opening_observer --loop --date "$trade_date" \
         --interval-sec "$KR_PB1_OPENING_OBSERVER_INTERVAL_SEC"
   ) >>"$log_dir/kr-opening-observer.log" 2>&1 </dev/null &
