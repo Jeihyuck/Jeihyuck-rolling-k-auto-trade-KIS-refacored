@@ -2892,6 +2892,7 @@ def route_order(
                     "[US_ORDER][EXECUTION_CLAIM][PRE_IO_RELEASE_FAILED] action_key=%s",
                     claim.action_key,
                 )
+            terminal_pre_io_intent = False
             if (side == "BUY" and _native_kis and not requires_reconcile
                     and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
                     and str(intent.get("position_action") or "").upper() == "NEW_POSITION_BUY"
@@ -2914,6 +2915,7 @@ def route_order(
                         symbol_upper, intent["submit_attempt_id"], failure_code,
                     )
                 else:
+                    terminal_pre_io_intent = True
                     logger.info(
                         "[US_ORDER][PRE_IO_INTENT_TERMINAL] symbol=%s attempt=%s code=%s",
                         symbol_upper, intent["submit_attempt_id"], failure_code,
@@ -2967,7 +2969,8 @@ def route_order(
                 "execution_integrity_error": integrity_error,
                 "execution_action_key": claim.action_key,
                 "broker_submit": False,
-                "retry_order": not requires_reconcile,
+                "retry_order": not requires_reconcile and not terminal_pre_io_intent,
+                "fresh_signal_required": terminal_pre_io_intent,
                 "requires_reconcile": requires_reconcile,
                 "intent": intent,
             }
