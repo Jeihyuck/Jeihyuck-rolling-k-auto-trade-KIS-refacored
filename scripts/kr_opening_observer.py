@@ -25,24 +25,59 @@ logger = logging.getLogger(__name__)
 
 
 def final30_codes(*, trade_date: str, filename: str | None = None) -> list[str]:
+    """Read the exact PREP canonical Final30 with its sibling dated contract.
+
+    The canonical Final30 payload may be an array, or a dict with items/rows.
+    The source file is not itself the authority for the trade date/market/env:
+    `prep_contract.json` is. Do not infer scope from the file's directory.
+    """
     file = Path(filename) if filename else runtime_path(
         "runtime", "kr", "watchlist", trade_date, "final30_scored.json"
     )
-    payload = json.loads(file.read_text(encoding="utf-8"))
-    if (not isinstance(payload, dict)
-            or payload.get("trade_date") != trade_date
-            or payload.get("market") != "KR"
-            or payload.get("env") != "practice"):
+    contract_file = file.with_name("prep_contract.json")
+    try:
+        payload = json.loads(file.read_text(encoding="utf-8"))
+        contract = json.loads(contract_file.read_text(encoding="utf-8"))
+    except (ValueError, OSError, TypeError) as exc:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH") from exc
+    if (
+        not isinstance(contract, dict)
+        or str(contract.get("trade_date") or "")[:10] != trade_date
+        or str(contract.get("market") or "").upper() != "KR"
+        or str(contract.get("env") or "").lower() != "practice"
+        or not bool(contract.get("contract_ok"))
+        or not bool(contract.get("trade_can_proceed"))
+        or int(contract.get("final30_rows") or 0) != 30
+    ):
         raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
-    rows = payload.get("rows") or []
-    codes = sorted({
-        str(r.get("code") or "").zfill(6)
-        for r in rows if isinstance(r, dict) and str(r.get("code") or "").strip()
-    })
-    if len(codes) != len(rows) or not 1 <= len(codes) <= 30:
+    if isinstance(payload, dict):
+        for field, expected in (
+            ("trade_date", trade_date),
+            ("market", "KR"),
+            ("env", "practice"),
+            ("as_of", str(contract.get("as_of") or "")),
+        ):
+            if payload.get(field) is not None and str(payload[field]) != expected:
+                raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+        rows = (payload.get("rows") or payload.get("items")
+                or payload.get("data") or payload.get("final30") or [])
+    elif isinstance(payload, list):
+        rows = payload
+    else:
         raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
-    return codes
-
+    if not isinstance(rows, list) or len(rows) != 30:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+    codes = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+        code = str(row.get("code") or "").strip()
+        if not code.isdigit() or len(code) > 6 or not code:
+            raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+        codes.append(code.zfill(6))
+    if len(set(codes)) != 30:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
+    return sorted(codes)
 
 def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
