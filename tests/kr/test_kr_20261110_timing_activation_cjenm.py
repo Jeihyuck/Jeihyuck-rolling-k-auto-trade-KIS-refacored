@@ -166,3 +166,97 @@ def test_observer_rejects_stale_final30_contract_and_payload_mismatch(tmp_path):
     f.write_text(json.dumps({"trade_date": "2026-11-10", "items": rows}))
     with pytest.raises(RuntimeError, match="SCOPE_MISMATCH"):
         final30_codes(trade_date="2026-11-11", filename=str(f))
+
+
+def test_enforce_without_explicit_approval_never_bypasses_entry_gate(monkeypatch):
+    """A stale .env approval=0 must not silently turn ENFORCE into SHADOW."""
+    import trader.pb1_engine as pb1
+    monkeypatch.setattr(pb1, "now_kst", lambda: CJ_BUY_TIME)
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_MODE", "ENFORCE")
+    monkeypatch.setenv("KR_PB1_ENTRY_TIMING_APPROVED", "0")
+    def _must_not_be_queried(**kwargs):
+        raise AssertionError("no proof should be queried when timing policy unapproved")
+    monkeypatch.setattr(pb1, "evaluate_proof_for_candidate", _must_not_be_queried)
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.env = "practice"
+    engine._now_kst = CJ_BUY_TIME
+    candidate = SimpleNamespace(
+        code="035760", setup_ok=True,
+        features={"entry_style_selected": "ENTRY_PULLBACK", "setup_ok": True,
+                  "trigger_ok": False},
+    )
+    decision = engine._resolve_entry_pre_submit(
+        cf=candidate, stage="PB1-AM", order_price=45350.0, order_type="LIMIT",
+    )
+    assert not decision.ok
+    assert decision.reason_codes == ["KR_ENTRY_TIMING_POLICY_NOT_APPROVED"]
+    assert decision.blocking_stage == "pre_submit_timing"
+
+
+def _synthetic_proven_rebound():
+    """Synthetic completed same-date minute OHLCV, NOT 2026-11-10 KIS history."""
+    start = datetime(2026, 11, 10, 9, 0, tzinfo=KST)
+    rows = []
+    for minute in range(30):
+        at = start + timedelta(minutes=minute)
+        rows.append({
+            "date": "20261110", "time": at.strftime("%H%M%S"),
+            "open": 96, "high": 100, "low": 94,
+            "close": 96, "volume": 500,
+        })
+    post = [
+        # Minute, open, high, low, close, volume
+        (30, 94.8, 95.6, 94.5, 95.0, 600),
+        (31, 94.9, 95.4, 94.0, 95.0, 650),
+        (32, 95.0, 95.5, 94.8, 95.3, 650),
+        (33, 95.4, 96.2, 95.2, 96.1, 650),
+    ]
+    for minute, o, h, lo, c, vol in post:
+        at = start + timedelta(minutes=minute)
+        rows.append({
+            "date": "20261110", "time": at.strftime("%H%M%S"),
+            "open": o, "high": h, "low": lo, "close": c, "volume": vol,
+        })
+    return rows
+
+
+def test_verified_positive_pullback_rebound_roundtrips_from_collector_to_new_buy_gate(tmp_path, monkeypatch):
+    """Verify actual producer/consumer file contract, not just WAIT-only paths."""
+    from trader.kr import opening_bar_contract as op
+    def _test_runtime_path(*parts):
+        return tmp_path.joinpath(*parts)
+    monkeypatch.setattr(op, "runtime_path", _test_runtime_path)
+    now = datetime(2026, 11, 10, 9, 34, 51, tzinfo=KST)
+    original_rows = _synthetic_proven_rebound()
+    saved = op.save_opening_proof(
+        env="practice", account_scope="test-account:no-orders",
+        code="035760", now=now, raw_bars=original_rows,
+        vwap=None, vwap_source="UNKNOWN",
+    )
+    assert saved["bars"] == 34
+    proof = op.evaluate_proof_for_candidate(
+        env="practice", account_scope="test-account:no-orders", code="035760",
+        now=now, style="ENTRY_PULLBACK", setup_ok=True, trigger_ok=False,
+        pivot=None, order_price=96.1,
+    )
+    assert proof["state"] == "READY_SHADOW", proof
+    assert proof["reason"] == "PULLBACK_REBOUND_CONFIRMED"
+    assert proof["max_entry_price"] >= 96.1
+    assert op.evaluate_proof_for_candidate(
+        env="practice", account_scope="test-account:no-orders", code="035760",
+        now=now, style="ENTRY_PULLBACK", setup_ok=True, trigger_ok=False,
+        pivot=None, order_price=97.0,
+    )["state"] == "WAIT"
+    # Source provenance mismatch and missing actual 1m date cannot make
+    # synthetic / other-date rows into verified same-day trading evidence.
+    bad_rows = [{**row, "date": "20261109"} for row in original_rows]
+    saved_bad = op.save_opening_proof(
+        env="practice", account_scope="other-account", code="035760",
+        now=now, raw_bars=bad_rows, vwap=None, vwap_source="UNKNOWN",
+    )
+    assert saved_bad["bars"] == 0
+    assert op.evaluate_proof_for_candidate(
+        env="practice", account_scope="other-account", code="035760",
+        now=now, style="ENTRY_PULLBACK", setup_ok=True, trigger_ok=False,
+        pivot=None, order_price=96.1,
+    )["state"] != "READY_SHADOW"
