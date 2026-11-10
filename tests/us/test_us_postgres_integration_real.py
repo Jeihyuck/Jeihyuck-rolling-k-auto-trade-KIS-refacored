@@ -2474,3 +2474,95 @@ def test_stage123_default_on_schema_preflight_requires_actual_rls_migration(pg_e
         conn.execute(text(
             "ALTER TABLE us_execution_account_reservations ENABLE ROW LEVEL SECURITY"
         ))
+
+
+def test_p0_proven_unsent_buy_intent_postgres_terminalization(pg_engine, monkeypatch):
+    """#341: close only exact authoritative pre-HTTP attempts; never broker-possible ones."""
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn, required=True: "p0-epoch")
+
+    def seed(key, *, positive=False, active=False, unverified=False, order=False):
+        attempt = f"{key}-attempt"
+        with pg_engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO us_execution_claims
+                  (action_key,env,account_id,market,trading_epoch_id,strategy_owner,
+                   lifecycle_id,action,target_qty,action_state,active_attempt_id,trade_date)
+                VALUES (:action,'practice','p0-account','US','p0-epoch','US_STANDARD',
+                        :action,'NEW_POSITION_BUY',1,:state,:active,'2026-11-09')
+            """), {"action": key, "state": "IN_FLIGHT" if active else "OPEN",
+                   "active": attempt if active else None})
+            conn.execute(text("""
+                INSERT INTO us_execution_attempts
+                  (attempt_id,action_key,attempt_no,requested_qty,client_order_key,
+                   attempt_state,authoritative)
+                VALUES (:attempt,:action,1,1,:key,'ABANDONED_PRE_SUBMIT',:verified)
+            """), {"attempt": attempt, "action": key, "key": key,
+                   "verified": not unverified})
+            conn.execute(text("""
+                INSERT INTO us_order_intents
+                  (trade_date,client_order_key,symbol,exchange,side,qty,status,
+                   trading_epoch_id,meta)
+                VALUES ('2026-11-09',:key,'AMGN','NASDAQ','BUY',1,'PENDING',
+                        'p0-epoch',CAST(:meta AS jsonb))
+            """), {"key": key, "meta": json.dumps({"submit_attempt_id": attempt,
+                      "strategy_owner": "US_STANDARD", "position_action": "NEW_POSITION_BUY"})})
+            for kind in (("BROKER_SUBMIT_ABORTED_PRE_IO", "BROKER_ACK_RECEIVED")
+                         if positive else ("BROKER_SUBMIT_ABORTED_PRE_IO",)):
+                conn.execute(text("""
+                    INSERT INTO us_order_events
+                      (event_id,trade_date,event_type,event_timestamp,client_order_key,
+                       submit_attempt_id,symbol,side,requested_qty,idempotency_key)
+                    VALUES (gen_random_uuid(),'2026-11-09',:kind,now(),:key,:attempt,
+                            'AMGN','BUY',1,:idem)
+                """), {"kind": kind, "key": key, "attempt": attempt,
+                       "idem": f"{key}:{kind}"})
+            if order:
+                conn.execute(text("""
+                    INSERT INTO us_orders
+                      (trade_date,client_order_key,symbol,exchange,side,qty_requested,
+                       status,dry_run,trading_epoch_id)
+                    VALUES ('2026-11-09',:key,'AMGN','NASDAQ','BUY',1,'ACK',false,'p0-epoch')
+                """), {"key": key})
+        return attempt
+
+    seed("p0-safe")
+    seed("p0-broker-ack", positive=True)
+    seed("p0-active-claim", active=True)
+    seed("p0-unverified-attempt", unverified=True)
+    seed("p0-existing-order", order=True)
+
+    assert repos.close_proven_unsent_us_buy_intent(
+        client_order_key="p0-safe", attempt_id="p0-safe-attempt",
+        trade_date="2026-11-09", failure_code="US_ENTRY_TIMING_BINDING_INVALID",
+    )
+    # Exact same attempt is idempotent; a changed attempt is not.
+    assert repos.close_proven_unsent_us_buy_intent(
+        client_order_key="p0-safe", attempt_id="p0-safe-attempt",
+        trade_date="2026-11-09", failure_code="US_ENTRY_TIMING_BINDING_INVALID",
+    )
+    assert not repos.close_proven_unsent_us_buy_intent(
+        client_order_key="p0-safe", attempt_id="p0-forged-attempt",
+        trade_date="2026-11-09", failure_code="US_ENTRY_TIMING_BINDING_INVALID",
+    )
+    for key in ("p0-broker-ack", "p0-active-claim", "p0-unverified-attempt", "p0-existing-order"):
+        assert not repos.close_proven_unsent_us_buy_intent(
+            client_order_key=key, attempt_id=f"{key}-attempt",
+            trade_date="2026-11-09", failure_code="US_ENTRY_TIMING_BINDING_INVALID",
+        ), key
+    with pg_engine.connect() as conn:
+        rows = dict(conn.execute(text(
+            "SELECT client_order_key,status FROM us_order_intents "
+            "WHERE client_order_key LIKE 'p0-%'"
+        )).all())
+        safe_meta = conn.execute(text(
+            "SELECT meta FROM us_order_intents WHERE client_order_key='p0-safe'"
+        )).scalar_one()
+    assert rows["p0-safe"] == "BLOCKED"
+    assert all(rows[key] == "PENDING" for key in (
+        "p0-broker-ack", "p0-active-claim", "p0-unverified-attempt", "p0-existing-order"))
+    assert safe_meta["pre_io_abort_stage"] == "BEFORE_KIS_HTTP"
+    assert safe_meta["pre_io_abort_attempt_id"] == "p0-safe-attempt"
