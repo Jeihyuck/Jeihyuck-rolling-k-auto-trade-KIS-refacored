@@ -2463,7 +2463,9 @@ def route_order(
         # released claim, and lack of broker evidence must agree.
         if (side == "BUY" and _native_kis and not abort_journal_error
                 and release_error is None
-                and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"):
+                and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+                and str(intent.get("position_action") or "").upper() == "NEW_POSITION_BUY"
+                and isinstance((intent.get("meta") or {}).get("us_entry_opportunity_v1"), dict)):
             from trader.us.db.repos import close_proven_unsent_us_buy_intent
             if not close_proven_unsent_us_buy_intent(
                 client_order_key=str(order_key or ""),
@@ -2891,7 +2893,9 @@ def route_order(
                     claim.action_key,
                 )
             if (side == "BUY" and _native_kis and not requires_reconcile
-                    and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"):
+                    and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+                    and str(intent.get("position_action") or "").upper() == "NEW_POSITION_BUY"
+                    and isinstance((intent.get("meta") or {}).get("us_entry_opportunity_v1"), dict)):
                 from trader.us.db.repos import close_proven_unsent_us_buy_intent
                 closed = close_proven_unsent_us_buy_intent(
                     client_order_key=str(order_key or ""),
