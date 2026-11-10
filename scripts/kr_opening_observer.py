@@ -34,10 +34,32 @@ def final30_codes(*, trade_date: str, filename: str | None = None) -> list[str]:
     file = Path(filename) if filename else runtime_path(
         "runtime", "kr", "watchlist", trade_date, "final30_scored.json"
     )
-    contract_file = file.with_name("prep_contract.json")
+    # PREP's production canonical artifact is sometimes mirrored under an
+    # extra trade-date directory. The 2026-11-10 AM archive proves:
+    #   runtime/kr/watchlist/YYYY-MM-DD/final30_scored.json
+    #   runtime/kr/watchlist/YYYY-MM-DD/YYYY-MM-DD/prep_contract.json
+    # Search only these two same-day canonical locations, never stale latest
+    # aliases. If both exist, reject conflicting date/as_of/contract hash.
+    contract_paths = (
+        file.with_name("prep_contract.json"),
+        file.parent / trade_date / "prep_contract.json",
+    )
+    existing = [p for p in contract_paths if p.is_file()]
+    if not existing:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
     try:
         payload = json.loads(file.read_text(encoding="utf-8"))
-        contract = json.loads(contract_file.read_text(encoding="utf-8"))
+        contracts = [json.loads(p.read_text(encoding="utf-8")) for p in existing]
+        contract = contracts[0]
+        for other in contracts[1:]:
+            for field in ("trade_date", "market", "env", "contract_hash"):
+                if (contract.get(field) is not None and other.get(field) is not None
+                        and str(contract[field]) != str(other[field])):
+                    raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_CONFLICTING_CONTRACTS")
+            left_asof = str(contract.get("actual_as_of") or contract.get("as_of") or contract.get("expected_as_of") or "")[:10]
+            right_asof = str(other.get("actual_as_of") or other.get("as_of") or other.get("expected_as_of") or "")[:10]
+            if not left_asof or left_asof != right_asof:
+                raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_CONFLICTING_CONTRACTS")
     except (ValueError, OSError, TypeError) as exc:
         raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH") from exc
     if (
@@ -50,14 +72,26 @@ def final30_codes(*, trade_date: str, filename: str | None = None) -> list[str]:
         or int(contract.get("final30_rows") or 0) != 30
     ):
         raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+    contract_asof = str(
+        contract.get("actual_as_of") or contract.get("as_of")
+        or contract.get("expected_as_of") or ""
+    )[:10]
+    if not contract_asof:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
+    # PREP contract can have 'actual_as_of' instead of 'as_of'; do not reject
+    # valid production artifacts or silently allow a mismatched scoring date.
+    expected_asof = str(contract.get("expected_as_of") or "")[:10]
+    if expected_asof and expected_asof != contract_asof:
+        raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
     if isinstance(payload, dict):
         for field, expected in (
             ("trade_date", trade_date),
             ("market", "KR"),
             ("env", "practice"),
-            ("as_of", str(contract.get("as_of") or "")),
+            ("as_of", contract_asof),
+            ("expected_as_of", contract_asof),
         ):
-            if payload.get(field) is not None and str(payload[field]) != expected:
+            if payload.get(field) is not None and str(payload[field])[:10] != expected:
                 raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_SCOPE_MISMATCH")
         rows = (payload.get("rows") or payload.get("items")
                 or payload.get("data") or payload.get("final30") or [])
