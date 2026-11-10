@@ -95,12 +95,58 @@ class CloseMailDateContract(unittest.TestCase):
             ), 0)
             run_close.assert_called_once()
 
-    def test_windows_installer_cannot_schedule_close_before_est_end(self):
-        for name in ("update-nullim-scheduler.ps1", "verify-scheduler.ps1"):
-            source = (ROOT / "scripts/windows" / name).read_text()
-            self.assertIn('"PB1 US Close WSL"', source)
-            self.assertIn('06:05', source)
-            self.assertNotIn('"PB1 US Close WSL";Days=$usMorningDays;Time="05:05"', source)
+    def test_windows_scheduler_uses_one_consistent_us_dst_profile(self):
+        # Baselines are KST EDT wall-clock triggers. Every phase, including
+        # Close, mail and health, gets +1h during EST; prewarm tasks already
+        # carry explicit season labels and stay on their separate clocks.
+        baseline = {
+            "PB1 US Prep WSL": "21:30",
+            "PB1 US Prep Recovery WSL": "22:10",
+            "PB1 US AM Preflight WSL": "22:20",
+            "PB1 US AM WSL": "22:30",
+            "PB1 US Afternoon WSL": "02:00",
+            "PB1 US Close WSL": "05:05",
+            "PB1 US Mail WSL": "06:00",
+            "PB1 US Health WSL": "06:10",
+        }
+        sources = {
+            name: (ROOT / "scripts/windows" / name).read_text()
+            for name in ("update-nullim-scheduler.ps1", "verify-scheduler.ps1")
+        }
+        for source in sources.values():
+            self.assertIn('FindSystemTimeZoneById("Eastern Standard Time")', source)
+            self.assertIn('IsDaylightSavingTime($nyLocalNow)', source)
+            self.assertIn('Get-UsKstTime', source)
+            for task, edt_clock in baseline.items():
+                self.assertIn(f'"{task}"', source)
+                self.assertIn(f'(Get-UsKstTime "{edt_clock}")', source)
+        self.assertIn('EST Close 16:00 NY => 06:00 KST', sources["update-nullim-scheduler.ps1"])
+
+    def test_us_scheduler_est_and_edt_phase_clock_matrix(self):
+        from datetime import timedelta
+        baselines = {
+            "Prep": ("21:30", "22:30"),
+            "Recovery": ("22:10", "23:10"),
+            "AM Preflight": ("22:20", "23:20"),
+            "AM": ("22:30", "23:30"),
+            "Afternoon": ("02:00", "03:00"),
+            "Close": ("05:05", "06:05"),
+            "Mail": ("06:00", "07:00"),
+            "Health": ("06:10", "07:10"),
+        }
+        for season_time, expected_hour_offset in (
+            (datetime(2026, 7, 10, tzinfo=NY), 0),
+            (datetime(2026, 11, 10, tzinfo=NY), 1),
+        ):
+            actual_offset = 0 if season_time.dst() else 1
+            self.assertEqual(actual_offset, expected_hour_offset)
+            for phase, (edt, est) in baselines.items():
+                hh, mm = map(int, edt.split(":"))
+                actual = (datetime(2026, 1, 1, hh, mm) + timedelta(
+                    hours=actual_offset)).strftime("%H:%M")
+                self.assertEqual(
+                    actual, edt if actual_offset == 0 else est, phase,
+                )
 
 
 if __name__ == "__main__":
