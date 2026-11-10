@@ -437,6 +437,14 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     if not isinstance(proof, dict) or proof.get("mode") != "ENFORCE":
         return False, "TIMING_PROOF_MISSING"
     if not _verify_timing_signal_and_binding(intent, proof):
+        # Distinguish an intact order-identity binding with a tampered/invalid
+        # signal payload from an altered order-identity binding. Both fail
+        # closed; retain the established reason-code contract for diagnostics.
+        try:
+            if proof.get("submission_binding_sha256") == _submission_binding(intent, proof):
+                return False, "TIMING_PROOF_INVALID"
+        except (ValueError, TypeError, OverflowError):
+            pass
         return False, "TIMING_BINDING_INVALID"
     if proof.get("state") != "READY":
         return False, "TIMING_PROOF_INVALID"
