@@ -12,13 +12,19 @@ ROOT = Path(__file__).parents[1]
 
 def _copy_calendar_runtime(root: Path) -> None:
     (root / "scripts/wsl").mkdir(parents=True, exist_ok=True)
-    for name in ("check-nullim-trading-day.py", "resolve-nullim-python.sh"):
+    for name in ("check-nullim-trading-day.py", "resolve-nullim-python.sh",
+                 "resolve-us-mail-trade-date.py"):
         shutil.copy2(ROOT / "scripts/wsl" / name, root / "scripts/wsl" / name)
     (root / "trader").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "trader/__init__.py", root / "trader/__init__.py")
     shutil.copy2(ROOT / "trader/time_utils.py", root / "trader/time_utils.py")
+    (root / "trader/us").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "trader/us/__init__.py", root / "trader/us/__init__.py")
+    shutil.copy2(ROOT / "trader/us/kis_http_governor.py", root / "trader/us/kis_http_governor.py")
+    shutil.copy2(ROOT / "trader/us/market_calendar.py", root / "trader/us/market_calendar.py")
     (root / "config").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "config/krx_holidays.json", root / "config/krx_holidays.json")
+    shutil.copy2(ROOT / "config/us_market_holidays.yaml", root / "config/us_market_holidays.yaml")
 
 
 def fixture_us_repo(tmp_path: Path, trade_date: str, *, missing_purposes=()) -> Path:
@@ -135,7 +141,9 @@ def test_us_missing_edt_prewarm_sends_degraded_mail(tmp_path):
     marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
     assert marker["status"] == "DEGRADED"
     assert marker["mail_sent"] is True
-    assert marker["mail_delivered"] is True
+    # SMTP accepted != mailbox delivery confirmed.
+    assert marker["mail_delivered"] is False
+    assert marker["delivery_status"] == "UNCONFIRMED_AFTER_SMTP_ACCEPT"
     assert marker["mail_complete"] is False
     assert marker["required_missing_count"] == 1
     assert marker["missing_evidence"] == [{
@@ -244,16 +252,21 @@ def test_newly_arrived_missing_log_changes_digest_and_allows_complete_resend(tmp
     assert second_marker["source_evidence_sha256"] != first_marker["source_evidence_sha256"]
 
 
-def test_us_delayed_mail_uses_latest_completed_partition(tmp_path):
-    reference = datetime.now(ZoneInfo("America/New_York")).date()
-    completed = (reference - timedelta(days=1)).isoformat()
+def test_us_delayed_mail_uses_latest_completed_exchange_session(tmp_path):
+    # Calendar decides the intended completed session; no prior Close folder
+    # can substitute for a current trading day's missing Close evidence.
+    import runpy
+    resolve = runpy.run_path(str(ROOT / "scripts/wsl/resolve-us-mail-trade-date.py"))
+    completed = resolve["latest_completed_us_trade_date"](
+        datetime.now(ZoneInfo("America/New_York"))
+    )
     run_date = datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat()
     root = fixture_us_repo(tmp_path, completed)
 
     result, _ = run_us_mail(root, None, kst_run_date=run_date)
 
     assert result.returncode == 0, result.stderr + result.stdout
-    assert "[LOG_MAIL][TRADE_DATE_RECOVERY]" in result.stdout
+    assert "[LOG_MAIL][TRADE_DATE_RESOLVED]" in result.stdout
     marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
     assert marker["trade_date"] == completed
 
@@ -395,3 +408,67 @@ def test_us_failed_sessions_not_masked_by_close_ok_in_mail(tmp_path):
     assert evidence["execution_sessions"]["am"]["final_status"] == "FAILED"
     assert evidence["execution_sessions"]["afternoon"]["orders_sent_total"] == 0
     assert "[EXECUTION_FAILED]" in (root / "smtp-args").read_text()
+
+
+def test_us_unknown_smtp_outcome_is_fenced_across_scheduler_retries(tmp_path):
+    # Exit 75 means the SMTP server MAY have accepted a message. A subsequent
+    # scheduled invocation must not duplicate it even if no ACK was observed.
+    trade_date, run_date = "2026-11-09", "2026-11-10"
+    root = fixture_us_repo(tmp_path, trade_date)
+    wrapper = root / "scripts/wsl/with-venv.sh"
+    counter = root / "smtp-count"
+    wrapper.write_text(
+        f"""#!/usr/bin/env bash
+count=0
+[[ -f "{counter}" ]] && count=$(cat "{counter}")
+count=$((count+1))
+echo "$count" > "{counter}"
+echo '[MAIL][SIMULATED_UNCERTAIN_AFTER_SEND]' >&2
+exit 75
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert first.returncode == 75, first.stdout + first.stderr
+    first_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert first_marker["status"] == "UNKNOWN_AFTER_SEND"
+    assert first_marker["mail_sent"] is None
+    assert first_marker["recipient"] == "ops@example.test"
+    assert first_marker["source_evidence_sha256"]
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+    second, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert second.returncode == 75, second.stdout + second.stderr
+    assert "UNKNOWN_AFTER_SEND_FENCED" in second.stderr
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+
+def test_us_missing_current_close_does_not_attach_prior_trading_date_close(tmp_path):
+    # November 9 is a valid US session, but its Close record was missing.
+    # Old November 6 evidence must never be used as a current Close substitute.
+    trade_date, run_date = "2026-11-09", "2026-11-10"
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"close"})
+    older_close = root / "runtime/logs/us/2026-11-06/close"
+    older_close.mkdir(parents=True)
+    (older_close / "attempt.log").write_text("old close evidence\\n", encoding="utf-8")
+
+    result, archive = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert marker["trade_date"] == trade_date
+    assert marker["status"] == "DEGRADED"
+    assert {
+        "code": "REQUIRED_LOG_MISSING_close",
+        "path": f"runtime/logs/us/{trade_date}/close",
+    } in marker["missing_evidence"]
+    with tarfile.open(archive, "r:gz") as tf:
+        names = tf.getnames()
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+        manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
+    assert evidence["trade_date"] == trade_date
+    assert evidence["close_missing_reason"] == "CLOSE_SESSION_LOG_MISSING"
+    assert manifest["trade_date_et"] == trade_date
+    assert not any("2026-11-06" in name for name in names)
+    assert "[DEGRADED] 2026-11-09 trading logs" in (root / "smtp-args").read_text()

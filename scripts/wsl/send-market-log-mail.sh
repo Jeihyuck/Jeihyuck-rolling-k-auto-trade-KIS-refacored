@@ -17,38 +17,18 @@ CALENDAR_PYTHON="$(nullim_resolve_python "$APP")" || {
 }
 
 KST_RUN_DATE="${NULLIM_KST_RUN_DATE:-$(TZ=Asia/Seoul date +%F)}"
-US_REFERENCE_DATE_ET="$(TZ=America/New_York date +%F)"
-
-resolve_latest_completed_us_trade_date() {
-  local reference_date="$1" dir base
-  local -a candidates=()
-  shopt -s nullglob
-  candidates=(runtime/logs/us/20??-??-??)
-  shopt -u nullglob
-  if ((${#candidates[@]})); then
-    while IFS= read -r dir; do
-      base="$(basename "$dir")"
-      [[ "$base" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
-      [[ "$base" > "$reference_date" ]] && continue
-      [[ -f "$dir/session-manifest.json" ]] || continue
-      if [[ -d "$dir/close" ]] && find "$dir/close" -maxdepth 1 -type f -name '*.log' -print -quit | grep -q .; then
-        printf '%s\n' "$base"
-        return 0
-      fi
-    done < <(printf '%s\n' "${candidates[@]}" | sort -r)
-  fi
-  printf '%s\n' "$reference_date"
-}
-
+# For US, determine the exchange's most recently COMPLETED trading session.
+# Never infer the target date from the existence of previous Close logs.
 TRADE_DATE="$KST_RUN_DATE"
 if [[ "$MARKET" == us ]]; then
   if [[ -n "${US_TRADE_DATE:-}" ]]; then
     TRADE_DATE="$US_TRADE_DATE"
   else
-    TRADE_DATE="$(resolve_latest_completed_us_trade_date "$US_REFERENCE_DATE_ET")"
-    if [[ "$TRADE_DATE" != "$US_REFERENCE_DATE_ET" ]]; then
-      echo "[LOG_MAIL][TRADE_DATE_RECOVERY] reference_et=$US_REFERENCE_DATE_ET resolved_trade_date=$TRADE_DATE source=latest_completed_partition"
-    fi
+    TRADE_DATE="$("$CALENDAR_PYTHON" "$APP/scripts/wsl/resolve-us-mail-trade-date.py")" || {
+      echo "[LOG_MAIL][FAIL] market=us reason=COMPLETED_US_TRADE_DATE_UNVERIFIED" >&2
+      exit 1
+    }
+    echo "[LOG_MAIL][TRADE_DATE_RESOLVED] market=us trade_date=$TRADE_DATE source=ny_exchange_calendar"
   fi
 fi
 
@@ -79,12 +59,17 @@ trap cleanup EXIT
 fail() {
   local reason="$1" rc="${2:-1}" missing_path="${3:-}" searched_file="${4:-}" marker="$PROD_MARKER"
   [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"
-  python3 - "$marker" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" <<'PY'
+  python3 - "$marker" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" "${SOURCE_SHA:-}" "${RECIPIENT:-}" <<'PY'
 import json,sys
 from datetime import datetime,timezone
 from pathlib import Path
-p,m,d,k,r,a,count,missing,searched_file=sys.argv[1:]
-data={'status':'FAIL','mail_sent':False,'mail_delivered':False,'mail_complete':False,'market':m,'trade_date':d,'run_date_kst':k,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+p,m,d,k,r,a,count,missing,searched_file,source_sha,recipient=sys.argv[1:]
+data={'status':'UNKNOWN_AFTER_SEND' if r=='UNKNOWN_AFTER_SEND' else 'FAIL','mail_sent':None if r=='UNKNOWN_AFTER_SEND' else False,'mail_delivered':False,'mail_complete':False,'market':m,'trade_date':d,'run_date_kst':k,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+if source_sha: data['source_evidence_sha256']=source_sha
+# SMTP exit 75 means the remote server may already have accepted this
+# message. Persist the original dedup identity so the next scheduled run
+# cannot send a duplicate after an uncertain outcome.
+if recipient: data['recipient']=recipient
 if missing: data['missing_path']=missing
 if searched_file and Path(searched_file).is_file(): data['searched_paths']=[x for x in Path(searched_file).read_text().splitlines() if x]
 Path(p).write_text(json.dumps(data,indent=2)+'\n')
@@ -447,6 +432,11 @@ if market == 'us':
     data['daily_execution_status'] = 'FAILED' if failed else ('UNKNOWN' if unknown else 'COMPLETED')
     data['execution_sessions'] = sessions
     data['close_report_status'] = close_status
+    data['close_missing_reason'] = (
+        'CLOSE_SESSION_LOG_MISSING' if 'close' in missing_sessions
+        else 'CLOSE_REPORT_MISSING_OR_INVALID' if close_status == 'UNKNOWN'
+        else None
+    )
 Path(out).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 
@@ -487,13 +477,20 @@ fi
 
 COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 RECIPIENT="${MAIL_TO:-${NAVER_MAIL_TO:-${REPORT_MAIL_TO:-dry-run}}}"
-SOURCE_SHA="$(python3 - "$STAGE" "$READINESS" <<'PY'
+# Digest only immutable included evidence + missing inventory, not generated
+# readiness/report timestamps. Identical source reports dedupe across retries.
+SOURCE_SHA="$(python3 - "$INCLUDED_LIST" "$MISSING_LIST" <<'PY'
 import hashlib,sys
 from pathlib import Path
-stage,readiness=sys.argv[1:]
-root=Path(stage); h=hashlib.sha256()
-for p in sorted(x for x in root.rglob('*') if x.is_file() and str(x.relative_to(root)) != readiness):
-    h.update(str(p.relative_to(root)).encode()+b'\0'); h.update(p.read_bytes())
+included,missing=map(Path,sys.argv[1:])
+h=hashlib.sha256()
+for line in sorted(included.read_text().splitlines()):
+    root=Path(line)
+    paths=sorted(p for p in root.rglob('*') if p.is_file()) if root.is_dir() else [root]
+    for p in paths:
+        h.update(str(p).encode()+b'\\0')
+        h.update(p.read_bytes())
+h.update(missing.read_bytes())
 print(h.hexdigest())
 PY
 )"
@@ -509,19 +506,22 @@ for path in sorted(root.glob(f'{market}-mail-*.json')):
     except Exception:
         continue
     if (
-        data.get('status') in {'OK','DEGRADED'}
-        and data.get('mail_sent') is True
+        data.get('status') in {'OK','DEGRADED','UNKNOWN_AFTER_SEND'}
+        and (data.get('mail_sent') is True or data.get('status')=='UNKNOWN_AFTER_SEND')
         and data.get('market') == market
         and data.get('trade_date') == trade
         and data.get('recipient') == recipient
         and data.get('source_evidence_sha256') == evidence_sha
     ):
-        print(path)
+        print(('UNKNOWN:' if data.get('status')=='UNKNOWN_AFTER_SEND' else 'SENT:')+str(path))
         break
 PY
 )"
-  if [[ -n "$IDEMPOTENT_MATCH" ]]; then
-    echo "[LOG_MAIL][IDEMPOTENT_SKIP] status=$EVIDENCE_STATUS source_evidence_sha256=$SOURCE_SHA prior_marker=$IDEMPOTENT_MATCH"
+  if [[ "$IDEMPOTENT_MATCH" == UNKNOWN:* ]]; then
+    echo "[LOG_MAIL][UNKNOWN_AFTER_SEND_FENCED] market=$MARKET trade_date=$TRADE_DATE prior_marker=${IDEMPOTENT_MATCH#UNKNOWN:}" >&2
+    exit 75
+  elif [[ "$IDEMPOTENT_MATCH" == SENT:* ]]; then
+    echo "[LOG_MAIL][IDEMPOTENT_SKIP] status=$EVIDENCE_STATUS source_evidence_sha256=$SOURCE_SHA prior_marker=${IDEMPOTENT_MATCH#SENT:}"
     exit 0
   fi
 fi
@@ -607,7 +607,10 @@ for attempt_no in 1 2 3; do
   mail_rc=$?
   set -e
   printf '%s\n' "$mail_output"
-  [[ "$mail_rc" == 75 ]] && unknown_after_send=1
+  if [[ "$mail_rc" == 75 ]]; then
+    unknown_after_send=1
+    break  # Never issue a second SMTP attempt after possible acceptance.
+  fi
   if [[ "$mail_rc" == 0 ]]; then
     message_id="$(printf '%s\n' "$mail_output" | sed -n 's/^\[MAIL\]\[MESSAGE_ID\] //p' | tail -1)"
     break
@@ -628,7 +631,7 @@ p,m,d,k,source,archive,a,msg,recipient,out,count,status,missing_path=sys.argv[1:
 missing=[]
 for line in Path(missing_path).read_text().splitlines():
     code,_,value=line.partition('\t'); missing.append({'code':code,'path':value})
-data={'status':status,'mail_sent':True,'mail_delivered':True,'mail_complete':status=='OK','market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':len(missing),'missing_evidence':missing,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+data={'status':status,'mail_sent':True,'mail_delivered':False,'delivery_status':'UNCONFIRMED_AFTER_SMTP_ACCEPT','mail_complete':status=='OK','market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':len(missing),'missing_evidence':missing,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
 Path(p).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 

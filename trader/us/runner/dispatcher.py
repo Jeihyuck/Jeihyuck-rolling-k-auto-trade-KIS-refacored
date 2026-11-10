@@ -133,7 +133,14 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
     if mode == "close":
         from trader.us.runner.trade_close_runner import run_trade_close
         r = run_trade_close(env=env, offline=offline, force_now=force_now)
-        return 0 if r.get("status") == "OK" else 1
+        # Completed Close with unresolved historical evidence is a successful
+        # session carrying warnings; never mask an actual ERROR or a SKIP.
+        status = str(r.get("status") or "").upper()
+        if status == "OK_WITH_WARNINGS":
+            logger.warning("[US_DISPATCHER][CLOSE_WITH_WARNINGS] result=COMPLETED_WITH_WARNINGS")
+        elif status == "SKIP":
+            logger.info("[US_DISPATCHER][CLOSE_SKIPPED] result=SKIPPED")
+        return 0 if status in {"OK", "OK_WITH_WARNINGS"} else 1
 
     if mode == "report":
         from trader.us.runner.daily_report_runner import run_daily_report

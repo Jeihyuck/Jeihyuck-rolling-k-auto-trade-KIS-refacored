@@ -1,0 +1,67 @@
+name: US Windows Scheduler PowerShell Parse CI
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/windows/update-nullim-scheduler.ps1'
+      - 'scripts/windows/verify-scheduler.ps1'
+      - '.github/workflows/us-windows-scheduler-parse-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parse-and-season-matrix:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell AST parse and isolated KST seasonal clock test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = @(
+            'scripts/windows/update-nullim-scheduler.ps1',
+            'scripts/windows/verify-scheduler.ps1'
+          )
+          $expected = @{
+            '21:30' = @('21:30','22:30')
+            '22:10' = @('22:10','23:10')
+            '22:20' = @('22:20','23:20')
+            '22:30' = @('22:30','23:30')
+            '02:00' = @('02:00','03:00')
+            '05:05' = @('05:05','06:05')
+            '06:00' = @('06:00','07:00')
+            '06:10' = @('06:10','07:10')
+          }
+          foreach ($path in $scripts) {
+            $tokens = $null; $parseErrors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path).Path, [ref]$tokens, [ref]$parseErrors
+            )
+            if ($parseErrors.Count -gt 0) {
+              foreach ($errorItem in $parseErrors) { Write-Error "$path : $errorItem" }
+              throw "PowerShell parse errors in $path"
+            }
+            $functionAst = @($ast.FindAll({
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Get-UsKstTime'
+            }, $true))
+            if ($functionAst.Count -ne 1) { throw "${path}: exactly one Get-UsKstTime function required" }
+            foreach ($clock in $expected.Keys) {
+              for ($offset = 0; $offset -le 1; $offset++) {
+                # Evaluate ONLY the pure clock conversion function extracted
+                # from AST; never dot-source an installer or schedule tasks.
+                $isolatedCode = '$usOffsetHours=' + $offset + "`n" +
+                  $functionAst[0].Extent.Text + "`n" +
+                  'Get-UsKstTime "' + $clock + '"'
+                $actual = & ([scriptblock]::Create($isolatedCode))
+                if ($actual -ne $expected[$clock][$offset]) {
+                  throw "$path $clock offset=$offset actual=$actual expected=$($expected[$clock][$offset])"
+                }
+              }
+            }
+            Write-Host "[US_SCHEDULER_PARSER][PASS] file=$path season_cases=16"
+          }
