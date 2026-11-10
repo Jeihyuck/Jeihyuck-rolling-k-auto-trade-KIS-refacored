@@ -452,6 +452,14 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     price = finite(intent.get("limit_price"))
     if cap is None or cap <= 0 or price is None or price <= 0 or price > cap + 1e-6:
         return False, "TIMING_PRICE_CAP_VIOLATED"
+    # Native overseas stock limit orders use two-decimal dollar prices. Never
+    # approve a 4-decimal intent whose HALF_UP submitted cent price exceeds cap.
+    from decimal import Decimal, ROUND_HALF_UP
+    submitted_cent_price = Decimal(str(price)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP,
+    )
+    if submitted_cent_price > Decimal(str(cap)):
+        return False, "TIMING_PRICE_CAP_VIOLATED"
     if not isinstance(fresh_ws_quote, dict):
         return False, "TIMING_WS_QUOTE_MISSING"
     received = finite(fresh_ws_quote.get("received_at"))
