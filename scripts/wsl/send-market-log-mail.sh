@@ -59,13 +59,17 @@ trap cleanup EXIT
 fail() {
   local reason="$1" rc="${2:-1}" missing_path="${3:-}" searched_file="${4:-}" marker="$PROD_MARKER"
   [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"
-  python3 - "$marker" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" "${SOURCE_SHA:-}" <<'PY'
+  python3 - "$marker" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" "${SOURCE_SHA:-}" "${RECIPIENT:-}" <<'PY'
 import json,sys
 from datetime import datetime,timezone
 from pathlib import Path
-p,m,d,k,r,a,count,missing,searched_file,source_sha=sys.argv[1:]
+p,m,d,k,r,a,count,missing,searched_file,source_sha,recipient=sys.argv[1:]
 data={'status':'UNKNOWN_AFTER_SEND' if r=='UNKNOWN_AFTER_SEND' else 'FAIL','mail_sent':None if r=='UNKNOWN_AFTER_SEND' else False,'mail_delivered':False,'mail_complete':False,'market':m,'trade_date':d,'run_date_kst':k,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
 if source_sha: data['source_evidence_sha256']=source_sha
+# SMTP exit 75 means the remote server may already have accepted this
+# message. Persist the original dedup identity so the next scheduled run
+# cannot send a duplicate after an uncertain outcome.
+if recipient: data['recipient']=recipient
 if missing: data['missing_path']=missing
 if searched_file and Path(searched_file).is_file(): data['searched_paths']=[x for x in Path(searched_file).read_text().splitlines() if x]
 Path(p).write_text(json.dumps(data,indent=2)+'\n')
