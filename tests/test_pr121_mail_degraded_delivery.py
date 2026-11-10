@@ -408,3 +408,67 @@ def test_us_failed_sessions_not_masked_by_close_ok_in_mail(tmp_path):
     assert evidence["execution_sessions"]["am"]["final_status"] == "FAILED"
     assert evidence["execution_sessions"]["afternoon"]["orders_sent_total"] == 0
     assert "[EXECUTION_FAILED]" in (root / "smtp-args").read_text()
+
+
+def test_us_unknown_smtp_outcome_is_fenced_across_scheduler_retries(tmp_path):
+    # Exit 75 means the SMTP server MAY have accepted a message. A subsequent
+    # scheduled invocation must not duplicate it even if no ACK was observed.
+    trade_date, run_date = "2026-11-09", "2026-11-10"
+    root = fixture_us_repo(tmp_path, trade_date)
+    wrapper = root / "scripts/wsl/with-venv.sh"
+    counter = root / "smtp-count"
+    wrapper.write_text(
+        f"""#!/usr/bin/env bash
+count=0
+[[ -f "{counter}" ]] && count=$(cat "{counter}")
+count=$((count+1))
+echo "$count" > "{counter}"
+echo '[MAIL][SIMULATED_UNCERTAIN_AFTER_SEND]' >&2
+exit 75
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    first, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert first.returncode == 75, first.stdout + first.stderr
+    first_marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert first_marker["status"] == "UNKNOWN_AFTER_SEND"
+    assert first_marker["mail_sent"] is None
+    assert first_marker["recipient"] == "ops@example.test"
+    assert first_marker["source_evidence_sha256"]
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+    second, _ = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert second.returncode == 75, second.stdout + second.stderr
+    assert "UNKNOWN_AFTER_SEND_FENCED" in second.stderr
+    assert (root / "smtp-count").read_text().strip() == "1"
+
+
+def test_us_missing_current_close_does_not_attach_prior_trading_date_close(tmp_path):
+    # November 9 is a valid US session, but its Close record was missing.
+    # Old November 6 evidence must never be used as a current Close substitute.
+    trade_date, run_date = "2026-11-09", "2026-11-10"
+    root = fixture_us_repo(tmp_path, trade_date, missing_purposes={"close"})
+    older_close = root / "runtime/logs/us/2026-11-06/close"
+    older_close.mkdir(parents=True)
+    (older_close / "attempt.log").write_text("old close evidence\\n", encoding="utf-8")
+
+    result, archive = run_us_mail(root, trade_date, kst_run_date=run_date)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/us-mail-{run_date}.json").read_text())
+    assert marker["trade_date"] == trade_date
+    assert marker["status"] == "DEGRADED"
+    assert {
+        "code": "REQUIRED_LOG_MISSING_close",
+        "path": f"runtime/logs/us/{trade_date}/close",
+    } in marker["missing_evidence"]
+    with tarfile.open(archive, "r:gz") as tf:
+        names = tf.getnames()
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+        manifest = json.load(tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json"))
+    assert evidence["trade_date"] == trade_date
+    assert evidence["close_missing_reason"] == "CLOSE_SESSION_LOG_MISSING"
+    assert manifest["trade_date_et"] == trade_date
+    assert not any("2026-11-06" in name for name in names)
+    assert "[DEGRADED] 2026-11-09 trading logs" in (root / "smtp-args").read_text()
