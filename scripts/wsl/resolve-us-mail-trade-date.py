@@ -7,8 +7,14 @@ missing. Mail only one ET session's evidence; incomplete sessions are DEGRADED.
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 NY = ZoneInfo("America/New_York")
 
