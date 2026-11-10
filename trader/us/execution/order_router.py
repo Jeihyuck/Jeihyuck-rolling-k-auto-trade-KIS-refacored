@@ -2441,7 +2441,8 @@ def route_order(
                 "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
                 intent,
                 context=context,
-                broker_status="tick_authority_expired_before_broker_submit",
+                broker_status="US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
+                require_db=side == "BUY" and _native_kis,
             )
         except Exception as exc:
             abort_journal_error = exc
@@ -2458,8 +2459,22 @@ def route_order(
                 "[US_ORDER][EXECUTION_CLAIM][PRE_BOUNDARY_RELEASE_FAILED] action_key=%s",
                 claim.action_key,
             )
+        # A release alone is not a terminal intent: the exact DB abort proof,
+        # released claim, and lack of broker evidence must agree.
+        if (side == "BUY" and _native_kis and not abort_journal_error
+                and release_error is None
+                and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"):
+            from trader.us.db.repos import close_proven_unsent_us_buy_intent
+            if not close_proven_unsent_us_buy_intent(
+                client_order_key=str(order_key or ""),
+                attempt_id=str(intent["submit_attempt_id"]),
+                trade_date=str(trade_date),
+                failure_code="US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
+            ):
+                release_error = RuntimeError("US_PRE_IO_INTENT_CLOSE_UNVERIFIED")
         integrity_errors = [
-            str(error) for error in (abort_journal_error, release_error) if error is not None
+            type(error).__name__ for error in (abort_journal_error, release_error)
+            if error is not None
         ]
         return {
             "status": (
@@ -2854,8 +2869,9 @@ def route_order(
             try:
                 append_order_event(
                     "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
-                    broker_status="PRE_SUBMIT_FAILURE",
-                    raw_response={"error": integrity_error},
+                    broker_status=failure_code,
+                    raw_response={"error_code": failure_code, "stage": "BEFORE_HTTP"},
+                    require_db=side == "BUY" and _native_kis,
                 )
                 abort_journal_ok = True
             except Exception as journal_exc:
@@ -2874,6 +2890,30 @@ def route_order(
                     "[US_ORDER][EXECUTION_CLAIM][PRE_IO_RELEASE_FAILED] action_key=%s",
                     claim.action_key,
                 )
+            if (side == "BUY" and _native_kis and not requires_reconcile
+                    and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"):
+                from trader.us.db.repos import close_proven_unsent_us_buy_intent
+                closed = close_proven_unsent_us_buy_intent(
+                    client_order_key=str(order_key or ""),
+                    attempt_id=str(intent["submit_attempt_id"]),
+                    trade_date=str(trade_date),
+                    failure_code=(
+                        failure_code if failure_code != "pre_http_setup_failed"
+                        else "PRE_HTTP_SETUP_FAILED"
+                    ),
+                )
+                if not closed:
+                    requires_reconcile = True
+                    logger.error(
+                        "[US_ORDER][PRE_IO_INTENT_CLOSE_UNVERIFIED] symbol=%s attempt=%s "
+                        "code=%s action=FENCE_WITHOUT_RESUBMIT",
+                        symbol_upper, intent["submit_attempt_id"], failure_code,
+                    )
+                else:
+                    logger.info(
+                        "[US_ORDER][PRE_IO_INTENT_TERMINAL] symbol=%s attempt=%s code=%s",
+                        symbol_upper, intent["submit_attempt_id"], failure_code,
+                    )
             # An intent-created TP PENDING must not strand a protective SELL
             # when KIS HTTP was provably never reached. Never clear PENDING
             # when Claim release/journal proof failed or the order is unknown.
