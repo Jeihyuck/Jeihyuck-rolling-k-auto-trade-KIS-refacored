@@ -47,7 +47,6 @@ class CloseMailDateContract(unittest.TestCase):
         mail = (ROOT / "scripts/wsl/send-market-log-mail.sh").read_text()
         self.assertIn("resolve-us-mail-trade-date.py", mail)
         self.assertNotIn("resolve_latest_completed_us_trade_date", mail)
-        self.assertIn("REQUIRED_LOG_MISSING_close", mail) if False else None
         self.assertIn("collect_session_purpose \"$purpose\"", mail)
         self.assertIn("UNKNOWN_AFTER_SEND_FENCED", mail)
         self.assertIn("break  # Never issue a second SMTP attempt", mail)
