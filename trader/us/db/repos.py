@@ -1250,6 +1250,95 @@ def load_open_order_intents(trade_date: str | None = None) -> list[dict]:
         return []
 
 
+
+def close_proven_unsent_us_buy_intent(
+    *, client_order_key: str, attempt_id: str, trade_date: str,
+    failure_code: str,
+) -> bool:
+    """Terminalize only the SAME authenticated, durably proven pre-I/O BUY.
+
+    Claim release precedes this call; if that or the journal write failed,
+    keep PENDING and fail closed. Old ACK/OPEN/fill evidence wins, never
+    transition a submitted attempt to BLOCKED. No broker I/O or tick replay.
+    """
+    import re
+    key, attempt, day = (str(client_order_key or "").strip(),
+                         str(attempt_id or "").strip(),
+                         str(trade_date or "").strip())
+    if (not key or not attempt or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)
+            or not re.fullmatch(r"[A-Z0-9_]{1,100}", str(failure_code or ""))):
+        return False
+    engine = _get_engine_or_none()
+    if engine is None:
+        return False
+    try:
+        with engine.begin() as conn:
+            epoch = _active_us_epoch(conn, required=True)
+            params = {"key": key, "attempt": attempt, "day": day, "epoch": epoch}
+            intent_row = conn.execute(text("""
+                SELECT status, meta FROM us_order_intents
+                WHERE client_order_key=:key AND trade_date=CAST(:day AS date)
+                  AND trading_epoch_id=:epoch AND UPPER(side)='BUY'
+                  FOR UPDATE
+            """), params).mappings().first()
+            if not intent_row:
+                return False
+            meta = _parse_json_meta(intent_row["meta"])
+            if str(meta.get("submit_attempt_id") or "") != attempt:
+                return False
+            a = conn.execute(text("""
+                SELECT action_key, attempt_state, authoritative
+                FROM us_execution_attempts
+                WHERE client_order_key=:key AND attempt_id=:attempt
+                FOR UPDATE
+            """), params).mappings().first()
+            if (not a or a["attempt_state"] != "ABANDONED_PRE_SUBMIT"
+                    or a["authoritative"] is not True):
+                return False
+            claim = conn.execute(text("""
+                SELECT action_state, active_attempt_id FROM us_execution_claims
+                WHERE action_key=:action FOR UPDATE
+            """), {"action": a["action_key"]}).mappings().first()
+            if (not claim or claim["active_attempt_id"] is not None
+                    or claim["action_state"] in {"IN_FLIGHT", "UNCERTAIN"}):
+                return False
+            events = {
+                str(r[0]) for r in conn.execute(text("""
+                    SELECT event_type FROM us_order_events
+                    WHERE trade_date=CAST(:day AS date) AND trading_epoch_id=:epoch
+                      AND client_order_key=:key AND submit_attempt_id=:attempt
+                """), params).all()
+            }
+            from trader.us.execution.order_journal import _BROKER_POSSIBLE, _PRE_IO_ABORTS
+            if not events.intersection(_PRE_IO_ABORTS) or events.intersection(_BROKER_POSSIBLE):
+                return False
+            if conn.execute(text("""
+                SELECT 1 FROM us_orders
+                WHERE client_order_key=:key AND trade_date=CAST(:day AS date)
+                LIMIT 1
+            """), params).first() is not None:
+                return False
+            if str(intent_row["status"]).upper() == "BLOCKED":
+                return (meta.get("pre_io_abort_attempt_id") == attempt)
+            if str(intent_row["status"]).upper() != "PENDING":
+                return False
+            result = conn.execute(text("""
+                UPDATE us_order_intents SET status='BLOCKED',
+                    meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb)
+                WHERE client_order_key=:key AND trade_date=CAST(:day AS date)
+                  AND trading_epoch_id=:epoch AND status='PENDING'
+            """), {**params, "patch": _json_param({
+                "pre_io_abort_attempt_id": attempt,
+                "pre_io_abort_code": failure_code,
+                "pre_io_abort_stage": "BEFORE_KIS_HTTP",
+            })})
+            return result.rowcount == 1
+    except Exception as exc:
+        logger.error("[US_INTENT][PROVEN_UNSENT_CLOSE_FAILED] error_type=%s",
+                     type(exc).__name__)
+        return False
+
+
 def mark_order_intent_sent(client_order_key: str) -> None:
     engine = _get_engine_or_none()
     if engine is None:
