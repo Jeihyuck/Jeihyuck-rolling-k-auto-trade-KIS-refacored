@@ -170,7 +170,7 @@ def main() -> None:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--final30-file")
     parser.add_argument("--date")
-    parser.add_argument("--interval-sec", type=float, default=180.0)
+    parser.add_argument("--interval-sec", type=float, default=120.0)
     args = parser.parse_args()
     if args.once == args.loop:
         parser.error("select exactly one of --once or --loop")
@@ -186,10 +186,25 @@ def main() -> None:
         now = now_kst()
         if now.date().isoformat() != today or now.time() > dtime(15, 5):
             break
-        if now.time() >= dtime(9, 0):
-            result = run_once(kis=kis, codes=codes, observed_at=now)
-            logger.info("[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s", result["completed"], result["unknown"])
-        time.sleep(max(60.0, float(args.interval_sec)))
+        if now.time() < dtime(9, 0):
+            # An AM wrapper may start before the cash session: wake near 09:00
+            # rather than sleeping the entire polling interval before the
+            # first native opening-minute collection.
+            time.sleep(2.0)
+            continue
+        cycle_started = time.monotonic()
+        result = run_once(kis=kis, codes=codes, observed_at=now)
+        elapsed = time.monotonic() - cycle_started
+        logger.info(
+            "[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s "
+            "elapsed_sec=%.1f target_period_sec=%.1f",
+            result["completed"], result["unknown"], elapsed,
+            max(60.0, float(args.interval_sec)),
+        )
+        # Schedule from the *start* of the last 30-symbol scan, not from
+        # its end. Otherwise every proof expires during the guaranteed
+        # 'cycle work + 180sec sleep' blind spot while the BUY gate is ON.
+        time.sleep(max(1.0, max(60.0, float(args.interval_sec)) - elapsed))
 
 
 if __name__ == "__main__":
