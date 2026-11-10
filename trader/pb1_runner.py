@@ -7177,12 +7177,19 @@ def run_once(
             "current_order_reconcile_ms": 0.0,
         }
         reconcile_result: dict | None = None
-        # Opt-in only after full CI, paper simulations and operator approval.
-        # LEGACY remains the default and the real-money environment is excluded.
+        # Practice-only default-on. Explicit =0 is an emergency LEGACY override.
+        # Share the same activation contract as the AM/CLOSE journal.
+        from trader.kr.historical_recovery_journal import lane_enabled
         kr_reconcile_once_enabled = (
-            os.getenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "0") == "1"
-            and env_effective == "practice"
+            lane_enabled(env_effective)
             and kis is not None and kis.env == "practice"
+        )
+        logger.info(
+            "[KR_HIST_RECOVERY][EFFECTIVE_CONFIG] enabled=%d flag=%s strategy_env=%s kis_env=%s",
+            int(kr_reconcile_once_enabled),
+            os.getenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "<default-on>"),
+            env_effective,
+            getattr(kis, "env", None) if kis is not None else None,
         )
         deferred_full_reconcile = False
         pre_exit_exact_proof = False
