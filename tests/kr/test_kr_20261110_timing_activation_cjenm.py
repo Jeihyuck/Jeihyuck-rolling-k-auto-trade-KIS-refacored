@@ -294,3 +294,69 @@ def test_practice_wsl_legacy_shadow_is_upgraded_but_emergency_off_survives():
     assert "RESULT:ENFORCE|0|1" in explicit_unapproved.stdout
     real = _run({"STRATEGY_ENV": "real", "KIS_ENV": "real"})
     assert "RESULT:SHADOW|0|0" in real.stdout
+
+
+def test_native_kis_api_envelope_to_observer_to_ready_proof_contract(tmp_path, monkeypatch):
+    """Offline contract replay using native KIS field NAMES, no broker credentials.
+
+    This is NOT a live KIS smoke test. It validates normalized OHLCV delivery
+    across the actual KisAPI parser, observer file writer and PB1 proof reader.
+    """
+    from trader.kr import opening_bar_contract as op
+    import scripts.kr_opening_observer as observer
+    import trader.kis_wrapper as kw
+
+    monkeypatch.setattr(op, "runtime_path", lambda *parts: tmp_path.joinpath(*parts))
+    observed = datetime(2026, 11, 10, 9, 34, 51, tzinfo=KST)
+    monkeypatch.setattr(observer, "now_kst", lambda: observed)
+    monkeypatch.setattr(observer, "get_account_key", lambda **kw: "offline-kis-api-contract")
+    native = _synthetic_proven_rebound()
+    called = []
+    class NativeResponse:
+        status_code = 200
+        def __init__(self, rows):
+            self.rows = rows
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"rt_cd": "0", "output2": self.rows}
+    def _request(*args, **kwargs):
+        hour = kwargs["params"]["fid_input_hour_1"]
+        called.append(hour)
+        current = int(hour[:4])
+        native_window = [bar for bar in native
+                         if int(str(bar["time"])[:4]) <= current][-30:]
+        return NativeResponse([{
+            "stck_bsop_date": bar["date"],
+            "stck_cntg_hour": bar["time"],
+            "stck_prpr": str(bar["close"]),
+            "stck_oprc": str(bar["open"]),
+            "stck_hgpr": str(bar["high"]),
+            "stck_lwpr": str(bar["low"]),
+            "cntg_vol": str(bar["volume"]),
+        } for bar in native_window])
+    monkeypatch.setattr(kw, "_pick_tr", lambda *args: ["FHKST03010200"])
+    client = kw.KisAPI.__new__(kw.KisAPI)
+    client.env = "practice"
+    client._limiter = SimpleNamespace(wait=lambda *args, **kwargs: None)
+    client._headers = lambda *args, **kwargs: {}
+    client._safe_request = _request
+    client.get_price_snapshot = lambda *args, **kwargs: {
+        "raw": {"stck_bsop_date": "20261110",
+                "stck_cntg_hour": "093450",
+                "wghn_avrg_stck_prc": "95.5"},
+    }
+    summary = observer.run_once(
+        kis=client, codes=["035760"], observed_at=observed,
+        sleep_between=0,
+    )
+    assert called == ["092900", "093451"]
+    assert summary["completed"] == 1, summary
+    assert summary["unknown"] == 0, summary
+    decision = op.evaluate_proof_for_candidate(
+        env="practice", account_scope="offline-kis-api-contract", code="035760",
+        now=observed, style="ENTRY_PULLBACK", setup_ok=True,
+        trigger_ok=False, pivot=None, order_price=96.1,
+    )
+    assert decision["state"] == "READY_SHADOW", decision
+    assert decision["vwap_proven"] is True, decision
