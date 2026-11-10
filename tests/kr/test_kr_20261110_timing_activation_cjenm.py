@@ -86,7 +86,7 @@ def test_cj_declining_minute_bar_hypothesis_waits_not_buy():
     proof = opening_bar_contract.evaluate_price_aware_entry(
         style="ENTRY_PULLBACK", rows=_synthetic_cj_decline(), now=now,
         vwap=None, vwap_verified=False, setup_ok=True, trigger_ok=False,
-        order_price=45100.0,
+        order_price=45150.0,
     )
     assert proof["state"] == "WAIT"
     assert proof["reason"] in {
