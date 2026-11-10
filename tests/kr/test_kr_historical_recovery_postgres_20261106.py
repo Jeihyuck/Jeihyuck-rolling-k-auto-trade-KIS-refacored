@@ -23,7 +23,8 @@ def pg_lane(monkeypatch):
     account = "practice:test:" + uuid4().hex
     scope = SimpleNamespace(env="practice", account_key=account, trading_epoch_id="epoch-" + uuid4().hex)
     monkeypatch.setattr(journal, "resolve_kr_recovery_scope", lambda **_: scope)
-    monkeypatch.setenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "1")
+    # Prove the journal stays enabled even without an explicit environment flag.
+    monkeypatch.delenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", raising=False)
     monkeypatch.setenv("KIS_ENV", "practice")
     yield engine, scope
     engine.dispose()
