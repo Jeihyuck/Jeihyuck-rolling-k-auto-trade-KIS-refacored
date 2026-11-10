@@ -1,8 +1,9 @@
 """KR full-historical recovery journal; separate from same-day broker reconciliation.
 
-Activation requires KR_HISTORICAL_RECOVERY_ONCE_ENABLED=1 on a KIS practice
-runtime. Default OFF. Unknown ownership, DB failure or missing proof never
-licenses the current-only fast path for new BUYs.
+Enabled by default on a KIS practice runtime. An explicit
+KR_HISTORICAL_RECOVERY_ONCE_ENABLED=0 is the emergency legacy override.
+Unknown ownership, DB failure or missing proof never licenses the current-only
+fast path for new BUYs.
 """
 from __future__ import annotations
 
@@ -46,7 +47,7 @@ def lane_enabled(env: str) -> bool:
     return (
         str(env).lower() == "practice"
         and os.getenv("KIS_ENV", "").lower() == "practice"
-        and os.getenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "0") == "1"
+        and os.getenv("KR_HISTORICAL_RECOVERY_ONCE_ENABLED", "1") == "1"
     )
 
 
