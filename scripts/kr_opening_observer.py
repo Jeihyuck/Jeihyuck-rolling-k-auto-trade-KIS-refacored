@@ -56,7 +56,29 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             # Separate owner: never collect KR_INFINITE by PB1 proof route.
             continue
         try:
-            data = kis.get_intraday_candles_today(code, start_hhmm="090000")
+            # KIS time-itemchart returns bounded minute windows. Read both
+            # the opening anchor and the latest anchor; a fixed 09:00 query
+            # alone cannot prove a post-09:30 rebound. Never fill gaps with
+            # synthetic open/high/low/close or an inferred business date.
+            anchors = (
+                ("092900", observed_at.strftime("%H%M%S"))
+                if observed_at.time() >= dtime(9, 30)
+                else (observed_at.strftime("%H%M%S"),)
+            )
+            data: list[dict] = []
+            for anchor in dict.fromkeys(anchors):
+                try:
+                    rows = kis.get_intraday_candles_today(code, start_hhmm=anchor)
+                    if isinstance(rows, list):
+                        data.extend(row for row in rows if isinstance(row, dict))
+                except Exception as minute_exc:
+                    logger.warning(
+                        "[KR][OPENING_OBSERVER][PARTIAL_MINUTE_FETCH] code=%s "
+                        "anchor=%s error_type=%s",
+                        code, anchor, type(minute_exc).__name__,
+                    )
+            if not data:
+                raise RuntimeError("NO_KIS_NATIVE_INTRADAY_MINUTE_ROWS")
             quote = kis.get_price_snapshot(code, market="J")
             if not isinstance(quote, dict):
                 quote = {}
