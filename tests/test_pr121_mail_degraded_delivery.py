@@ -20,6 +20,7 @@ def _copy_calendar_runtime(root: Path) -> None:
     shutil.copy2(ROOT / "trader/time_utils.py", root / "trader/time_utils.py")
     (root / "trader/us").mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "trader/us/__init__.py", root / "trader/us/__init__.py")
+    shutil.copy2(ROOT / "trader/us/kis_http_governor.py", root / "trader/us/kis_http_governor.py")
     shutil.copy2(ROOT / "trader/us/market_calendar.py", root / "trader/us/market_calendar.py")
     (root / "config").mkdir(exist_ok=True)
     shutil.copy2(ROOT / "config/krx_holidays.json", root / "config/krx_holidays.json")
