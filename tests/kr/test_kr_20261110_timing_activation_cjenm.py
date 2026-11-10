@@ -124,3 +124,45 @@ def test_kis_observer_uses_opening_and_current_anchors_without_making_up_dates(m
     )
     assert called == ["092900", "093500"]
     assert result["completed"] == 1
+
+
+def test_real_prep_canonical_array_payload_and_contract_are_accepted(tmp_path):
+    """PREP mirrors may contain arrays, not an embedded trade_date JSON dict."""
+    import json
+    from scripts.kr_opening_observer import final30_codes
+    f = tmp_path / "final30_scored.json"
+    rows = [{"code": f"{i:06d}", "rank_final30": i} for i in range(1, 31)]
+    contract = {
+        "market": "KR", "env": "practice", "trade_date": "2026-11-11",
+        "as_of": "2026-11-10", "final30_rows": 30,
+        "contract_ok": True, "trade_can_proceed": True,
+    }
+    (tmp_path / "prep_contract.json").write_text(
+        json.dumps(contract), encoding="utf-8",
+    )
+    f.write_text(json.dumps(rows), encoding="utf-8")
+    codes = final30_codes(trade_date="2026-11-11", filename=str(f))
+    assert codes == [f"{i:06d}" for i in range(1, 31)]
+    f.write_text(json.dumps({"as_of": "2026-11-10", "items": rows}), encoding="utf-8")
+    assert final30_codes(trade_date="2026-11-11", filename=str(f)) == codes
+
+
+def test_observer_rejects_stale_final30_contract_and_payload_mismatch(tmp_path):
+    import json
+    from scripts.kr_opening_observer import final30_codes
+    f = tmp_path / "final30_scored.json"
+    rows = [{"code": f"{i:06d}"} for i in range(1, 31)]
+    contract = {
+        "market": "KR", "env": "practice", "trade_date": "2026-11-10",
+        "as_of": "2026-11-09", "final30_rows": 30,
+        "contract_ok": True, "trade_can_proceed": True,
+    }
+    (tmp_path / "prep_contract.json").write_text(json.dumps(contract))
+    f.write_text(json.dumps(rows))
+    with pytest.raises(RuntimeError, match="SCOPE_MISMATCH"):
+        final30_codes(trade_date="2026-11-11", filename=str(f))
+    contract["trade_date"] = "2026-11-11"
+    (tmp_path / "prep_contract.json").write_text(json.dumps(contract))
+    f.write_text(json.dumps({"trade_date": "2026-11-10", "items": rows}))
+    with pytest.raises(RuntimeError, match="SCOPE_MISMATCH"):
+        final30_codes(trade_date="2026-11-11", filename=str(f))
