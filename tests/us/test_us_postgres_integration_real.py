@@ -2515,9 +2515,9 @@ def test_p0_proven_unsent_buy_intent_postgres_terminalization(pg_engine, monkeyp
                 conn.execute(text("""
                     INSERT INTO us_order_events
                       (event_id,trade_date,event_type,event_timestamp,client_order_key,
-                       submit_attempt_id,symbol,side,requested_qty,idempotency_key)
+                       submit_attempt_id,symbol,side,requested_qty,idempotency_key,trading_epoch_id)
                     VALUES (gen_random_uuid(),'2026-11-09',:kind,now(),:key,:attempt,
-                            'AMGN','BUY',1,:idem)
+                            'AMGN','BUY',1,:idem,'p0-epoch')
                 """), {"kind": kind, "key": key, "attempt": attempt,
                        "idem": f"{key}:{kind}"})
             if order:
