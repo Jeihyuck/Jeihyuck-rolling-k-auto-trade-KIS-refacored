@@ -18,7 +18,7 @@ import time
 
 from trader.account_state import get_account_key
 from trader.kr.opening_bar_contract import KST, save_opening_proof
-from trader.runtime_paths import runtime_path
+from trader.runtime_paths import repo_root
 from trader.time_utils import now_kst
 
 logger = logging.getLogger(__name__)
@@ -31,8 +31,13 @@ def final30_codes(*, trade_date: str, filename: str | None = None) -> list[str]:
     The source file is not itself the authority for the trade date/market/env:
     `prep_contract.json` is. Do not infer scope from the file's directory.
     """
-    file = Path(filename) if filename else runtime_path(
-        "runtime", "kr", "watchlist", trade_date, "final30_scored.json"
+    # PREP writes the canonical mirrored file under the REPOSITORY runtime
+    # directory. The generic ephemeral runtime_path() defaults to
+    # /tmp/trader_runtime, which has no Final30 in actual WSL AM sessions.
+    # Do not silently accept a different artifact root/date.
+    file = (
+        Path(filename) if filename else
+        repo_root() / "runtime" / "kr" / "watchlist" / trade_date / "final30_scored.json"
     )
     # PREP's production canonical artifact is sometimes mirrored under an
     # extra trade-date directory. The 2026-11-10 AM archive proves:
