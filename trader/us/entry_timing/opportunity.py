@@ -331,8 +331,80 @@ def _submission_binding(intent: dict, proof: dict) -> str:
         "client_order_key": intent.get("client_order_key"),
         "position_lifecycle_id": intent.get("position_lifecycle_id"),
     }
+    # V1 stays readable for historic intents; the router upgrades a VERIFIED
+    # producer placeholder to V2 only after the original DB scope is resolved.
+    if proof.get("submission_binding_version") == 2:
+        fields.update({
+            "env": intent.get("env"),
+            "broker_account_hash": intent.get("broker_account_hash"),
+            "trading_epoch_id": intent.get("trading_epoch_id"),
+            "portfolio_epoch_id": intent.get("portfolio_epoch_id"),
+            "position_cycle_id": intent.get("position_cycle_id"),
+            "submit_attempt_id": intent.get("submit_attempt_id"),
+        })
     raw = json.dumps(fields, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _verify_timing_signal_and_binding(intent: dict, proof: dict) -> bool:
+    """Validate ORIGINAL signed signal and its current immutable binding.
+
+    No clock refresh, cap change, or silent resigning of legacy records.
+    """
+    if proof.get("submission_binding_version") not in (None, 2):
+        return False
+    try:
+        if proof.get("submission_binding_sha256") != _submission_binding(intent, proof):
+            return False
+        signed = {k: v for k, v in proof.items()
+                  if k not in {"mode", "decision_epoch", "max_age_sec",
+                               "evidence_sha256", "submission_binding_sha256",
+                               "submission_binding_version"}}
+        digest = hashlib.sha256(json.dumps(
+            signed, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()).hexdigest()
+        age = finite(proof.get("max_age_sec"))
+        epoch = finite(proof.get("decision_epoch"))
+        return (digest == proof.get("evidence_sha256")
+                and age is not None and 0 < age <= MAX_BUY_SIGNAL_AGE_SEC
+                and epoch is not None)
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def finalize_verified_buy_scope_binding(
+    intent: dict, *, original: dict, placeholder: str,
+) -> None:
+    """Upgrade ONLY an authentic PB1 placeholder to final scoped V2 proof.
+
+    Called before the first intent/Claim/journal persistence. A V2 binding
+    includes the broker account hash, both epochs, cycle, key and attempt id.
+    """
+    original_meta = original.get("meta") if isinstance(original.get("meta"), dict) else {}
+    proof = original_meta.get("us_entry_opportunity_v1")
+    if not isinstance(proof, dict) or not _verify_timing_signal_and_binding(original, proof):
+        raise ValueError("US_ENTRY_TIMING_ORIGINAL_PROOF_UNVERIFIED")
+    if (proof.get("submission_binding_version") is not None
+            or original.get("position_lifecycle_id") != placeholder
+            or str(intent.get("position_lifecycle_id") or "") == placeholder):
+        raise ValueError("US_ENTRY_TIMING_SCOPE_TRANSITION_FORBIDDEN")
+    for field in ("symbol", "side", "strategy_owner", "position_action",
+                  "client_order_key", "submit_attempt_id", "trade_date"):
+        if original.get(field) != intent.get(field):
+            raise ValueError("US_ENTRY_TIMING_ORIGINAL_IDENTITY_CHANGED")
+    if not all(str(intent.get(field) or "").strip() for field in (
+        "env", "broker_account_hash", "trading_epoch_id", "portfolio_epoch_id",
+        "position_cycle_id", "client_order_key", "submit_attempt_id",
+    )):
+        raise ValueError("US_ENTRY_TIMING_FINAL_SCOPE_MISSING")
+    if intent.get("position_lifecycle_id") != intent.get("position_cycle_id"):
+        raise ValueError("US_ENTRY_TIMING_FINAL_CYCLE_CONFLICT")
+    updated = dict(proof)
+    updated["submission_binding_version"] = 2
+    updated["submission_binding_sha256"] = _submission_binding(intent, updated)
+    if not _verify_timing_signal_and_binding(intent, updated):
+        raise ValueError("US_ENTRY_TIMING_FINAL_BINDING_INVALID")
+    intent["meta"]["us_entry_opportunity_v1"] = updated
 
 
 def attach_opportunity_proof(intent: dict, decision: dict, *, mode: str,
@@ -364,22 +436,9 @@ def pre_submit_timing_check(intent: dict, *, now_epoch: float, fresh_ws_quote: d
     proof = meta.get("us_entry_opportunity_v1")
     if not isinstance(proof, dict) or proof.get("mode") != "ENFORCE":
         return False, "TIMING_PROOF_MISSING"
-    try:
-        if proof.get("submission_binding_sha256") != _submission_binding(intent, proof):
-            return False, "TIMING_BINDING_INVALID"
-    except (ValueError, TypeError, OverflowError):
+    if not _verify_timing_signal_and_binding(intent, proof):
         return False, "TIMING_BINDING_INVALID"
-    signed = {k: v for k, v in proof.items()
-              if k not in {"mode", "decision_epoch", "max_age_sec",
-                           "evidence_sha256", "submission_binding_sha256"}}
-    try:
-        digest = hashlib.sha256(
-            json.dumps(signed, sort_keys=True, separators=(",", ":"),
-                       allow_nan=False).encode()
-        ).hexdigest()
-    except (TypeError, ValueError):
-        return False, "TIMING_PROOF_INVALID"
-    if digest != proof.get("evidence_sha256") or proof.get("state") != "READY":
+    if proof.get("state") != "READY":
         return False, "TIMING_PROOF_INVALID"
     observed = finite(proof.get("decision_epoch"))
     proof_age_limit = finite(proof.get("max_age_sec"))
