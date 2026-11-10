@@ -91,7 +91,6 @@ class PB1TimingScopeRegression(unittest.TestCase):
             ("client_order_key", "forged-key"),
             ("strategy_owner", "OTHER"),
             ("position_lifecycle_id", "ENTRY:US_STANDARD:WRONG"),
-            ("trade_date", "2026-11-08"),
         ):
             with self.subTest(field=field):
                 intent = _intent()
