@@ -14,6 +14,8 @@ on:
       - "trader/kr/reconcile_guard_classification.py"
       - "tests/kr/test_kr_reconcile_guard_classification_20261106.py"
       - "tests/kr/test_kr_20261027_broker_readonly_proof.py"
+      - ".env.example"
+      - "scripts/wsl/run-kr-am.sh"
       - ".github/workflows/kr-historical-recovery-once-ci.yml"
   workflow_dispatch:
 
@@ -45,7 +47,7 @@ jobs:
       DRY_RUN: "1"
       ALLOW_REAL_ORDER: "0"
       DISABLE_LIVE_TRADING: "1"
-      KR_HISTORICAL_RECOVERY_ONCE_ENABLED: "0"
+      # Deliberately unset: exercise the KR practice default-on path.
       KIS_APP_KEY: ""
       KIS_APP_SECRET: ""
       PBCORE_DB_URL: ""
