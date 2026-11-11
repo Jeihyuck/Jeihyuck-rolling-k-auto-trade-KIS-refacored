@@ -163,6 +163,7 @@ source scripts/wsl/us-stage123-paper-defaults.sh
 # Practice: opening observer and real BUY timing gate ON by default;
 # explicit operator override remains visible and protective SELL is unchanged.
 source scripts/wsl/us-entry-timing-paper-defaults.sh
+source scripts/wsl/us-swing-v3-paper-defaults.sh
 if [[ "${US_STAGE123_PAPER_PROFILE}" == "ON" ]]; then
   if ! "${PYTHON_BIN}" scripts/us_stage123_paper_preflight.py >> "${LOG_FILE}" 2>&1; then
     export NULLIM_SESSION_FINAL_STATUS=FAILED_STAGE123_PREFLIGHT
