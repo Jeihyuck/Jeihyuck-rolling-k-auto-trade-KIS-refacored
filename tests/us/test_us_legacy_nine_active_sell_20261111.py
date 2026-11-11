@@ -548,3 +548,50 @@ def test_legacy_bridge_reconcile_boundaries_static_contract():
     assert "tp_stage_lifecycle_from_order_proof" in router
     assert "tp_stage_lifecycle_from_order_proof" in profit
     assert '"source_entry_contract_version": entry_contract.get("version")' in market
+
+
+def test_legacy_zero_fill_open_original_sell_is_not_an_invented_fill(scenario):
+    db,client,intent=scenario
+    db.sell_orders.append({
+        "trade_date":"2026-10-30","order_no":"0000050555",
+        "qty_requested":1,"qty_filled":0,"status":"OPEN",
+        "meta":{"position_lifecycle_id":OLD_CYCLE},
+    })
+    db.pending.append({
+        "trade_date":"2026-10-30","order_no":"0000050555",
+        "qty_requested":1,"qty_filled":0,"status":"OPEN",
+    })
+    client.old_rows["2026-10-30"].append(_native_order(
+        no="0000050555",symbol="ABBV",day="2026-10-30",
+        side="SELL",qty=1,filled=0,remaining=1,
+    ))
+    # This is the historic TMO-like case: no actual fill should ever be
+    # synthesized merely to make SELL orders and fills match 1:1.
+    evidence, reason = _evidence_from_db(
+        db, symbol="ABBV",trade_date="2026-11-11",
+        active_epoch=EPOCH,raw_account=RAW_ACCOUNT,intent=intent,
+    )
+    assert reason=="DB_LEGACY_EVIDENCE_VERIFIED"
+    assert evidence["zero_fill_sell_proofs"] == [
+        ("2026-10-30","0000050555",1,0),
+    ]
+    assert evidence["holding"]==4
+    assert len(evidence["prior_sell_proofs"])==1
+    ok,reason,_=_authorize(scenario)
+    assert not ok
+    assert reason=="ORIGINAL_KIS_ZERO_FILL_SELL_NOT_CANCELLED"
+
+
+def test_legacy_zero_fill_unknown_or_recorded_partial_fill_is_fenced(scenario):
+    db,client,intent=scenario
+    db.sell_orders.append({
+        "trade_date":"2026-10-30","order_no":"0000050555",
+        "qty_requested":1,"qty_filled":1,"status":"OPEN",
+        "meta":{"position_lifecycle_id":OLD_CYCLE},
+    })
+    evidence, reason = _evidence_from_db(
+        db,symbol="ABBV",trade_date="2026-11-11",
+        active_epoch=EPOCH,raw_account=RAW_ACCOUNT,intent=intent,
+    )
+    assert evidence is None
+    assert reason=="ORIGINAL_SELL_NO_FILL_UNVERIFIED"
