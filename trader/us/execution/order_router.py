@@ -1525,6 +1525,9 @@ def route_order(
                 _raw_account_key = get_account_key(env=_env)
                 _legacy_nine_applicable = (
                     side == "SELL"
+                    and _env == "practice"
+                    and os.getenv("DRY_RUN","1").strip().lower()
+                        in {"0","false","no","off"}
                     and str(intent.get("symbol") or "").upper() in {
                         "ABBV", "DHR", "HCA", "KO", "KR", "MCK",
                         "PFE", "PG", "TMO",
