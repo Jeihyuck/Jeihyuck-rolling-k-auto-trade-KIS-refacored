@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Read-only diagnostic: no broker orders, no schedule modifications.
 set -uo pipefail
-cd "$(dirname "$0")/../.." || exit 1
+# Safe to run by streaming the GitHub PR version into bash -s while the
+# installed dual-agent worktree stays unchanged and code-pinning remains valid.
+if [[ -d "$PWD/scripts/wsl" && -d "$PWD/trader" ]]; then
+  cd "$PWD" || exit 1
+else
+  cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+fi
 DAY="2026-11-11"
 echo "[KR_DIAG] date=$DAY"
 echo "[KR_DIAG] branch=$(git branch --show-current 2>/dev/null) sha=$(git rev-parse HEAD 2>/dev/null)"
