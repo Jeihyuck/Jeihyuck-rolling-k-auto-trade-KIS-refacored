@@ -446,3 +446,82 @@ def recheck_legacy_nine_sell_before_http(
         expected_holding=proof["holding"],
         minimum_orderable=qty,day=proof["trade_date"],
     )
+
+
+
+def enrich_legacy_nine_v2_decision_position(
+    position: dict, *, trade_date: str,
+) -> dict:
+    """Restore ONLY in-memory historical V2 exit-decision inputs.
+
+    This does not set automated_sell_authorized, create an executable order,
+    backdate any current portfolio, or change a database row. A separate
+    original KIS broker proof at route_order is mandatory before a SELL POST.
+    It also restores completed TP-stage flags so TP1 cannot fire again
+    merely because the Nov-05 fresh risk-state row is empty.
+    """
+    symbol=str(position.get("symbol") or "").upper()
+    if (symbol not in SYMBOLS or os.getenv("KIS_ENV")!="practice"
+            or os.getenv("WSL_RUN_MARKET","").upper()!="US"
+            or os.getenv("US_LEGACY_NINE_AUTO_SELL_ACTIVE","1")!="1"):
+        return position
+    if position.get("portfolio_epoch_id") or position.get("position_cycle_id"):
+        return position
+    owner=str(position.get("strategy_owner") or
+              _json(position.get("meta")).get("strategy_owner") or
+              "US_STANDARD").upper()
+    if owner!="US_STANDARD":
+        return position
+    try:
+        from trader.us.db.repos import _get_engine_or_none,_active_us_epoch
+        from trader.account_state import get_account_key
+        from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
+        engine=_get_engine_or_none()
+        if engine is None:
+            return position
+        raw_account=get_account_key(env="practice")
+        with engine.connect() as conn:
+            epoch=str(_active_us_epoch(conn, required=True))
+            rows=_rows(conn,POSITION_SQL,{
+                "symbol":symbol,"today":trade_date,"epoch":epoch,
+            })
+            if len(rows)!=1:
+                return position
+            meta=_json(rows[0].get("meta"))
+            digest=str(meta.get("entry_exit_contract_sha256") or "")
+            if not digest:
+                return position
+            decision_intent={
+                "symbol":symbol,"side":"SELL",
+                "strategy_owner":"US_STANDARD",
+                "meta":{
+                    "source_entry_contract_sha256":digest,
+                    "source_entry_contract_version":US_ENTRY_EXIT_CONTRACT_VERSION,
+                },
+            }
+            evidence,_=_evidence_from_db(
+                conn,symbol=symbol,trade_date=trade_date,
+                active_epoch=epoch,raw_account=raw_account,
+                intent=decision_intent,
+            )
+        if not evidence or _positive(position.get("qty"))!=evidence["holding"]:
+            return position
+        out=dict(position)
+        meta_out=dict(_json(position.get("meta")))
+        old_life=evidence["original_cycle"]
+        existing=str(out.get("position_lifecycle_id") or
+                     meta_out.get("position_lifecycle_id") or "")
+        if existing and existing!=old_life:
+            return position
+        out["position_lifecycle_id"]=old_life
+        meta_out["position_lifecycle_id"]=old_life
+        for stage in evidence["completed_tp_stages"]:
+            if stage in {"tp1","tp2","tp3"}:
+                meta_out[f"{stage}_done"]=True
+        out["meta"]=meta_out
+        out["legacy_nine_decision_only_provisional"]=True
+        return out
+    except Exception:
+        # Strategy may still evaluate a protective decision, but will never
+        # auto route from this read-only provisional source on failure.
+        return position
