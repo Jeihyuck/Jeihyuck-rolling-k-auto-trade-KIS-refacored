@@ -50,6 +50,24 @@ mail_wrapper="runtime/scheduler/windows/$DAY/PB1-KR-Mail-WSL.log"
 if [[ -f "$mail_wrapper" ]]; then
   grep -E 'WINDOWS_TASK.*(START|END)' "$mail_wrapper" | tail -12 || true
 else echo "MISSING $mail_wrapper"; fi
+echo "[KR_DIAG] MAIL_WINDOWS_TASK_EVENTS"
+if command -v powershell.exe >/dev/null 2>&1; then
+  powershell.exe -NoProfile -NonInteractive -Command '
+    $start=[datetime]"2026-11-11 15:50:00"
+    $finish=[datetime]"2026-11-11 16:25:00"
+    $events=@(Get-WinEvent -FilterHashtable @{
+      LogName="Microsoft-Windows-TaskScheduler/Operational"
+      StartTime=$start; EndTime=$finish
+    } -MaxEvents 300 -ErrorAction SilentlyContinue | Where-Object {
+      $_.Message -like "*PB1 KR Mail WSL*"
+    })
+    if($events.Count -eq 0){Write-Output "MAIL_WINDOWS_EVENTS_NOT_FOUND_OR_LOG_DISABLED"}
+    foreach($event in $events){
+      Write-Output ("MAIL_EVENT at={0:o} id={1} message={2}" -f
+        $event.TimeCreated,$event.Id,($event.Message -replace "[\\r\\n]+"," "))
+    }
+  ' 2>&1 | tr -d '\r' || true
+else echo "[KR_DIAG] MAIL_WINDOWS_EVENT_QUERY_UNAVAILABLE"; fi
 echo "[KR_DIAG] MAIL_RESULT_MARKER"
 mail_marker="runtime/health/kr-mail-$DAY.json"
 if [[ -r "$mail_marker" ]]; then
