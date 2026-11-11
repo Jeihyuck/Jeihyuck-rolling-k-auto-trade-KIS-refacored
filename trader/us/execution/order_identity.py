@@ -52,6 +52,21 @@ def deterministic_order_key(intent: dict, context: Any | None = None) -> str:
     return raw[:139] + "_" + hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
+def exact_order_share_quantity(raw: Any) -> int:
+    """Return only whole positive shares; floats and booleans are not order proof."""
+    if isinstance(raw, bool):
+        raise InvalidOrderIdentity("qty must be a positive whole share count")
+    if isinstance(raw, int):
+        qty = raw
+    elif isinstance(raw, str) and raw.isascii() and raw.isdecimal():
+        qty = int(raw)
+    else:
+        raise InvalidOrderIdentity("qty must be a positive whole share count")
+    if qty <= 0:
+        raise InvalidOrderIdentity("qty must be a positive whole share count")
+    return qty
+
+
 def normalize_and_validate_order_identity(intent: dict, context: Any | None = None) -> dict:
     normalized = dict(intent or {})
     meta = dict(normalized.get("meta") or {})
@@ -65,7 +80,9 @@ def normalize_and_validate_order_identity(intent: dict, context: Any | None = No
     if side not in {"BUY", "SELL"}:
         raise InvalidOrderIdentity("side must be BUY or SELL")
     normalized["side"] = side
-    normalized["qty"] = int(normalized.get("qty", normalized.get("quantity", 0)) or 0)
+    normalized["qty"] = exact_order_share_quantity(
+        normalized.get("qty", normalized.get("quantity"))
+    )
     for field in ("trade_date", "session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source",
                   "position_lifecycle_id", "pre_order_position_qty", "trading_epoch_id"):
         value = normalized.get(field, meta.get(field))
