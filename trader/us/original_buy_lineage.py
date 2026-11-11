@@ -251,7 +251,21 @@ def verified_new_buy_snapshot_identity(
         )
         if actual not in (None, "") and str(actual) != str(expected):
             return None
+    # Original BUY contract is as economically important as its lifecycle ID.
+    # The broker balance contains neither strategy policy nor TP thresholds;
+    # never persist a verified scope that drops the signed original policy.
+    source_meta = proof.get("meta") if isinstance(proof.get("meta"), dict) else {}
+    signed = source_meta.get("entry_exit_contract")
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+    if not isinstance(signed, dict) or not verify_us_entry_exit_contract(signed):
+        return None
     return {
+        "entry_exit_contract": signed,
+        "entry_exit_contract_sha256": signed["sha256"],
+        "entry_exit_contract_version": signed["version"],
+        "book": (signed.get("management") or {}).get("book"),
+        "horizon": (signed.get("management") or {}).get("horizon"),
+        "exit_policy": (signed.get("management") or {}).get("exit_policy"),
         "env": "practice", "account_id": identity["account_id"],
         "broker_account_hash": hashlib.sha256(identity["account_id"].encode()).hexdigest(),
         "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
@@ -383,6 +397,14 @@ def verified_carried_us_snapshot_identity(
         return None
 
     return {
+        # Preserve signed V2/V3 at every authoritative next-day balance;
+        # raw KIS balance rows cannot recreate an original BUY-time contract.
+        "entry_exit_contract": contract,
+        "entry_exit_contract_sha256": contract["sha256"],
+        "entry_exit_contract_version": contract["version"],
+        "book": (contract.get("management") or {}).get("book"),
+        "horizon": (contract.get("management") or {}).get("horizon"),
+        "exit_policy": (contract.get("management") or {}).get("exit_policy"),
         "env": "practice", "account_id": raw_account,
         "broker_account_hash": broker_hash,
         "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
