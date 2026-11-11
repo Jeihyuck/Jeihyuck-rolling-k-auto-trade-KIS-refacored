@@ -14,7 +14,7 @@ echo "[KR_DIAG] branch=$(git branch --show-current 2>/dev/null) sha=$(git rev-pa
 echo "[KR_DIAG] time=$(TZ=Asia/Seoul date -Is)"
 if command -v powershell.exe >/dev/null 2>&1; then
  powershell.exe -NoProfile -NonInteractive -Command '
-$names=@("PB1 KR Prep WSL","PB1 KR AM WSL","PB1 KR Afternoon WSL","PB1 KR Close WSL")
+$names=@("PB1 KR Prep WSL","PB1 KR AM WSL","PB1 KR Afternoon WSL","PB1 KR Close WSL","PB1 KR Mail WSL","PB1 KR Health WSL")
 foreach($name in $names){
  $task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
  if($null -eq $task){Write-Output ("MISSING_TASK "+$name);continue}
@@ -44,4 +44,38 @@ for key in ("scheduler_owner","status","installed_commit_sha"):
  print(key+"="+str(d.get(key)))
 PY
 else echo "MISSING_DEPLOY_MARKER"; fi
+
+echo "[KR_DIAG] MAIL_SCHEDULER_WRAPPER"
+mail_wrapper="runtime/scheduler/windows/$DAY/PB1-KR-Mail-WSL.log"
+if [[ -f "$mail_wrapper" ]]; then
+  grep -E '^\\[WINDOWS_TASK\\]\\[(START|END)\\]' "$mail_wrapper" | tail -12 || true
+else echo "MISSING $mail_wrapper"; fi
+echo "[KR_DIAG] MAIL_RESULT_MARKER"
+mail_marker="runtime/health/kr-mail-$DAY.json"
+if [[ -r "$mail_marker" ]]; then
+  python3 - "$mail_marker" <<'PY_MAIL_MARKER'
+import json, sys
+from pathlib import Path
+try:
+    data=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    for k in ("status", "sent_at", "mail_sent", "attempt_count", "failure_reason", "required_missing_count"):
+        print("MAIL_MARKER "+k+"="+str(data.get(k)))
+except (OSError, ValueError, TypeError) as exc:
+    print("MAIL_MARKER_INVALID "+type(exc).__name__)
+PY_MAIL_MARKER
+else echo "MISSING $mail_marker"; fi
+echo "[KR_DIAG] PREP_LAST_STAGE"
+prep_stage="runtime/state/kr/prep_last_stage.json"
+if [[ -r "$prep_stage" ]]; then
+  python3 - "$prep_stage" <<'PY_PREP'
+import json, sys
+from pathlib import Path
+try:
+    data=json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    for k in ("stage", "expected_as_of", "final30_rows", "updated_at", "elapsed_sec_from_start"):
+        print("PREP_STAGE "+k+"="+str(data.get(k)))
+except (OSError, ValueError, TypeError) as exc:
+    print("PREP_STAGE_INVALID "+type(exc).__name__)
+PY_PREP
+else echo "MISSING $prep_stage"; fi
 echo "[KR_DIAG] Do not infer Windows task failure solely from DB runs=0."
