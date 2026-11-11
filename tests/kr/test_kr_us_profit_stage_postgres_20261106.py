@@ -161,3 +161,36 @@ def test_concurrent_runner_partial_and_final_never_both_claim(stage_db):
     active = [name for name in ("PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL")
               if states[name]["status"] == "PENDING"]
     assert len(active) == 1
+
+
+@pytest.mark.parametrize("corruption", [
+    {"cumulative_filled_qty": 22},
+    {"target_qty": True},
+    {"broker_odno": ""},
+    {"broker_fill_proven": False},
+])
+def test_runner_final_never_unlocks_on_corrupt_partial_fill_proof(stage_db, corruption):
+    """A forged FILLED label must not open the last SELL claim in PostgreSQL."""
+    from trader.kr.us_profit_stage_journal import _key
+
+    _prove_three_tp_stages(stage_db)
+    assert reserve(stage_db, "PROFIT_DEFENSE_PARTIAL", 23, "partial-verified").accepted
+    assert observe(
+        stage_db, "PROFIT_DEFENSE_PARTIAL", "partial-verified", "KIS-P", 23
+    ).status == "FILLED"
+
+    table = schema_for_engine(stage_db["engine"]).job_checkpoints
+    job_key = _key(stage_db["contract"], "PROFIT_DEFENSE_PARTIAL")
+    with stage_db["engine"].begin() as conn:
+        payload = dict(conn.execute(
+            sa.select(table.c.payload).where(table.c.job_key == job_key)
+        ).scalar_one())
+        payload.update(corruption)
+        conn.execute(
+            sa.update(table).where(table.c.job_key == job_key).values(payload=payload)
+        )
+
+    rejected = reserve(stage_db, "RUNNER_FINAL", 23, "must-not-submit")
+    assert not rejected.accepted
+    assert rejected.status == "BLOCK"
+    assert load_frozen_stage_states(**stage_db)["RUNNER_FINAL"]["status"] == "NOT_TRIGGERED"
