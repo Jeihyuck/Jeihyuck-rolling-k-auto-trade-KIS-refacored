@@ -85,7 +85,7 @@ fail() {
   local reason="$1" rc="${2:-1}" missing_path="${3:-}" searched_file="${4:-}" marker="$PROD_MARKER"
   [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"
   python3 - "$marker" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" "${SOURCE_SHA:-}" "${RECIPIENT:-}" <<'PY'
-import json,sys
+import json,os,sys
 from datetime import datetime,timezone
 from pathlib import Path
 p,m,d,k,r,a,count,missing,searched_file,source_sha,recipient=sys.argv[1:]
@@ -668,7 +668,7 @@ p,m,d,k,source,archive,a,msg,recipient,out,count,status,missing_path=sys.argv[1:
 missing=[]
 for line in Path(missing_path).read_text().splitlines():
     code,_,value=line.partition('\t'); missing.append({'code':code,'path':value})
-data={'status':status,'mail_sent':True,'mail_delivered':False,'delivery_status':'UNCONFIRMED_AFTER_SMTP_ACCEPT','mail_complete':status=='OK','market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':len(missing),'missing_evidence':missing,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+data={'status':status,'mail_sent':True,'mail_delivered':False,'delivery_status':'UNCONFIRMED_AFTER_SMTP_ACCEPT','mail_complete':status=='OK','market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':len(missing),'missing_evidence':missing,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'daily_execution_status':os.getenv('NULLIM_MAIL_DAILY_EXECUTION_STATUS','UNKNOWN'),'mail_script_started_at_kst':os.getenv('NULLIM_MAIL_SCRIPT_STARTED_AT_KST'),'mail_start_lag_sec':int(os.getenv('NULLIM_MAIL_START_LAG_SEC','-1')),'sent_at':datetime.now(timezone.utc).isoformat()}
 Path(p).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 
