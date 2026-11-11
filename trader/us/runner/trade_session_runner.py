@@ -1690,6 +1690,59 @@ def run_trade_session(
                     session, _stage4_restart_count, new_child.pid,
                 )
 
+            # Activated by the practice WSL profile. Once the old writer is
+            # reaped and the precise DB generation is proven stopped/absent,
+            # reuse the EXISTING KIS+DB legacy reconciler for SELL only.
+            # This is not a writer-health bypass: no uncertain writer may
+            # coexist with a second reconciliation executor.
+            _stage4_exit_only_fallback = False
+
+            def _stage4_verified_exit_only_failover(reason: str) -> bool:
+                nonlocal _shadow_reconcile_child, _reconcile_mode
+                nonlocal _stage4_exit_only_fallback
+                if (
+                    os.getenv("US_STAGE4_EXIT_ONLY_FALLBACK_ENABLED", "0") != "1"
+                    or env != "practice" or offline or resolved_signal_only
+                    or _reconcile_mode != "WORKER" or _unreaped_child_seen
+                ):
+                    return False
+                from trader.us.execution.stage4_failover import (
+                    verified_stage4_exit_only_handoff,
+                )
+                confirmed, cause = verified_stage4_exit_only_handoff(
+                    child=_shadow_reconcile_child,
+                    expected_generation=os.getenv("US_STAGE4_EXPECTED_GENERATION", ""),
+                    env=env,
+                )
+                if not confirmed:
+                    logger.critical(
+                        "[US_STAGE4][EXIT_ONLY_FALLBACK_DENIED] original=%s reason=%s"
+                        " orders_authorized=0",
+                        reason, cause,
+                    )
+                    return False
+                # Proven dead writer. No native order is allowed on the old
+                # Stage4 generation, and canonical legacy route checks all
+                # current broker orders/claims again before SELL HTTP.
+                _shadow_reconcile_child = None
+                _reconcile_mode = "LEGACY"
+                _stage4_exit_only_fallback = True
+                os.environ["US_RECONCILE_WORKER_MODE"] = "LEGACY"
+                os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
+                for key in (
+                    "US_STAGE4_EXPECTED_GENERATION", "US_STAGE4_WORKER_PID",
+                    "US_STAGE4_WORKER_START_TICKS",
+                    "US_STAGE4_PROCESS_PROOF_REQUIRED",
+                ):
+                    os.environ.pop(key, None)
+                logger.critical(
+                    "[US_STAGE4][EXIT_ONLY_FALLBACK_ACTIVE] original=%s "
+                    "writer_stop_proven=1 buy_allowed=0 tqqq_buy_allowed=0 "
+                    "legacy_reconcile=1 sell_via_canonical_router=1",
+                    reason,
+                )
+                return True
+
             _stage4_startup_failed = False
             if _reconcile_mode == "WORKER":
                 from trader.us.execution.stage4_lifecycle import (
@@ -1713,21 +1766,25 @@ def run_trade_session(
                     )
                 except Exception as _stage4_startup_exc:
                     root_cause = stage4_error_code(_stage4_startup_exc)
-                    _stage4_unhealthy_since = time_mod.monotonic()
-                    # Offline/one-shot calls must remain bounded. Scheduled
-                    # practice sessions continue in PAUSED with ZERO orders.
-                    _stage4_startup_failed = bool(force_now or max_ticks > 0)
-                    if _stage4_startup_failed:
-                        final_status = "FAILED"
-                        final_reason = "stage4_worker_startup_unavailable"
-                    else:
+                    if _stage4_verified_exit_only_failover(root_cause):
                         final_status = "COMPLETED_DEGRADED"
-                        final_reason = "stage4_startup_waiting_for_recovery"
-                    logger.error(
-                        "[US_STAGE4][STARTUP_FAILED] code=%s action=FAIL_CLOSED "
-                        "orders_sent=0 supervisor=%s",
-                        root_cause, "DISABLED_ONE_SHOT" if _stage4_startup_failed else "PAUSE_AND_RECOVER",
-                    )
+                        final_reason = "stage4_verified_exit_only_fallback"
+                    else:
+                        _stage4_unhealthy_since = time_mod.monotonic()
+                        # Offline/one-shot calls must remain bounded. Scheduled
+                        # practice sessions continue in PAUSED with ZERO orders.
+                        _stage4_startup_failed = bool(force_now or max_ticks > 0)
+                        if _stage4_startup_failed:
+                            final_status = "FAILED"
+                            final_reason = "stage4_worker_startup_unavailable"
+                        else:
+                            final_status = "COMPLETED_DEGRADED"
+                            final_reason = "stage4_startup_waiting_for_recovery"
+                        logger.error(
+                            "[US_STAGE4][STARTUP_FAILED] code=%s action=FAIL_CLOSED "
+                            "orders_sent=0 supervisor=%s",
+                            root_cause, "DISABLED_ONE_SHOT" if _stage4_startup_failed else "PAUSE_AND_RECOVER",
+                        )
             while not _stage4_startup_failed:
                 if _reconcile_mode == "WORKER":
                     from trader.us.execution.stage4_lifecycle import (
@@ -1752,6 +1809,11 @@ def run_trade_session(
                             final_reason = "stage4_recovered"
                     except Exception as _stage4_health_exc:
                         code = stage4_error_code(_stage4_health_exc)
+                        if _stage4_verified_exit_only_failover(code):
+                            final_status = "COMPLETED_DEGRADED"
+                            final_reason = "stage4_verified_exit_only_fallback"
+                            # Restart the loop under LEGACY with BUY forbidden.
+                            continue
                         # Abort on actual policy/authentication failures: waiting
                         # cannot legitimately authorize a forbidden order.
                         if code.startswith("US_STAGE4_STARTUP_FATAL_"):
@@ -2117,6 +2179,13 @@ def run_trade_session(
                             # shared by the watchdog, child and all KIS I/O.
                             tick_deadline_monotonic=time_mod.monotonic() + child_budget_sec,
                         )
+                    if _stage4_exit_only_fallback:
+                        # Block EVERY new BUY, including dedicated TQQQ policy
+                        # overrides. Keep existing authorized SELL evaluation.
+                        tick_kwargs["entry_can_proceed"] = False
+                        tick_kwargs["tqqq_policy_override_allowed"] = False
+                        tick_kwargs["session_entry_allowed"] = False
+                        tick_kwargs["entry_block_reason"] = "STAGE4_EXIT_ONLY_FALLBACK"
                     # Collector runs in its own subprocess, not a thread in
                     # the parent that will fork the trading tick. Each tick
                     # checks collector liveness so a crashed instance can be
