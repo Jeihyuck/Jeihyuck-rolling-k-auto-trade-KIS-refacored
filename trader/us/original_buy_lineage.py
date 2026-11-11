@@ -3,7 +3,7 @@
 The original order's *hashed* broker account scope is different from the raw
 account key retained by US lifecycle states. Bind the two only using SHA256,
 exact original intent/order/KIS-cumulative fill and fresh authoritative balance.
-Never update fills/orders or synthesize a fill.
+Never mutate brokerage execution evidence or synthesize a fill.
 """
 from __future__ import annotations
 
