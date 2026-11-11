@@ -275,3 +275,138 @@ def test_historical_sell_same_number_wrong_side_is_not_buy_proof():
     out=prepare_original_plan(p,f,o)
     assert out["original_sell_entries"][0]["db_link_verified"] is True
     assert len(out["original_sell_entries"])==1
+
+
+
+def _historical_runtime_archive():
+    """Models 11/04 legacy runtime cycles vs original BUY ENTRY placeholders."""
+    positions, fills, orders = _archive()
+    raw_account = "practice:fixture:01"
+    for row, buy_fill, pos in zip(orders, fills, positions):
+        contract = row["meta"]["entry_exit_contract_sha256"]
+        pos["meta"] = {"entry_exit_contract_sha256": contract}
+        buy_fill["meta"].update({
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "cumulative_filled_qty": buy_fill["qty"],
+        })
+    historical = []
+    for row in orders:
+        sym=row["symbol"]
+        historical.append({
+            "symbol":sym,
+            "trade_date":"2026-11-04",
+            "trading_epoch_id":"epoch",
+            "lifecycle":{
+                "lifecycle_id":f"original-runtime-{sym}-a19e86c2f4f",
+                "is_open":True,
+                "env":"practice",
+                "account_id":raw_account,
+                "trading_epoch_id":"epoch",
+                "strategy_owner":"US_STANDARD",
+                "opened_trade_date":row["trade_date"],
+                "portfolio_epoch_id":None,
+                "position_cycle_id":None,
+            },
+        })
+    positions[-1]["qty"]=7
+    runtime_tmo=historical[-1]["lifecycle"]["lifecycle_id"]
+    fills.append({
+        "symbol":"TMO","side":"SELL","trade_date":"2026-11-04",
+        "order_no":"0000099999","qty":2,
+        "meta":{"requested_qty":2,"position_lifecycle_id":runtime_tmo,
+                "strategy_owner":"US_STANDARD",
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "cumulative_filled_qty": 2},
+    })
+    orders.append({
+        "symbol":"TMO","side":"SELL","trade_date":"2026-11-04",
+        "order_no":"0000099999","qty_requested":2,
+        "status":"FILLED",
+        "meta":{"position_lifecycle_id":runtime_tmo,
+                "strategy_owner":"US_STANDARD"},
+    })
+    stages=[{
+        "symbol":"TMO","trade_date":"2026-11-04",
+        "position_lifecycle_id":runtime_tmo,
+        "stage":"tp1","stage_status":"DONE",
+    }]
+    return positions, fills, orders, historical, stages, raw_account
+
+
+def test_historical_real_runtime_cycle_not_placeholder_buy_alias():
+    p,f,o,h,tp,account=_historical_runtime_archive()
+    plan=prepare_original_plan(
+        p,f,o,historical_lifecycles=h,
+        historical_tp_stages=tp,
+        current_raw_account=account,
+    )
+    assert not plan["blockers"], plan["blockers"]
+    assert len(plan["entries"])==9
+    tmo=next(row for row in plan["entries"] if row["symbol"]=="TMO")
+    assert tmo["original_buy_lifecycle_alias"] == "legacy-TMO"
+    assert tmo["original_lifecycle_id"] != tmo["original_buy_lifecycle_alias"]
+    assert tmo["historical_runtime_cycle_certified_by_db"] is True
+    sale=plan["original_sell_entries"][0]
+    assert sale["db_link_verified"] is True
+    assert plan["all_legacy_scope_proven"] is False
+
+
+def test_wrong_historical_account_cycle_or_tp_stage_never_certifies():
+    import copy
+    args=_historical_runtime_archive()
+    p,f,o,h,tp,account=args
+    altered=copy.deepcopy(h)
+    altered[-1]["lifecycle"]["account_id"]="practice:foreign:01"
+    plan=prepare_original_plan(
+        p,f,o,historical_lifecycles=altered,
+        historical_tp_stages=tp,current_raw_account=account,
+    )
+    assert "TMO_HISTORICAL_RUNTIME_CYCLE_UNVERIFIED" in plan["blockers"]
+    altered=copy.deepcopy(h)
+    altered[-1]["lifecycle"]["opened_trade_date"]="2026-10-09"
+    plan=prepare_original_plan(
+        p,f,o,historical_lifecycles=altered,
+        historical_tp_stages=tp,current_raw_account=account,
+    )
+    assert "TMO_HISTORICAL_RUNTIME_CYCLE_UNVERIFIED" in plan["blockers"]
+    altered=copy.deepcopy(tp)
+    altered[0]["position_lifecycle_id"]="wrong-cycle"
+    plan=prepare_original_plan(
+        p,f,o,historical_lifecycles=h,
+        historical_tp_stages=altered,current_raw_account=account,
+    )
+    assert "TMO_HISTORICAL_TP_STAGE_CYCLE_MISMATCH" in plan["blockers"]
+    modified=copy.deepcopy(f)
+    modified[-1]["meta"]["position_lifecycle_id"]="legacy-TMO"
+    plan=prepare_original_plan(
+        p,modified,o,historical_lifecycles=h,
+        historical_tp_stages=tp,current_raw_account=account,
+    )
+    assert "TMO_LEGACY_SELL_DB_LINEAGE_UNVERIFIED" in plan["blockers"]
+
+
+def test_historical_readonly_query_uses_scoped_epoch_before_any_fetch():
+    from scripts.us_legacy_nine_originals_readonly_certify import (
+        load_historical_lifecycle_evidence,
+    )
+    from contextlib import contextmanager
+    seen=[]
+    class Res:
+        def mappings(self): return self
+        def all(self): return []
+    class Conn:
+        def execute(self, query, params=None):
+            seen.append((str(query),params))
+            return Res()
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield Conn()
+    history,stages=load_historical_lifecycle_evidence(
+        Engine(),trading_epoch_id="epoch",trade_date="2026-11-11",
+    )
+    assert history == stages == []
+    assert seen[0][0] == "SET TRANSACTION READ ONLY"
+    assert len(seen)==3
+    assert all(item[1]["epoch"] == "epoch" for item in seen[1:])
+    assert all("symbol" in item[0] for item in seen[1:])
