@@ -6005,6 +6005,45 @@ def mark_order_filled_by_reconcile(
                     })
             else:
                 conn.execute(text(insert_sql), insert_params)
+        if original_scope and not synthetic and _is_kis_order_cumulative_evidence(evidence):
+            # Read-through repair is permitted ONLY for the same verified
+            # immutable original order. A failed scope readback rolls back the
+            # order/fill transaction and fences further entry.
+            scope_args = {
+                **original_scope, "td": td, "symbol": sym, "side": side_u,
+                "order_no": on, "cok": resolved_client_order_key,
+            }
+            conn.execute(text("""
+                UPDATE us_fills
+                SET account_id=:account_id, portfolio_epoch_id=:portfolio_epoch_id,
+                    position_cycle_id=:position_cycle_id
+                WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                  AND order_no=:order_no AND client_order_key=:cok
+                  AND trading_epoch_id=:trading_epoch_id
+                  AND (account_id IS NULL OR account_id=:account_id)
+                  AND (portfolio_epoch_id IS NULL OR portfolio_epoch_id=:portfolio_epoch_id)
+                  AND (position_cycle_id IS NULL OR position_cycle_id=:position_cycle_id)
+                  AND meta->>'broker_account_hash'=:account_id
+                  AND meta->>'portfolio_epoch_id'=:portfolio_epoch_id
+                  AND meta->>'position_cycle_id'=:position_cycle_id
+                  AND meta->>'position_lifecycle_id'=:position_cycle_id
+                  AND meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
+            """), scope_args)
+            missing_scope = conn.execute(text("""
+                SELECT COUNT(*) FROM us_fills
+                WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                  AND order_no=:order_no AND client_order_key=:cok
+                  AND trading_epoch_id=:trading_epoch_id
+                  AND meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
+                  AND (account_id IS DISTINCT FROM :account_id
+                    OR portfolio_epoch_id IS DISTINCT FROM :portfolio_epoch_id
+                    OR position_cycle_id IS DISTINCT FROM :position_cycle_id)
+            """), scope_args).scalar()
+            if int(missing_scope or 0):
+                raise FillAccountingInvariantError({
+                    "status": "FILL_ORIGINAL_SCOPE_NOT_DURABLE",
+                    "retry_order": False, "entry_fence": True,
+                })
         rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
         """ + fill_epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
