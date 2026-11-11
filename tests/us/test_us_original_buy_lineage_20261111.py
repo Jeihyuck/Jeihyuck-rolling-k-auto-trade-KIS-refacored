@@ -34,6 +34,7 @@ def original_row():
         "portfolio_epoch_id": PORTFOLIO, "order_no": "0000039784",
         "client_order_key": "fixture-amgn-buy",
         "order_qty": 6, "intent_qty": 6, "fill_qty": 6,
+        "order_filled": 6, "order_status": "FILLED",
         "filled_at": datetime(2026, 11, 10, 14, 31, tzinfo=timezone.utc),
         "order_meta": {**meta, "pre_order_holding_qty": 0},
         "intent_meta": dict(meta),
@@ -224,4 +225,24 @@ def test_snapshot_proof_missing_or_conflicting_never_rebinds(monkeypatch):
                         lambda **kwargs: None)
     assert verified_new_buy_snapshot_identity(
         position={"symbol": "AMGN", "qty": 6}, **kwargs
+    ) is None
+
+
+def test_partial_original_buy_binds_exact_3_of_6_not_any_arbitrary_qty():
+    row = original_row()
+    row["fill_qty"] = 3
+    row["order_filled"] = 3
+    row["order_status"] = "PARTIALLY_FILLED"
+    row["fill_meta"]["cumulative_filled_qty"] = 3
+    partial = select_verified_us_original_buy_scope(
+        [row], symbol="AMGN", qty=3, identity=IDENTITY,
+    )
+    assert partial and partial["qty"] == 3
+    assert partial["position_cycle_id"] == CYCLE
+    assert select_verified_us_original_buy_scope(
+        [row], symbol="AMGN", qty=6, identity=IDENTITY,
+    ) is None
+    row["order_status"] = "FILLED"  # Broker ACK/status inconsistent with KIS
+    assert select_verified_us_original_buy_scope(
+        [row], symbol="AMGN", qty=3, identity=IDENTITY,
     ) is None
