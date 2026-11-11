@@ -632,14 +632,20 @@ export NULLIM_MAIL_DAILY_EXECUTION_STATUS="$DAILY_EXECUTION_STATUS"
 EXECUTION_FLAG=""
 if [[ "$DAILY_EXECUTION_STATUS" == FAILED ]]; then
   EXECUTION_FLAG="[EXECUTION_FAILED]"
+elif [[ "$MARKET" == kr && "$DAILY_EXECUTION_STATUS" == DEGRADED ]]; then
+  EXECUTION_FLAG="[EXECUTION_DEGRADED]"
+fi
+MAIL_LATE_FLAG=""
+if [[ "$MARKET" == kr && "${NULLIM_MAIL_START_LAG_SEC:-}" =~ ^[0-9]+$ ]] && (( NULLIM_MAIL_START_LAG_SEC > 60 )); then
+  MAIL_LATE_FLAG="[LATE_START]"
 fi
 if [[ "$EVIDENCE_STATUS" == DEGRADED ]]; then
-  SUBJECT="[NULLIM][${MARKET^^}]${EXECUTION_FLAG}[DEGRADED] $TRADE_DATE trading logs"
+  SUBJECT="[NULLIM][${MARKET^^}]${MAIL_LATE_FLAG}${EXECUTION_FLAG}[DEGRADED] $TRADE_DATE trading logs"
   MISSING_SUMMARY="$(awk -F '\t' '{printf "%s%s:%s", (NR>1?", ":""), $1, $2}' "$MISSING_LIST")"
   BODY="NULLIM ${MARKET^^} redacted log archive (DEGRADED). execution_status=${DAILY_EXECUTION_STATUS}. ${EXECUTION_SUMMARY}. Missing evidence: ${MISSING_SUMMARY}"
 else
-  SUBJECT="[NULLIM][${MARKET^^}]${EXECUTION_FLAG} $TRADE_DATE trading logs"
-  BODY="NULLIM ${MARKET^^} verified redacted log archive. execution_status=${DAILY_EXECUTION_STATUS}. ${EXECUTION_SUMMARY}"
+  SUBJECT="[NULLIM][${MARKET^^}]${MAIL_LATE_FLAG}${EXECUTION_FLAG} $TRADE_DATE trading logs"
+  BODY="NULLIM ${MARKET^^} evidence-verified redacted log archive. execution_status=${DAILY_EXECUTION_STATUS}. ${EXECUTION_SUMMARY}"
 fi
 
 mail_rc=1; attempt_count=0; message_id=""; unknown_after_send=0
