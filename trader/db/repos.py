@@ -3627,6 +3627,18 @@ class OrdersRepo:
                 if (
                     frozen_plan.get("exit_policy_family") == "SWING_STAGED_EXIT"
                     and frozen_plan.get("trade_horizon") == "SWING"
+                    and not trading_epoch_id and run_id is not None
+                ):
+                    # A live execution run must NOT silently open an unbound
+                    # SWING position and then miss its approved TP contract.
+                    raise RuntimeError("KR_ACTIVE_TP_NEW_BUY_REQUIRES_TRADING_EPOCH")
+                if (
+                    frozen_plan.get("exit_policy_family") == "SWING_STAGED_EXIT"
+                    and frozen_plan.get("trade_horizon") == "SWING"
+                    # Historical/offline contract fixture rows without a
+                    # trading epoch are not live orders. Preserve their v1
+                    # schema instead of fabricating a parity lifecycle.
+                    and bool(trading_epoch_id)
                 ):
                     parity = build_new_swing_parity_contract(
                         strategy_owner="PB1",

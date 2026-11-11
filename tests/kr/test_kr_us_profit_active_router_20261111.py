@@ -1,5 +1,5 @@
 """Practice KR US TP router contract evidence, owner isolation and fail-closed tests."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import pytest
 
@@ -9,7 +9,7 @@ from trader.execution_state import BrokerPosition, BalanceFreshness
 @dataclass
 class FakeBalance:
     snapshot_id: str = "kis-snapshot"
-    fetched_at: datetime = datetime.now(timezone.utc)
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     freshness: BalanceFreshness = BalanceFreshness.FRESH
     broker_qty: int = 100
     broker_orderable: int = 100
