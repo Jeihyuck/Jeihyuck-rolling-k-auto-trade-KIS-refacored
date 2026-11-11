@@ -174,6 +174,9 @@ def load_verified_us_original_buy_scope(
                    AND f.order_no=o.order_no
                    AND f.client_order_key=o.client_order_key
                    AND f.trading_epoch_id=o.trading_epoch_id
+                   AND f.account_id=o.account_id
+                   AND f.portfolio_epoch_id=o.portfolio_epoch_id
+                   AND f.position_cycle_id=o.position_cycle_id
                  WHERE o.trade_date=:td AND o.symbol=:symbol
                    AND o.side='BUY' AND o.status IN ('FILLED','PARTIALLY_FILLED')
                    AND o.trading_epoch_id=:epoch
