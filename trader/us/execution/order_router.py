@@ -1495,6 +1495,14 @@ def route_order(
             "intent": intent,
         }
 
+    # The nine original October 2026 V2 holdings pre-date the canonical
+    # portfolio_epoch schema. Their archived BUY cannot be retroactively
+    # scoped. A broker-proven, forward-only SELL management identity is
+    # permitted only with exact KIS original fills, current balance/order
+    # proof, TP-stage state and one account/epoch, BEFORE saving the intent.
+    # No owner (including TQQQ Infinite) or normal BUY gets this exception.
+    _legacy_nine_auto_sell_proof = None
+
     # Production US_STANDARD writes must have ORIGINAL account + owner-specific
     # Portfolio Epoch + position-cycle provenance before even saving an Intent.
     # Other owners (notably TQQQ Infinite) retain their dedicated route/contract.
@@ -1514,9 +1522,43 @@ def route_order(
             _env = _kis_env()
             with _identity_engine.connect() as _identity_conn:
                 _epoch = _active_us_epoch(_identity_conn, required=True)
+                _raw_account_key = get_account_key(env=_env)
+                _legacy_nine_applicable = (
+                    side == "SELL"
+                    and str(intent.get("symbol") or "").upper() in {
+                        "ABBV", "DHR", "HCA", "KO", "KR", "MCK",
+                        "PFE", "PG", "TMO",
+                    }
+                )
+                if _legacy_nine_applicable:
+                    from trader.us.execution.us_legacy_nine_active_sell import (
+                        prove_and_bind_legacy_nine_sell,
+                    )
+                    _verified, _legacy_reason, _legacy_proof = (
+                        prove_and_bind_legacy_nine_sell(
+                            intent, conn=_identity_conn,
+                            kis_client=kis_client, trade_date=str(trade_date),
+                            env=_env, raw_account=_raw_account_key,
+                            active_epoch=str(_epoch or ""),
+                        )
+                    )
+                    if _verified:
+                        _legacy_nine_auto_sell_proof = _legacy_proof
+                        logger.info(
+                            "[US_LEGACY_NINE][AUTO_SELL][AUTHORIZED] symbol=%s "
+                            "source=KIS_ORIGINAL_AND_FRESH_CURRENT scope=FORWARD_ONLY_V2 "
+                            "automated_sell_authorized=true", symbol_upper,
+                        )
+                    elif _legacy_reason != "NOT_AN_UNSCOPED_LEGACY_POSITION":
+                        # Do NOT silently fall back to the normal router if a
+                        # legacy account/owner/fill/balance/original order proof
+                        # failed. That would rebind an old BUY to a new epoch.
+                        raise RuntimeError(
+                            "US_LEGACY_AUTO_SELL_UNVERIFIED:" + _legacy_reason
+                        )
                 bind_original_us_order_scope(
                     intent, conn=_identity_conn, env=_env,
-                    account_key=get_account_key(env=_env),
+                    account_key=_raw_account_key,
                     trading_epoch_id=str(_epoch or ""),
                 )
             meta = intent["meta"]
@@ -2554,6 +2596,21 @@ def route_order(
 
     def _mark_broker_submit_boundary() -> None:
         nonlocal _http_boundary_mono
+        if _legacy_nine_auto_sell_proof is not None:
+            # This is after claim/outbox persistence but just before native
+            # HTTP. A manual MTS SELL or an in-flight other BUY since the
+            # first GET invalidates the first observation.
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                recheck_legacy_nine_sell_before_http,
+            )
+            _legacy_ok, _legacy_why = recheck_legacy_nine_sell_before_http(
+                intent, kis_client=kis_client,
+                proof=_legacy_nine_auto_sell_proof, qty=qty,
+            )
+            if not _legacy_ok:
+                raise KisUSPreSubmitError(
+                    "US_LEGACY_NINE_PRE_HTTP_KIS_FENCED:" + _legacy_why
+                )
         # The first Stage4 check occurs before claim reservation. It is not
         # sufficient: rate limiting, journal I/O and account leases may take
         # time before the *actual* KIS POST boundary. Recheck broker evidence
