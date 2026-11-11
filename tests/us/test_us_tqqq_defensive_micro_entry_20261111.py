@@ -132,7 +132,23 @@ def test_invalid_cap_or_buffer_is_not_silently_accepted(monkeypatch):
 
 def test_real_infinite_sleeve_path_reserves_cycle_and_binds_order_provenance(monkeypatch):
     from trader.us.infinite.integration import run_sleeve
-    from tests.us.test_us_tqqq_infinite_integration import FakeRepository
+    class FakeRepository:
+        def __init__(self, state):
+            self.state = state
+        def ensure_schema(self):
+            return None
+        def load_state(self, **_kwargs):
+            return self.state
+        def save_state(self, state):
+            self.state = state
+        def pending_sides(self, *_args):
+            return False, False
+        def has_pending_infinite_order(self, *_args):
+            return False
+        def fill_accounting(self, *_args):
+            return 0, 0, 0, None, None
+        def reconcile_metadata(self, state, **_kwargs):
+            return state
 
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
