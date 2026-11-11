@@ -89,6 +89,34 @@ def test_runner_unknown_entry_or_unproven_tp3_never_trades(monkeypatch):
     assert run(monkeypatch, states=state)["action"] == "BLOCK"
 
 
+def test_broker_filled_partial_is_us_done_and_final_can_fire(monkeypatch):
+    states = completed()
+    states["PROFIT_DEFENSE_PARTIAL"] = {
+        "status": "FILLED", "broker_fill_proven": True, "broker_odno": "00001234",
+        "target_qty": 23, "cumulative_filled_qty": 23,
+    }
+    out = run(monkeypatch, states=states, price=108, qty=23)
+    assert out["action"] == "ACTIVE_RUNNER"
+    assert out["stage"] == "RUNNER_FINAL"
+    assert out["qty"] == 23
+
+
+@pytest.mark.parametrize("state", [
+    {"status": "FILLED", "broker_fill_proven": False,
+     "broker_odno": "00001234", "target_qty": 23, "cumulative_filled_qty": 23},
+    {"status": "FILLED", "broker_fill_proven": True,
+     "target_qty": 23, "cumulative_filled_qty": 23},
+    {"status": "FILLED", "broker_fill_proven": True,
+     "broker_odno": "00001234", "target_qty": 23, "cumulative_filled_qty": 13},
+])
+def test_unproven_partial_filled_does_not_unlock_final(monkeypatch, state):
+    states = completed()
+    states["PROFIT_DEFENSE_PARTIAL"] = state
+    out = run(monkeypatch, states=states, price=108, qty=23)
+    assert out["action"] == "HOLD"
+    assert "KIS_FILL_INTEGRITY" in out["reason"]
+
+
 def test_runner_unknown_partial_blocks_full_exit(monkeypatch):
     state = completed()
     state["PROFIT_DEFENSE_PARTIAL"] = {"status": "ACK"}

@@ -140,7 +140,24 @@ def evaluate_kr_v3_runner(
     )
     if atr.get("valid") is not True:
         return hold("V3_COMPLETED_CHANDELIER_UNVERIFIED:" + str(atr.get("reason")))
-    partial = str((stage_states.get("PROFIT_DEFENSE_PARTIAL") or {}).get("status") or "NOT_TRIGGERED").upper()
+    partial_state = dict(stage_states.get("PROFIT_DEFENSE_PARTIAL") or {})
+    partial = str(partial_state.get("status") or "NOT_TRIGGERED").upper()
+    if partial == "FILLED":
+        # KR native journal calls completed KIS fills FILLED; the original
+        # US V3 pure policy calls the same terminal evidence DONE. Do not
+        # translate a merely ACKed/partial/unverified record into DONE.
+        try:
+            target = int(partial_state.get("target_qty") or 0)
+            filled = int(partial_state.get("cumulative_filled_qty") or -1)
+        except (TypeError, ValueError):
+            return hold("V3_PARTIAL_KIS_FILL_INTEGRITY_UNVERIFIED")
+        if (
+            partial_state.get("broker_fill_proven") is not True
+            or not str(partial_state.get("broker_odno") or "").strip()
+            or target <= 0 or filled != target
+        ):
+            return hold("V3_PARTIAL_KIS_FILL_INTEGRITY_UNVERIFIED")
+        partial = "DONE"
     final = str((stage_states.get("RUNNER_FINAL") or {}).get("status") or "NOT_TRIGGERED").upper()
     # The original US evaluator performs all R1-R4 priority and quantity
     # calculations. Unknown KR trend is never manufactured as verified.
