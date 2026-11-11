@@ -2605,21 +2605,6 @@ def route_order(
 
     def _mark_broker_submit_boundary() -> None:
         nonlocal _http_boundary_mono
-        if _legacy_nine_auto_sell_proof is not None:
-            # This is after claim/outbox persistence but just before native
-            # HTTP. A manual MTS SELL or an in-flight other BUY since the
-            # first GET invalidates the first observation.
-            from trader.us.execution.us_legacy_nine_active_sell import (
-                recheck_legacy_nine_sell_before_http,
-            )
-            _legacy_ok, _legacy_why = recheck_legacy_nine_sell_before_http(
-                intent, kis_client=kis_client,
-                proof=_legacy_nine_auto_sell_proof, qty=qty,
-            )
-            if not _legacy_ok:
-                raise KisUSPreSubmitError(
-                    "US_LEGACY_NINE_PRE_HTTP_KIS_FENCED:" + _legacy_why
-                )
         # The first Stage4 check occurs before claim reservation. It is not
         # sufficient: rate limiting, journal I/O and account leases may take
         # time before the *actual* KIS POST boundary. Recheck broker evidence
@@ -2744,6 +2729,20 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
                 ) from _final_stage4_exc
+        if _legacy_nine_auto_sell_proof is not None:
+            # AFTER claim/outbox persistence and worker authority, BEFORE
+            # the native KIS HTTP and final TP quote/claim fence.
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                recheck_legacy_nine_sell_before_http,
+            )
+            _legacy_ok, _legacy_why = recheck_legacy_nine_sell_before_http(
+                intent, kis_client=kis_client,
+                proof=_legacy_nine_auto_sell_proof, qty=qty,
+            )
+            if not _legacy_ok:
+                raise KisUSPreSubmitError(
+                    "US_LEGACY_NINE_PRE_HTTP_KIS_FENCED:" + _legacy_why
+                )
         # Price and stage were evaluated earlier in the Tick. If Stage4,
         # database or rate-limit delays made that TP decision obsolete,
         # abort strictly BEFORE KIS HTTP. The proven-unsent journal/claim
