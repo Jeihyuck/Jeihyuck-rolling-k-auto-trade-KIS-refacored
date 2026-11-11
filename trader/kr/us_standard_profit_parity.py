@@ -133,7 +133,7 @@ def build_new_swing_parity_contract(
         "strategy_owner": "PB1",
         "exit_policy_family": "SWING_STAGED_EXIT",
         "trade_horizon": "SWING",
-        "position_action": "NEW_POSITION_BUY",
+        "position_action": str(position_action).upper(),
         "activation_mode": mode,
         "account_sha256": hashlib.sha256(account_id.encode("utf-8")).hexdigest(),
         "trading_epoch_id": trading_epoch_id,
