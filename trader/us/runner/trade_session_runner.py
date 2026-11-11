@@ -846,6 +846,7 @@ def run_trade_session(
     """
     # A previous run in the same interpreter must not leak EXIT_ONLY state.
     os.environ.pop("US_STAGE4_EXIT_ONLY_ACTIVE", None)
+    _us_stage4_original_worker_mode = os.environ.get("US_RECONCILE_WORKER_MODE")
     global _received_signal, _exit_code
     _received_signal = None
     _exit_code = None
@@ -3329,6 +3330,11 @@ def run_trade_session(
         # clear an unverified live Tick or an unresolved execution Claim.
         os.environ.pop("US_RESERVATION_WORKER_PID", None)
         os.environ.pop("US_STAGE4_EXIT_ONLY_ACTIVE", None)
+        if locals().get("_stage4_exit_only_fallback"):
+            if _us_stage4_original_worker_mode is None:
+                os.environ.pop("US_RECONCILE_WORKER_MODE", None)
+            else:
+                os.environ["US_RECONCILE_WORKER_MODE"] = _us_stage4_original_worker_mode
         _stage4_stop_unverified = False
         if _shadow_reconcile_child is not None:
             try:
