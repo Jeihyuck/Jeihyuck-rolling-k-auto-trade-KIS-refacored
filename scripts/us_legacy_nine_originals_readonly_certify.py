@@ -29,7 +29,7 @@ TMO_ORIGINAL_ORDER_DATE = "2026-10-30"
 TMO_ORIGINAL_ORDER_NO = "0000036019"
 SELECT_POSITIONS = """
 SELECT DISTINCT ON (symbol) symbol, qty, as_of, account_id,
-    trading_epoch_id, portfolio_epoch_id, position_cycle_id
+    trading_epoch_id, portfolio_epoch_id, position_cycle_id, meta
 FROM public.us_positions
 WHERE trading_epoch_id=:epoch AND as_of<=:trade_date
 AND symbol=ANY(:symbols)
@@ -212,6 +212,21 @@ def prepare_original_plan(
         archived_cycle = str(archived_lifecycle.get("lifecycle_id") or "")
         life = archived_cycle if historical_mode else buy_lifecycle_alias
         contract = str(meta.get("entry_exit_contract_sha256") or "")
+        if historical_mode:
+            # Real newer positions have preserved the V2 SHA, but not cycle
+            # columns. Never certify a different current signed strategy
+            # merely because a historical BUY row looks valid.
+            current_meta = position.get("meta") if isinstance(position.get("meta"),dict) else {}
+            if current_meta.get("entry_exit_contract_sha256") != contract:
+                blockers.append(f"{symbol}_CURRENT_POSITION_FROZEN_CONTRACT_MISMATCH")
+            if (str(meta.get("fill_evidence_type") or "") != "KIS_ORDER_CUMULATIVE_ACTUAL"
+                    or meta.get("is_synthetic") is True):
+                blockers.append(f"{symbol}_ORIGINAL_BUY_NOT_NATIVE_KIS_ACTUAL")
+            try:
+                if _count(meta.get("cumulative_filled_qty")) != q:
+                    blockers.append(f"{symbol}_ORIGINAL_BUY_CUMULATIVE_MISMATCH")
+            except ValueError:
+                blockers.append(f"{symbol}_ORIGINAL_BUY_CUMULATIVE_MISMATCH")
         owner = str(meta.get("strategy_owner") or "").upper()
         original_order_meta = (
             matched[0].get("meta") if len(matched)==1 and
@@ -255,6 +270,11 @@ def prepare_original_plan(
             sale_day = str(sale.get("trade_date") or "")
             sale_no = str(sale.get("order_no") or "").strip()
             sale_meta = sale.get("meta") if isinstance(sale.get("meta"),dict) else {}
+            if historical_mode and (
+                str(sale_meta.get("fill_evidence_type") or "")!="KIS_ORDER_CUMULATIVE_ACTUAL"
+                or sale_meta.get("is_synthetic") is True
+            ):
+                blockers.append(f"{symbol}_LEGACY_SELL_NOT_NATIVE_KIS_ACTUAL")
             sale_key = (symbol,"SELL",sale_day,sale_no.lstrip("0"))
             sale_orders = matching_orders.get(sale_key,[])
             try:
