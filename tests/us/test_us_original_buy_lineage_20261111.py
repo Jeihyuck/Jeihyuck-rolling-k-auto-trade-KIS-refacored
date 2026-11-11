@@ -437,3 +437,158 @@ def test_truncated_original_buy_source_window_is_never_identity_proof(monkeypatc
         symbol="AMGN", trade_date="2026-11-10", qty=6,
         identity=IDENTITY, conn=DBConn([original_row()]),
     ) is not None
+
+
+
+def _native_verified_sell_row(*, sold=2):
+    return {
+        "side": "SELL", "status": "FILLED",
+        "qty_requested": sold, "qty_filled": sold, "fill_qty": sold,
+        "client_order_key": "verified-actual-partial-sell",
+        "order_no": "0000009411",
+        "trading_epoch_id": "epoch-current",
+        "order_account_id": ACCOUNT_HASH,
+        "fill_account_id": ACCOUNT_HASH,
+        "order_portfolio_epoch_id": PORTFOLIO,
+        "fill_portfolio_epoch_id": PORTFOLIO,
+        "order_position_cycle_id": CYCLE,
+        "fill_position_cycle_id": CYCLE,
+        "order_meta": {
+            "position_lifecycle_id": CYCLE,
+            "broker_account_hash": ACCOUNT_HASH,
+            "strategy_owner": "US_STANDARD",
+        },
+        "fill_meta": {
+            "position_lifecycle_id": CYCLE,
+            "broker_account_hash": ACCOUNT_HASH,
+            "strategy_owner": "US_STANDARD",
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "cumulative_filled_qty": sold,
+        },
+    }
+
+
+def test_native_partial_sell_continuity_requires_every_original_scope_and_fill():
+    from trader.us.original_buy_lineage import _verified_actual_partial_sell_continuity
+    import copy
+
+    row = _native_verified_sell_row(sold=2)
+    base = dict(
+        sold_shares=2, epoch="epoch-current",
+        broker_hash=ACCOUNT_HASH,
+        portfolio=PORTFOLIO, cycle=CYCLE,
+    )
+    assert _verified_actual_partial_sell_continuity([row], **base)
+    assert not _verified_actual_partial_sell_continuity([row], **{
+        **base, "sold_shares": 3,
+    })
+    for bad_field, val in (
+        ("side", "BUY"), ("status", "OPEN"),
+        ("order_account_id", "wrong-account"),
+        ("fill_account_id", "wrong-account"),
+        ("order_portfolio_epoch_id", "other-portfolio"),
+        ("fill_position_cycle_id", "foreign-cycle"),
+        ("qty_filled", 3), ("fill_qty", 3),
+        ("trading_epoch_id", "previous-epoch"),
+    ):
+        poisoned = copy.deepcopy(row)
+        poisoned[bad_field] = val
+        assert not _verified_actual_partial_sell_continuity(
+            [poisoned], **base,
+        ), bad_field
+    for bad_meta, bad_value in (
+        ("position_lifecycle_id", "foreign-cycle"),
+        ("broker_account_hash", "wrong-account"),
+        ("fill_evidence_type", "BALANCE_DELTA_SYNTHETIC"),
+        ("is_synthetic", True),
+    ):
+        poisoned = copy.deepcopy(row)
+        poisoned["fill_meta"][bad_meta] = bad_value
+        assert not _verified_actual_partial_sell_continuity(
+            [poisoned], **base,
+        ), bad_meta
+    assert not _verified_actual_partial_sell_continuity(
+        [row, copy.deepcopy(row)], **base,
+    )
+    assert not _verified_actual_partial_sell_continuity(
+        [row, {**row, "client_order_key": "different-broker-order"}], **base,
+    )  # cumulative actual shares do not match 2
+
+
+def test_next_day_partial_sell_keeps_original_cycle_only_after_native_proof():
+    from trader.us.original_buy_lineage import verified_carried_us_snapshot_identity
+    contract = original_row()["order_meta"]["entry_exit_contract"]
+    class Result:
+        def __init__(self, rows=None, value=None):
+            self.rows = rows or []
+            self.value = value
+        def mappings(self):
+            return self
+        def first(self):
+            return self.rows[0] if self.rows else None
+        def all(self):
+            return self.rows
+        def scalar(self):
+            return self.value
+    class Conn:
+        def __init__(self):
+            self.rows = [_native_verified_sell_row(sold=2)]
+            self.previous_pending = 0
+        def execute(self, sql, params):
+            sql = str(sql)
+            if "FROM us_positions" in sql:
+                return Result([{
+                    "as_of": "2026-11-10", "qty": 6,
+                    "account_id": ACCOUNT_HASH,
+                    "portfolio_epoch_id": PORTFOLIO,
+                    "position_cycle_id": CYCLE,
+                    "meta": {
+                        "strategy_owner": "US_STANDARD",
+                        "position_lifecycle_id": CYCLE,
+                        "position_cycle_id": CYCLE,
+                        "portfolio_epoch_id": PORTFOLIO,
+                        "broker_account_hash": ACCOUNT_HASH,
+                        "lineage_resolution":
+                            "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+                        "entry_exit_contract": contract,
+                        "entry_exit_contract_sha256": contract["sha256"],
+                    },
+                }])
+            if "FROM trading_epochs" in sql:
+                return Result([{"account_id": ACCOUNT}])
+            if "FROM us_position_risk_state" in sql:
+                return Result([{"lifecycle": {
+                    "is_open": True,
+                    "lifecycle_id": CYCLE, "position_cycle_id": CYCLE,
+                    "portfolio_epoch_id": PORTFOLIO,
+                    "account_id": ACCOUNT,
+                    "trading_epoch_id": "epoch-current",
+                    "strategy_owner": "US_STANDARD",
+                    "entry_policy": {
+                        "entry_exit_contract_sha256": contract["sha256"],
+                    },
+                }}])
+            if "FROM us_orders o" in sql:
+                return Result(self.rows)
+            if "FROM us_orders" in sql:
+                return Result(value=self.previous_pending)
+            raise AssertionError(sql)
+    db = Conn()
+    def check():
+        return verified_carried_us_snapshot_identity(
+            conn=db, trade_date="2026-11-11",
+            position={"symbol": "AMGN", "qty": 4},
+            trading_epoch_id="epoch-current",
+        )
+    proof = check()
+    assert proof and proof["position_cycle_id"] == CYCLE
+    assert proof["entry_exit_contract_sha256"] == contract["sha256"]
+    assert proof["lineage_verified_partial_sell_shares"] == 2
+    db.previous_pending = 1
+    assert check() is None
+    db.previous_pending = 0
+    db.rows = [{**_native_verified_sell_row(sold=2),
+                "fill_account_id": "cross-account"}]
+    assert check() is None
+    db.rows = [_native_verified_sell_row(sold=3)]
+    assert check() is None  # expected two-share delta, not three
