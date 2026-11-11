@@ -56,7 +56,7 @@ class InfiniteConfig:
     conflict_first_buy_max_usd: float = 125.0
     defensive_micro_first_buy_enabled: bool = True
     defensive_micro_first_buy_max_usd: float = 125.0
-    defensive_micro_first_buy_cost_buffer_pct: float = 0.005
+    defensive_micro_first_buy_cost_buffer_pct: float = 0.01
     max_total_capital_usd: float = 10_000.0
     buy_premium_pct: float = 0.03
     take_profit_pct: float = 0.10
@@ -101,7 +101,7 @@ class InfiniteConfig:
             conflict_first_buy_max_usd=_float(prefix + "CONFLICT_FIRST_BUY_MAX_USD", 125),
             defensive_micro_first_buy_enabled=_bool(prefix + "DEFENSIVE_MICRO_FIRST_BUY_ENABLED", True),
             defensive_micro_first_buy_max_usd=_strict_float(prefix + "DEFENSIVE_MICRO_FIRST_BUY_MAX_USD", 125),
-            defensive_micro_first_buy_cost_buffer_pct=_strict_float(prefix + "DEFENSIVE_MICRO_FIRST_BUY_COST_BUFFER_PCT", .005),
+            defensive_micro_first_buy_cost_buffer_pct=_strict_float(prefix + "DEFENSIVE_MICRO_FIRST_BUY_COST_BUFFER_PCT", .01),
             max_total_capital_usd=_float(prefix + "MAX_TOTAL_CAPITAL_USD", 10_000),
             buy_premium_pct=_float(prefix + "BUY_PREMIUM_PCT", .03),
             take_profit_pct=_float(prefix + "TAKE_PROFIT_PCT", .10),
