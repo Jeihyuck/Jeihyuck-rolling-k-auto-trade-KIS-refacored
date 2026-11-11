@@ -42,7 +42,10 @@ def select_verified_us_original_buy_scope(
     account = str(identity.get("account_id") or "")
     epoch = str(identity.get("trading_epoch_id") or "")
     env = str(identity.get("env") or "").lower()
-    if env != "practice" or not account or not epoch or int(qty or 0) < 1:
+    # A bool, float, or decimal-looking string is not a broker-proven share count.
+    # Do not allow an integer cast at this execution/provenance boundary.
+    exact_qty = _exact_positive_shares(qty)
+    if env != "practice" or not account or not epoch or exact_qty is None:
         return None
     expected_hash = hashlib.sha256(account.encode("utf-8")).hexdigest()
     eligible: list[dict] = []
@@ -75,7 +78,7 @@ def select_verified_us_original_buy_scope(
             and row.get("order_no") and row.get("client_order_key")
             and row.get("filled_at") is not None
             and pre_order_qty == 0
-            and requested == intended and 0 < filled == cumulative == qty <= requested
+            and requested == intended and 0 < filled == cumulative == exact_qty <= requested
             and order_filled == filled
             and (
                 (order_status == "FILLED" and filled == requested)
