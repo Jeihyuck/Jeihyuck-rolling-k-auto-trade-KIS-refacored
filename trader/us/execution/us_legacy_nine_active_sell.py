@@ -233,22 +233,43 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
     if net!=holding:
         return None,"ORIGINAL_FILL_NET_NOT_CURRENT_HOLDING"
     sells=_rows(conn,SELL_ORDERS_SQL,params)
-    if len(sells)!=len(fill_sells):
-        return None,"SELL_ORDER_FILL_COUNT_MISMATCH"
     sale_proofs=[]
+    zero_fill_sell_proofs=[]
+    matched_sells=set()
+    seen_orders=set()
     for order in sells:
         key=(str(order["trade_date"]),str(order.get("order_no") or "").lstrip("0"))
+        if not key[1] or key in seen_orders:
+            return None,"ORIGINAL_SELL_ORDER_IDENTITY_DUPLICATE"
+        seen_orders.add(key)
         qty=fill_sells.get(key)
         meta=_json(order.get("meta"))
-        if (qty is None or
-                _positive(order.get("qty_requested")) is None or
-                _positive(order["qty_requested"])<qty or
-                _nonnegative(order.get("qty_filled"))!=qty or
-                str(order.get("status") or "").upper() not in {"FILLED","RECONCILED","CANCELLED"}
+        requested=_positive(order.get("qty_requested"))
+        recorded=_nonnegative(order.get("qty_filled"))
+        status=str(order.get("status") or "").upper()
+        if (requested is None or recorded is None
+                or recorded>requested
                 or meta.get("position_lifecycle_id")!=original_cycle):
             return None,"ORIGINAL_SELL_DB_ORDER_FILL_CONFLICT"
-        sale_proofs.append((key[0],str(order["order_no"]),
-                            _positive(order["qty_requested"]),qty))
+        if qty is None:
+            # An old zero-fill ACK/OPEN is still a real historical order.
+            # It need not have a fill row. Do not invent one to make the
+            # count match. Authorize later only if its original KIS day
+            # proves a terminal cancellation with cumulative 0.
+            if recorded != 0 or status not in {
+                "OPEN","ACK","SUBMITTED","CANCELLED","CANCELED",
+                "REJECTED","EXPIRED","BLOCKED",
+            }:
+                return None,"ORIGINAL_SELL_NO_FILL_UNVERIFIED"
+            zero_fill_sell_proofs.append((key[0],str(order["order_no"]),requested,0))
+            continue
+        if (requested<qty or recorded!=qty
+                or status not in {"FILLED","RECONCILED","CANCELLED"}):
+            return None,"ORIGINAL_SELL_DB_ORDER_FILL_CONFLICT"
+        matched_sells.add(key)
+        sale_proofs.append((key[0],str(order["order_no"]),requested,qty))
+    if matched_sells!=set(fill_sells):
+        return None,"SELL_ORDER_FILL_COUNT_MISMATCH"
     stages=_rows(conn,STAGES_SQL,params)
     done=set()
     for stage in stages:
@@ -278,6 +299,7 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         "source_buy_qty":buy_qty, "v2_sha":digest,
         "original_v2_contract":contract,
         "prior_sell_proofs":sale_proofs, "old_unresolved":unresolved,
+        "zero_fill_sell_proofs":zero_fill_sell_proofs,
         "completed_tp_stages":sorted(done),
     },"DB_LEGACY_EVIDENCE_VERIFIED"
 
@@ -361,6 +383,16 @@ def prove_and_bind_legacy_nine_sell(
             if (status["classification"] not in {"PROVEN_FILLED","PROVEN_CANCELLED"}
                     or status.get("cumulative_filled_qty")!=filled):
                 return False,"ORIGINAL_KIS_SELL_FILL_UNVERIFIED",None
+        for day,no,req,filled in evidence["zero_fill_sell_proofs"]:
+            # Source-day broker cancelled + zero cumulative fill is the
+            # only proof accepted for a local zero-fill SELL.
+            zero_status=classify_original_order(
+                get_order_day(day),order_no=no,symbol=symbol,
+                expected_qty=req,trade_date=day,side="SELL",
+            )
+            if (zero_status["classification"]!="PROVEN_CANCELLED"
+                    or zero_status.get("cumulative_filled_qty")!=0):
+                return False,"ORIGINAL_KIS_ZERO_FILL_SELL_NOT_CANCELLED",None
         for day,no,req,filled in evidence["old_unresolved"]:
             status=classify_original_order(
                 get_order_day(day),order_no=no,symbol=symbol,
