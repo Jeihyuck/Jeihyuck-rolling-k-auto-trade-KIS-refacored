@@ -1571,6 +1571,43 @@ def route_order(
                     trading_epoch_id=str(_epoch or ""),
                 )
             meta = intent["meta"]
+            if meta.get("legacy_nine_tp_pending_deferred") is True:
+                # Durable TP stage still belongs to the archived original
+                # V2 holding lifecycle. Never create PENDING before complete
+                # KIS proof: a failed historical GET would otherwise strand
+                # the position and stop subsequent automatic TPs.
+                _source = str(meta.get("source_original_runtime_lifecycle_id") or "")
+                _stage = str(meta.get("profit_capture_stage") or "").lower()
+                if (
+                    _legacy_nine_auto_sell_proof is None
+                    or intent.get("automated_sell_authorized") is not True
+                    or _source != _legacy_nine_auto_sell_proof["source_cycle"]
+                    or _stage not in {"tp1", "tp2", "tp3"}
+                    or not str(order_key or "").startswith("US_PC_")
+                    or f"_{symbol_upper}_{_source}_" not in str(order_key or "")
+                ):
+                    raise RuntimeError("US_LEGACY_TP_DEFERRED_WITHOUT_KIS_PROOF")
+                from trader.us.db.repos import (
+                    load_us_profit_capture_state, mark_us_profit_capture_stage,
+                )
+                _prior = load_us_profit_capture_state(
+                    str(trade_date), [symbol_upper], {symbol_upper: _source},
+                ).get(symbol_upper) or {}
+                if _prior.get(f"{_stage}_done") or _prior.get(f"{_stage}_pending"):
+                    raise RuntimeError("US_LEGACY_TP_STAGE_ALREADY_PENDING_OR_COMPLETE")
+                mark_us_profit_capture_stage(
+                    str(trade_date), symbol_upper, _stage,
+                    position_lifecycle_id=_source, order_key=str(order_key),
+                    qty=qty, notional_usd=qty * price, status="PENDING",
+                )
+                _saved = load_us_profit_capture_state(
+                    str(trade_date), [symbol_upper], {symbol_upper: _source},
+                ).get(symbol_upper) or {}
+                if (
+                    _saved.get(f"{_stage}_pending") is not True
+                    or _saved.get(f"{_stage}_order_key") != str(order_key)
+                ):
+                    raise RuntimeError("US_LEGACY_TP_PENDING_NOT_DURABLE")
         except Exception as exc:
             logger.error(
                 "[US_ORDER][ORIGINAL_RECOVERY_SCOPE_FENCED] symbol=%s "
