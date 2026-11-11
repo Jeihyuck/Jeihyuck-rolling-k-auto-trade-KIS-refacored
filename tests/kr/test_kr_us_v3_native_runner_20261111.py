@@ -108,6 +108,10 @@ def test_broker_filled_partial_is_us_done_and_final_can_fire(monkeypatch):
      "target_qty": 23, "cumulative_filled_qty": 23},
     {"status": "FILLED", "broker_fill_proven": True,
      "broker_odno": "00001234", "target_qty": 23, "cumulative_filled_qty": 13},
+    {"status": "FILLED", "broker_fill_proven": True,
+     "broker_odno": "00001234", "target_qty": 1, "cumulative_filled_qty": True},
+    {"status": "FILLED", "broker_fill_proven": True,
+     "broker_odno": "00001234", "target_qty": 23.0, "cumulative_filled_qty": 23.0},
 ])
 def test_unproven_partial_filled_does_not_unlock_final(monkeypatch, state):
     states = completed()

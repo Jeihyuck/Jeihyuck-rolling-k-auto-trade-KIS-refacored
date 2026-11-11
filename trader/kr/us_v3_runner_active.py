@@ -146,15 +146,22 @@ def evaluate_kr_v3_runner(
         # KR native journal calls completed KIS fills FILLED; the original
         # US V3 pure policy calls the same terminal evidence DONE. Do not
         # translate a merely ACKed/partial/unverified record into DONE.
-        try:
-            target = int(partial_state.get("target_qty") or 0)
-            filled = int(partial_state.get("cumulative_filled_qty") or -1)
-        except (TypeError, ValueError):
-            return hold("V3_PARTIAL_KIS_FILL_INTEGRITY_UNVERIFIED")
+        def _exact_runner_qty(value: Any) -> int | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value if value > 0 else None
+            if isinstance(value, str) and value.isascii() and value.isdecimal():
+                number = int(value)
+                return number if number > 0 else None
+            return None
+
+        target = _exact_runner_qty(partial_state.get("target_qty"))
+        filled = _exact_runner_qty(partial_state.get("cumulative_filled_qty"))
         if (
             partial_state.get("broker_fill_proven") is not True
             or not str(partial_state.get("broker_odno") or "").strip()
-            or target <= 0 or filled != target
+            or target is None or filled != target
         ):
             return hold("V3_PARTIAL_KIS_FILL_INTEGRITY_UNVERIFIED")
         partial = "DONE"
