@@ -463,9 +463,17 @@ if market == 'us':
         else None
     )
 if market == 'kr':
-    sys.path.insert(0, script_dir)
-    from kr_mail_execution_evidence import collect_kr_execution_status
-    data.update(collect_kr_execution_status(Path(out).parent, trade))
+    # Evidence classifier failures must never suppress the required mail.
+    try:
+        sys.path.insert(0, script_dir)
+        from kr_mail_execution_evidence import collect_kr_execution_status
+        data.update(collect_kr_execution_status(Path(out).parent, trade))
+    except Exception as exc:
+        data.update(
+            daily_execution_status="UNKNOWN",
+            execution_summary="KR_EXECUTION_CLASSIFIER_UNAVAILABLE",
+            execution_summary_error=type(exc).__name__,
+        )
 Path(out).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 
