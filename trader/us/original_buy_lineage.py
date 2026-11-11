@@ -20,7 +20,7 @@ def select_verified_us_original_buy_scope(
     """Return the only proven complete first BUY or fail closed.
 
     The source query must already restrict to the current trade date and epoch.
-    A pre-BUY position of zero and exact cumulative KIS full fill are mandatory.
+    A pre-BUY position of zero and exact cumulative KIS actual fill are mandatory.
     Mixed portfolios, owner and account formats cannot be adopted by ticker.
     """
     from trader.us.entry_exit_contract import verify_us_entry_exit_contract
@@ -46,6 +46,8 @@ def select_verified_us_original_buy_scope(
             intended = int(row.get("intent_qty") or 0)
             cumulative = int(fill_meta.get("cumulative_filled_qty") or 0)
             pre_order_qty = int(order_meta.get("pre_order_holding_qty"))
+            order_filled = int(row.get("order_filled") if row.get("order_filled") is not None else filled)
+            order_status = str(row.get("order_status") or ("FILLED" if filled == requested else "PARTIALLY_FILLED")).upper()
         except (TypeError, ValueError):
             continue
         if not (
@@ -59,7 +61,12 @@ def select_verified_us_original_buy_scope(
             and row.get("order_no") and row.get("client_order_key")
             and row.get("filled_at") is not None
             and pre_order_qty == 0
-            and filled == requested == intended == cumulative == qty
+            and requested == intended and 0 < filled == cumulative == qty <= requested
+            and order_filled == filled
+            and (
+                (order_status == "FILLED" and filled == requested)
+                or (order_status == "PARTIALLY_FILLED" and filled < requested)
+            )
             and str(fill_meta.get("fill_evidence_type") or "") == "KIS_ORDER_CUMULATIVE_ACTUAL"
             and isinstance(contract, dict) and verify_us_entry_exit_contract(contract)
             and all(str(meta.get("broker_account_hash") or "") == expected_hash
@@ -125,6 +132,7 @@ def load_verified_us_original_buy_scope(
                 SELECT o.symbol, o.trading_epoch_id, o.account_id,
                        o.portfolio_epoch_id, o.position_cycle_id,
                        o.order_no, o.client_order_key, o.qty_requested AS order_qty,
+                       o.qty_filled AS order_filled, o.status AS order_status,
                        i.qty AS intent_qty, f.qty AS fill_qty, f.filled_at,
                        o.meta AS order_meta, i.meta AS intent_meta, f.meta AS fill_meta
                   FROM us_orders o
@@ -144,7 +152,7 @@ def load_verified_us_original_buy_scope(
                    AND f.client_order_key=o.client_order_key
                    AND f.trading_epoch_id=o.trading_epoch_id
                  WHERE o.trade_date=:td AND o.symbol=:symbol
-                   AND o.side='BUY' AND o.status='FILLED'
+                   AND o.side='BUY' AND o.status IN ('FILLED','PARTIALLY_FILLED')
                    AND o.trading_epoch_id=:epoch
                  LIMIT 50
             """), {"td": trade_date, "symbol": symbol,
