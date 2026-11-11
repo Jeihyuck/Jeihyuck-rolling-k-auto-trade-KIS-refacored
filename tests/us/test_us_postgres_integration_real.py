@@ -64,6 +64,22 @@ def pg_engine(monkeypatch):
             conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
             )
+        # Migration 0052 rekeys snapshots by trading epoch. The isolated
+        # fixture cannot run all KR/epoch DDL, so mirror precisely the
+        # *production* scoped uniqueness before testing original BUY writes.
+        # Without it repos.save_position_snapshot fails on ON CONFLICT rather
+        # than exercising the lineage assertions.
+        conn.exec_driver_sql(
+            "ALTER TABLE us_positions "
+            "DROP CONSTRAINT IF EXISTS us_positions_as_of_symbol_exchange_key"
+        )
+        conn.exec_driver_sql(
+            "DROP INDEX IF EXISTS uq_us_positions_epoch_asof_symbol_exchange"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX uq_us_positions_epoch_asof_symbol_exchange "
+            "ON us_positions(trading_epoch_id, as_of, symbol, exchange)"
+        )
     # Fail the fixture immediately on missing 0062 columns, rather than
     # reporting misleading downstream KIS pre-submit/claim failures.
     with engine.connect() as conn:
