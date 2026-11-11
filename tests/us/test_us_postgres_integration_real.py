@@ -2752,13 +2752,27 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(pg_eng
     }
     with pg_engine.begin() as conn:
         conn.execute(text("""
+            -- The PostgreSQL service is shared by focused + complete US
+            -- suites; a four-column shortcut table poisons later tests.
+            -- Match migration 0052's actual risk-state schema.
             CREATE TABLE IF NOT EXISTS us_position_risk_state(
-                trading_epoch_id TEXT NOT NULL,
                 trade_date DATE NOT NULL,
                 symbol TEXT NOT NULL,
+                soft_stop_breach_count INTEGER NOT NULL DEFAULT 0,
+                first_soft_stop_seen_at TIMESTAMPTZ,
+                last_soft_stop_seen_at TIMESTAMPTZ,
+                lowest_price_since_breach NUMERIC,
+                last_price NUMERIC,
+                last_pnl_pct NUMERIC,
                 state JSONB NOT NULL DEFAULT '{}'::jsonb,
-                PRIMARY KEY(trading_epoch_id, trade_date, symbol)
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                trading_epoch_id TEXT NOT NULL
             )
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            uq_us_position_risk_state_epoch_date_symbol
+            ON us_position_risk_state(trading_epoch_id, trade_date, symbol)
         """))
         conn.execute(text("""
             INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
