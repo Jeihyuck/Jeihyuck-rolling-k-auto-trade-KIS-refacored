@@ -92,11 +92,61 @@ def authoritative_broker_avg(position: dict, *, now: datetime | None = None,
     raise ValueError("missing_authoritative_broker_avg_price")
 
 
+def tp_stage_lifecycle_from_order_proof(order_lifecycle_id: str, order_meta: dict | None,
+                                        *, client_order_key: str = "") -> str:
+    """Keep the source V2 TP ledger on the ORIGINAL runtime cycle.
+
+    PR352 has two explicitly different IDs:
+    - execution lifecycle: prospective account-scoped SELL claim
+    - TP stage lifecycle: original V2 holding (preserves TP1/TP2/TP3 DONE)
+
+    Never retag an original BUY or grant a broker order with this helper.
+    Malformed/forged partial forward attribution fails closed.
+    """
+    meta = order_meta if isinstance(order_meta, dict) else {}
+    current = str(order_lifecycle_id or "").strip()
+    if not meta.get("forward_management_not_original_buy"):
+        return current
+    from trader.us.entry_exit_contract import US_ENTRY_EXIT_CONTRACT_VERSION
+    import re
+
+    source = str(meta.get("source_original_runtime_lifecycle_id") or "").strip()
+    version = str(meta.get("us_legacy_forward_management_version") or "")
+    sha = str(meta.get("source_original_entry_exit_contract_sha256") or "")
+    stage = str(meta.get("profit_capture_stage") or "").lower()
+    symbol = str(meta.get("symbol") or "").upper()
+    order_key = str(client_order_key or "").strip()
+    if not (
+        version == "US_LEGACY_NINE_V2_SELL_V1"
+        and meta.get("automated_sell_authorized") is True
+        and meta.get("strategy_owner") == "US_STANDARD"
+        and meta.get("forward_management_not_original_buy") is True
+        and stage in {"tp1", "tp2", "tp3"}
+        and source and source != current
+        and current and str(meta.get("position_lifecycle_id") or "") == current
+        and str(meta.get("position_cycle_id") or "") == current
+        and str(meta.get("source_entry_contract_sha256") or "") == sha
+        and str(meta.get("source_entry_contract_version") or "") == US_ENTRY_EXIT_CONTRACT_VERSION
+        and re.fullmatch(r"[0-9a-f]{64}", sha)
+        and str(meta.get("broker_account_hash") or "")
+        and str(meta.get("portfolio_epoch_id") or "")
+        and str(meta.get("trading_epoch_id") or "")
+        and symbol and symbol != "TQQQ"
+        and order_key.startswith("US_PC_")
+        and f"_{symbol}_{source}_" in order_key
+    ):
+        raise ValueError("US_LEGACY_TP_STAGE_SOURCE_ID_UNVERIFIED")
+    return source
+
+
 def sync_profit_capture_stage_from_order(**event) -> None:
     """Canonical, idempotent order lifecycle -> TP lifecycle transition."""
     stage = str(event.get("profit_capture_stage") or "").lower()
-    lifecycle = str(event.get("position_lifecycle_id") or "").strip()
     key = str(event.get("client_order_key") or "").strip()
+    lifecycle = tp_stage_lifecycle_from_order_proof(
+        str(event.get("position_lifecycle_id") or ""),
+        event.get("order_meta"), client_order_key=key,
+    )
     if stage not in {"tp1", "tp2", "tp3"} or not lifecycle or not key:
         return
     status = str(event.get("order_status") or "").upper()
