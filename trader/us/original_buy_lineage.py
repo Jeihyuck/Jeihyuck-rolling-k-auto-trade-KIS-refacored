@@ -14,6 +14,20 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+
+
+
+def _exact_positive_shares(raw: Any) -> int | None:
+    """No fractional/boolean/coerced broker quantities at an identity boundary."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str) and raw.isascii() and raw.isdecimal():
+        number = int(raw)
+        return number if number > 0 else None
+    return None
+
 def select_verified_us_original_buy_scope(
     rows: list[dict], *, symbol: str, qty: int, identity: dict[str, str],
 ) -> dict | None:
@@ -188,11 +202,8 @@ def verified_new_buy_snapshot_identity(
         or str(position.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
     ):
         return None
-    try:
-        qty = int(position.get("qty") or 0)
-    except (TypeError, ValueError):
-        return None
-    if qty < 1 or not trading_epoch_id:
+    qty = _exact_positive_shares(position.get("qty"))
+    if qty is None or not trading_epoch_id:
         return None
     accounts = conn.execute(text("""
         SELECT account_id FROM trading_epochs
@@ -234,4 +245,129 @@ def verified_new_buy_snapshot_identity(
         "opened_at": str(proof["filled_at"]),
         "opened_at_source": "confirmed_buy_fill",
         "lineage_resolution": "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+    }
+
+
+
+def verified_carried_us_snapshot_identity(
+    *, conn: Any, trade_date: str, position: dict,
+    trading_epoch_id: str,
+) -> dict | None:
+    """Conservative cross-session continuity for an already verified open cycle.
+
+    Broker balances do not contain a strategy owner or portfolio cycle. Carry
+    those fields only when the *previous* scoped position and matching durable
+    lifecycle agree, the current KIS holding has unchanged exact shares, and
+    there has been no intervening US order or unresolved previous-day order.
+    A re-entry, late fill, split, ambiguous account, or changed quantity must
+    obtain a new independent original KIS proof, never inherit the old cycle.
+    """
+    from sqlalchemy import text
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+    from trader.us.strategy_ownership import owner_for_symbol, STANDARD_OWNER
+
+    sym = str(position.get("symbol") or "").strip().upper()
+    meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    qty = _exact_positive_shares(position.get("qty"))
+    if (
+        not sym or sym == "TQQQ" or qty is None
+        or owner_for_symbol(sym) != STANDARD_OWNER or not trading_epoch_id
+        or str(position.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
+    ):
+        return None
+    for field in ("account_id", "portfolio_epoch_id", "position_cycle_id",
+                  "position_lifecycle_id"):
+        if position.get(field) not in (None, "") or meta.get(field) not in (None, ""):
+            # A pre-bound position must be verified by the normal scoped
+            # lifecycle path, not overwritten with a different prior cycle.
+            return None
+
+    # The last balance observation is the continuity anchor. A zero holding
+    # is a terminal boundary even when an earlier snapshot was positive.
+    prior = conn.execute(text("""
+        SELECT as_of,qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+          FROM us_positions
+         WHERE trading_epoch_id=:epoch AND symbol=:symbol AND as_of<:today
+         ORDER BY as_of DESC LIMIT 1
+    """), {"epoch":trading_epoch_id,"symbol":sym,"today":trade_date}).mappings().first()
+    if not prior or _exact_positive_shares(prior.get("qty")) != qty:
+        return None
+    prior_meta = prior.get("meta") if isinstance(prior.get("meta"),dict) else {}
+    if str(prior_meta.get("strategy_owner") or "").upper() != "US_STANDARD":
+        return None
+    cycle = str(prior.get("position_cycle_id") or "")
+    portfolio = str(prior.get("portfolio_epoch_id") or "")
+    broker_hash = str(prior.get("account_id") or "")
+    contract = prior_meta.get("entry_exit_contract")
+    if not (
+        cycle and portfolio and broker_hash
+        and str(prior_meta.get("position_lifecycle_id") or "") == cycle
+        and str(prior_meta.get("position_cycle_id") or "") == cycle
+        and str(prior_meta.get("portfolio_epoch_id") or "") == portfolio
+        and str(prior_meta.get("broker_account_hash") or "") == broker_hash
+        and prior_meta.get("lineage_resolution") in {
+            "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+            "VERIFIED_CURRENT_EPOCH_CONTINUITY",
+        }
+        and isinstance(contract,dict)
+        and verify_us_entry_exit_contract(contract)
+        and str(prior_meta.get("entry_exit_contract_sha256") or "") == str(contract["sha256"])
+    ):
+        return None
+
+    accounts = conn.execute(text("""
+        SELECT account_id FROM trading_epochs
+        WHERE trading_epoch_id=:epoch AND env='practice' AND status='ACTIVE'
+    """), {"epoch":trading_epoch_id}).mappings().all()
+    if len(accounts) != 1:
+        return None
+    raw_account = str(accounts[0].get("account_id") or "")
+    if not raw_account or hashlib.sha256(raw_account.encode()).hexdigest() != broker_hash:
+        return None
+    state = conn.execute(text("""
+        SELECT state->'lifecycle' AS lifecycle
+          FROM us_position_risk_state
+         WHERE trading_epoch_id=:epoch AND symbol=:symbol AND trade_date=:date
+    """), {"epoch":trading_epoch_id,"symbol":sym,"date":prior["as_of"]}).mappings().first()
+    life = (state or {}).get("lifecycle")
+    if not isinstance(life,dict) or not (
+        life.get("is_open") is True
+        and str(life.get("lifecycle_id") or "") == cycle
+        and str(life.get("position_cycle_id") or "") == cycle
+        and str(life.get("portfolio_epoch_id") or "") == portfolio
+        and str(life.get("account_id") or "") == raw_account
+        and str(life.get("trading_epoch_id") or "") == trading_epoch_id
+        and str(life.get("strategy_owner") or "").upper() == "US_STANDARD"
+        and str((life.get("entry_policy") or {}).get("entry_exit_contract_sha256") or "") == contract["sha256"]
+    ):
+        return None
+    # Order uncertainty since the previous snapshot is not a continuity
+    # proof. Stage4 will handle fresh fill evidence independently.
+    intervening = conn.execute(text("""
+        SELECT COUNT(*) FROM us_orders
+        WHERE trading_epoch_id=:epoch AND symbol=:symbol
+          AND (
+             (trade_date>:previous_date AND trade_date<=:today)
+             OR (trade_date=:previous_date AND status IN
+                ('PENDING','ACK','OPEN','PARTIALLY_FILLED','SUBMIT_STARTED','BROKER_UNKNOWN'))
+          )
+    """), {"epoch":trading_epoch_id,"symbol":sym,
+           "previous_date":prior["as_of"],"today":trade_date}).scalar()
+    if intervening is None or int(intervening) != 0:
+        return None
+
+    return {
+        "env": "practice", "account_id": raw_account,
+        "broker_account_hash": broker_hash,
+        "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
+        "position_lifecycle_id": cycle,
+        "opened_trade_date": str(life.get("opened_trade_date") or ""),
+        "opened_at": str(life.get("opened_at") or ""),
+        "opened_at_source": str(life.get("opened_at_source") or ""),
+        "high_watermark": life.get("high_watermark"),
+        "high_watermark_at": life.get("high_watermark_at"),
+        "high_watermark_source": life.get("high_watermark_source"),
+        "holding_trade_days": life.get("holding_trade_days"),
+        "lineage_resolution": "VERIFIED_CURRENT_EPOCH_CONTINUITY",
     }
