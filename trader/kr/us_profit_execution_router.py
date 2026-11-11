@@ -204,6 +204,32 @@ def evaluate_active_kr_tp(
             verified_entry_price=basis, executable_price=price,
             unresolved_sell=unresolved_sell,
         )
+        if d.action == "RUNNER" and contract.get("runner_version") == "US_V3":
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            from trader.kr.us_v3_runner_active import (
+                load_kr_kis_native_completed_daily, evaluate_kr_v3_runner,
+            )
+            today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+            native_daily, native_source = load_kr_kis_native_completed_daily(
+                kis=kis, code=code, today=today,
+            )
+            runner = evaluate_kr_v3_runner(
+                contract=contract, stage_states=states,
+                position=position, verified_entry_price=basis,
+                executable_price=price, holding_qty=qty,
+                orderable_qty=orderable, completed_daily=native_daily,
+                completed_daily_source=native_source,
+                today=today, unresolved_sell=unresolved_sell,
+            )
+            return {
+                **runner,
+                "contract": contract,
+                "account_id": str(account), "epoch_id": str(epoch),
+                "position_cycle_id": cycle, "code": str(code).zfill(6),
+                "fresh_bid_or_last": price, "verified_entry_price": basis,
+                "balance_snapshot_id": balance_snapshot.snapshot_id,
+            }
         return {
             "action": d.action, "reason": d.reason, "stage": d.stage,
             "qty": d.target_qty, "contract": contract,
