@@ -1704,6 +1704,7 @@ def run_trade_session(
                     os.getenv("US_STAGE4_EXIT_ONLY_FALLBACK_ENABLED", "0") != "1"
                     or env != "practice" or offline or resolved_signal_only
                     or _reconcile_mode != "WORKER" or _unreaped_child_seen
+                    or str(reason or "").startswith("US_STAGE4_STARTUP_FATAL_")
                 ):
                     return False
                 from trader.us.execution.stage4_failover import (
