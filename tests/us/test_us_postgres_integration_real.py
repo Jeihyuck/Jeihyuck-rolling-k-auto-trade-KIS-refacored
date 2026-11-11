@@ -2566,3 +2566,127 @@ def test_p0_proven_unsent_buy_intent_postgres_terminalization(pg_engine, monkeyp
         "p0-broker-ack", "p0-active-claim", "p0-unverified-attempt", "p0-existing-order"))
     assert safe_meta["pre_io_abort_stage"] == "BEFORE_KIS_HTTP"
     assert safe_meta["pre_io_abort_attempt_id"] == "p0-safe-attempt"
+
+
+def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(pg_engine, monkeypatch):
+    """No network: real PostgreSQL order -> cumulative KIS evidence -> balance."""
+    import hashlib
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "LEGACY_V2")
+    account = "practice:ci:01"
+    broker_hash = hashlib.sha256(account.encode()).hexdigest()
+    epoch = "epoch-ci-amgn"
+    portfolio = "portfolio-ci-amgn"
+    cycle = "cycle-ci-amgn"
+    key = "original-buy-amgn-ci"
+    order_no = "0000039784"
+    contract = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY", "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY", "entry_reason": "CI_BUY",
+    })
+    meta = {
+        "env": "practice", "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "broker_account_hash": broker_hash, "trading_epoch_id": epoch,
+        "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
+        "position_lifecycle_id": cycle,
+        "entry_exit_contract": contract,
+        "entry_exit_contract_sha256": contract["sha256"],
+        "entry_exit_contract_version": contract["version"],
+        "pre_order_holding_qty": 0, "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY", "exit_policy": "US_SWING_DEFAULT",
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trading_epochs(
+                trading_epoch_id TEXT PRIMARY KEY,
+                env TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status)
+            VALUES (:epoch,'practice',:account,'ACTIVE')
+            ON CONFLICT(trading_epoch_id) DO UPDATE SET
+                account_id=EXCLUDED.account_id,status='ACTIVE'
+        """), {"epoch": epoch, "account": account})
+        conn.execute(text("""
+            INSERT INTO us_order_intents
+                (trade_date,client_order_key,symbol,exchange,side,qty,
+                 strategy,status,trading_epoch_id,account_id,portfolio_epoch_id,
+                 position_cycle_id,meta)
+            VALUES ('2026-11-10',:key,'AMGN','NASDAQ','BUY',6,
+                    'us_pb1','SENT',:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"key": key, "epoch": epoch, "account": broker_hash,
+               "portfolio": portfolio, "cycle": cycle, "meta": json.dumps(meta)})
+        conn.execute(text("""
+            INSERT INTO us_orders
+                (trade_date,client_order_key,symbol,exchange,side,
+                 qty_requested,qty_filled,order_no,status,trading_epoch_id,
+                 account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-10',:key,'AMGN','NASDAQ','BUY',6,0,
+                    :order_no,'ACK',:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"key": key, "order_no": order_no, "epoch": epoch,
+               "account": broker_hash, "portfolio": portfolio,
+               "cycle": cycle, "meta": json.dumps(meta)})
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn=None: epoch)
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda conn=None: epoch)
+
+    evidence = {
+        **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "cumulative_filled_qty": 6,
+    }
+    result = repos.mark_order_filled_by_reconcile(
+        order_no=order_no, client_order_key=key, symbol="AMGN", side="BUY",
+        filled_qty=6, requested_qty=6, cumulative_filled_qty=6,
+        avg_price_usd=461.8, trade_date="2026-11-10",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no", meta=evidence,
+    )
+    assert result["status"] == "OK", result
+    with pg_engine.connect() as conn:
+        fill = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_fills WHERE trade_date='2026-11-10'
+              AND symbol='AMGN' AND order_no=:order_no
+        """), {"order_no": order_no}).mappings().one()
+        assert fill["qty"] == 6
+        assert (fill["account_id"],fill["portfolio_epoch_id"],fill["position_cycle_id"]) == (
+            broker_hash, portfolio, cycle,
+        )
+        assert fill["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+
+    saved = repos.save_position_snapshot(
+        [{
+            "symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+            "avg_cost": 461.8, "current_px": 465.875,
+            "balance_source": "kis_balance_authoritative", "meta": {},
+        }],
+        trade_date="2026-11-10",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True,
+        preserve_previous_positions=False,
+    )
+    assert saved == 1
+    with pg_engine.connect() as conn:
+        position = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_positions WHERE as_of='2026-11-10' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert position["qty"] == 6
+    assert (position["account_id"],position["portfolio_epoch_id"],
+            position["position_cycle_id"]) == (broker_hash,portfolio,cycle)
+    assert position["meta"]["position_lifecycle_id"] == cycle
+    assert position["meta"]["strategy_owner"] == "US_STANDARD"
+    assert position["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert position["meta"]["lineage_identity_status"] == "VERIFIED_ORIGINAL_KIS_BUY"
