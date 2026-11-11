@@ -15,6 +15,7 @@ on:
       - "scripts/wsl/run-kr-am.sh"
       - "scripts/wsl/run-kr-afternoon.sh"
       - "scripts/wsl/run-kr-close.sh"
+      - "scripts/wsl/diagnose-kr-no-runs-20261111.sh"
       - "tests/kr/infinite/test_runner_integration.py"
       - "trader/kr/infinite/runner.py"
       - "tests/kr/test_kr_us_standard_profit_parity_20261106.py"
@@ -79,4 +80,4 @@ jobs:
             tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py \
             tests/kr/test_kr_us_v3_native_runner_20261111.py
       - name: KR operating runner script syntax
-        run: bash -n scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh
+        run: bash -n scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh scripts/wsl/diagnose-kr-no-runs-20261111.sh
