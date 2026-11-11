@@ -1,0 +1,52 @@
+"""US native order identity must never round or coerce broker share counts.
+
+Pure offline regression: no KIS order, network, DB, trading epoch mutation.
+"""
+from decimal import Decimal
+
+import pytest
+
+from trader.us.execution.order_identity import (
+    InvalidOrderIdentity,
+    exact_order_share_quantity,
+    normalize_and_validate_order_identity,
+)
+
+
+@pytest.mark.parametrize("raw", [True, False, 6.5, 6.0, -1, 0, None, "6.0", " 6", "-1", "", Decimal("6"), float("nan"), float("inf")])
+def test_bad_share_quantity_fail_closed_before_any_order_row(raw):
+    with pytest.raises(InvalidOrderIdentity, match="positive whole share"):
+        exact_order_share_quantity(raw)
+    with pytest.raises(InvalidOrderIdentity, match="positive whole share"):
+        normalize_and_validate_order_identity({
+            "symbol": "AMGN", "side": "BUY",
+            "trade_date": "2026-11-11", "qty": raw,
+            "client_order_key": "fixture-identity",
+        })
+
+
+@pytest.mark.parametrize("raw,expected", [(6, 6), ("6", 6), ("0006", 6), (1, 1)])
+def test_exact_whole_share_inputs_remain_orderable(raw, expected):
+    got = normalize_and_validate_order_identity({
+        "symbol": "amgn", "side": "BUY",
+        "trade_date": "2026-11-11", "qty": raw,
+        "client_order_key": "fixture-identity",
+    })
+    assert got["qty"] == expected
+    assert got["symbol"] == "AMGN"
+    assert got["client_order_key"] == "fixture-identity"
+
+
+def test_legacy_quantity_alias_is_checked_with_identical_policy():
+    got = normalize_and_validate_order_identity({
+        "symbol": "AMGN", "side": "SELL",
+        "trade_date": "2026-11-11", "quantity": "3",
+        "client_order_key": "fixture-sell",
+    })
+    assert got["qty"] == 3
+    with pytest.raises(InvalidOrderIdentity):
+        normalize_and_validate_order_identity({
+            "symbol": "AMGN", "side": "SELL",
+            "trade_date": "2026-11-11", "quantity": 3.5,
+            "client_order_key": "fixture-sell",
+        })
