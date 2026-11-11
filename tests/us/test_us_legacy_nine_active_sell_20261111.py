@@ -408,3 +408,143 @@ def test_legacy_through_canonical_router_and_original_tp_policy_static_contract(
     assert "_legacy_nine_auto_sell_proof" in router
     assert "enrich_legacy_nine_v2_decision_position(" in exit_engine
     assert "enrich_legacy_nine_v2_decision_position(" in market
+
+
+def test_legacy_v2_tp2_native_actual_fill_completes_original_not_new_cycle(
+    scenario, monkeypatch,
+):
+    """Broker-proven TP2 fill must update the ORIGINAL V2 TP stage ledger.
+
+    This path tests the exact state router->order->native KIS fill->reconcile
+    uses when the SELL execution cycle differs from the archived BUY cycle.
+    """
+    from trader.us.db import repos
+    from trader.us.profit_capture import (
+        sync_profit_capture_stage_from_order,
+        tp_stage_lifecycle_from_order_proof,
+    )
+
+    db, client, intent = scenario
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    key=f"US_PC_2026-11-11_ABBV_{OLD_CYCLE}_TAKE_PROFIT_TP2"
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    repos.mark_us_profit_capture_stage(
+        "2026-11-11","ABBV","tp2",position_lifecycle_id=OLD_CYCLE,
+        order_key=key,qty=1,status="PENDING",
+    )
+    assert tp_stage_lifecycle_from_order_proof(
+        proof["prospective_cycle"], intent["meta"], client_order_key=key,
+    ) == OLD_CYCLE
+    sync_profit_capture_stage_from_order(
+        trade_date="2026-11-11",symbol="ABBV",
+        position_lifecycle_id=proof["prospective_cycle"],
+        order_meta=intent["meta"],client_order_key=key,
+        profit_capture_stage="tp2",order_status="FILLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        filled_qty=1,requested_qty=1,
+        broker_order_no="0000099999",
+    )
+    old = repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": OLD_CYCLE},
+    ).get("ABBV") or {}
+    new = repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": proof["prospective_cycle"]},
+    ).get("ABBV") or {}
+    assert old["tp2_done"] is True
+    assert old["tp2_pending"] is False
+    assert int((old.get("meta") or {})["tp2_filled_qty"]) == 1
+    assert new.get("tp2_done") is not True
+    assert db.buy["meta"]["position_lifecycle_id"] == "ENTRY:US_STANDARD:ABBV"
+
+
+def test_legacy_prospective_cycle_never_allowed_to_steal_other_tp_stage(
+    scenario, monkeypatch,
+):
+    from trader.us.db import repos
+    from trader.us.profit_capture import (
+        sync_profit_capture_stage_from_order,
+        tp_stage_lifecycle_from_order_proof,
+    )
+    db,client,intent=scenario
+    ok, reason, proof=_authorize(scenario)
+    assert ok,reason
+    key=f"US_PC_2026-11-11_ABBV_{OLD_CYCLE}_TAKE_PROFIT_TP2"
+    for change in (
+        {"source_original_runtime_lifecycle_id":"unrelated-cycle"},
+        {"position_cycle_id":"unrelated-cycle"},
+        {"broker_account_hash":""},
+        {"source_entry_contract_sha256":"other"},
+        {"source_entry_contract_version":"us_entry_exit_contract_v3"},
+        {"automated_sell_authorized":False},
+        {"strategy_owner":"TQQQ_INFINITE"},
+        {"symbol":"KO"},
+    ):
+        altered={**intent["meta"],**change}
+        with pytest.raises(ValueError,match="US_LEGACY_TP_STAGE_SOURCE_ID_UNVERIFIED"):
+            tp_stage_lifecycle_from_order_proof(
+                proof["prospective_cycle"],altered,client_order_key=key,
+            )
+    monkeypatch.setattr(repos,"_get_engine_or_none",lambda: None)
+    repos.reset_memory_stores()
+    tampered={**intent["meta"],"source_original_runtime_lifecycle_id":"unrelated-cycle"}
+    with pytest.raises(ValueError,match="US_LEGACY_TP_STAGE_SOURCE_ID_UNVERIFIED"):
+        sync_profit_capture_stage_from_order(
+            trade_date="2026-11-11", symbol="ABBV",
+            position_lifecycle_id=proof["prospective_cycle"],order_meta=tampered,
+            client_order_key=key,profit_capture_stage="tp2",
+            order_status="FILLED",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+            filled_qty=1,requested_qty=1,
+        )
+    assert not (repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": OLD_CYCLE},
+    ).get("ABBV") or {}).get("tp2_done")
+    assert not (repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": proof["prospective_cycle"]},
+    ).get("ABBV") or {}).get("tp2_done")
+
+
+def test_legacy_v2_tp_stage_replay_with_same_order_key_is_idempotent(
+    scenario, monkeypatch,
+):
+    from trader.us.db import repos
+    from trader.us.profit_capture import sync_profit_capture_stage_from_order
+    db,client,intent=scenario
+    ok,reason,proof=_authorize(scenario)
+    assert ok,reason
+    key=f"US_PC_2026-11-11_ABBV_{OLD_CYCLE}_TAKE_PROFIT_TP2"
+    monkeypatch.setattr(repos,"_get_engine_or_none",lambda: None)
+    repos.reset_memory_stores()
+    repos.mark_us_profit_capture_stage(
+        "2026-11-11","ABBV","tp2",position_lifecycle_id=OLD_CYCLE,
+        order_key=key,qty=1,status="PENDING",
+    )
+    event=dict(
+        trade_date="2026-11-11",symbol="ABBV",
+        position_lifecycle_id=proof["prospective_cycle"],
+        order_meta=intent["meta"],client_order_key=key,
+        profit_capture_stage="tp2",order_status="FILLED",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        filled_qty=1,requested_qty=1,
+    )
+    sync_profit_capture_stage_from_order(**event)
+    sync_profit_capture_stage_from_order(**event)
+    state=repos.load_us_profit_capture_state(
+        "2026-11-11",["ABBV"],{"ABBV":OLD_CYCLE},
+    )["ABBV"]
+    assert state["tp2_done"] is True
+    assert int(state["meta"]["tp2_filled_qty"])==1
+
+
+def test_legacy_bridge_reconcile_boundaries_static_contract():
+    from pathlib import Path
+    repo=Path("trader/us/db/repos.py").read_text()
+    router=Path("trader/us/execution/order_router.py").read_text()
+    profit=Path("trader/us/profit_capture.py").read_text()
+    market=Path("trader/us/market_state_overlay.py").read_text()
+    assert "order_meta=order_meta" in repo
+    assert "order_meta=merged" in repo
+    assert "tp_stage_lifecycle_from_order_proof" in router
+    assert "tp_stage_lifecycle_from_order_proof" in profit
+    assert '"source_entry_contract_version": entry_contract.get("version")' in market
