@@ -39,7 +39,7 @@ def _failure_reason(stage: Path, trade: str, purpose: str, attempt: dict) -> str
     if not isinstance(raw_rel, str):
         return str(attempt.get("reason") or "MISSING_LOG")
     expected_prefix = f"runtime/logs/kr/{trade}/{purpose}/"
-    if not raw_rel.startswith(expected_prefix) or "/../" in raw_rel or "\\\\" in raw_rel:
+    if not raw_rel.startswith(expected_prefix) or "/../" in raw_rel or "\\" in raw_rel:
         return "LOG_PATH_UNVERIFIED"
     log_path = stage / raw_rel
     try:
@@ -48,11 +48,11 @@ def _failure_reason(stage: Path, trade: str, purpose: str, attempt: dict) -> str
         return str(attempt.get("reason") or "MISSING_LOG")
     for line in reversed(lines):
         if "[KR_SESSION][PRECHECK_FAIL]" in line:
-            match = re.search(r"\\breason=([A-Z][A-Z_0-9]+)", line)
+            match = re.search(r"\breason=([A-Z][A-Z_0-9]+)", line)
             if match:
                 return match.group(1)
         if "[RUN_SUMMARY][RESULT]" in line and "status=FAIL" in line:
-            match = re.search(r"\\breason=([A-Z][A-Z_0-9]+)", line)
+            match = re.search(r"\breason=([A-Z][A-Z_0-9]+)", line)
             if match:
                 return match.group(1)
     return str(attempt.get("reason") or "UNSPECIFIED")
