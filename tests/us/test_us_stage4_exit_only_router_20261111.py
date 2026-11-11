@@ -40,10 +40,9 @@ def test_exit_only_does_not_replace_sell_validations(monkeypatch):
     """For SELL the real canonical identity check must still execute."""
     monkeypatch.setenv("US_STAGE4_EXIT_ONLY_ACTIVE", "1")
     response = route_order(
-        {"symbol": "AMGN", "side": "SELL", "qty": 2.5,
-         "trade_date": "2026-11-11", "client_order_key": "bad-sell-qty"},
+        {"symbol": "", "side": "SELL", "qty": 1,
+         "trade_date": "2026-11-11", "client_order_key": "bad-sell-symbol"},
     )
-    # On the #347 integration branch this becomes INVALID_ORDER_IDENTITY,
-    # whereas on dual-agent legacy float coercion is still allowed. Verify
-    # only that the Stage4 BUY-only gate never hides SELL processing.
-    assert response["status"] != "ORDER_DISABLED_STAGE4_EXIT_ONLY"
+    # The normal SELL identity validator is still called. The exit-only BUY
+    # fence must neither authorize nor suppress a normal SELL evaluation.
+    assert response["status"] == "INVALID_ORDER_IDENTITY"
