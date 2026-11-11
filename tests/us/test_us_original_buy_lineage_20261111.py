@@ -246,3 +246,101 @@ def test_partial_original_buy_binds_exact_3_of_6_not_any_arbitrary_qty():
     assert select_verified_us_original_buy_scope(
         [row], symbol="AMGN", qty=3, identity=IDENTITY,
     ) is None
+
+
+def test_next_day_kis_balance_carries_only_verified_live_cycle():
+    from trader.us.original_buy_lineage import verified_carried_us_snapshot_identity
+
+    contract = original_row()["order_meta"]["entry_exit_contract"]
+    prior = {
+        "as_of": "2026-11-10", "qty": 6,
+        "account_id": ACCOUNT_HASH, "portfolio_epoch_id": PORTFOLIO,
+        "position_cycle_id": CYCLE,
+        "meta": {
+            "strategy_owner": "US_STANDARD",
+            "broker_account_hash": ACCOUNT_HASH,
+            "position_lifecycle_id": CYCLE, "position_cycle_id": CYCLE,
+            "portfolio_epoch_id": PORTFOLIO,
+            "entry_exit_contract": contract,
+            "entry_exit_contract_sha256": contract["sha256"],
+            "lineage_resolution": "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+        },
+    }
+    lifecycle = {
+        "is_open": True, "lifecycle_id": CYCLE, "position_cycle_id": CYCLE,
+        "portfolio_epoch_id": PORTFOLIO,
+        "account_id": ACCOUNT, "strategy_owner": "US_STANDARD",
+        "trading_epoch_id": "epoch-current",
+        "opened_trade_date": "2026-11-10",
+        "opened_at": "2026-11-10T16:26:14+00:00",
+        "opened_at_source": "confirmed_buy_fill",
+        "high_watermark": 470.0,
+        "high_watermark_at": "2026-11-10T20:00:00+00:00",
+        "high_watermark_source": "us_position_risk_state",
+        "holding_trade_days": 1,
+        "entry_policy": {"entry_exit_contract_sha256": contract["sha256"]},
+    }
+
+    class Result:
+        def __init__(self, rows=None, value=None):
+            self.rows = list(rows or [])
+            self.value = value
+        def mappings(self):
+            return self
+        def first(self):
+            return self.rows[0] if self.rows else None
+        def all(self):
+            return self.rows
+        def scalar(self):
+            return self.value
+
+    class Conn:
+        def __init__(self):
+            self.prior = dict(prior)
+            self.lifecycle = dict(lifecycle)
+            self.raw_account = ACCOUNT
+            self.intervening = 0
+        def execute(self, sql, params):
+            sql = str(sql)
+            if "FROM us_positions" in sql:
+                assert params["epoch"] == "epoch-current"
+                return Result([self.prior])
+            if "FROM trading_epochs" in sql:
+                return Result([{"account_id": self.raw_account}])
+            if "FROM us_position_risk_state" in sql:
+                return Result([{"lifecycle": self.lifecycle}])
+            if "FROM us_orders" in sql:
+                return Result(value=self.intervening)
+            raise AssertionError(sql)
+
+    def resolve(conn, qty=6):
+        return verified_carried_us_snapshot_identity(
+            conn=conn, trade_date="2026-11-11",
+            position={"symbol": "AMGN", "qty": qty},
+            trading_epoch_id="epoch-current",
+        )
+
+    connection = Conn()
+    matched = resolve(connection)
+    assert matched
+    assert matched["position_lifecycle_id"] == CYCLE
+    assert matched["portfolio_epoch_id"] == PORTFOLIO
+    assert matched["account_id"] == ACCOUNT
+    assert matched["lineage_resolution"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+    assert matched["high_watermark"] == 470.0
+
+    connection.intervening = 1
+    assert resolve(connection) is None  # any new/pending BUY or SELL
+    connection.intervening = 0
+    assert resolve(connection, qty=5) is None  # late fill / split / partial SELL
+
+    connection.lifecycle = {**lifecycle, "is_open": False}
+    assert resolve(connection) is None  # closed previous cycle
+    connection.lifecycle = dict(lifecycle)
+    connection.raw_account = "practice:another-account:01"
+    assert resolve(connection) is None  # no cross-account scope adoption
+    connection.raw_account = ACCOUNT
+    connection.prior = {
+        **prior, "meta": {**prior["meta"], "lineage_resolution": "UNVERIFIED"},
+    }
+    assert resolve(connection) is None  # no provenance-less carry
