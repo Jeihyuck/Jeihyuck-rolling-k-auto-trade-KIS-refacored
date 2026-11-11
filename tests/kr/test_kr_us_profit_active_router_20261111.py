@@ -62,6 +62,7 @@ def setup_contract(monkeypatch):
         "TP2": {"status": "NOT_TRIGGERED"},
         "TP3": {"status": "NOT_TRIGGERED"},
     })
+    monkeypatch.setattr(router, "has_unresolved_kr_sell_orders", lambda **kw: False)
     return pos
 
 
@@ -136,3 +137,14 @@ def test_legacy_and_shadow_do_not_create_active_order(monkeypatch):
         position=pos, engine=object(), kis=FakeKis(), env="practice", code="005930",
         balance_snapshot=FakeBalance(),
     ) is None
+
+
+def test_cross_owner_unresolved_sell_blocks_new_tp(monkeypatch):
+    pos = setup_contract(monkeypatch)
+    monkeypatch.setattr(router, "has_unresolved_kr_sell_orders", lambda **kw: True)
+    result = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=FakeKis(),
+        env="practice", code="005930", balance_snapshot=FakeBalance(),
+    )
+    assert result["action"] == "BLOCK"
+    assert result["reason"] == "UNRESOLVED_SELL_OR_ACK"

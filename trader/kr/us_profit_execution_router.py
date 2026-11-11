@@ -38,6 +38,35 @@ def frozen_kr_profit_contract(position: Mapping[str, Any]) -> dict | None:
     return None
 
 
+def has_unresolved_kr_sell_orders(*, engine: Any, env: str, code: str,
+                                  trading_epoch_id: str) -> bool:
+    """Cross-owner SELL/ACK fence: unrelated orders reserve the same KIS shares.
+
+    No account-wide blocking: only the same broker account epoch + symbol.
+    Missing DB evidence is an exception (router fails closed), not no orders.
+    """
+    import sqlalchemy as sa
+    from trader.db.schema import schema_for_engine
+
+    orders = schema_for_engine(engine).orders
+    with engine.connect() as conn:
+        count = conn.execute(sa.select(sa.func.count()).select_from(orders).where(
+            sa.and_(
+                orders.c.env == env,
+                orders.c.trading_epoch_id == trading_epoch_id,
+                orders.c.code == str(code).zfill(6),
+                sa.func.upper(orders.c.side).like("SELL%"),
+                sa.or_(
+                    orders.c.status.is_(None),
+                    sa.func.upper(orders.c.status).not_in(
+                        ["FILLED", "RECONCILED", "CANCELLED", "REJECTED"]
+                    ),
+                ),
+            )
+        )).scalar_one()
+    return bool(count)
+
+
 def evaluate_active_kr_tp(
     *, position: Mapping[str, Any], engine: Any, kis: Any, env: str, code: str,
     balance_snapshot: Any,
@@ -165,10 +194,15 @@ def evaluate_active_kr_tp(
             engine=engine, contract=contract, account_id=str(account),
             trading_epoch_id=str(epoch), position_cycle_id=cycle, code=str(code).zfill(6),
         )
+        unresolved_sell = has_unresolved_kr_sell_orders(
+            engine=engine, env=env, code=code,
+            trading_epoch_id=str(epoch),
+        )
         d = calculate_next_tp_stage(
             contract=contract, stage_states=states,
             holding_qty=qty, orderable_qty=orderable,
             verified_entry_price=basis, executable_price=price,
+            unresolved_sell=unresolved_sell,
         )
         return {
             "action": d.action, "reason": d.reason, "stage": d.stage,
