@@ -101,21 +101,27 @@ def select_verified_us_original_buy_scope(
 
 def load_verified_us_original_buy_scope(
     *, symbol: str, trade_date: str, qty: int, identity: dict[str, str],
+    conn: Any = None,
 ) -> dict | None:
-    """Read-only DB lookup. Never mutate a current/older account's originals."""
+    """Read-only exact original BUY lookup, optionally within a snapshot transaction."""
     if not identity.get("trading_epoch_id") or not identity.get("account_id"):
         return None
     try:
         from sqlalchemy import text
         from trader.us.db.repos import _active_us_epoch, _get_engine_or_none
-        engine = _get_engine_or_none()
-        if engine is None:
-            return None
-        with engine.connect() as conn:
-            active_epoch = str(_active_us_epoch(conn) or "")
-            if active_epoch != str(identity["trading_epoch_id"]):
+        if conn is None:
+            engine = _get_engine_or_none()
+            if engine is None:
                 return None
-            rows = conn.execute(text("""
+            with engine.connect() as scoped_connection:
+                return load_verified_us_original_buy_scope(
+                    symbol=symbol, trade_date=trade_date, qty=qty,
+                    identity=identity, conn=scoped_connection,
+                )
+        active_epoch = str(_active_us_epoch(conn) or "")
+        if active_epoch != str(identity["trading_epoch_id"]):
+            return None
+        rows = conn.execute(text("""
                 SELECT o.symbol, o.trading_epoch_id, o.account_id,
                        o.portfolio_epoch_id, o.position_cycle_id,
                        o.order_no, o.client_order_key, o.qty_requested AS order_qty,
@@ -142,7 +148,7 @@ def load_verified_us_original_buy_scope(
                    AND o.trading_epoch_id=:epoch
                  LIMIT 50
             """), {"td": trade_date, "symbol": symbol,
-                   "epoch": active_epoch}).mappings().all()
+                 "epoch": active_epoch}).mappings().all()
         return select_verified_us_original_buy_scope(
             [dict(row) for row in rows], symbol=symbol, qty=qty, identity=identity,
         )
@@ -151,3 +157,59 @@ def load_verified_us_original_buy_scope(
         logger.warning("[US_POSITION][ORIGINAL_BUY][UNAVAILABLE] symbol=%s error=%s",
                        symbol, type(exc).__name__)
         return None
+
+
+
+def verified_new_buy_snapshot_identity(
+    *, conn: Any, trade_date: str, position: dict,
+    trading_epoch_id: str,
+) -> dict | None:
+    """Attach original immutable BUY scope before first authoritative snapshot.
+
+    No ticker-only, last-order, next-day, TQQQ, partial-fill or stale-balance
+    adoption. A failure returns None and never fabricates a lifecycle.
+    """
+    from sqlalchemy import text
+    from trader.us.strategy_ownership import owner_for_symbol, STANDARD_OWNER
+
+    symbol = str(position.get("symbol") or "").upper().strip()
+    meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
+    if (
+        not symbol or symbol == "TQQQ" or owner_for_symbol(symbol) != STANDARD_OWNER
+        or position.get("position_lifecycle_id") or meta.get("position_lifecycle_id")
+        or str(position.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
+    ):
+        return None
+    try:
+        qty = int(position.get("qty") or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty < 1 or not trading_epoch_id:
+        return None
+    accounts = conn.execute(text("""
+        SELECT account_id FROM trading_epochs
+        WHERE trading_epoch_id=:epoch AND env='practice' AND status='ACTIVE'
+    """), {"epoch": trading_epoch_id}).mappings().all()
+    if len(accounts) != 1 or not accounts[0].get("account_id"):
+        return None
+    identity = {
+        "env": "practice", "account_id": str(accounts[0]["account_id"]),
+        "trading_epoch_id": str(trading_epoch_id), "strategy_owner": "US_STANDARD",
+    }
+    proof = load_verified_us_original_buy_scope(
+        symbol=symbol, trade_date=trade_date, qty=qty, identity=identity, conn=conn,
+    )
+    if proof is None:
+        return None
+    return {
+        "env": "practice", "account_id": identity["account_id"],
+        "broker_account_hash": hashlib.sha256(identity["account_id"].encode()).hexdigest(),
+        "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "position_cycle_id": proof["position_cycle_id"],
+        "position_lifecycle_id": proof["position_lifecycle_id"],
+        "portfolio_epoch_id": proof["portfolio_epoch_id"],
+        "opened_trade_date": str(trade_date),
+        "opened_at": str(proof["filled_at"]),
+        "opened_at_source": "confirmed_buy_fill",
+        "lineage_resolution": "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+    }
