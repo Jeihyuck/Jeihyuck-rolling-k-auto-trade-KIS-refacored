@@ -150,3 +150,27 @@ def test_unsafe_runtime_flags_prevent_any_broker_call(monkeypatch, capsys):
     monkeypatch.setenv("DISABLE_REAL_TRADING", "1")
     assert module.main() == 42
     assert '"PRACTICE_READONLY_REQUIRED"' in capsys.readouterr().out
+
+
+
+def test_unresolved_same_day_buy_also_blocks_manual_sell_review():
+    rows = [{
+        "odno": "0000050404", "pdno": "KO", "sll_buy_dvsn_cd": "02",
+        "ord_qty": "1", "ft_ccld_qty": "0", "nccs_qty": "1",
+    }]
+    result = _check(original_day_orders={"2026-11-11": rows})
+    ko = next(x for x in result["positions"] if x["symbol"] == "KO")
+    assert "CURRENT_KIS_BUY_UNRESOLVED" in ko["blockers"]
+    assert result["review_candidates"] == 8
+
+
+def test_cancel_request_not_treated_as_terminal_sell():
+    rows = [{
+        "odno": "0000050405", "orgn_odno": "0000050404",
+        "rvse_cncl_dvsn_cd": "02",
+        "pdno": "KO", "sll_buy_dvsn_cd": "01",
+        "ord_qty": "1", "ft_ccld_qty": "0", "nccs_qty": "1",
+    }]
+    result = _check(original_day_orders={"2026-11-11": rows})
+    ko = next(x for x in result["positions"] if x["symbol"] == "KO")
+    assert "CURRENT_KIS_CANCEL_TERMINAL_UNVERIFIED" in ko["blockers"]
