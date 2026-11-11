@@ -120,6 +120,7 @@ def _broker_proof(kis: Any) -> dict:
         or str(trades.get("ctx_area_nk100") or "").strip()
         or str(trades.get("CTX_AREA_FK100") or "").strip()
         or str(trades.get("CTX_AREA_NK100") or "").strip()
+        or str((trades.get("_response_meta") or {}).get("tr_cont") or "").upper() in {"F", "M"}
     ):
         raise ValueError("KIS_ORIGINAL_DAILY_CCLD_UNVERIFIED_OR_PAGINATED")
     same_code = [
