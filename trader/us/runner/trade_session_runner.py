@@ -844,6 +844,8 @@ def run_trade_session(
     Returns:
         {"status": "OK"|"OK_WITH_WARNINGS"|"OK_RISK_BLOCKED"|"SKIP"|"ERROR", ...}
     """
+    # A previous run in the same interpreter must not leak EXIT_ONLY state.
+    os.environ.pop("US_STAGE4_EXIT_ONLY_ACTIVE", None)
     global _received_signal, _exit_code
     _received_signal = None
     _exit_code = None
@@ -1700,11 +1702,37 @@ def run_trade_session(
             def _stage4_verified_exit_only_failover(reason: str) -> bool:
                 nonlocal _shadow_reconcile_child, _reconcile_mode
                 nonlocal _stage4_exit_only_fallback
+                # Only known writer-unavailability errors may trigger a
+                # mode switch. Never convert unknown policy/account/auth or
+                # malformed health evidence into order authorization.
+                _allowed = {
+                    "US_STAGE4_STARTUP_TIMEOUT",
+                    "US_STAGE4_STARTUP_FATAL_US_STAGE4_STARTUP_WORKER_EXITED",
+                    "US_STAGE4_WRITER_NOT_READY",
+                    "US_STAGE4_WRITER_STALE",
+                    "US_STAGE4_WRITER_GENERATION_MISMATCH",
+                    "US_STAGE4_WRITER_DATABASE_UNAVAILABLE",
+                    "US_STAGE4_WRITER_TIMESTAMP_UNVERIFIED",
+                    "US_STAGE4_RECONCILIATION_UNVERIFIED",
+                    "US_STAGE4_WORKER_PROCESS_DEAD",
+                }
                 if (
                     os.getenv("US_STAGE4_EXIT_ONLY_FALLBACK_ENABLED", "0") != "1"
                     or env != "practice" or offline or resolved_signal_only
                     or _reconcile_mode != "WORKER" or _unreaped_child_seen
-                    or str(reason or "").startswith("US_STAGE4_STARTUP_FATAL_")
+                    or str(reason or "") not in _allowed
+                ):
+                    return False
+                # The per-tick 8s supervisor probe is not sufficient reason
+                # to kill a healthy-but-slow writer. Wait for persistent
+                # unavailability; startup already waited its bounded timeout.
+                if reason != "US_STAGE4_STARTUP_TIMEOUT" and reason != (
+                    "US_STAGE4_STARTUP_FATAL_US_STAGE4_STARTUP_WORKER_EXITED"
+                ) and (
+                    _stage4_unhealthy_since is None or
+                    time_mod.monotonic() - _stage4_unhealthy_since < max(
+                        15.0, float(os.getenv("US_STAGE4_EXIT_ONLY_AFTER_SEC", "45"))
+                    )
                 ):
                     return False
                 from trader.us.execution.stage4_failover import (
@@ -1729,6 +1757,9 @@ def run_trade_session(
                 _reconcile_mode = "LEGACY"
                 _stage4_exit_only_fallback = True
                 os.environ["US_RECONCILE_WORKER_MODE"] = "LEGACY"
+                # Canonical router is the final, strategy-independent BUY fence.
+                # It overrides any later overlay/TQQQ policy logic.
+                os.environ["US_STAGE4_EXIT_ONLY_ACTIVE"] = "1"
                 os.environ["US_STAGE4_WORKER_ALIVE"] = "0"
                 for key in (
                     "US_STAGE4_EXPECTED_GENERATION", "US_STAGE4_WORKER_PID",
@@ -3297,6 +3328,7 @@ def run_trade_session(
         # It never owns the order submission lock, so its lifecycle cannot
         # clear an unverified live Tick or an unresolved execution Claim.
         os.environ.pop("US_RESERVATION_WORKER_PID", None)
+        os.environ.pop("US_STAGE4_EXIT_ONLY_ACTIVE", None)
         _stage4_stop_unverified = False
         if _shadow_reconcile_child is not None:
             try:
