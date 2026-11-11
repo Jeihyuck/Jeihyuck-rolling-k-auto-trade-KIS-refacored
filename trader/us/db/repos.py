@@ -4826,7 +4826,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         prior_policy["entry_policy_source"] = "prior_position_snapshot"
             policy = _us_entry_policy_from(meta, p) or prior_policy
             meta.update(policy)
-            meta.update({
+            meta.update({k: v for k, v in {
                 "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                 "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
                 "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
@@ -4841,7 +4841,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 "high_watermark_at": p.get("high_watermark_at"),
                 "high_watermark_source": p.get("high_watermark_source"),
                 "trend_state": p.get("trend_state"),
-            })
+            }.items() if v is not None})
             for field in (
                 "env", "trading_env", "account_id", "account_key",
                 "trading_epoch_id", "strategy_owner", "sleeve_id",
@@ -4879,7 +4879,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         ).strip() or None,
                     )
                 meta.update(policy)
-                meta.update({
+                meta.update({k: v for k, v in {
                     "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                     "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
                     "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
@@ -4894,7 +4894,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     "high_watermark_at": p.get("high_watermark_at"),
                     "high_watermark_source": p.get("high_watermark_source"),
                     "trend_state": p.get("trend_state"),
-                })
+                }.items() if v is not None})
                 for field in (
                     "env", "trading_env", "account_id", "account_key",
                     "trading_epoch_id", "strategy_owner", "sleeve_id",
