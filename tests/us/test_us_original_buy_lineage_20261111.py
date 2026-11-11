@@ -94,6 +94,54 @@ def test_tampered_signed_contract_old_account_or_ambiguous_original_fails():
                         identity={**IDENTITY, "env": "real"}) is None
 
 
+
+@pytest.mark.parametrize("field,invalid", [
+    ("fill_qty", 6.5),
+    ("fill_qty", True),
+    ("fill_qty", "6.0"),
+    ("intent_qty", 6.9),
+    ("intent_qty", True),
+    ("order_qty", 6.9),
+    ("order_qty", "6.0"),
+    ("order_filled", 6.1),
+    ("order_filled", None),
+    ("order_status", None),
+    ("order_status", ""),
+])
+def test_original_buy_source_quantities_and_status_are_never_coerced(field, invalid):
+    row = original_row()
+    row[field] = invalid
+    assert select_verified_us_original_buy_scope(
+        [row], symbol="AMGN", qty=6, identity=IDENTITY,
+    ) is None
+
+
+@pytest.mark.parametrize("section,key,invalid", [
+    ("fill_meta", "cumulative_filled_qty", 6.5),
+    ("fill_meta", "cumulative_filled_qty", True),
+    ("fill_meta", "cumulative_filled_qty", "6.0"),
+    ("order_meta", "pre_order_holding_qty", 0.5),
+    ("order_meta", "pre_order_holding_qty", False),
+    ("order_meta", "pre_order_holding_qty", "-0"),
+])
+def test_original_buy_broker_metadata_numbers_are_never_coerced(section, key, invalid):
+    row = original_row()
+    row[section][key] = invalid
+    assert select_verified_us_original_buy_scope(
+        [row], symbol="AMGN", qty=6, identity=IDENTITY,
+    ) is None
+
+
+def test_original_buy_exact_integer_strings_still_work():
+    row = original_row()
+    row["fill_meta"]["cumulative_filled_qty"] = "6"
+    row["order_meta"]["pre_order_holding_qty"] = "0"
+    proof = select_verified_us_original_buy_scope(
+        [row], symbol="AMGN", qty=6, identity=IDENTITY,
+    )
+    assert proof is not None and proof["qty"] == 6
+
+
 def test_normalized_original_kis_fill_is_usable_by_existing_confirmed_fill_logic():
     from trader.us.position_lifecycle_state import _confirmed_buy_fill
     fill = select_verified_us_original_buy_scope([original_row()], symbol="AMGN",
