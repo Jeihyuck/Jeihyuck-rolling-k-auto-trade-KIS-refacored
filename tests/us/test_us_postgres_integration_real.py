@@ -2691,3 +2691,57 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(pg_eng
     assert position["meta"]["strategy_owner"] == "US_STANDARD"
     assert position["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
     assert position["meta"]["lineage_identity_status"] == "VERIFIED_ORIGINAL_KIS_BUY"
+
+    # The following US session must not erase the just-established owner,
+    # cycle, signed BUY contract or original provenance on a fresh KIS balance.
+    first_lifecycle = {
+        "lifecycle_id": cycle, "position_cycle_id": cycle,
+        "portfolio_epoch_id": portfolio, "trading_epoch_id": epoch,
+        "account_id": account, "strategy_owner": "US_STANDARD",
+        "env": "practice", "is_open": True,
+        "opened_trade_date": "2026-11-10",
+        "opened_at": "2026-11-10T16:26:14+00:00",
+        "opened_at_source": "confirmed_buy_fill",
+        "high_watermark": 470.0,
+        "high_watermark_source": "us_position_risk_state",
+        "high_watermark_at": "2026-11-10T20:00:00+00:00",
+        "holding_trade_days": 1,
+        "entry_policy": {"entry_exit_contract_sha256": contract["sha256"]},
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS us_position_risk_state(
+                trading_epoch_id TEXT NOT NULL,
+                trade_date DATE NOT NULL,
+                symbol TEXT NOT NULL,
+                state JSONB NOT NULL DEFAULT '{}'::jsonb,
+                PRIMARY KEY(trading_epoch_id, trade_date, symbol)
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
+            VALUES (:epoch,'2026-11-10','AMGN',CAST(:state AS jsonb))
+            ON CONFLICT(trading_epoch_id,trade_date,symbol)
+            DO UPDATE SET state=EXCLUDED.state
+        """), {"epoch": epoch, "state": json.dumps({"lifecycle": first_lifecycle})})
+
+    assert repos.save_position_snapshot(
+        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+          "avg_cost": 461.8, "current_px": 469.0,
+          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        trade_date="2026-11-11",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True, preserve_previous_positions=False,
+    ) == 1
+    with pg_engine.connect() as conn:
+        tomorrow = conn.execute(text("""
+            SELECT qty, account_id, portfolio_epoch_id, position_cycle_id, meta
+            FROM us_positions WHERE as_of='2026-11-11' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert tomorrow["qty"] == 6
+    assert (tomorrow["account_id"], tomorrow["portfolio_epoch_id"],
+            tomorrow["position_cycle_id"]) == (broker_hash, portfolio, cycle)
+    assert tomorrow["meta"]["position_lifecycle_id"] == cycle
+    assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+    assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
