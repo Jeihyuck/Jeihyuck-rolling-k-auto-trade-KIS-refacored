@@ -13682,6 +13682,15 @@ class PB1Engine:
                     position=pos, engine=self.orders_repo.engine,
                     kis=self.kis, env=self.env, code=code,
                     balance_snapshot=self._authoritative_balance,
+                    # An analytical dry-run/DIAG is read-only. Explicit
+                    # historical policy amendment must not mutate account
+                    # positions until the real KIS practice SELL lane is
+                    # armed; all other existing V1 policies remain frozen.
+                    allow_amendment=bool(
+                        self.intended_live and not self.dry_run
+                        and not self.force_block_live
+                        and self.trading_day and self.strategy_mode != "DIAG"
+                    ),
                 )
                 if _kr_candidate is not None:
                     _kr_us_tp_contract_active = True

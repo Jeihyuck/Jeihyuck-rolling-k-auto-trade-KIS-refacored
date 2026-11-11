@@ -251,3 +251,29 @@ def test_unresolved_sell_fence_ignores_only_broker_free_pre_http_errors():
     assert router._unresolved_sell_row({**row, "status": "ACK"}) is True
     assert router._unresolved_sell_row({**row, "status": "PARTIAL_FILLED"}) is True
     assert router._unresolved_sell_row({**row, "status": "FILLED"}) is False
+
+
+def test_diagnostic_samsung_position_never_mutates_amendment(monkeypatch):
+    from trader.kr import us_profit_existing_amendment as amendment
+    calls = []
+    monkeypatch.setattr(
+        amendment, "maybe_amend_samsung_ea_position",
+        lambda **kw: calls.append(kw) or None,
+    )
+    missing_contract_position = {"code": "028050", "position_cycle_id": "cycle"}
+    result = router.evaluate_active_kr_tp(
+        position=missing_contract_position, engine=object(),
+        kis=FakeKis(), env="practice", code="028050",
+        balance_snapshot=None, allow_amendment=False,
+    )
+    assert result is None
+    assert calls == []
+    # A positively authorized, real execution lane still reaches the
+    # original KIS proof gate instead of leaving it shadow-only.
+    result = router.evaluate_active_kr_tp(
+        position=missing_contract_position, engine=object(),
+        kis=FakeKis(), env="practice", code="028050",
+        balance_snapshot=None, allow_amendment=True,
+    )
+    assert result is None
+    assert len(calls) == 1

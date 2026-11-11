@@ -115,6 +115,7 @@ def has_unresolved_kr_sell_orders(*, engine: Any, env: str, code: str,
 def evaluate_active_kr_tp(
     *, position: Mapping[str, Any], engine: Any, kis: Any, env: str, code: str,
     balance_snapshot: Any,
+    allow_amendment: bool = False,
 ) -> dict | None:
     """Return None only for a position with no ACTIVE frozen parity policy.
 
@@ -122,7 +123,10 @@ def evaluate_active_kr_tp(
     A broker error never turns into an empty/clean stage list.
     """
     contract = frozen_kr_profit_contract(position)
-    if contract is None and str(code).zfill(6) == "028050" and env == "practice":
+    if (
+        contract is None and allow_amendment
+        and str(code).zfill(6) == "028050" and env == "practice"
+    ):
         # One explicitly scoped existing v1 holding: broker-proof amendment
         # may attach a NEW versioned overlay. A failure preserves v1 exactly
         # and does NOT claim that a new TP strategy is active.
