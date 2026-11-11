@@ -5731,6 +5731,7 @@ def mark_order_filled_by_reconcile(
             order_params["active_epoch_id"] = active_epoch_id
         rows = conn.execute(text("""
             SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
+                   account_id, portfolio_epoch_id, position_cycle_id,
                    qty_requested, qty_filled""" + epoch_select + """
             FROM us_orders WHERE trade_date=:td AND
               ((:order_no <> '' AND order_no=:order_no) OR
@@ -5785,6 +5786,32 @@ def mark_order_filled_by_reconcile(
         }
         if order_epoch_id:
             merged["trading_epoch_id"] = order_epoch_id
+        # Validate immutable original BUY scope before modifying order/fill.
+        source_meta = _parse_json_meta(order.get("meta"))
+        original_scope = {}
+        if (order_epoch_id and order.get("portfolio_epoch_id")
+                and str(source_meta.get("strategy_owner") or "").upper() == "US_STANDARD"):
+            original_scope = {
+                "account_id": str(order.get("account_id") or ""),
+                "portfolio_epoch_id": str(order.get("portfolio_epoch_id") or ""),
+                "position_cycle_id": str(order.get("position_cycle_id") or ""),
+                "trading_epoch_id": str(order_epoch_id),
+            }
+            proof_pairs = (
+                ("broker_account_hash", "account_id"),
+                ("portfolio_epoch_id", "portfolio_epoch_id"),
+                ("position_cycle_id", "position_cycle_id"),
+                ("position_lifecycle_id", "position_cycle_id"),
+            )
+            if (not all(original_scope.values())
+                    or any(str(merged.get(k) or "") != original_scope[v]
+                           or str(source_meta.get(k) or "") != original_scope[v]
+                           for k, v in proof_pairs)
+                    or str(merged.get("trading_epoch_id") or "") != str(order_epoch_id)):
+                raise FillAccountingInvariantError({
+                    "status": "FILL_ORIGINAL_SCOPE_CONFLICT",
+                    "retry_order": False, "entry_fence": True,
+                })
         promotion = {"superseded": 0, "conflict": 0}
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(
