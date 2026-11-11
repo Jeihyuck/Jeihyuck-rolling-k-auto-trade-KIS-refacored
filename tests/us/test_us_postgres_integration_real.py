@@ -2666,6 +2666,32 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(pg_eng
         )
         assert fill["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
 
+    # A source fill row with mismatched top-level economic scope is not
+    # valid original BUY evidence even if signed JSON meta still looks valid.
+    from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+    identity = {"env": "practice", "account_id": account,
+                "trading_epoch_id": epoch, "strategy_owner": "US_STANDARD"}
+    def original_proof():
+        return load_verified_us_original_buy_scope(
+            symbol="AMGN", trade_date="2026-11-10", qty=6,
+            identity=identity,
+        )
+    assert original_proof() is not None
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE us_fills SET position_cycle_id='foreign-cycle'
+            WHERE trade_date='2026-11-10' AND symbol='AMGN'
+              AND order_no=:order_no
+        """), {"order_no": order_no})
+    assert original_proof() is None
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE us_fills SET position_cycle_id=:cycle
+            WHERE trade_date='2026-11-10' AND symbol='AMGN'
+              AND order_no=:order_no
+        """), {"cycle": cycle, "order_no": order_no})
+    assert original_proof() is not None
+
     saved = repos.save_position_snapshot(
         [{
             "symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
