@@ -344,3 +344,17 @@ def test_next_day_kis_balance_carries_only_verified_live_cycle():
         **prior, "meta": {**prior["meta"], "lineage_resolution": "UNVERIFIED"},
     }
     assert resolve(connection) is None  # no provenance-less carry
+
+
+@pytest.mark.parametrize("bad_qty", [True, False, 6.0, 6.5, "6.0", "-6", "", None, 0])
+def test_original_buy_proof_rejects_non_integer_authoritative_qty(bad_qty):
+    # Never coerce a partially parsed or bogus broker quantity into shares.
+    assert select_verified_us_original_buy_scope(
+        [original_row()], symbol="AMGN", qty=bad_qty, identity=IDENTITY,
+    ) is None
+
+
+def test_original_buy_proof_accepts_exact_broker_integer_string():
+    assert select_verified_us_original_buy_scope(
+        [original_row()], symbol="AMGN", qty="6", identity=IDENTITY,
+    ) is not None
