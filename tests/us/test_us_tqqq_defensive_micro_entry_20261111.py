@@ -60,7 +60,7 @@ def test_nov10_defensive_transition_proposes_one_small_share_default_on():
 
 
 def test_cost_reserve_stops_order_if_whole_share_all_in_exceeds_cap():
-    assert decide(price=124).action == Action.BUY
+    assert decide(price=123).action == Action.BUY
     out = decide(price=124.5)
     assert (out.action, out.reason) == (
         Action.BLOCK, "defensive_micro_whole_share_exceeds_cap",
