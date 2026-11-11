@@ -358,3 +358,34 @@ def test_original_buy_proof_accepts_exact_broker_integer_string():
     assert select_verified_us_original_buy_scope(
         [original_row()], symbol="AMGN", qty="6", identity=IDENTITY,
     ) is not None
+
+
+def test_truncated_original_buy_source_window_is_never_identity_proof(monkeypatch):
+    from trader.us import original_buy_lineage as bridge
+    from trader.us.db import repos
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn: IDENTITY["trading_epoch_id"])
+
+    class DBRows:
+        def __init__(self, rows):
+            self.rows = rows
+        def mappings(self):
+            return self
+        def all(self):
+            return self.rows
+
+    class DBConn:
+        def __init__(self, rows):
+            self.rows = rows
+        def execute(self, sql, params):
+            assert "LIMIT 51" in str(sql)
+            assert params["symbol"] == "AMGN"
+            return DBRows(self.rows)
+
+    assert bridge.load_verified_us_original_buy_scope(
+        symbol="AMGN", trade_date="2026-11-10", qty=6,
+        identity=IDENTITY, conn=DBConn([original_row()] * 51),
+    ) is None
+    assert bridge.load_verified_us_original_buy_scope(
+        symbol="AMGN", trade_date="2026-11-10", qty=6,
+        identity=IDENTITY, conn=DBConn([original_row()]),
+    ) is not None
