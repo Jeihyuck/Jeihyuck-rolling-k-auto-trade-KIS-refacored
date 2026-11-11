@@ -151,3 +151,77 @@ def test_raw_kis_snapshot_does_not_null_out_verified_provenance(monkeypatch):
     assert stored["opened_trade_date"] == "2026-11-10"
     assert stored["high_watermark"] == 470.0
     assert stored["strategy_owner"] == "US_STANDARD"
+
+
+def test_first_authoritative_snapshot_binds_original_scope_before_insert(monkeypatch):
+    from trader.us.original_buy_lineage import verified_new_buy_snapshot_identity
+    import trader.us.original_buy_lineage as bridge
+
+    class Query:
+        def mappings(self):
+            return self
+        def all(self):
+            return [{"account_id": ACCOUNT}]
+
+    class Conn:
+        def execute(self, query, params):
+            assert "trading_epochs" in str(query)
+            assert params["epoch"] == IDENTITY["trading_epoch_id"]
+            return Query()
+
+    called = []
+    def proved(**kwargs):
+        called.append(kwargs)
+        return select_verified_us_original_buy_scope(
+            [original_row()], symbol="AMGN", qty=6, identity=IDENTITY,
+        )
+    monkeypatch.setattr(bridge, "load_verified_us_original_buy_scope", proved)
+    result = verified_new_buy_snapshot_identity(
+        conn=Conn(), trade_date="2026-11-10",
+        position={"symbol": "AMGN", "qty": 6, "meta": {}},
+        trading_epoch_id=IDENTITY["trading_epoch_id"],
+    )
+    assert result["position_lifecycle_id"] == CYCLE
+    assert result["portfolio_epoch_id"] == PORTFOLIO
+    assert result["broker_account_hash"] == ACCOUNT_HASH
+    assert result["account_id"] == ACCOUNT
+    assert len(called) == 1
+    assert called[0]["conn"].__class__.__name__ == "Conn"
+
+
+def test_snapshot_proof_missing_or_conflicting_never_rebinds(monkeypatch):
+    from trader.us.original_buy_lineage import verified_new_buy_snapshot_identity
+    import trader.us.original_buy_lineage as bridge
+
+    class Query:
+        def mappings(self):
+            return self
+        def all(self):
+            return [{"account_id": ACCOUNT}]
+
+    class Conn:
+        def execute(self, _query, _params):
+            return Query()
+
+    proof = select_verified_us_original_buy_scope(
+        [original_row()], symbol="AMGN", qty=6, identity=IDENTITY,
+    )
+    monkeypatch.setattr(bridge, "load_verified_us_original_buy_scope",
+                        lambda **kwargs: proof)
+    kwargs = {"conn": Conn(), "trade_date": "2026-11-10",
+              "trading_epoch_id": IDENTITY["trading_epoch_id"]}
+    assert verified_new_buy_snapshot_identity(
+        position={"symbol": "AMGN", "qty": 6,
+                  "meta": {"position_cycle_id": "foreign-cycle"}}, **kwargs
+    ) is None
+    assert verified_new_buy_snapshot_identity(
+        position={"symbol": "TQQQ", "qty": 6, "meta": {}}, **kwargs
+    ) is None
+    assert verified_new_buy_snapshot_identity(
+        position={"symbol": "AMGN", "qty": 6, "strategy_owner": "OTHER"}, **kwargs
+    ) is None
+    monkeypatch.setattr(bridge, "load_verified_us_original_buy_scope",
+                        lambda **kwargs: None)
+    assert verified_new_buy_snapshot_identity(
+        position={"symbol": "AMGN", "qty": 6}, **kwargs
+    ) is None
