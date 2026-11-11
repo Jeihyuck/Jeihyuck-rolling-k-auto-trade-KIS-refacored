@@ -13700,13 +13700,21 @@ class PB1Engine:
                             "[KR_PROFIT_PARITY][SAFETY_PRIORITY] code=%s reason=%s",
                             code, final_reason,
                         )
-                    elif _kr_candidate["action"] == "ACTIVE_TP":
+                    elif _kr_candidate["action"] in {"ACTIVE_TP", "ACTIVE_RUNNER"}:
+                        # The original US V3 runner proposal is subject to
+                        # the SAME native PB1 SELL claim, durable KIS stage
+                        # reservation, KIS submit and original-fill proof as
+                        # TP1/TP2/TP3. Never order directly from the policy.
                         _kr_us_tp_context = _kr_candidate
+                        _runner_final = (
+                            _kr_candidate["action"] == "ACTIVE_RUNNER"
+                            and _kr_candidate["stage"] == "RUNNER_FINAL"
+                        )
                         _tp_reason = "KR_TAKE_PROFIT_" + str(_kr_candidate["stage"])
                         horizon_result = {
                             "exit_ok": True, "reason": _tp_reason,
                             "qty": int(_kr_candidate["qty"]),
-                            "sell_pct": None, "full_exit": False,
+                            "sell_pct": None, "full_exit": _runner_final,
                         }
                         final_reason = _tp_reason
                         ordered_reasons = [_tp_reason]
