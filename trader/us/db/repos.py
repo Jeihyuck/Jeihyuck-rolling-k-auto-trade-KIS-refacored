@@ -4879,6 +4879,12 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                             conn=conn, trade_date=str(td), position=p,
                             trading_epoch_id=trading_epoch_id,
                         )
+                        if not verified_identity:
+                            from trader.us.original_buy_lineage import verified_carried_us_snapshot_identity
+                            verified_identity = verified_carried_us_snapshot_identity(
+                                conn=conn, trade_date=str(td), position=p,
+                                trading_epoch_id=trading_epoch_id,
+                            )
                     except Exception as exc:
                         logger.warning(
                             "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s",
@@ -4906,7 +4912,12 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     )
                 meta.update(policy)
                 if verified_identity:
-                    meta["lineage_identity_status"] = "VERIFIED_ORIGINAL_KIS_BUY"
+                    meta["lineage_identity_status"] = (
+                        "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+                        if verified_identity.get("lineage_resolution")
+                           == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+                        else "VERIFIED_ORIGINAL_KIS_BUY"
+                    )
                 elif (authoritative_positions
                         and int(p.get("qty") or 0) > 0
                         and policy.get("entry_policy_source") == "confirmed_buy_order"
