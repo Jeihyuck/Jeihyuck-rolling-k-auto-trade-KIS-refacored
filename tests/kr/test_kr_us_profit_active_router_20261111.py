@@ -148,3 +148,15 @@ def test_cross_owner_unresolved_sell_blocks_new_tp(monkeypatch):
     )
     assert result["action"] == "BLOCK"
     assert result["reason"] == "UNRESOLVED_SELL_OR_ACK"
+
+
+def test_native_tp_fails_closed_when_any_broker_shares_are_reserved(monkeypatch):
+    pos = setup_contract(monkeypatch)
+    pos["orderable_qty"] = 92
+    out = router.evaluate_active_kr_tp(
+        position=pos, engine=object(), kis=FakeKis(),
+        env="practice", code="005930",
+        balance_snapshot=FakeBalance(broker_orderable=92),
+    )
+    assert out["action"] == "BLOCK"
+    assert out["reason"] == "KR_TP_BROKER_RESERVED_INVENTORY_RECONCILE_REQUIRED"

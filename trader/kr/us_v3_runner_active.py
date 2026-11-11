@@ -231,6 +231,11 @@ def load_kr_kis_native_completed_daily(
             for row in raw:
                 if not isinstance(row, dict):
                     return None, None
+                # KIS sometimes pads chart responses with empty-date rows;
+                # these are not completed candles and must not poison the
+                # valid dated portion of the *same* original native response.
+                if not str(row.get("stck_bsop_date") or "").strip():
+                    continue
                 try:
                     d = str(row["stck_bsop_date"])
                     parsed = date.fromisoformat(d)

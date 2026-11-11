@@ -147,6 +147,11 @@ def evaluate_active_kr_tp(
         qty, orderable = int(qty), int(orderable)
         if qty <= 0 or orderable <= 0 or orderable > qty or qty != int(position.get("qty") or -1):
             return block("KR_TP_KIS_DB_QTY_MISMATCH")
+        if orderable != qty:
+            # Partial sell reservation / unsettled broker order may consume
+            # available inventory without being recorded in our DB yet.
+            # Do not manufacture a smaller TP target from that inventory.
+            return block("KR_TP_BROKER_RESERVED_INVENTORY_RECONCILE_REQUIRED")
         # The immutable BUY contract is not sufficient: compare the current
         # broker balance avg, qty and orderable shares to DB every exit tick.
         from trader.execution_state import BalanceFreshness
