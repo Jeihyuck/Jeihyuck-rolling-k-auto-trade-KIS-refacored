@@ -164,11 +164,22 @@ def evaluate_readiness(
             if sym not in problems:
                 continue
             if normalized.get("normalization_result") != "normalized":
-                problems[sym].append("CURRENT_SELL_ORDER_SCHEMA_UNVERIFIED")
-            elif (normalized.get("side") == "SELL"
-                  and normalized.get("broker_operation") != "CANCEL"
-                  and normalized.get("status") not in {"FILLED", "CANCELLED", "REJECTED"}):
-                problems[sym].append("CURRENT_KIS_SELL_UNRESOLVED")
+                problems[sym].append("CURRENT_ORDER_SCHEMA_UNVERIFIED")
+            elif normalized.get("broker_operation") == "CANCEL":
+                # A cancellation request is not native proof that the
+                # original SELL disappeared. The operator must inspect its
+                # original KIS order and remaining quantity separately.
+                problems[sym].append("CURRENT_KIS_CANCEL_TERMINAL_UNVERIFIED")
+            elif normalized.get("status") not in {
+                "FILLED", "CANCELLED", "REJECTED",
+            }:
+                # An in-flight BUY can also change the holdings and cycle;
+                # never infer the old orderable shares are a stable exit.
+                problems[sym].append(
+                    "CURRENT_KIS_SELL_UNRESOLVED"
+                    if normalized.get("side") == "SELL"
+                    else "CURRENT_KIS_BUY_UNRESOLVED"
+                )
 
     output = []
     for sym in SYMBOLS:
