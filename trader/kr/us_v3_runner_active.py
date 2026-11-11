@@ -165,3 +165,91 @@ def evaluate_kr_v3_runner(
             "qty": quantity, "native_source": "KIS_COMPLETED_DAILY_VERIFIED",
             "verified_high": verified_high, "atr_evidence": atr,
             "order_authorized": False}
+
+
+
+# A direct original KIS HTTP response only. The generic get_daily_candles()
+# and OHLCV provider read DB/Parquet caches and cannot attest provenance.
+# Do not turn those values into falsely labelled "KIS_DAILY_VERIFIED".
+_NATIVE_CACHE: dict[tuple[str, str, str], tuple[float, list[dict]]] = {}
+
+
+def load_kr_kis_native_completed_daily(
+    *, kis: Any, code: str, today: date,
+) -> tuple[list[dict] | None, str | None]:
+    """Read-only bounded native KIS daily chart; cache verified response <=10min.
+
+    Do not use this on real accounts or in HTTP-disabled diagnostic mode.
+    The broker wrapper's stage deadline still governs native HTTP calls.
+    """
+    import os
+    import time
+    from trader.kis_wrapper import API_BASE_URL, _pick_tr, kis_http_enabled
+
+    symbol = str(code).zfill(6)
+    if (
+        str(getattr(kis, "env", "")).lower() != "practice"
+        or str(os.getenv("KIS_ENV", "")).lower() != "practice"
+        or not kis_http_enabled() or not symbol.isdecimal()
+    ):
+        return None, None
+    account = str(getattr(kis, "CANO", "") or "")
+    key = (account, symbol, today.isoformat())
+    now = time.monotonic()
+    saved = _NATIVE_CACHE.get(key)
+    if saved is not None and now - saved[0] <= 600:
+        return saved[1], "kis"
+    chart_ids = _pick_tr("practice", "DAILY_CHART")
+    if not chart_ids:
+        return None, None
+    # KIS returns recent daily bars as output2, sometimes in descending
+    # order. 120 calendar days is sufficient for US V3 ATR14+22 chandelier.
+    params = {
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd": symbol,
+        "fid_input_date_1": (today - timedelta(days=120)).strftime("%Y%m%d"),
+        "fid_input_date_2": today.strftime("%Y%m%d"),
+        "fid_org_adj_prc": "0",
+        "fid_period_div_code": "D",
+    }
+    url = f"{API_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    for tr in list(chart_ids)[:1]:
+        try:
+            response = kis._safe_request(
+                "GET", url, headers=kis._headers(tr), params=params,
+                timeout=(2.5, 6.0),
+            )
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            if not isinstance(payload, dict) or str(payload.get("rt_cd")) != "0":
+                continue
+            raw = payload.get("output2")
+            if not isinstance(raw, list):
+                continue
+            bars = []
+            for row in raw:
+                if not isinstance(row, dict):
+                    return None, None
+                try:
+                    d = str(row["stck_bsop_date"])
+                    parsed = date.fromisoformat(d)
+                    if parsed >= today:
+                        continue
+                    bars.append({
+                        "date": parsed.isoformat(),
+                        "high": float(row["stck_hgpr"]),
+                        "low": float(row["stck_lwpr"]),
+                        "close": float(row["stck_clpr"]),
+                    })
+                except (KeyError, ValueError, TypeError):
+                    return None, None
+            valid = _valid_daily_rows(bars, source="kis", today=today)
+            if valid is not None:
+                _NATIVE_CACHE[key] = (now, bars)
+                return bars, "kis"
+        except Exception:
+            # A transient KIS error is NOT authorization to use DB-derived
+            # prices/unknown ATR in a profit-defense native order.
+            continue
+    return None, None
