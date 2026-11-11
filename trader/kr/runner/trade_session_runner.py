@@ -702,6 +702,8 @@ def _arm_prep_failure_protective_exit(
         "CANONICAL_PREP_ARTIFACT_INVALID",
         "DB_FINAL30_INVALID",
         "PREP_CONTRACT_MISSING",
+        "TRADE_DATE_MISMATCH",  # 11/11 stale latest contract; BUY remains fenced
+        "ASOF_MISMATCH",
     }:
         return False
 
