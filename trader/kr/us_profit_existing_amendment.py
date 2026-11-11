@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
@@ -37,7 +38,7 @@ TARGET = {
     "qty": 33,
     "avg_price": 60200.0,
 }
-_ATTEMPTED: set[tuple[str, str]] = set()
+_ATTEMPTED: dict[tuple[str, str], float] = {}
 
 
 def _exact_positive_int(value: Any) -> int:
@@ -217,9 +218,13 @@ def maybe_amend_samsung_ea_position(
     ):
         return None
     attempt_scope = (TARGET["epoch"], TARGET["cycle"])
-    if attempt_scope in _ATTEMPTED:
+    # Transient KIS/DB failure must not suppress this user-approved
+    # amendment for the lifetime of an AM worker. Bound retries to <= one
+    # verification per 10 minutes; never query KIS on every trading tick.
+    now_monotonic = time.monotonic()
+    if now_monotonic < _ATTEMPTED.get(attempt_scope, -1.0):
         return None
-    _ATTEMPTED.add(attempt_scope)
+    _ATTEMPTED[attempt_scope] = now_monotonic + 600.0
     if engine.dialect.name != "postgresql":
         raise ValueError("KR_AMENDMENT_POSTGRES_DURABLE_REQUIRED")
 
