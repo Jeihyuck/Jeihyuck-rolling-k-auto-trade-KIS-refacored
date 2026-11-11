@@ -912,11 +912,31 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     if retryable and not completed and int(marker.get("sell_completed", 0)):
         status = "PARTIAL_SUCCESS_RETRYABLE"
     if session == "close":
-        raw_balance = None
-        try:
-            raw_balance = KisAPI().get_balance()
-        except Exception as exc:
-            logger.warning("[KR_CLOSE][BALANCE_INCONSISTENT][RELOAD_WARN] err=%s", exc)
+        from trader.kr.close_reporting_20261111 import reuse_close_balance_for_reporting
+        # No new order -> the fresh KIS precheck already proved positions.
+        # Reuse it ONLY for the terminal report guard, never for order sizing.
+        zero_order_proven = bool(
+            pb1_result_present
+            and all(key in pb1_result for key in ("broker_submitted", "api_submitted", "broker_acked", "unresolved_acks"))
+            and all(
+                type(pb1_result[key]) is int and pb1_result[key] == 0
+                for key in ("broker_submitted", "api_submitted", "broker_acked", "unresolved_acks")
+            )
+        )
+        raw_balance = reuse_close_balance_for_reporting(
+            ROOT / "runtime" / "kr" / "session" / ctx.trade_date.isoformat() / "close" / "balance_precheck.json",
+            new_orders_submitted=0 if zero_order_proven else -1,
+        )
+        if raw_balance is not None:
+            logger.info(
+                "[KR_CLOSE][REPORT_BALANCE_REUSED] source=KIS same_session=1 "
+                "orders_submitted=0 reporting_only=1 order_permit=0"
+            )
+        else:
+            try:
+                raw_balance = KisAPI().get_balance()
+            except Exception as exc:
+                logger.warning("[KR_CLOSE][BALANCE_INCONSISTENT][RELOAD_WARN] err=%s", exc)
         guard = close_balance_guard(
             holdings_count=_balance_holdings_count(raw_balance) or 0,
             market_value=_balance_market_value(raw_balance),
@@ -952,6 +972,20 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             "action=PRESERVE_BROKER_EVIDENCE_NO_AUTOMATIC_RESUBMIT",
             close_consistency_warnings,
         )
+    if session == "close":
+        from trader.kr.close_reporting_20261111 import close_economic_warning
+        close_economic_reason = close_economic_warning(pb1_result)
+        if close_economic_reason:
+            # Preserve trading execution result, but never report economic
+            # settlement as OK when original broker/ledger proof is pending.
+            if status in {"OK", "SUCCESS"}:
+                status = "WARN"
+                summary_reason = close_economic_reason
+            logger.warning(
+                "[KR_CLOSE][ECONOMIC_SETTLEMENT][REPORT] state=%s "
+                "execution_exit_code=%s trade_order_retry=0",
+                close_economic_reason, exit_code,
+            )
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
     orders_intent = int(pb1_result.get("order_intents_created", pb1_result.get("order_candidates", 0)) or 0)
     orders_submitted = int(pb1_result.get("broker_submitted", pb1_result.get("api_submitted", 0)) or 0)
@@ -991,6 +1025,9 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         result.update(lock_unavailable_result_fields())
     if session == "close":
         result.update({
+            "economic_settlement_state": str(pb1_result.get("economic_settlement_state") or "UNKNOWN"),
+            "economic_settlement_pending": int(bool(close_economic_reason)),
+            "native_priced_sell_gap_count": pb1_result.get("native_priced_sell_gap_count"),
             "phase": "close",
             "phase_executed": status not in {"FAIL", "FAILED"},
             "force_phase": True,
