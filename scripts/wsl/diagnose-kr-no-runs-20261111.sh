@@ -48,7 +48,7 @@ else echo "MISSING_DEPLOY_MARKER"; fi
 echo "[KR_DIAG] MAIL_SCHEDULER_WRAPPER"
 mail_wrapper="runtime/scheduler/windows/$DAY/PB1-KR-Mail-WSL.log"
 if [[ -f "$mail_wrapper" ]]; then
-  grep -E '^\\[WINDOWS_TASK\\]\\[(START|END)\\]' "$mail_wrapper" | tail -12 || true
+  grep -E 'WINDOWS_TASK.*(START|END)' "$mail_wrapper" | tail -12 || true
 else echo "MISSING $mail_wrapper"; fi
 echo "[KR_DIAG] MAIL_RESULT_MARKER"
 mail_marker="runtime/health/kr-mail-$DAY.json"
