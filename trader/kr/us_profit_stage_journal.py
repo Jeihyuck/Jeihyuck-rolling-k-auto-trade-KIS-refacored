@@ -18,7 +18,11 @@ from trader.db.schema import schema_for_engine
 from trader.kr.us_standard_profit_parity import STAGES, verified_contract
 
 STAGE_VERSION = "kr_pb1_tp_durable_stage_v1"
-STAGE_NAMES = tuple(s[0] for s in STAGES)
+# The US V3 runner uses two independently claimable native SELL stages.
+# RUNNER_FINAL may legitimately fire without RUNNER_PARTIAL; both require TP3.
+TP_STAGE_NAMES = tuple(s[0] for s in STAGES)
+RUNNER_STAGE_NAMES = ("PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL")
+STAGE_NAMES = TP_STAGE_NAMES + RUNNER_STAGE_NAMES
 TRANSIENT = {"PENDING", "ACK", "PARTIAL_FILLED", "UNRESOLVED"}
 
 
@@ -135,7 +139,7 @@ def reserve_tp_stage(
         with engine.begin() as conn:
             # Lock all three keys consistently to prevent independent workers
             # from simultaneously claiming TP1 and TP2.
-            for prior in STAGE_NAMES[:stage_ix]:
+            for prior in TP_STAGE_NAMES[:min(stage_ix, len(TP_STAGE_NAMES))]:
                 value = conn.execute(
                     sa.select(table.c.payload).where(table.c.job_key == _key(contract, prior))
                     .with_for_update()
@@ -150,6 +154,24 @@ def reserve_tp_stage(
                     or _exact_qty(state.get("target_qty") or 0) < 1
                 ):
                     return StageJournalResult(False, "BLOCK", f"{prior}_NOT_BROKER_FILLED")
+            if stage == "RUNNER_FINAL":
+                # A pending partial has reserved shares; a final liquidation
+                # must never submit for the full holding until the partial
+                # has a terminal, broker-proven fill.
+                partial_raw = conn.execute(
+                    sa.select(table.c.payload).where(
+                        table.c.job_key == _key(contract, "PROFIT_DEFENSE_PARTIAL")
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                partial = dict(partial_raw or {})
+                if partial and (
+                    partial.get("status") != "FILLED"
+                    or partial.get("broker_fill_proven") is not True
+                    or not partial.get("broker_odno")
+                ):
+                    return StageJournalResult(
+                        False, "BLOCK", "RUNNER_PARTIAL_UNSETTLED",
+                    )
             conn.execute(pg_insert(table).values(
                 job_key=key, updated_ts=datetime.now(timezone.utc),
                 payload={
