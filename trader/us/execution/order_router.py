@@ -3035,13 +3035,17 @@ def route_order(
                     and tp_stage in {"tp1", "tp2", "tp3"}):
                 try:
                     from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                    from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                    _tp_ledger_cycle = tp_stage_lifecycle_from_order_proof(
+                        str(intent.get("position_lifecycle_id")
+                            or (intent.get("meta") or {}).get("position_lifecycle_id") or ""),
+                        intent.get("meta"),
+                        client_order_key=str(order_key or ""),
+                    )
                     restored = release_us_profit_capture_pre_http_abort(
                         trade_date=str(trade_date or ""),
                         symbol=symbol_upper, stage=tp_stage,
-                        position_lifecycle_id=str(
-                            intent.get("position_lifecycle_id")
-                            or (intent.get("meta") or {}).get("position_lifecycle_id") or ""
-                        ),
+                        position_lifecycle_id=_tp_ledger_cycle,
                         client_order_key=str(order_key or ""),
                     )
                     if not restored:
