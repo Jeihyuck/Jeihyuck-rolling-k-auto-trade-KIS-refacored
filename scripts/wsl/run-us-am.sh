@@ -177,6 +177,11 @@ source scripts/wsl/us-stage123-paper-defaults.sh
 # explicit operator override remains visible and protective SELL is unchanged.
 source scripts/wsl/us-entry-timing-paper-defaults.sh
 source scripts/wsl/us-swing-v3-paper-defaults.sh
+# On practice WSL, a proven dead Stage4 writer can hand over to the existing
+# legacy reconciler in EXIT_ONLY mode. Explicit 0 is an immediate rollback.
+if [[ "${KIS_ENV:-}" == "practice" ]]; then
+  export US_STAGE4_EXIT_ONLY_FALLBACK_ENABLED="${US_STAGE4_EXIT_ONLY_FALLBACK_ENABLED:-1}"
+fi
 if [[ "${US_STAGE123_PAPER_PROFILE}" == "ON" ]]; then
   if ! "${PYTHON_BIN}" scripts/us_stage123_paper_preflight.py >> "${LOG_FILE}" 2>&1; then
     export NULLIM_SESSION_FINAL_STATUS=FAILED_STAGE123_PREFLIGHT
