@@ -206,7 +206,7 @@ def test_active_v2_sell_true_only_after_original_kis_and_current_balance(scenari
 
 
 @pytest.mark.parametrize("mutation,reason_prefix",[
-    (lambda db,cl,it: setattr(cl,"holding",3),"KIS_LEGACY_HOLDING_CHANGED"),
+    (lambda db,cl,it: setattr(cl,"holding",3),"BROKER_HOLDING_OR_ORDERABLE_UNVERIFIED"),
     (lambda db,cl,it: setattr(cl,"orderable",0),"KIS_LEGACY_INSUFFICIENT"),
     (lambda db,cl,it: db.position.update(qty=8),"ORIGINAL_FILL_NET"),
     (lambda db,cl,it: db.position["meta"].update(
