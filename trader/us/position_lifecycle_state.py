@@ -200,6 +200,33 @@ def _bind_authoritative_position_identity(
     if not identity.get("trading_epoch_id"):
         return identity
 
+    # Nov-10 AMGN: original intent/order carry account+epoch+portfolio+cycle,
+    # but normalized KIS balance and some fill columns do not. Bridge only a
+    # *fresh authoritative* zero->fully-filled original BUY proved by KIS,
+    # exact account SHA256 and immutable signed contract. No ticker-only
+    # historical adoption, no mutation of any original execution record.
+    if authoritative and (
+        not identity.get("position_lifecycle_id")
+        or not identity.get("portfolio_epoch_id")
+    ):
+        from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+        proof = load_verified_us_original_buy_scope(
+            symbol=_sym(pos.get("symbol")), trade_date=trade_date,
+            qty=_i(pos.get("qty")), identity=identity,
+        )
+        if proof is not None and all(
+            not identity.get(key) or identity[key] == str(proof.get(key) or "")
+            for key in ("env", "account_id", "trading_epoch_id", "strategy_owner",
+                        "portfolio_epoch_id", "position_lifecycle_id", "position_cycle_id")
+        ):
+            for key in ("strategy_owner", "portfolio_epoch_id",
+                        "position_cycle_id", "position_lifecycle_id"):
+                identity[key] = str(proof[key])
+                pos[key] = str(proof[key])
+            pos["_verified_original_buy_fill"] = proof
+            pos["lifecycle_identity_source"] = "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY"
+            return identity
+
     lifecycle_matches: dict[str, tuple[str, dict]] = {}
     try:
         from trader.us.db.repos import load_us_position_risk_state_candidates
@@ -511,8 +538,15 @@ def reconcile_us_position_lifecycles(
         if lifecycle and not _lifecycle_matches_identity(lifecycle, identity):
             lifecycle = {}
         if not lifecycle or lifecycle.get("is_open") is False:
+            original_proof = pos.get("_verified_original_buy_fill")
+            candidate_fills = list(fills or [])
+            if isinstance(original_proof, dict):
+                # Original broker-positive evidence already independently
+                # matched intent/order/account/cycle; no synthetic fill.
+                candidate_fills.append(original_proof)
             confirmed_buy = _confirmed_buy_fill(
-                fills, symbol, identity, after=lifecycle.get("closed_at") if lifecycle else None,
+                candidate_fills, symbol, identity,
+                after=lifecycle.get("closed_at") if lifecycle else None,
             )
             confirmed_fill, confirmed_opened_at = confirmed_buy or ({}, None)
             fill_meta = confirmed_fill.get("meta") if isinstance(confirmed_fill.get("meta"), dict) else {}
