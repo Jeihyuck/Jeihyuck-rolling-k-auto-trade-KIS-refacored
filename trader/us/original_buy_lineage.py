@@ -348,8 +348,8 @@ def verified_carried_us_snapshot_identity(
         WHERE trading_epoch_id=:epoch AND symbol=:symbol
           AND (
              (trade_date>:previous_date AND trade_date<=:today)
-             OR (trade_date=:previous_date AND status IN
-                ('PENDING','ACK','OPEN','PARTIALLY_FILLED','SUBMIT_STARTED','BROKER_UNKNOWN'))
+             OR (trade_date=:previous_date AND status NOT IN
+                ('FILLED','CANCELLED','REJECTED','BLOCKED','EXPIRED'))
           )
     """), {"epoch":trading_epoch_id,"symbol":sym,
            "previous_date":prior["as_of"],"today":trade_date}).scalar()
