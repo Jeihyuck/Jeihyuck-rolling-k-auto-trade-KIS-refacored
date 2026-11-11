@@ -2584,7 +2584,90 @@ def test_p0_proven_unsent_buy_intent_postgres_terminalization(pg_engine, monkeyp
     assert safe_meta["pre_io_abort_attempt_id"] == "p0-safe-attempt"
 
 
-def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(pg_engine, monkeypatch):
+@pytest.fixture()
+def amgn_pg_engine(monkeypatch):
+    """Isolated REAL PostgreSQL CI DB; never poison other suite fixtures.
+
+    The original fixture uses a shared us_ci database and resets tables per
+    test. This AMGN original lineage test requires migration 0052 / 0062
+    scope and an active trading_epochs record; a shared database corrupted
+    unrelated tests after the focused test step. Use a dedicated disposable
+    localhost ci database, and drop it with FORCE after verification.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+    import trader.us.db.repos as repos
+
+    source=make_url(os.environ["PBCORE_TEST_POSTGRES_URL"])
+    # Never CREATE/DROP a nonlocal or non-ci database.
+    if (source.host not in ("localhost","127.0.0.1")
+            or source.database != "us_ci"
+            or not source.drivername.startswith("postgresql")):
+        pytest.skip("AMGN isolated original BUY test requires localhost us_ci")
+    db_name="us_ci_amgn_original_buy_proof"
+    admin=create_engine(
+        source.set(database="postgres"),
+        isolation_level="AUTOCOMMIT",future=True,
+    )
+    with admin.connect() as conn:
+        conn.execute(text('DROP DATABASE IF EXISTS "'+db_name+'" WITH (FORCE)'))
+        conn.execute(text('CREATE DATABASE "'+db_name+'"'))
+    engine=create_engine(source.set(database=db_name),future=True)
+    try:
+        with engine.begin() as conn:
+            for path in (
+                "migrations/0038_us_agent_tables.sql",
+                "migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql",
+                "migrations/0046_us_orders_committed_notional.sql",
+                "migrations/0047_us_order_events_profit_lifecycle.sql",
+                "migrations/0053_execution_state_claims.sql",
+                "migrations/0054_semantic_action_instances.sql",
+            ):
+                conn.exec_driver_sql(open(path,encoding="utf-8").read())
+            for table in (
+                "us_order_intents","us_orders","us_fills","us_positions",
+                "us_order_events","us_profit_capture_lifecycle",
+            ):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+                )
+            for table in (
+                "us_orders","us_order_intents","us_order_events",
+                "us_fills","us_positions","us_execution_claims",
+            ):
+                for column in ("portfolio_epoch_id","position_cycle_id"):
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT"
+                    )
+            for table in (
+                "us_orders","us_order_intents","us_order_events",
+                "us_fills","us_positions",
+            ):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
+                )
+            conn.exec_driver_sql(
+                "ALTER TABLE us_positions DROP CONSTRAINT IF EXISTS "
+                "us_positions_as_of_symbol_exchange_key"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_us_positions_epoch_asof_symbol_exchange "
+                "ON us_positions(trading_epoch_id,as_of,symbol,exchange)"
+            )
+        monkeypatch.setattr(repos,"_get_engine_or_none",lambda:engine)
+        yield engine
+    finally:
+        engine.dispose()
+        with admin.connect() as conn:
+            conn.execute(text('DROP DATABASE IF EXISTS "'+db_name+'" WITH (FORCE)'))
+        admin.dispose()
+
+
+def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
+    amgn_pg_engine, monkeypatch,
+):
+    pg_engine = amgn_pg_engine
+
     """No network: real PostgreSQL order -> cumulative KIS evidence -> balance."""
     import hashlib
     import json
