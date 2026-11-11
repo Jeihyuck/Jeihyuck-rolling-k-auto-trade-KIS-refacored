@@ -146,3 +146,18 @@ def test_native_runner_final_without_partial_is_legal_but_not_duplicate(stage_db
     assert reserve(args, "RUNNER_FINAL", 46, "runner-final-no-partial").accepted
     assert not reserve(args, "PROFIT_DEFENSE_PARTIAL", 23, "runner-partial-late").accepted
     assert observe(args, "RUNNER_FINAL", "runner-final-no-partial", "KIS-RUNNER-F", 46).status == "FILLED"
+
+def test_concurrent_runner_partial_and_final_never_both_claim(stage_db):
+    """Across native workers, same-cycle runner orders cannot race before KIS."""
+    args = stage_db
+    _prove_three_tp_stages(args)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_partial = pool.submit(reserve, args, "PROFIT_DEFENSE_PARTIAL", 23, "race-P")
+        fut_final = pool.submit(reserve, args, "RUNNER_FINAL", 46, "race-F")
+        outcomes = (fut_partial.result(), fut_final.result())
+    assert sum(result.accepted for result in outcomes) == 1
+    assert all(result.order_authorized is False for result in outcomes)
+    states = load_frozen_stage_states(**args)
+    active = [name for name in ("PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL")
+              if states[name]["status"] == "PENDING"]
+    assert len(active) == 1

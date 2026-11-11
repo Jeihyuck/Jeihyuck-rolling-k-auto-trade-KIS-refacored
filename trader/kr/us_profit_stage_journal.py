@@ -137,8 +137,27 @@ def reserve_tp_stage(
     key = _key(contract, stage)
     try:
         with engine.begin() as conn:
-            # Lock all three keys consistently to prevent independent workers
-            # from simultaneously claiming TP1 and TP2.
+            # FOR UPDATE cannot lock a row that has not been inserted yet.
+            # Serialize EVERY TP/runner stage on the same account/epoch/cycle
+            # contract-scoped PostgreSQL transaction advisory lock. Otherwise
+            # runner partial and final can simultaneously claim absent rows.
+            lock_material = (
+                STAGE_VERSION + "|" + contract["account_sha256"] + "|"
+                + contract["trading_epoch_id"] + "|"
+                + contract["position_cycle_id"] + "|"
+                + contract["sha256"]
+            )
+            lock_key = int.from_bytes(
+                hashlib.sha256(lock_material.encode("utf-8")).digest()[:8],
+                byteorder="big", signed=True,
+            )
+            locked = conn.execute(
+                sa.text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_key},
+            ).scalar_one()
+            if locked is not True:
+                return StageJournalResult(False, "BLOCK", "KR_TP_JOURNAL_CONCURRENT_CLAIM")
+            # The predecessor rows are now stable within this contract.
             for prior in TP_STAGE_NAMES[:min(stage_ix, len(TP_STAGE_NAMES))]:
                 value = conn.execute(
                     sa.select(table.c.payload).where(table.c.job_key == _key(contract, prior))
