@@ -334,3 +334,77 @@ def test_original_buy_fields_are_never_backdated_for_new_management(scenario):
     assert proof["prospective_cycle"]!=OLD_CYCLE
     assert db.position["portfolio_epoch_id"] is None
     assert db.buy["meta"]["position_lifecycle_id"]=="ENTRY:US_STANDARD:ABBV"
+
+
+
+def test_pre_nov05_runtime_lifecycle_restored_for_inmemory_v2_exit_and_tp_only(
+    scenario,monkeypatch,
+):
+    from contextlib import contextmanager
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        enrich_legacy_nine_v2_decision_position,
+    )
+    from trader.us.db import repos
+    db, client, intent = scenario
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield db
+    monkeypatch.setattr(repos,"_get_engine_or_none",lambda:Engine())
+    monkeypatch.setattr(repos,"_active_us_epoch",lambda *a,**kw:EPOCH)
+    position={
+        "symbol":"ABBV","qty":4,"exchange":"NYSE",
+        "strategy_owner":"US_STANDARD",
+        "meta":{},
+    }
+    enriched=enrich_legacy_nine_v2_decision_position(
+        position,trade_date="2026-11-11",
+    )
+    assert enriched["position_lifecycle_id"]==OLD_CYCLE
+    assert enriched["meta"]["position_lifecycle_id"]==OLD_CYCLE
+    assert enriched["meta"]["tp1_done"] is True
+    assert enriched["meta"]["entry_exit_contract_sha256"]==db.position[
+        "meta"
+    ]["entry_exit_contract_sha256"]
+    assert enriched["legacy_nine_decision_only_provisional"] is True
+    assert enriched.get("automated_sell_authorized") is not True
+    assert enriched["meta"].get("automated_sell_authorized") is not True
+    assert position["meta"]=={}
+    assert db.position["position_cycle_id"] is None
+
+
+def test_inmemory_provisional_lifecycle_never_adopts_mismatched_cycle(
+    scenario,monkeypatch,
+):
+    from contextlib import contextmanager
+    from trader.us.execution.us_legacy_nine_active_sell import (
+        enrich_legacy_nine_v2_decision_position,
+    )
+    from trader.us.db import repos
+    db,_,_=scenario
+    class Engine:
+        @contextmanager
+        def connect(self):
+            yield db
+    monkeypatch.setattr(repos,"_get_engine_or_none",lambda:Engine())
+    monkeypatch.setattr(repos,"_active_us_epoch",lambda *a,**kw:EPOCH)
+    pos={"symbol":"ABBV","qty":4,"strategy_owner":"US_STANDARD",
+         "meta":{"position_lifecycle_id":"foreign-cycle"}}
+    assert enrich_legacy_nine_v2_decision_position(
+        pos,trade_date="2026-11-11",
+    ) is pos
+    assert not pos.get("automated_sell_authorized")
+
+
+def test_legacy_through_canonical_router_and_original_tp_policy_static_contract():
+    from pathlib import Path
+    router=Path("trader/us/execution/order_router.py").read_text()
+    exit_engine=Path("trader/us/pb1/us_exit_engine.py").read_text()
+    market=Path("trader/us/market_state_overlay.py").read_text()
+    assert router.index("prove_and_bind_legacy_nine_sell") < router.index(
+        "bind_original_us_order_scope("
+    )
+    assert "recheck_legacy_nine_sell_before_http(" in router
+    assert "_legacy_nine_auto_sell_proof" in router
+    assert "enrich_legacy_nine_v2_decision_position(" in exit_engine
+    assert "enrich_legacy_nine_v2_decision_position(" in market
