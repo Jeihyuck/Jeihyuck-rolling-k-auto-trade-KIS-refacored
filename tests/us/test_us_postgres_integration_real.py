@@ -64,6 +64,22 @@ def pg_engine(monkeypatch):
             conn.exec_driver_sql(
                 f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
             )
+        # Migration 0052 rekeys snapshots by trading epoch. The isolated
+        # fixture cannot run all KR/epoch DDL, so mirror precisely the
+        # *production* scoped uniqueness before testing original BUY writes.
+        # Without it repos.save_position_snapshot fails on ON CONFLICT rather
+        # than exercising the lineage assertions.
+        conn.exec_driver_sql(
+            "ALTER TABLE us_positions "
+            "DROP CONSTRAINT IF EXISTS us_positions_as_of_symbol_exchange_key"
+        )
+        conn.exec_driver_sql(
+            "DROP INDEX IF EXISTS uq_us_positions_epoch_asof_symbol_exchange"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX uq_us_positions_epoch_asof_symbol_exchange "
+            "ON us_positions(trading_epoch_id, as_of, symbol, exchange)"
+        )
     # Fail the fixture immediately on missing 0062 columns, rather than
     # reporting misleading downstream KIS pre-submit/claim failures.
     with engine.connect() as conn:
@@ -2566,3 +2582,305 @@ def test_p0_proven_unsent_buy_intent_postgres_terminalization(pg_engine, monkeyp
         "p0-broker-ack", "p0-active-claim", "p0-unverified-attempt", "p0-existing-order"))
     assert safe_meta["pre_io_abort_stage"] == "BEFORE_KIS_HTTP"
     assert safe_meta["pre_io_abort_attempt_id"] == "p0-safe-attempt"
+
+
+@pytest.fixture()
+def amgn_pg_engine(monkeypatch):
+    """Isolated REAL PostgreSQL CI DB; never poison other suite fixtures.
+
+    The original fixture uses a shared us_ci database and resets tables per
+    test. This AMGN original lineage test requires migration 0052 / 0062
+    scope and an active trading_epochs record; a shared database corrupted
+    unrelated tests after the focused test step. Use a dedicated disposable
+    localhost ci database, and drop it with FORCE after verification.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+    import trader.us.db.repos as repos
+
+    source=make_url(os.environ["PBCORE_TEST_POSTGRES_URL"])
+    # Never CREATE/DROP a nonlocal or non-ci database.
+    if (source.host not in ("localhost","127.0.0.1")
+            or source.database != "us_ci"
+            or not source.drivername.startswith("postgresql")):
+        pytest.skip("AMGN isolated original BUY test requires localhost us_ci")
+    db_name="us_ci_amgn_original_buy_proof"
+    admin=create_engine(
+        source.set(database="postgres"),
+        isolation_level="AUTOCOMMIT",future=True,
+    )
+    with admin.connect() as conn:
+        conn.execute(text('DROP DATABASE IF EXISTS "'+db_name+'" WITH (FORCE)'))
+        conn.execute(text('CREATE DATABASE "'+db_name+'"'))
+    engine=create_engine(source.set(database=db_name),future=True)
+    try:
+        with engine.begin() as conn:
+            for path in (
+                "migrations/0038_us_agent_tables.sql",
+                "migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql",
+                "migrations/0046_us_orders_committed_notional.sql",
+                "migrations/0047_us_order_events_profit_lifecycle.sql",
+                "migrations/0053_execution_state_claims.sql",
+                "migrations/0054_semantic_action_instances.sql",
+            ):
+                conn.exec_driver_sql(open(path,encoding="utf-8").read())
+            for table in (
+                "us_order_intents","us_orders","us_fills","us_positions",
+                "us_order_events","us_profit_capture_lifecycle",
+            ):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+                )
+            for table in (
+                "us_orders","us_order_intents","us_order_events",
+                "us_fills","us_positions","us_execution_claims",
+            ):
+                for column in ("portfolio_epoch_id","position_cycle_id"):
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} TEXT"
+                    )
+            for table in (
+                "us_orders","us_order_intents","us_order_events",
+                "us_fills","us_positions",
+            ):
+                conn.exec_driver_sql(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account_id TEXT"
+                )
+            conn.exec_driver_sql(
+                "ALTER TABLE us_positions DROP CONSTRAINT IF EXISTS "
+                "us_positions_as_of_symbol_exchange_key"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX uq_us_positions_epoch_asof_symbol_exchange "
+                "ON us_positions(trading_epoch_id,as_of,symbol,exchange)"
+            )
+        monkeypatch.setattr(repos,"_get_engine_or_none",lambda:engine)
+        yield engine
+    finally:
+        engine.dispose()
+        with admin.connect() as conn:
+            conn.execute(text('DROP DATABASE IF EXISTS "'+db_name+'" WITH (FORCE)'))
+        admin.dispose()
+
+
+def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
+    amgn_pg_engine, monkeypatch,
+):
+    pg_engine = amgn_pg_engine
+
+    """No network: real PostgreSQL order -> cumulative KIS evidence -> balance."""
+    import hashlib
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "LEGACY_V2")
+    account = "practice:ci:01"
+    broker_hash = hashlib.sha256(account.encode()).hexdigest()
+    epoch = "epoch-ci-amgn"
+    portfolio = "portfolio-ci-amgn"
+    cycle = "cycle-ci-amgn"
+    key = "original-buy-amgn-ci"
+    order_no = "0000039784"
+    contract = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY", "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY", "entry_reason": "CI_BUY",
+    })
+    meta = {
+        "env": "practice", "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "broker_account_hash": broker_hash, "trading_epoch_id": epoch,
+        "portfolio_epoch_id": portfolio, "position_cycle_id": cycle,
+        "position_lifecycle_id": cycle,
+        "entry_exit_contract": contract,
+        "entry_exit_contract_sha256": contract["sha256"],
+        "entry_exit_contract_version": contract["version"],
+        "pre_order_holding_qty": 0, "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY", "exit_policy": "US_SWING_DEFAULT",
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS trading_epochs(
+                trading_epoch_id TEXT PRIMARY KEY,
+                env TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'CI_ORIGINAL_BUY_SCOPE',
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status,reason)
+            VALUES (:epoch,'practice',:account,'ACTIVE','CI_ORIGINAL_BUY_SCOPE')
+            ON CONFLICT(trading_epoch_id) DO UPDATE SET
+                account_id=EXCLUDED.account_id,status='ACTIVE'
+        """), {"epoch": epoch, "account": account})
+        conn.execute(text("""
+            INSERT INTO us_order_intents
+                (trade_date,client_order_key,symbol,exchange,side,qty,
+                 strategy,status,trading_epoch_id,account_id,portfolio_epoch_id,
+                 position_cycle_id,meta)
+            VALUES ('2026-11-10',:key,'AMGN','NASDAQ','BUY',6,
+                    'us_pb1','SENT',:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"key": key, "epoch": epoch, "account": broker_hash,
+               "portfolio": portfolio, "cycle": cycle, "meta": json.dumps(meta)})
+        conn.execute(text("""
+            INSERT INTO us_orders
+                (trade_date,client_order_key,symbol,exchange,side,
+                 qty_requested,qty_filled,order_no,status,trading_epoch_id,
+                 account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-10',:key,'AMGN','NASDAQ','BUY',6,0,
+                    :order_no,'ACK',:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"key": key, "order_no": order_no, "epoch": epoch,
+               "account": broker_hash, "portfolio": portfolio,
+               "cycle": cycle, "meta": json.dumps(meta)})
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda conn=None: epoch)
+    monkeypatch.setattr(repos, "_us_state_epoch_id", lambda conn=None: epoch)
+
+    evidence = {
+        **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "cumulative_filled_qty": 6,
+    }
+    result = repos.mark_order_filled_by_reconcile(
+        order_no=order_no, client_order_key=key, symbol="AMGN", side="BUY",
+        filled_qty=6, requested_qty=6, cumulative_filled_qty=6,
+        avg_price_usd=461.8, trade_date="2026-11-10",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no", meta=evidence,
+    )
+    assert result["status"] == "OK", result
+    with pg_engine.connect() as conn:
+        fill = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_fills WHERE trade_date='2026-11-10'
+              AND symbol='AMGN' AND order_no=:order_no
+        """), {"order_no": order_no}).mappings().one()
+        assert fill["qty"] == 6
+        assert (fill["account_id"],fill["portfolio_epoch_id"],fill["position_cycle_id"]) == (
+            broker_hash, portfolio, cycle,
+        )
+        assert fill["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+
+    # A source fill row with mismatched top-level economic scope is not
+    # valid original BUY evidence even if signed JSON meta still looks valid.
+    from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+    identity = {"env": "practice", "account_id": account,
+                "trading_epoch_id": epoch, "strategy_owner": "US_STANDARD"}
+    def original_proof():
+        return load_verified_us_original_buy_scope(
+            symbol="AMGN", trade_date="2026-11-10", qty=6,
+            identity=identity,
+        )
+    assert original_proof() is not None
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE us_fills SET position_cycle_id='foreign-cycle'
+            WHERE trade_date='2026-11-10' AND symbol='AMGN'
+              AND order_no=:order_no
+        """), {"order_no": order_no})
+    assert original_proof() is None
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE us_fills SET position_cycle_id=:cycle
+            WHERE trade_date='2026-11-10' AND symbol='AMGN'
+              AND order_no=:order_no
+        """), {"cycle": cycle, "order_no": order_no})
+    assert original_proof() is not None
+
+    saved = repos.save_position_snapshot(
+        [{
+            "symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+            "avg_cost": 461.8, "current_px": 465.875,
+            "balance_source": "kis_balance_authoritative", "meta": {},
+        }],
+        trade_date="2026-11-10",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True,
+        preserve_previous_positions=False,
+    )
+    assert saved == 1
+    with pg_engine.connect() as conn:
+        position = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_positions WHERE as_of='2026-11-10' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert position["qty"] == 6
+    assert (position["account_id"],position["portfolio_epoch_id"],
+            position["position_cycle_id"]) == (broker_hash,portfolio,cycle)
+    assert position["meta"]["position_lifecycle_id"] == cycle
+    assert position["meta"]["strategy_owner"] == "US_STANDARD"
+    assert position["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert position["meta"]["lineage_identity_status"] == "VERIFIED_ORIGINAL_KIS_BUY"
+
+    # The following US session must not erase the just-established owner,
+    # cycle, signed BUY contract or original provenance on a fresh KIS balance.
+    first_lifecycle = {
+        "lifecycle_id": cycle, "position_cycle_id": cycle,
+        "portfolio_epoch_id": portfolio, "trading_epoch_id": epoch,
+        "account_id": account, "strategy_owner": "US_STANDARD",
+        "env": "practice", "is_open": True,
+        "opened_trade_date": "2026-11-10",
+        "opened_at": "2026-11-10T16:26:14+00:00",
+        "opened_at_source": "confirmed_buy_fill",
+        "high_watermark": 470.0,
+        "high_watermark_source": "us_position_risk_state",
+        "high_watermark_at": "2026-11-10T20:00:00+00:00",
+        "holding_trade_days": 1,
+        "entry_policy": {"entry_exit_contract_sha256": contract["sha256"]},
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            -- The PostgreSQL service is shared by focused + complete US
+            -- suites; a four-column shortcut table poisons later tests.
+            -- Match migration 0052's actual risk-state schema.
+            CREATE TABLE IF NOT EXISTS us_position_risk_state(
+                trade_date DATE NOT NULL,
+                symbol TEXT NOT NULL,
+                soft_stop_breach_count INTEGER NOT NULL DEFAULT 0,
+                first_soft_stop_seen_at TIMESTAMPTZ,
+                last_soft_stop_seen_at TIMESTAMPTZ,
+                lowest_price_since_breach NUMERIC,
+                last_price NUMERIC,
+                last_pnl_pct NUMERIC,
+                state JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                trading_epoch_id TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            uq_us_position_risk_state_epoch_date_symbol
+            ON us_position_risk_state(trading_epoch_id, trade_date, symbol)
+        """))
+        conn.execute(text("""
+            INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
+            VALUES (:epoch,'2026-11-10','AMGN',CAST(:state AS jsonb))
+            ON CONFLICT(trading_epoch_id,trade_date,symbol)
+            DO UPDATE SET state=EXCLUDED.state
+        """), {"epoch": epoch, "state": json.dumps({"lifecycle": first_lifecycle})})
+
+    assert repos.save_position_snapshot(
+        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 6,
+          "avg_cost": 461.8, "current_px": 469.0,
+          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        trade_date="2026-11-11",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True, preserve_previous_positions=False,
+    ) == 1
+    with pg_engine.connect() as conn:
+        tomorrow = conn.execute(text("""
+            SELECT qty, account_id, portfolio_epoch_id, position_cycle_id, meta
+            FROM us_positions WHERE as_of='2026-11-11' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert tomorrow["qty"] == 6
+    assert (tomorrow["account_id"], tomorrow["portfolio_epoch_id"],
+            tomorrow["position_cycle_id"]) == (broker_hash, portfolio, cycle)
+    assert tomorrow["meta"]["position_lifecycle_id"] == cycle
+    assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+    assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]

@@ -4826,7 +4826,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         prior_policy["entry_policy_source"] = "prior_position_snapshot"
             policy = _us_entry_policy_from(meta, p) or prior_policy
             meta.update(policy)
-            meta.update({
+            meta.update({k: v for k, v in {
                 "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                 "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
                 "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
@@ -4841,7 +4841,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 "high_watermark_at": p.get("high_watermark_at"),
                 "high_watermark_source": p.get("high_watermark_source"),
                 "trend_state": p.get("trend_state"),
-            })
+            }.items() if v is not None})
             for field in (
                 "env", "trading_env", "account_id", "account_key",
                 "trading_epoch_id", "strategy_owner", "sleeve_id",
@@ -4864,6 +4864,38 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             for p in positions:
+                # Proactively bind a NEW US_STANDARD BUY from the original,
+                # uniquely matching KIS fill/order/intent *before* writing
+                # the first authoritative broker balance snapshot. Never
+                # infer original lifecycle from symbol or a newer unrelated
+                # order. This happens in the existing DB transaction.
+                verified_identity = None
+                if (authoritative_positions and balance_fetch_status == "OK"
+                        and balance_parse_status == "OK" and trading_epoch_id
+                        and int(p.get("qty") or 0) > 0):
+                    try:
+                        from trader.us.original_buy_lineage import verified_new_buy_snapshot_identity
+                        verified_identity = verified_new_buy_snapshot_identity(
+                            conn=conn, trade_date=str(td), position=p,
+                            trading_epoch_id=trading_epoch_id,
+                        )
+                        if not verified_identity:
+                            from trader.us.original_buy_lineage import verified_carried_us_snapshot_identity
+                            verified_identity = verified_carried_us_snapshot_identity(
+                                conn=conn, trade_date=str(td), position=p,
+                                trading_epoch_id=trading_epoch_id,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s",
+                            p.get("symbol"), type(exc).__name__,
+                        )
+                if verified_identity:
+                    p = dict(p)
+                    p["meta"] = {**dict(p.get("meta") or {}), **verified_identity}
+                    p.update(verified_identity)
+                    logger.info("[US_POSITIONS][ORIGINAL_SCOPE][VERIFIED] symbol=%s owner=US_STANDARD",
+                                p.get("symbol"))
                 avg_cost = float(p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd") or 0)
                 current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
                 # meta에 orderable_qty 등 보존
@@ -4879,7 +4911,28 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         ).strip() or None,
                     )
                 meta.update(policy)
-                meta.update({
+                if verified_identity:
+                    meta["lineage_identity_status"] = (
+                        "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+                        if verified_identity.get("lineage_resolution")
+                           == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+                        else "VERIFIED_ORIGINAL_KIS_BUY"
+                    )
+                elif (authoritative_positions
+                        and int(p.get("qty") or 0) > 0
+                        and policy.get("entry_policy_source") == "confirmed_buy_order"
+                        and not (
+                            p.get("position_lifecycle_id")
+                            or meta.get("position_lifecycle_id")
+                        )):
+                    # Persist balance truth but never silently describe an
+                    # unbound holding as an adopted/trend-managed cycle.
+                    meta["lineage_identity_status"] = "ORIGINAL_BUY_SCOPE_UNVERIFIED"
+                    logger.error(
+                        "[US_POSITIONS][ORIGINAL_SCOPE][FENCED] symbol=%s action=WAIT_ORIGINAL_BUY_PROOF",
+                        p.get("symbol"),
+                    )
+                meta.update({k: v for k, v in {
                     "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                     "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
                     "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
@@ -4894,7 +4947,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     "high_watermark_at": p.get("high_watermark_at"),
                     "high_watermark_source": p.get("high_watermark_source"),
                     "trend_state": p.get("trend_state"),
-                })
+                }.items() if v is not None})
                 for field in (
                     "env", "trading_env", "account_id", "account_key",
                     "trading_epoch_id", "strategy_owner", "sleeve_id",
@@ -4945,8 +4998,42 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
                                 meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
                     """
+                if verified_identity:
+                    # Column-level source-of-truth: preserve complete identity
+                    # in the same transaction as the fresh KIS balance row.
+                    # Conflicting already-persisted cycles cannot be replaced.
+                    params.update({
+                        "broker_account_hash": verified_identity["broker_account_hash"],
+                        "portfolio_epoch_id": verified_identity["portfolio_epoch_id"],
+                        "position_cycle_id": verified_identity["position_cycle_id"],
+                    })
+                    sql = sql.replace(
+                        "trading_epoch_id, meta)",
+                        "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
+                    ).replace(
+                        ":trading_epoch_id, CAST(:meta",
+                        ":trading_epoch_id, :broker_account_hash, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
+                    ).replace(
+                        "meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta",
+                        "account_id        =COALESCE(us_positions.account_id,EXCLUDED.account_id),"
+                        "portfolio_epoch_id=COALESCE(us_positions.portfolio_epoch_id,EXCLUDED.portfolio_epoch_id),"
+                        "position_cycle_id =COALESCE(us_positions.position_cycle_id,EXCLUDED.position_cycle_id),"
+                        "meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta",
+                    )
+                    sql += """
+                         WHERE (us_positions.account_id IS NULL
+                                OR us_positions.account_id=EXCLUDED.account_id)
+                           AND (us_positions.portfolio_epoch_id IS NULL
+                                OR us_positions.portfolio_epoch_id=EXCLUDED.portfolio_epoch_id)
+                           AND (us_positions.position_cycle_id IS NULL
+                                OR us_positions.position_cycle_id=EXCLUDED.position_cycle_id)
+                    """
+                    if "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)" not in sql:
+                        raise RuntimeError("US_SNAPSHOT_IDENTITY_COLUMNS_NOT_PERSISTED")
                 params["meta"] = _json_param(meta_to_store)
-                conn.execute(text(sql), params)
+                result = conn.execute(text(sql), params)
+                if verified_identity and getattr(result, "rowcount", None) == 0:
+                    raise RuntimeError("US_SNAPSHOT_ORIGINAL_SCOPE_CONFLICT")
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
@@ -5671,6 +5758,9 @@ def mark_order_filled_by_reconcile(
             order_params["active_epoch_id"] = active_epoch_id
         rows = conn.execute(text("""
             SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
+                   to_jsonb(us_orders)->>'account_id' AS account_id,
+                   to_jsonb(us_orders)->>'portfolio_epoch_id' AS portfolio_epoch_id,
+                   to_jsonb(us_orders)->>'position_cycle_id' AS position_cycle_id,
                    qty_requested, qty_filled""" + epoch_select + """
             FROM us_orders WHERE trade_date=:td AND
               ((:order_no <> '' AND order_no=:order_no) OR
@@ -5725,6 +5815,32 @@ def mark_order_filled_by_reconcile(
         }
         if order_epoch_id:
             merged["trading_epoch_id"] = order_epoch_id
+        # Validate immutable original BUY scope before modifying order/fill.
+        source_meta = _parse_json_meta(order.get("meta"))
+        original_scope = {}
+        if (order_epoch_id and order.get("portfolio_epoch_id")
+                and str(source_meta.get("strategy_owner") or "").upper() == "US_STANDARD"):
+            original_scope = {
+                "account_id": str(order.get("account_id") or ""),
+                "portfolio_epoch_id": str(order.get("portfolio_epoch_id") or ""),
+                "position_cycle_id": str(order.get("position_cycle_id") or ""),
+                "trading_epoch_id": str(order_epoch_id),
+            }
+            proof_pairs = (
+                ("broker_account_hash", "account_id"),
+                ("portfolio_epoch_id", "portfolio_epoch_id"),
+                ("position_cycle_id", "position_cycle_id"),
+                ("position_lifecycle_id", "position_cycle_id"),
+            )
+            if (not all(original_scope.values())
+                    or any(str(merged.get(k) or "") != original_scope[v]
+                           or str(source_meta.get(k) or "") != original_scope[v]
+                           for k, v in proof_pairs)
+                    or str(merged.get("trading_epoch_id") or "") != str(order_epoch_id)):
+                raise FillAccountingInvariantError({
+                    "status": "FILL_ORIGINAL_SCOPE_CONFLICT",
+                    "retry_order": False, "entry_fence": True,
+                })
         promotion = {"superseded": 0, "conflict": 0}
         if not synthetic:
             promotion = _supersede_synthetic_fills_for_actual(
@@ -5843,6 +5959,17 @@ def mark_order_filled_by_reconcile(
                         (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
                         VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
                         ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+            if original_scope and order_epoch_id:
+                insert_params.update(original_scope)
+                insert_sql = insert_sql.replace(
+                    "trading_epoch_id,meta,",
+                    "trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,meta,",
+                ).replace(
+                    ":trading_epoch_id,CAST(:meta",
+                    ":trading_epoch_id,:account_id,:portfolio_epoch_id,:position_cycle_id,CAST(:meta",
+                )
+                if "trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,meta," not in insert_sql:
+                    raise RuntimeError("US_FILL_SCOPE_PERSISTENCE_MISSING")
             # On production's uq_us_fills_idempotent the column tuple does
             # NOT contain evidence_type. If synthetic and actual broker
             # cumulative have identical qty AND price, the otherwise-correct
@@ -5907,6 +6034,45 @@ def mark_order_filled_by_reconcile(
                     })
             else:
                 conn.execute(text(insert_sql), insert_params)
+        if original_scope and not synthetic and _is_kis_order_cumulative_evidence(evidence):
+            # Read-through repair is permitted ONLY for the same verified
+            # immutable original order. A failed scope readback rolls back the
+            # order/fill transaction and fences further entry.
+            scope_args = {
+                **original_scope, "td": td, "symbol": sym, "side": side_u,
+                "order_no": on, "cok": resolved_client_order_key,
+            }
+            conn.execute(text("""
+                UPDATE us_fills
+                SET account_id=:account_id, portfolio_epoch_id=:portfolio_epoch_id,
+                    position_cycle_id=:position_cycle_id
+                WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                  AND order_no=:order_no AND client_order_key=:cok
+                  AND trading_epoch_id=:trading_epoch_id
+                  AND (account_id IS NULL OR account_id=:account_id)
+                  AND (portfolio_epoch_id IS NULL OR portfolio_epoch_id=:portfolio_epoch_id)
+                  AND (position_cycle_id IS NULL OR position_cycle_id=:position_cycle_id)
+                  AND meta->>'broker_account_hash'=:account_id
+                  AND meta->>'portfolio_epoch_id'=:portfolio_epoch_id
+                  AND meta->>'position_cycle_id'=:position_cycle_id
+                  AND meta->>'position_lifecycle_id'=:position_cycle_id
+                  AND meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
+            """), scope_args)
+            missing_scope = conn.execute(text("""
+                SELECT COUNT(*) FROM us_fills
+                WHERE trade_date=:td AND symbol=:symbol AND side=:side
+                  AND order_no=:order_no AND client_order_key=:cok
+                  AND trading_epoch_id=:trading_epoch_id
+                  AND meta->>'fill_evidence_type'='KIS_ORDER_CUMULATIVE_ACTUAL'
+                  AND (account_id IS DISTINCT FROM :account_id
+                    OR portfolio_epoch_id IS DISTINCT FROM :portfolio_epoch_id
+                    OR position_cycle_id IS DISTINCT FROM :position_cycle_id)
+            """), scope_args).scalar()
+            if int(missing_scope or 0):
+                raise FillAccountingInvariantError({
+                    "status": "FILL_ORIGINAL_SCOPE_NOT_DURABLE",
+                    "retry_order": False, "entry_fence": True,
+                })
         rows_after = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:order_no
         """ + fill_epoch_clause + """
             AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
