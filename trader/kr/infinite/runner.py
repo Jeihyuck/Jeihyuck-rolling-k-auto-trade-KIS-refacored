@@ -25,7 +25,7 @@ from .reconciliation import reconcile
 from .reconciliation import reconcile_order_fill_prices
 from .repository import InfiniteRepository
 from .regime_adapter import load_canonical_snapshot
-from .risk_adapter import allows_new_cycle
+from .risk_adapter import allows_new_cycle, buy_pause_reason, permits_dedicated_new_cycle
 from .strategy import evaluate, trading_days_since
 
 logger = logging.getLogger(__name__)
@@ -214,11 +214,26 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
         pending_sell = any(item.side in {"SELL_PARTIAL", "SELL_ALL"} for item in pending)
 
-        if allow_entry and position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
+        # COMPLETE is terminal for the OLD KODEX cycle.  In a defensive
+        # regime the KR_INFINITE 122630 owner may open a NEW cycle, but the
+        # generic allows_new_cycle() gate previously prevented reinitializing
+        # the ID. That let evaluate() reuse the completed old cycle: unsafe.
+        new_cycle_allowed = (
+            buy_pause_reason(market_state, quality) is None
+            and permits_dedicated_new_cycle(market_state, symbol=config.symbol)
+        )
+        if (allow_entry and position.qty == 0 and not pending_buy and not pending_sell
+                and new_cycle_allowed):
             same_day = state is not None and state.last_exit_date == day and not config.same_day_restart
             if not same_day and (state is None or state.status in {Status.READY, Status.COMPLETE}):
                 state = _new_cycle(state, executor, config, day)
                 repository.save_state(state)
+        if state is not None and state.status == Status.COMPLETE and position.qty == 0:
+            # Never submit a new BUY against the old COMPLETE cycle ID when
+            # the regime, same-day restart, owner gate or pending order blocks
+            # creation of a distinct new cycle.  Existing SELLs are unaffected.
+            return RunResult(Decision(Action.WAIT, "KR_INF_NEW_CYCLE_NOT_YET_ELIGIBLE",
+                                      next_status=Status.COMPLETE), state)
 
         # Exit-only and already-held ticks never need buying-power data.  This
         # avoids a second KIS transaction endpoint call (EGW00215) on the hot

@@ -24,8 +24,8 @@ def contract(monkeypatch, mode="SHADOW", runner="US_V2"):
     )
 
 
-def test_default_legacy_never_replaces_existing_v1(monkeypatch):
-    monkeypatch.delenv("KR_SWING_US_PROFIT_MODE", raising=False)
+def test_explicit_legacy_never_replaces_existing_v1(monkeypatch):
+    monkeypatch.setenv("KR_SWING_US_PROFIT_MODE", "LEGACY")
     assert build_new_swing_parity_contract(
         strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
         trade_horizon="SWING", position_action="NEW_POSITION_BUY",
@@ -120,16 +120,38 @@ def test_separate_owner_and_horizon_never_inherit(monkeypatch, owner, family, ho
         )
 
 
-def test_active_practice_requires_approved_environment(monkeypatch):
+def test_active_practice_builds_signed_candidate_not_broker_permission(monkeypatch):
     monkeypatch.setenv("KIS_ENV", "practice")
-    with pytest.raises(ValueError, match="DEPLOY_NOT_APPROVED"):
-        contract(monkeypatch, mode="ACTIVE_PRACTICE")
-    monkeypatch.setenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "1")
-    with pytest.raises(ValueError, match="ROUTER_NOT_WIRED"):
-        contract(monkeypatch, mode="ACTIVE_PRACTICE")
+    c = contract(monkeypatch, mode="ACTIVE_PRACTICE")
+    assert verified_contract(c)
+    assert c["activation_mode"] == "ACTIVE_PRACTICE"
+    out = calculate_next_tp_stage(
+        contract=c, stage_states={}, holding_qty=100, orderable_qty=100,
+        verified_entry_price=100, executable_price=109,
+    )
+    assert out.action == "ACTIVE_TP" and out.stage == "TP1"
+    assert out.target_qty == 25 and out.order_authorized is False
     monkeypatch.setenv("KIS_ENV", "real")
     with pytest.raises(ValueError, match="DEPLOY_NOT_APPROVED"):
         contract(monkeypatch, mode="ACTIVE_PRACTICE")
+
+
+def test_practice_default_is_active_but_real_default_is_legacy(monkeypatch):
+    monkeypatch.delenv("KR_SWING_US_PROFIT_MODE", raising=False)
+    monkeypatch.setenv("KIS_ENV", "practice")
+    assert verified_contract(build_new_swing_parity_contract(
+        strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
+        trade_horizon="SWING", position_action="NEW_POSITION_BUY",
+        account_id="practice:account", trading_epoch_id="epoch",
+        position_cycle_id="cycle", runner_version="US_V3", code="005930",
+    ))
+    monkeypatch.setenv("KIS_ENV", "real")
+    assert build_new_swing_parity_contract(
+        strategy_owner="PB1", exit_policy_family="SWING_STAGED_EXIT",
+        trade_horizon="SWING", position_action="NEW_POSITION_BUY",
+        account_id="real:account", trading_epoch_id="epoch",
+        position_cycle_id="cycle", runner_version="US_V3", code="005930",
+    ) is None
 
 
 def test_signed_contract_cannot_be_rewritten_or_used_as_order_authorization(monkeypatch):

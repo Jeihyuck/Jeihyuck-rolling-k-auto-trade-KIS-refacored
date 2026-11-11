@@ -18,7 +18,11 @@ from trader.db.schema import schema_for_engine
 from trader.kr.us_standard_profit_parity import STAGES, verified_contract
 
 STAGE_VERSION = "kr_pb1_tp_durable_stage_v1"
-STAGE_NAMES = tuple(s[0] for s in STAGES)
+# The US V3 runner uses two independently claimable native SELL stages.
+# RUNNER_FINAL may legitimately fire without RUNNER_PARTIAL; both require TP3.
+TP_STAGE_NAMES = tuple(s[0] for s in STAGES)
+RUNNER_STAGE_NAMES = ("PROFIT_DEFENSE_PARTIAL", "RUNNER_FINAL")
+STAGE_NAMES = TP_STAGE_NAMES + RUNNER_STAGE_NAMES
 TRANSIENT = {"PENDING", "ACK", "PARTIAL_FILLED", "UNRESOLVED"}
 
 
@@ -133,9 +137,28 @@ def reserve_tp_stage(
     key = _key(contract, stage)
     try:
         with engine.begin() as conn:
-            # Lock all three keys consistently to prevent independent workers
-            # from simultaneously claiming TP1 and TP2.
-            for prior in STAGE_NAMES[:stage_ix]:
+            # FOR UPDATE cannot lock a row that has not been inserted yet.
+            # Serialize EVERY TP/runner stage on the same account/epoch/cycle
+            # contract-scoped PostgreSQL transaction advisory lock. Otherwise
+            # runner partial and final can simultaneously claim absent rows.
+            lock_material = (
+                STAGE_VERSION + "|" + contract["account_sha256"] + "|"
+                + contract["trading_epoch_id"] + "|"
+                + contract["position_cycle_id"] + "|"
+                + contract["sha256"]
+            )
+            lock_key = int.from_bytes(
+                hashlib.sha256(lock_material.encode("utf-8")).digest()[:8],
+                byteorder="big", signed=True,
+            )
+            locked = conn.execute(
+                sa.text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_key},
+            ).scalar_one()
+            if locked is not True:
+                return StageJournalResult(False, "BLOCK", "KR_TP_JOURNAL_CONCURRENT_CLAIM")
+            # The predecessor rows are now stable within this contract.
+            for prior in TP_STAGE_NAMES[:min(stage_ix, len(TP_STAGE_NAMES))]:
                 value = conn.execute(
                     sa.select(table.c.payload).where(table.c.job_key == _key(contract, prior))
                     .with_for_update()
@@ -150,6 +173,45 @@ def reserve_tp_stage(
                     or _exact_qty(state.get("target_qty") or 0) < 1
                 ):
                     return StageJournalResult(False, "BLOCK", f"{prior}_NOT_BROKER_FILLED")
+            if stage == "PROFIT_DEFENSE_PARTIAL":
+                # Final may be claimed directly after TP3: no late partial.
+                final_raw = conn.execute(
+                    sa.select(table.c.payload).where(
+                        table.c.job_key == _key(contract, "RUNNER_FINAL")
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if final_raw is not None:
+                    return StageJournalResult(False, "BLOCK", "RUNNER_FINAL_ALREADY_CLAIMED")
+            if stage == "RUNNER_FINAL":
+                # A pending partial has reserved shares; a final liquidation
+                # must never submit for the full holding until the partial
+                # has a terminal, broker-proven fill.
+                partial_raw = conn.execute(
+                    sa.select(table.c.payload).where(
+                        table.c.job_key == _key(contract, "PROFIT_DEFENSE_PARTIAL")
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                partial = dict(partial_raw or {})
+                if partial:
+                    # Never infer broker finality merely from a FILLED label:
+                    # the durable quantity proof must exactly match the
+                    # claimed target, using strict integer shares.
+                    try:
+                        p_target = _exact_qty(partial.get("target_qty"))
+                        p_filled = _exact_qty(partial.get("cumulative_filled_qty"))
+                    except (ValueError, TypeError):
+                        return StageJournalResult(
+                            False, "BLOCK", "RUNNER_PARTIAL_FILL_INTEGRITY_INVALID",
+                        )
+                    if (
+                        partial.get("status") != "FILLED"
+                        or partial.get("broker_fill_proven") is not True
+                        or not str(partial.get("broker_odno") or "").strip()
+                        or p_target <= 0 or p_filled != p_target
+                    ):
+                        return StageJournalResult(
+                            False, "BLOCK", "RUNNER_PARTIAL_UNSETTLED",
+                        )
             conn.execute(pg_insert(table).values(
                 job_key=key, updated_ts=datetime.now(timezone.utc),
                 payload={

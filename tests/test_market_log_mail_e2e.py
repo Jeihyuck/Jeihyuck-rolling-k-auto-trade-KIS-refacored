@@ -13,7 +13,7 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
     root = tmp_path / "repo"
     (root / "scripts/wsl").mkdir(parents=True)
     (root / "scripts/notify").mkdir(parents=True)
-    for name in ("send-market-log-mail.sh", f"send-{market}-log-mail.sh"):
+    for name in ("send-market-log-mail.sh", f"send-{market}-log-mail.sh", "kr_mail_execution_evidence.py"):
         shutil.copy2(ROOT / "scripts/wsl" / name, root / "scripts/wsl" / name)
     shutil.copy2(ROOT / "scripts/notify/send_mail_attachment.py", root / "scripts/notify/send_mail_attachment.py")
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-trading-day.py", root / "scripts/wsl/check-nullim-trading-day.py")
@@ -72,6 +72,21 @@ def run_mail(root: Path, market: str, *, dry=True, trade_date: str = DATE):
 
 def members(archive):
     with tarfile.open(archive,"r:gz") as tf: return tf.getnames(), tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json").read(), tf
+
+
+
+def test_kr_mail_execution_classifier_unavailable_does_not_suppress_delivery(tmp_path):
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    (root / "scripts/wsl/kr_mail_execution_evidence.py").unlink()
+    result, archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["mail_sent"] is True
+    assert marker["daily_execution_status"] == "UNKNOWN"
+    with tarfile.open(archive, "r:gz") as tf:
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+        assert evidence["daily_execution_status"] == "UNKNOWN"
+        assert evidence["execution_summary"] == "KR_EXECUTION_CLASSIFIER_UNAVAILABLE"
 
 
 def test_kr_end_to_end_uses_canonical_paths_and_dry_run_isolated(tmp_path):

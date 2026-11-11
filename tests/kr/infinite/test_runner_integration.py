@@ -627,3 +627,48 @@ def test_certified_full_exit_does_not_restart_on_same_trade_day(armed_practice_e
     assert result.decision.action in (Action.BLOCK, Action.WAIT)
     assert len(kis.orders) == 0
     assert repo.state.cycle_id == old.cycle_id
+
+
+def test_complete_cycle_defensive_new_buy_creates_distinct_cycle(armed_practice_env):
+    """KR_INFINITE 122630 can start small in risk-off, never on old COMPLETE ID."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    prior = State(cycle_id="KRINF-OLD-COMPLETE", cycle_start_date=DAY - timedelta(days=10),
+                  last_exit_date=DAY - timedelta(days=1),
+                  status=Status.COMPLETE, allocated_capital_krw=1_200_000,
+                  unit_krw=30_000, units_used=1, core_units_used=1)
+    kis, repo = FakeKIS(fill_qty=100), FakeRepository(prior)
+    result = run_once(config=config(), kis=kis, repository=repo,
+                      regime_provider=lambda: ("KR_DEFENSE_RISK_OFF", "OK"),
+                      trade_date=DAY, kis_env="practice",
+                      now_kst_value=datetime(2026, 8, 14, 11, 0, tzinfo=ZoneInfo("Asia/Seoul")))
+    assert result.decision.action == Action.BUY
+    assert result.submitted and len(kis.orders) == 1
+    assert repo.state.cycle_id.startswith("KRINF-20260814-")
+    assert repo.state.cycle_id != prior.cycle_id
+    assert repo.intents[0].cycle_id == repo.state.cycle_id
+
+
+@pytest.mark.parametrize("regime,quality", [
+    ("KR_DEFENSE_CRASH", "OK"),
+    ("KR_SHOCK_REBOUND_PENDING", "OK"),
+    ("KR_DEFENSE_RISK_OFF", "BLOCKED"),
+])
+def test_complete_cycle_no_reentry_without_owner_market_permission(armed_practice_env, regime, quality):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    prior = State(cycle_id="KRINF-OLD-COMPLETE", cycle_start_date=DAY - timedelta(days=10),
+                  last_exit_date=DAY - timedelta(days=1),
+                  status=Status.COMPLETE, allocated_capital_krw=1_200_000,
+                  unit_krw=30_000, units_used=1, core_units_used=1)
+    kis, repo = FakeKIS(), FakeRepository(prior)
+    result = run_once(config=config(), kis=kis, repository=repo,
+                      regime_provider=lambda: (regime, quality),
+                      trade_date=DAY, kis_env="practice",
+                      now_kst_value=datetime(2026, 8, 14, 11, 0, tzinfo=ZoneInfo("Asia/Seoul")))
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "KR_INF_NEW_CYCLE_NOT_YET_ELIGIBLE"
+    assert repo.state.cycle_id == prior.cycle_id
+    assert not repo.intents and not kis.orders

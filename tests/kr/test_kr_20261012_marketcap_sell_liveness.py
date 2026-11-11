@@ -163,6 +163,25 @@ def test_prep_failure_sell_only_explicitly_disables_buy_and_force_liquidation(mo
     assert os.environ["PB1_DIAG_FULL_EXEC"] == "0"
 
 
+
+@pytest.mark.parametrize("session", ["am", "afternoon"])
+@pytest.mark.parametrize("reason", ["TRADE_DATE_MISMATCH", "ASOF_MISMATCH"])
+def test_11nov_stale_contract_still_runs_owner_protective_sell_only(
+    monkeypatch, session, reason,
+):
+    """The 11/11 PREP artifact mismatch cannot disable existing-holding SELL."""
+    from trader.kr.runner.trade_session_runner import _arm_prep_failure_protective_exit
+    monkeypatch.delenv("KR_PREP_FAILURE_PROTECT_SELL_ENABLED", raising=False)
+    assert _arm_prep_failure_protective_exit(
+        session=session, precheck={"status": "FAIL", "reason": reason}
+    ) is True
+    assert os.environ["PB1_ENTRY_ENABLED"] == "0"
+    assert os.environ["ALLOW_NEW_BUY"] == "0"
+    assert os.environ["PB1_EXIT_ONLY_MODE"] == "1"
+    assert os.environ["PB1_EXIT_ENABLED"] == "1"
+    assert os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] == "0"
+    assert os.environ["FORCE_PB1_PHASE"] == "exit"
+
 @pytest.mark.parametrize("session,reason", [
     ("close", "CANONICAL_PREP_ARTIFACT_INVALID"),
     ("am", "KIS_BALANCE_UNAVAILABLE"),

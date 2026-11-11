@@ -33,6 +33,31 @@ if [[ "$MARKET" == us ]]; then
 fi
 
 TS="$(date +%Y%m%d-%H%M%S)"
+MAIL_SCRIPT_STARTED_AT_KST="$(TZ=Asia/Seoul date -Is)"
+export NULLIM_MAIL_SCRIPT_STARTED_AT_KST="$MAIL_SCRIPT_STARTED_AT_KST"
+# This is a measured scheduler-to-WSL *script entry* lag, not proof that the
+# Windows trigger fired late. Windows TaskScheduler history resolves that.
+if [[ "$MARKET" == kr && "${NULLIM_SCHEDULER_TASK_NAME:-}" == "PB1 KR Mail WSL" ]]; then
+  export NULLIM_MAIL_SCHEDULED_KST_HHMM="${NULLIM_MAIL_SCHEDULED_KST_HHMM:-16:00}"
+  NULLIM_MAIL_START_LAG_SEC="$(python3 - "$KST_RUN_DATE" "$MAIL_SCRIPT_STARTED_AT_KST" "$NULLIM_MAIL_SCHEDULED_KST_HHMM" <<'PY_MAIL_LAG'
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+try:
+    trade, started, clock = sys.argv[1:]
+    scheduled = datetime.fromisoformat(trade + "T" + clock + ":00").replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    lag = (datetime.fromisoformat(started).astimezone(ZoneInfo("Asia/Seoul")) - scheduled).total_seconds()
+    print(max(0, int(lag)))
+except (TypeError, ValueError, IndexError):
+    print(-1)
+PY_MAIL_LAG
+)"
+  export NULLIM_MAIL_START_LAG_SEC
+  echo "[LOG_MAIL][SCHEDULE_LAG] scheduled_kst=$KST_RUN_DATE $NULLIM_MAIL_SCHEDULED_KST_HHMM actual_script_kst=$MAIL_SCRIPT_STARTED_AT_KST lag_sec=$NULLIM_MAIL_START_LAG_SEC source=WSL_ENTRY_NOT_WINDOWS_TRIGGER"
+  if [[ "$NULLIM_MAIL_START_LAG_SEC" =~ ^[0-9]+$ ]] && (( NULLIM_MAIL_START_LAG_SEC > 60 )); then
+    echo "[LOG_MAIL][LATE_START] lag_sec=$NULLIM_MAIL_START_LAG_SEC policy_threshold_sec=60 action=REPORT_AND_SEND_DEGRADED_IF_NEEDED"
+  fi
+fi
 BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"
 BRANCH="${BRANCH:-unknown}"
 BRANCH_SAFE="$(printf %s "$BRANCH" | sed 's/[^A-Za-z0-9._-]/-/g')"
@@ -60,11 +85,11 @@ fail() {
   local reason="$1" rc="${2:-1}" missing_path="${3:-}" searched_file="${4:-}" marker="$PROD_MARKER"
   [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"
   python3 - "$marker" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" "${SOURCE_SHA:-}" "${RECIPIENT:-}" <<'PY'
-import json,sys
+import json,os,sys
 from datetime import datetime,timezone
 from pathlib import Path
 p,m,d,k,r,a,count,missing,searched_file,source_sha,recipient=sys.argv[1:]
-data={'status':'UNKNOWN_AFTER_SEND' if r=='UNKNOWN_AFTER_SEND' else 'FAIL','mail_sent':None if r=='UNKNOWN_AFTER_SEND' else False,'mail_delivered':False,'mail_complete':False,'market':m,'trade_date':d,'run_date_kst':k,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+data={'status':'UNKNOWN_AFTER_SEND' if r=='UNKNOWN_AFTER_SEND' else 'FAIL','mail_sent':None if r=='UNKNOWN_AFTER_SEND' else False,'mail_delivered':False,'mail_complete':False,'market':m,'trade_date':d,'run_date_kst':k,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'daily_execution_status':os.getenv('NULLIM_MAIL_DAILY_EXECUTION_STATUS','UNKNOWN'),'mail_script_started_at_kst':os.getenv('NULLIM_MAIL_SCRIPT_STARTED_AT_KST'),'mail_start_lag_sec':int(os.getenv('NULLIM_MAIL_START_LAG_SEC','-1')),'sent_at':datetime.now(timezone.utc).isoformat()}
 if source_sha: data['source_evidence_sha256']=source_sha
 # SMTP exit 75 means the remote server may already have accepted this
 # message. Persist the original dedup identity so the next scheduled run
@@ -373,10 +398,10 @@ mkdir -p "$STAGE/$(dirname "$READINESS")"
 cp -a "$READINESS" "$STAGE/$READINESS" || fail STAGING_COPY_FAILED 1 "$READINESS"
 
 # Deterministic evidence report is part of the evidence digest and archive.
-python3 - "$STAGE/mail_evidence_report.json" "$MARKET" "$TRADE_DATE" "$EVIDENCE_STATUS" "$EXPECTED_LIST" "$INCLUDED_LIST" "$MISSING_LIST" "$SESSION_EXPECTED_COUNT" "$SESSION_PRESENT_COUNT" <<'PY'
+python3 - "$STAGE/mail_evidence_report.json" "$MARKET" "$TRADE_DATE" "$EVIDENCE_STATUS" "$EXPECTED_LIST" "$INCLUDED_LIST" "$MISSING_LIST" "$SESSION_EXPECTED_COUNT" "$SESSION_PRESENT_COUNT" "$APP/scripts/wsl" <<'PY'
 import json,sys
 from pathlib import Path
-out,market,trade,status,expected_path,included_path,missing_path,session_expected,session_present=sys.argv[1:]
+out,market,trade,status,expected_path,included_path,missing_path,session_expected,session_present,script_dir=sys.argv[1:]
 def lines(path):
     q=Path(path)
     return q.read_text().splitlines() if q.is_file() else []
@@ -437,6 +462,18 @@ if market == 'us':
         else 'CLOSE_REPORT_MISSING_OR_INVALID' if close_status == 'UNKNOWN'
         else None
     )
+if market == 'kr':
+    # Evidence classifier failures must never suppress the required mail.
+    try:
+        sys.path.insert(0, script_dir)
+        from kr_mail_execution_evidence import collect_kr_execution_status
+        data.update(collect_kr_execution_status(Path(out).parent, trade))
+    except Exception as exc:
+        data.update(
+            daily_execution_status="UNKNOWN",
+            execution_summary="KR_EXECUTION_CLASSIFIER_UNAVAILABLE",
+            execution_summary_error=type(exc).__name__,
+        )
 Path(out).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 
@@ -539,7 +576,7 @@ def parse(path):
         code,_,value=line.partition('\t'); out.append({'code':code,'path':value})
     return out
 expected=parse(expected_path); included=lines(included_path); missing=parse(missing_path)
-data={'market':market,'run_date_kst':kst,'trade_date_et':trade,'branch':branch,'commit_sha':commit,'scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_task':os.getenv('NULLIM_SCHEDULER_TASK_NAME','manual'),'archive_created_at':datetime.now(timezone.utc).isoformat(),'evidence_status':status,'required_files':[x['path'] for x in expected],'included_required_files':included,'missing_required_files':[x['path'] for x in missing],'missing_evidence':missing,'required_missing_count':len(missing),'optional_files':[],'source_evidence_sha256':source,'redaction_applied':True,'session_active_at_packaging':False,'mail_attempt_id':attempt}
+data={'market':market,'run_date_kst':kst,'trade_date_et':trade,'branch':branch,'commit_sha':commit,'scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_task':os.getenv('NULLIM_SCHEDULER_TASK_NAME','manual'),'archive_created_at':datetime.now(timezone.utc).isoformat(),'evidence_status':status,'required_files':[x['path'] for x in expected],'included_required_files':included,'missing_required_files':[x['path'] for x in missing],'missing_evidence':missing,'required_missing_count':len(missing),'optional_files':[],'source_evidence_sha256':source,'redaction_applied':True,'session_active_at_packaging':False,'mail_attempt_id':attempt,'mail_script_started_at_kst':os.getenv('NULLIM_MAIL_SCRIPT_STARTED_AT_KST'),'mail_scheduled_kst_hhmm':os.getenv('NULLIM_MAIL_SCHEDULED_KST_HHMM'),'mail_start_lag_sec':int(os.getenv('NULLIM_MAIL_START_LAG_SEC','-1'))}
 Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.txt').write_text('\n'.join(f'{k}={v}' for k,v in data.items())+'\n')
 PY
@@ -585,23 +622,36 @@ report=json.load(open(sys.argv[1],encoding='utf-8'))
 print(report.get('daily_execution_status','UNKNOWN'))
 PY_EXECUTION
 )"
+EXECUTION_SUMMARY="$(python3 - "$STAGE/mail_evidence_report.json" <<'PY_EXECUTION_SUMMARY'
+import json,sys
+report=json.load(open(sys.argv[1],encoding='utf-8'))
+print(str(report.get('execution_summary') or ''))
+PY_EXECUTION_SUMMARY
+)"
+export NULLIM_MAIL_DAILY_EXECUTION_STATUS="$DAILY_EXECUTION_STATUS"
 EXECUTION_FLAG=""
-if [[ "$MARKET" == us && "$DAILY_EXECUTION_STATUS" == FAILED ]]; then
+if [[ "$DAILY_EXECUTION_STATUS" == FAILED ]]; then
   EXECUTION_FLAG="[EXECUTION_FAILED]"
+elif [[ "$MARKET" == kr && "$DAILY_EXECUTION_STATUS" == DEGRADED ]]; then
+  EXECUTION_FLAG="[EXECUTION_DEGRADED]"
+fi
+MAIL_LATE_FLAG=""
+if [[ "$MARKET" == kr && "${NULLIM_MAIL_START_LAG_SEC:-}" =~ ^[0-9]+$ ]] && (( NULLIM_MAIL_START_LAG_SEC > 60 )); then
+  MAIL_LATE_FLAG="[LATE_START]"
 fi
 if [[ "$EVIDENCE_STATUS" == DEGRADED ]]; then
-  SUBJECT="[NULLIM][${MARKET^^}]${EXECUTION_FLAG}[DEGRADED] $TRADE_DATE trading logs"
+  SUBJECT="[NULLIM][${MARKET^^}]${MAIL_LATE_FLAG}${EXECUTION_FLAG}[DEGRADED] $TRADE_DATE trading logs"
   MISSING_SUMMARY="$(awk -F '\t' '{printf "%s%s:%s", (NR>1?", ":""), $1, $2}' "$MISSING_LIST")"
-  BODY="NULLIM ${MARKET^^} redacted log archive (DEGRADED). execution_status=${DAILY_EXECUTION_STATUS}. Missing evidence: ${MISSING_SUMMARY}"
+  BODY="NULLIM ${MARKET^^} redacted log archive (DEGRADED). execution_status=${DAILY_EXECUTION_STATUS}. ${EXECUTION_SUMMARY}. Missing evidence: ${MISSING_SUMMARY}"
 else
-  SUBJECT="[NULLIM][${MARKET^^}]${EXECUTION_FLAG} $TRADE_DATE trading logs"
-  BODY="NULLIM ${MARKET^^} verified redacted log archive. execution_status=${DAILY_EXECUTION_STATUS}"
+  SUBJECT="[NULLIM][${MARKET^^}]${MAIL_LATE_FLAG}${EXECUTION_FLAG} $TRADE_DATE trading logs"
+  BODY="NULLIM ${MARKET^^} evidence-verified redacted log archive. execution_status=${DAILY_EXECUTION_STATUS}. ${EXECUTION_SUMMARY}"
 fi
 
 mail_rc=1; attempt_count=0; message_id=""; unknown_after_send=0
 for attempt_no in 1 2 3; do
   attempt_count="$attempt_no"; MAIL_ATTEMPT_COUNT="$attempt_no"
-  echo "[LOG_MAIL][SEND_ATTEMPT] group=$ATTEMPT_GROUP attempt=$attempt_no evidence_status=$EVIDENCE_STATUS"
+  echo "[LOG_MAIL][SEND_ATTEMPT] group=$ATTEMPT_GROUP attempt=$attempt_no evidence_status=$EVIDENCE_STATUS started_at_kst=$(TZ=Asia/Seoul date -Is)"
   set +e
   mail_output="$("$APP/scripts/wsl/with-venv.sh" python "$APP/scripts/notify/send_mail_attachment.py" --subject "$SUBJECT" --body "$BODY" --attach "$OUT" --attempt-id "$ATTEMPT_GROUP" 2>&1)"
   mail_rc=$?
@@ -612,6 +662,7 @@ for attempt_no in 1 2 3; do
     break  # Never issue a second SMTP attempt after possible acceptance.
   fi
   if [[ "$mail_rc" == 0 ]]; then
+    echo "[LOG_MAIL][SMTP_ACCEPTED] market=$MARKET attempt=$attempt_no accepted_at_kst=$(TZ=Asia/Seoul date -Is)"
     message_id="$(printf '%s\n' "$mail_output" | sed -n 's/^\[MAIL\]\[MESSAGE_ID\] //p' | tail -1)"
     break
   fi
@@ -624,14 +675,14 @@ if [[ "$mail_rc" != 0 ]]; then
 fi
 
 python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$SOURCE_SHA" "$ARCHIVE_SHA" "$ATTEMPT_GROUP" "$message_id" "$RECIPIENT" "$OUT" "$attempt_count" "$EVIDENCE_STATUS" "$MISSING_LIST" <<'PY'
-import json,sys
+import json,os,sys
 from datetime import datetime,timezone
 from pathlib import Path
 p,m,d,k,source,archive,a,msg,recipient,out,count,status,missing_path=sys.argv[1:]
 missing=[]
 for line in Path(missing_path).read_text().splitlines():
     code,_,value=line.partition('\t'); missing.append({'code':code,'path':value})
-data={'status':status,'mail_sent':True,'mail_delivered':False,'delivery_status':'UNCONFIRMED_AFTER_SMTP_ACCEPT','mail_complete':status=='OK','market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':len(missing),'missing_evidence':missing,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+data={'status':status,'mail_sent':True,'mail_delivered':False,'delivery_status':'UNCONFIRMED_AFTER_SMTP_ACCEPT','mail_complete':status=='OK','market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':len(missing),'missing_evidence':missing,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'daily_execution_status':os.getenv('NULLIM_MAIL_DAILY_EXECUTION_STATUS','UNKNOWN'),'mail_script_started_at_kst':os.getenv('NULLIM_MAIL_SCRIPT_STARTED_AT_KST'),'mail_start_lag_sec':int(os.getenv('NULLIM_MAIL_START_LAG_SEC','-1')),'sent_at':datetime.now(timezone.utc).isoformat()}
 Path(p).write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
 

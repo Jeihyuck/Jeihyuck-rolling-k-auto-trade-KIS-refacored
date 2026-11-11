@@ -1,4 +1,4 @@
-"""KR PB1 new-SWING US_STANDARD TP parity, pure shadow-safe policy.
+"""KR PB1 new-SWING US_STANDARD TP parity, immutable practice policy.
 
 No broker I/O and no DB stage writes. The execution router MUST NOT submit
 an intent from this module without a separately approved, durable KR stage
@@ -45,7 +45,8 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
             or data.get("strategy_owner") != "PB1"
             or data.get("exit_policy_family") != "SWING_STAGED_EXIT"
             or data.get("trade_horizon") != "SWING"
-            or data.get("position_action") != "NEW_POSITION_BUY"
+            or data.get("position_action") not in {"NEW_POSITION_BUY", "EXPLICIT_POSITION_AMENDMENT"}
+            or data.get("activation_mode", "SHADOW") not in {"SHADOW", "ACTIVE_PRACTICE"}
             or not str(data.get("account_sha256") or "").strip()
             or not str(data.get("trading_epoch_id") or "").strip()
             or not str(data.get("position_cycle_id") or "").strip()
@@ -55,11 +56,31 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
             or data.get("stages") != [dict(stage=s[0], threshold_fraction=s[1],
                                            sell_fraction=s[2], reason=s[3]) for s in STAGES]):
         return False
+    proof = data.get("amendment_proof")
+    if data.get("position_action") == "EXPLICIT_POSITION_AMENDMENT":
+        if (
+            not isinstance(proof, Mapping)
+            or proof.get("version") != "kr_pb1_position_amendment_v1"
+            or proof.get("source") != "KIS_DAILY_CCLD_AND_FRESH_BALANCE"
+            or not str(proof.get("original_buy_odno") or "").strip()
+            or not str(proof.get("original_buy_trade_date") or "").strip()
+            or not str(proof.get("original_entry_contract_sha256") or "").strip()
+            or not isinstance(proof.get("verified_qty"), int)
+            or isinstance(proof.get("verified_qty"), bool)
+            or proof.get("verified_qty", 0) <= 0
+            or not isinstance(proof.get("verified_avg_price"), (int, float))
+            or float(proof.get("verified_avg_price") or 0) <= 0
+        ):
+            return False
+    elif proof is not None:
+        return False
     return bool(old_sha) and old_sha == _canonical_sha(data)
 
 
 def _mode() -> str:
-    value = str(os.getenv("KR_SWING_US_PROFIT_MODE", "LEGACY")).strip().upper()
+    # Approved KR practice policy is ON by default; real accounts stay LEGACY.
+    default = "ACTIVE_PRACTICE" if os.getenv("KIS_ENV", "").lower() == "practice" else "LEGACY"
+    value = str(os.getenv("KR_SWING_US_PROFIT_MODE", default)).strip().upper()
     if value not in {"LEGACY", "SHADOW", "ACTIVE_PRACTICE"}:
         raise ValueError("KR_SWING_PROFIT_MODE_INVALID")
     return value
@@ -71,6 +92,7 @@ def build_new_swing_parity_contract(
     position_action: str, account_id: str, trading_epoch_id: str,
     position_cycle_id: str, runner_version: str, code: str,
     existing_contract: Mapping[str, Any] | None = None,
+    amendment_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Only a positively identified NEW PB1 SWING can receive a new contract.
 
@@ -87,9 +109,14 @@ def build_new_swing_parity_contract(
         str(strategy_owner).upper() != "PB1"
         or str(exit_policy_family).upper() != "SWING_STAGED_EXIT"
         or str(trade_horizon).upper() != "SWING"
-        or str(position_action).upper() != "NEW_POSITION_BUY"
+        or str(position_action).upper() not in {"NEW_POSITION_BUY", "EXPLICIT_POSITION_AMENDMENT"}
     ):
         raise ValueError("KR_PROFIT_PARITY_OWNER_OR_HORIZON_UNVERIFIED")
+    if str(position_action).upper() == "EXPLICIT_POSITION_AMENDMENT":
+        if mode != "ACTIVE_PRACTICE" or not isinstance(amendment_proof, Mapping):
+            raise ValueError("KR_PROFIT_PARITY_AMENDMENT_EVIDENCE_REQUIRED")
+    elif amendment_proof is not None:
+        raise ValueError("KR_PROFIT_PARITY_NEW_BUY_MUST_NOT_INHERIT_AMENDMENT")
     if not all(str(x or "").strip() for x in
                (account_id, trading_epoch_id, position_cycle_id)):
         raise ValueError("KR_PROFIT_PARITY_LIFECYCLE_UNVERIFIED")
@@ -97,20 +124,17 @@ def build_new_swing_parity_contract(
         raise ValueError("KR_PROFIT_PARITY_RUNNER_VERSION_UNVERIFIED")
     if not (str(code).isdigit() and len(str(code)) == 6):
         raise ValueError("KR_PROFIT_PARITY_SYMBOL_UNVERIFIED")
-    if mode == "ACTIVE_PRACTICE":
-        if (os.getenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "0") != "1"
-                or os.getenv("KIS_ENV", "").lower() != "practice"):
-            raise ValueError("KR_PROFIT_PARITY_DEPLOY_NOT_APPROVED")
-        # No KR native order-router claim/submit/fill path is wired yet.
-        # An ENV approval must not make this SHADOW library appear ACTIVE.
-        # Remove this fence only with a new versioned, fully tested router.
-        raise ValueError("KR_PROFIT_PARITY_ROUTER_NOT_WIRED")
+    if mode == "ACTIVE_PRACTICE" and os.getenv("KIS_ENV", "").lower() != "practice":
+        raise ValueError("KR_PROFIT_PARITY_DEPLOY_NOT_APPROVED")
+    # A signed contract is NOT broker permission. The live PB1 exit owner
+    # must pass the existing execution claim and a durable TP stage journal.
     payload: dict[str, Any] = {
         "version": POLICY_VERSION,
         "strategy_owner": "PB1",
         "exit_policy_family": "SWING_STAGED_EXIT",
         "trade_horizon": "SWING",
-        "position_action": "NEW_POSITION_BUY",
+        "position_action": str(position_action).upper(),
+        "activation_mode": mode,
         "account_sha256": hashlib.sha256(account_id.encode("utf-8")).hexdigest(),
         "trading_epoch_id": trading_epoch_id,
         "position_cycle_id": position_cycle_id,
@@ -120,6 +144,8 @@ def build_new_swing_parity_contract(
         "stages": [dict(stage=s[0], threshold_fraction=s[1],
                         sell_fraction=s[2], reason=s[3]) for s in STAGES],
     }
+    if amendment_proof is not None:
+        payload["amendment_proof"] = dict(amendment_proof)
     if runner_version == "US_V3":
         # Snapshot the approved US V3 policy, not today's ENV at sell time.
         from trader.us.pb1.swing_runner_exit_v3 import V3_RUNNER_POLICY
@@ -217,7 +243,8 @@ def calculate_next_tp_stage(
         quantity = min(quantity, orderable)
         if quantity <= 0:
             return StageDecision("HOLD", name, reason="NOT_ENOUGH_ORDERABLE_OR_RUNNER")
-        return StageDecision("SHADOW_TP", name, quantity,
+        active = contract.get("activation_mode") == "ACTIVE_PRACTICE"
+        return StageDecision("ACTIVE_TP" if active else "SHADOW_TP", name, quantity,
                              reason="REQUIRES_KR_DURABLE_BROKER_STAGE_GATE",
                              order_authorized=False)
     return StageDecision("RUNNER", reason="ALL_TP_STAGES_PROVEN_FILLED")
