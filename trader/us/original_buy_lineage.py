@@ -17,16 +17,21 @@ logger = logging.getLogger(__name__)
 
 
 
-def _exact_positive_shares(raw: Any) -> int | None:
-    """No fractional/boolean/coerced broker quantities at an identity boundary."""
+def _exact_nonnegative_shares(raw: Any) -> int | None:
+    """Strict share proof: reject bool, float, fractional strings and negatives."""
     if isinstance(raw, bool):
         return None
     if isinstance(raw, int):
-        return raw if raw > 0 else None
+        return raw if raw >= 0 else None
     if isinstance(raw, str) and raw.isascii() and raw.isdecimal():
-        number = int(raw)
-        return number if number > 0 else None
+        return int(raw)
     return None
+
+
+def _exact_positive_shares(raw: Any) -> int | None:
+    """Strict positive share proof; never truncate broker evidence."""
+    number = _exact_nonnegative_shares(raw)
+    return number if number is not None and number > 0 else None
 
 def select_verified_us_original_buy_scope(
     rows: list[dict], *, symbol: str, qty: int, identity: dict[str, str],
@@ -57,15 +62,16 @@ def select_verified_us_original_buy_scope(
         cycle = str(row.get("position_cycle_id") or "")
         portfolio = str(row.get("portfolio_epoch_id") or "")
         contract = order_meta.get("entry_exit_contract")
-        try:
-            filled = int(row.get("fill_qty") or 0)
-            requested = int(row.get("order_qty") or 0)
-            intended = int(row.get("intent_qty") or 0)
-            cumulative = int(fill_meta.get("cumulative_filled_qty") or 0)
-            pre_order_qty = int(order_meta.get("pre_order_holding_qty"))
-            order_filled = int(row.get("order_filled") if row.get("order_filled") is not None else filled)
-            order_status = str(row.get("order_status") or ("FILLED" if filled == requested else "PARTIALLY_FILLED")).upper()
-        except (TypeError, ValueError):
+        # The source row is part of immutable broker evidence. Never infer
+        # missing order status/fill counts or truncate float/boolean values.
+        filled = _exact_positive_shares(row.get("fill_qty"))
+        requested = _exact_positive_shares(row.get("order_qty"))
+        intended = _exact_positive_shares(row.get("intent_qty"))
+        cumulative = _exact_positive_shares(fill_meta.get("cumulative_filled_qty"))
+        pre_order_qty = _exact_nonnegative_shares(order_meta.get("pre_order_holding_qty"))
+        order_filled = _exact_positive_shares(row.get("order_filled"))
+        order_status = str(row.get("order_status") or "").strip().upper()
+        if None in (filled, requested, intended, cumulative, pre_order_qty, order_filled):
             continue
         if not (
             row.get("symbol") == symbol
