@@ -5747,7 +5747,9 @@ def mark_order_filled_by_reconcile(
             order_params["active_epoch_id"] = active_epoch_id
         rows = conn.execute(text("""
             SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
-                   account_id, portfolio_epoch_id, position_cycle_id,
+                   to_jsonb(us_orders)->>'account_id' AS account_id,
+                   to_jsonb(us_orders)->>'portfolio_epoch_id' AS portfolio_epoch_id,
+                   to_jsonb(us_orders)->>'position_cycle_id' AS position_cycle_id,
                    qty_requested, qty_filled""" + epoch_select + """
             FROM us_orders WHERE trade_date=:td AND
               ((:order_no <> '' AND order_no=:order_no) OR
