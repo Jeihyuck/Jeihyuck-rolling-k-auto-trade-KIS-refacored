@@ -218,3 +218,36 @@ def test_cross_owner_sell_fence_distinguishes_proven_pre_http_error(
         "kis_odno": broker, "broker_order_id": None,
         "submitted_at": submitted, "acked_at": None,
     }) is expected
+
+def test_diagnostic_or_pretrade_denied_never_claims_durable_tp_intent():
+    """Only an armed, non-diagnostic session may create a native TP SELL claim."""
+    permitted = router.active_tp_durable_intent_permitted
+    assert permitted(dry_run=False, intended_live=True, force_block_live=False) is True
+    assert permitted(dry_run=True, intended_live=True, force_block_live=False) is False
+    assert permitted(dry_run=False, intended_live=False, force_block_live=False) is False
+    assert permitted(dry_run=False, intended_live=True, force_block_live=True) is False
+
+
+def test_unresolved_sell_fence_ignores_only_broker_free_pre_http_errors():
+    """No ACK, missing submit evidence, or ambiguous ERROR may bypass SELL dedupe."""
+    row = {
+        "status": "ERROR",
+        "response_json": {
+            "rt_cd": "KR_US_TP_STAGE_NOT_DURABLE",
+            "broker_submit": False,
+        },
+        "kis_odno": None, "broker_order_id": None,
+        "submitted_at": None, "acked_at": None,
+    }
+    assert router._unresolved_sell_row(row) is False
+    assert router._unresolved_sell_row({**row, "response_json": {
+        "rt_cd": "KR_US_TP_STAGE_NOT_DURABLE",
+    }}) is True
+    assert router._unresolved_sell_row({**row, "response_json": {
+        "rt_cd": "HTTP_TIMEOUT", "broker_submit": False,
+    }}) is True
+    assert router._unresolved_sell_row({**row, "kis_odno": "00000099"}) is True
+    assert router._unresolved_sell_row({**row, "submitted_at": "2026-11-11T15:10:00Z"}) is True
+    assert router._unresolved_sell_row({**row, "status": "ACK"}) is True
+    assert router._unresolved_sell_row({**row, "status": "PARTIAL_FILLED"}) is True
+    assert router._unresolved_sell_row({**row, "status": "FILLED"}) is False
