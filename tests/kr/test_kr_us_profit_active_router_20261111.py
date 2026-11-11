@@ -195,6 +195,8 @@ def test_active_tp_no_intent_preflight_precedes_native_sell_row():
                "broker_submit": False}, None, None, False),
     ("ERROR", {"rt_cd": "KR_US_TP_STAGE_NOT_DURABLE",
                "broker_submit": False}, None, None, False),
+    ("ERROR", {"rt_cd": "KR_US_TP_PRETRADE_DENIED",
+               "broker_submit": False}, None, None, False),
     ("ERROR", {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE",
                "broker_submit": False}, None, None, False),
     ("ERROR", {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE",

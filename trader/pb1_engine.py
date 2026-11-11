@@ -14650,6 +14650,15 @@ class PB1Engine:
             client_order_key=client_key,
             stage=stage,
         ):
+            if _kr_us_tp_context is not None:
+                # Pretrade may become false between the preliminary and
+                # final check. This exact CREATED row was never sent to KIS.
+                # Persist the positive pre-HTTP negative proof; it must not
+                # block later cross-owner SELLs as an unresolved broker order.
+                self.orders_repo.mark_error(
+                    self.env, client_key,
+                    {"rt_cd": "KR_US_TP_PRETRADE_DENIED", "broker_submit": False},
+                )
             if profit_capture_stage:
                 self.positions_repo.update_position_fields(
                     env=self.env, strategy=self.STRATEGY_NAME, sid=sid, mode=mode, code=code,
