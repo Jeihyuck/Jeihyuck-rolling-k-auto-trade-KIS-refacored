@@ -40,6 +40,7 @@ def frozen_kr_profit_contract(position: Mapping[str, Any]) -> dict | None:
 
 def evaluate_active_kr_tp(
     *, position: Mapping[str, Any], engine: Any, kis: Any, env: str, code: str,
+    balance_snapshot: Any,
 ) -> dict | None:
     """Return None only for a position with no ACTIVE frozen parity policy.
 
@@ -88,6 +89,31 @@ def evaluate_active_kr_tp(
         qty, orderable = int(qty), int(orderable)
         if qty <= 0 or orderable <= 0 or orderable > qty or qty != int(position.get("qty") or -1):
             return block("KR_TP_KIS_DB_QTY_MISMATCH")
+        # The immutable BUY contract is not sufficient: compare the current
+        # broker balance avg, qty and orderable shares to DB every exit tick.
+        from trader.execution_state import BalanceFreshness
+        from datetime import datetime, timezone
+        if (
+            balance_snapshot is None
+            or getattr(balance_snapshot, "freshness", None) != BalanceFreshness.FRESH
+            or not callable(getattr(balance_snapshot, "position", None))
+        ):
+            return block("KR_TP_KIS_BALANCE_NOT_FRESH")
+        acquired_at = balance_snapshot.fetched_at
+        if acquired_at.tzinfo is None or (
+            datetime.now(timezone.utc) - acquired_at.astimezone(timezone.utc)
+        ).total_seconds() > 180:
+            return block("KR_TP_KIS_BALANCE_TOO_OLD")
+        broker = balance_snapshot.position(code)
+        broker_avg = float(broker.avg_price or 0)
+        db_avg = float(position.get("avg_buy_price") or 0)
+        if (
+            broker.qty != qty or broker.orderable_qty != orderable
+            or broker_avg <= 0 or not math.isfinite(broker_avg)
+            or not math.isfinite(db_avg) or db_avg <= 0
+            or abs(broker_avg - db_avg) / broker_avg > 0.005
+        ):
+            return block("KR_TP_KIS_AVG_OR_QTY_MISMATCH")
         account = get_account_key(env=env, kis=kis)
         if hashlib.sha256(str(account).encode("utf-8")).hexdigest() != contract["account_sha256"]:
             return block("KR_TP_ACCOUNT_MISMATCH")
@@ -103,7 +129,7 @@ def evaluate_active_kr_tp(
         px = px or snapshot.get("stck_prpr") or snapshot.get("prpr") or snapshot.get("last")
         px = px or raw.get("bidp1") or raw.get("stck_prpr")
         price = float(px or 0)
-        basis = float(position.get("avg_buy_price") or 0)
+        basis = broker_avg
         if not math.isfinite(price) or price <= 0 or not math.isfinite(basis) or basis <= 0:
             return block("KR_TP_PRICE_OR_BASIS_UNVERIFIED")
         states = load_frozen_stage_states(
@@ -121,6 +147,7 @@ def evaluate_active_kr_tp(
             "account_id": str(account), "epoch_id": str(epoch),
             "position_cycle_id": cycle, "code": str(code).zfill(6),
             "fresh_bid_or_last": price, "verified_entry_price": basis,
+            "balance_snapshot_id": balance_snapshot.snapshot_id,
         }
     except Exception as exc:
         return block("KR_TP_EVIDENCE_UNAVAILABLE:" + type(exc).__name__)

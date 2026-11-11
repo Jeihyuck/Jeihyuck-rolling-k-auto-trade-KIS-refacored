@@ -13681,6 +13681,7 @@ class PB1Engine:
                 _kr_candidate = evaluate_active_kr_tp(
                     position=pos, engine=self.orders_repo.engine,
                     kis=self.kis, env=self.env, code=code,
+                    balance_snapshot=self._authoritative_balance,
                 )
                 if _kr_candidate is not None:
                     _kr_us_tp_contract_active = True

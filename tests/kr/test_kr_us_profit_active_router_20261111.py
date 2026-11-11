@@ -1,5 +1,25 @@
 """Practice KR US TP router contract evidence, owner isolation and fail-closed tests."""
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import pytest
+
+from trader.execution_state import BrokerPosition, BalanceFreshness
+
+
+@dataclass
+class FakeBalance:
+    snapshot_id: str = "kis-snapshot"
+    fetched_at: datetime = datetime.now(timezone.utc)
+    freshness: BalanceFreshness = BalanceFreshness.FRESH
+    broker_qty: int = 100
+    broker_orderable: int = 100
+    broker_avg: float = 100
+
+    def position(self, code):
+        return BrokerPosition(
+            qty=self.broker_qty, orderable_qty=self.broker_orderable,
+            avg_price=self.broker_avg,
+        )
 
 from trader.kr.us_standard_profit_parity import build_new_swing_parity_contract
 from trader.kr import us_profit_execution_router as router
@@ -50,6 +70,7 @@ def test_tp1_at_9pct_is_sequential_only(monkeypatch):
     kis = FakeKis()
     result = router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=kis, env="practice", code="005930",
+        balance_snapshot=FakeBalance(),
     )
     assert result["action"] == "ACTIVE_TP"
     assert result["stage"] == "TP1" and result["qty"] == 25
@@ -65,6 +86,7 @@ def test_unresolved_tp1_never_advances_or_submits(monkeypatch):
     })
     result = router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=FakeKis(), env="practice", code="005930",
+        balance_snapshot=FakeBalance(),
     )
     assert result["action"] == "BLOCK" and result["stage"] == "TP1"
 
@@ -82,6 +104,7 @@ def test_owner_cycle_and_kis_holdings_fence(monkeypatch, mutated, reason):
     pos.update(mutated)
     out = router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=FakeKis(), env="practice", code="005930",
+        balance_snapshot=FakeBalance(),
     )
     assert out["action"] == "BLOCK" and out["reason"] == reason
 
@@ -90,12 +113,13 @@ def test_missing_price_or_stage_db_fails_closed(monkeypatch):
     pos = setup_contract(monkeypatch)
     out = router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=FakeKis(quote={}),
-        env="practice", code="005930",
+        env="practice", code="005930", balance_snapshot=FakeBalance(),
     )
     assert out["action"] == "BLOCK"
     monkeypatch.setattr(router, "load_frozen_stage_states", lambda **kw: (_ for _ in ()).throw(TimeoutError()))
     out = router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=FakeKis(), env="practice", code="005930",
+        balance_snapshot=FakeBalance(),
     )
     assert out["action"] == "BLOCK" and "EVIDENCE_UNAVAILABLE" in out["reason"]
 
@@ -105,8 +129,10 @@ def test_legacy_and_shadow_do_not_create_active_order(monkeypatch):
     pos["position_meta"]["kr_us_profit_contract"]["activation_mode"] = "SHADOW"
     assert router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=FakeKis(), env="practice", code="005930",
+        balance_snapshot=FakeBalance(),
     ) is None
     pos["position_meta"] = {}
     assert router.evaluate_active_kr_tp(
         position=pos, engine=object(), kis=FakeKis(), env="practice", code="005930",
+        balance_snapshot=FakeBalance(),
     ) is None
