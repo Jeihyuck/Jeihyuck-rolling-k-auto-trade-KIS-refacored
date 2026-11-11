@@ -74,6 +74,21 @@ def members(archive):
     with tarfile.open(archive,"r:gz") as tf: return tf.getnames(), tf.extractfile("./NULLIM_LOG_ARCHIVE_MANIFEST.json").read(), tf
 
 
+
+def test_kr_mail_execution_classifier_unavailable_does_not_suppress_delivery(tmp_path):
+    root = fixture_repo(tmp_path, "kr", smtp_mode="success")
+    (root / "scripts/wsl/kr_mail_execution_evidence.py").unlink()
+    result, archive = run_mail(root, "kr", dry=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    marker = json.loads((root / f"runtime/health/kr-mail-{DATE}.json").read_text())
+    assert marker["mail_sent"] is True
+    assert marker["daily_execution_status"] == "UNKNOWN"
+    with tarfile.open(archive, "r:gz") as tf:
+        evidence = json.load(tf.extractfile("./mail_evidence_report.json"))
+        assert evidence["daily_execution_status"] == "UNKNOWN"
+        assert evidence["execution_summary"] == "KR_EXECUTION_CLASSIFIER_UNAVAILABLE"
+
+
 def test_kr_end_to_end_uses_canonical_paths_and_dry_run_isolated(tmp_path):
     root=fixture_repo(tmp_path,"kr")
     result,archive=run_mail(root,"kr")
