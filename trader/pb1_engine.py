@@ -13487,6 +13487,8 @@ class PB1Engine:
         _max_pnl = float((pos.get("position_meta") or {}).get("max_pnl_pct_since_entry") or 0.0)
         _max_pnl = max(_max_pnl, ret_pct)
         regime_str = str(getattr(self, "_regime", None) or "")
+        _kr_us_tp_context: dict[str, Any] | None = None
+        _kr_us_tp_contract_active = False
 
         # holding_minutes 계산 (당일 보유 시간)
         _holding_minutes: float = 0.0
@@ -13663,6 +13665,72 @@ class PB1Engine:
                         })
                         _paper_stop36_signal = True
 
+            # PR #328 active KR PB1 SWING policy. Hard/soft risk sells and
+            # explicitly stronger protective exits retain priority. Existing
+            # positions with v1 or Kakao adoption are not reinterpreted.
+            if (
+                self.env == "practice"
+                and self.STRATEGY_NAME == "pb1_pullback_close"
+                and exit_policy_family == "SWING_STAGED_EXIT"
+                and position_book == "SWING_BOOK"
+                and not _policy_missing_contract
+                and not _policy_adoption_active
+                and code != "122630"
+            ):
+                from trader.kr.us_profit_execution_router import evaluate_active_kr_tp
+                _kr_candidate = evaluate_active_kr_tp(
+                    position=pos, engine=self.orders_repo.engine,
+                    kis=self.kis, env=self.env, code=code,
+                )
+                if _kr_candidate is not None:
+                    _kr_us_tp_contract_active = True
+                    _safety_exit = bool(
+                        stop_hit or trail_hit or ma20_break or ma50_break
+                        or risk_off_hit or time_stop_hit
+                        or str(final_reason or "").upper() in {
+                            "EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK",
+                            "EXIT_MA50_BREAK", "EXIT_FORCE_EOD",
+                            "KR_PB1_SOFT_STOP_3PCT",
+                        }
+                        or _paper_stop36_signal
+                    )
+                    if _safety_exit:
+                        logger.info(
+                            "[KR_PROFIT_PARITY][SAFETY_PRIORITY] code=%s reason=%s",
+                            code, final_reason,
+                        )
+                    elif _kr_candidate["action"] == "ACTIVE_TP":
+                        _kr_us_tp_context = _kr_candidate
+                        _tp_reason = "KR_TAKE_PROFIT_" + str(_kr_candidate["stage"])
+                        horizon_result = {
+                            "exit_ok": True, "reason": _tp_reason,
+                            "qty": int(_kr_candidate["qty"]),
+                            "sell_pct": None, "full_exit": False,
+                        }
+                        final_reason = _tp_reason
+                        ordered_reasons = [_tp_reason]
+                        exit_policy = {**exit_policy, "exit_ok": True, "final_reason": _tp_reason}
+                        logger.info(
+                            "[KR_PROFIT_PARITY][ACTIVE_TP] code=%s stage=%s qty=%s "
+                            "contract_sha=%s price=%s",
+                            code, _kr_candidate["stage"], _kr_candidate["qty"],
+                            _kr_candidate["contract"]["sha256"],
+                            _kr_candidate["fresh_bid_or_last"],
+                        )
+                    else:
+                        # Do not fall back to legacy R or unproven global TP.
+                        _tp_hold_reason = "KR_PROFIT_PARITY_" + str(
+                            _kr_candidate.get("reason") or _kr_candidate["action"]
+                        )
+                        horizon_result = {"exit_ok": False, "reason": _tp_hold_reason, "qty": 0}
+                        final_reason = _tp_hold_reason
+                        ordered_reasons = [final_reason]
+                        exit_policy = {**exit_policy, "exit_ok": False, "final_reason": final_reason}
+                        logger.warning(
+                            "[KR_PROFIT_PARITY][NO_TP] code=%s action=%s reason=%s",
+                            code, _kr_candidate["action"], _kr_candidate.get("reason"),
+                        )
+
             if horizon_result is not None:
                 _router_qty = int(horizon_result.get("qty", 0))
                 _router_full_exit = bool(horizon_result.get("full_exit", False))
@@ -13716,7 +13784,7 @@ class PB1Engine:
                 _router_sell_pct = None
 
         signal_hit = bool(stop_hit or trail_hit or ma20_break or ma50_break or time_stop_hit or risk_off_hit
-                          or _paper_stop36_signal)
+                          or _paper_stop36_signal or _kr_us_tp_context)
         eval_reason = final_reason if (signal_hit or _policy_missing_contract) else "NO_EXIT_SIGNAL"
 
         entry_exit_plan = pos.get("entry_exit_plan_json")
@@ -13807,7 +13875,7 @@ class PB1Engine:
                 if kr_trim:
                     trimmed_this_tick.add(code)
                     self._kr_defense_trim_symbols_this_tick = trimmed_this_tick
-                kr_tp = [] if kr_trim else generate_kr_profit_capture_intents([pos_for_overlay], overlay)
+                kr_tp = [] if (kr_trim or _kr_us_tp_contract_active) else generate_kr_profit_capture_intents([pos_for_overlay], overlay)
                 kr_intent = (kr_trim or kr_tp or [None])[0]
                 if kr_intent:
                     final_reason = str(kr_intent.get("reason") or final_reason)
@@ -14193,6 +14261,10 @@ class PB1Engine:
         orderable_qty = sell_qty
 
         stage = policy_exit_stage
+        if _kr_us_tp_context is not None:
+            # A unique same-day key per stage, even after a process restart.
+            stage = "KR_US_" + str(_kr_us_tp_context["stage"])
+            client_key = self._client_order_key(code, mode, "SELL", window_tag, stage)
         reason_family = normalize_sell_reason_family(exit_reason)
         execution_action = f"SELL:{reason_family}:{stage}"
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
@@ -14422,6 +14494,12 @@ class PB1Engine:
                               "semantic_action": execution_action,
                               "execution_meta_update": exit_execution_meta_update,
                               "profit_capture_stage": profit_capture_stage,
+                              **({
+                                  "kr_us_tp_contract": _kr_us_tp_context["contract"],
+                                  "kr_us_tp_stage": _kr_us_tp_context["stage"],
+                                  "kr_us_tp_trade_date": self._now_kst.date().isoformat(),
+                                  "kr_us_tp_verified_bid": _kr_us_tp_context["fresh_bid_or_last"],
+                              } if _kr_us_tp_context else {}),
                               "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
                               "exit_stage": stage,
                               "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
@@ -14585,6 +14663,49 @@ class PB1Engine:
             exit_eval_payload["order_result"] = "EXECUTION_ACTION_ALREADY_CLAIMED"
             exit_eval_payload["order_skip_reasons"] = ["EXECUTION_ACTION_ALREADY_CLAIMED"]
             return exit_eval_payload
+
+        if _kr_us_tp_context is not None:
+            from trader.kr.us_profit_stage_journal import (
+                reserve_tp_stage, load_frozen_stage_states,
+            )
+            _tp_scope = _kr_us_tp_context
+            _tp_kwargs = {
+                "engine": self.orders_repo.engine,
+                "contract": _tp_scope["contract"],
+                "account_id": _tp_scope["account_id"],
+                "trading_epoch_id": _tp_scope["epoch_id"],
+                "position_cycle_id": _tp_scope["position_cycle_id"],
+                "code": code,
+            }
+            _tp_claim = reserve_tp_stage(
+                **_tp_kwargs, stage=_tp_scope["stage"],
+                target_qty=orderable_qty, client_order_key=client_key,
+                trade_date=self._now_kst.date(),
+            )
+            _tp_claim_ok = _tp_claim.accepted
+            if _tp_claim_ok:
+                try:
+                    _readback = load_frozen_stage_states(**_tp_kwargs)
+                    _saved = _readback[_tp_scope["stage"]]
+                    _tp_claim_ok = (
+                        _saved.get("status") == "PENDING"
+                        and _saved.get("client_order_key") == client_key
+                        and int(_saved.get("target_qty") or 0) == orderable_qty
+                    )
+                except Exception:
+                    _tp_claim_ok = False
+            if not _tp_claim_ok:
+                # No KIS call without BOTH native execution claim and TP journal.
+                # The existing claim is released as positively pre-HTTP only.
+                self.orders_repo.mark_error(
+                    self.env, client_key,
+                    {"rt_cd": "KR_US_TP_STAGE_NOT_DURABLE", "broker_submit": False},
+                )
+                self.orders_repo.release_execution_claim_before_submit_for_order(client_key)
+                exit_eval_payload["order_result"] = "KR_US_TP_STAGE_NOT_DURABLE"
+                exit_eval_payload["order_skip_reasons"] = [_tp_claim.reason]
+                exit_eval_payload["reconcile_required"] = 1
+                return exit_eval_payload
 
         exit_eval_payload["submit_attempted"] = 1
         emit_event(
