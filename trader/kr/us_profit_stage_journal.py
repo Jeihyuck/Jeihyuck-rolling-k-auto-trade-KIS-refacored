@@ -154,6 +154,15 @@ def reserve_tp_stage(
                     or _exact_qty(state.get("target_qty") or 0) < 1
                 ):
                     return StageJournalResult(False, "BLOCK", f"{prior}_NOT_BROKER_FILLED")
+            if stage == "PROFIT_DEFENSE_PARTIAL":
+                # Final may be claimed directly after TP3: no late partial.
+                final_raw = conn.execute(
+                    sa.select(table.c.payload).where(
+                        table.c.job_key == _key(contract, "RUNNER_FINAL")
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if final_raw is not None:
+                    return StageJournalResult(False, "BLOCK", "RUNNER_FINAL_ALREADY_CLAIMED")
             if stage == "RUNNER_FINAL":
                 # A pending partial has reserved shares; a final liquidation
                 # must never submit for the full holding until the partial
