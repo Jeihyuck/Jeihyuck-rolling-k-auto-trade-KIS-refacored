@@ -2608,12 +2608,13 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(pg_eng
                 env TEXT NOT NULL,
                 account_id TEXT NOT NULL,
                 status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'CI_ORIGINAL_BUY_SCOPE',
                 started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
         conn.execute(text("""
-            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status)
-            VALUES (:epoch,'practice',:account,'ACTIVE')
+            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status,reason)
+            VALUES (:epoch,'practice',:account,'ACTIVE','CI_ORIGINAL_BUY_SCOPE')
             ON CONFLICT(trading_epoch_id) DO UPDATE SET
                 account_id=EXCLUDED.account_id,status='ACTIVE'
         """), {"epoch": epoch, "account": account})
