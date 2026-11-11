@@ -1528,6 +1528,14 @@ def route_order(
             "intent": intent,
         }
 
+    # The nine original October 2026 V2 holdings pre-date the canonical
+    # portfolio_epoch schema. Their archived BUY cannot be retroactively
+    # scoped. A broker-proven, forward-only SELL management identity is
+    # permitted only with exact KIS original fills, current balance/order
+    # proof, TP-stage state and one account/epoch, BEFORE saving the intent.
+    # No owner (including TQQQ Infinite) or normal BUY gets this exception.
+    _legacy_nine_auto_sell_proof = None
+
     # Production US_STANDARD writes must have ORIGINAL account + owner-specific
     # Portfolio Epoch + position-cycle provenance before even saving an Intent.
     # Other owners (notably TQQQ Infinite) retain their dedicated route/contract.
@@ -1547,12 +1555,92 @@ def route_order(
             _env = _kis_env()
             with _identity_engine.connect() as _identity_conn:
                 _epoch = _active_us_epoch(_identity_conn, required=True)
+                _raw_account_key = get_account_key(env=_env)
+                _legacy_nine_applicable = (
+                    side == "SELL"
+                    and _env == "practice"
+                    and os.getenv("DRY_RUN","1").strip().lower()
+                        in {"0","false","no","off"}
+                    and str(intent.get("symbol") or "").upper() in {
+                        "ABBV", "DHR", "HCA", "KO", "KR", "MCK",
+                        "PFE", "PG", "TMO",
+                    }
+                )
+                if _legacy_nine_applicable:
+                    # The regular router initializes the native KIS client
+                    # much later (after risk gates). Legacy verification is
+                    # intentionally pre-intent, so initialize it here once.
+                    if kis_client is None:
+                        from trader.us.execution.kis_us_client import KisUSClient
+                        kis_client = KisUSClient(env=_env)
+                    from trader.us.execution.us_legacy_nine_active_sell import (
+                        prove_and_bind_legacy_nine_sell,
+                    )
+                    _verified, _legacy_reason, _legacy_proof = (
+                        prove_and_bind_legacy_nine_sell(
+                            intent, conn=_identity_conn,
+                            kis_client=kis_client, trade_date=str(trade_date),
+                            env=_env, raw_account=_raw_account_key,
+                            active_epoch=str(_epoch or ""),
+                        )
+                    )
+                    if _verified:
+                        _legacy_nine_auto_sell_proof = _legacy_proof
+                        logger.info(
+                            "[US_LEGACY_NINE][AUTO_SELL][AUTHORIZED] symbol=%s "
+                            "source=KIS_ORIGINAL_AND_FRESH_CURRENT scope=FORWARD_ONLY_V2 "
+                            "automated_sell_authorized=true", symbol_upper,
+                        )
+                    elif _legacy_reason != "NOT_AN_UNSCOPED_LEGACY_POSITION":
+                        # Do NOT silently fall back to the normal router if a
+                        # legacy account/owner/fill/balance/original order proof
+                        # failed. That would rebind an old BUY to a new epoch.
+                        raise RuntimeError(
+                            "US_LEGACY_AUTO_SELL_UNVERIFIED:" + _legacy_reason
+                        )
                 bind_original_us_order_scope(
                     intent, conn=_identity_conn, env=_env,
-                    account_key=get_account_key(env=_env),
+                    account_key=_raw_account_key,
                     trading_epoch_id=str(_epoch or ""),
                 )
             meta = intent["meta"]
+            if meta.get("legacy_nine_tp_pending_deferred") is True:
+                # Durable TP stage still belongs to the archived original
+                # V2 holding lifecycle. Never create PENDING before complete
+                # KIS proof: a failed historical GET would otherwise strand
+                # the position and stop subsequent automatic TPs.
+                _source = str(meta.get("source_original_runtime_lifecycle_id") or "")
+                _stage = str(meta.get("profit_capture_stage") or "").lower()
+                if (
+                    _legacy_nine_auto_sell_proof is None
+                    or intent.get("automated_sell_authorized") is not True
+                    or _source != _legacy_nine_auto_sell_proof["source_cycle"]
+                    or _stage not in {"tp1", "tp2", "tp3"}
+                    or not str(order_key or "").startswith("US_PC_")
+                    or f"_{symbol_upper}_{_source}_" not in str(order_key or "")
+                ):
+                    raise RuntimeError("US_LEGACY_TP_DEFERRED_WITHOUT_KIS_PROOF")
+                from trader.us.db.repos import (
+                    load_us_profit_capture_state, mark_us_profit_capture_stage,
+                )
+                _prior = load_us_profit_capture_state(
+                    str(trade_date), [symbol_upper], {symbol_upper: _source},
+                ).get(symbol_upper) or {}
+                if _prior.get(f"{_stage}_done") or _prior.get(f"{_stage}_pending"):
+                    raise RuntimeError("US_LEGACY_TP_STAGE_ALREADY_PENDING_OR_COMPLETE")
+                mark_us_profit_capture_stage(
+                    str(trade_date), symbol_upper, _stage,
+                    position_lifecycle_id=_source, order_key=str(order_key),
+                    qty=qty, notional_usd=qty * price, status="PENDING",
+                )
+                _saved = load_us_profit_capture_state(
+                    str(trade_date), [symbol_upper], {symbol_upper: _source},
+                ).get(symbol_upper) or {}
+                if (
+                    _saved.get(f"{_stage}_pending") is not True
+                    or _saved.get(f"{_stage}_order_key") != str(order_key)
+                ):
+                    raise RuntimeError("US_LEGACY_TP_PENDING_NOT_DURABLE")
         except Exception as exc:
             logger.error(
                 "[US_ORDER][ORIGINAL_RECOVERY_SCOPE_FENCED] symbol=%s "
@@ -2711,6 +2799,20 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_STAGE4_WRITER_FENCED_BEFORE_HTTP"
                 ) from _final_stage4_exc
+        if _legacy_nine_auto_sell_proof is not None:
+            # AFTER claim/outbox persistence and worker authority, BEFORE
+            # the native KIS HTTP and final TP quote/claim fence.
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                recheck_legacy_nine_sell_before_http,
+            )
+            _legacy_ok, _legacy_why = recheck_legacy_nine_sell_before_http(
+                intent, kis_client=kis_client,
+                proof=_legacy_nine_auto_sell_proof, qty=qty,
+            )
+            if not _legacy_ok:
+                raise KisUSPreSubmitError(
+                    "US_LEGACY_NINE_PRE_HTTP_KIS_FENCED:" + _legacy_why
+                )
         # Price and stage were evaluated earlier in the Tick. If Stage4,
         # database or rate-limit delays made that TP decision obsolete,
         # abort strictly BEFORE KIS HTTP. The proven-unsent journal/claim
@@ -3003,13 +3105,17 @@ def route_order(
                     and tp_stage in {"tp1", "tp2", "tp3"}):
                 try:
                     from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                    from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                    _tp_ledger_cycle = tp_stage_lifecycle_from_order_proof(
+                        str(intent.get("position_lifecycle_id")
+                            or (intent.get("meta") or {}).get("position_lifecycle_id") or ""),
+                        intent.get("meta"),
+                        client_order_key=str(order_key or ""),
+                    )
                     restored = release_us_profit_capture_pre_http_abort(
                         trade_date=str(trade_date or ""),
                         symbol=symbol_upper, stage=tp_stage,
-                        position_lifecycle_id=str(
-                            intent.get("position_lifecycle_id")
-                            or (intent.get("meta") or {}).get("position_lifecycle_id") or ""
-                        ),
+                        position_lifecycle_id=_tp_ledger_cycle,
                         client_order_key=str(order_key or ""),
                     )
                     if not restored:

@@ -2274,6 +2274,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
             sync_profit_capture_stage_from_order(trade_date=td, symbol=symbol,
                 position_lifecycle_id=str(order_meta.get("position_lifecycle_id") or ""),
+                order_meta=order_meta,
                 client_order_key=key, broker_order_no=raw_order_no,
                 profit_capture_stage=str(order_meta.get("profit_capture_stage")),
                 order_status=status, evidence_type=evidence_type, filled_qty=filled_qty_value,
@@ -5722,6 +5723,7 @@ def mark_order_filled_by_reconcile(
             sync_profit_capture_stage_from_order(
                 trade_date=td, symbol=sym,
                 position_lifecycle_id=str(order_meta.get("position_lifecycle_id") or ""),
+                order_meta=order_meta,
                 client_order_key=cok or str(order.get("client_order_key") or ""),
                 broker_order_no=on, profit_capture_stage=str(order_meta.get("profit_capture_stage")),
                 order_status=status, evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
@@ -6101,6 +6103,7 @@ def mark_order_filled_by_reconcile(
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
             sync_profit_capture_stage_from_order(
                 trade_date=td, symbol=sym, position_lifecycle_id=str(merged.get("position_lifecycle_id") or ""),
+                order_meta=merged,
                 client_order_key=resolved_client_order_key, broker_order_no=on,
                 profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
                 evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,

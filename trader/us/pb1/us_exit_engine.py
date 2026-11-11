@@ -1459,6 +1459,18 @@ def _evaluate_exit_intents_from_snapshots(
     hold_count = 0
     from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
     for pos in snapshots or []:
+        # The original BUY-time V2 policy was already verified by DB and
+        # is restored ONLY for the in-memory exit decision. Router still
+        # needs independent authenticated KIS proof to issue the SELL.
+        try:
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                enrich_legacy_nine_v2_decision_position,
+            )
+            pos = enrich_legacy_nine_v2_decision_position(
+                pos, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
+            )
+        except Exception:
+            pass
         symbol = pos.get("symbol", "")
         current_price = float(pos.get("resolved_current_price") or 0)
         if current_price <= 0:
