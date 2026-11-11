@@ -275,12 +275,11 @@ def verified_carried_us_snapshot_identity(
         or str(position.get("strategy_owner") or meta.get("strategy_owner") or "US_STANDARD").upper() != "US_STANDARD"
     ):
         return None
-    for field in ("account_id", "portfolio_epoch_id", "position_cycle_id",
-                  "position_lifecycle_id"):
-        if position.get(field) not in (None, "") or meta.get(field) not in (None, ""):
-            # A pre-bound position must be verified by the normal scoped
-            # lifecycle path, not overwritten with a different prior cycle.
-            return None
+    # A position that already claims a lifecycle is handled by the normal
+    # lifecycle path. A raw account key may be present even on broker rows:
+    # validate it against the original account rather than discard evidence.
+    if position.get("position_lifecycle_id") not in (None, "") or meta.get("position_lifecycle_id") not in (None, ""):
+        return None
 
     # The last balance observation is the continuity anchor. A zero holding
     # is a terminal boundary even when an earlier snapshot was positive.
@@ -324,6 +323,16 @@ def verified_carried_us_snapshot_identity(
     raw_account = str(accounts[0].get("account_id") or "")
     if not raw_account or hashlib.sha256(raw_account.encode()).hexdigest() != broker_hash:
         return None
+    supplied = {**meta, **{k: v for k, v in position.items() if v is not None}}
+    for key, expected in (
+        ("account_id", raw_account),
+        ("portfolio_epoch_id", portfolio),
+        ("position_cycle_id", cycle),
+        ("strategy_owner", "US_STANDARD"),
+        ("broker_account_hash", broker_hash),
+    ):
+        if supplied.get(key) not in (None, "") and str(supplied[key]) != str(expected):
+            return None
     state = conn.execute(text("""
         SELECT state->'lifecycle' AS lifecycle
           FROM us_position_risk_state
