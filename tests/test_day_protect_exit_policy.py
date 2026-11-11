@@ -22,6 +22,25 @@ def _pos(avg: float = 10000.0, qty: int = 10, orderable_qty: int = 10, meta: dic
 
 
 class TestDayProtectHardStop:
+    def test_default_day_stop_is_minus_three_not_minus_two(self, monkeypatch):
+        # A full DAY_TRADE stop must no longer fire at -2.1% by default.
+        # Explicit env overrides and independent frozen-stop evidence remain
+        # covered by the existing tests below.
+        monkeypatch.delenv("PB1_DAY_STOP_LOSS_PCT", raising=False)
+        pos = _pos(avg=10000.0, orderable_qty=10)
+        early = _resolve_day_protect_exit(
+            pos, mark=9790.0, now_hhmm=1000,
+            ret_pct=-2.1, max_pnl_pct=0.0, stop_hit=False,
+        )
+        assert early["exit_ok"] is False
+        at_threshold = _resolve_day_protect_exit(
+            pos, mark=9700.0, now_hhmm=1000,
+            ret_pct=-3.0, max_pnl_pct=0.0, stop_hit=False,
+        )
+        assert at_threshold["exit_ok"] is True
+        assert at_threshold["reason"] == "EXIT_DAY_STOP_LOSS"
+        assert at_threshold["qty"] == 10
+
     def test_hard_stop_triggers_full_exit(self, monkeypatch):
         monkeypatch.setenv("PB1_DAY_STOP_LOSS_PCT", "2.0")
         pos = _pos(avg=10000.0, orderable_qty=10)
