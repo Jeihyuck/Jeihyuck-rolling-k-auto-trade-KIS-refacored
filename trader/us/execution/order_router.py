@@ -907,6 +907,18 @@ def _semantic_action_instance(
         from trader.us.entry_exit_contract import (
             US_SWING_V3_CONTRACT_VERSION, verify_us_entry_exit_contract,
         )
+        # For legacy V2 positions, do not pretend the original BUY was V3.
+        # A separately signed *forward-only management* authorization has
+        # its own semantic action instance and source V2 SHA.
+        _forward_auth = meta.get("us_v2_v3_forward_handoff")
+        if _forward_auth is not None:
+            from trader.us.pb1.us_forward_v3_handoff import (
+                verify_forward_v3_order_authorization,
+            )
+            if not verify_forward_v3_order_authorization(intent, _forward_auth):
+                raise ValueError("US_V3_FORWARD_SEMANTIC_AUTHORIZATION_UNVERIFIED")
+            _forward_contract = _forward_auth["forward_v3_contract"]
+            return "V2_FORWARD_V3:" + str(_forward_contract["sha256"])
         sha = str(meta.get("source_entry_contract_sha256") or "")
         signed = meta.get("v3_signed_entry_contract")
         if (str(meta.get("source_entry_contract_version") or "")

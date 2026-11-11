@@ -417,6 +417,7 @@ def evaluate_exit(
     contract_integrity_state = "NONE"
     frozen_contract = {}
     is_v3_contract = False
+    forward_v3_handoff = None
     try:
         from trader.us.entry_exit_contract import (
             contract_exit_config,
@@ -429,6 +430,22 @@ def evaluate_exit(
             contract_integrity_state == "VALID"
             and frozen_contract.get("version") == US_SWING_V3_CONTRACT_VERSION
         )
+        # The immutable original BUY contract remains V2. A *separate*,
+        # actively HMAC-authorized forward management contract may select V3
+        # only after original KIS/account/epoch/cycle/stage proof was stored in
+        # both position and risk state. Missing authorization keeps V2.
+        if not is_v3_contract:
+            from trader.us.pb1.us_forward_v3_handoff import (
+                verified_forward_v3_management,
+            )
+            _approved = verified_forward_v3_management(position)
+            if _approved:
+                frozen_contract, forward_v3_handoff = _approved
+                is_v3_contract = True
+                logger.warning(
+                    "[US_EXIT][V3_FORWARD][ACTIVE] symbol=%s original_v2_preserved=1",
+                    position.get("symbol"),
+                )
         frozen_cfg = contract_exit_config(position)
         if frozen_cfg:
             cfg = {**cfg, **frozen_cfg}
@@ -805,6 +822,17 @@ def evaluate_exit(
                     "v3_trend_state": _decision.get("trend_state"),
                     "v3_stage_target_qty": _size,
                     "v3_original_decision_at": _when.isoformat(),
+                    # A forward handoff does NOT retrofit the original BUY
+                    # contract into V3; the order must disclose its source V2
+                    # and carry the distinct signed management authorization.
+                    **({
+                        "source_entry_contract_sha256": forward_v3_handoff[
+                            "original_v2_sha256"],
+                        "source_entry_contract_version": "us_entry_exit_contract_v2",
+                        "v3_signed_entry_contract": None,
+                        "forward_management_contract_sha256": frozen_contract["sha256"],
+                        "us_v2_v3_forward_handoff": forward_v3_handoff,
+                    } if forward_v3_handoff else {}),
                     "partial_exit_scope": _stage if _stage == "PROFIT_DEFENSE_PARTIAL" else None,
                     "partial_exit_allowed": _stage == "PROFIT_DEFENSE_PARTIAL",
                 }
