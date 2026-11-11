@@ -122,6 +122,59 @@ def _confirmed_conflict_first_buy(
     return True
 
 
+def _eligible_defensive_micro_first_buy(
+    *, config: InfiniteConfig, state: InfiniteState, position: PositionSnapshot,
+    trading_date: date, overlay: dict, effective_regime_name: str,
+) -> bool:
+    """New, independent $125 probe. Never extends the two-day bullish exception.
+
+    The raw market label must be a non-crash, non-risk-off defensive caution
+    signal; the normalized DEFENSIVE label alone is not enough. The rest of the
+    strategy's capital, chop, order, opening and router fences still apply.
+    """
+    if (not config.defensive_micro_first_buy_enabled or config.symbol != "TQQQ"
+            or position.qty != 0 or state.total_filled_notional != 0
+            or effective_regime_name != "DEFENSIVE"):
+        return False
+    if state.cycle_id is None:
+        if state.status != Status.READY:
+            return False
+    elif not (
+        state.status in {Status.READY, Status.ACTIVE}
+        and state.cycle_start_date == trading_date
+        and state.last_buy_date is None
+        and (state.metadata or {}).get("defensive_micro_first_buy_reserved_cycle") is True
+        and (state.metadata or {}).get("defensive_micro_first_buy_trade_date") == trading_date.isoformat()
+    ):
+        # Same-session pre-HTTP retry only, never a foreign/filled cycle.
+        return False
+    raw_state = str(overlay.get("market_state") or "").upper()
+    raw_regime = str(overlay.get("market_regime") or "").upper()
+    if raw_state not in {"DEFENSE_CAUTION", "NORMAL", "RISK_ON"} or raw_regime != "DEFENSIVE":
+        return False
+    if not all(overlay.get(key) is True for key in
+               ("entry_can_proceed", "exit_can_proceed", "allow_new_buy")):
+        return False
+    if any(overlay.get(key) is True for key in
+           ("force_entry_block", "hard_system_failure", "reconcile_entry_block",
+            "tqqq_capital_preservation")):
+        return False
+    if str(overlay.get("tqqq_context_quality") or "").lower() != "ok":
+        return False
+    if any(bool(overlay.get(key)) for key in (
+        "qqq_stale", "qqq_suspect", "qqq_degraded", "tqqq_context_stale",
+        "tqqq_context_suspect", "tqqq_context_degraded", "tqqq_quote_stale",
+        "tqqq_quote_suspect", "tqqq_quote_degraded",
+    )):
+        return False
+    if not assess_market_risk(overlay).allow_buy:
+        return False
+    if classify_long_trend(overlay, bool((state.metadata or {}).get("structural_bear_seen"))) == "BEAR":
+        return False
+    from trader.us.market_calendar import is_us_trading_day
+    return is_us_trading_day(trading_date)
+
+
 def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: PositionSnapshot,
              trading_date: date, pending_buy: bool = False, pending_sell: bool = False,
              daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
@@ -302,6 +355,10 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         config=config, state=state, position=position, trading_date=trading_date,
         overlay=overlay, effective_regime_name=effective_regime_name,
     )
+    defensive_micro_first_buy = _eligible_defensive_micro_first_buy(
+        config=config, state=state, position=position, trading_date=trading_date,
+        overlay=overlay, effective_regime_name=effective_regime_name,
+    )
 
     infinite_overlay_bypass = config.symbol == "TQQQ"
     # PB1 intraday labels are deliberately not used as strategy conditions here.
@@ -331,7 +388,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             valid_context = False
     if not valid_context:
         return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
-    if position.qty <= 0 and not conflict_first_buy and effective_regime_name in {
+    if position.qty <= 0 and not (conflict_first_buy or defensive_micro_first_buy) and effective_regime_name in {
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
@@ -411,7 +468,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                    and position.average_price > 0 and position.price <= position.average_price)
         if not allowed:
             return Decision(Action.BLOCK, "chop_high_vol_wait")
-    elif policy_regime in {"RISK_OFF", "DEFENSIVE"} and not conflict_first_buy:
+    elif policy_regime in {"RISK_OFF", "DEFENSIVE"} and not (conflict_first_buy or defensive_micro_first_buy):
         allowed = (position.qty > 0 and long_trend == "BEAR" and days_since >= config.bear_fallback_gap
                    and last_price and position.price <= last_price * (1 - config.bear_step)
                    and position.average_price > 0 and position.price <= position.average_price)
@@ -454,12 +511,18 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     effective_buy_multiplier = buy_multiplier
     budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
     if conflict_first_buy:
-        # This exception can never exceed $125, even under an incorrect ENV value.
+        # Existing bullish two-session first entry is unchanged.
         budget = min(budget, config.conflict_first_buy_max_usd, 125.0)
-    qty = math.floor(budget / position.price)
+    if defensive_micro_first_buy:
+        budget = min(budget, config.defensive_micro_first_buy_max_usd, 125.0)
+        # Cost reserve keeps even a one-share order within the capped budget.
+        qty = math.floor(budget / (position.price * (1.0 + config.defensive_micro_first_buy_cost_buffer_pct)))
+    else:
+        qty = math.floor(budget / position.price)
     notional = qty * position.price
     if qty < 1:
-        return Decision(Action.BLOCK, "unit_cannot_buy_whole_share")
+        return Decision(Action.BLOCK, "defensive_micro_whole_share_exceeds_cap" if defensive_micro_first_buy
+                        else "unit_cannot_buy_whole_share")
     if state.total_filled_notional + notional > config.max_total_capital_usd + 1e-6:
         return Decision(Action.BLOCK, "hard_cap_exceeded")
     if conflict_first_buy:
@@ -475,6 +538,24 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                 "conflict_first_buy_long_trend": "BULL",
                 "conflict_first_buy_max_usd": min(config.conflict_first_buy_max_usd, 125.0),
                 "conflict_first_buy_actual_notional": notional,
+            },
+        )
+    if defensive_micro_first_buy:
+        return Decision(
+            Action.BUY, "DEFENSIVE_MICRO_FIRST_BUY", qty=qty,
+            notional=notional, next_status=Status.ACTIVE,
+            metadata={
+                "defensive_micro_first_buy_trade_date": trading_date.isoformat(),
+                "defensive_micro_first_buy_raw_state": str(overlay.get("market_state") or ""),
+                "defensive_micro_first_buy_raw_regime": str(overlay.get("market_regime") or ""),
+                "defensive_micro_first_buy_effective_regime": effective_regime_name,
+                "defensive_micro_first_buy_long_trend": long_trend,
+                "defensive_micro_first_buy_max_usd": min(config.defensive_micro_first_buy_max_usd, 125.0),
+                "defensive_micro_first_buy_cost_buffer_pct": config.defensive_micro_first_buy_cost_buffer_pct,
+                "defensive_micro_first_buy_gross_cap_proof": notional * (1.0 + config.defensive_micro_first_buy_cost_buffer_pct),
+                "defensive_micro_first_buy_quote_asof": overlay.get("tqqq_quote_asof"),
+                "defensive_micro_first_buy_context_asof": overlay.get("qqq_context_asof"),
+                "defensive_micro_first_buy_actual_notional": notional,
             },
         )
     return Decision(Action.BUY, "first_buy" if position.qty == 0 else "average_buy", qty=qty,

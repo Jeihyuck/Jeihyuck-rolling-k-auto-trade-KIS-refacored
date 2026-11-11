@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -15,6 +16,19 @@ def _float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _strict_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return float(default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be a finite number")
+    return parsed
 
 
 def _int(name: str, default: int) -> int:
@@ -40,6 +54,9 @@ class InfiniteConfig:
     conflict_first_buy_enabled: bool = True
     conflict_first_buy_confirm_days: int = 2
     conflict_first_buy_max_usd: float = 125.0
+    defensive_micro_first_buy_enabled: bool = True
+    defensive_micro_first_buy_max_usd: float = 125.0
+    defensive_micro_first_buy_cost_buffer_pct: float = 0.01
     max_total_capital_usd: float = 10_000.0
     buy_premium_pct: float = 0.03
     take_profit_pct: float = 0.10
@@ -82,6 +99,9 @@ class InfiniteConfig:
             conflict_first_buy_enabled=_bool(prefix + "CONFLICT_FIRST_BUY_ENABLED", True),
             conflict_first_buy_confirm_days=_int(prefix + "CONFLICT_FIRST_BUY_CONFIRM_DAYS", 2),
             conflict_first_buy_max_usd=_float(prefix + "CONFLICT_FIRST_BUY_MAX_USD", 125),
+            defensive_micro_first_buy_enabled=_bool(prefix + "DEFENSIVE_MICRO_FIRST_BUY_ENABLED", True),
+            defensive_micro_first_buy_max_usd=_strict_float(prefix + "DEFENSIVE_MICRO_FIRST_BUY_MAX_USD", 125),
+            defensive_micro_first_buy_cost_buffer_pct=_strict_float(prefix + "DEFENSIVE_MICRO_FIRST_BUY_COST_BUFFER_PCT", .01),
             max_total_capital_usd=_float(prefix + "MAX_TOTAL_CAPITAL_USD", 10_000),
             buy_premium_pct=_float(prefix + "BUY_PREMIUM_PCT", .03),
             take_profit_pct=_float(prefix + "TAKE_PROFIT_PCT", .10),
@@ -121,3 +141,9 @@ class InfiniteConfig:
             raise ValueError("conflict first buy requires 2-5 separate US trading sessions")
         if (not 0 < self.conflict_first_buy_max_usd <= 125.0):
             raise ValueError("conflict first buy max must stay within the $125 hard ceiling")
+        if (not math.isfinite(self.defensive_micro_first_buy_max_usd)
+                or not 0 < self.defensive_micro_first_buy_max_usd <= 125.0):
+            raise ValueError("defensive micro first buy must stay within the $125 hard ceiling")
+        if (not math.isfinite(self.defensive_micro_first_buy_cost_buffer_pct)
+                or not 0 <= self.defensive_micro_first_buy_cost_buffer_pct <= 0.03):
+            raise ValueError("defensive micro cost buffer must be between 0 and 3%")

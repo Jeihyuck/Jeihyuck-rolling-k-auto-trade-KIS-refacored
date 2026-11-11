@@ -122,7 +122,10 @@ def test_current_tick_cannot_reuse_two_day_evidence_after_market_changes():
     state = observe(observe(InfiniteState(), D1), D2)
     assert decision(state, D2, overlay(market_state="DEFENSE_CRASH_CONFIRMED",
                                        market_regime="RISK_OFF")).action == Action.BLOCK
-    assert decision(state, D2, overlay(market_state="DEFENSE_CAUTION")).action == Action.BLOCK
+    # Nov-11 approved policy: caution+DEFENSIVE may independently probe with
+    # a tiny first buy. This is not the original two-session bullish exception.
+    caution = decision(state, D2, overlay(market_state="DEFENSE_CAUTION"))
+    assert caution.reason == "DEFENSIVE_MICRO_FIRST_BUY"
     assert decision(state, D2, overlay(qqq_ma200=130)).action == Action.BLOCK
 
 
