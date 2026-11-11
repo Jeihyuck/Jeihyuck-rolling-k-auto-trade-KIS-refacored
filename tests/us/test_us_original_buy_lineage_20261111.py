@@ -128,3 +128,26 @@ def test_authoritative_only_original_scope_identity_bridge(monkeypatch):
     )
     assert "portfolio_epoch_id" not in got2 or not got2["portfolio_epoch_id"]
     assert "_verified_original_buy_fill" not in raw2
+
+
+def test_raw_kis_snapshot_does_not_null_out_verified_provenance(monkeypatch):
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "_MEM_POSITIONS", [])
+    row = {
+        "symbol": "AMGN", "qty": 6, "exchange": "NASDAQ",
+        "avg_cost": 461.80, "current_px": 465.0,
+        "meta": {
+            "position_lifecycle_id": CYCLE,
+            "high_watermark": 470.0,
+            "opened_trade_date": "2026-11-10",
+            "strategy_owner": "US_STANDARD",
+        },
+    }
+    assert repos.save_position_snapshot([row], trade_date="2026-11-10") == 1
+    stored = repos._MEM_POSITIONS[0]["meta"]
+    assert stored["position_lifecycle_id"] == CYCLE
+    assert stored["opened_trade_date"] == "2026-11-10"
+    assert stored["high_watermark"] == 470.0
+    assert stored["strategy_owner"] == "US_STANDARD"
