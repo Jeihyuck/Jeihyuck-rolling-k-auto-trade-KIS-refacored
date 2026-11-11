@@ -82,6 +82,9 @@ export US_RUN_SOURCE="${US_RUN_SOURCE:-WINDOWS_SCHEDULE}"
 export WSL_RUN_MARKET="US"
 export WSL_RUN_SESSION="prep"
 
+# Use the same practice policy in PREP and trading, including ATR prewarm.
+source scripts/wsl/us-swing-v3-paper-defaults.sh >> "$LOG_FILE" 2>&1
+
 # PREP scans a large candidate universe and must not own the shared realtime
 # KIS WebSocket/AppKey. Current-price lookups keep their existing REST/DB
 # fallback path; only the process-local realtime subscription service is off.
