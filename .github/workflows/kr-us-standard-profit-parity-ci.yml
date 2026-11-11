@@ -10,9 +10,15 @@ on:
       - "trader/kr/us_profit_existing_amendment.py"
       - "trader/kr/us_v3_runner_active.py"
       - "trader/pb1_engine.py"
+      - "trader/reconcile_kis.py"
+      - "trader/db/repos.py"
+      - "scripts/wsl/run-kr-am.sh"
+      - "scripts/wsl/run-kr-afternoon.sh"
+      - "scripts/wsl/run-kr-close.sh"
+      - "tests/kr/infinite/test_runner_integration.py"
       - "trader/kr/infinite/runner.py"
       - "tests/kr/test_kr_us_standard_profit_parity_20261106.py"
-      - "tests/kr/test_kr_us_profit_stage_postgres_20261106.py tests/kr/test_kr_us_profit_active_router_20261111.py tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py tests/kr/test_kr_us_v3_native_runner_20261111.py"
+      - "tests/kr/test_kr_us_profit_stage_postgres_20261106.py"
       - "tests/kr/test_kr_us_profit_active_router_20261111.py"
       - "tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py"
       - "tests/kr/test_kr_us_v3_native_runner_20261111.py"
@@ -63,6 +69,14 @@ jobs:
         run: python -m pip install -r requirements.txt pytest psycopg2-binary
       - name: Compile policy modules
         run: |
-          python -m py_compile trader/kr/us_standard_profit_parity.py trader/kr/us_profit_stage_journal.py trader/kr/us_profit_execution_router.py trader/kr/us_profit_existing_amendment.py trader/kr/us_v3_runner_active.py trader/us/pb1/swing_runner_exit_v3.py
-      - name: US/KR parity math, contract integrity and owner exclusion
-        run: python -m pytest -q tests/kr/test_kr_us_standard_profit_parity_20261106.py tests/kr/test_kr_us_profit_stage_postgres_20261106.py
+          python -m py_compile trader/kr/us_standard_profit_parity.py trader/kr/us_profit_stage_journal.py trader/kr/us_profit_execution_router.py trader/kr/us_profit_existing_amendment.py trader/kr/us_v3_runner_active.py trader/us/pb1/swing_runner_exit_v3.py trader/pb1_engine.py trader/reconcile_kis.py
+      - name: Practice ACTIVE route, Samsung amendment, US V3 runner and durable Postgres stage tests
+        run: |
+          python -m pytest -q \
+            tests/kr/test_kr_us_standard_profit_parity_20261106.py \
+            tests/kr/test_kr_us_profit_stage_postgres_20261106.py \
+            tests/kr/test_kr_us_profit_active_router_20261111.py \
+            tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py \
+            tests/kr/test_kr_us_v3_native_runner_20261111.py
+      - name: KR operating runner script syntax
+        run: bash -n scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh
