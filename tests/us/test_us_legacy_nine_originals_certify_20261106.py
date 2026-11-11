@@ -282,6 +282,13 @@ def _historical_runtime_archive():
     """Models 11/04 legacy runtime cycles vs original BUY ENTRY placeholders."""
     positions, fills, orders = _archive()
     raw_account = "practice:fixture:01"
+    for row, buy_fill, pos in zip(orders, fills, positions):
+        contract = row["meta"]["entry_exit_contract_sha256"]
+        pos["meta"] = {"entry_exit_contract_sha256": contract}
+        buy_fill["meta"].update({
+            "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+            "cumulative_filled_qty": buy_fill["qty"],
+        })
     historical = []
     for row in orders:
         sym=row["symbol"]
@@ -307,7 +314,9 @@ def _historical_runtime_archive():
         "symbol":"TMO","side":"SELL","trade_date":"2026-11-04",
         "order_no":"0000099999","qty":2,
         "meta":{"requested_qty":2,"position_lifecycle_id":runtime_tmo,
-                "strategy_owner":"US_STANDARD"},
+                "strategy_owner":"US_STANDARD",
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "cumulative_filled_qty": 2},
     })
     orders.append({
         "symbol":"TMO","side":"SELL","trade_date":"2026-11-04",
