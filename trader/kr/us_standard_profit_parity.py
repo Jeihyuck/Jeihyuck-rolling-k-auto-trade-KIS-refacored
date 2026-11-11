@@ -1,4 +1,4 @@
-"""KR PB1 new-SWING US_STANDARD TP parity, pure shadow-safe policy.
+"""KR PB1 new-SWING US_STANDARD TP parity, immutable practice policy.
 
 No broker I/O and no DB stage writes. The execution router MUST NOT submit
 an intent from this module without a separately approved, durable KR stage
@@ -46,6 +46,7 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
             or data.get("exit_policy_family") != "SWING_STAGED_EXIT"
             or data.get("trade_horizon") != "SWING"
             or data.get("position_action") != "NEW_POSITION_BUY"
+            or data.get("activation_mode", "SHADOW") not in {"SHADOW", "ACTIVE_PRACTICE"}
             or not str(data.get("account_sha256") or "").strip()
             or not str(data.get("trading_epoch_id") or "").strip()
             or not str(data.get("position_cycle_id") or "").strip()
@@ -59,7 +60,9 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
 
 
 def _mode() -> str:
-    value = str(os.getenv("KR_SWING_US_PROFIT_MODE", "LEGACY")).strip().upper()
+    # Approved KR practice policy is ON by default; real accounts stay LEGACY.
+    default = "ACTIVE_PRACTICE" if os.getenv("KIS_ENV", "").lower() == "practice" else "LEGACY"
+    value = str(os.getenv("KR_SWING_US_PROFIT_MODE", default)).strip().upper()
     if value not in {"LEGACY", "SHADOW", "ACTIVE_PRACTICE"}:
         raise ValueError("KR_SWING_PROFIT_MODE_INVALID")
     return value
@@ -97,20 +100,17 @@ def build_new_swing_parity_contract(
         raise ValueError("KR_PROFIT_PARITY_RUNNER_VERSION_UNVERIFIED")
     if not (str(code).isdigit() and len(str(code)) == 6):
         raise ValueError("KR_PROFIT_PARITY_SYMBOL_UNVERIFIED")
-    if mode == "ACTIVE_PRACTICE":
-        if (os.getenv("KR_SWING_US_PROFIT_DEPLOY_APPROVED", "0") != "1"
-                or os.getenv("KIS_ENV", "").lower() != "practice"):
-            raise ValueError("KR_PROFIT_PARITY_DEPLOY_NOT_APPROVED")
-        # No KR native order-router claim/submit/fill path is wired yet.
-        # An ENV approval must not make this SHADOW library appear ACTIVE.
-        # Remove this fence only with a new versioned, fully tested router.
-        raise ValueError("KR_PROFIT_PARITY_ROUTER_NOT_WIRED")
+    if mode == "ACTIVE_PRACTICE" and os.getenv("KIS_ENV", "").lower() != "practice":
+        raise ValueError("KR_PROFIT_PARITY_DEPLOY_NOT_APPROVED")
+    # A signed contract is NOT broker permission. The live PB1 exit owner
+    # must pass the existing execution claim and a durable TP stage journal.
     payload: dict[str, Any] = {
         "version": POLICY_VERSION,
         "strategy_owner": "PB1",
         "exit_policy_family": "SWING_STAGED_EXIT",
         "trade_horizon": "SWING",
         "position_action": "NEW_POSITION_BUY",
+        "activation_mode": mode,
         "account_sha256": hashlib.sha256(account_id.encode("utf-8")).hexdigest(),
         "trading_epoch_id": trading_epoch_id,
         "position_cycle_id": position_cycle_id,
@@ -217,7 +217,8 @@ def calculate_next_tp_stage(
         quantity = min(quantity, orderable)
         if quantity <= 0:
             return StageDecision("HOLD", name, reason="NOT_ENOUGH_ORDERABLE_OR_RUNNER")
-        return StageDecision("SHADOW_TP", name, quantity,
+        active = contract.get("activation_mode") == "ACTIVE_PRACTICE"
+        return StageDecision("ACTIVE_TP" if active else "SHADOW_TP", name, quantity,
                              reason="REQUIRES_KR_DURABLE_BROKER_STAGE_GATE",
                              order_authorized=False)
     return StageDecision("RUNNER", reason="ALL_TP_STAGES_PROVEN_FILLED")

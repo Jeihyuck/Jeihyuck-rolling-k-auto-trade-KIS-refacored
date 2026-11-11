@@ -3609,6 +3609,51 @@ class OrdersRepo:
             if safe_request_json.get("parent_entry_contract_sha256"):
                 safe_request_json["parent_contract_binding_sha256"] = _kr_parent_contract_binding_hash(safe_request_json)
             _assert_kr_buy_entry_contract(safe_request_json)
+            # Bind +3/+5/+8 PB1 practice policy to the *actual* persisted BUY
+            # account/epoch/position cycle. Never fabricate a cycle upstream.
+            # Add/pyramid, DAY, CORE, KR_INFINITE and legacy positions are excluded.
+            if (
+                str(env).lower() == "practice"
+                and str(strategy).lower() == "pb1_pullback_close"
+                and str(side).upper() == "BUY"
+                and str(stage).upper() != "PB1-ADD"
+                and safe_request_json.get("pre_order_holding_qty") in (0, "0")
+                and not safe_request_json.get("parent_entry_contract_sha256")
+            ):
+                from trader.kr.us_standard_profit_parity import (
+                    build_new_swing_parity_contract, verified_contract,
+                )
+                frozen_plan = safe_request_json.get("entry_exit_plan") or {}
+                if (
+                    frozen_plan.get("exit_policy_family") == "SWING_STAGED_EXIT"
+                    and frozen_plan.get("trade_horizon") == "SWING"
+                ):
+                    parity = build_new_swing_parity_contract(
+                        strategy_owner="PB1",
+                        exit_policy_family=frozen_plan["exit_policy_family"],
+                        trade_horizon=frozen_plan["trade_horizon"],
+                        position_action="NEW_POSITION_BUY",
+                        account_id=str(account_id),
+                        trading_epoch_id=str(trading_epoch_id or ""),
+                        position_cycle_id=str(position_cycle_id),
+                        runner_version="US_V3",
+                        code=str(code).zfill(6),
+                    )
+                    if parity:
+                        if not verified_contract(parity):
+                            raise RuntimeError("KR_PROFIT_PARITY_CONTRACT_INVALID")
+                        safe_request_json["kr_us_profit_contract"] = parity
+                        saved_meta = dict(safe_request_json.get("entry_meta") or {})
+                        saved_meta["kr_us_profit_contract"] = parity
+                        safe_request_json["entry_meta"] = saved_meta
+                        entry_meta_json = {**(entry_meta_json or {}),
+                                           "kr_us_profit_contract": parity}
+                        logger.info(
+                            "[KR_PROFIT_PARITY][BUY_CONTRACT] code=%s cycle=%s "
+                            "epoch=%s sha=%s mode=%s",
+                            code, position_cycle_id, trading_epoch_id,
+                            parity["sha256"], parity["activation_mode"],
+                        )
         payload = {
             "order_id": order_id,
             "env": env,
@@ -3682,6 +3727,15 @@ class OrdersRepo:
                     )
                 ).scalar()
                 _assert_kr_buy_entry_contract(persisted)
+                if safe_request_json.get("kr_us_profit_contract"):
+                    from trader.kr.us_standard_profit_parity import verified_contract
+                    frozen_parity = (persisted or {}).get("kr_us_profit_contract")
+                    if (
+                        not verified_contract(frozen_parity)
+                        or frozen_parity != safe_request_json["kr_us_profit_contract"]
+                        or (persisted.get("entry_meta") or {}).get("kr_us_profit_contract") != frozen_parity
+                    ):
+                        raise RuntimeError("KR_PROFIT_PARITY_BUY_PERSISTENCE_MISMATCH")
                 if _kr_buy_entry_contract_hash(persisted) != _kr_buy_entry_contract_hash(safe_request_json):
                     raise RuntimeError("KR_BUY_ENTRY_CONTRACT_PERSISTENCE_MISMATCH")
             return inserted_id, True
