@@ -70,6 +70,12 @@ export KIS_ENV="${KIS_ENV:-practice}"
 if [[ "$STRATEGY_ENV" == "practice" && "$KIS_ENV" == "practice" ]]; then
   export PAPER_MAX_CAPITAL_KRW=100000000
   export EXPECTED_PRACTICE_CAPITAL_KRW=100000000
+  # 2026-11-11 explicit user-approved KR PB1 profit activation.
+  # .env is loaded above: override stale SHADOW/LEGACY only for KIS practice.
+  # Real account remains governed by its existing LEGACY policy, unchanged.
+  export KR_SWING_US_PROFIT_MODE=ACTIVE_PRACTICE
+  export KR_SAMSUNG_EA_AMENDMENT_ENABLED=1
+  echo "[KR_PROFIT_PARITY][EFFECTIVE] mode=${KR_SWING_US_PROFIT_MODE} samsung_ea_amendment=${KR_SAMSUNG_EA_AMENDMENT_ENABLED} env=practice"
   echo "[KR_CAPITAL][FINAL] expected=100000000 cap=100000000 session=${WSL_RUN_SESSION:-unknown}"
 fi
 export KR_ARTIFACT_STRICT="${KR_ARTIFACT_STRICT:-1}"
