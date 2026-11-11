@@ -17,6 +17,7 @@ DRY_RUN 또는 KIS 모의주문으로 라우팅한다.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 import uuid
@@ -38,6 +39,40 @@ from trader.us.db.repos import (  # test patch surface
 
 logger = logging.getLogger(__name__)
 AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
+
+
+def defensive_micro_first_buy_budget_error(intent: dict, *, qty: int, price: float) -> str | None:
+    """Additional pre-ledger/HTTP budget fence for the new TQQQ-only probe.
+
+    Standard router cash checks are still mandatory and can be stricter.
+    Never trust the strategy-calculated notional alone after sizing/rounding.
+    """
+    if not (
+        str(intent.get("reason") or "") == "DEFENSIVE_MICRO_FIRST_BUY"
+        and str(intent.get("strategy_owner") or "") == "TQQQ_INFINITE"
+        and str(intent.get("sleeve_id") or "") == "TQQQ_INFINITE"
+        and str(intent.get("symbol") or "").upper() == "TQQQ"
+    ):
+        return None
+    if str(os.getenv("KIS_ENV") or "").lower() != "practice":
+        return "TQQQ_DEFENSIVE_MICRO_PRACTICE_ONLY"
+    proof = (intent.get("meta") or {}).get("tqqq_defensive_micro_first_buy_evidence")
+    if not isinstance(proof, dict):
+        return "TQQQ_DEFENSIVE_MICRO_PROOF_MISSING"
+    try:
+        limit = float(proof["defensive_micro_first_buy_max_usd"])
+        cost_buffer = float(proof["defensive_micro_first_buy_cost_buffer_pct"])
+        broker_buffer = float(os.getenv("US_BROKER_ORDERABLE_CASH_SAFETY_BUFFER", "1.01"))
+        gross = float(qty) * float(price) * max(1.0 + cost_buffer, broker_buffer)
+    except (KeyError, TypeError, ValueError):
+        return "TQQQ_DEFENSIVE_MICRO_BUDGET_INVALID"
+    if not all(math.isfinite(v) for v in (limit, cost_buffer, broker_buffer, gross)):
+        return "TQQQ_DEFENSIVE_MICRO_BUDGET_INVALID"
+    if not 0 < limit <= 125.0 or not 0 <= cost_buffer <= 0.03 or broker_buffer < 1.0:
+        return "TQQQ_DEFENSIVE_MICRO_BUDGET_INVALID"
+    if qty < 1 or price <= 0 or gross > min(limit, 125.0) + 1e-9:
+        return "TQQQ_DEFENSIVE_MICRO_BUDGET_EXCEEDED"
+    return None
 
 
 def annotate_execution_quantity_provenance(intent: dict, *, strategy_requested_qty: int, final_qty: int, price: float) -> dict:
@@ -1379,6 +1414,13 @@ def route_order(
             qty, intent["qty"], old_notional, intent["notional_usd"],
         )
     qty = int(intent["qty"])
+    if side == "BUY" and is_tqqq_infinite:
+        budget_error = defensive_micro_first_buy_budget_error(intent, qty=qty, price=price)
+        if budget_error:
+            logger.error("[US_ORDER][TQQQ_DEFENSIVE_MICRO][BLOCK] reason=%s qty=%s price=%s",
+                         budget_error, qty, price)
+            return {"status": "BLOCKED", "reason": budget_error,
+                    "broker_submit": False, "intent": intent}
     exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
     if side == "SELL":
         exchange = enrich_sell_exchange(intent, kis_client, context)
