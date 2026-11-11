@@ -12,10 +12,10 @@ on:
       - "trader/pb1_engine.py"
       - "trader/kr/infinite/runner.py"
       - "tests/kr/test_kr_us_standard_profit_parity_20261106.py"
-      - "tests/kr/test_kr_us_profit_stage_postgres_20261106.py tests/kr/test_kr_us_profit_active_router_20261111.py tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py tests/kr/test_kr_us_v3_runner_active_20261111.py"
+      - "tests/kr/test_kr_us_profit_stage_postgres_20261106.py tests/kr/test_kr_us_profit_active_router_20261111.py tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py tests/kr/test_kr_us_v3_native_runner_20261111.py"
       - "tests/kr/test_kr_us_profit_active_router_20261111.py"
       - "tests/kr/test_kr_samsung_ea_explicit_amendment_20261111.py"
-      - "tests/kr/test_kr_us_v3_runner_active_20261111.py"
+      - "tests/kr/test_kr_us_v3_native_runner_20261111.py"
       - ".github/workflows/kr-us-standard-profit-parity-ci.yml"
   workflow_dispatch:
 
