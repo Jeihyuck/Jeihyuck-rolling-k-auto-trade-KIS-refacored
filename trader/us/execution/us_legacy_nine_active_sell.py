@@ -144,11 +144,18 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         return None,"ONE_LEGACY_POSITION_NOT_PROVEN"
     pos=poses[0]
     holding=_positive(pos.get("qty"))
-    if (holding is None or str(pos.get("trading_epoch_id") or "")!=active_epoch
-            or pos.get("account_id") not in (None,"")
-            or pos.get("portfolio_epoch_id") not in (None,"")
-            or pos.get("position_cycle_id") not in (None,"")):
+    if holding is None or str(pos.get("trading_epoch_id") or "")!=active_epoch:
+        return None,"LEGACY_HOLDING_OR_EPOCH_UNVERIFIED"
+    scoped_fields=(pos.get("account_id"),pos.get("portfolio_epoch_id"),
+                   pos.get("position_cycle_id"))
+    if all(value not in (None,"") for value in scoped_fields):
         return None,"NOT_AN_UNSCOPED_LEGACY_POSITION"
+    if any(value not in (None,"") for value in scoped_fields):
+        return None,"INCOMPLETE_PARTIALLY_SCOPED_LEGACY_POSITION"
+    if any(_json(pos.get("meta")).get(field) not in (None,"") for field in (
+        "position_cycle_id","portfolio_epoch_id","position_lifecycle_id",
+    )):
+        return None,"LEGACY_POSITION_META_SCOPE_CONFLICT"
     contract=extract_us_entry_exit_contract(pos,_json(pos.get("meta")))
     digest=str(_json(pos.get("meta")).get("entry_exit_contract_sha256") or "")
     if (not contract or contract.get("version")!=US_ENTRY_EXIT_CONTRACT_VERSION
@@ -290,8 +297,7 @@ def prove_and_bind_legacy_nine_sell(
 
     symbol=str(intent.get("symbol") or "").upper()
     meta=_json(intent.get("meta"))
-    if (os.getenv("US_LEGACY_NINE_AUTO_SELL_ACTIVE","1")!="1"
-            or env!="practice" or os.getenv("KIS_ENV")!="practice"
+    if (env!="practice" or os.getenv("KIS_ENV")!="practice"
             or os.getenv("WSL_RUN_MARKET","").upper()!="US"
             or str(intent.get("side") or "").upper()!="SELL"
             or str(intent.get("strategy_owner") or meta.get("strategy_owner") or "")
@@ -316,6 +322,8 @@ def prove_and_bind_legacy_nine_sell(
         )
         if evidence is None:
             return False,reason,None
+        if os.getenv("US_LEGACY_NINE_AUTO_SELL_ACTIVE","1")!="1":
+            return False,"LEGACY_AUTO_SELL_EXPLICITLY_DISABLED",None
         requested=_positive(intent.get("qty"))
         if requested is None or requested>evidence["holding"]:
             return False,"LEGACY_STRATEGY_SELL_QUANTITY_INVALID",None
