@@ -1010,6 +1010,20 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
     from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
     from trader.us.strategy_ownership import exclude_non_standard
     positions = exclude_non_standard(positions)
+    # The pre-Nov-05 V2 lifecycle + DONE TP flags were lost from fresh
+    # daily risk-state. Rehydrate decision-only historical facts before
+    # loading stage journal by lifecycle, never before KIS broker authority.
+    if trade_date:
+        try:
+            from trader.us.execution.us_legacy_nine_active_sell import (
+                enrich_legacy_nine_v2_decision_position,
+            )
+            positions = [
+                enrich_legacy_nine_v2_decision_position(p, trade_date=str(trade_date))
+                for p in positions
+            ]
+        except Exception:
+            pass
     if not overlay.get("profit_capture_enabled", True):
         return []
     existing_sell_symbols = existing_sell_symbols or set()
