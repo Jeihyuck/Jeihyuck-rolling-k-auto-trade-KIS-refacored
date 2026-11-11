@@ -280,6 +280,60 @@ def verified_new_buy_snapshot_identity(
 
 
 
+def _verified_actual_partial_sell_continuity(
+    rows: list[dict], *, sold_shares: int, epoch: str,
+    broker_hash: str, portfolio: str, cycle: str,
+) -> bool:
+    """Allow a lower broker balance ONLY with exact native KIS SELL proof.
+
+    The daily order window must be complete: one unique non-synthetic native
+    cumulative fill per terminal SELL, same immutable cycle and account.
+    This refuses re-BUY, unknown ACK, old-epoch, duplicated or synthetic fills.
+    An arbitrary quantity delta or a changed average price is never proof.
+    """
+    if not rows or len(rows) > 200 or sold_shares <= 0:
+        return False
+    seen: set[str] = set()
+    total_sold = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        order_meta = row.get("order_meta") if isinstance(row.get("order_meta"), dict) else {}
+        fill_meta = row.get("fill_meta") if isinstance(row.get("fill_meta"), dict) else {}
+        key = str(row.get("client_order_key") or "")
+        requested = _exact_positive_shares(row.get("qty_requested"))
+        sold = _exact_positive_shares(row.get("qty_filled"))
+        filled = _exact_positive_shares(row.get("fill_qty"))
+        if not key or key in seen or None in (requested, sold, filled):
+            return False
+        seen.add(key)
+        if not (
+            str(row.get("side") or "").upper() == "SELL"
+            and str(row.get("status") or "").upper() in {"FILLED", "CANCELLED"}
+            and str(row.get("order_no") or "")
+            and str(row.get("trading_epoch_id") or "") == epoch
+            and str(row.get("order_account_id") or "") == broker_hash
+            and str(row.get("fill_account_id") or "") == broker_hash
+            and str(row.get("order_portfolio_epoch_id") or "") == portfolio
+            and str(row.get("fill_portfolio_epoch_id") or "") == portfolio
+            and str(row.get("order_position_cycle_id") or "") == cycle
+            and str(row.get("fill_position_cycle_id") or "") == cycle
+            and str(order_meta.get("position_lifecycle_id") or "") == cycle
+            and str(fill_meta.get("position_lifecycle_id") or "") == cycle
+            and str(order_meta.get("strategy_owner") or "") == "US_STANDARD"
+            and str(fill_meta.get("strategy_owner") or "") == "US_STANDARD"
+            and str(order_meta.get("broker_account_hash") or "") == broker_hash
+            and str(fill_meta.get("broker_account_hash") or "") == broker_hash
+            and str(fill_meta.get("fill_evidence_type") or "") == "KIS_ORDER_CUMULATIVE_ACTUAL"
+            and fill_meta.get("is_synthetic") is not True
+            and sold == filled and sold <= requested
+            and (str(row.get("status")).upper() != "FILLED" or sold == requested)
+        ):
+            return False
+        total_sold += sold
+    return total_sold == sold_shares
+
+
 def verified_carried_us_snapshot_identity(
     *, conn: Any, trade_date: str, position: dict,
     trading_epoch_id: str,
@@ -320,7 +374,10 @@ def verified_carried_us_snapshot_identity(
          WHERE trading_epoch_id=:epoch AND symbol=:symbol AND as_of<:today
          ORDER BY as_of DESC LIMIT 1
     """), {"epoch":trading_epoch_id,"symbol":sym,"today":trade_date}).mappings().first()
-    if not prior or _exact_positive_shares(prior.get("qty")) != qty:
+    prior_qty = _exact_positive_shares((prior or {}).get("qty"))
+    if prior_qty is None or qty > prior_qty:
+        # A higher balance could be an independent new BUY, corporate action,
+        # broker-late fill or another epoch. Never carry a prior cycle.
         return None
     prior_meta = prior.get("meta") if isinstance(prior.get("meta"),dict) else {}
     if str(prior_meta.get("strategy_owner") or "").upper() != "US_STANDARD":
@@ -381,20 +438,63 @@ def verified_carried_us_snapshot_identity(
         and str((life.get("entry_policy") or {}).get("entry_exit_contract_sha256") or "") == contract["sha256"]
     ):
         return None
-    # Order uncertainty since the previous snapshot is not a continuity
-    # proof. Stage4 will handle fresh fill evidence independently.
-    intervening = conn.execute(text("""
+    # Previous-day unresolved orders invalidate every carry. A quantity
+    # reduction is permitted only if each intervening order is a fully scoped,
+    # terminal, native-KIS-confirmed SELL of the same original cycle.
+    # This is essential for TP1->TP2/runner continuity after partial fills.
+    pending_previous = conn.execute(text("""
         SELECT COUNT(*) FROM us_orders
         WHERE trading_epoch_id=:epoch AND symbol=:symbol
-          AND (
-             (trade_date>:previous_date AND trade_date<=:today)
-             OR (trade_date=:previous_date AND status NOT IN
-                ('FILLED','CANCELLED','REJECTED','BLOCKED','EXPIRED'))
-          )
+          AND trade_date=:previous_date AND status NOT IN
+              ('FILLED','CANCELLED','REJECTED','BLOCKED','EXPIRED')
     """), {"epoch":trading_epoch_id,"symbol":sym,
-           "previous_date":prior["as_of"],"today":trade_date}).scalar()
-    if intervening is None or int(intervening) != 0:
+           "previous_date":prior["as_of"]}).scalar()
+    if pending_previous is None or int(pending_previous) != 0:
         return None
+
+    sold_shares = prior_qty - qty
+    if sold_shares == 0:
+        # No intervening order may be silently skipped just because the
+        # observed share balance did not change.
+        intervening = conn.execute(text("""
+            SELECT COUNT(*) FROM us_orders
+            WHERE trading_epoch_id=:epoch AND symbol=:symbol
+              AND trade_date>:previous_date AND trade_date<=:today
+        """), {"epoch":trading_epoch_id,"symbol":sym,
+               "previous_date":prior["as_of"],"today":trade_date}).scalar()
+        if intervening is None or int(intervening) != 0:
+            return None
+    else:
+        # Do not use a ticker-only historical lookup: every order and fill
+        # must match this exact account/portfolio/cycle. The left join makes
+        # missing native KIS fill evidence a strict failure.
+        rows = conn.execute(text("""
+            SELECT o.trade_date, o.side, o.status, o.qty_requested,
+                   o.qty_filled, o.client_order_key, o.order_no,
+                   o.trading_epoch_id, o.account_id AS order_account_id,
+                   o.portfolio_epoch_id AS order_portfolio_epoch_id,
+                   o.position_cycle_id AS order_position_cycle_id,
+                   o.meta AS order_meta, f.qty AS fill_qty,
+                   f.account_id AS fill_account_id,
+                   f.portfolio_epoch_id AS fill_portfolio_epoch_id,
+                   f.position_cycle_id AS fill_position_cycle_id,
+                   f.meta AS fill_meta
+            FROM us_orders o
+            LEFT JOIN us_fills f
+              ON f.trade_date=o.trade_date
+             AND f.client_order_key=o.client_order_key
+             AND f.trading_epoch_id=o.trading_epoch_id
+            WHERE o.trading_epoch_id=:epoch AND o.symbol=:symbol
+              AND o.trade_date>:previous_date AND o.trade_date<=:today
+            ORDER BY o.trade_date, o.client_order_key LIMIT 201
+        """), {"epoch":trading_epoch_id,"symbol":sym,
+               "previous_date":prior["as_of"],"today":trade_date}).mappings().all()
+        if not _verified_actual_partial_sell_continuity(
+            [dict(r) for r in rows], sold_shares=sold_shares,
+            epoch=trading_epoch_id, broker_hash=broker_hash,
+            portfolio=portfolio, cycle=cycle,
+        ):
+            return None
 
     return {
         # Preserve signed V2/V3 at every authoritative next-day balance;
@@ -418,4 +518,5 @@ def verified_carried_us_snapshot_identity(
         "high_watermark_source": life.get("high_watermark_source"),
         "holding_trade_days": life.get("holding_trade_days"),
         "lineage_resolution": "VERIFIED_CURRENT_EPOCH_CONTINUITY",
+        "lineage_verified_partial_sell_shares": sold_shares,
     }
