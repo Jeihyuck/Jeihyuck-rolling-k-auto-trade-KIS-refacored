@@ -5930,6 +5930,17 @@ def mark_order_filled_by_reconcile(
                         (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
                         VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
                         ON CONFLICT (fill_idempotency_key) DO NOTHING"""
+            if original_scope and order_epoch_id:
+                insert_params.update(original_scope)
+                insert_sql = insert_sql.replace(
+                    "trading_epoch_id,meta,",
+                    "trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,meta,",
+                ).replace(
+                    ":trading_epoch_id,CAST(:meta",
+                    ":trading_epoch_id,:account_id,:portfolio_epoch_id,:position_cycle_id,CAST(:meta",
+                )
+                if "trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,meta," not in insert_sql:
+                    raise RuntimeError("US_FILL_SCOPE_PERSISTENCE_MISSING")
             # On production's uq_us_fills_idempotent the column tuple does
             # NOT contain evidence_type. If synthetic and actual broker
             # cumulative have identical qty AND price, the otherwise-correct
