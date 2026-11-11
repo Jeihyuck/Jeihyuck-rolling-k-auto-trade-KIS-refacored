@@ -192,14 +192,26 @@ def reserve_tp_stage(
                     ).with_for_update()
                 ).scalar_one_or_none()
                 partial = dict(partial_raw or {})
-                if partial and (
-                    partial.get("status") != "FILLED"
-                    or partial.get("broker_fill_proven") is not True
-                    or not partial.get("broker_odno")
-                ):
-                    return StageJournalResult(
-                        False, "BLOCK", "RUNNER_PARTIAL_UNSETTLED",
-                    )
+                if partial:
+                    # Never infer broker finality merely from a FILLED label:
+                    # the durable quantity proof must exactly match the
+                    # claimed target, using strict integer shares.
+                    try:
+                        p_target = _exact_qty(partial.get("target_qty"))
+                        p_filled = _exact_qty(partial.get("cumulative_filled_qty"))
+                    except (ValueError, TypeError):
+                        return StageJournalResult(
+                            False, "BLOCK", "RUNNER_PARTIAL_FILL_INTEGRITY_INVALID",
+                        )
+                    if (
+                        partial.get("status") != "FILLED"
+                        or partial.get("broker_fill_proven") is not True
+                        or not str(partial.get("broker_odno") or "").strip()
+                        or p_target <= 0 or p_filled != p_target
+                    ):
+                        return StageJournalResult(
+                            False, "BLOCK", "RUNNER_PARTIAL_UNSETTLED",
+                        )
             conn.execute(pg_insert(table).values(
                 job_key=key, updated_ts=datetime.now(timezone.utc),
                 payload={
