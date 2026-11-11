@@ -50,3 +50,32 @@ def test_legacy_quantity_alias_is_checked_with_identical_policy():
             "trade_date": "2026-11-11", "quantity": 3.5,
             "client_order_key": "fixture-sell",
         })
+
+
+
+@pytest.mark.parametrize("side,raw", [
+    ("BUY", 6.5), ("BUY", True), ("BUY", "6.0"),
+    ("SELL", 2.5), ("SELL", False), ("SELL", None),
+])
+def test_actual_router_denies_invalid_qty_before_db_and_kis(monkeypatch, side, raw):
+    from trader.us.db import repos
+    from trader.us.execution.order_router import route_order
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("INVALID_QUANTITY_MUST_NOT_REACH_DB_OR_KIS")
+
+    monkeypatch.setattr(repos, "save_order_intent", unexpected)
+    class NoBroker:
+        place_us_buy_order = staticmethod(unexpected)
+        place_us_sell_order = staticmethod(unexpected)
+
+    got = route_order(
+        {
+            "symbol": "AMGN", "side": side, "qty": raw,
+            "exchange": "NASDAQ", "trade_date": "2026-11-11",
+            "client_order_key": "bad-share-proof",
+        },
+        kis_client=NoBroker(),
+    )
+    assert got["status"] == "INVALID_ORDER_IDENTITY"
+    assert got["broker_submit"] is False
