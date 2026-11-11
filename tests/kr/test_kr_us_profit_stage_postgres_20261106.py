@@ -107,3 +107,42 @@ def test_concurrent_same_tp_exactly_one_durable_claim(stage_db):
     assert sum(item.accepted for item in result) == 1
     assert all(not item.order_authorized for item in result)
     assert load_frozen_stage_states(**args)["TP1"]["status"] == "PENDING"
+
+
+
+def _prove_three_tp_stages(stage_db):
+    for stage, qty in (("TP1", 25), ("TP2", 18), ("TP3", 11)):
+        assert reserve(stage_db, stage, qty, f"key-{stage}").accepted
+        assert observe(stage_db, stage, f"key-{stage}", f"KIS-{stage}", qty).status == "FILLED"
+
+
+def test_native_v3_runner_requires_kis_proven_tp3_and_partial_before_final(stage_db):
+    args = stage_db
+    assert not reserve(args, "PROFIT_DEFENSE_PARTIAL", 23, "runner-partial").accepted
+    assert not reserve(args, "RUNNER_FINAL", 46, "runner-final").accepted
+    _prove_three_tp_stages(args)
+    assert reserve(args, "PROFIT_DEFENSE_PARTIAL", 23, "runner-partial").accepted
+    assert not reserve(args, "PROFIT_DEFENSE_PARTIAL", 23, "runner-partial").accepted
+    assert not reserve(args, "RUNNER_FINAL", 23, "runner-final").accepted
+    assert observe(args, "PROFIT_DEFENSE_PARTIAL", "runner-partial",
+                   "KIS-RUNNER-P", 0).status == "ACK"
+    assert not reserve(args, "RUNNER_FINAL", 23, "runner-final").accepted
+    assert observe(args, "PROFIT_DEFENSE_PARTIAL", "runner-partial",
+                   "KIS-RUNNER-P", 12).status == "PARTIAL_FILLED"
+    assert not reserve(args, "RUNNER_FINAL", 23, "runner-final").accepted
+    assert observe(args, "PROFIT_DEFENSE_PARTIAL", "runner-partial",
+                   "KIS-RUNNER-P", 23).status == "FILLED"
+    assert reserve(args, "RUNNER_FINAL", 23, "runner-final").accepted
+    assert not reserve(args, "RUNNER_FINAL", 23, "runner-final").accepted
+    assert observe(args, "RUNNER_FINAL", "runner-final", "KIS-RUNNER-F", 23).status == "FILLED"
+    states = load_frozen_stage_states(**args)
+    assert states["PROFIT_DEFENSE_PARTIAL"]["status"] == "FILLED"
+    assert states["RUNNER_FINAL"]["status"] == "FILLED"
+
+
+def test_native_runner_final_without_partial_is_legal_but_not_duplicate(stage_db):
+    args = stage_db
+    _prove_three_tp_stages(args)
+    assert reserve(args, "RUNNER_FINAL", 46, "runner-final-no-partial").accepted
+    assert not reserve(args, "PROFIT_DEFENSE_PARTIAL", 23, "runner-partial-late").accepted
+    assert observe(args, "RUNNER_FINAL", "runner-final-no-partial", "KIS-RUNNER-F", 46).status == "FILLED"
