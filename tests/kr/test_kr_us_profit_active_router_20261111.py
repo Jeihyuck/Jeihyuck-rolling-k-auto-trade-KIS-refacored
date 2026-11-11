@@ -188,3 +188,31 @@ def test_active_tp_no_intent_preflight_precedes_native_sell_row():
     intent = src.index("self.orders_repo.create_intent_idempotent(", guard)
     assert src.index("active_tp_durable_intent_permitted(", guard) < intent
     assert src.index("if not self._pretrade_check(", guard) < intent
+
+
+@pytest.mark.parametrize("status,response,broker,submitted,expected", [
+    ("ERROR", {"rt_cd": "EXECUTION_ACTION_ALREADY_CLAIMED",
+               "broker_submit": False}, None, None, False),
+    ("ERROR", {"rt_cd": "KR_US_TP_STAGE_NOT_DURABLE",
+               "broker_submit": False}, None, None, False),
+    ("ERROR", {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE",
+               "broker_submit": False}, None, None, False),
+    ("ERROR", {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE",
+               "broker_submit": False}, "0000033", None, True),
+    ("ERROR", {"rt_cd": "EXECUTION_CLAIM_UNAVAILABLE",
+               "broker_submit": False}, None, "submitted", True),
+    ("ERROR", {"rt_cd": "TIMEOUT", "broker_submit": False}, None, None, True),
+    ("ERROR", {}, None, None, True),
+    ("CREATED", {}, None, None, True),
+    ("ACKED", {}, "0000033", "submitted", True),
+    ("PARTIAL_FILLED", {}, "0000033", "submitted", True),
+    ("FILLED", {}, "0000033", "submitted", False),
+])
+def test_cross_owner_sell_fence_distinguishes_proven_pre_http_error(
+    status, response, broker, submitted, expected,
+):
+    assert router._unresolved_sell_row({
+        "status": status, "response_json": response,
+        "kis_odno": broker, "broker_order_id": None,
+        "submitted_at": submitted, "acked_at": None,
+    }) is expected

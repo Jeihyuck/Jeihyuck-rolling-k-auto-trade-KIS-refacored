@@ -49,19 +49,52 @@ def frozen_kr_profit_contract(position: Mapping[str, Any]) -> dict | None:
     return None
 
 
+_PROVEN_PRE_HTTP_ERROR_CODES = frozenset({
+    "EXECUTION_CLAIM_UNAVAILABLE",
+    "EXECUTION_ACTION_ALREADY_CLAIMED",
+    "KR_US_TP_STAGE_NOT_DURABLE",
+})
+
+
+def _unresolved_sell_row(row: Mapping[str, Any]) -> bool:
+    """A positive, broker-free pre-HTTP failure does not reserve KIS shares.
+
+    ERROR alone is NOT proof of no submission. Missing response, ambiguous
+    HTTP exception, broker number or submit timestamp remains unresolved.
+    """
+    status = str(row.get("status") or "").strip().upper()
+    if status in {"FILLED", "RECONCILED", "CANCELLED", "REJECTED"}:
+        return False
+    response = _meta(row.get("response_json"))
+    if (
+        status == "ERROR"
+        and response.get("broker_submit") is False
+        and str(response.get("rt_cd") or "") in _PROVEN_PRE_HTTP_ERROR_CODES
+        and not any(row.get(k) for k in (
+            "kis_odno", "broker_order_id", "submitted_at", "acked_at"
+        ))
+    ):
+        return False
+    return True
+
+
 def has_unresolved_kr_sell_orders(*, engine: Any, env: str, code: str,
                                   trading_epoch_id: str) -> bool:
-    """Cross-owner SELL/ACK fence: unrelated orders reserve the same KIS shares.
+    """Cross-owner SELL/ACK fence on the exact trading epoch and symbol.
 
-    No account-wide blocking: only the same broker account epoch + symbol.
-    Missing DB evidence is an exception (router fails closed), not no orders.
+    Only explicitly proven pre-KIS, error-status local claims can be ignored.
+    Any unknown DB/KIS row, ambiguous submit, ACK or partial fill fails closed.
     """
     import sqlalchemy as sa
     from trader.db.schema import schema_for_engine
 
     orders = schema_for_engine(engine).orders
     with engine.connect() as conn:
-        count = conn.execute(sa.select(sa.func.count()).select_from(orders).where(
+        rows = conn.execute(sa.select(
+            orders.c.status, orders.c.response_json,
+            orders.c.kis_odno, orders.c.broker_order_id,
+            orders.c.submitted_at, orders.c.acked_at,
+        ).where(
             sa.and_(
                 orders.c.env == env,
                 orders.c.trading_epoch_id == trading_epoch_id,
@@ -74,8 +107,8 @@ def has_unresolved_kr_sell_orders(*, engine: Any, env: str, code: str,
                     ),
                 ),
             )
-        )).scalar_one()
-    return bool(count)
+        )).mappings().all()
+    return any(_unresolved_sell_row(row) for row in rows)
 
 
 def evaluate_active_kr_tp(
