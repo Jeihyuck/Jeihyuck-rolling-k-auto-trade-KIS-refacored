@@ -171,9 +171,14 @@ def load_verified_us_original_buy_scope(
                  WHERE o.trade_date=:td AND o.symbol=:symbol
                    AND o.side='BUY' AND o.status IN ('FILLED','PARTIALLY_FILLED')
                    AND o.trading_epoch_id=:epoch
-                 LIMIT 50
+                 LIMIT 51
             """), {"td": trade_date, "symbol": symbol,
                  "epoch": active_epoch}).mappings().all()
+        # An exhausted bounded scan is not evidence of a globally unique BUY.
+        # Reject instead of selecting one order from a truncated 50-row sample.
+        if len(rows) >= 51:
+            logger.error("[US_POSITION][ORIGINAL_BUY][AMBIGUOUS_SOURCE_WINDOW] symbol=%s", symbol)
+            return None
         return select_verified_us_original_buy_scope(
             [dict(row) for row in rows], symbol=symbol, qty=qty, identity=identity,
         )
