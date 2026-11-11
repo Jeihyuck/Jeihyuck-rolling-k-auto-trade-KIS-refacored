@@ -14480,6 +14480,39 @@ class PB1Engine:
             "KR_TAKE_PROFIT_TP2": "tp2",
             "KR_TAKE_PROFIT_TP3": "tp3",
         }.get(str(exit_reason or "").upper())
+        if _kr_us_tp_context is not None:
+            # Active TP/V3 SELL is different from an analytical dry-run:
+            # a CREATED order without a broker submit would appear as an
+            # unresolved cross-owner SELL on the next live tick. Never let
+            # diagnostic evaluation poison the durable order ledger.
+            if self.dry_run or not self.intended_live or self.force_block_live:
+                logger.info(
+                    "[KR_PROFIT_PARITY][DRY_RUN_SIGNAL_ONLY] code=%s stage=%s "
+                    "action=NO_ORDER_INTENT_NO_STAGE_CLAIM_NO_KIS",
+                    code, _kr_us_tp_context["stage"],
+                )
+                exit_eval_payload["submit_attempted"] = 0
+                exit_eval_payload["submitted"] = 0
+                exit_eval_payload["api_called"] = 0
+                exit_eval_payload["order_result"] = "KR_PROFIT_PARITY_SIGNAL_ONLY"
+                exit_eval_payload["order_skip_reasons"] = ["ACTIVE_TP_DIAGNOSTIC_NO_DURABLE_INTENT"]
+                return exit_eval_payload
+            # A PRE-INTENT native tradeability check prevents a denied
+            # pretrade from leaving a CREATED cross-owner SELL blocker.
+            # The ordinary second check nearer broker submit is retained
+            # to preserve its established safety semantics.
+            if not self._pretrade_check(
+                code=code, market=market, mode=mode, side="SELL",
+                qty=orderable_qty, price=float(mark or 0.0),
+                client_order_key=client_key, stage=stage,
+            ):
+                exit_eval_payload["submit_attempted"] = 0
+                exit_eval_payload["submitted"] = 0
+                exit_eval_payload["api_called"] = 0
+                exit_eval_payload["order_result"] = "KR_PROFIT_PARITY_PRE_INTENT_BLOCKED"
+                exit_eval_payload["order_skip_reasons"] = ["PRETRADE_BLOCKED_NO_DURABLE_INTENT"]
+                return exit_eval_payload
+
         sell_baseline = (OrderBaseline.capture(self._authoritative_balance, code, orderable_qty)
                          if self._authoritative_balance else None)
         try:
