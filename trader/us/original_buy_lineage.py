@@ -201,6 +201,20 @@ def verified_new_buy_snapshot_identity(
     )
     if proof is None:
         return None
+    # Do not override an explicit partially bound but inconsistent snapshot.
+    asserted = {**meta, **{k: v for k, v in position.items() if v is not None}}
+    for key in ("account_id", "strategy_owner", "position_cycle_id",
+                "position_lifecycle_id", "portfolio_epoch_id"):
+        actual = asserted.get(key)
+        expected = (
+            identity["account_id"] if key == "account_id"
+            else "US_STANDARD" if key == "strategy_owner"
+            else proof["position_cycle_id"] if key == "position_cycle_id"
+            else proof["position_lifecycle_id"] if key == "position_lifecycle_id"
+            else proof["portfolio_epoch_id"]
+        )
+        if actual not in (None, "") and str(actual) != str(expected):
+            return None
     return {
         "env": "practice", "account_id": identity["account_id"],
         "broker_account_hash": hashlib.sha256(identity["account_id"].encode()).hexdigest(),
