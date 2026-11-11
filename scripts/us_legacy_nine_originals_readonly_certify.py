@@ -50,6 +50,48 @@ AND side IN ('BUY','SELL') AND trade_date<=:trade_date AND env='practice'
 ORDER BY symbol,trade_date,order_no
 """
 
+# November 4's real original-runtime lifecycle is not the historical BUY
+# intent's ENTRY:US_STANDARD:<symbol> placeholder. Read it separately:
+# it was durable until 11/04, while fresh 11/05+ risk rows are '{}'.
+# Never rebrand the old lifecycle as a retroactive portfolio epoch.
+SELECT_HISTORICAL_RUNTIME_LIFECYCLES = """
+SELECT DISTINCT ON (symbol) symbol,trade_date,trading_epoch_id,
+       state->'lifecycle' AS lifecycle
+FROM public.us_position_risk_state
+WHERE trading_epoch_id=:epoch AND trade_date<=:trade_date
+  AND symbol=ANY(:symbols)
+  AND NULLIF(state->'lifecycle'->>'lifecycle_id','') IS NOT NULL
+ORDER BY symbol,trade_date DESC
+"""
+SELECT_HISTORICAL_TP_STAGES = """
+SELECT symbol,trade_date,position_lifecycle_id,stage,stage_status
+FROM public.us_profit_capture_lifecycle
+WHERE trading_epoch_id=:epoch AND trade_date<=:trade_date
+  AND symbol=ANY(:symbols)
+ORDER BY symbol,trade_date,stage
+"""
+
+
+def load_historical_lifecycle_evidence(
+    engine: Any, *, trading_epoch_id: str, trade_date: str,
+) -> tuple[list[dict], list[dict]]:
+    """GET-only historical lifecycle and stage evidence, without SQL mutation."""
+    if not trading_epoch_id:
+        raise RuntimeError("US_HISTORICAL_LIFECYCLE_EPOCH_MISSING")
+    date.fromisoformat(trade_date)
+    with engine.connect() as conn:
+        conn.execute(text("SET TRANSACTION READ ONLY"))
+        params={"epoch":trading_epoch_id,"trade_date":trade_date,
+                "symbols":list(SYMBOLS)}
+        lifecycles=[_plain(x) for x in conn.execute(
+            text(SELECT_HISTORICAL_RUNTIME_LIFECYCLES),params
+        ).mappings().all()]
+        stages=[_plain(x) for x in conn.execute(
+            text(SELECT_HISTORICAL_TP_STAGES),params
+        ).mappings().all()]
+    return lifecycles,stages
+
+
 
 def _count(value: Any) -> int:
     try:
@@ -85,6 +127,9 @@ def load_readonly_archive(engine: Any, *, trading_epoch_id: str,
 
 def prepare_original_plan(
     positions: list[dict], fills: list[dict], orders: list[dict],
+    *, historical_lifecycles: list[dict] | None = None,
+    historical_tp_stages: list[dict] | None = None,
+    current_raw_account: str = "",
 ) -> dict:
     """Build a narrow and fail-closed original order GET plan from DB rows."""
     blockers = []
@@ -101,6 +146,20 @@ def prepare_original_plan(
                str(order.get("trade_date") or ""),
                str(order.get("order_no") or "").lstrip("0"))
         matching_orders[key].append(order)
+    # Explicit historical proof mode is used by the real WSL entrypoint.
+    # Fixture callers without historical evidence preserve the old exact
+    # BUY/SELL lifecycle semantics for early-era databases.
+    historical_mode = historical_lifecycles is not None
+    history_rows = {}
+    if historical_mode:
+        for row in historical_lifecycles or []:
+            sym=str(row.get("symbol") or "")
+            history_rows.setdefault(sym, []).append(row)
+    tp_by_symbol: dict[str,list[dict]] = defaultdict(list)
+    if historical_tp_stages is not None:
+        for stage in historical_tp_stages:
+            tp_by_symbol[str(stage.get("symbol") or "")].append(stage)
+
     entries = []
     original_sell_entries = []
     for symbol in SYMBOLS:
@@ -139,7 +198,19 @@ def prepare_original_plan(
             order_requested = _count(matched[0].get("qty_requested")) if len(matched)==1 else 0
         except ValueError:
             q=requested=order_requested=0
-        life = str(meta.get("position_lifecycle_id") or "")
+        # The original BUY intent stores an ENTRY:<owner>:<symbol> alias.
+        # The later genuine runtime cycle is a distinct, deterministic ID.
+        # Never claim that the alias IS the actual SELL/TP lifecycle.
+        buy_lifecycle_alias = str(meta.get("position_lifecycle_id") or "")
+        history = history_rows.get(symbol, []) if historical_mode else []
+        archived_lifecycle = (
+            history[0].get("lifecycle")
+            if len(history)==1 and isinstance(history[0].get("lifecycle"),dict)
+            else {}
+        )
+        archived_lifecycle = archived_lifecycle or {}
+        archived_cycle = str(archived_lifecycle.get("lifecycle_id") or "")
+        life = archived_cycle if historical_mode else buy_lifecycle_alias
         contract = str(meta.get("entry_exit_contract_sha256") or "")
         owner = str(meta.get("strategy_owner") or "").upper()
         original_order_meta = (
@@ -147,9 +218,38 @@ def prepare_original_plan(
             isinstance(matched[0].get("meta"),dict) else {}
         )
         order_contract = str(original_order_meta.get("entry_exit_contract_sha256") or "")
+        if historical_mode:
+            # The archived lifecycle pre-dates the new canonical portfolio
+            # epoch. Only account/owner/epoch/date and real lifecycle can be
+            # certified; NEVER invent a source position_cycle_id/portfolio.
+            if not (
+                len(history)==1 and current_raw_account
+                and str(history[0].get("trading_epoch_id") or "")==
+                    str(position.get("trading_epoch_id") or "")
+                and archived_lifecycle.get("is_open") is True
+                and archived_cycle and len(archived_cycle) >= 20
+                and str(archived_lifecycle.get("strategy_owner") or "")==
+                    "US_STANDARD"
+                and str(archived_lifecycle.get("env") or "")=="practice"
+                and str(archived_lifecycle.get("account_id") or "")==
+                    current_raw_account
+                and str(archived_lifecycle.get("trading_epoch_id") or "")==
+                    str(position.get("trading_epoch_id") or "")
+                and str(archived_lifecycle.get("opened_trade_date") or "")==
+                    original_day
+            ):
+                blockers.append(f"{symbol}_HISTORICAL_RUNTIME_CYCLE_UNVERIFIED")
+            if historical_tp_stages is not None:
+                stages=[
+                    t for t in tp_by_symbol.get(symbol, [])
+                    if str(t.get("trade_date") or "") >= original_day
+                ]
+                if any(str(t.get("position_lifecycle_id") or "")!=archived_cycle
+                       for t in stages):
+                    blockers.append(f"{symbol}_HISTORICAL_TP_STAGE_CYCLE_MISMATCH")
         if (not order_no or len(original_day)!=10 or q<=0 or
             requested != q or order_requested != q or owner != "US_STANDARD" or
-            not life or not contract or contract != order_contract):
+            not life or not buy_lifecycle_alias or not contract or contract != order_contract):
             blockers.append(f"{symbol}_FROZEN_BUY_CONTRACT_NOT_PROVEN")
         for sale in sells:
             sale_day = str(sale.get("trade_date") or "")
@@ -169,9 +269,17 @@ def prepare_original_plan(
             # The original sell must belong to the original BUY's lifecycle.
             # All sale proofs are new KIS GETs; an existing DB FILLED status
             # without authenticated source-day broker quantity is not proof.
+            sell_order_meta = (
+                sale_orders[0].get("meta")
+                if len(sale_orders)==1
+                and isinstance(sale_orders[0].get("meta"),dict)
+                else {}
+            )
             sell_identity_matches = bool(
                 sale_meta.get("position_lifecycle_id") == life and life
                 and str(sale_meta.get("strategy_owner") or "").upper() == owner
+                and (not historical_mode or
+                     sell_order_meta.get("position_lifecycle_id")==life)
             )
             sale_ok = bool(
                 sale_no and len(sale_day)==10 and len(sale_orders)==1
@@ -198,6 +306,11 @@ def prepare_original_plan(
             # account or contract. The proposal digest must bind the exact
             # immutable lifecycle and frozen entry-exit policy.
             "original_lifecycle_id":life,
+            "original_buy_lifecycle_alias":buy_lifecycle_alias,
+            "historical_runtime_cycle_certified_by_db":bool(
+                historical_mode and archived_cycle and
+                f"{symbol}_HISTORICAL_RUNTIME_CYCLE_UNVERIFIED" not in blockers
+            ),
             "original_contract_sha256":contract,
             "frozen_contract_match":bool(contract and contract==order_contract),
             "epoch_db_net_matches":net == quantity if net is not None else False,
@@ -438,9 +551,21 @@ def main() -> int:
         archive=load_readonly_archive(
             engine,trading_epoch_id=scope["trading_epoch_id"],
             trade_date=args.trade_date)
-        plan=prepare_original_plan(*archive)
+        lifecycles,tp_stages=load_historical_lifecycle_evidence(
+            engine,trading_epoch_id=scope["trading_epoch_id"],
+            trade_date=args.trade_date)
         client=KisUSClient(env="practice")
         assert_practice_client_matches_current_scope(client,scope)
+        from trader.account_state import get_account_key
+        raw_account=get_account_key(
+            env="practice",cano=client._cano,
+            product_code=client._acnt_prdt_cd,
+        )
+        plan=prepare_original_plan(
+            *archive,historical_lifecycles=lifecycles,
+            historical_tp_stages=tp_stages,
+            current_raw_account=raw_account,
+        )
         result=certify_get_only(plan,client)
     except Exception as exc:
         result={"status":"US_ORIGINAL_CERTIFICATION_FAILED",
