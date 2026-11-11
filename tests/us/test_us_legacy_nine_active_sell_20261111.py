@@ -595,3 +595,75 @@ def test_legacy_zero_fill_unknown_or_recorded_partial_fill_is_fenced(scenario):
     )
     assert evidence is None
     assert reason=="ORIGINAL_SELL_NO_FILL_UNVERIFIED"
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    ("ABBV", "DHR", "HCA", "KO", "KR", "MCK", "PFE", "PG", "TMO"),
+)
+@pytest.mark.parametrize("reason", ("TAKE_PROFIT_TP2", "HARD_STOP"))
+def test_all_nine_v2_exit_signals_are_broker_fenced_offline(
+    scenario, symbol, reason,
+):
+    """Each original V2 owner path reaches a guarded SELL with native fixtures.
+
+    This is an offline regression only. It neither authenticates real KIS
+    historical orders nor proves an actual practice fill or WSL deployment.
+    """
+    db, client, intent = scenario
+    contract = build_us_entry_exit_contract({
+        "symbol": symbol,
+        "strategy_owner": "US_STANDARD",
+        "book": "SWING_BOOK",
+        "horizon": "SWING_CARRY",
+        "entry_reason": "TEST_ORIGINAL_BUY",
+    })
+    digest = contract["sha256"]
+    db.position["symbol"] = symbol
+    db.position["meta"] = {
+        "entry_exit_contract_sha256": digest,
+        "entry_exit_contract": contract,
+    }
+    db.buy["meta"]["position_lifecycle_id"] = f"ENTRY:US_STANDARD:{symbol}"
+    db.buy["meta"]["entry_exit_contract_sha256"] = digest
+    db.fills[0]["meta"]["position_lifecycle_id"] = f"ENTRY:US_STANDARD:{symbol}"
+    db.fills[0]["meta"]["entry_exit_contract_sha256"] = digest
+    for rows in client.old_rows.values():
+        for original_order in rows:
+            original_order["pdno"] = symbol
+    def balance(*, force_refresh=False):
+        assert force_refresh is True
+        return {
+            "rt_cd": "0", "balance_complete": True,
+            "balance_authoritative": True, "balance_conflicts": [],
+            "failed_exchanges": {},
+            "output1": [{
+                "ovrs_pdno": symbol,
+                "ovrs_cblc_qty": str(client.holding),
+                "ord_psbl_qty": str(client.orderable),
+            }],
+        }
+    client.get_us_balance = balance
+    intent["symbol"] = symbol
+    intent["reason"] = reason
+    intent["meta"]["source_entry_contract_sha256"] = digest
+    if reason == "HARD_STOP":
+        intent["meta"].pop("profit_capture_stage", None)
+    ok, why, proof = _authorize(scenario)
+    assert ok, (symbol, reason, why)
+    assert intent["automated_sell_authorized"] is True
+    assert intent["meta"]["source_original_entry_exit_contract_sha256"] == digest
+    assert intent["meta"]["source_original_runtime_lifecycle_id"] == OLD_CYCLE
+    assert intent["position_cycle_id"] != OLD_CYCLE
+    assert db.position["position_cycle_id"] is None
+    assert db.buy["meta"]["position_lifecycle_id"] == f"ENTRY:US_STANDARD:{symbol}"
+    assert recheck_legacy_nine_sell_before_http(
+        intent, kis_client=client, proof=proof, qty=1
+    )[0] is True
+
+    # No stale pre-HTTP authorization survives a changed broker holding.
+    client.holding -= 1
+    recheck_ok, _ = recheck_legacy_nine_sell_before_http(
+        intent, kis_client=client, proof=proof, qty=1,
+    )
+    assert recheck_ok is False
