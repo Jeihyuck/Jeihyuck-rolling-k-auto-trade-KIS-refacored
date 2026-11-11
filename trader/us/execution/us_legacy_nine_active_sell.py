@@ -276,6 +276,7 @@ def _evidence_from_db(conn, *, symbol: str, trade_date: str,
         "holding":holding,"original_cycle":original_cycle,
         "source_buy_day":opened,"source_buy_order":str(buy["order_no"]),
         "source_buy_qty":buy_qty, "v2_sha":digest,
+        "original_v2_contract":contract,
         "prior_sell_proofs":sale_proofs, "old_unresolved":unresolved,
         "completed_tp_stages":sorted(done),
     },"DB_LEGACY_EVIDENCE_VERIFIED"
@@ -513,8 +514,21 @@ def enrich_legacy_nine_v2_decision_position(
                      meta_out.get("position_lifecycle_id") or "")
         if existing and existing!=old_life:
             return position
+        source_contract=evidence["original_v2_contract"]
+        existing_sha=str(meta_out.get("entry_exit_contract_sha256") or "")
+        if existing_sha and existing_sha!=evidence["v2_sha"]:
+            return position
+        from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+        old_contract=meta_out.get("entry_exit_contract")
+        if old_contract and (
+            not verify_us_entry_exit_contract(old_contract)
+            or old_contract.get("sha256")!=evidence["v2_sha"]
+        ):
+            return position
         out["position_lifecycle_id"]=old_life
         meta_out["position_lifecycle_id"]=old_life
+        meta_out["entry_exit_contract"]=source_contract
+        meta_out["entry_exit_contract_sha256"]=evidence["v2_sha"]
         for stage in evidence["completed_tp_stages"]:
             if stage in {"tp1","tp2","tp3"}:
                 meta_out[f"{stage}_done"]=True
