@@ -1234,6 +1234,27 @@ def route_order(
         return {"status": "BLOCKED", "reason": "tqqq_ownership_rejected",
                 "broker_submit": False, "intent": intent}
 
+    # A verified Stage4->legacy handoff is SELL-only even if a later
+    # crash-rebound overlay or TQQQ dedicated sleeve re-enables an entry.
+    # This guard runs BEFORE DB/order-intent creation and KIS HTTP for every
+    # canonical BUY. It does not bypass any SELL claims or broker fences.
+    if (
+        os.getenv("US_STAGE4_EXIT_ONLY_ACTIVE", "0") == "1"
+        and str(intent.get("side") or "").upper() == "BUY"
+    ):
+        logger.warning(
+            "[US_ORDER][STAGE4_EXIT_ONLY][BUY_BLOCKED] symbol=%s owner=%s",
+            str(intent.get("symbol") or "").upper(),
+            intent.get("strategy_owner"),
+        )
+        return {
+            "status": "ORDER_DISABLED_STAGE4_EXIT_ONLY",
+            "reason": "stage4_verified_writer_stop_sell_only",
+            "broker_submit": False,
+            "retry_order": False,
+            "intent": intent,
+        }
+
     from trader.us.db.repos import (
         save_order_intent, save_dry_run_order, save_order_ack, save_order_reject,
         mark_order_intent_sent, mark_order_intent_blocked, mark_order_intent_rejected,
