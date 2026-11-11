@@ -118,7 +118,12 @@ class TestEdgeCases:
             available_cash_usd=500.0,
             now=DAYTIME_ET,
         )
-        assert result["status"] == "BLOCKED"
+        # The shared strict identity boundary now rejects zero shares BEFORE
+        # any DB intent / broker activity. Previously the later risk gate
+        # returned the generic BLOCKED status; no order is authorized in
+        # either case.
+        assert result["status"] == "INVALID_ORDER_IDENTITY"
+        assert result["broker_submit"] is False
 
     def test_notional_exceeds_limit_blocked(self):
         result = route_order(
