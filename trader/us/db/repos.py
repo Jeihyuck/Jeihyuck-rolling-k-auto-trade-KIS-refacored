@@ -4905,6 +4905,22 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         ).strip() or None,
                     )
                 meta.update(policy)
+                if verified_identity:
+                    meta["lineage_identity_status"] = "VERIFIED_ORIGINAL_KIS_BUY"
+                elif (authoritative_positions
+                        and int(p.get("qty") or 0) > 0
+                        and policy.get("entry_policy_source") == "confirmed_buy_order"
+                        and not (
+                            p.get("position_lifecycle_id")
+                            or meta.get("position_lifecycle_id")
+                        )):
+                    # Persist balance truth but never silently describe an
+                    # unbound holding as an adopted/trend-managed cycle.
+                    meta["lineage_identity_status"] = "ORIGINAL_BUY_SCOPE_UNVERIFIED"
+                    logger.error(
+                        "[US_POSITIONS][ORIGINAL_SCOPE][FENCED] symbol=%s action=WAIT_ORIGINAL_BUY_PROOF",
+                        p.get("symbol"),
+                    )
                 meta.update({k: v for k, v in {
                     "holding_qty": p.get("holding_qty") or p.get("qty", 0),
                     "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
