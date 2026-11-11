@@ -1024,7 +1024,19 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 list(decision.metadata.get("conflict_first_buy_confirmed_dates") or [])
                 if decision.reason == "CONFLICT_STRONG_RISK_ON_FIRST_BUY" else []
             )
+            micro_proof = (
+                dict(decision.metadata)
+                if decision.reason == "DEFENSIVE_MICRO_FIRST_BUY" else {}
+            )
             state = reserve_new_cycle(state, trading_date)
+            if micro_proof:
+                # Allow only a retry of the same unfilled current-day cycle.
+                # All live risk, quote, balance and order fences are rechecked.
+                state = replace(state, metadata={
+                    "defensive_micro_first_buy_reserved_cycle": True,
+                    "defensive_micro_first_buy_trade_date": trading_date.isoformat(),
+                    "defensive_micro_first_buy_origin": micro_proof,
+                })
             if bootstrap_proof:
                 # Keep only this epoch's verified two-session evidence so a
                 # pre-HTTP KIS failure can retry the same reserved cycle;
@@ -1163,7 +1175,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "tqqq_max_daily_buy_usd": config.max_daily_buy_usd,
                      "tqqq_max_total_capital_usd": config.max_total_capital_usd,
                      **({"tqqq_conflict_first_buy_evidence": dict(decision.metadata)}
-                        if decision.reason == "CONFLICT_STRONG_RISK_ON_FIRST_BUY" else {})},
+                        if decision.reason == "CONFLICT_STRONG_RISK_ON_FIRST_BUY" else {}),
+                     **({"tqqq_defensive_micro_first_buy_evidence": dict(decision.metadata)}
+                        if decision.reason == "DEFENSIVE_MICRO_FIRST_BUY" else {})},
         }
         result = route(intent)
         if (decision.action == Action.SELL and state is not None
