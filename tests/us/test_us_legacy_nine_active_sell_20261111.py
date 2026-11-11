@@ -305,14 +305,10 @@ def test_pre_http_recheck_fences_new_competing_sell_and_balance_change(scenario)
 
 def test_disabled_real_other_owner_or_symbol_never_authorizes(scenario,monkeypatch):
     db,client,intent=scenario
-    for kw in [{"env":"real"}, {"active_epoch":""}]:
+    for env,epoch in [("real",EPOCH),("practice","")]:
         out=prove_and_bind_legacy_nine_sell(
             intent,conn=db,kis_client=client,trade_date="2026-11-11",
-            raw_account=RAW_ACCOUNT,env="practice",
-            active_epoch=EPOCH,**{k:v for k,v in kw.items() if k not in {"env"}}
-        ) if "env" not in kw else prove_and_bind_legacy_nine_sell(
-            intent,conn=db,kis_client=client,trade_date="2026-11-11",
-            raw_account=RAW_ACCOUNT,env="real",active_epoch=EPOCH,
+            raw_account=RAW_ACCOUNT,env=env,active_epoch=epoch,
         )
         assert out[0] is False
     intent["symbol"]="TQQQ"
