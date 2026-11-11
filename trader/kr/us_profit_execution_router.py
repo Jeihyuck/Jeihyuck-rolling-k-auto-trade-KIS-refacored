@@ -48,6 +48,26 @@ def evaluate_active_kr_tp(
     A broker error never turns into an empty/clean stage list.
     """
     contract = frozen_kr_profit_contract(position)
+    if contract is None and str(code).zfill(6) == "028050" and env == "practice":
+        # One explicitly scoped existing v1 holding: broker-proof amendment
+        # may attach a NEW versioned overlay. A failure preserves v1 exactly
+        # and does NOT claim that a new TP strategy is active.
+        try:
+            from trader.kr.us_profit_existing_amendment import (
+                maybe_amend_samsung_ea_position,
+            )
+            amended = maybe_amend_samsung_ea_position(
+                engine=engine, kis=kis, env=env,
+                position_cycle_id=str(position.get("position_cycle_id") or ""),
+            )
+            if amended:
+                contract = amended
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[KR_PROFIT_PARITY][SAMSUNG_AMENDMENT_NOT_VERIFIED] code=%s reason=%s",
+                code, type(exc).__name__,
+            )
     if contract is None or contract.get("activation_mode") != "ACTIVE_PRACTICE":
         return None
 
@@ -56,6 +76,15 @@ def evaluate_active_kr_tp(
 
     if not verified_contract(contract):
         return block("KR_TP_INVALID_FROZEN_CONTRACT")
+    if contract.get("position_action") == "EXPLICIT_POSITION_AMENDMENT":
+        try:
+            from trader.kr.us_profit_existing_amendment import (
+                verified_amendment_readback,
+            )
+            if not verified_amendment_readback(engine=engine, contract=contract):
+                return block("KR_TP_EXISTING_POSITION_AMENDMENT_NOT_DURABLE")
+        except Exception:
+            return block("KR_TP_EXISTING_POSITION_AMENDMENT_DB_UNAVAILABLE")
     if env != "practice" or str(getattr(kis, "env", "")).lower() != "practice":
         return block("KR_TP_NOT_PRACTICE")
     owner = str(position.get("owner_strategy") or position.get("strategy") or "").lower()

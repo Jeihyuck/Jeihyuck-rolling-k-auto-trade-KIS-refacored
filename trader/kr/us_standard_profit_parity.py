@@ -45,7 +45,7 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
             or data.get("strategy_owner") != "PB1"
             or data.get("exit_policy_family") != "SWING_STAGED_EXIT"
             or data.get("trade_horizon") != "SWING"
-            or data.get("position_action") != "NEW_POSITION_BUY"
+            or data.get("position_action") not in {"NEW_POSITION_BUY", "EXPLICIT_POSITION_AMENDMENT"}
             or data.get("activation_mode", "SHADOW") not in {"SHADOW", "ACTIVE_PRACTICE"}
             or not str(data.get("account_sha256") or "").strip()
             or not str(data.get("trading_epoch_id") or "").strip()
@@ -55,6 +55,24 @@ def verified_contract(value: Mapping[str, Any] | None) -> bool:
             or data.get("runner_version") not in VALID_RUNNER_VERSIONS
             or data.get("stages") != [dict(stage=s[0], threshold_fraction=s[1],
                                            sell_fraction=s[2], reason=s[3]) for s in STAGES]):
+        return False
+    proof = data.get("amendment_proof")
+    if data.get("position_action") == "EXPLICIT_POSITION_AMENDMENT":
+        if (
+            not isinstance(proof, Mapping)
+            or proof.get("version") != "kr_pb1_position_amendment_v1"
+            or proof.get("source") != "KIS_DAILY_CCLD_AND_FRESH_BALANCE"
+            or not str(proof.get("original_buy_odno") or "").strip()
+            or not str(proof.get("original_buy_trade_date") or "").strip()
+            or not str(proof.get("original_entry_contract_sha256") or "").strip()
+            or not isinstance(proof.get("verified_qty"), int)
+            or isinstance(proof.get("verified_qty"), bool)
+            or proof.get("verified_qty", 0) <= 0
+            or not isinstance(proof.get("verified_avg_price"), (int, float))
+            or float(proof.get("verified_avg_price") or 0) <= 0
+        ):
+            return False
+    elif proof is not None:
         return False
     return bool(old_sha) and old_sha == _canonical_sha(data)
 
@@ -74,6 +92,7 @@ def build_new_swing_parity_contract(
     position_action: str, account_id: str, trading_epoch_id: str,
     position_cycle_id: str, runner_version: str, code: str,
     existing_contract: Mapping[str, Any] | None = None,
+    amendment_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Only a positively identified NEW PB1 SWING can receive a new contract.
 
@@ -90,9 +109,14 @@ def build_new_swing_parity_contract(
         str(strategy_owner).upper() != "PB1"
         or str(exit_policy_family).upper() != "SWING_STAGED_EXIT"
         or str(trade_horizon).upper() != "SWING"
-        or str(position_action).upper() != "NEW_POSITION_BUY"
+        or str(position_action).upper() not in {"NEW_POSITION_BUY", "EXPLICIT_POSITION_AMENDMENT"}
     ):
         raise ValueError("KR_PROFIT_PARITY_OWNER_OR_HORIZON_UNVERIFIED")
+    if str(position_action).upper() == "EXPLICIT_POSITION_AMENDMENT":
+        if mode != "ACTIVE_PRACTICE" or not isinstance(amendment_proof, Mapping):
+            raise ValueError("KR_PROFIT_PARITY_AMENDMENT_EVIDENCE_REQUIRED")
+    elif amendment_proof is not None:
+        raise ValueError("KR_PROFIT_PARITY_NEW_BUY_MUST_NOT_INHERIT_AMENDMENT")
     if not all(str(x or "").strip() for x in
                (account_id, trading_epoch_id, position_cycle_id)):
         raise ValueError("KR_PROFIT_PARITY_LIFECYCLE_UNVERIFIED")
@@ -120,6 +144,8 @@ def build_new_swing_parity_contract(
         "stages": [dict(stage=s[0], threshold_fraction=s[1],
                         sell_fraction=s[2], reason=s[3]) for s in STAGES],
     }
+    if amendment_proof is not None:
+        payload["amendment_proof"] = dict(amendment_proof)
     if runner_version == "US_V3":
         # Snapshot the approved US V3 policy, not today's ENV at sell time.
         from trader.us.pb1.swing_runner_exit_v3 import V3_RUNNER_POLICY
