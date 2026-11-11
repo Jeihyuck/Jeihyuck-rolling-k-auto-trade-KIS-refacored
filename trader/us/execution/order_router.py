@@ -1531,6 +1531,12 @@ def route_order(
                     }
                 )
                 if _legacy_nine_applicable:
+                    # The regular router initializes the native KIS client
+                    # much later (after risk gates). Legacy verification is
+                    # intentionally pre-intent, so initialize it here once.
+                    if kis_client is None:
+                        from trader.us.execution.kis_us_client import KisUSClient
+                        kis_client = KisUSClient(env=_env)
                     from trader.us.execution.us_legacy_nine_active_sell import (
                         prove_and_bind_legacy_nine_sell,
                     )
