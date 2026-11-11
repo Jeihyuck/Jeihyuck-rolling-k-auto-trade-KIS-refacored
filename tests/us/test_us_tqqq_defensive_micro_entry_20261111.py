@@ -128,3 +128,48 @@ def test_invalid_cap_or_buffer_is_not_silently_accepted(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_DEFENSIVE_MICRO_FIRST_BUY_COST_BUFFER_PCT", "nan")
     with pytest.raises(ValueError):
         InfiniteConfig.from_env()
+
+
+def test_real_infinite_sleeve_path_reserves_cycle_and_binds_order_provenance(monkeypatch):
+    from trader.us.infinite.integration import run_sleeve
+    from tests.us.test_us_tqqq_infinite_integration import FakeRepository
+
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    repo = FakeRepository(InfiniteState())
+    routed = []
+
+    def fake_router(intent):
+        routed.append(intent)
+        return {"status": "ACK", "broker_submit": False}
+
+    out = run_sleeve(
+        positions=[], price=100, trading_date=DAY, overlay=caution(),
+        repository=repo, route=fake_router,
+    )
+    assert out["status"] == "ACK"
+    assert len(routed) == 1
+    order = routed[0]
+    assert order["strategy_owner"] == "TQQQ_INFINITE"
+    assert order["reason"] == "DEFENSIVE_MICRO_FIRST_BUY"
+    assert order["qty"] == 1
+    assert order["position_lifecycle_id"] == repo.state.cycle_id
+    assert repo.state.metadata["defensive_micro_first_buy_reserved_cycle"] is True
+    assert order["meta"]["tqqq_defensive_micro_first_buy_evidence"]["defensive_micro_first_buy_gross_cap_proof"] <= 125
+
+    # A failed pre-HTTP route may only reconsider the same, still unfilled
+    # cycle on the same ET day. The durable production router is responsible
+    # for de-duplicating the stable semantic key and attempt.
+    again = run_sleeve(
+        positions=[], price=100, trading_date=DAY, overlay=caution(),
+        repository=repo, route=fake_router,
+    )
+    assert again["decision"].reason == "DEFENSIVE_MICRO_FIRST_BUY"
+    assert routed[1]["client_order_key"] == routed[0]["client_order_key"]
+    next_day = run_sleeve(
+        positions=[], price=100, trading_date=date(2026, 11, 11),
+        overlay=caution(), repository=repo, route=fake_router,
+    )
+    assert next_day["decision"].action == Action.BLOCK
+    assert len(routed) == 2
