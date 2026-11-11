@@ -4864,6 +4864,32 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
         with engine.begin() as conn:
             trading_epoch_id = _active_us_epoch(conn)
             for p in positions:
+                # Proactively bind a NEW US_STANDARD BUY from the original,
+                # uniquely matching KIS fill/order/intent *before* writing
+                # the first authoritative broker balance snapshot. Never
+                # infer original lifecycle from symbol or a newer unrelated
+                # order. This happens in the existing DB transaction.
+                verified_identity = None
+                if (authoritative_positions and balance_fetch_status == "OK"
+                        and balance_parse_status == "OK" and trading_epoch_id
+                        and int(p.get("qty") or 0) > 0):
+                    try:
+                        from trader.us.original_buy_lineage import verified_new_buy_snapshot_identity
+                        verified_identity = verified_new_buy_snapshot_identity(
+                            conn=conn, trade_date=str(td), position=p,
+                            trading_epoch_id=trading_epoch_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s",
+                            p.get("symbol"), type(exc).__name__,
+                        )
+                if verified_identity:
+                    p = dict(p)
+                    p["meta"] = {**dict(p.get("meta") or {}), **verified_identity}
+                    p.update(verified_identity)
+                    logger.info("[US_POSITIONS][ORIGINAL_SCOPE][VERIFIED] symbol=%s owner=US_STANDARD",
+                                p.get("symbol"))
                 avg_cost = float(p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd") or 0)
                 current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
                 # meta에 orderable_qty 등 보존
@@ -4945,8 +4971,42 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
                                 meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
                     """
+                if verified_identity:
+                    # Column-level source-of-truth: preserve complete identity
+                    # in the same transaction as the fresh KIS balance row.
+                    # Conflicting already-persisted cycles cannot be replaced.
+                    params.update({
+                        "broker_account_hash": verified_identity["broker_account_hash"],
+                        "portfolio_epoch_id": verified_identity["portfolio_epoch_id"],
+                        "position_cycle_id": verified_identity["position_cycle_id"],
+                    })
+                    sql = sql.replace(
+                        "trading_epoch_id, meta)",
+                        "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
+                    ).replace(
+                        ":trading_epoch_id, CAST(:meta",
+                        ":trading_epoch_id, :broker_account_hash, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
+                    ).replace(
+                        "meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta",
+                        "account_id        =COALESCE(us_positions.account_id,EXCLUDED.account_id),"
+                        "portfolio_epoch_id=COALESCE(us_positions.portfolio_epoch_id,EXCLUDED.portfolio_epoch_id),"
+                        "position_cycle_id =COALESCE(us_positions.position_cycle_id,EXCLUDED.position_cycle_id),"
+                        "meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta",
+                    )
+                    sql += """
+                         WHERE (us_positions.account_id IS NULL
+                                OR us_positions.account_id=EXCLUDED.account_id)
+                           AND (us_positions.portfolio_epoch_id IS NULL
+                                OR us_positions.portfolio_epoch_id=EXCLUDED.portfolio_epoch_id)
+                           AND (us_positions.position_cycle_id IS NULL
+                                OR us_positions.position_cycle_id=EXCLUDED.position_cycle_id)
+                    """
+                    if "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)" not in sql:
+                        raise RuntimeError("US_SNAPSHOT_IDENTITY_COLUMNS_NOT_PERSISTED")
                 params["meta"] = _json_param(meta_to_store)
-                conn.execute(text(sql), params)
+                result = conn.execute(text(sql), params)
+                if verified_identity and getattr(result, "rowcount", None) == 0:
+                    raise RuntimeError("US_SNAPSHOT_ORIGINAL_SCOPE_CONFLICT")
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
