@@ -160,3 +160,31 @@ def test_native_tp_fails_closed_when_any_broker_shares_are_reserved(monkeypatch)
     )
     assert out["action"] == "BLOCK"
     assert out["reason"] == "KR_TP_BROKER_RESERVED_INVENTORY_RECONCILE_REQUIRED"
+
+
+@pytest.mark.parametrize("dry_run,intended_live,force_block_live,allowed", [
+    (False, True, False, True),
+    (True, True, False, False),
+    (False, False, False, False),
+    (False, True, True, False),
+    (True, False, True, False),
+])
+def test_active_tp_durable_intent_gate(
+    dry_run, intended_live, force_block_live, allowed,
+):
+    # Diagnostic/disabled TP evaluation must never persist a CREATED SELL.
+    assert router.active_tp_durable_intent_permitted(
+        dry_run=dry_run, intended_live=intended_live,
+        force_block_live=force_block_live,
+    ) is allowed
+
+
+def test_active_tp_no_intent_preflight_precedes_native_sell_row():
+    # Guard against regression from intent-before-preflight in a large PB1
+    # engine method. Business logic is tested above; this asserts placement.
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[2] / "trader" / "pb1_engine.py").read_text()
+    guard = src.index("if _kr_us_tp_context is not None:\n            # Active TP/V3 SELL")
+    intent = src.index("self.orders_repo.create_intent_idempotent(", guard)
+    assert src.index("active_tp_durable_intent_permitted(", guard) < intent
+    assert src.index("if not self._pretrade_check(", guard) < intent

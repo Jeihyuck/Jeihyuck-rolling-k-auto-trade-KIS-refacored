@@ -14485,7 +14485,12 @@ class PB1Engine:
             # a CREATED order without a broker submit would appear as an
             # unresolved cross-owner SELL on the next live tick. Never let
             # diagnostic evaluation poison the durable order ledger.
-            if self.dry_run or not self.intended_live or self.force_block_live:
+            from trader.kr.us_profit_execution_router import active_tp_durable_intent_permitted
+            if not active_tp_durable_intent_permitted(
+                dry_run=bool(self.dry_run),
+                intended_live=bool(self.intended_live),
+                force_block_live=bool(self.force_block_live),
+            ):
                 logger.info(
                     "[KR_PROFIT_PARITY][DRY_RUN_SIGNAL_ONLY] code=%s stage=%s "
                     "action=NO_ORDER_INTENT_NO_STAGE_CLAIM_NO_KIS",

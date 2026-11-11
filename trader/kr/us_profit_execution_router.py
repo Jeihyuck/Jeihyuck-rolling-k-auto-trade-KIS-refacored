@@ -29,6 +29,17 @@ def _meta(value: Any) -> dict:
     return {}
 
 
+def active_tp_durable_intent_permitted(
+    *, dry_run: bool, intended_live: bool, force_block_live: bool,
+) -> bool:
+    """No diagnostic/disabled PB1 TP SELL may reserve real DB inventory.
+
+    Decision evaluation is allowed in dry-run; writing a CREATED/ACK-less
+    order is not: it would block the next live cross-owner SELL reconciliation.
+    """
+    return not (dry_run or not intended_live or force_block_live)
+
+
 def frozen_kr_profit_contract(position: Mapping[str, Any]) -> dict | None:
     """Never adopt an unrelated historical contract by symbol-only lookup."""
     for source in ("position_meta", "entry_meta_json"):
