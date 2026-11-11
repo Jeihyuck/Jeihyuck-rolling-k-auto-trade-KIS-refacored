@@ -399,6 +399,8 @@ def prove_and_bind_legacy_nine_sell(
                 return False,"LEGACY_CURRENT_SCOPE_FIELD_CONFLICT_"+field,None
         new_meta=dict(meta)
         new_meta.update({
+            "symbol":symbol,
+            "strategy_owner":"US_STANDARD",
             "automated_sell_authorized":True,
             "us_legacy_forward_management_version":"US_LEGACY_NINE_V2_SELL_V1",
             "source_original_runtime_lifecycle_id":evidence["original_cycle"],
