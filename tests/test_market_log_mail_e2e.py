@@ -13,7 +13,7 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_d
     root = tmp_path / "repo"
     (root / "scripts/wsl").mkdir(parents=True)
     (root / "scripts/notify").mkdir(parents=True)
-    for name in ("send-market-log-mail.sh", f"send-{market}-log-mail.sh"):
+    for name in ("send-market-log-mail.sh", f"send-{market}-log-mail.sh", "kr_mail_execution_evidence.py"):
         shutil.copy2(ROOT / "scripts/wsl" / name, root / "scripts/wsl" / name)
     shutil.copy2(ROOT / "scripts/notify/send_mail_attachment.py", root / "scripts/notify/send_mail_attachment.py")
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-trading-day.py", root / "scripts/wsl/check-nullim-trading-day.py")
