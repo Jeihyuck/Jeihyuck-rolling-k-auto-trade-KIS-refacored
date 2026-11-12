@@ -3650,9 +3650,9 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
 
     engine = amgn_pg_engine
     symbol = "AMGN"
-    epoch = "eight-combination-test-epoch"
-    portfolio = "eight-original-portfolio"
-    cycle = "eight-original-cycle"
+    # Use UUID-shaped IDs compatible with the actual portfolio-epoch schema.
+    epoch = "e3d79991-73aa-425d-971b-cbb80c7e9c10"
+    portfolio = "f6f8b13e-10d9-481f-8f0d-8987be0946c0"
     raw_account = "practice:offline-eight-combinations"
     account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
     is_v3 = contract_mode == "V3_ACTIVE_PRACTICE"
@@ -3660,7 +3660,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         "us_entry_exit_contract_v3" if is_v3 else "us_entry_exit_contract_v2"
     )
     monkeypatch.setenv("KIS_ENV", "practice")
-    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    monkeypatch.setenv("WSL_RUN_MARKET", "US")
     monkeypatch.setenv("US_SWING_EXIT_MODE", contract_mode)
     monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "1" if is_v3 else "0")
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
@@ -3683,6 +3683,10 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     monkeypatch.setattr(
         order_router, "resolve_dry_run_for_us_order", lambda: False,
     )
+    # Parametrized CI cases represent separate fresh processes and separate
+    # disposable databases, unlike the module-level live-process dedupe cache.
+    monkeypatch.setattr(order_router, "_SENT_ORDER_KEYS", set())
+    monkeypatch.setattr(order_router, "_BLOCKED_INTENT_KEYS", set())
     claim_repo = DurableExecutionClaimRepo(
         engine, us_execution_claims, us_execution_attempts,
     )
@@ -3696,19 +3700,30 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         repos, "release_execution_action_before_submit",
         claim_repo.release_before_submit,
     )
+    # Both epoch tables are the actual production SQLAlchemy schema, not
+    # a shortened CI DDL stub. The BUY router must perform its normal
+    # account -> portfolio -> deterministic cycle binding in PostgreSQL.
+    from trader.db.schema import schema_for_engine
+    epoch_schema = schema_for_engine(engine)
+    epoch_schema.trading_epochs.create(engine, checkfirst=True)
+    epoch_schema.portfolio_epochs.create(engine, checkfirst=True)
     with engine.begin() as conn:
         conn.execute(text("""
-            CREATE TABLE trading_epochs(
-                trading_epoch_id TEXT PRIMARY KEY,
-                env TEXT NOT NULL, account_id TEXT NOT NULL,
-                status TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'CI',
-                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """))
-        conn.execute(text("""
-            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status)
-            VALUES (:epoch,'practice',:account,'ACTIVE')
+            INSERT INTO trading_epochs(
+                trading_epoch_id,env,account_id,status,reason)
+            VALUES (:epoch,'practice',:account,'ACTIVE','CI_EIGHT')
         """), {"epoch":epoch,"account":raw_account})
+        conn.execute(text("""
+            INSERT INTO portfolio_epochs(
+                portfolio_epoch_id,trading_epoch_id,env,account_id,
+                sid,mode,strategy,status,reason)
+            VALUES (:portfolio,:epoch,'practice',:account,
+                    0,0,'US_STANDARD','ACTIVE','CI_EIGHT')
+        """), {"portfolio":portfolio,"epoch":epoch,"account":raw_account})
+    cycle = hashlib.sha256("|".join((
+        account_hash, epoch, portfolio, "US_STANDARD", symbol,
+        "2026-11-10", "NEW_POSITION_BUY",
+    )).encode("utf-8")).hexdigest()[:32]
 
     class TestBroker:
         def __init__(self):
