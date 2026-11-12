@@ -1251,6 +1251,161 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
         return False
 
 
+def finalize_us_buy_intent_pre_submit(intent: dict, *, trade_date: str) -> bool:
+    """Freeze the executable BUY quantity while the original intent is PRE_IO.
+
+    The initial BUY intent stores the immutable V2/V3 sell contract before
+    risk/cash checks.  Risk caps or fresh KIS orderable cash may subsequently
+    *reduce* the executable quantity.  Leaving the original qty in the intent
+    makes original intent/order/native-fill strict identity checks fail.
+
+    This is a one-way, in-transaction PENDING amendment to execution economics,
+    NOT a replacement of BUY strategy, contract, account or cycle.  Never
+    amend once a claim/attempt or us_orders row might imply broker POST.
+    """
+    from trader.us.execution.order_identity import valid_identity
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+
+    key = str(intent.get("client_order_key") or "")
+    sym = str(intent.get("symbol") or "").upper()
+    side = str(intent.get("side") or "").upper()
+    final_qty = intent.get("qty")
+    px = intent.get("limit_price") or intent.get("limit_price_usd") or intent.get("order_price")
+    try:
+        if (
+            not valid_identity(key) or not sym or side != "BUY"
+            or type(final_qty) is not int or final_qty <= 0
+            or not trade_date
+        ):
+            return False
+        executable_notional = float(intent.get("notional_usd") or 0)
+        if not (0 < executable_notional < 1e12):
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    supplied_meta = _parse_json_meta(intent.get("meta"))
+    owner = str(intent.get("strategy_owner") or supplied_meta.get("strategy_owner") or "").upper()
+    if owner not in {"US_STANDARD", "TQQQ_INFINITE"}:
+        return False
+    original_contract = supplied_meta.get("entry_exit_contract")
+    if owner == "US_STANDARD" and (
+        not isinstance(original_contract, dict)
+        or not verify_us_entry_exit_contract(original_contract)
+        or str(supplied_meta.get("entry_exit_contract_sha256") or "") != original_contract["sha256"]
+    ):
+        return False
+
+    def acceptable(row: dict) -> bool:
+        meta = _parse_json_meta(row.get("meta"))
+        previous = meta.get("execution_qty_finalization")
+        previous = previous if isinstance(previous, dict) else {}
+        try:
+            current_qty = int(row["qty"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        row_date = str(row.get("trade_date") or "")[:10]
+        if (
+            row_date != str(trade_date)[:10]
+            or str(row.get("symbol") or "").upper() != sym
+            or str(row.get("side") or "").upper() != "BUY"
+            or str(row.get("status") or "").upper() != "PENDING"
+            or final_qty > current_qty
+            or str(meta.get("strategy_owner") or "").upper() != owner
+            or (previous and int(previous.get("final_qty") or 0) != final_qty)
+        ):
+            return False
+        if owner == "US_STANDARD" and (
+            meta.get("entry_exit_contract") != original_contract
+            or meta.get("entry_exit_contract_sha256") != original_contract["sha256"]
+        ):
+            return False
+        return True
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        matches = [row for row in _MEM_INTENTS if row.get("client_order_key") == key]
+        if len(matches) != 1 or not acceptable(matches[0]):
+            return False
+        row = matches[0]
+        row_meta = _parse_json_meta(row.get("meta"))
+        origin_qty = int(row_meta.get("execution_qty_finalization", {}).get("original_qty") or row["qty"])
+        row["qty"] = final_qty
+        row["notional_usd"] = executable_notional
+        row_meta["execution_qty_finalization"] = {
+            "original_qty": origin_qty,
+            "final_qty": final_qty,
+            "reason": "PRE_HTTP_RISK_OR_CASH_RESIZE",
+        }
+        row["meta"] = row_meta
+        return True
+
+    try:
+        with engine.begin() as conn:
+            active_epoch = _active_us_epoch(conn)
+            raw = conn.execute(text("""
+                SELECT trade_date,client_order_key,symbol,side,qty,notional_usd,
+                       status,trading_epoch_id,meta
+                  FROM us_order_intents WHERE client_order_key=:key FOR UPDATE
+            """), {"key": key}).mappings().all()
+            if len(raw) != 1:
+                raise RuntimeError("US_BUY_FINALIZE_INTENT_NOT_UNIQUE")
+            row = dict(raw[0])
+            if (
+                not acceptable(row)
+                or (active_epoch and str(row.get("trading_epoch_id") or "") != str(active_epoch))
+            ):
+                raise RuntimeError("US_BUY_FINALIZE_SCOPE_OR_CONTRACT_MISMATCH")
+            # Absolute proof that the broker boundary was not approached.
+            # Even a PRE_IO attempt is a durable claim which must not be
+            # silently rewritten by a later tick or duplicate invocation.
+            attempt_count = conn.execute(text("""
+                SELECT
+                  (SELECT COUNT(*) FROM us_execution_attempts
+                    WHERE client_order_key=:key)
+                  + (SELECT COUNT(*) FROM us_orders
+                    WHERE client_order_key=:key)
+            """), {"key": key}).scalar()
+            if attempt_count is None or int(attempt_count) != 0:
+                raise RuntimeError("US_BUY_FINALIZE_ATTEMPT_ALREADY_EXISTS")
+            persisted = _parse_json_meta(row.get("meta"))
+            previous = persisted.get("execution_qty_finalization")
+            original_qty = (
+                int(previous["original_qty"])
+                if isinstance(previous, dict) and previous.get("original_qty") is not None
+                else int(row["qty"])
+            )
+            details = {
+                "original_qty": original_qty, "final_qty": final_qty,
+                "reason": "PRE_HTTP_RISK_OR_CASH_RESIZE",
+            }
+            result = conn.execute(text("""
+                UPDATE us_order_intents
+                   SET qty=:final_qty,notional_usd=:notional,
+                       meta=jsonb_set(COALESCE(meta, '{}'::jsonb),
+                           '{execution_qty_finalization}', CAST(:details AS jsonb), true)
+                 WHERE client_order_key=:key AND status='PENDING'
+                   AND trade_date=:td AND symbol=:symbol AND side='BUY'
+                   AND qty>=:final_qty
+                   AND trading_epoch_id IS NOT DISTINCT FROM :epoch
+                 RETURNING qty, notional_usd,
+                     meta->>'entry_exit_contract_sha256' AS original_contract_sha
+            """), {
+                "key": key, "final_qty": final_qty, "notional": executable_notional,
+                "details": _json_param(details), "td": trade_date, "symbol": sym,
+                "epoch": row.get("trading_epoch_id"),
+            }).mappings().first()
+            if not result or int(result["qty"]) != final_qty:
+                raise RuntimeError("US_BUY_FINALIZE_DB_READBACK_FAILED")
+            if owner == "US_STANDARD" and (
+                str(result.get("original_contract_sha") or "") != original_contract["sha256"]
+            ):
+                raise RuntimeError("US_BUY_FINALIZE_ORIGINAL_CONTRACT_CHANGED")
+        return True
+    except Exception as exc:
+        logger.error("[US_BUY][PRE_HTTP_QTY_FINALIZE][FENCED] symbol=%s error=%s", sym, type(exc).__name__)
+        return False
+
+
 def load_open_order_intents(trade_date: str | None = None) -> list[dict]:
     td = trade_date or _today()
     engine = _get_engine_or_none()
