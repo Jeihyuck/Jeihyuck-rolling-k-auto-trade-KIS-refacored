@@ -366,8 +366,11 @@ def verified_carried_us_snapshot_identity(
     if position.get("position_lifecycle_id") not in (None, "") or meta.get("position_lifecycle_id") not in (None, ""):
         return None
 
-    # The last balance observation is the continuity anchor. A zero holding
-    # is a terminal boundary even when an earlier snapshot was positive.
+    # The newest observed balance is a hard boundary. If a previous
+    # post-0062 day lost optional identity copies, walk back only a bounded
+    # number of same-epoch snapshots and require *every* intervening positive
+    # observation to match the proven source quantity and signed contract.
+    # This is scoped snapshot provenance, never a tick-time order replay.
     prior = conn.execute(text("""
         SELECT as_of,qty,account_id,portfolio_epoch_id,position_cycle_id,meta
           FROM us_positions
@@ -376,14 +379,98 @@ def verified_carried_us_snapshot_identity(
     """), {"epoch":trading_epoch_id,"symbol":sym,"today":trade_date}).mappings().first()
     prior_qty = _exact_positive_shares((prior or {}).get("qty"))
     if prior_qty is None or qty > prior_qty:
-        # A higher balance could be an independent new BUY, corporate action,
-        # broker-late fill or another epoch. Never carry a prior cycle.
+        # Never revive an earlier zero-share cycle or ignore a later BUY.
         return None
+
+    def _complete_source(row: dict) -> bool:
+        source_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        source_contract = source_meta.get("entry_exit_contract")
+        source_cycle = str(row.get("position_cycle_id") or source_meta.get("position_cycle_id") or "")
+        source_portfolio = str(row.get("portfolio_epoch_id") or source_meta.get("portfolio_epoch_id") or "")
+        source_hash = str(row.get("account_id") or source_meta.get("broker_account_hash") or "")
+        return bool(
+            source_cycle and source_portfolio and source_hash
+            and str(source_meta.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and str(source_meta.get("position_lifecycle_id") or "") == source_cycle
+            and str(source_meta.get("position_cycle_id") or "") == source_cycle
+            and str(source_meta.get("portfolio_epoch_id") or "") == source_portfolio
+            and str(source_meta.get("broker_account_hash") or "") == source_hash
+            and source_meta.get("lineage_resolution") in {
+                "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+                "VERIFIED_CURRENT_EPOCH_CONTINUITY",
+            }
+            and isinstance(source_contract, dict)
+            and verify_us_entry_exit_contract(source_contract)
+            and str(source_meta.get("entry_exit_contract_sha256") or "") == source_contract["sha256"]
+        )
+
+    observed_after_source = []
+    if not _complete_source(prior):
+        # A missing copy is repairable; a positive but different count is not.
+        # No bulk backfill, account guess, owner default or synthetic fill.
+        if prior_qty != qty:
+            return None
+        older_rows = conn.execute(text("""
+            SELECT as_of,qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+              FROM us_positions
+             WHERE trading_epoch_id=:epoch AND symbol=:symbol AND as_of<:prior_date
+             ORDER BY as_of DESC LIMIT 32
+        """), {"epoch":trading_epoch_id, "symbol":sym,
+               "prior_date":prior["as_of"]}).mappings().all() or []
+        observed_after_source = [prior]
+        previous_date = prior["as_of"]
+        found = None
+        for candidate in older_rows:
+            candidate_date = candidate.get("as_of")
+            # A duplicate/conflicting date or any changed share observation
+            # cannot be silently bridged into one original cycle.
+            if not candidate_date or candidate_date >= previous_date:
+                return None
+            previous_date = candidate_date
+            if _exact_positive_shares(candidate.get("qty")) != qty:
+                return None
+            if _complete_source(candidate):
+                found = candidate
+                break
+            observed_after_source.append(candidate)
+        if found is None:
+            return None
+        source_meta = found.get("meta") if isinstance(found.get("meta"), dict) else {}
+        source_contract = source_meta["entry_exit_contract"]
+        source_cycle = str(found.get("position_cycle_id") or source_meta["position_cycle_id"])
+        source_portfolio = str(found.get("portfolio_epoch_id") or source_meta["portfolio_epoch_id"])
+        source_hash = str(found.get("account_id") or source_meta["broker_account_hash"])
+        expected = {
+            "account_id": source_hash,
+            "portfolio_epoch_id": source_portfolio,
+            "position_cycle_id": source_cycle,
+            "strategy_owner": "US_STANDARD",
+            "broker_account_hash": source_hash,
+            "position_lifecycle_id": source_cycle,
+            "entry_exit_contract_sha256": source_contract["sha256"],
+        }
+        for observed in observed_after_source:
+            if _exact_positive_shares(observed.get("qty")) != qty:
+                return None
+            source_copy = observed.get("meta") if isinstance(observed.get("meta"), dict) else {}
+            # An explicit assertion of another account/strategy/contract is a
+            # conflict, not a partially missing snapshot to auto-adopt.
+            for key, correct in expected.items():
+                column = observed.get(key)
+                stored = column if column not in (None, "") else source_copy.get(key)
+                if stored not in (None, "") and str(stored) != correct:
+                    return None
+            signed_copy = source_copy.get("entry_exit_contract")
+            if signed_copy is not None and (
+                not verify_us_entry_exit_contract(signed_copy)
+                or signed_copy.get("sha256") != source_contract["sha256"]
+            ):
+                return None
+        prior = found
+        prior_qty = _exact_positive_shares(prior["qty"])
     prior_meta = prior.get("meta") if isinstance(prior.get("meta"),dict) else {}
-    if str(prior_meta.get("strategy_owner") or "").upper() != "US_STANDARD":
-        return None
-    cycle = str(prior.get("position_cycle_id") or "")
-    portfolio = str(prior.get("portfolio_epoch_id") or "")
+    cycle = str(prior.get("position_cycle_id") or prior_meta.get("position_cycle_id") or "")
+    portfolio = str(prior.get("portfolio_epoch_id") or prior_meta.get("portfolio_epoch_id") or "")
     # Older 0062 snapshots can have a complete signed source in meta and
     # risk-state while the separately-added hash column is NULL.  A NULL
     # *copy* is not proof that the original BUY identity was lost.
@@ -443,9 +530,9 @@ def verified_carried_us_snapshot_identity(
         and str((life.get("entry_policy") or {}).get("entry_exit_contract_sha256") or "") == contract["sha256"]
     ):
         return None
-    # Previous-day unresolved orders invalidate every carry. A quantity
-    # reduction is permitted only if each intervening order is a fully scoped,
-    # terminal, native-KIS-confirmed SELL of the same original cycle.
+    # Source-day unresolved orders invalidate every carry. Any skipped
+    # snapshot requires a complete order-free interval from that source; a
+    # quantity reduction is allowed only when direct native KIS fills prove it.
     # This is essential for TP1->TP2/runner continuity after partial fills.
     pending_previous = conn.execute(text("""
         SELECT COUNT(*) FROM us_orders
@@ -458,6 +545,10 @@ def verified_carried_us_snapshot_identity(
         return None
 
     sold_shares = prior_qty - qty
+    if observed_after_source and sold_shares != 0:
+        # Gap recovery cannot prove a changed quantity across an unverified
+        # intermediate snapshot. Require a separate original broker audit.
+        return None
     if sold_shares == 0:
         # No intervening order may be silently skipped just because the
         # observed share balance did not change.
