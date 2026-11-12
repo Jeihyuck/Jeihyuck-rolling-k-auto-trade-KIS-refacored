@@ -121,6 +121,19 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
         else:
             time_quality = "ORDER_TIME_PROXY_OR_UNKNOWN"
         if kind == NATIVE_CUMULATIVE:
+            raw = _obj(row.get("raw_json"))
+            native = _obj(raw.get("kis_response")) or raw
+            source_qty = _positive_int(native.get("tot_ccld_qty"))
+            source_amount = native.get("tot_ccld_amt")
+            if not source_qty or not _price(source_amount):
+                issues.add("CUMULATIVE_NATIVE_QTY_OR_NOTIONAL_MISSING")
+                continue
+            if source_qty != qty:
+                issues.add("CUMULATIVE_QTY_CONFLICT_WITH_ORIGINAL_KIS")
+                continue
+            if abs(Decimal(str(source_amount)) - Decimal(str(row.get("price"))) * Decimal(qty)) > Decimal("0.50"):
+                issues.add("CUMULATIVE_NOTIONAL_CONFLICT_WITH_ORIGINAL_KIS")
+                continue
             proof_id = str(row.get("broker_fill_id") or row.get("trade_id") or "")
             if not proof_id or not proof_id.startswith("KR_KIS_CUM:"):
                 issues.add("CUMULATIVE_WATERMARK_KEY_MISSING")
@@ -140,6 +153,11 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
             indiv[proof_id] = row
     if len(cum) > 1:
         issues.add("MULTIPLE_CUMULATIVE_PROOF_IDS_SAME_ORDER")
+    for proof_rows in cum.values():
+        if len(proof_rows) > 1 and all(x.get("created_at") for x in proof_rows):
+            latest = max(proof_rows, key=lambda x: str(x.get("created_at")))
+            if _positive_int(latest.get("qty")) != max(_positive_int(x.get("qty")) for x in proof_rows):
+                issues.add("CUMULATIVE_WATERMARK_REGRESSION")
     if cum and indiv:
         issues.add("MIXED_CUMULATIVE_AND_INDIVIDUAL_FILL_PROOF")
     watermark = 0
@@ -161,7 +179,10 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
     qty = (cum_qty if cum else individual_qty) if not (cum and indiv) else None
     if any(x.startswith("ORDER_SCOPE_INCOMPLETE") or x.startswith("FILL_IDENTITY_INVALID") for x in issues):
         qty = None
-    if ("CONFLICTING_BROKER_TRADE_ID" in issues or "MULTIPLE_CUMULATIVE_PROOF_IDS_SAME_ORDER" in issues):
+    if ("CONFLICTING_BROKER_TRADE_ID" in issues or "MULTIPLE_CUMULATIVE_PROOF_IDS_SAME_ORDER" in issues
+            or "CUMULATIVE_WATERMARK_REGRESSION" in issues
+            or any(x.startswith("CUMULATIVE_") and x not in ("CUMULATIVE_WATERMARK_REGRESSION",)
+                   for x in issues)):
         qty = None
     if qty is not None and requested and qty > requested:
         issues.add("KIS_FILL_EXCEEDS_ORDER_REQUEST")
