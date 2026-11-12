@@ -3190,3 +3190,106 @@ def test_pg_closed_latest_snapshot_never_resurrects_old_buy_parent(pg_engine, mo
     assert repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-11") == {}
     assert repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-12") == {}
     assert repos.load_us_positions_by_symbols(["AMGN"]) == {}
+
+
+def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
+    pg_engine, monkeypatch,
+):
+    """Real US position/order SQL -> exit resolver -> V2 exit engine -> real
+    order router in SIGNAL_ONLY mode. No KIS POST or claim/fill is asserted.
+    """
+    import json
+    from datetime import datetime, timezone
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
+    from trader.us.pb1.us_exit_engine import generate_exit_intents, should_skip_exit_due_to_pending_sell
+    from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
+
+    epoch = "fixture-ten-symbol-exit-epoch"
+    symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
+               "KR", "MCK", "PFE", "PG", "TMO"]
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None: epoch)
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *_args, **_kw: None,
+    )
+    with pg_engine.begin() as conn:
+        for sym in symbols:
+            signed = build_us_entry_exit_contract({
+                "symbol": sym, "strategy_owner": "US_STANDARD",
+                "position_action": "NEW_POSITION_BUY",
+                "entry_style_selected": "ENTRY_PULLBACK",
+                "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+            })
+            meta = {
+                "strategy_owner": "US_STANDARD",
+                "sleeve_id": "US_STANDARD",
+                "position_lifecycle_id": f"fixture-cycle-{sym}",
+                "position_cycle_id": f"fixture-cycle-{sym}",
+                "entry_exit_contract": signed,
+                "entry_exit_contract_sha256": signed["sha256"],
+                "entry_time": "2026-11-10T16:00:00+00:00",
+                "orderable_qty": 4,
+            }
+            if sym == "ABBV":
+                # Real missing-contract row: a profitable/flat holding cannot
+                # inherit a different symbol's original exit agreement.
+                meta.pop("entry_exit_contract")
+                meta.pop("entry_exit_contract_sha256")
+                meta.pop("position_lifecycle_id")
+                meta.pop("position_cycle_id")
+            conn.execute(text("""
+                INSERT INTO us_positions(
+                    as_of,symbol,exchange,qty,avg_cost,current_px,trading_epoch_id,
+                    account_id,portfolio_epoch_id,position_cycle_id,meta)
+                VALUES ('2026-11-12',:sym,'NASDAQ',4,100,:price,:epoch,
+                        'hash-fixture','portfolio-fixture',:cycle,CAST(:meta AS jsonb))
+            """), {
+                "sym": sym, "price": 100 if sym == "ABBV" else 80,
+                "epoch": epoch, "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
+                "meta": json.dumps(meta),
+            })
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,qty_requested,
+                qty_filled,order_no,status,dry_run,trading_epoch_id,meta)
+            VALUES ('2026-11-12','fixture-ko-unresolved','KO','NYSE','SELL',
+                    1,0,'KO-UNRESOLVED','ACK',false,:epoch,'{}'::jsonb)
+        """), {"epoch": epoch})
+
+    positions = repos.load_us_positions_by_symbols(symbols, as_of="2026-11-12")
+    assert set(positions) == set(symbols)
+    assert should_skip_exit_due_to_pending_sell("KO", "2026-11-12")[0] is True
+    resolved, resolution = enrich_us_positions_for_exit(
+        list(positions.values()), trade_date="2026-11-12", env="practice",
+    )
+    assert len(resolved) == 10
+    for row in resolved:
+        row["resolved_current_price"] = float(row.get("current_px") or 0)
+        # Preserve the actual signed original from the stored DB JSON.
+        row_meta = row.get("meta") or {}
+        if row["symbol"] != "ABBV":
+            assert row_meta["entry_exit_contract_sha256"] == row_meta["entry_exit_contract"]["sha256"]
+            row["entry_exit_contract"] = row_meta["entry_exit_contract"]
+    now = datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)
+    signals = generate_exit_intents(
+        [], prepared_snapshots=resolved, now=now, include_trend_time=False,
+    )
+    found = {intent["symbol"]: intent for intent in signals if intent.get("side") == "SELL"}
+    assert len(found) == 8, found
+    assert "KO" not in found and "ABBV" not in found
+    for sym, intent in found.items():
+        assert intent["position_lifecycle_id"] == f"fixture-cycle-{sym}"
+        assert intent["source_entry_contract_sha256"] == (
+            positions[sym]["meta"]["entry_exit_contract_sha256"]
+        )
+    routed = route_exit_orders_immediately(
+        signals, buy_daily_notional=0, position_count=10,
+        effective_budget=10000, signal_only=True, kis_order_allowed=True,
+        current_position_symbols=set(symbols),
+    )
+    assert len(routed["orders"]) == 8
+    assert {order.get("symbol") for order in routed["orders"]} == set(found)
+    assert all(order["status"] == "SIGNAL_ONLY" for order in routed["orders"])
