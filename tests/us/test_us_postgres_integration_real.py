@@ -2158,7 +2158,12 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine, owner, sy
         conn.exec_driver_sql(Path(
             "migrations/0056_us_execution_authority_reservations.sql"
         ).read_text())
-    fingerprint = hashlib.sha256(b"stage-123-synthetic-test").hexdigest()
+    # Both parametrized owners share this real PostgreSQL database. Keep
+    # their account-reservation leases distinct to avoid a cross-owner
+    # reservation idempotency collision that is unrelated to rollback.
+    fingerprint = hashlib.sha256(
+        ("stage-123-synthetic-test:" + owner).encode("utf-8")
+    ).hexdigest()
     authority = AccountExecutionAuthority(
         pg_engine, env="practice", account_fingerprint=fingerprint,
         trading_epoch_id="stage123-epoch",
@@ -4037,6 +4042,25 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     )
     assert route["status"] == "ACK", (selected_style, contract_mode, route)
     assert len(broker.posts) == 2
+    # A broker ACK alone does not prove a durable claim. The actual SELL
+    # order's action/attempt must resolve to the same PostgreSQL claim rows
+    # BEFORE any native-format fill is accepted.
+    with engine.connect() as conn:
+        sell_claim = conn.execute(text("""
+            SELECT o.meta->>'execution_action_key' AS action_key,
+                   o.meta->>'submit_attempt_id' AS attempt_id,
+                   c.action_key AS persisted_claim_key,
+                   a.attempt_id AS persisted_attempt_id
+            FROM us_orders o
+            LEFT JOIN us_execution_claims c
+              ON c.action_key=o.meta->>'execution_action_key'
+            LEFT JOIN us_execution_attempts a
+              ON a.action_key=c.action_key
+             AND a.attempt_id=o.meta->>'submit_attempt_id'
+            WHERE o.order_no='CI-SELL-EIGHT'
+        """)).mappings().one()
+    assert sell_claim["persisted_claim_key"] == sell_claim["action_key"], sell_claim
+    assert sell_claim["persisted_attempt_id"] == sell_claim["attempt_id"], sell_claim
     actual_sell_qty = int(broker.posts[-1][2])
     confirmed_sell = repos.mark_order_filled_by_reconcile(
         order_no="CI-SELL-EIGHT",
