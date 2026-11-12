@@ -66,72 +66,58 @@ def _records(conn: sa.Connection, statement: str, params: dict) -> list[dict]:
     return [dict(row) for row in conn.execute(sa.text(statement), params).mappings()]
 
 
+def _same_scope(a: dict, b: dict, *, owner: bool = True) -> bool:
+    if not all(str(a.get(k) or "").strip() for k in (
+        "env", "market", "code", "trading_epoch_id",
+        "portfolio_epoch_id", "position_cycle_id"
+    )):
+        return False
+    keys = ("env", "market", "code", "trading_epoch_id",
+            "portfolio_epoch_id", "position_cycle_id")
+    if owner:
+        keys += ("strategy",)
+    return all(str(a.get(k) or "") == str(b.get(k) or "") for k in keys)
+
+
+def _required_scope(order: dict) -> bool:
+    keys = ("order_id", "env", "strategy", "market", "code",
+            "trading_epoch_id", "portfolio_epoch_id", "position_cycle_id")
+    return all(str(order.get(k) or "").strip() for k in keys)
+
+
 def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
-              sells: list[dict], sell_fills: list[dict], names: dict) -> dict:
-    """Pure assessment: do not auto-join on a symbol, only exact owner/scope."""
+              sells: list[dict], sell_fills: list[dict], names: dict,
+              cycle_buy_orders: list[dict] | None = None) -> dict:
+    """Audit one signed PB1 BUY without assigning all cycle sells to that BUY.
+
+    If multiple entry orders share a lifecycle, report cycle allocation debt
+    rather than misattributing every sell to every entry. KIS cumulative fill
+    evidence is not a native individual execution timestamp.
+    """
+    from trader.db.repos import _assert_kr_buy_entry_contract
+    from trader.kr.order_execution_evidence import summarize_native_order, _odno
+
     req = _obj(order.get("request_json"))
     plan = _obj(req.get("entry_exit_plan"))
     root_sha = str(req.get("entry_contract_sha256") or "")
-    cycle = str(order.get("position_cycle_id") or "")
-    exact = [
-        p for p in positions if (
-            p.get("code") == order.get("code")
-            and p.get("strategy") == order.get("strategy")
-            and str(p.get("position_cycle_id") or "") == cycle
-            and str(p.get("portfolio_epoch_id") or "") == str(order.get("portfolio_epoch_id") or "")
-            and str(p.get("trading_epoch_id") or "") == str(order.get("trading_epoch_id") or "")
-        )
-    ]
-    same_code_other = [p for p in positions if p.get("code") == order.get("code")
-                       and str(p.get("position_cycle_id") or "") != cycle]
-    buy_fills = [f for f in fills if str(f.get("order_id")) == str(order.get("order_id"))]
-    foreign_buys = [f for f in buy_fills if (
-        f.get("code") != order.get("code")
-        or str(f.get("position_cycle_id") or "") != cycle
-        or str(f.get("portfolio_epoch_id") or "") != str(order.get("portfolio_epoch_id") or "")
-        or str(f.get("trading_epoch_id") or "") != str(order.get("trading_epoch_id") or "")
-        or str(f.get("kis_odno") or "").lstrip("0") != str(order.get("kis_odno") or "").lstrip("0")
-    )]
-    buy_fills = [f for f in buy_fills if f not in foreign_buys]
-    same_cycle_sells = [s for s in sells if (
-        s.get("code") == order.get("code")
-        and s.get("strategy") == order.get("strategy")
-        and str(s.get("position_cycle_id") or "") == cycle
-        and str(s.get("portfolio_epoch_id") or "") == str(order.get("portfolio_epoch_id") or "")
-    )]
-    sell_ids = {str(s["order_id"]) for s in same_cycle_sells if s.get("status") in ("FILLED", "RECONCILED")}
-    sold = sum(int(s.get("qty") or 0) for s in same_cycle_sells if str(s.get("order_id")) in sell_ids)
-    documented_sell_fills = [f for f in sell_fills if str(f.get("order_id")) in sell_ids]
-    sell_by_id = {str(s["order_id"]): s for s in same_cycle_sells}
-    foreign_sells = [f for f in documented_sell_fills if (
-        f.get("code") != order.get("code")
-        or str(f.get("position_cycle_id") or "") != cycle
-        or str(f.get("portfolio_epoch_id") or "") != str(order.get("portfolio_epoch_id") or "")
-        or str(f.get("kis_odno") or "").lstrip("0") !=
-            str(sell_by_id[str(f.get("order_id"))].get("kis_odno") or "").lstrip("0")
-    )]
-    documented_sell_fills = [f for f in documented_sell_fills if f not in foreign_sells]
-    sell_filled = sum(int(f.get("qty") or 0) for f in documented_sell_fills)
-    valid_buy = [f for f in buy_fills
-                 if _obj(f.get("fill_meta_json")).get("evidence_kind") in _NATIVE
-                 and _priced(f.get("price"))]
-    cumulative = [int(f.get("qty") or 0) for f in valid_buy
-                  if _obj(f.get("fill_meta_json")).get("evidence_kind") == "KIS_ORDER_CUMULATIVE_EXECUTION"]
-    individual = [int(f.get("qty") or 0) for f in valid_buy
-                  if _obj(f.get("fill_meta_json")).get("evidence_kind") == "KIS_INDIVIDUAL_EXECUTION"]
-    native_buy = max(cumulative, default=0) if not individual else sum(individual)
-    issues = []
-    if len(exact) != 1:
-        issues.append("CYCLE_DISCONNECTED" if same_code_other else "POSITION_MISSING")
-    if cumulative and individual:
-        issues.append("MIXED_CUMULATIVE_AND_INDIVIDUAL_FILL_PROOF")
-    if foreign_buys:
-        issues.append("BUY_FILL_IDENTITY_MISMATCH")
-    if foreign_sells:
-        issues.append("SELL_FILL_IDENTITY_MISMATCH")
+    issues: list[str] = []
+    scope_ok = _required_scope(order)
+    if not scope_ok or not _odno(order.get("kis_odno")):
+        issues.append("ORIGINAL_BUY_IDENTITY_INCOMPLETE")
+    try:
+        _assert_kr_buy_entry_contract(req)
+    except (RuntimeError, ValueError, TypeError) as exc:
+        issues.append("ORIGINAL_BUY_CONTRACT_INVALID:" + str(exc)[:120])
     echo = _obj(_obj(order.get("response_json")).get("_kr_buy_entry_contract"))
-    if echo.get("entry_contract_sha256") != root_sha:
+    if echo.get("entry_contract_sha256") != root_sha or not root_sha:
         issues.append("ORDER_CONTRACT_ECHO_UNVERIFIED")
+
+    exact = [p for p in positions if scope_ok and _same_scope(order, p)]
+    if len(exact) != 1:
+        siblings = [p for p in positions
+                    if p.get("env") == order.get("env") and p.get("code") == order.get("code")
+                    and p.get("trading_epoch_id") == order.get("trading_epoch_id")]
+        issues.append("CYCLE_DISCONNECTED" if siblings else "POSITION_MISSING")
     if len(exact) > 1:
         issues.append("MULTIPLE_POSITIONS_EXACT_CYCLE")
     pos = exact[0] if len(exact) == 1 else {}
@@ -140,59 +126,104 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     if pos:
         if not plan or stored_plan != plan:
             issues.append("ORIGINAL_PLAN_MISMATCH")
-        last_eval = _obj(pos.get("last_exit_eval_json"))
-        eval_plan = _obj(last_eval.get("entry_exit_plan"))
-        if eval_plan and eval_plan != plan:
-            issues.append("SELL_EVALUATION_PLAN_DRIFT")
-        if eval_plan and last_eval.get("entry_exit_plan_status") not in (None, "OK"):
-            issues.append("SELL_EVALUATION_CONTRACT_STATUS_NOT_OK")
-        if len(root_sha) != 64 or entry.get("entry_contract_sha256") != root_sha:
+        if entry.get("entry_contract_sha256") != root_sha or len(root_sha) != 64:
             issues.append("ORIGINAL_BUY_HASH_MISMATCH")
         if str(entry.get("source_buy_order_id") or "") != str(order.get("order_id") or ""):
             issues.append("SOURCE_BUY_ORDER_UNBOUND")
         expected = str(entry.get("entry_exit_plan_sha256") or "")
         if len(expected) != 64 or _sha(stored_plan) != expected:
             issues.append("STORED_PLAN_HASH_MISMATCH")
-        if (pos.get("exit_policy_family") != plan.get("exit_policy_family")
-                or pos.get("entry_style_selected") != plan.get("entry_style_selected")):
+        if (pos.get("exit_policy_family") != plan.get("exit_policy_family") or
+                pos.get("entry_style_selected") != plan.get("entry_style_selected")):
             issues.append("TOP_LEVEL_POLICY_DRIFT")
-    if native_buy < int(order.get("qty") or 0):
+        last_eval = _obj(pos.get("last_exit_eval_json"))
+        eval_plan = _obj(last_eval.get("entry_exit_plan"))
+        if eval_plan and eval_plan != plan:
+            issues.append("SELL_EVALUATION_PLAN_DRIFT")
+        if last_eval.get("entry_exit_plan_status") not in (None, "OK"):
+            issues.append("SELL_EVALUATION_CONTRACT_STATUS_NOT_OK")
+        if not eval_plan:
+            issues.append("SELL_EVALUATION_NOT_IN_DB_SNAPSHOT")
+
+    related_sells = [s for s in sells if scope_ok and _same_scope(order, s)]
+    extra_sells = [s for s in sells if s.get("code") == order.get("code")
+                   and s.get("trading_epoch_id") == order.get("trading_epoch_id")
+                   and s.get("position_cycle_id") == order.get("position_cycle_id")
+                   and not _same_scope(order, s)]
+    if extra_sells:
+        issues.append("SELL_SCOPE_OWNER_OR_MARKET_MISMATCH")
+    buy_evidence = summarize_native_order(order, fills)
+    issues.extend("BUY:" + issue for issue in buy_evidence["issues"])
+    if buy_evidence["evidence_status"] not in (
+        "ECONOMIC_AND_TIMESTAMP_PROVEN", "ECONOMIC_PROOF_TIMESTAMP_PROXY"
+    ):
         issues.append("ORIGINAL_PRICED_BUY_FILL_UNPROVEN")
-    if sold != sell_filled:
-        issues.append("SELL_ORDER_FILL_DISAGREEMENT")
-    if pos and pos.get("status") == "CLOSED" and sold == 0:
+    sell_reports = [summarize_native_order(s, sell_fills) for s in related_sells]
+    for sr in sell_reports:
+        issues.extend("SELL:" + issue for issue in sr["issues"])
+    unknown_sell = any(sr["proven_filled_qty"] is None for sr in sell_reports)
+    unknown_sell |= any(sr["evidence_status"] in ("UNPROVEN", "CONFLICT") for sr in sell_reports)
+    sold = None if unknown_sell else sum(int(sr["proven_filled_qty"] or 0) for sr in sell_reports)
+    # The status FILLED/RECONCILED is not economic execution evidence.
+    sell_order_qty = sum(int(s.get("qty") or 0) for s in related_sells)
+
+    cycle_buy_orders = cycle_buy_orders if cycle_buy_orders is not None else [order]
+    cycle_buys = [b for b in cycle_buy_orders if scope_ok and _same_scope(order, b)]
+    if len(cycle_buys) > 1:
+        issues.append("MULTIPLE_BUYS_SAME_CYCLE_ALLOCATION_UNPROVEN")
+    if pos and pos.get("status") == "CLOSED" and not related_sells:
         issues.append("CLOSED_WITHOUT_ORIGINAL_CYCLE_SELL")
-    if pos and (sold + int(pos.get("qty") or 0) != int(order.get("qty") or 0)):
-        issues.append("POSITION_QUANTITY_CHAIN_MISMATCH")
-    if not issues:
-        status = "EXPECTED"
-    elif any(s in issues for s in ("ORIGINAL_PLAN_MISMATCH", "ORIGINAL_BUY_HASH_MISMATCH",
-                                  "STORED_PLAN_HASH_MISMATCH", "TOP_LEVEL_POLICY_DRIFT",
-                                  "SELL_EVALUATION_PLAN_DRIFT")):
+    if pos and len(cycle_buys) == 1:
+        buy_filled = buy_evidence["proven_filled_qty"]
+        if buy_filled is not None and sold is not None:
+            if buy_filled - sold != int(pos.get("qty") or 0):
+                issues.append("POSITION_ECONOMIC_QUANTITY_CHAIN_MISMATCH")
+        else:
+            issues.append("POSITION_ECONOMIC_CHAIN_UNPROVEN")
+
+    if any(i in issues for i in (
+        "ORIGINAL_PLAN_MISMATCH", "ORIGINAL_BUY_HASH_MISMATCH",
+        "STORED_PLAN_HASH_MISMATCH", "TOP_LEVEL_POLICY_DRIFT",
+        "SELL_EVALUATION_PLAN_DRIFT"
+    )):
         status = "CONTRACT_MISMATCH"
     elif "CYCLE_DISCONNECTED" in issues or "CLOSED_WITHOUT_ORIGINAL_CYCLE_SELL" in issues:
         status = "CYCLE_DISCONNECTED"
     elif "ORIGINAL_PRICED_BUY_FILL_UNPROVEN" in issues:
         status = "FILL_EVIDENCE_MISSING"
-    else:
+    elif issues or (buy_evidence["time_quality"] != "NATIVE_EXECUTION_TIMESTAMP"
+                    or any(sr["time_quality"] != "NATIVE_EXECUTION_TIMESTAMP" for sr in sell_reports)):
         status = "REVIEW_REQUIRED"
+    else:
+        status = "EXPECTED"
+
     overlay = _obj(_obj(pos.get("position_meta")).get("kr_us_profit_contract"))
     return {
-        "code": order.get("code"), "name": names.get(order.get("code")) or "NAME_UNAVAILABLE",
-        "strategy_owner": "PB1", "buy_order_id": str(order.get("order_id")),
-        "broker_order_no": order.get("kis_odno"), "buy_date": _kst_day(order.get("created_at")),
-        "cycle": cycle, "portfolio_epoch_id": str(order.get("portfolio_epoch_id") or ""),
-        "buy_qty": int(order.get("qty") or 0),
-        "priced_buy_fill_qty_in_db": native_buy,
-        "position_origin": pos.get("position_origin"), "position_status": pos.get("status"),
+        "code": order.get("code"),
+        "name": names.get(order.get("code")) or "NAME_UNAVAILABLE",
+        "strategy_owner": "PB1", "buy_order_id": str(order.get("order_id") or ""),
+        "broker_order_no": order.get("kis_odno"),
+        "buy_date": _kst_day(order.get("created_at")),
+        "cycle": str(order.get("position_cycle_id") or ""),
+        "portfolio_epoch_id": str(order.get("portfolio_epoch_id") or ""),
+        "submitted_buy_qty": int(order.get("qty") or 0),
+        "proven_buy_fill_qty": buy_evidence["proven_filled_qty"],
+        "buy_time_quality": buy_evidence["time_quality"],
+        "buy_evidence_status": buy_evidence["evidence_status"],
+        "position_origin": pos.get("position_origin"),
+        "position_status": pos.get("status"),
         "remaining_qty": pos.get("qty"),
-        "sell_order_qty_same_cycle": sold, "sell_filled_qty_same_cycle": sell_filled,
+        "same_cycle_buy_orders": len(cycle_buys),
+        "sell_submitted_qty_same_cycle": sell_order_qty,
+        "sell_proven_filled_qty_same_cycle": sold,
+        "sell_evidence": sell_reports,
         "original_contract_sha256": root_sha or None,
         "position_contract_sha256": entry.get("entry_contract_sha256"),
         "last_sell_evaluation_plan_matches_buy": (
             _obj(_obj(pos.get("last_exit_eval_json")).get("entry_exit_plan")) == plan
             if _obj(pos.get("last_exit_eval_json")).get("entry_exit_plan") else None
         ),
+        "sell_evaluation_history_complete": False,
         "effective_amendment_version": overlay.get("version"),
         "effective_amendment_mode": overlay.get("activation_mode"),
         "status": status, "issues": sorted(set(issues)),
