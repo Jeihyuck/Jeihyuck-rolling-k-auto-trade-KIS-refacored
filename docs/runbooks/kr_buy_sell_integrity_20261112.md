@@ -35,7 +35,7 @@ Base: `dual-agent@00f182ae9ff86a5615763f05f7a7e184a2e87277`.
 | Trade date | Code / name | Original BUY ODNO / qty | Current finding |
 | --- | --- | --- | --- |
 | 2026-10-27 | 028050 Samsung E&A | 0000011241 / 33 | SELL33 belongs to IMPORTED cycle; original KIS fill row absent |
-| 2026-10-27 | 012750 E1 | 0000011653 / 21 | SELL21 belongs to IMPORTED cycle; original fill row absent |
+| 2026-10-27 | 012750 에스원 | 0000011653 / 21 | SELL21 belongs to IMPORTED cycle; original fill row absent |
 | 2026-10-27 | 455890 RISE Money Market Active | 0000011685 / 35 | SELL35 belongs to IMPORTED cycle; original fill row absent |
 | 2026-10-28 | 253590 Neosem | 0000029434 / 110 | SELL110 belongs to IMPORTED cycle; original fill row absent |
 | 2026-10-29 | 059090 Mico | 0000011865 / 79 | Original SYSTEM cycle retained contract; imported SELL79 is distinct |
@@ -99,3 +99,43 @@ all instructions are complete. Still required before `MERGE READY`:
 - real PostgreSQL suite, complete CI, and independently verified broker proof.
 
 No automatic merge, deploy, historical Supabase mutation or KIS order.
+
+## 6.1 review amendment (2026-11-12)
+
+1. Account-epoch and owner: active `trading_epochs(account_id, env, trading_epoch_id)`
+   must bind uniquely to `portfolio_epochs(account_id, strategy)`; empty identities
+   are never matched. Signed PB1 and unsigned/legacy/foreign-owned transactions
+   are reported separately, and KR Infinite uses its own order-intent lifecycle.
+2. KIS daily-ccld `tot_ccld_qty`/`tot_ccld_amt` is per-order cumulative
+   economic evidence, not an independent execution. `filled_at_source=
+   ORDER_TIME_PROXY` is never treated as actual execution time. A canceled
+   order can have positive filled quantity; orders.qty is a submission limit,
+   not an execution. Mixed cumulative and individual evidence is unresolved.
+3. BUYs sharing a cycle require cycle-level accounting and explicit allocation
+   proof; never allocate the full cycle's sells to every BUY. Current active
+   epoch has no repeated signed PB1 BUY cycle, but that historical property
+   cannot be coded as an invariant for future pyramid entries.
+4. Current KIS practice symbol 012750 is **에스원**, corroborated by
+   `public.universe_members` lookup (no proof of a historical specific KIS
+   execution merely from this name source). The previous "E1" name was wrong.
+5. An after-CLOSE audit gets an attempt-specific run ID, KST trade date, and
+   status marker. A timeout/crash must not leave yesterday/today's earlier
+   successful audit masquerading as the latest. Existing Mail missing-audit
+   cases remain deliverable, not degraded session-execution evidence.
+6. Appendix tests must cover cross-account/epoch fill identity, order-number
+   absence, native cumulative notional conflict, mixed execution types,
+   canceled partial SELL, same-cycle multiple BUY and original contract
+   immutability in a PostgreSQL disposable schema.
+
+### Not yet proven by this code change
+- Stored KIS daily cumulative economic proof is **not** live requery for
+  every historic order, nor proof of individual execution timestamp.
+- One DB transaction for both fresh `fills` write and `positions` apply
+  in every legacy settlement path is **not** established. The existing
+  protected atomic settlement cutover is subject to the current, unchanged
+  guarded release gate and not automatically activated by this PR.
+- Broker POST cannot be made transactional with PostgreSQL. The original
+  durable intent and unresolved-ACK recovery gate must remain authoritative.
+- Current KR Infinite adaptive policy remains unchanged; the read-only audit
+  enumerates intent and owner state but has not proven all historic evaluations.
+- No account changes, no KIS order, no operator DB migration, no deployment.
