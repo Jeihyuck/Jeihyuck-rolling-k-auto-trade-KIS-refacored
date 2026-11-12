@@ -49,6 +49,12 @@ ORDER BY trade_date DESC,updated_at DESC LIMIT 1
 
 BUY_SOURCE_SQL = text("""
 SELECT o.trade_date, o.account_id, o.portfolio_epoch_id, o.position_cycle_id,
+       i.account_id AS intent_account_id,
+       i.portfolio_epoch_id AS intent_portfolio_epoch_id,
+       i.position_cycle_id AS intent_position_cycle_id,
+       f.account_id AS fill_account_id,
+       f.portfolio_epoch_id AS fill_portfolio_epoch_id,
+       f.position_cycle_id AS fill_position_cycle_id,
        o.meta AS order_meta, i.meta AS intent_meta, f.meta AS fill_meta,
        f.qty AS filled_shares, f.order_no AS fill_order,
        o.order_no AS broker_order, o.status, o.qty_filled, o.qty_requested,
@@ -93,10 +99,14 @@ def _safe_original_buy_count(rows: list[dict], *, account_hash: str, contract_sh
         contract = _dict(im.get("entry_exit_contract"))
         if not (verify_us_entry_exit_contract(contract)
                 and contract.get("sha256") == contract_sha
-                and str(r.get("account_id") or "") == account_hash
-                and str(r.get("position_cycle_id") or "") == cycle
-                and str(r.get("portfolio_epoch_id") or "") == portfolio
-                and str(om.get("strategy_owner") or "") == "US_STANDARD"
+                and all(str(r.get(col) or "") == account_hash
+                        for col in ("account_id", "intent_account_id", "fill_account_id"))
+                and all(str(r.get(col) or "") == cycle
+                        for col in ("position_cycle_id", "intent_position_cycle_id", "fill_position_cycle_id"))
+                and all(str(r.get(col) or "") == portfolio
+                        for col in ("portfolio_epoch_id", "intent_portfolio_epoch_id", "fill_portfolio_epoch_id"))
+                and all(str(m.get("strategy_owner") or "") == "US_STANDARD"
+                        for m in (om, im, fm))
                 and str(fm.get("fill_evidence_type") or "") == "KIS_ORDER_CUMULATIVE_ACTUAL"
                 and fm.get("is_synthetic") is not True
                 and all(str(m.get("entry_exit_contract_sha256") or "") == contract_sha
@@ -105,6 +115,19 @@ def _safe_original_buy_count(rows: list[dict], *, account_hash: str, contract_sh
                 and str(r.get("fill_order")) == str(r.get("broker_order"))
                 and str(r.get("status") or "") in {"FILLED", "PARTIALLY_FILLED"}
                 and r.get("filled_shares") is not None):
+            continue
+        try:
+            # Strict exact cumulative KIS shares, not an ACK or a float cast.
+            shares = int(r["filled_shares"])
+            accounted = int(fm.get("cumulative_filled_qty"))
+            order_filled = int(r["qty_filled"])
+            intended = int(r["intended_shares"])
+            requested = int(r["qty_requested"])
+            assert shares > 0 and shares == accounted == order_filled
+            assert shares <= requested == intended
+            assert str(r["filled_shares"]) == str(shares)
+            assert str(fm["cumulative_filled_qty"]) == str(shares)
+        except (AssertionError, ValueError, TypeError, KeyError):
             continue
         valid_keys.add((str(r["trade_date"]), str(r["broker_order"])))
     return len(valid_keys)
