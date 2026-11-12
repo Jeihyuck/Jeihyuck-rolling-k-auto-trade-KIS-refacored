@@ -308,12 +308,19 @@ import pytest
 @pytest.mark.parametrize("style", [
     "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
 ])
-def test_original_selected_strategy_and_version_survive_sell_contract(style, monkeypatch):
+@pytest.mark.parametrize("mode,approved,version", [
+    ("LEGACY_V2", "0", "us_entry_exit_contract_v2"),
+    ("V3_ACTIVE_PRACTICE", "1", "us_entry_exit_contract_v3"),
+])
+def test_original_selected_strategy_and_version_survive_sell_contract(
+    style, mode, approved, version, monkeypatch,
+):
     from trader.us.entry_exit_contract import (
         build_us_entry_exit_contract, verify_us_entry_exit_contract,
     )
-    monkeypatch.setenv("US_SWING_EXIT_MODE", "LEGACY_V2")
-    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "0")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_SWING_EXIT_MODE", mode)
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", approved)
     contract = build_us_entry_exit_contract({
         "symbol": "AMGN", "strategy_owner": "US_STANDARD",
         "sleeve_id": "US_STANDARD", "strategy": "us_pb1",
@@ -324,6 +331,7 @@ def test_original_selected_strategy_and_version_survive_sell_contract(style, mon
         "entry_reason": "proven-original-selection",
     })
     assert verify_us_entry_exit_contract(contract)
+    assert contract["version"] == version
     assert contract["entry_strategy"] == "us_pb1"
     assert contract["entry_strategy_detail"] == {
         "selected_style": style,
@@ -333,8 +341,15 @@ def test_original_selected_strategy_and_version_survive_sell_contract(style, mon
     }
     # A later change to the runtime configuration may not mutate a holding's
     # original V2/V3 policy or selected entry family.
-    monkeypatch.setenv("US_SWING_EXIT_MODE", "V3_ACTIVE_PRACTICE")
-    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "1")
+    # Reverse today's runtime mode, proving an overnight holding is not
+    # silently upgraded from V2 or downgraded from V3.
+    monkeypatch.setenv(
+        "US_SWING_EXIT_MODE",
+        "V3_ACTIVE_PRACTICE" if version.endswith("_v2") else "LEGACY_V2",
+    )
+    monkeypatch.setenv(
+        "US_SWING_V3_DEPLOY_APPROVED", "1" if version.endswith("_v2") else "0",
+    )
     assert build_us_entry_exit_contract({
         "symbol": "AMGN", "strategy_owner": "US_STANDARD",
         "position_action": "ADD_TO_EXISTING_BUY",
