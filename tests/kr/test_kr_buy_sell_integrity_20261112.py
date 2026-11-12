@@ -524,3 +524,73 @@ def test_postgres_physical_raw_json_sql_to_real_audit_verdict():
         with engine.begin() as conn:
             conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         engine.dispose()
+
+
+@pytest.mark.parametrize("side,starting_qty,expected", [("BUY", 0, 4), ("SELL", 10, 6)])
+def test_controlled_atomic_cutover_rollback_and_replay(side, starting_qty, expected):
+    """Fault injection on guarded cutover, without activating any live switch."""
+    from dataclasses import replace
+    from datetime import date
+    from decimal import Decimal
+    from trader.settlement.core import SettlementObservation
+    from trader.settlement.kr_cutover import route_kr_settlement
+    from trader.settlement.release_gate import SettlementReleaseDecision
+    from trader.settlement.schema import metadata
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata.create_all(engine)
+    local = sa.MetaData()
+    holdings = sa.Table("case_holdings", local, sa.Column("id", sa.Integer, primary_key=True),
+                        sa.Column("qty", sa.Integer, nullable=False))
+    local.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(holdings.insert().values(id=1, qty=starting_qty))
+    release = SettlementReleaseDecision(
+        market="KR", status="READY_FOR_CONTROLLED_SWITCH",
+        writer_allowed=True, missing=(),
+    )
+    first = SettlementObservation(
+        env="practice", market="KR", account_scope="offline-account",
+        trading_epoch_id="epoch1", strategy_owner="PB1",
+        position_cycle_id="cycle1", client_order_key="client1",
+        broker_trade_date=date(2026, 11, 6), exchange="KOSDAQ",
+        broker_order_no="0000011759", side=side, requested_qty=4,
+        cumulative_qty=2, evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        evidence_digest="digest-first", currency="KRW",
+        execution_price=Decimal("2000"),
+    )
+
+    def value():
+        with engine.connect() as conn:
+            return conn.execute(sa.select(holdings.c.qty)).scalar_one()
+
+    def apply(conn, obs, decision):
+        assert conn.in_transaction()
+        conn.execute(
+            sa.update(holdings).where(holdings.c.id == 1).values(
+                qty=holdings.c.qty + (
+                    decision.qty_delta if obs.side == "BUY" else -decision.qty_delta
+                )
+            )
+        )
+
+    def crash(conn, obs, decision):
+        apply(conn, obs, decision)
+        raise RuntimeError("INJECTED_CRASH_BEFORE_TRANSACTION_COMMIT")
+
+    def route(observation, callback):
+        return route_kr_settlement(
+            engine=engine, observation=observation, release=release,
+            apply_atomic_economic_delta=callback,
+            apply_legacy=lambda: pytest.fail("unreleased legacy callback"),
+        )
+
+    with pytest.raises(RuntimeError, match="INJECTED_CRASH"):
+        route(first, crash)
+    assert value() == starting_qty
+    assert route(first, apply).atomic_decision.qty_delta == 2
+    assert route(first, apply).atomic_decision.qty_delta == 0
+    final = replace(first, cumulative_qty=4, evidence_digest="digest-final")
+    assert route(final, apply).atomic_decision.qty_delta == 2
+    assert route(final, apply).atomic_decision.qty_delta == 0
+    assert value() == expected
