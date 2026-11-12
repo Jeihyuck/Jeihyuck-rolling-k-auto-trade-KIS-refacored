@@ -3012,3 +3012,68 @@ def test_pg_tqqq_cycle_version_cas_active_and_new_cycle(pg_engine, monkeypatch):
     assert current.status == Status.READY
     assert current.cycle_id == "distinct-next-cycle"
     assert current.version == 5
+
+
+def test_pg_risk_cash_resized_buy_intent_finalization_atomic(pg_engine, monkeypatch):
+    """Execution qty changes before claim/POST, never the signed sell contract."""
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda bind=None, **kwargs: "fixture-resize-epoch")
+    initial = {
+        "client_order_key": "f" * 24, "symbol": "LIFY",
+        "exchange": "NASDAQ", "side": "BUY", "qty": 7,
+        "limit_price": 50, "notional_usd": 350,
+        "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
+        "strategy_name": "us_pb1", "strategy": "us_pb1",
+        "strategy_version": "fixture-v42",
+        "entry_style_selected": "ENTRY_MOMENTUM",
+        "position_action": "NEW_POSITION_BUY",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    }
+    signed = build_us_entry_exit_contract(initial)
+    initial["meta"] = {
+        "strategy_owner": "US_STANDARD", "strategy_name": "us_pb1",
+        "strategy_version": "fixture-v42", "sleeve_id": "US_STANDARD",
+        "entry_exit_contract": signed,
+        "entry_exit_contract_sha256": signed["sha256"],
+        "entry_exit_contract_version": signed["version"],
+        "entry_style_selected": "ENTRY_MOMENTUM",
+    }
+    assert repos.save_order_intent(initial, trade_date="2026-11-12")
+    resized = {**initial, "qty": 4, "notional_usd": 200}
+    assert repos.finalize_us_buy_intent_pre_submit(resized, trade_date="2026-11-12")
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT qty,notional_usd,meta FROM us_order_intents
+            WHERE client_order_key=:key
+        """), {"key": initial["client_order_key"]}).mappings().one()
+    assert row["qty"] == 4
+    assert float(row["notional_usd"]) == 200
+    assert row["meta"]["entry_exit_contract"] == signed
+    assert row["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
+    assert row["meta"]["execution_qty_finalization"]["original_qty"] == 7
+
+    # Once the same client key has an execution record, a different resize
+    # must fail closed and leave its original contract/qty untouched.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,status,meta)
+            VALUES ('2026-11-12',:key,'LIFY','NASDAQ','BUY',
+                    4,0,'ACK','{}'::jsonb)
+        """), {"key": initial["client_order_key"]})
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        {**initial, "qty": 3, "notional_usd": 150},
+        trade_date="2026-11-12",
+    )
+    with pg_engine.connect() as conn:
+        persisted = conn.execute(text("""
+            SELECT qty,meta FROM us_order_intents
+            WHERE client_order_key=:key
+        """), {"key": initial["client_order_key"]}).mappings().one()
+    assert persisted["qty"] == 4
+    assert persisted["meta"]["entry_exit_contract"] == signed
