@@ -3012,6 +3012,122 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert next_tp[0]["position_lifecycle_id"] == cycle
     assert not any(t.get("reason") == "TAKE_PROFIT_TP1" for t in next_tp)
 
+    # Continue the real original-BUY -> actual BUY fill -> carry -> original
+    # TP1 fill -> next-day original TP2 evaluation THROUGH THE ORDER ROUTER.
+    # Only the broker API boundary is simulated; no real KIS calls occur.
+    from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
+    from trader.us.execution import order_router
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda _conn=None, **_kw: epoch)
+    monkeypatch.setattr(repos, "_us_state_epoch_id",
+                        lambda _conn=None, **_kw: epoch)
+    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", claim_repo.acquire)
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation", claim_repo.record_observation,
+    )
+    monkeypatch.setattr(
+        repos, "release_execution_action_before_submit", claim_repo.release_before_submit,
+    )
+
+    class TP2TestBroker:
+        def __init__(self):
+            self.posts = []
+
+        def get_balance(self, **_kw):
+            return {"positions": [{
+                "symbol": "AMGN", "exchange": "NASDAQ",
+                "qty": 4, "holding_qty": 4, "orderable_qty": 4,
+                "avg_price": 461.8, "broker_avg_price_source": "kis_pchs_avg_pric",
+                "currency": "USD",
+            }]}
+
+        def place_us_sell_order(self, symbol, exchange, qty, price):
+            assert symbol == "AMGN" and exchange == "NASDAQ"
+            assert qty > 0
+            self.posts.append((symbol, qty, price))
+            return {"ok": True, "order_no": "CI-AMGN-TP2-SELL"}
+
+    broker = TP2TestBroker()
+    tp2_intent = next_tp[0]
+    tp2_intent["trade_date"] = "2026-11-13"
+    tp2_intent.setdefault("strategy_owner", "US_STANDARD")
+    tp2_intent.setdefault("sleeve_id", "US_STANDARD")
+    tp2_intent.setdefault("holding_qty", 4)
+    tp2_intent.setdefault("orderable_qty", 4)
+    tp2_intent.setdefault("sellable_qty", 4)
+    tp2_intent.setdefault("available_qty", 4)
+    routed_tp2 = route_exit_orders_immediately(
+        [tp2_intent], buy_daily_notional=0, position_count=1,
+        effective_budget=10000, signal_only=False, kis_order_allowed=True,
+        current_position_symbols={"AMGN"}, kis_client=broker,
+    )
+    assert len(broker.posts) == 1, routed_tp2
+    assert routed_tp2["orders"][0]["status"] == "ACK", routed_tp2
+    tp2_qty = int(broker.posts[0][1])
+    # ACK is not TP2 completion; only actual native-format evidence can do so.
+    pending_tp2 = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert pending_tp2["tp2_done"] is False
+    tp2_fill = repos.mark_order_filled_by_reconcile(
+        order_no="CI-AMGN-TP2-SELL",
+        client_order_key=tp2_intent["client_order_key"],
+        symbol="AMGN", side="SELL",
+        filled_qty=tp2_qty, requested_qty=tp2_qty,
+        cumulative_filled_qty=tp2_qty, avg_price_usd=490.0,
+        trade_date="2026-11-13",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage": "tp2",
+              "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+              "cumulative_filled_qty": tp2_qty},
+    )
+    assert tp2_fill["status"] == "OK", tp2_fill
+    done_tp2 = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert done_tp2["tp1_done"] is True
+    assert done_tp2["tp2_done"] is True and not done_tp2["tp2_pending"]
+    assert int(done_tp2["meta"]["tp2_filled_qty"]) == tp2_qty
+    repeated_tp2 = repos.mark_order_filled_by_reconcile(
+        order_no="CI-AMGN-TP2-SELL",
+        client_order_key=tp2_intent["client_order_key"],
+        symbol="AMGN", side="SELL",
+        filled_qty=tp2_qty, requested_qty=tp2_qty,
+        cumulative_filled_qty=tp2_qty, avg_price_usd=490.0,
+        trade_date="2026-11-13",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage": "tp2",
+              "cumulative_filled_qty": tp2_qty},
+    )
+    assert repeated_tp2["status"] == "OK", repeated_tp2
+    reloaded_tp2 = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert int(reloaded_tp2["meta"]["tp2_filled_qty"]) == tp2_qty
+    with pg_engine.connect() as conn:
+        persisted = conn.execute(text("""
+            SELECT o.meta AS order_meta, f.meta AS fill_meta, f.qty AS fill_qty
+            FROM us_orders o JOIN us_fills f
+              ON f.order_no=o.order_no AND f.client_order_key=o.client_order_key
+            WHERE o.order_no='CI-AMGN-TP2-SELL'
+        """)).mappings().one()
+    assert persisted["fill_qty"] == tp2_qty
+    assert persisted["order_meta"]["source_entry_contract_sha256"] == contract["sha256"]
+    assert persisted["fill_meta"]["position_lifecycle_id"] == cycle
 
 
 def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
