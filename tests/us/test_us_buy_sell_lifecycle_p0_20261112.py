@@ -118,6 +118,71 @@ def test_carry_rejects_scope_conflict_unproved_lifecycle_and_pending_orders():
     assert _carry(_Conn(damaged)) is None
 
 
+class _GapConn(_Conn):
+    """Latest snapshot has no identity; one older proven source remains."""
+    def __init__(self, latest, source, **kwargs):
+        super().__init__(source, **kwargs)
+        self.latest = latest
+        self.source = source
+
+    def execute(self, statement, params):
+        sql = str(statement)
+        if "SELECT as_of,qty,account_id" in sql:
+            if "as_of<:prior_date" in sql:
+                return _Query(rows=[self.source])
+            return _Query(row=self.latest)
+        return super().execute(statement, params)
+
+
+def test_amgn_carries_across_one_unverified_snapshot_without_history_rewrite():
+    source = _source()
+    intermediate = {
+        "as_of": date(2026, 11, 11), "qty": 6,
+        "account_id": None, "portfolio_epoch_id": None,
+        "position_cycle_id": None,
+        "meta": {
+            "entry_exit_contract": source["meta"]["entry_exit_contract"],
+            "entry_exit_contract_sha256": source["meta"]["entry_exit_contract_sha256"],
+            "lineage_identity_status": "ORIGINAL_BUY_SCOPE_UNVERIFIED",
+        },
+    }
+    result = verified_carried_us_snapshot_identity(
+        conn=_GapConn(intermediate, source),
+        trade_date="2026-11-12",
+        position={"symbol": "AMGN", "qty": 6},
+        trading_epoch_id=EPOCH,
+    )
+    assert result is not None
+    assert result["position_cycle_id"] == CYCLE
+    assert result["lineage_resolution"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+
+
+def test_amgn_missing_identity_gap_rejects_conflict_and_intervening_order():
+    source = _source()
+    intermediate = {
+        "as_of": date(2026, 11, 11), "qty": 6,
+        "account_id": None, "portfolio_epoch_id": None,
+        "position_cycle_id": None, "meta": {},
+    }
+
+    def carry(middle, *, pending=0):
+        return verified_carried_us_snapshot_identity(
+            conn=_GapConn(middle, source, pending=pending),
+            trade_date="2026-11-12",
+            position={"symbol": "AMGN", "qty": 6},
+            trading_epoch_id=EPOCH,
+        )
+
+    assert carry(intermediate) is not None
+    assert carry(intermediate, pending=1) is None
+    assert carry({**intermediate, "qty": 0}) is None
+    assert carry({**intermediate, "qty": 7}) is None
+    assert carry({**intermediate, "position_cycle_id": "foreign-cycle"}) is None
+    assert carry({**intermediate, "account_id": "foreign-hash"}) is None
+    assert carry({**intermediate, "meta": {"strategy_owner": "TQQQ_INFINITE"}}) is None
+    assert carry({**intermediate, "meta": {"entry_exit_contract_sha256": "wrong"}}) is None
+
+
 class _FillProof:
     def __init__(self, buy_shares, net_shares):
         self.buy_shares = buy_shares
