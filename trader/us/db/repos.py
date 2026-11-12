@@ -5000,37 +5000,45 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
                     """
                 if verified_identity:
-                    # Column-level source-of-truth: preserve complete identity
-                    # in the same transaction as the fresh KIS balance row.
-                    # Conflicting already-persisted cycles cannot be replaced.
+                    # Explicit scoped SQL, not string replacement against an
+                    # unrelated base UPSERT.  Hash is the canonical DB account
+                    # scope; the raw lifecycle account remains in signed meta.
+                    # A conflicting old cycle or signed policy is not repaired
+                    # by overwriting its economic history.
+                    if not trading_epoch_id:
+                        raise RuntimeError("US_SNAPSHOT_IDENTITY_EPOCH_REQUIRED")
                     params.update({
                         "broker_account_hash": verified_identity["broker_account_hash"],
                         "portfolio_epoch_id": verified_identity["portfolio_epoch_id"],
                         "position_cycle_id": verified_identity["position_cycle_id"],
                     })
-                    sql = sql.replace(
-                        "trading_epoch_id, meta)",
-                        "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)",
-                    ).replace(
-                        ":trading_epoch_id, CAST(:meta",
-                        ":trading_epoch_id, :broker_account_hash, :portfolio_epoch_id, :position_cycle_id, CAST(:meta",
-                    ).replace(
-                        "meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta",
-                        "account_id        =COALESCE(us_positions.account_id,EXCLUDED.account_id),"
-                        "portfolio_epoch_id=COALESCE(us_positions.portfolio_epoch_id,EXCLUDED.portfolio_epoch_id),"
-                        "position_cycle_id =COALESCE(us_positions.position_cycle_id,EXCLUDED.position_cycle_id),"
-                        "meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta",
-                    )
-                    sql += """
-                         WHERE (us_positions.account_id IS NULL
-                                OR us_positions.account_id=EXCLUDED.account_id)
-                           AND (us_positions.portfolio_epoch_id IS NULL
-                                OR us_positions.portfolio_epoch_id=EXCLUDED.portfolio_epoch_id)
-                           AND (us_positions.position_cycle_id IS NULL
-                                OR us_positions.position_cycle_id=EXCLUDED.position_cycle_id)
+                    sql = """
+                        INSERT INTO us_positions
+                          (as_of, symbol, exchange, qty, avg_cost, current_px,
+                           unrealized_pnl_usd, trading_epoch_id, account_id,
+                           portfolio_epoch_id, position_cycle_id, meta)
+                        VALUES (:as_of, :symbol, :exchange, :qty, :avg_cost, :current_px,
+                                :unrealized_pnl_usd, :trading_epoch_id, :broker_account_hash,
+                                :portfolio_epoch_id, :position_cycle_id, CAST(:meta AS jsonb))
+                        ON CONFLICT (trading_epoch_id, as_of, symbol, exchange) DO UPDATE
+                          SET qty=EXCLUDED.qty,
+                              avg_cost=EXCLUDED.avg_cost,
+                              current_px=EXCLUDED.current_px,
+                              unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
+                              account_id=COALESCE(us_positions.account_id, EXCLUDED.account_id),
+                              portfolio_epoch_id=COALESCE(us_positions.portfolio_epoch_id, EXCLUDED.portfolio_epoch_id),
+                              position_cycle_id=COALESCE(us_positions.position_cycle_id, EXCLUDED.position_cycle_id),
+                              meta=COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
+                        WHERE (us_positions.account_id IS NULL
+                               OR us_positions.account_id=EXCLUDED.account_id)
+                          AND (us_positions.portfolio_epoch_id IS NULL
+                               OR us_positions.portfolio_epoch_id=EXCLUDED.portfolio_epoch_id)
+                          AND (us_positions.position_cycle_id IS NULL
+                               OR us_positions.position_cycle_id=EXCLUDED.position_cycle_id)
+                          AND (us_positions.meta->>'entry_exit_contract_sha256' IS NULL
+                               OR us_positions.meta->>'entry_exit_contract_sha256'
+                                  = EXCLUDED.meta->>'entry_exit_contract_sha256')
                     """
-                    if "trading_epoch_id, account_id, portfolio_epoch_id, position_cycle_id, meta)" not in sql:
-                        raise RuntimeError("US_SNAPSHOT_IDENTITY_COLUMNS_NOT_PERSISTED")
                 params["meta"] = _json_param(meta_to_store)
                 result = conn.execute(text(sql), params)
                 if verified_identity and getattr(result, "rowcount", None) == 0:
