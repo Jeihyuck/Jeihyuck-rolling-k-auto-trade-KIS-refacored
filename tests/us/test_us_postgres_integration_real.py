@@ -3659,19 +3659,23 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
 
 
 @pytest.mark.parametrize(
-    "selected_style,contract_mode,paper_profile",
+    "selected_style,contract_mode,paper_profile,paper_failure",
     [
-        (style, mode, False)
+        (style, mode, False, None)
         for mode in ("LEGACY_V2", "V3_ACTIVE_PRACTICE")
         for style in ("ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_MINERVINI")
     ] + [
-        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True,
-                     id="real-pg-paper-on-enforce-native-router")
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True, None,
+                     id="real-pg-paper-on-enforce-native-router"),
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True, "unknown_ack",
+                     id="real-pg-paper-on-enforce-post-unknown-ack"),
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True, "ack_db_failure",
+                     id="real-pg-paper-on-enforce-post-ack-db-failure"),
     ],
 )
 def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     amgn_pg_engine, monkeypatch, tmp_path, selected_style, contract_mode,
-    paper_profile,
+    paper_profile, paper_failure,
 ):
     """Eight explicit production-router paths; only KIS HTTP is a test broker.
 
@@ -3799,6 +3803,10 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         def place_us_buy_order(self, sym, exchange, qty, price):
             assert (sym, exchange, qty, price) == (symbol, "NASDAQ", 6, 10.0)
             self.posts.append(("BUY", sym, qty))
+            if paper_failure == "unknown_ack":
+                # The fake broker may have received the economic order; this
+                # transport error MUST NOT authorize a second native POST.
+                raise TimeoutError("synthetic_unknown_ack_after_post")
             return {"ok": True, "order_no": "CI-BUY-EIGHT"}
 
         def place_us_sell_order(self, sym, exchange, qty, price):
@@ -3862,12 +3870,54 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     order_router._capture_native_buy_baseline(original_intent, broker, None)
     assert original_intent["meta"]["pre_order_holding_qty"] == 0
     assert original_intent["meta"]["pre_order_position_source"] == "kis_balance_authoritative"
+    if paper_failure == "ack_db_failure":
+        def synthetic_ack_failure(*_args, **_kw):
+            raise RuntimeError("synthetic_ack_db_failure")
+        monkeypatch.setattr(repos, "save_order_ack", synthetic_ack_failure)
     buy = route_order(
         original_intent, kis_client=broker,
         allowed_symbols={symbol}, current_position_symbols=set(),
         total_portfolio_usd=20000, available_cash_usd=10000,
         now=datetime(2026, 11, 10, 16, 0, tzinfo=timezone.utc),
     )
+    if paper_failure:
+        expected = ("BROKER_SUBMIT_RESULT_UNKNOWN" if paper_failure == "unknown_ack"
+                    else "ACK_DB_FAILED")
+        assert buy["status"] == expected, (paper_failure, buy)
+        assert buy["retry_order"] is False
+        assert buy["requires_reconcile"] is True
+        assert broker.posts == [("BUY", symbol, 6)]
+        with engine.connect() as conn:
+            original = conn.execute(text("""
+                SELECT meta FROM us_order_intents
+                 WHERE client_order_key='ci-eight-original-buy'
+            """)).mappings().one()
+            assert verify_us_entry_exit_contract(
+                original["meta"]["entry_exit_contract"]
+            )
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_execution_account_reservations
+                 WHERE symbol='AMGN' AND side='BUY'
+            """)).scalar_one() == 1
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_order_events
+                 WHERE client_order_key='ci-eight-original-buy'
+                   AND event_type='BROKER_CLAIM_PREPARED'
+            """)).scalar_one() == 1
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_orders
+                 WHERE client_order_key='ci-eight-original-buy'
+            """)).scalar_one() == 0
+        retried = route_order(
+            {**original_intent, "client_order_key": "ci-eight-unsafely-retried-buy"},
+            kis_client=broker, allowed_symbols={symbol},
+            current_position_symbols=set(),
+            total_portfolio_usd=20000, available_cash_usd=10000,
+            now=datetime(2026, 11, 10, 16, 1, tzinfo=timezone.utc),
+        )
+        assert retried["status"] != "ACK", retried
+        assert broker.posts == [("BUY", symbol, 6)]
+        return
     assert buy["status"] == "ACK", (selected_style, contract_mode, buy)
     assert broker.posts == [("BUY", symbol, 6)]
     with engine.connect() as conn:
