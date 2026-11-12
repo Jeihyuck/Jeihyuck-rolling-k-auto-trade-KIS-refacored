@@ -3819,6 +3819,34 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
             carried["position_cycle_id"]) == (account_hash,portfolio,cycle)
     assert carried["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
 
+    # A different explicit engine is NOT a same-contract ADD, even when the
+    # malicious/buggy producer copied the incumbent selected style. No lot
+    # allocator exists, so do not create an intent, claim, or broker request.
+    changed_engine = {
+        **original_intent,
+        "client_order_key": "ci-eight-conflicting-add",
+        "trade_date": "2026-11-11",
+        "strategy": "different_execution_engine",
+        "position_action": "ADD_TO_EXISTING_BUY",
+        "qty": 1,
+        "notional_usd": 100.0,
+    }
+    denied = route_order(
+        changed_engine, kis_client=broker,
+        current_position_symbols={symbol}, allowed_symbols={symbol},
+        total_portfolio_usd=20000, available_cash_usd=10000,
+    )
+    assert denied["status"] == "BLOCKED", denied
+    assert denied["reason"] == (
+        "US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY_REQUIRES_LOT_POLICY"
+    )
+    assert broker.posts == [("BUY", symbol, 6)]
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT COUNT(*) FROM us_order_intents
+            WHERE client_order_key='ci-eight-conflicting-add'
+        """)).scalar_one() == 0
+
     # A restarted claim repository and reloaded position cannot trust the
     # constructor's original intent object. Decisions read stored contract.
     fresh_repo = DurableExecutionClaimRepo(
