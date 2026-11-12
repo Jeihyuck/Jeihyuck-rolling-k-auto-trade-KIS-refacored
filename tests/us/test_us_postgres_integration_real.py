@@ -3556,6 +3556,16 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         assert intent["source_entry_contract_sha256"] == (
             positions[sym]["meta"]["entry_exit_contract_sha256"]
         )
+    if paper_profile:
+        # The legacy-off parameter ran earlier against the same PG fixture.
+        # Distinct test sessions must not reuse its date-scoped SELL client
+        # keys; otherwise the operational router correctly deduplicates all
+        # eight, but this test mistakes fixture pollution for failed isolation.
+        for candidate in signals:
+            if candidate.get("side") == "SELL":
+                candidate["client_order_key"] = (
+                    "ci-paper-on-" + str(candidate["client_order_key"])
+                )
     routed = route_exit_orders_immediately(
         signals, buy_daily_notional=0, position_count=10,
         effective_budget=10000, signal_only=True, kis_order_allowed=True,
