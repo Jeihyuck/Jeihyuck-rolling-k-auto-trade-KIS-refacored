@@ -3425,8 +3425,9 @@ def test_pg_closed_latest_snapshot_never_resurrects_old_buy_parent(pg_engine, mo
     assert repos.load_us_positions_by_symbols(["AMGN"]) == {}
 
 
+@pytest.mark.parametrize("paper_profile", [False, True], ids=["legacy-off", "paper-on-enforce"])
 def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
-    pg_engine, monkeypatch,
+    pg_engine, monkeypatch, paper_profile,
 ):
     """Real PG -> exit resolver -> signed original V2/V3 -> actual order
     router and fake broker ACK; neither a real KIS request nor a KIS fill.
@@ -3572,9 +3573,35 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     )
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setenv("WSL_RUN_MARKET", "")
-    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
-    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1" if paper_profile else "0")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE" if paper_profile else "OFF")
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "RESERVATION_ONLY" if paper_profile else "LEGACY")
     monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+    if paper_profile:
+        import hashlib
+        from pathlib import Path
+        import trader.account_state as account_state
+        from trader.us import config as us_cfg
+        from trader.us.execution import reservation_reconcile_worker
+        with pg_engine.begin() as conn:
+            conn.exec_driver_sql(Path(
+                "migrations/0056_us_execution_authority_reservations.sql"
+            ).read_text())
+        raw_account = "practice:ten-symbol-concurrency-integration"
+        account_fingerprint = hashlib.sha256(raw_account.encode()).hexdigest()
+        monkeypatch.setattr(
+            account_state, "get_account_key", lambda **_kw: raw_account,
+        )
+        monkeypatch.setattr(repos, "_us_execution_claim_scope", lambda: {
+            "env": "practice",
+            "account_id": account_fingerprint,
+            "trading_epoch_id": epoch,
+        })
+        monkeypatch.setattr(us_cfg, "assert_us_paper_order_allowed", lambda: None)
+        monkeypatch.setattr(
+            reservation_reconcile_worker,
+            "assert_fresh_reservation_worker", lambda **_kw: True,
+        )
     claim_repo = DurableExecutionClaimRepo(
         pg_engine, us_execution_claims, us_execution_attempts,
     )
@@ -3607,6 +3634,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
             self.sells.append((symbol, qty, price))
             return {"ok": True, "order_no": "CI-SELL-" + symbol}
 
+    if paper_profile:
+        monkeypatch.setattr(order_router, "NativeKisUSClient", TestBroker)
     broker = TestBroker()
     for intent in signals:
         intent["trade_date"] = "2026-11-12"
@@ -3636,6 +3665,31 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         """)).mappings().all()
     assert len(pg_sell_rows) == 8
     assert {r["symbol"] for r in pg_sell_rows} == set(found)
+    if paper_profile:
+        with pg_engine.connect() as conn:
+            reservations = conn.execute(text("""
+                SELECT symbol,side,state,requested_qty
+                  FROM us_execution_account_reservations
+                 WHERE env='practice' AND trading_epoch_id=:epoch
+            """), {"epoch": epoch}).mappings().all()
+            outbox = conn.execute(text("""
+                SELECT symbol,side,COUNT(*) AS n
+                  FROM us_order_events
+                 WHERE trade_date='2026-11-12'
+                   AND event_type='BROKER_CLAIM_PREPARED'
+                 GROUP BY symbol,side
+            """)).mappings().all()
+            attempts = conn.execute(text("""
+                SELECT COUNT(*) FROM us_execution_attempts a
+                  JOIN us_execution_claims c ON c.action_key=a.action_key
+                 WHERE c.trading_epoch_id=:epoch
+            """), {"epoch": epoch}).scalar_one()
+        assert {r["symbol"] for r in reservations} == set(found)
+        assert all(r["side"] == "SELL" and r["requested_qty"] > 0
+                   for r in reservations)
+        assert {r["symbol"] for r in outbox} == set(found)
+        assert all(r["n"] == 1 for r in outbox)
+        assert attempts == 8
     assert {
         positions[row["symbol"]]["meta"]["entry_exit_contract"]["version"]
         for row in pg_sell_rows
