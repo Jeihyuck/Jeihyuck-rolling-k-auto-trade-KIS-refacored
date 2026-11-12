@@ -3488,6 +3488,14 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     assert len(resolved) == 10
     for row in resolved:
         row["resolved_current_price"] = float(row.get("current_px") or 0)
+        # Real PG snapshots do not own a fresh broker orderable-qty column.
+        # The normal tick merges KIS balance before exit evaluation: inject
+        # the explicit 4-share test-broker snapshot here, not a guessed DB
+        # value. V3's strict orderable proof gate is kept intact.
+        row["holding_qty"] = 4
+        row["orderable_qty"] = 4
+        row["sellable_qty"] = 4
+        row["orderable_qty_source"] = "TEST_BROKER_FRESH_BALANCE"
         # Preserve the actual signed original from the stored DB JSON.
         row_meta = row.get("meta") or {}
         if row["symbol"] != "ABBV":
