@@ -1226,6 +1226,16 @@ def route_order(
     # This check deliberately precedes identity normalization, persistence and
     # every KIS call: malformed legacy intents cannot bypass symbol ownership.
     from trader.us.strategy_ownership import is_valid_tqqq_intent, owner_for_symbol, TQQQ_OWNER, TQQQ_SYMBOL
+    # A future dedicated owner must install its own explicit router/contract,
+    # fill attribution and SELL adapter. Never quietly adopt that owner into
+    # US_STANDARD through the legacy non-TQQQ symbol fallback.
+    raw_meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    explicit_owner = str(intent.get("strategy_owner") or raw_meta.get("strategy_owner") or "").upper()
+    registered_owner = owner_for_symbol(intent.get("symbol"))
+    if explicit_owner and explicit_owner != registered_owner:
+        logger.error("[US_ORDER][OWNER_NOT_REGISTERED] symbol=%s owner=%s", intent.get("symbol"), explicit_owner)
+        return {"status": "BLOCKED", "reason": "US_OWNER_ADAPTER_NOT_REGISTERED",
+                "broker_submit": False, "intent": intent}
     if owner_for_symbol(intent.get("symbol")) == TQQQ_OWNER and not is_valid_tqqq_intent(intent):
         logger.error(
             "[TQQQ_INF][OWNERSHIP_REJECT] symbol=TQQQ strategy_owner=%s sleeve_id=%s",
