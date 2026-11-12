@@ -360,6 +360,44 @@ def test_original_selected_strategy_and_version_survive_sell_contract(
         "entry_exit_contract": contract,
     }) == {}
 
+    from trader.us.execution.order_router import us_add_contract_requires_lot_policy
+
+    # A true ADD is allowed to inherit the exact incumbent agreement.
+    # Explicitly different strategy/style/version/contract must fail closed,
+    # never be relabelled under that immutable original.
+    same = {
+        "symbol": "AMGN", "side": "BUY", "strategy_owner": "US_STANDARD",
+        "strategy": "us_pb1", "entry_strategy": "us_pb1",
+        "strategy_version": "fixture-selection-v42",
+        "entry_style_selected": style,
+        "position_action": "ADD_TO_EXISTING_BUY",
+        "meta": {"entry_exit_contract": contract},
+    }
+    assert not us_add_contract_requires_lot_policy(same, contract)
+    assert us_add_contract_requires_lot_policy(
+        {**same, "strategy": "other_execution_engine"}, contract,
+    )
+    assert us_add_contract_requires_lot_policy(
+        {**same, "strategy_version": "different_execution_version"}, contract,
+    )
+    assert us_add_contract_requires_lot_policy(
+        {**same, "entry_style_selected": (
+            "ENTRY_BREAKOUT" if style != "ENTRY_BREAKOUT" else "ENTRY_PULLBACK"
+        )}, contract,
+    )
+    opposite_contract = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "sleeve_id": "US_STANDARD", "strategy": "us_pb1",
+        "strategy_version": "fixture-selection-v42",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": style,
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    })
+    assert opposite_contract.get("sha256") != contract["sha256"]
+    assert us_add_contract_requires_lot_policy(
+        {**same, "meta": {"entry_exit_contract": opposite_contract}}, contract,
+    )
+
 
 def test_unregistered_owner_rejected_before_any_database_or_kis_io():
     from trader.us.execution.order_router import route_order
