@@ -66,6 +66,14 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     same_code_other = [p for p in positions if p.get("code") == order.get("code")
                        and str(p.get("position_cycle_id") or "") != cycle]
     buy_fills = [f for f in fills if str(f.get("order_id")) == str(order.get("order_id"))]
+    foreign_buys = [f for f in buy_fills if (
+        f.get("code") != order.get("code")
+        or str(f.get("position_cycle_id") or "") != cycle
+        or str(f.get("portfolio_epoch_id") or "") != str(order.get("portfolio_epoch_id") or "")
+        or str(f.get("trading_epoch_id") or "") != str(order.get("trading_epoch_id") or "")
+        or str(f.get("kis_odno") or "").lstrip("0") != str(order.get("kis_odno") or "").lstrip("0")
+    )]
+    buy_fills = [f for f in buy_fills if f not in foreign_buys]
     same_cycle_sells = [s for s in sells if (
         s.get("code") == order.get("code")
         and s.get("strategy") == order.get("strategy")
@@ -75,6 +83,15 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     sell_ids = {str(s["order_id"]) for s in same_cycle_sells if s.get("status") in ("FILLED", "RECONCILED")}
     sold = sum(int(s.get("qty") or 0) for s in same_cycle_sells if str(s.get("order_id")) in sell_ids)
     documented_sell_fills = [f for f in sell_fills if str(f.get("order_id")) in sell_ids]
+    sell_by_id = {str(s["order_id"]): s for s in same_cycle_sells}
+    foreign_sells = [f for f in documented_sell_fills if (
+        f.get("code") != order.get("code")
+        or str(f.get("position_cycle_id") or "") != cycle
+        or str(f.get("portfolio_epoch_id") or "") != str(order.get("portfolio_epoch_id") or "")
+        or str(f.get("kis_odno") or "").lstrip("0") !=
+            str(sell_by_id[str(f.get("order_id"))].get("kis_odno") or "").lstrip("0")
+    )]
+    documented_sell_fills = [f for f in documented_sell_fills if f not in foreign_sells]
     sell_filled = sum(int(f.get("qty") or 0) for f in documented_sell_fills)
     native_buy = sum(int(f.get("qty") or 0) for f in buy_fills
                      if _obj(f.get("fill_meta_json")).get("evidence_kind") in _NATIVE
@@ -82,6 +99,13 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     issues = []
     if len(exact) != 1:
         issues.append("CYCLE_DISCONNECTED" if same_code_other else "POSITION_MISSING")
+    if foreign_buys:
+        issues.append("BUY_FILL_IDENTITY_MISMATCH")
+    if foreign_sells:
+        issues.append("SELL_FILL_IDENTITY_MISMATCH")
+    echo = _obj(_obj(order.get("response_json")).get("_kr_buy_entry_contract"))
+    if echo.get("entry_contract_sha256") != root_sha:
+        issues.append("ORDER_CONTRACT_ECHO_UNVERIFIED")
     if len(exact) > 1:
         issues.append("MULTIPLE_POSITIONS_EXACT_CYCLE")
     pos = exact[0] if len(exact) == 1 else {}
@@ -90,6 +114,12 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     if pos:
         if not plan or stored_plan != plan:
             issues.append("ORIGINAL_PLAN_MISMATCH")
+        last_eval = _obj(pos.get("last_exit_eval_json"))
+        eval_plan = _obj(last_eval.get("entry_exit_plan"))
+        if eval_plan and eval_plan != plan:
+            issues.append("SELL_EVALUATION_PLAN_DRIFT")
+        if eval_plan and last_eval.get("entry_exit_plan_status") not in (None, "OK"):
+            issues.append("SELL_EVALUATION_CONTRACT_STATUS_NOT_OK")
         if len(root_sha) != 64 or entry.get("entry_contract_sha256") != root_sha:
             issues.append("ORIGINAL_BUY_HASH_MISMATCH")
         if str(entry.get("source_buy_order_id") or "") != str(order.get("order_id") or ""):
@@ -111,7 +141,8 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     if not issues:
         status = "EXPECTED"
     elif any(s in issues for s in ("ORIGINAL_PLAN_MISMATCH", "ORIGINAL_BUY_HASH_MISMATCH",
-                                  "STORED_PLAN_HASH_MISMATCH", "TOP_LEVEL_POLICY_DRIFT")):
+                                  "STORED_PLAN_HASH_MISMATCH", "TOP_LEVEL_POLICY_DRIFT",
+                                  "SELL_EVALUATION_PLAN_DRIFT")):
         status = "CONTRACT_MISMATCH"
     elif "CYCLE_DISCONNECTED" in issues or "CLOSED_WITHOUT_ORIGINAL_CYCLE_SELL" in issues:
         status = "CYCLE_DISCONNECTED"
@@ -132,6 +163,10 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
         "sell_order_qty_same_cycle": sold, "sell_filled_qty_same_cycle": sell_filled,
         "original_contract_sha256": root_sha or None,
         "position_contract_sha256": entry.get("entry_contract_sha256"),
+        "last_sell_evaluation_plan_matches_buy": (
+            _obj(_obj(pos.get("last_exit_eval_json")).get("entry_exit_plan")) == plan
+            if _obj(pos.get("last_exit_eval_json")).get("entry_exit_plan") else None
+        ),
         "effective_amendment_version": overlay.get("version"),
         "effective_amendment_mode": overlay.get("activation_mode"),
         "status": status, "issues": sorted(set(issues)),
@@ -162,17 +197,18 @@ def collect(engine: sa.Engine, *, env: str) -> dict:
             SELECT code, strategy, trading_epoch_id, portfolio_epoch_id,
                 position_cycle_id, status, position_origin, qty,
                 entry_style_selected, exit_policy_family, entry_exit_plan_json,
-                entry_meta_json, position_meta
+                entry_meta_json, position_meta, last_exit_eval_json
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """, params)
         fills = _records(conn, """
             SELECT order_id, code, side, qty, price, fill_meta_json,
-                kis_odno, position_cycle_id
+                kis_odno, position_cycle_id, portfolio_epoch_id, trading_epoch_id
             FROM public.fills
             WHERE env=:env AND trading_epoch_id=:epoch AND side='BUY'
         """, params)
         sell_fills = _records(conn, """
-            SELECT order_id, code, side, qty, price, kis_odno, position_cycle_id
+            SELECT order_id, code, side, qty, price, kis_odno, position_cycle_id,
+                portfolio_epoch_id, trading_epoch_id
             FROM public.fills
             WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
         """, params)
@@ -214,7 +250,8 @@ def collect(engine: sa.Engine, *, env: str) -> dict:
             and x["position_contract_sha256"] is not None
             and not any(i in x["issues"] for i in
                 ("ORIGINAL_PLAN_MISMATCH", "STORED_PLAN_HASH_MISMATCH",
-                 "SOURCE_BUY_ORDER_UNBOUND", "TOP_LEVEL_POLICY_DRIFT"))
+                 "SOURCE_BUY_ORDER_UNBOUND", "TOP_LEVEL_POLICY_DRIFT",
+                 "SELL_EVALUATION_PLAN_DRIFT"))
             for x in reports),
         "categories": dict(statuses), "buys": reports,
         "imported_open_positions": imported,
