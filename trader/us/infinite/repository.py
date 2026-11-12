@@ -109,6 +109,9 @@ class InfiniteRepository:
                       AND (
                         us_tqqq_infinite_state.cycle_id IS NOT DISTINCT FROM EXCLUDED.cycle_id
                         OR (us_tqqq_infinite_state.status='COMPLETE' AND EXCLUDED.status='READY')
+                        OR (us_tqqq_infinite_state.status='READY'
+                            AND us_tqqq_infinite_state.cycle_id IS NULL
+                            AND EXCLUDED.status='READY' AND EXCLUDED.cycle_id IS NOT NULL)
                       )
                       AND NOT (
                         us_tqqq_infinite_state.status='ACTIVE' AND EXCLUDED.status='READY'
@@ -141,6 +144,9 @@ class InfiniteRepository:
                       AND (
                         us_tqqq_infinite_state.cycle_id IS NOT DISTINCT FROM EXCLUDED.cycle_id
                         OR (us_tqqq_infinite_state.status='COMPLETE' AND EXCLUDED.status='READY')
+                        OR (us_tqqq_infinite_state.status='READY'
+                            AND us_tqqq_infinite_state.cycle_id IS NULL
+                            AND EXCLUDED.status='READY' AND EXCLUDED.cycle_id IS NOT NULL)
                       )
                       AND NOT (
                         us_tqqq_infinite_state.status='ACTIVE' AND EXCLUDED.status='READY'
