@@ -661,3 +661,23 @@ def test_cycle_delta_net_zero_native_round_trip_requires_every_fill():
     assert _carry(_CycleDeltaConn(source, [rows[0], {
         **rows[1], "fill_qty": None,
     }])) is None
+
+
+def test_add_with_missing_style_cannot_sneak_different_engine_version_or_parent():
+    from trader.us.execution.order_router import us_add_contract_requires_lot_policy
+    parent = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "entry_strategy": "us_pb1",
+        "strategy_version": "2026.11",
+    })
+    def blocked(meta):
+        return us_add_contract_requires_lot_policy(
+            {"symbol": "AMGN", "side": "BUY", "meta": meta}, parent,
+        )
+    assert blocked({"entry_strategy": "DIFFERENT_ENGINE"})
+    assert blocked({"strategy_version": "2026.12"})
+    assert blocked({"parent_entry_contract_sha256": "foreign-cycle-contract"})
+    assert not blocked({"entry_strategy": "us_pb1", "strategy_version": "2026.11",
+                        "parent_entry_contract_sha256": parent["sha256"]})
