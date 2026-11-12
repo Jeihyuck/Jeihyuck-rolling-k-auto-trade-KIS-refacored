@@ -5059,11 +5059,39 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                           AND (us_positions.meta->>'entry_exit_contract_sha256' IS NULL
                                OR us_positions.meta->>'entry_exit_contract_sha256'
                                   = EXCLUDED.meta->>'entry_exit_contract_sha256')
+                          AND (us_positions.meta->>'strategy_owner' IS NULL
+                               OR us_positions.meta->>'strategy_owner'='US_STANDARD')
+                          AND (us_positions.meta->>'position_lifecycle_id' IS NULL
+                               OR us_positions.meta->>'position_lifecycle_id'
+                                  = EXCLUDED.meta->>'position_lifecycle_id')
+                          AND (us_positions.meta->>'broker_account_hash' IS NULL
+                               OR us_positions.meta->>'broker_account_hash'
+                                  = EXCLUDED.meta->>'broker_account_hash')
+                        RETURNING account_id, portfolio_epoch_id, position_cycle_id,
+                                  meta->>'entry_exit_contract_sha256' AS contract_sha,
+                                  meta->>'strategy_owner' AS persisted_owner,
+                                  meta->>'position_lifecycle_id' AS persisted_lifecycle
                     """
                 params["meta"] = _json_param(meta_to_store)
                 result = conn.execute(text(sql), params)
-                if verified_identity and getattr(result, "rowcount", None) == 0:
-                    raise RuntimeError("US_SNAPSHOT_ORIGINAL_SCOPE_CONFLICT")
+                if verified_identity:
+                    if getattr(result, "rowcount", None) == 0:
+                        raise RuntimeError("US_SNAPSHOT_ORIGINAL_SCOPE_CONFLICT")
+                    # PostgreSQL RETURNING verifies identity in the SAME
+                    # transaction, without a second per-tick DB roundtrip.
+                    # Statement-capture fixture clients may lack mappings().
+                    mapped = getattr(result, "mappings", None)
+                    if callable(mapped):
+                        stored = mapped().first()
+                        if not stored or any((
+                            str(stored.get("account_id") or "") != verified_identity["broker_account_hash"],
+                            str(stored.get("portfolio_epoch_id") or "") != verified_identity["portfolio_epoch_id"],
+                            str(stored.get("position_cycle_id") or "") != verified_identity["position_cycle_id"],
+                            str(stored.get("contract_sha") or "") != verified_identity["entry_exit_contract_sha256"],
+                            str(stored.get("persisted_owner") or "") != "US_STANDARD",
+                            str(stored.get("persisted_lifecycle") or "") != verified_identity["position_lifecycle_id"],
+                        )):
+                            raise RuntimeError("US_SNAPSHOT_IDENTITY_READBACK_MISMATCH")
                 count += 1
             if stale_close_requested:
                 params = {"td": td, "symbols": symbols, "source": close_source}
