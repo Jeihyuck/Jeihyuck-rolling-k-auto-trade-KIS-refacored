@@ -832,6 +832,17 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             broker_authoritative = True
             logger.debug("[TQQQ_INF][TEST_DOUBLE] treating injected positions as authoritative baseline")
 
+        # A database-only or stale balance row cannot prove that a newly
+        # reserved READY cycle owns a real KIS holding.  Do not activate or
+        # place another BUY using an unverified broker quantity; the next
+        # authoritative KIS snapshot can complete the native fill transition.
+        if not broker_authoritative and broker.qty > 0:
+            current = repository.load_state(symbol=config.symbol)
+            if current is not None and current.status == Status.READY:
+                logger.error("[TQQQ_INF][READY][BALANCE_UNVERIFIED] action=BLOCK_ONLY_TQQQ")
+                return {"status": "BLOCK", "reason": "TQQQ_READY_BROKER_BALANCE_NOT_AUTHORITATIVE",
+                        "orders": []}
+
         if cancel_order is not None and query_order is not None:
             try:
                 ttl_result = reconcile_tqqq_open_buy_ttl(
