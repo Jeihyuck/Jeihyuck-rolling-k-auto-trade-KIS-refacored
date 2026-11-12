@@ -3718,11 +3718,11 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
             return {"positions": [{
                 "symbol": symbol, "exchange": "NASDAQ", "qty": self.qty,
                 "holding_qty": self.qty, "orderable_qty": self.qty,
-                "avg_price": 100.0,
+                "avg_price": 10.0,
             }]} if self.qty else {"positions": []}
 
         def place_us_buy_order(self, sym, exchange, qty, price):
-            assert (sym, exchange, qty, price) == (symbol, "NASDAQ", 6, 100.0)
+            assert (sym, exchange, qty, price) == (symbol, "NASDAQ", 6, 10.0)
             self.posts.append(("BUY", sym, qty))
             return {"ok": True, "order_no": "CI-BUY-EIGHT"}
 
@@ -3737,7 +3737,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         "trade_date": "2026-11-10",
         "client_order_key": "ci-eight-original-buy",
         "symbol": symbol, "exchange": "NASDAQ", "side": "BUY",
-        "qty": 6, "limit_price": 100.0, "notional_usd": 600.0,
+        "qty": 6, "limit_price": 10.0, "notional_usd": 60.0,
         "strategy_owner": "US_STANDARD", "sleeve_id": "US_STANDARD",
         "strategy": "us_pb1", "strategy_name": "us_pb1",
         "strategy_version": "offline-eight-v1",
@@ -3801,7 +3801,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     verified_buy = repos.mark_order_filled_by_reconcile(
         order_no="CI-BUY-EIGHT", client_order_key="ci-eight-original-buy",
         symbol=symbol, side="BUY", filled_qty=6, requested_qty=6,
-        cumulative_filled_qty=6, avg_price_usd=100.0,
+        cumulative_filled_qty=6, avg_price_usd=10.0,
         trade_date="2026-11-10",
         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
         source="fills_by_order_no", meta=fill_meta,
@@ -3811,7 +3811,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     for td in ("2026-11-10", "2026-11-11"):
         assert repos.save_position_snapshot(
             [{"symbol":symbol,"exchange":"NASDAQ","qty":6,
-              "avg_cost":100.0,"current_px":80.0,
+              "avg_cost":10.0,"current_px":8.0,
               "balance_source":"kis_balance_authoritative","meta":{}}],
             trade_date=td, balance_fetch_status="OK",
             balance_parse_status="OK", authoritative_positions=True,
@@ -3838,7 +3838,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         "strategy": "different_execution_engine",
         "position_action": "ADD_TO_EXISTING_BUY",
         "qty": 1,
-        "notional_usd": 100.0,
+        "notional_usd": 10.0,
     }
     denied = route_order(
         changed_engine, kis_client=broker,
@@ -3873,7 +3873,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     )
     assert len(resolved) == 1
     held = resolved[0]
-    held["resolved_current_price"] = 80.0
+    held["resolved_current_price"] = 8.0
     held["orderable_qty"] = 6
     held["holding_qty"] = 6
     held["sellable_qty"] = 6
@@ -3909,7 +3909,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         symbol=symbol, side="SELL", filled_qty=actual_sell_qty,
         requested_qty=actual_sell_qty,
         cumulative_filled_qty=actual_sell_qty,
-        avg_price_usd=80.0, trade_date="2026-11-11",
+        avg_price_usd=8.0, trade_date="2026-11-11",
         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
         source="fills_by_order_no",
         meta={**fill_meta,"cumulative_filled_qty":actual_sell_qty,
