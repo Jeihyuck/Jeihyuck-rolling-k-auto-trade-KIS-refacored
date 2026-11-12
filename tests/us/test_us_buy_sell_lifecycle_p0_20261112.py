@@ -548,3 +548,116 @@ def test_same_contract_add_preserves_original_and_mixed_strategy_is_fenced():
         "symbol": "AMGN", "side": "BUY",
         "meta": {"entry_exit_contract": different},
     }, original) is True
+
+
+class _CycleDeltaConn(_Conn):
+    """DB read harness: intervening actual native orders, no broker stubs."""
+    def __init__(self, prior, rows, **kwargs):
+        super().__init__(prior, **kwargs)
+        self.rows = rows
+
+    def execute(self, statement, params):
+        sql = str(statement)
+        if "FROM us_orders o" in sql and "LEFT JOIN us_fills f" in sql:
+            return _Query(rows=self.rows)
+        if "SELECT COUNT(*) FROM us_orders" in sql and "status NOT IN" not in sql:
+            return _Query(scalar=len(self.rows))
+        return super().execute(statement, params)
+
+
+def _cycle_delta_row(side, shares, *, key=None, status="FILLED", source=None):
+    source = source or _source()
+    contract = source["meta"]["entry_exit_contract"]
+    key = key or f"TEST_NATIVE_{side}_{shares}"
+    order_no = f"NATIVE_{key}"
+    meta = {
+        "strategy_owner": "US_STANDARD", "position_lifecycle_id": CYCLE,
+        "broker_account_hash": HASH, "entry_exit_contract_sha256": contract["sha256"],
+        "entry_exit_contract": contract,
+    }
+    if side == "BUY":
+        meta["parent_entry_contract_sha256"] = contract["sha256"]
+    return {
+        "trade_date": date(2026, 11, 11), "side": side,
+        "status": status, "qty_requested": shares,
+        "qty_filled": shares, "client_order_key": key, "order_no": order_no,
+        "trading_epoch_id": EPOCH,
+        "order_account_id": HASH, "fill_account_id": HASH,
+        "order_portfolio_epoch_id": PORTFOLIO, "fill_portfolio_epoch_id": PORTFOLIO,
+        "order_position_cycle_id": CYCLE, "fill_position_cycle_id": CYCLE,
+        "order_meta": dict(meta),
+        "fill_meta": {**meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                      "is_synthetic": False},
+        "fill_qty": shares, "fill_order_no": order_no, "fill_side": side,
+        "fill_client_order_key": key,
+    }
+
+
+def test_same_cycle_add_and_partial_sell_preserve_original_contract():
+    """6 original -> BUY 3 -> SELL 2 -> 7 shares, frozen V2/V3 unchanged."""
+    source = _source()
+    rows = [_cycle_delta_row("BUY", 3), _cycle_delta_row("SELL", 2)]
+    proven = _carry(_CycleDeltaConn(source, rows), {"symbol": "AMGN", "qty": 7})
+    assert proven is not None
+    assert proven["position_cycle_id"] == CYCLE
+    assert proven["entry_exit_contract"] == source["meta"]["entry_exit_contract"]
+    assert proven["lineage_verified_net_add_shares"] == 1
+    assert proven["lineage_verified_partial_sell_shares"] == 0
+
+
+def test_same_cycle_partial_tp_then_next_day_contract_stays_frozen():
+    source = _source()
+    proven = _carry(_CycleDeltaConn(source, [_cycle_delta_row("SELL", 2)]),
+                    {"symbol": "AMGN", "qty": 4})
+    assert proven is not None
+    assert proven["lineage_verified_partial_sell_shares"] == 2
+    assert proven["entry_exit_contract_sha256"] == source["meta"]["entry_exit_contract_sha256"]
+
+
+def test_cycle_delta_rejects_unproved_add_foreign_contract_and_broker_gaps():
+    source = _source()
+    added = _cycle_delta_row("BUY", 2)
+    def carry(row, *, qty=8):
+        return _carry(_CycleDeltaConn(source, [row]), {"symbol": "AMGN", "qty": qty})
+    assert carry(added) is not None
+    no_parent = {**added, "order_meta": {
+        **added["order_meta"], "parent_entry_contract_sha256": None,
+    }}
+    assert carry(no_parent) is None
+    for field, bad in (
+        ("status", "ACK"), ("fill_qty", None),
+        ("fill_order_no", "ANOTHER_NATIVE_ORDER"),
+        ("fill_side", "SELL"), ("fill_account_id", "foreign"),
+        ("fill_position_cycle_id", "another-lot"),
+    ):
+        assert carry({**added, field: bad}) is None, field
+    fake_meta = dict(added["fill_meta"], fill_evidence_type="BALANCE_DELTA_SYNTHETIC")
+    assert carry({**added, "fill_meta": fake_meta}) is None
+    tampered = dict(added["order_meta"], entry_exit_contract_sha256="foreign-contract")
+    assert carry({**added, "order_meta": tampered}) is None
+    # A broker status stuck at PARTIALLY_FILLED cannot be adopted as terminal.
+    assert carry({**added, "status": "PARTIALLY_FILLED"}) is None
+    assert carry(added, qty=9) is None
+    assert carry(added, qty=6) is None
+
+
+def test_cycle_delta_rejects_duplicate_native_fill_or_unresolved_peer_order():
+    source = _source()
+    add = _cycle_delta_row("BUY", 2)
+    # A 1:many native join or second open order cannot be hidden by net math.
+    assert _carry(_CycleDeltaConn(source, [add, add]),
+                  {"symbol": "AMGN", "qty": 8}) is None
+    open_sell = _cycle_delta_row("SELL", 1, status="ACK")
+    assert _carry(_CycleDeltaConn(source, [add, open_sell]),
+                  {"symbol": "AMGN", "qty": 7}) is None
+
+
+def test_cycle_delta_net_zero_native_round_trip_requires_every_fill():
+    source = _source()
+    rows = [_cycle_delta_row("BUY", 2), _cycle_delta_row("SELL", 2)]
+    proven = _carry(_CycleDeltaConn(source, rows))
+    assert proven is not None
+    assert proven["entry_exit_contract_sha256"] == source["meta"]["entry_exit_contract_sha256"]
+    assert _carry(_CycleDeltaConn(source, [rows[0], {
+        **rows[1], "fill_qty": None,
+    }])) is None
