@@ -71,6 +71,7 @@ def _fixture_case():
         "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
         "trading_epoch_id": "epoch1",
         "qty": 10, "price": 2000.0, "broker_fill_id": "KR_KIS_CUM:proof1",
+        "raw_json": {"kis_response": {"tot_ccld_qty": "10", "tot_ccld_amt": "20000"}},
         "filled_at": "2026-11-02T09:31:59+09:00",
         "fill_meta_json": {
             "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
@@ -90,6 +91,7 @@ def _fixture_case():
         "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
         "trading_epoch_id": "epoch1", "qty": 4, "price": 2100.0,
         "broker_fill_id": "KR_KIS_CUM:proof2",
+        "raw_json": {"kis_response": {"tot_ccld_qty": "4", "tot_ccld_amt": "8400"}},
         "filled_at": "2026-11-06T09:06:36+09:00",
         "fill_meta_json": {
             "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
@@ -169,6 +171,7 @@ def test_sell_partial_fill_after_cancel_uses_priced_execution_not_order_qty():
     sell["qty"], sell["status"] = 8, "CANCELLED"
     pos["qty"] = 7
     sell_fill["qty"] = 3
+    sell_fill["raw_json"]["kis_response"] = {"tot_ccld_qty": "3", "tot_ccld_amt": "6300"}
     result = audit_buy(
         order, positions=[pos], fills=[fill], sells=[sell],
         sell_fills=[sell_fill], names={},
@@ -184,10 +187,22 @@ def test_duplicate_cumulative_watermark_is_counted_once():
     two = copy.deepcopy(fill)
     one["qty"] = 3
     two["qty"] = 10
+    one["raw_json"]["kis_response"] = {"tot_ccld_qty": "3", "tot_ccld_amt": "6000"}
+    two["raw_json"]["kis_response"] = {"tot_ccld_qty": "10", "tot_ccld_amt": "20000"}
     one["created_at"], two["created_at"] = "2026-11-02T00:31:59Z", "2026-11-02T00:32:00Z"
     report = summarize_native_order(order, [one, two])
     assert report["proven_filled_qty"] == 10
     assert report["cumulative_watermark"] == 10
+
+
+def test_kis_cumulative_source_qty_and_notional_mismatch_are_not_proof():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    wrong_amount = copy.deepcopy(fill)
+    wrong_amount["raw_json"]["kis_response"]["tot_ccld_amt"] = "21000"
+    assert summarize_native_order(order, [wrong_amount])["proven_filled_qty"] is None
+    wrong_qty = copy.deepcopy(fill)
+    wrong_qty["raw_json"]["kis_response"]["tot_ccld_qty"] = "9"
+    assert summarize_native_order(order, [wrong_qty])["proven_filled_qty"] is None
 
 
 def test_mixed_native_cumulative_and_individual_is_unproven():
