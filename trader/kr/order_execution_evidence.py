@@ -84,6 +84,7 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
     cum: dict[str, list[dict]] = {}
     indiv: dict[str, dict] = {}
     time_quality = "NO_FILL"
+    observed_time_quality: set[str] = set()
     fill_notional = Decimal("0")
     for row in related:
         bad = []
@@ -116,10 +117,10 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
             issues.add("FILL_NOTIONAL_INVALID")
             continue
         source = str(meta.get("filled_at_source") or meta.get("filled_at_confidence") or "")
-        if source == "KIS_EXECUTION_TIMESTAMP":
-            time_quality = "NATIVE_EXECUTION_TIMESTAMP"
-        else:
-            time_quality = "ORDER_TIME_PROXY_OR_UNKNOWN"
+        observed_time_quality.add(
+            "NATIVE_EXECUTION_TIMESTAMP" if source == "KIS_EXECUTION_TIMESTAMP"
+            else "ORDER_TIME_PROXY_OR_UNKNOWN"
+        )
         if kind == NATIVE_CUMULATIVE:
             raw = _obj(row.get("raw_json"))
             native = _obj(raw.get("kis_response")) or raw
@@ -151,6 +152,10 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
                 issues.add("CONFLICTING_BROKER_TRADE_ID")
                 continue
             indiv[proof_id] = row
+    if "ORDER_TIME_PROXY_OR_UNKNOWN" in observed_time_quality:
+        time_quality = "ORDER_TIME_PROXY_OR_UNKNOWN"
+    elif "NATIVE_EXECUTION_TIMESTAMP" in observed_time_quality:
+        time_quality = "NATIVE_EXECUTION_TIMESTAMP"
     if len(cum) > 1:
         issues.add("MULTIPLE_CUMULATIVE_PROOF_IDS_SAME_ORDER")
     for proof_rows in cum.values():
