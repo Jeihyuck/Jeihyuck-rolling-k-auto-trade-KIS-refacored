@@ -751,3 +751,76 @@ def test_ten_symbol_real_exit_evaluation_isolates_one_corrupt_and_one_pending(
         "[US_EXIT][SYMBOL_ISOLATED][EVALUATION_ERROR]" in record.message
         and "ABBV" in record.message for record in caplog.records
     )
+
+
+def test_ten_symbol_exit_resolver_exception_is_symbol_local(monkeypatch, caplog):
+    """One broken original BUY lookup must not abort nine other exit inputs.
+
+    This exercises the real public resolver, not a mocked batch return.
+    No KIS HTTP or operational database writes are performed.
+    """
+    from trader.us.pb1 import us_exit_position_resolver as resolver
+
+    symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
+               "KR", "MCK", "PFE", "PG", "TMO"]
+    positions = [
+        {"symbol": symbol, "qty": 4, "entry_price": 100.0,
+         "position_cycle_id": f"cycle-{symbol}",
+         "strategy_owner": "US_STANDARD"}
+        for symbol in symbols
+    ]
+    def original_resolver(position, **_kwargs):
+        if position["symbol"] == "AMGN":
+            raise ValueError("original_buy_scope_conflict")
+        return {**position, "pnl_input_ok": True,
+                "entry_price_source": "verified_original_buy"}
+
+    monkeypatch.setattr(resolver, "_enrich_single_position", original_resolver)
+    monkeypatch.setattr(
+        "trader.us.db.repos.load_us_position_risk_state_candidates_batch",
+        lambda *_args, **_kwargs: {},
+    )
+    enriched, meta = resolver.enrich_us_positions_for_exit(
+        positions, trade_date="2026-11-12", env="practice",
+    )
+    assert len(enriched) == 10
+    assert meta["ok"] == 9 and meta["missing"] == 1
+    assert meta["missing_symbols"] == ["AMGN"]
+    bad = next(row for row in enriched if row["symbol"] == "AMGN")
+    assert bad["qty"] == 4
+    assert bad["position_cycle_id"] == "cycle-AMGN"
+    assert bad["exit_resolution_failed"] is True
+    assert bad["exit_resolution_failure_reason"] == "ValueError"
+    assert bad["pnl_input_ok"] is False
+    assert all(
+        not row.get("exit_resolution_failed") and row["pnl_input_ok"]
+        for row in enriched if row["symbol"] != "AMGN"
+    )
+    assert any(
+        "[US_EXIT_RESOLVER][SYMBOL_ISOLATED][ERROR]" in rec.message
+        and "AMGN" in rec.message for rec in caplog.records
+    )
+
+
+def test_failed_exit_resolver_is_fenced_before_price_and_exit_evaluation(monkeypatch):
+    """A failed resolver must never turn a stale entry price into a SELL."""
+    from datetime import datetime, timezone
+    from trader.us.pb1 import us_exit_engine as engine
+
+    class QuoteProvider:
+        def get_current_price(self, symbol, exchange):
+            if symbol == "AMGN":
+                raise AssertionError("fenced symbol reached price provider")
+            return 80.0
+
+    broken = {
+        "symbol": "AMGN", "exchange": "NASDAQ", "qty": 4,
+        "entry_price": 100.0, "exit_resolution_failed": True,
+        "exit_resolution_failure_reason": "ValueError",
+        "strategy_owner": "US_STANDARD",
+    }
+    snapshots = engine.prepare_exit_position_snapshots(
+        [broken], provider=QuoteProvider(),
+        now=datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc),
+    )
+    assert snapshots == []
