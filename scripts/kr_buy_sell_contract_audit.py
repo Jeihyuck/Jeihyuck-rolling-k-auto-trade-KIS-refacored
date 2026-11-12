@@ -195,11 +195,12 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
         if len(hashes) != 1:
             issues.append("MULTIPLE_CONTRACTS_IN_SAME_CYCLE")
 
-    if any(i in issues for i in (
-        "ORIGINAL_PLAN_MISMATCH", "ORIGINAL_BUY_HASH_MISMATCH",
-        "STORED_PLAN_HASH_MISMATCH", "TOP_LEVEL_POLICY_DRIFT",
-        "SELL_EVALUATION_PLAN_DRIFT"
-    )):
+    if (any(i.startswith("ORIGINAL_BUY_CONTRACT_INVALID:") for i in issues)
+            or any(i in issues for i in (
+                "ORIGINAL_PLAN_MISMATCH", "ORIGINAL_BUY_HASH_MISMATCH",
+                "STORED_PLAN_HASH_MISMATCH", "TOP_LEVEL_POLICY_DRIFT",
+                "SELL_EVALUATION_PLAN_DRIFT"
+            ))):
         status = "CONTRACT_MISMATCH"
     elif "CYCLE_DISCONNECTED" in issues or "CLOSED_WITHOUT_ORIGINAL_CYCLE_SELL" in issues:
         status = "CYCLE_DISCONNECTED"
