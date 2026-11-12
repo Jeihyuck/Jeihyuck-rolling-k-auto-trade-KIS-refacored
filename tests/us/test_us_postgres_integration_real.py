@@ -3658,12 +3658,20 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
 
 
 
-@pytest.mark.parametrize("selected_style", [
-    "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
-])
-@pytest.mark.parametrize("contract_mode", ["LEGACY_V2", "V3_ACTIVE_PRACTICE"])
+@pytest.mark.parametrize(
+    "selected_style,contract_mode,paper_profile",
+    [
+        (style, mode, False)
+        for mode in ("LEGACY_V2", "V3_ACTIVE_PRACTICE")
+        for style in ("ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_MINERVINI")
+    ] + [
+        pytest.param("ENTRY_PULLBACK", "V3_ACTIVE_PRACTICE", True,
+                     id="real-pg-paper-on-enforce-native-router")
+    ],
+)
 def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     amgn_pg_engine, monkeypatch, tmp_path, selected_style, contract_mode,
+    paper_profile,
 ):
     """Eight explicit production-router paths; only KIS HTTP is a test broker.
 
@@ -3702,9 +3710,9 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     monkeypatch.setenv("WSL_RUN_MARKET", "US")
     monkeypatch.setenv("US_SWING_EXIT_MODE", contract_mode)
     monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "1" if is_v3 else "0")
-    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
-    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
-    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "ENFORCE" if paper_profile else "OFF")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "1" if paper_profile else "0")
+    monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "RESERVATION_ONLY" if paper_profile else "LEGACY")
     # The shared CI suite intentionally applies a $100 test risk cap for
     # unrelated rejection cases. Restore the repository production DEFAULT
     # $2,500 maximum within this one 6x$100 BUY scenario; do not disable risk.
@@ -3799,6 +3807,22 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
             self.posts.append(("SELL", sym, qty))
             return {"ok": True, "order_no": "CI-SELL-EIGHT"}
 
+    if paper_profile:
+        # Keep the actual router, PostgreSQL authority and Claim+Outbox path.
+        # Only the transport is a test broker; no KIS credential or HTTP.
+        from pathlib import Path
+        from trader.us import config as us_cfg
+        from trader.us.execution import reservation_reconcile_worker
+        with engine.begin() as conn:
+            conn.exec_driver_sql(Path(
+                "migrations/0056_us_execution_authority_reservations.sql"
+            ).read_text())
+        monkeypatch.setattr(order_router, "NativeKisUSClient", TestBroker)
+        monkeypatch.setattr(us_cfg, "assert_us_paper_order_allowed", lambda: None)
+        monkeypatch.setattr(
+            reservation_reconcile_worker,
+            "assert_fresh_reservation_worker", lambda **_kw: True,
+        )
     broker = TestBroker()
     original_intent = {
         "trade_date": "2026-11-10",
@@ -3861,6 +3885,23 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     assert signed["entry_strategy_detail"]["selected_style"] == selected_style
     assert original["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
     assert order["status"] == "ACK" and order["order_no"] == "CI-BUY-EIGHT"
+    if paper_profile:
+        with engine.connect() as conn:
+            prepared = conn.execute(text("""
+                SELECT count(*) FROM us_order_events
+                 WHERE client_order_key='ci-eight-original-buy'
+                   AND event_type='BROKER_CLAIM_PREPARED'
+            """)).scalar_one()
+            reserved = conn.execute(text("""
+                SELECT count(*) FROM us_execution_account_reservations
+                 WHERE symbol='AMGN' AND side='BUY'
+                   AND strategy_owner='US_STANDARD'
+            """)).scalar_one()
+            claimed = conn.execute(text("""
+                SELECT count(*) FROM us_execution_claims
+                 WHERE trading_epoch_id=:epoch
+            """), {"epoch": epoch}).scalar_one()
+        assert (prepared, reserved, claimed) == (1, 1, 1)
     # The native WSL binder must scope the *real BUY ledger*, not merely
     # attach signed JSON to an otherwise anonymous client key.
     with engine.connect() as conn:
