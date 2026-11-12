@@ -7213,6 +7213,38 @@ class PositionsRepo:
                 select(self._schema.positions).where(and_(*conditions))
             ).mappings().first()
             existing_row = dict(existing) if existing else {}
+            # 2026-11-12: stop accidental frozen source-plan/hash rewrites at the
+            # repository boundary. The PostgreSQL trigger is the final guard
+            # against direct SQL and racing writers. Mutable execution metadata
+            # (trail, partial TP, applied fill watermark) is deliberately exempt.
+            if existing_row and existing_row.get("strategy") == "pb1_pullback_close":
+                frozen_entry = existing_row.get("entry_meta_json") or {}
+                frozen_plan = existing_row.get("entry_exit_plan_json") or {}
+                if isinstance(frozen_entry, dict) and len(str(
+                    frozen_entry.get("entry_contract_sha256") or ""
+                )) == 64:
+                    if ("entry_exit_plan_json" in values
+                            and values["entry_exit_plan_json"] != frozen_plan):
+                        raise RuntimeError(
+                            "KR_ORIGINAL_CONTRACT_IMMUTABLE:entry_exit_plan_json"
+                        )
+                    incoming = values.get("entry_meta_json")
+                    if isinstance(incoming, dict):
+                        frozen_keys = (
+                            "entry_contract_sha256", "entry_contract_version",
+                            "entry_exit_plan_sha256", "source_buy_order_id",
+                            "source_buy_client_order_key",
+                            "entry_reason", "entry_style_selected",
+                            "entry_decision_family", "entry_rule_version",
+                            "entry_thesis", "trade_horizon", "exit_policy_family",
+                            "eod_action", "force_eod_close", "initial_stop_price",
+                            "initial_risk_r", "policy_source", "policy_version",
+                        )
+                        for key in frozen_keys:
+                            if key in incoming and incoming[key] != frozen_entry.get(key):
+                                raise RuntimeError(
+                                    f"KR_ORIGINAL_CONTRACT_IMMUTABLE:entry_meta_json.{key}"
+                                )
             # Frozen BUY plan owns the exit family. Diagnostics, stale copies
             # and reconciliation must not overwrite the protected policy field.
             # Import/legacy rows without a source-contract hash are unaffected.
@@ -7246,7 +7278,7 @@ class PositionsRepo:
             )
             conn.execute(stmt)
         except Exception as exc:
-            if _conn is not None:
+            if _conn is not None or str(exc).startswith("KR_ORIGINAL_CONTRACT_IMMUTABLE:"):
                 raise
             if fail_soft:
                 logger.warning(
