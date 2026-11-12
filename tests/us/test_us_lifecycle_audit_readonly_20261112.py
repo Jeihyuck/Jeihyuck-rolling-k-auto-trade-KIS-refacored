@@ -172,3 +172,14 @@ def test_am_close_hooks_do_not_run_in_trade_ticks_or_gate_sells():
     assert "US_ORDER_ARMED=0" in helper
     assert "NO_TRADE=1 DRY_RUN=1" in helper
     assert "return 0" in helper
+
+
+def test_am_close_readonly_audit_has_bounded_runtime_and_no_trade_permission():
+    from pathlib import Path
+    helper = Path("scripts/wsl/us-lifecycle-readonly-audit.sh").read_text()
+    assert "US_LIFECYCLE_AUDIT_TIMEOUT_SECONDS:-15" in helper
+    assert "timeout --kill-after=2s" in helper
+    assert "NO_TRADE=1 DRY_RUN=1" in helper
+    assert "audit_rc=$?" in helper
+    assert "no_order_block=1" in helper
+    assert "return 0" in helper
