@@ -1263,6 +1263,14 @@ def prepare_exit_position_snapshots(
                 except Exception:
                     pass
             symbol = pos.get("symbol", "")
+            if pos.get("exit_resolution_failed"):
+                logger.error(
+                    "[US_EXIT][SYMBOL_ISOLATED][RESOLVER_FAILURE] symbol=%s reason=%s "
+                    "action=skip_only_this_symbol",
+                    symbol, pos.get("exit_resolution_failure_reason") or "unknown",
+                )
+                _observe_snapshot_outcome("SKIP", "resolver_failure")
+                continue
             raw_exchange = pos.get("exchange", "NASDAQ")
             try:
                 exchange = normalize_us_exchange(raw_exchange)
