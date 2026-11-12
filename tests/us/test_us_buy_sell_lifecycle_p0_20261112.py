@@ -450,3 +450,71 @@ def test_tqqq_state_version_cas_refuses_stale_writer_without_rollback(monkeypatc
             cycle_id="specific-tqqq-cycle", status=Status.READY,
             cycle_start_date=date(2026, 11, 11), version=709,
         ))
+
+
+def test_resized_buy_finalization_preserves_original_signed_sell_contract(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "_MEM_INTENTS", [])
+    monkeypatch.setenv("KIS_ENV", "practice")
+    initial = {
+        "client_order_key": "f" * 24, "symbol": "AMGN",
+        "side": "BUY", "strategy_owner": "US_STANDARD",
+        "strategy_name": "us_pb1", "strategy": "us_pb1",
+        "strategy_version": "fixture-original-version",
+        "sleeve_id": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_BREAKOUT",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "qty": 7, "limit_price": 50, "notional_usd": 350,
+    }
+    signed = build_us_entry_exit_contract(initial)
+    initial["meta"] = {
+        "strategy_owner": "US_STANDARD",
+        "entry_exit_contract": signed,
+        "entry_exit_contract_sha256": signed["sha256"],
+        "entry_exit_contract_version": signed["version"],
+    }
+    assert repos.save_order_intent(initial, trade_date="2026-11-12")
+    final = {**initial, "qty": 4, "notional_usd": 200}
+    assert repos.finalize_us_buy_intent_pre_submit(final, trade_date="2026-11-12")
+    stored = repos._MEM_INTENTS[0]
+    assert stored["qty"] == 4
+    assert stored["notional_usd"] == 200
+    assert stored["meta"]["entry_exit_contract"] == signed
+    assert stored["meta"]["execution_qty_finalization"] == {
+        "original_qty": 7, "final_qty": 4,
+        "reason": "PRE_HTTP_RISK_OR_CASH_RESIZE",
+    }
+    assert repos.finalize_us_buy_intent_pre_submit(final, trade_date="2026-11-12")
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        {**initial, "qty": 8, "notional_usd": 400}, trade_date="2026-11-12"
+    )
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        {**initial, "qty": 3, "notional_usd": 150}, trade_date="2026-11-12"
+    )
+    stored["status"] = "SENT"
+    assert not repos.finalize_us_buy_intent_pre_submit(final, trade_date="2026-11-12")
+
+
+def test_buy_finalization_blocks_missing_original_or_foreign_strategy(monkeypatch):
+    from trader.us.db import repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "_MEM_INTENTS", [])
+    base = {
+        "client_order_key": "c" * 24, "symbol": "AMGN",
+        "side": "BUY", "qty": 2, "notional_usd": 100,
+        "strategy_owner": "US_STANDARD", "meta": {},
+    }
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        base, trade_date="2026-11-12"
+    )
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        {**base, "qty": 2.5}, trade_date="2026-11-12"
+    )
+    assert not repos.finalize_us_buy_intent_pre_submit(
+        {**base, "strategy_owner": "OTHER"}, trade_date="2026-11-12"
+    )
