@@ -222,3 +222,81 @@ def test_tqqq_ack_without_fill_or_mismatched_balance_cannot_activate():
     assert _tqqq_reconcile(2, 2, 0).status == Status.READY
     assert _tqqq_reconcile(2, 1, 2).status == Status.READY
     assert _tqqq_reconcile(2, 2, 3).status == Status.READY
+
+
+def test_real_postgres_tqqq_cas_rejects_stale_ready_and_preserves_active(monkeypatch):
+    """Runs against CI PostgreSQL; no KIS or operating database access."""
+    import os
+    from pathlib import Path
+    from dataclasses import replace
+
+    import pytest
+
+    uri = os.environ.get("PBCORE_TEST_POSTGRES_URL")
+    if not uri:
+        pytest.skip("no isolated PostgreSQL service")
+    from sqlalchemy import create_engine, text
+
+    schema = "us_lifecycle_p0_ci"
+    root = create_engine(uri, future=True)
+    with root.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {schema}"))
+    engine = create_engine(
+        uri, future=True,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    try:
+        with engine.begin() as conn:
+            # Exact production 0048 DDL with the 0052 scoped-PK shape
+            # applied in this isolated schema (not a fake SQLite table).
+            conn.exec_driver_sql(
+                Path("migrations/0048_add_us_tqqq_infinite_state.sql").read_text()
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE us_tqqq_infinite_state "
+                "ADD COLUMN IF NOT EXISTS trading_epoch_id TEXT"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE us_tqqq_infinite_state DROP CONSTRAINT "
+                "us_tqqq_infinite_state_pkey"
+            )
+            conn.exec_driver_sql(
+                "ALTER TABLE us_tqqq_infinite_state "
+                "ADD CONSTRAINT us_tqqq_infinite_state_pkey "
+                "PRIMARY KEY (trading_epoch_id, strategy_id, symbol)"
+            )
+        monkeypatch.setattr(
+            InfiniteRepository, "_epoch_id",
+            lambda self, bind=None, required=None: "fixture-practice-epoch",
+        )
+        repo = InfiniteRepository(engine)
+        ready = InfiniteState(
+            strategy_id="TQQQ_INFINITE_V3", symbol="TQQQ",
+            cycle_id="fixture-cycle-1", cycle_start_date=date(2026, 11, 11),
+            status=Status.READY, version=1,
+        )
+        repo.save_state(ready)
+        assert ready.version == 1
+        stale = replace(ready)
+        active = replace(ready, status=Status.ACTIVE, core_filled_notional=118.71)
+        repo.save_state(active)
+        assert active.version == 2
+        from trader.us.infinite.repository import StateCorruptionError
+
+        with pytest.raises(StateCorruptionError, match="STALE_VERSION_OR_CYCLE"):
+            repo.save_state(stale)
+        stored = repo.load_state()
+        assert stored.status == Status.ACTIVE
+        assert stored.version == 2
+        assert stored.cycle_id == "fixture-cycle-1"
+        assert float(stored.core_filled_notional) == pytest.approx(118.71)
+        next_update = replace(stored, metadata={"broker_qty": 2})
+        repo.save_state(next_update)
+        assert next_update.version == 3
+        assert repo.load_state().metadata["broker_qty"] == 2
+    finally:
+        engine.dispose()
+        with root.begin() as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        root.dispose()
