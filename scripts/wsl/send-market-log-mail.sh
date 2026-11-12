@@ -342,6 +342,14 @@ fi
 for purpose in "${purposes[@]}"; do collect_session_purpose "$purpose"; done
 for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "$item"; done
 
+# 2026-11-12: KR CLOSE produces a read-only BUY→SELL lineage audit.
+# Include the exact trade-day file in the regular KR mail evidence archive.
+# A missing report is DEGRADED evidence, NEVER a reason to suppress the mail.
+if [[ "$MARKET" == kr ]]; then
+  KR_CONTRACT_AUDIT_PATH="runtime/health/kr-contract-audit-${TRADE_DATE}.json"
+  collect_path KR_CONTRACT_AUDIT_MISSING "$KR_CONTRACT_AUDIT_PATH"
+fi
+
 # Read exact same-day Stage4 child paths from each session's own logs.
 # Retain the session-specific missing evidence code for existing mail contracts.
 # Run tokens need not contain the session label; guessed glob paths are unsafe.
