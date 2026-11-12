@@ -3733,6 +3733,15 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         def get_orderable_cash(self, **_kw):
             return 100000.0
 
+        def get_us_balance(self, *, force_refresh=False):
+            # Native KIS shape used by the real pre-HTTP BUY baseline reader.
+            assert force_refresh is True
+            assert self.qty == 0
+            return {
+                "rt_cd": "0", "output1": [], "output2": {},
+                "balance_complete": True, "balance_authoritative": True,
+            }
+
         def get_balance(self, **_kw):
             return {"positions": [{
                 "symbol": symbol, "exchange": "NASDAQ", "qty": self.qty,
@@ -3783,6 +3792,13 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
             "position_action": "NEW_POSITION_BUY",
         },
     }
+    # Non-native test adapters deliberately bypass the native-only baseline
+    # hook in route_order. Exercise that *real operating function* explicitly
+    # with native-shaped GET evidence rather than hand-writing a fake
+    # pre_order_holding_qty into order metadata.
+    order_router._capture_native_buy_baseline(original_intent, broker, None)
+    assert original_intent["meta"]["pre_order_holding_qty"] == 0
+    assert original_intent["meta"]["pre_order_position_source"] == "kis_balance_authoritative"
     buy = route_order(
         original_intent, kis_client=broker,
         allowed_symbols={symbol}, current_position_symbols=set(),
