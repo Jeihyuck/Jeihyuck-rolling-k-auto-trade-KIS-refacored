@@ -3931,6 +3931,33 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
         "cumulative_filled_qty": 6,
     }
+    if paper_profile:
+        partial = repos.mark_order_filled_by_reconcile(
+            order_no="CI-BUY-EIGHT", client_order_key="ci-eight-original-buy",
+            symbol=symbol, side="BUY", filled_qty=2, requested_qty=6,
+            cumulative_filled_qty=2, avg_price_usd=10.0,
+            trade_date="2026-11-10",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+            source="fills_by_order_no",
+            meta={**fill_meta, "cumulative_filled_qty": 2},
+        )
+        assert partial["status"] == "OK", partial
+        with engine.connect() as conn:
+            assert conn.execute(text("""
+                SELECT qty_filled FROM us_orders
+                 WHERE client_order_key='ci-eight-original-buy'
+            """)).scalar_one() == 2
+        # A separate durable-repository instance sees the same original
+        # execution evidence before the delayed final cumulative fill.
+        fresh_partial_repo = DurableExecutionClaimRepo(
+            engine, us_execution_claims, us_execution_attempts,
+        )
+        monkeypatch.setattr(repos, "_execution_claim_repo", lambda: fresh_partial_repo)
+        monkeypatch.setattr(repos, "claim_execution_action", fresh_partial_repo.acquire)
+        monkeypatch.setattr(
+            repos, "record_execution_action_observation",
+            fresh_partial_repo.record_observation,
+        )
     verified_buy = repos.mark_order_filled_by_reconcile(
         order_no="CI-BUY-EIGHT", client_order_key="ci-eight-original-buy",
         symbol=symbol, side="BUY", filled_qty=6, requested_qty=6,
@@ -4155,6 +4182,32 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     assert sell_row["order_meta"]["source_entry_contract_sha256"] == signed["sha256"]
     assert (sell_row["order_cycle"],sell_row["fill_cycle"]) == (cycle,cycle)
     assert sell_row["fill_meta"]["source_entry_contract_sha256"] == signed["sha256"]
+    if paper_profile:
+        with engine.connect() as conn:
+            original_count = conn.execute(text("""
+                SELECT count(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
+            """)).scalar_one()
+        replay = repos.mark_order_filled_by_reconcile(
+            order_no="CI-SELL-EIGHT",
+            client_order_key=route["intent"]["client_order_key"],
+            symbol=symbol, side="SELL",
+            filled_qty=actual_sell_qty, requested_qty=actual_sell_qty,
+            cumulative_filled_qty=actual_sell_qty, avg_price_usd=8.0,
+            trade_date="2026-11-11",
+            evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+            source="fills_by_order_no",
+            meta={
+                **{k: v for k, v in fill_meta.items()
+                   if k not in ("execution_action_key", "submit_attempt_id")},
+                "cumulative_filled_qty": actual_sell_qty,
+                "source_entry_contract_sha256": signed["sha256"],
+            },
+        )
+        assert replay["status"] == "OK", replay
+        with engine.connect() as conn:
+            assert conn.execute(text("""
+                SELECT count(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
+            """)).scalar_one() == original_count
 
 
 def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
