@@ -7972,10 +7972,7 @@ def load_us_positions_by_symbols(
             if as_of:
                 rows = conn.execute(
                     text("""
-                        SELECT DISTINCT ON (symbol)
-                            symbol, exchange, qty, avg_cost, trading_epoch_id,
-                            current_px, unrealized_pnl_usd, meta, as_of,
-                            account_id, portfolio_epoch_id, position_cycle_id
+                        SELECT DISTINCT ON (symbol) *
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                           AND as_of <= :as_of
@@ -7987,10 +7984,7 @@ def load_us_positions_by_symbols(
             else:
                 rows = conn.execute(
                     text("""
-                        SELECT DISTINCT ON (symbol)
-                            symbol, exchange, qty, avg_cost, trading_epoch_id,
-                            current_px, unrealized_pnl_usd, meta, as_of,
-                            account_id, portfolio_epoch_id, position_cycle_id
+                        SELECT DISTINCT ON (symbol) *
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
                     """ + epoch_clause + """
@@ -8001,10 +7995,11 @@ def load_us_positions_by_symbols(
 
             result = {}
             for row in rows:
-                cols = ["symbol", "exchange", "qty", "avg_cost", "trading_epoch_id",
-                        "current_px", "unrealized_pnl_usd", "meta", "as_of",
-                        "account_id", "portfolio_epoch_id", "position_cycle_id"]
-                d = dict(zip(cols, row))
+                # SELECT * works with both pre-0062 CI fixtures and the
+                # current scoped schema; never require a missing legacy column.
+                # The later identity verification still requires explicit
+                # original proof before any ORDER is allowed.
+                d = dict(row._mapping)
                 # A latest zero-share snapshot is terminal for this loader.
                 # Do not fall back to an older held cycle by filtering in SQL.
                 if int(d.get("qty") or 0) <= 0:
