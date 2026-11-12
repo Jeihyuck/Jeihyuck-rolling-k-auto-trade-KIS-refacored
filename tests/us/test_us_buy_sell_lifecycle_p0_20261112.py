@@ -851,9 +851,17 @@ def test_corrupt_qty_in_one_of_ten_is_diagnostic_only_and_peer_exits_continue(mo
          "holding_qty": 4, "position_cycle_id": f"cycle-{s}"}
         for s in symbols
     ]
+    original_single = resolver._enrich_single_position
+    def resolved_with_one_actual_invalid_branch(position, **kwargs):
+        if position["symbol"] == "AMGN":
+            # Do not mock the branch under test: the actual resolver must
+            # retain corrupt qty as a broker-data incident rather than zero.
+            return original_single(position, **kwargs)
+        return {**position, "pnl_input_ok": True,
+                "entry_price_source": "verified"}
+
     monkeypatch.setattr(
-        resolver, "_enrich_single_position",
-        lambda p, **_kw: {**p, "pnl_input_ok": True, "entry_price_source": "verified"},
+        resolver, "_enrich_single_position", resolved_with_one_actual_invalid_branch,
     )
     monkeypatch.setattr(
         "trader.us.db.repos.load_us_position_risk_state_candidates_batch",
