@@ -2131,7 +2131,11 @@ def test_claim_pre_submit_outbox_atomic_rollback(pg_engine):
     assert counts == (1, 1)
 
 
-def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
+@pytest.mark.parametrize("owner,symbol", [
+    ("TQQQ_INFINITE", "TQQQ"),
+    ("US_STANDARD", "AMGN"),
+])
+def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine, owner, symbol):
     """Full Stage 1+3 DB preparation is one atomic write on PostgreSQL.
 
     Three durable rows (Claim / account reservation / immutable pre-submit
@@ -2165,10 +2169,10 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     identity = SemanticActionIdentity(
         env="practice", account_id=fingerprint,
         market="US", trading_epoch_id="stage123-epoch",
-        strategy_owner="TQQQ_INFINITE", lifecycle_id="stage123-cycle",
+        strategy_owner=owner, lifecycle_id="stage123-cycle",
         action="BUY", trade_date=date(2026, 10, 20),
     )
-    key = "TQQQ_INF_V3:stage123-cycle:2026-10-20:BUY"
+    key = f"{owner}:stage123-cycle:2026-10-20:BUY"
     attempt = "stage123-reserved-attempt"
     event = {
         "event_id": str(uuid4()), "trade_date": "2026-10-20",
@@ -2176,7 +2180,7 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
         "event_timestamp": datetime.now(timezone.utc).isoformat(),
         "session": "am", "session_run_id": "synthetic",
         "tick_id": "synthetic", "client_order_key": key,
-        "submit_attempt_id": attempt, "symbol": "TQQQ", "side": "BUY",
+        "submit_attempt_id": attempt, "symbol": symbol, "side": "BUY",
         "requested_qty": 3, "raw_broker_order_no": None,
         "canonical_broker_order_no": None,
         "position_lifecycle_id": "stage123-cycle",
@@ -2192,8 +2196,8 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
         ).acquired
         authority.reserve(
             lease=lease, action_key=attempt,
-            strategy_owner="TQQQ_INFINITE",
-            symbol="TQQQ", side="BUY", qty=3,
+            strategy_owner=owner,
+            symbol=symbol, side="BUY", qty=3,
             price_usd="100", broker_cash_usd="500",
             _conn=conn,
         )
@@ -2223,13 +2227,14 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     assert counts() == (1, 1, 1)
     authority.assert_reserved_submit_authority(
         attempt_id=attempt, client_order_key=key,
-        strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+        strategy_owner=owner, symbol=symbol, side="BUY", qty=3,
     )
     from trader.us.execution.account_authority import AuthorityUnavailable
     with pytest.raises(AuthorityUnavailable, match="STALE"):
         authority.assert_reserved_submit_authority(
             attempt_id=attempt, client_order_key=key,
-            strategy_owner="US_STANDARD", symbol="TQQQ", side="BUY", qty=3,
+            strategy_owner=("US_STANDARD" if owner == "TQQQ_INFINITE" else "TQQQ_INFINITE"),
+            symbol=symbol, side="BUY", qty=3,
         )
     # A lost HTTP response must NOT cause a second identical broker POST
     # from the same Claim/Attempt. The initial boundary transitions Attempt
@@ -2241,7 +2246,7 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine):
     with pytest.raises(AuthorityUnavailable, match="STALE"):
         authority.assert_reserved_submit_authority(
             attempt_id=attempt, client_order_key=key,
-            strategy_owner="TQQQ_INFINITE", symbol="TQQQ", side="BUY", qty=3,
+            strategy_owner=owner, symbol=symbol, side="BUY", qty=3,
         )
     authority.release_lease(lease=lease)
 
