@@ -195,7 +195,11 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
       KR_CONTRACT_AUDIT_TIMEOUT_SEC=45
     fi
     audit_file="runtime/health/kr-contract-audit-${TODAY_KST}.json"
-    echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_START] timeout_sec=$KR_CONTRACT_AUDIT_TIMEOUT_SEC output=$audit_file"
+    mkdir -p runtime/health
+    export KR_CONTRACT_AUDIT_RUN_ID="KR-CLOSE-$(date -u +%Y%m%dT%H%M%S%N)-$"
+    # A retry must never email a prior success after today's timeout/crash.
+    rm -f -- "$audit_file"
+    echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_START] run_id=$KR_CONTRACT_AUDIT_RUN_ID timeout_sec=$KR_CONTRACT_AUDIT_TIMEOUT_SEC output=$audit_file"
     set +e
     timeout --kill-after=5s "${KR_CONTRACT_AUDIT_TIMEOUT_SEC}s" \
       env NO_TRADE=1 DRY_RUN=1 DISABLE_REAL_TRADING=1 \
@@ -204,7 +208,24 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
     set -e
     echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_DONE] rc=$audit_rc report=$audit_file"
     if [[ "$audit_rc" -ne 0 ]]; then
-      echo "[KR_CONTRACT_AUDIT][REPORT_FAILURE] audit_rc=$audit_rc trade_rc=$rc action=REPORT_ONLY_NO_ORDER"
+      # The child may have been SIGKILLed before emitting a JSON report.
+      # Persist a fresh, explicit failed status using an atomic file replace.
+      python - "$audit_file" "$KR_CONTRACT_AUDIT_RUN_ID" "$TODAY_KST" "$audit_rc" <<'PY_KR_CONTRACT_AUDIT_FAIL'
+import json, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+path = Path(sys.argv[1]); run_id, trade_date, rc = sys.argv[2:]
+payload = {"version": "KR_BUY_SELL_READONLY_AUDIT_V2",
+           "audit_run_id": run_id, "trade_date_kst": trade_date,
+           "generated_utc": datetime.now(timezone.utc).isoformat(),
+           "audit_status": "AUDIT_FAILED", "status": "AUDIT_FAILED",
+           "child_exit_code": int(rc), "account": "REDACTED",
+           "orders_submitted": 0, "recovery_applied": False}
+tmp = path.with_name(path.name + ".tmp." + str(os.getpid()))
+tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\\n", encoding="utf-8")
+tmp.replace(path)
+PY_KR_CONTRACT_AUDIT_FAIL
+      echo "[KR_CONTRACT_AUDIT][REPORT_FAILURE] run_id=$KR_CONTRACT_AUDIT_RUN_ID audit_rc=$audit_rc trade_rc=$rc action=REPORT_ONLY_NO_ORDER"
       if [[ "$rc" -eq 0 ]]; then
         export NULLIM_SESSION_FINAL_STATUS=OK_WITH_WARNINGS
         export NULLIM_SESSION_FINAL_REASON=KR_CONTRACT_AUDIT_FAILED
