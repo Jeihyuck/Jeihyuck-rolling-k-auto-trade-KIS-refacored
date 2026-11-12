@@ -205,6 +205,42 @@ def test_kis_cumulative_source_qty_and_notional_mismatch_are_not_proof():
     assert summarize_native_order(order, [wrong_qty])["proven_filled_qty"] is None
 
 
+def test_duplicate_individual_broker_ids_are_not_double_counted():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    fill["broker_fill_id"] = "KIS-NATIVE-FILL-ID-001"
+    fill["qty"] = 5
+    fill["fill_meta_json"]["evidence_kind"] = "KIS_INDIVIDUAL_EXECUTION"
+    duplicate = copy.deepcopy(fill)
+    result = summarize_native_order(order, [fill, duplicate])
+    assert result["proven_filled_qty"] == 5
+    assert result["evidence_status"] == "ECONOMIC_AND_TIMESTAMP_PROVEN"
+
+
+def test_conflicting_duplicate_individual_broker_id_is_not_proven():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    fill["broker_fill_id"] = "KIS-NATIVE-FILL-ID-001"
+    fill["qty"] = 5
+    fill["fill_meta_json"]["evidence_kind"] = "KIS_INDIVIDUAL_EXECUTION"
+    conflict = copy.deepcopy(fill)
+    conflict["qty"] = 6
+    result = summarize_native_order(order, [fill, conflict])
+    assert result["evidence_status"] == "CONFLICT"
+    assert result["proven_filled_qty"] is None
+
+
+def test_entry_contract_hash_canonical_key_order_and_plan_tamper():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    original = order["request_json"]
+    assert _kr_buy_entry_contract_hash(original) == original["entry_contract_sha256"]
+    reversed_plan = {key: original["entry_exit_plan"][key]
+                     for key in reversed(original["entry_exit_plan"])}
+    altered_order = {**original, "entry_exit_plan": reversed_plan}
+    assert _kr_buy_entry_contract_hash(altered_order) == original["entry_contract_sha256"]
+    tampered = copy.deepcopy(original)
+    tampered["entry_exit_plan"]["profit_plan"]["tp1_profit_pct"] = 99.0
+    assert _kr_buy_entry_contract_hash(tampered) != original["entry_contract_sha256"]
+
+
 def test_mixed_native_cumulative_and_individual_is_unproven():
     order, pos, fill, sell, sell_fill = _fixture_case()
     duplicate = copy.deepcopy(fill)
@@ -267,7 +303,10 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
                     env text, strategy text, sid integer, mode integer,
                     code text, market text, side text, client_order_key text,
                     position_cycle_id text, portfolio_epoch_id text, trading_epoch_id text,
-                    kis_odno text, request_json jsonb, response_json jsonb, status text, qty integer
+                    kis_odno text, request_json jsonb, response_json jsonb, status text, qty integer,
+                    ord_type text, entry_reason text, entry_style_selected text,
+                    entry_decision_family text, entry_rule_version text,
+                    stop_price_at_entry numeric, pivot_price_at_entry numeric
                 )
             """))
             conn.execute(sa.text(f"""
