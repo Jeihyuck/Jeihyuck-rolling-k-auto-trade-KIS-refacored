@@ -229,7 +229,7 @@ payload = {"version": "KR_BUY_SELL_READONLY_AUDIT_V2",
            "child_exit_code": int(rc), "account": "REDACTED",
            "orders_submitted": 0, "recovery_applied": False}
 tmp = path.with_name(path.name + ".tmp." + str(os.getpid()))
-tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\\n", encoding="utf-8")
+tmp.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 tmp.replace(path)
 PY_KR_CONTRACT_AUDIT_FAIL
       echo "[KR_CONTRACT_AUDIT][REPORT_FAILURE] run_id=$KR_CONTRACT_AUDIT_RUN_ID audit_rc=$audit_rc trade_rc=$rc action=REPORT_ONLY_NO_ORDER"
