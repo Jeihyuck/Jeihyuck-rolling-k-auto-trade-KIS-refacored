@@ -128,4 +128,9 @@ if [[ "${US_OFFLINE:-0}" == "1" ]]; then
   cmd+=(--offline)
 fi
 
+# AM/Close-only, read-only all-positive-symbol lifecycle diagnostic. Does not
+# reconcile old orders, mutate DB, or gate independent protective SELL.
+source scripts/wsl/us-lifecycle-readonly-audit.sh
+nullim_us_lifecycle_readonly_audit "CLOSE"
+
 "${cmd[@]}" >> "$LOG_FILE" 2>&1
