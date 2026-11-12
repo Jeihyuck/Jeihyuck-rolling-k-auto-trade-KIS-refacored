@@ -824,3 +824,35 @@ def test_failed_exit_resolver_is_fenced_before_price_and_exit_evaluation(monkeyp
         now=datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc),
     )
     assert snapshots == []
+
+
+def test_corrupt_qty_in_one_of_ten_is_diagnostic_only_and_peer_exits_continue(monkeypatch):
+    """One invalid broker qty is retained as an incident, never normalized to SELL."""
+    from trader.us.pb1 import us_exit_position_resolver as resolver
+    symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
+               "KR", "MCK", "PFE", "PG", "TMO"]
+    positions = [
+        {"symbol": s, "qty": ("corrupt" if s == "AMGN" else 4),
+         "holding_qty": 4, "position_cycle_id": f"cycle-{s}"}
+        for s in symbols
+    ]
+    monkeypatch.setattr(
+        resolver, "_enrich_single_position",
+        lambda p, **_kw: {**p, "pnl_input_ok": True, "entry_price_source": "verified"},
+    )
+    monkeypatch.setattr(
+        "trader.us.db.repos.load_us_position_risk_state_candidates_batch",
+        lambda *_a, **_k: {},
+    )
+    enriched, meta = resolver.enrich_us_positions_for_exit(
+        positions, trade_date="2026-11-12",
+    )
+    assert len(enriched) == 10
+    assert meta["ok"] == 9 and meta["missing_symbols"] == ["AMGN"]
+    broken = next(p for p in enriched if p["symbol"] == "AMGN")
+    assert broken["qty"] == "corrupt"  # no fabricated executable quantity
+    assert broken["exit_resolution_failed"] is True
+    assert broken["exit_resolution_failure_reason"] == "INVALID_POSITION_QTY"
+    assert all(
+        p["pnl_input_ok"] for p in enriched if p["symbol"] != "AMGN"
+    )
