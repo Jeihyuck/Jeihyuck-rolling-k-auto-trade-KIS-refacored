@@ -82,6 +82,11 @@ def test_today_orders_follow_cursor_even_without_header(monkeypatch):
     rows = client.get_us_fills_today("2026-09-21")
     assert [row["odno"] for row in rows] == ["1", "2"]
     assert client._get.call_count == 2
+    assert client._last_us_fills_query_evidence["complete"] is True
+    assert client._last_us_fills_query_evidence["pages"] == 2
+    assert client._last_us_fills_query_evidence["raw_rows"] == 2
+    assert client._last_us_fills_query_evidence["filtered_rows"] == 2
+    assert client._last_us_fills_query_evidence["us_trade_date"] == "2026-09-21"
     second = client._get.call_args_list[1]
     assert second.kwargs["headers"]["tr_cont"] == "N"
     assert second.kwargs["params"]["CTX_AREA_FK200"] == "FK2"
@@ -97,6 +102,7 @@ def test_today_orders_reject_unknown_continuation_status(monkeypatch):
     })
     with pytest.raises(mod.KisUSClientError, match="unknown tr_cont"):
         client.get_us_fills_today("2026-09-21")
+    assert client._last_us_fills_query_evidence["complete"] is False
 
 
 
