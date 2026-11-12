@@ -3997,6 +3997,50 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
                 SELECT qty_filled FROM us_orders
                  WHERE client_order_key='ci-eight-original-buy'
             """)).scalar_one() == 2
+        # A newly launched OS process must independently read durable
+        # PostgreSQL state. This is a real process boundary, distinct from
+        # constructing a second repository object in the same interpreter.
+        import json as _json
+        import subprocess as _subprocess
+        import sys as _sys
+        import os as _os
+        _read_across_process = """
+import json, os
+from sqlalchemy import create_engine, text
+engine = create_engine(os.environ['PBCORE_TEST_POSTGRES_URL'], future=True)
+with engine.connect() as conn:
+    row = conn.execute(text('''
+        SELECT i.position_cycle_id AS cycle,
+               i.meta->>'entry_exit_contract_sha256' AS digest,
+               o.qty_filled AS filled,
+               (SELECT count(*) FROM us_execution_attempts
+                 WHERE client_order_key='ci-eight-original-buy') AS attempts,
+               (SELECT count(*) FROM us_execution_account_reservations
+                 WHERE symbol='AMGN' AND side='BUY') AS reservations,
+               (SELECT count(*) FROM us_order_events
+                 WHERE client_order_key='ci-eight-original-buy'
+                   AND event_type='BROKER_CLAIM_PREPARED') AS outbox
+        FROM us_order_intents i
+        JOIN us_orders o USING (client_order_key)
+        WHERE i.client_order_key='ci-eight-original-buy'
+    ''')).mappings().one()
+    print(json.dumps(dict(row)))
+engine.dispose()
+"""
+        def _child_read(expected_qty):
+            result = _subprocess.run(
+                [_sys.executable, "-c", _read_across_process],
+                env=_os.environ.copy(), capture_output=True, text=True,
+                timeout=15, check=True,
+            )
+            observed = _json.loads(result.stdout.strip())
+            assert observed["cycle"] == cycle, observed
+            assert observed["digest"] == signed["sha256"], observed
+            assert observed["filled"] == expected_qty, observed
+            assert observed["attempts"] == 1, observed
+            assert observed["reservations"] == 1, observed
+            assert observed["outbox"] == 1, observed
+        _child_read(2)
         # A separate durable-repository instance sees the same original
         # execution evidence before the delayed final cumulative fill.
         fresh_partial_repo = DurableExecutionClaimRepo(
@@ -4017,6 +4061,8 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         source="fills_by_order_no", meta=fill_meta,
     )
     assert verified_buy["status"] == "OK", verified_buy
+    if paper_profile:
+        _child_read(6)
     from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
     identity = {"env": "practice", "account_id": raw_account,
                 "trading_epoch_id": epoch, "strategy_owner": "US_STANDARD"}
