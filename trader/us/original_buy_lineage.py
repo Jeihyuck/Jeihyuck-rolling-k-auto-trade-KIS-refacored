@@ -459,7 +459,14 @@ def verified_carried_us_snapshot_identity(
                 column = observed.get(key)
                 stored = column if column not in (None, "") else source_copy.get(key)
                 if stored not in (None, "") and str(stored) != correct:
-                    return None
+                    # us_positions.account_id is a broker SHA256 scope,
+                    # whereas lifecycle meta.account_id is the original raw
+                    # account key. These representations may both be valid.
+                    if not (
+                        key == "account_id"
+                        and hashlib.sha256(str(stored).encode()).hexdigest() == source_hash
+                    ):
+                        return None
             signed_copy = source_copy.get("entry_exit_contract")
             if signed_copy is not None and (
                 not verify_us_entry_exit_contract(signed_copy)
