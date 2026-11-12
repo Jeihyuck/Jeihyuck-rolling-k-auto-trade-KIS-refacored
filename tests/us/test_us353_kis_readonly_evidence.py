@@ -47,6 +47,12 @@ def test_broker_evidence_get_only_redacted_and_complete(monkeypatch):
 
         def get_us_fills_today(self, *, trade_date):
             self.calls.append(("GET_FILLS", trade_date))
+            self._last_us_fills_query_evidence = {
+                "complete": True, "us_trade_date": trade_date,
+                "pages": 2, "raw_rows": 1, "filtered_rows": 1,
+                "broker_kst_start": "20261110",
+                "broker_kst_end": "20261111",
+            }
             return [{
                 "pdno": "AMGN", "odno": "0000039784",
                 "ord_dt": "20261110", "ft_ord_qty": "6",
@@ -65,6 +71,9 @@ def test_broker_evidence_get_only_redacted_and_complete(monkeypatch):
     assert broker.calls == ["GET_BALANCE", ("GET_FILLS", "2026-11-10")]
     assert result["orders_posted"] == 0 and result["db_writes"] == 0
     assert result["positions"][0]["qty"] == 6
+    assert result["orders"][0]["pages"] == 2
+    assert result["orders"][0]["cursor_validated_by_client"] is True
+    assert result["orders"][0]["order_status_verification"] == "RAW_FIELDS_ONLY_NOT_TERMINAL_CERTIFICATION"
     assert result["orders"][0]["rows"][0]["order_no"] == "0000039784"
     import json
     rendered = json.dumps(result)
@@ -101,3 +110,79 @@ def test_whitelist_ignores_unknown_sensitive_keys():
         "broker_date": "", "broker_time": "", "raw_side": "",
         "raw_status": "", "requested": "", "filled": "", "remaining": "",
     }
+
+
+def test_broker_rows_without_completed_cursor_evidence_are_not_certified(monkeypatch):
+    from datetime import date
+    _readonly(monkeypatch)
+
+    class Broker:
+        def get_us_balance(self, *, force_refresh):
+            return {
+                "balance_authoritative": True, "balance_complete": True,
+                "queried_exchanges": ["NASD", "NYSE", "AMEX"],
+            }
+
+        def get_us_fills_today(self, *, trade_date):
+            self._last_us_fills_query_evidence = {
+                "complete": False, "us_trade_date": trade_date,
+                "pages": 1, "filtered_rows": 0,
+            }
+            return []
+
+    with pytest.raises(RuntimeError, match="KIS_ORDER_PAGINATION_UNVERIFIED"):
+        collect(
+            Broker(), date(2026, 11, 10), date(2026, 11, 10),
+            lambda raw: {"balance_parse_status": "OK", "positions": []},
+            "hidden-account",
+        )
+
+
+def test_incomplete_exchange_scope_must_not_be_labelled_account_wide(monkeypatch):
+    from datetime import date
+    _readonly(monkeypatch)
+
+    class Broker:
+        def get_us_balance(self, *, force_refresh):
+            return {
+                "balance_authoritative": True, "balance_complete": True,
+                "queried_exchanges": ["NASD"],
+            }
+
+        def get_us_fills_today(self, *, trade_date):
+            raise AssertionError("No order history after incomplete exchange sweep")
+
+    with pytest.raises(
+        RuntimeError, match="KIS_BALANCE_EXCHANGE_COVERAGE_INCOMPLETE"
+    ):
+        collect(
+            Broker(), date(2026, 11, 10), date(2026, 11, 10),
+            lambda raw: {"balance_parse_status": "OK", "positions": []},
+            "hidden-account",
+        )
+
+
+def test_query_cursor_evidence_must_match_requested_trade_date(monkeypatch):
+    from datetime import date
+    _readonly(monkeypatch)
+
+    class Broker:
+        def get_us_balance(self, *, force_refresh):
+            return {
+                "balance_authoritative": True, "balance_complete": True,
+                "queried_exchanges": ["NASD", "NYSE", "AMEX"],
+            }
+
+        def get_us_fills_today(self, *, trade_date):
+            self._last_us_fills_query_evidence = {
+                "complete": True, "us_trade_date": "2026-08-26",
+                "pages": 1, "filtered_rows": 0,
+            }
+            return []
+
+    with pytest.raises(RuntimeError, match="KIS_ORDER_PAGINATION_UNVERIFIED"):
+        collect(
+            Broker(), date(2026, 11, 10), date(2026, 11, 10),
+            lambda raw: {"balance_parse_status": "OK", "positions": []},
+            "hidden-account",
+        )
