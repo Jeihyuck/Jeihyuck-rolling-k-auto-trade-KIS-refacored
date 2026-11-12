@@ -2885,6 +2885,75 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
 
+    # An actual PostgreSQL / repo-reconciled partial SELL in the SAME scoped
+    # cycle must not orphan the original BUY V2/V3 on the next KIS balance day.
+    # This is an offline native-evidence fixture; never a real KIS HTTP call.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
+            VALUES (:epoch,'2026-11-11','AMGN',CAST(:state AS jsonb))
+            ON CONFLICT(trading_epoch_id,trade_date,symbol)
+            DO UPDATE SET state=EXCLUDED.state
+        """), {"epoch": epoch, "state": json.dumps({"lifecycle": first_lifecycle})})
+        conn.execute(text("""
+            INSERT INTO us_orders(
+                trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,order_no,status,trading_epoch_id,
+                account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-12','partial-sell-amgn-ci','AMGN','NASDAQ','SELL',
+                    2,0,'0000039785','ACK',:epoch,:account,:portfolio,:cycle,
+                    CAST(:meta AS jsonb))
+        """), {"epoch": epoch, "account": broker_hash,
+                 "portfolio": portfolio, "cycle": cycle,
+                 "meta": json.dumps({**meta, "pre_order_holding_qty": 6})})
+
+    actual_sell = repos.mark_order_filled_by_reconcile(
+        order_no="0000039785", client_order_key="partial-sell-amgn-ci",
+        symbol="AMGN", side="SELL", filled_qty=2, requested_qty=2,
+        cumulative_filled_qty=2, avg_price_usd=475.0,
+        trade_date="2026-11-12", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+              "cumulative_filled_qty": 2},
+    )
+    assert actual_sell["status"] == "OK", actual_sell
+
+    with pg_engine.connect() as conn:
+        sell = conn.execute(text("""
+            SELECT o.qty_filled AS order_filled, o.status, o.position_cycle_id,
+                   f.qty AS fill_qty, f.position_cycle_id AS fill_cycle,
+                   f.meta AS fill_meta
+              FROM us_orders o JOIN us_fills f
+                ON f.order_no=o.order_no AND f.client_order_key=o.client_order_key
+               AND f.trade_date=o.trade_date AND f.account_id=o.account_id
+             WHERE o.client_order_key='partial-sell-amgn-ci'
+        """)).mappings().one()
+    assert sell["status"] == "FILLED"
+    assert (sell["order_filled"], sell["fill_qty"]) == (2, 2)
+    assert (sell["position_cycle_id"], sell["fill_cycle"]) == (cycle, cycle)
+    assert sell["fill_meta"]["fill_evidence_type"] == "KIS_ORDER_CUMULATIVE_ACTUAL"
+
+    assert repos.save_position_snapshot(
+        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 4,
+          "avg_cost": 461.8, "current_px": 474.0,
+          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        trade_date="2026-11-13",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True, preserve_previous_positions=False,
+    ) == 1
+    with pg_engine.connect() as conn:
+        carried = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+              FROM us_positions WHERE as_of='2026-11-13' AND symbol='AMGN'
+                AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert carried["qty"] == 4
+    assert (carried["account_id"], carried["portfolio_epoch_id"],
+            carried["position_cycle_id"]) == (broker_hash, portfolio, cycle)
+    assert carried["meta"]["entry_exit_contract"] == contract
+    assert carried["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+    assert carried["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
+    assert carried["meta"]["lineage_verified_partial_sell_shares"] == 2
 
 
 def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
