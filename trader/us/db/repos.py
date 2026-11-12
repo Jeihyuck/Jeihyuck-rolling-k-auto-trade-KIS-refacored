@@ -7949,14 +7949,20 @@ def load_us_positions_by_symbols(
     engine = _get_engine_or_none()
 
     if engine is None:
-        # in-memory fallback
-        result: dict[str, dict] = {}
+        # Select the newest snapshot first (including zero-share tombstones).
+        # Selecting a historical positive row after a later complete SELL
+        # would resurrect a closed cycle as the parent of a new BUY.
+        latest: dict[str, dict] = {}
         for pos in _MEM_POSITIONS:
             sym = str(pos.get("symbol") or "").strip().upper()
-            if sym in normalized:
-                if sym not in result:
-                    result[sym] = pos
-        return result
+            snapshot_date = str(pos.get("as_of") or pos.get("trade_date") or "")
+            if sym not in normalized or (as_of and snapshot_date > as_of):
+                continue
+            old = latest.get(sym)
+            if old is None or snapshot_date >= str(old.get("as_of") or old.get("trade_date") or ""):
+                latest[sym] = pos
+        return {sym: row for sym, row in latest.items()
+                if int(row.get("qty") or 0) > 0}
 
     try:
         with engine.connect() as conn:
@@ -7968,10 +7974,10 @@ def load_us_positions_by_symbols(
                     text("""
                         SELECT DISTINCT ON (symbol)
                             symbol, exchange, qty, avg_cost, trading_epoch_id,
-                            current_px, unrealized_pnl_usd, meta, as_of
+                            current_px, unrealized_pnl_usd, meta, as_of,
+                            account_id, portfolio_epoch_id, position_cycle_id
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
-                          AND qty > 0
                           AND as_of <= :as_of
                     """ + epoch_clause + """
                         ORDER BY symbol, as_of DESC
@@ -7983,10 +7989,10 @@ def load_us_positions_by_symbols(
                     text("""
                         SELECT DISTINCT ON (symbol)
                             symbol, exchange, qty, avg_cost, trading_epoch_id,
-                            current_px, unrealized_pnl_usd, meta, as_of
+                            current_px, unrealized_pnl_usd, meta, as_of,
+                            account_id, portfolio_epoch_id, position_cycle_id
                         FROM us_positions
                         WHERE symbol = ANY(:syms)
-                          AND qty > 0
                     """ + epoch_clause + """
                         ORDER BY symbol, as_of DESC
                     """),
@@ -7996,8 +8002,13 @@ def load_us_positions_by_symbols(
             result = {}
             for row in rows:
                 cols = ["symbol", "exchange", "qty", "avg_cost", "trading_epoch_id",
-                        "current_px", "unrealized_pnl_usd", "meta", "as_of"]
+                        "current_px", "unrealized_pnl_usd", "meta", "as_of",
+                        "account_id", "portfolio_epoch_id", "position_cycle_id"]
                 d = dict(zip(cols, row))
+                # A latest zero-share snapshot is terminal for this loader.
+                # Do not fall back to an older held cycle by filtering in SQL.
+                if int(d.get("qty") or 0) <= 0:
+                    continue
                 sym = str(d.get("symbol") or "").strip().upper()
                 result[sym] = d
             return result
