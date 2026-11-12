@@ -3745,6 +3745,11 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         "position_action": "NEW_POSITION_BUY",
         "entry_reason": selected_style,
         "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        # Supply the exact classification provenance required by the
+        # production canonical risk gate; do not monkeypatch away risk checks.
+        "theme_cluster": "OTHER",
+        "classification_source": "CI_FINAL30_OFFLINE",
+        "position_state": "NEW",
         "position_lifecycle_id": cycle, "position_cycle_id": cycle,
         "portfolio_epoch_id": portfolio, "trading_epoch_id": epoch,
         "broker_account_hash": account_hash,
@@ -3753,6 +3758,10 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
             "trading_epoch_id": epoch, "portfolio_epoch_id": portfolio,
             "position_cycle_id": cycle, "position_lifecycle_id": cycle,
             "entry_style_selected": selected_style,
+            "theme_cluster": "OTHER",
+            "classification_source": "CI_FINAL30_OFFLINE",
+            "position_state": "NEW",
+            "position_action": "NEW_POSITION_BUY",
         },
     }
     buy = route_order(
