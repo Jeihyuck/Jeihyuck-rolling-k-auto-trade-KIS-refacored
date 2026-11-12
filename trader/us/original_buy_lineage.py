@@ -364,16 +364,6 @@ def _verified_actual_cycle_fill_delta(
     return net_shares == share_delta
 
 
-def _verified_actual_partial_sell_continuity(
-    rows: list[dict], *, sold_shares: int, epoch: str,
-    broker_hash: str, portfolio: str, cycle: str,
-) -> bool:
-    """Legacy direct helper: do not grant continuity without a frozen source.
-
-    Snapshot carry uses _verified_actual_cycle_fill_delta with contract SHA.
-    """
-    return False
-
 
 def verified_carried_us_snapshot_identity(
     *, conn: Any, trade_date: str, position: dict,
