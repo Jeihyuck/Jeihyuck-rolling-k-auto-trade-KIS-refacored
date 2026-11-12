@@ -3872,15 +3872,52 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     )
     assert original_buy_proof["position_cycle_id"] == cycle
     broker.qty = 6
-    for td in ("2026-11-10", "2026-11-11"):
-        assert repos.save_position_snapshot(
-            [{"symbol":symbol,"exchange":"NASDAQ","qty":6,
-              "avg_cost":10.0,"current_px":8.0,
-              "balance_source":"kis_balance_authoritative","meta":{}}],
-            trade_date=td, balance_fetch_status="OK",
-            balance_parse_status="OK", authoritative_positions=True,
-            preserve_previous_positions=False,
-        ) == 1
+    # First actual BUY snapshot: the repo proves account + epoch + original
+    # contract against its persistent native-shaped BUY order and fill.
+    assert repos.save_position_snapshot(
+        [{"symbol":symbol,"exchange":"NASDAQ","qty":6,
+          "avg_cost":10.0,"current_px":8.0,
+          "balance_source":"kis_balance_authoritative","meta":{}}],
+        trade_date="2026-11-10", balance_fetch_status="OK",
+        balance_parse_status="OK", authoritative_positions=True,
+        preserve_previous_positions=False,
+    ) == 1
+    # Real session lifecycle writer: this state does not come from a copied
+    # fixture or a freshly rebuilt ENV contract. It is derived from the
+    # original PostgreSQL BUY proof returned above and persisted by the
+    # same production lifecycle repository used at AM/CLOSE.
+    open_lifecycle = repos.save_us_position_lifecycle_atomic(
+        symbol, "2026-11-10", {
+            "lifecycle_id": original_buy_proof["position_cycle_id"],
+            "position_cycle_id": original_buy_proof["position_cycle_id"],
+            "portfolio_epoch_id": original_buy_proof["portfolio_epoch_id"],
+            "trading_epoch_id": original_buy_proof["trading_epoch_id"],
+            "account_id": original_buy_proof["account_id"],
+            "strategy_owner": original_buy_proof["strategy_owner"],
+            "env": original_buy_proof["env"], "is_open": True,
+            "opened_trade_date": "2026-11-10",
+            "opened_at": str(original_buy_proof["filled_at"]),
+            "opened_at_source": "confirmed_buy_fill",
+            "high_watermark": 10.0,
+            "entry_policy": {
+                "entry_exit_contract": signed,
+                "entry_exit_contract_sha256": signed["sha256"],
+                "entry_exit_contract_version": signed["version"],
+            },
+        },
+    )
+    assert open_lifecycle["position_cycle_id"] == cycle
+    assert open_lifecycle["entry_policy"]["entry_exit_contract_sha256"] == signed["sha256"]
+    # Restart: only a raw KIS-style balance is passed; no scope or contract
+    # copy is added to that snapshot.
+    assert repos.save_position_snapshot(
+        [{"symbol":symbol,"exchange":"NASDAQ","qty":6,
+          "avg_cost":10.0,"current_px":8.0,
+          "balance_source":"kis_balance_authoritative","meta":{}}],
+        trade_date="2026-11-11", balance_fetch_status="OK",
+        balance_parse_status="OK", authoritative_positions=True,
+        preserve_previous_positions=False,
+    ) == 1
     with engine.connect() as conn:
         carried = conn.execute(text("""
             SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
