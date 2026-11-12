@@ -4062,7 +4062,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
 
 
 def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
-    amgn_pg_engine, monkeypatch,
+    amgn_pg_engine, monkeypatch, caplog,
 ):
     """A failed optional original-scope SELECT must not poison broker balance.
 
@@ -4140,6 +4140,12 @@ def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
         authoritative_positions=True, preserve_previous_positions=False,
     )
     assert saved == 1
+    assert any(
+        "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE]" in rec.message
+        and "error=ProgrammingError" in rec.message
+        and "action=SAVE_UNVERIFIED_BALANCE_ONLY" in rec.message
+        for rec in caplog.records
+    ), "The savepoint failure branch was NOT exercised"
     with engine.connect() as conn:
         latest = conn.execute(text("""
             SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
