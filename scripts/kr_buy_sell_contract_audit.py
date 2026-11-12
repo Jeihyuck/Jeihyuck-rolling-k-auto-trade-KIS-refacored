@@ -66,6 +66,29 @@ def _records(conn: sa.Connection, statement: str, params: dict) -> list[dict]:
     return [dict(row) for row in conn.execute(sa.text(statement), params).mappings()]
 
 
+def _select_execution_fills(
+    conn: sa.Connection, params: dict, *, schema_name: str = "public",
+) -> list[dict]:
+    """Load the physical native KIS evidence used by the production audit.
+
+    raw_json in the existing KR Supabase table is TEXT, whereas
+    fill_meta_json is JSONB. Do not cast away or fabricate the former.
+    The only schema override is for an isolated PostgreSQL regression fixture.
+    """
+    import re
+
+    if not re.fullmatch(r"(?:public|kr_audit_[a-f0-9]{12})", schema_name):
+        raise ValueError("KR_AUDIT_SCHEMA_NOT_ALLOWED")
+    return _records(conn, f"""
+        SELECT order_id, env, code, market, side, qty, price,
+            raw_json, fill_meta_json, kis_odno, position_cycle_id,
+            portfolio_epoch_id, trading_epoch_id, broker_fill_id,
+            trade_id, filled_at, created_at
+        FROM {schema_name}.fills
+        WHERE env=:env AND trading_epoch_id=:epoch
+    """, params)
+
+
 def _same_scope(a: dict, b: dict, *, owner: bool = True) -> bool:
     if not all(str(a.get(k) or "").strip() for k in (
         "env", "market", "code", "trading_epoch_id",
@@ -296,12 +319,7 @@ def collect(engine: sa.Engine, *, env: str) -> dict:
                 entry_meta_json, position_meta, last_exit_eval_json
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """, params)
-        all_fills = _records(conn, """
-            SELECT order_id, env, code, market, side, qty, price,
-                fill_meta_json, kis_odno, position_cycle_id, portfolio_epoch_id,
-                trading_epoch_id, broker_fill_id, trade_id, filled_at, created_at
-            FROM public.fills WHERE env=:env AND trading_epoch_id=:epoch
-        """, params)
+        all_fills = _select_execution_fills(conn, params)
         names = {str(x["code"]): x["name"] for x in _records(conn, """
             SELECT stock_code AS code, MIN(name) AS name
             FROM public.universe_members GROUP BY stock_code
