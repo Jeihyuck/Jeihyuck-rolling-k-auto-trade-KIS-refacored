@@ -4030,3 +4030,97 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     assert sell_row["order_meta"]["source_entry_contract_sha256"] == signed["sha256"]
     assert (sell_row["order_cycle"],sell_row["fill_cycle"]) == (cycle,cycle)
     assert sell_row["fill_meta"]["source_entry_contract_sha256"] == signed["sha256"]
+
+
+def test_pg_authoritative_balance_survives_optional_lineage_query_exception(
+    amgn_pg_engine, monkeypatch,
+):
+    """A failed optional original-scope SELECT must not poison broker balance.
+
+    This disposable real PostgreSQL database deliberately lacks the risk-state
+    table: verified carried lifecycle cannot be proven. The real repo must
+    preserve actual KIS-shaped qty but must NOT invent account/cycle authority.
+    """
+    import json
+    import hashlib
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    engine = amgn_pg_engine
+    epoch = "ci-savepoint-balance-epoch"
+    raw_account = "practice:ci-savepoint-account"
+    account_hash = hashlib.sha256(raw_account.encode()).hexdigest()
+    frozen = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    })
+    cycle = "ci-savepoint-source-cycle"
+    portfolio = "ci-savepoint-portfolio"
+    prior_meta = {
+        "env": "practice", "strategy_owner": "US_STANDARD",
+        "broker_account_hash": account_hash,
+        "trading_epoch_id": epoch, "portfolio_epoch_id": portfolio,
+        "position_cycle_id": cycle, "position_lifecycle_id": cycle,
+        "entry_exit_contract": frozen,
+        "entry_exit_contract_sha256": frozen["sha256"],
+        "entry_exit_contract_version": frozen["version"],
+        "lineage_resolution": "EXACT_ORIGINAL_KIS_CUMULATIVE_FULL_BUY",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "exit_policy": "US_SWING_DEFAULT",
+    }
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_k: epoch)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE trading_epochs(
+                trading_epoch_id TEXT PRIMARY KEY, env TEXT NOT NULL,
+                account_id TEXT NOT NULL, status TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO trading_epochs(trading_epoch_id,env,account_id,status)
+            VALUES (:epoch,'practice',:account,'ACTIVE')
+        """), {"epoch": epoch, "account": raw_account})
+        conn.execute(text("""
+            INSERT INTO us_positions(
+                as_of,symbol,exchange,qty,avg_cost,trading_epoch_id,
+                account_id,portfolio_epoch_id,position_cycle_id,meta
+            ) VALUES (
+                '2026-11-10','AMGN','NASDAQ',4,10,:epoch,
+                :account,:portfolio,:cycle,CAST(:meta AS jsonb)
+            )
+        """), {
+            "epoch": epoch, "account": account_hash, "portfolio": portfolio,
+            "cycle": cycle, "meta": json.dumps(prior_meta),
+        })
+        assert conn.execute(text(
+            "SELECT to_regclass('us_position_risk_state')"
+        )).scalar_one() is None
+
+    # The missing lifecycle table causes a SELECT ProgrammingError inside
+    # verified_carried_us_snapshot_identity. That read must roll back ONLY its
+    # SAVEPOINT and must not lose the raw next-day broker quantity.
+    saved = repos.save_position_snapshot(
+        [{"symbol": "AMGN", "exchange": "NASDAQ", "qty": 4,
+          "avg_cost": 10.0, "current_px": 8.0,
+          "balance_source": "kis_balance_authoritative", "meta": {}}],
+        trade_date="2026-11-11",
+        balance_fetch_status="OK", balance_parse_status="OK",
+        authoritative_positions=True, preserve_previous_positions=False,
+    )
+    assert saved == 1
+    with engine.connect() as conn:
+        latest = conn.execute(text("""
+            SELECT qty,account_id,portfolio_epoch_id,position_cycle_id,meta
+            FROM us_positions
+            WHERE as_of='2026-11-11' AND symbol='AMGN'
+              AND trading_epoch_id=:epoch
+        """), {"epoch": epoch}).mappings().one()
+    assert latest["qty"] == 4
+    assert (latest["account_id"],latest["portfolio_epoch_id"],
+            latest["position_cycle_id"]) == (None,None,None)
+    assert latest["meta"].get("lineage_identity_status") not in {
+        "VERIFIED_CURRENT_EPOCH_CONTINUITY", "VERIFIED_ORIGINAL_KIS_BUY",
+    }
