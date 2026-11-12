@@ -12,6 +12,8 @@ import json
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +23,7 @@ from trader.account_state import get_account_key
 from trader.db.engine import get_engine
 from trader.db.trading_epoch import active_trading_epoch_id
 
-_NATIVE = {"KIS_ORDER_CUMULATIVE_EXECUTION", "KIS_EXECUTION", "KIS_DAILY_CCLD",
-           "KIS_TRADE_EXECUTION", "KIS_ORDER_EXECUTION"}
+_NATIVE = {"KIS_ORDER_CUMULATIVE_EXECUTION", "KIS_INDIVIDUAL_EXECUTION"}
 
 
 def _obj(value: Any) -> dict:
@@ -35,6 +36,24 @@ def _obj(value: Any) -> dict:
         except (TypeError, ValueError):
             pass
     return {}
+
+
+def _kst_day(value: Any) -> str:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if not isinstance(value, datetime):
+        return "UNKNOWN_DATE"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(ZoneInfo("Asia/Seoul")).date().isoformat()
+
+
+def _priced(value: Any) -> bool:
+    try:
+        val = Decimal(str(value))
+        return val.is_finite() and val > 0
+    except (InvalidOperation, ValueError, TypeError):
+        return False
 
 
 def _sha(plan: dict) -> str:
@@ -93,12 +112,19 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     )]
     documented_sell_fills = [f for f in documented_sell_fills if f not in foreign_sells]
     sell_filled = sum(int(f.get("qty") or 0) for f in documented_sell_fills)
-    native_buy = sum(int(f.get("qty") or 0) for f in buy_fills
-                     if _obj(f.get("fill_meta_json")).get("evidence_kind") in _NATIVE
-                     and float(f.get("price") or 0) > 0)
+    valid_buy = [f for f in buy_fills
+                 if _obj(f.get("fill_meta_json")).get("evidence_kind") in _NATIVE
+                 and _priced(f.get("price"))]
+    cumulative = [int(f.get("qty") or 0) for f in valid_buy
+                  if _obj(f.get("fill_meta_json")).get("evidence_kind") == "KIS_ORDER_CUMULATIVE_EXECUTION"]
+    individual = [int(f.get("qty") or 0) for f in valid_buy
+                  if _obj(f.get("fill_meta_json")).get("evidence_kind") == "KIS_INDIVIDUAL_EXECUTION"]
+    native_buy = max(cumulative, default=0) if not individual else sum(individual)
     issues = []
     if len(exact) != 1:
         issues.append("CYCLE_DISCONNECTED" if same_code_other else "POSITION_MISSING")
+    if cumulative and individual:
+        issues.append("MIXED_CUMULATIVE_AND_INDIVIDUAL_FILL_PROOF")
     if foreign_buys:
         issues.append("BUY_FILL_IDENTITY_MISMATCH")
     if foreign_sells:
@@ -154,7 +180,7 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     return {
         "code": order.get("code"), "name": names.get(order.get("code")) or "NAME_UNAVAILABLE",
         "strategy_owner": "PB1", "buy_order_id": str(order.get("order_id")),
-        "broker_order_no": order.get("kis_odno"), "buy_date": str(order.get("created_at") or "")[:10],
+        "broker_order_no": order.get("kis_odno"), "buy_date": _kst_day(order.get("created_at")),
         "cycle": cycle, "portfolio_epoch_id": str(order.get("portfolio_epoch_id") or ""),
         "buy_qty": int(order.get("qty") or 0),
         "priced_buy_fill_qty_in_db": native_buy,
