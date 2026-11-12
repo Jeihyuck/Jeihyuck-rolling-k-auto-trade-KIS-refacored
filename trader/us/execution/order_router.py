@@ -63,7 +63,31 @@ def us_add_contract_requires_lot_policy(intent: dict, original_contract: dict) -
         or (original_contract.get("entry_strategy_detail") or {}).get("selected_style")
         or ""
     ).strip()
-    return bool(incoming_style and prior_style and incoming_style != prior_style)
+    if incoming_style and prior_style and incoming_style != prior_style:
+        return True
+
+    # Some producers transmit the engine name/version but not the selected
+    # style.  A different explicit strategy/version must not be relabelled
+    # under the incumbent frozen BUY, even when no new signed contract exists.
+    incoming_strategy = str(
+        intent.get("entry_strategy") or meta.get("entry_strategy") or ""
+    ).strip()
+    prior_strategy = str(original_contract.get("entry_strategy") or "").strip()
+    if incoming_strategy and prior_strategy and incoming_strategy != prior_strategy:
+        return True
+    incoming_version = str(
+        intent.get("strategy_version") or meta.get("strategy_version") or ""
+    ).strip()
+    previous_version = str(
+        (original_contract.get("entry_strategy_detail") or {}).get("strategy_version")
+        or ""
+    ).strip()
+    if incoming_version and previous_version and incoming_version != previous_version:
+        return True
+    asserted_parent = str(meta.get("parent_entry_contract_sha256") or "").strip()
+    if asserted_parent and asserted_parent != parent_sha:
+        return True
+    return False
 
 
 def defensive_micro_first_buy_budget_error(intent: dict, *, qty: int, price: float) -> str | None:
