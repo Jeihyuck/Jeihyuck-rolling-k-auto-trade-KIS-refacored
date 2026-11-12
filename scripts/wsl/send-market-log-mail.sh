@@ -350,11 +350,44 @@ if [[ "$MARKET" == kr ]]; then
   # This proof is optional for historic/fixture log mail and never changes
   # ordinary session completeness or SMTP delivery status. Missing is logged
   # as audit debt, not silently represented as a successful audit.
-  if [[ -f "$KR_CONTRACT_AUDIT_PATH" ]]; then
-    record_expected KR_CONTRACT_AUDIT_AVAILABLE "$KR_CONTRACT_AUDIT_PATH"
+  audit_marker="runtime/health/kr-contract-audit-run-${TRADE_DATE}.json"
+  audit_valid=0
+  if [[ -f "$KR_CONTRACT_AUDIT_PATH" && -f "$audit_marker" ]]; then
+    if python3 - "$KR_CONTRACT_AUDIT_PATH" "$audit_marker" "$TRADE_DATE" <<'PY_KR_AUDIT_MARKER'
+import json, sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+report_path, marker_path, trade_day = map(str, sys.argv[1:])
+try:
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    marker = json.loads(Path(marker_path).read_text(encoding="utf-8"))
+    run_id = str(report.get("audit_run_id") or "")
+    time = datetime.fromisoformat(str(report.get("generated_utc") or ""))
+    valid = (
+        run_id.startswith("KR-CLOSE-")
+        and marker.get("audit_run_id") == run_id
+        and marker.get("trade_date_kst") == trade_day
+        and report.get("trade_date_kst") == trade_day
+        and time.tzinfo is not None
+        and time.astimezone(ZoneInfo("Asia/Seoul")).date().isoformat() == trade_day
+        and ((marker.get("status") == "COMPLETED" and
+              report.get("audit_status") in ("COMPLETED", "COMPLETED_WITH_EVIDENCE_GAPS"))
+             or (marker.get("status") == "FAILED" and
+                 report.get("audit_status") == "AUDIT_FAILED"))
+    )
+    raise SystemExit(0 if valid else 2)
+except (OSError, ValueError, TypeError, KeyError):
+    raise SystemExit(2)
+PY_KR_AUDIT_MARKER
+    then audit_valid=1; fi
+  fi
+  if [[ "$audit_valid" == 1 ]]; then
+    record_expected KR_CONTRACT_AUDIT_EVIDENCE "$KR_CONTRACT_AUDIT_PATH"
     record_included "$KR_CONTRACT_AUDIT_PATH"
+    record_included "$audit_marker"
   else
-    echo "[KR_CONTRACT_AUDIT][MISSING] trade_date=$TRADE_DATE path=$KR_CONTRACT_AUDIT_PATH audit_status=NOT_VERIFIED" >&2
+    echo "[KR_CONTRACT_AUDIT][NOT_VERIFIED] trade_date=$TRADE_DATE reason=missing_stale_or_inconsistent_report_or_run_marker action=MAIL_CONTINUES" >&2
   fi
 fi
 
