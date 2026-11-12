@@ -3268,7 +3268,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     epoch = "fixture-ten-symbol-exit-epoch"
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
-    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None: epoch)
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
     monkeypatch.setattr(
         "trader.us.protective_stop_obligation.record_confirmed_stop",
         lambda *_args, **_kw: None,
