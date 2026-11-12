@@ -3429,7 +3429,9 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     assert {r["symbol"] for r in pg_sell_rows} == set(found)
     for record in pg_sell_rows:
         assert record["status"] == "ACK"
-        assert record["meta"]["entry_exit_contract_sha256"] == (
+        # SELL carries the immutable BUY as a *source* lineage reference;
+        # it must not pretend to be the BUY that originally signed the policy.
+        assert record["meta"]["source_entry_contract_sha256"] == (
             positions[record["symbol"]]["meta"]["entry_exit_contract_sha256"]
         )
 
