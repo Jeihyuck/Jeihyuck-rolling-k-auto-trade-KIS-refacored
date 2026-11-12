@@ -946,3 +946,17 @@ def test_prepared_exit_engine_never_uses_bad_resolver_contract(monkeypatch):
         include_trend_time=False,
     )
     assert not [row for row in actual if row.get("side") == "SELL"]
+
+
+def test_minervini_vcp_entry_is_not_an_unapproved_fifth_us_entry_style():
+    """Router compatibility with ENTRY_MINERVINI does not confer live eligibility.
+
+    Approved US PB1 Minervini-style VCP remains ENTRY_VCP and still requires
+    its independent setup plus broker price/volume trigger proof.
+    """
+    from trader.us.pb1.us_explain import validate_tradable_us_entry_style
+
+    allowed, family = validate_tradable_us_entry_style("ENTRY_VCP")
+    assert allowed is True and family == "ENTRY_VCP"
+    allowed, family = validate_tradable_us_entry_style("ENTRY_MINERVINI")
+    assert allowed is False and family == "SKIP"
