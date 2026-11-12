@@ -446,6 +446,9 @@ def _native_verified_sell_row(*, sold=2):
         "qty_requested": sold, "qty_filled": sold, "fill_qty": sold,
         "client_order_key": "verified-actual-partial-sell",
         "order_no": "0000009411",
+        "fill_order_no": "0000009411",
+        "fill_side": "SELL",
+        "fill_client_order_key": "verified-actual-partial-sell",
         "trading_epoch_id": "epoch-current",
         "order_account_id": ACCOUNT_HASH,
         "fill_account_id": ACCOUNT_HASH,
@@ -469,18 +472,19 @@ def _native_verified_sell_row(*, sold=2):
 
 
 def test_native_partial_sell_continuity_requires_every_original_scope_and_fill():
-    from trader.us.original_buy_lineage import _verified_actual_partial_sell_continuity
+    from trader.us.original_buy_lineage import _verified_actual_cycle_fill_delta
     import copy
 
     row = _native_verified_sell_row(sold=2)
     base = dict(
-        sold_shares=2, epoch="epoch-current",
+        share_delta=-2, epoch="epoch-current",
+        contract_sha=original_row()["order_meta"]["entry_exit_contract"]["sha256"],
         broker_hash=ACCOUNT_HASH,
         portfolio=PORTFOLIO, cycle=CYCLE,
     )
-    assert _verified_actual_partial_sell_continuity([row], **base)
-    assert not _verified_actual_partial_sell_continuity([row], **{
-        **base, "sold_shares": 3,
+    assert _verified_actual_cycle_fill_delta([row], **base)
+    assert not _verified_actual_cycle_fill_delta([row], **{
+        **base, "share_delta": -3,
     })
     for bad_field, val in (
         ("side", "BUY"), ("status", "OPEN"),
@@ -490,10 +494,13 @@ def test_native_partial_sell_continuity_requires_every_original_scope_and_fill()
         ("fill_position_cycle_id", "foreign-cycle"),
         ("qty_filled", 3), ("fill_qty", 3),
         ("trading_epoch_id", "previous-epoch"),
+        ("fill_order_no", "different-native-order"),
+        ("fill_side", "BUY"),
+        ("fill_client_order_key", "wrong-client-key"),
     ):
         poisoned = copy.deepcopy(row)
         poisoned[bad_field] = val
-        assert not _verified_actual_partial_sell_continuity(
+        assert not _verified_actual_cycle_fill_delta(
             [poisoned], **base,
         ), bad_field
     for bad_meta, bad_value in (
@@ -504,13 +511,13 @@ def test_native_partial_sell_continuity_requires_every_original_scope_and_fill()
     ):
         poisoned = copy.deepcopy(row)
         poisoned["fill_meta"][bad_meta] = bad_value
-        assert not _verified_actual_partial_sell_continuity(
+        assert not _verified_actual_cycle_fill_delta(
             [poisoned], **base,
         ), bad_meta
-    assert not _verified_actual_partial_sell_continuity(
+    assert not _verified_actual_cycle_fill_delta(
         [row, copy.deepcopy(row)], **base,
     )
-    assert not _verified_actual_partial_sell_continuity(
+    assert not _verified_actual_cycle_fill_delta(
         [row, {**row, "client_order_key": "different-broker-order"}], **base,
     )  # cumulative actual shares do not match 2
 
@@ -569,8 +576,11 @@ def test_next_day_partial_sell_keeps_original_cycle_only_after_native_proof():
                     },
                 }}])
             if "FROM us_orders o" in sql:
+                assert "LEFT JOIN us_fills f" in sql
                 return Result(self.rows)
             if "FROM us_orders" in sql:
+                if "trade_date>:previous_date" in sql and "trade_date<=:today" in sql:
+                    return Result(value=len(self.rows))
                 return Result(value=self.previous_pending)
             raise AssertionError(sql)
     db = Conn()
