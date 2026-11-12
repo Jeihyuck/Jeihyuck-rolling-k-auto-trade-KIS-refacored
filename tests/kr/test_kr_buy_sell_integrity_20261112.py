@@ -184,7 +184,7 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
                     """))
             # Dynamic state and ACK are expected to keep changing.
             conn.execute(sa.text(f"UPDATE {schema}.orders SET kis_odno='0000011759',status='FILLED'"))
-            conn.execute(sa.text(f"UPDATE {schema}.positions SET qty=6,position_meta='{{" + '"tp1_done":true' + "}}'::jsonb"))
+            conn.execute(sa.text(f"UPDATE {schema}.positions SET qty=6,position_meta=CAST(:metadata AS jsonb)"), {"metadata": '{"tp1_done":true}'})
             assert conn.execute(sa.text(f"SELECT qty FROM {schema}.positions")).scalar_one() == 6
     finally:
         with admin.begin() as conn:
