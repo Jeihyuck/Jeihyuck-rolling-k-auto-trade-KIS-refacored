@@ -3806,6 +3806,24 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     assert signed["entry_strategy_detail"]["selected_style"] == selected_style
     assert original["meta"]["entry_exit_contract_sha256"] == signed["sha256"]
     assert order["status"] == "ACK" and order["order_no"] == "CI-BUY-EIGHT"
+    # The native WSL binder must scope the *real BUY ledger*, not merely
+    # attach signed JSON to an otherwise anonymous client key.
+    with engine.connect() as conn:
+        durable_buy_scope = conn.execute(text("""
+            SELECT i.account_id AS i_account,i.portfolio_epoch_id AS i_portfolio,
+                   i.position_cycle_id AS i_cycle,i.trading_epoch_id AS i_epoch,
+                   o.account_id AS o_account,o.portfolio_epoch_id AS o_portfolio,
+                   o.position_cycle_id AS o_cycle,o.trading_epoch_id AS o_epoch
+              FROM us_order_intents i
+              JOIN us_orders o ON o.client_order_key=i.client_order_key
+             WHERE i.client_order_key='ci-eight-original-buy'
+        """)).mappings().one()
+    assert (
+        durable_buy_scope["i_account"],durable_buy_scope["i_portfolio"],
+        durable_buy_scope["i_cycle"],durable_buy_scope["i_epoch"],
+        durable_buy_scope["o_account"],durable_buy_scope["o_portfolio"],
+        durable_buy_scope["o_cycle"],durable_buy_scope["o_epoch"],
+    ) == (account_hash,portfolio,cycle,epoch,account_hash,portfolio,cycle,epoch), durable_buy_scope
 
     fill_meta = {
         **original["meta"],
@@ -3826,6 +3844,17 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         source="fills_by_order_no", meta=fill_meta,
     )
     assert verified_buy["status"] == "OK", verified_buy
+    from trader.us.original_buy_lineage import load_verified_us_original_buy_scope
+    identity = {"env": "practice", "account_id": raw_account,
+                "trading_epoch_id": epoch, "strategy_owner": "US_STANDARD"}
+    original_buy_proof = load_verified_us_original_buy_scope(
+        symbol=symbol, trade_date="2026-11-10", qty=6, identity=identity,
+    )
+    assert original_buy_proof is not None, (
+        selected_style, contract_mode, durable_buy_scope,
+        "ORIGINAL_BUY_SCOPE_MISSING_AFTER_KIS_FORMAT_FILL",
+    )
+    assert original_buy_proof["position_cycle_id"] == cycle
     broker.qty = 6
     for td in ("2026-11-10", "2026-11-11"):
         assert repos.save_position_snapshot(
