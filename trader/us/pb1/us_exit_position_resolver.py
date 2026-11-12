@@ -702,14 +702,30 @@ def enrich_us_positions_for_exit(
     ok_count = 0
 
     for pos in positions:
-        ep = _enrich_single_position(
-            pos, trade_date=trade_date, env=env,
-            scoped_identity_cache=scoped_identity_cache,
-            preloaded_risk_candidates=(
-                risk_candidates_by_symbol.get(_normalize_symbol(pos.get("symbol")))
-                if risk_candidates_by_symbol is not None else None
-            ),
-        )
+        try:
+            ep = _enrich_single_position(
+                pos, trade_date=trade_date, env=env,
+                scoped_identity_cache=scoped_identity_cache,
+                preloaded_risk_candidates=(
+                    risk_candidates_by_symbol.get(_normalize_symbol(pos.get("symbol")))
+                    if risk_candidates_by_symbol is not None else None
+                ),
+            )
+        except Exception as exc:
+            # A corrupt original BUY/cycle for one symbol is NOT an account-wide
+            # exit failure. Retain its real balance and original metadata for
+            # diagnosis, but explicitly fence only this symbol's exit decision.
+            # Never invent a contract, cycle, entry price, or a zero balance.
+            symbol = _normalize_symbol(pos.get("symbol"))
+            logger.exception(
+                "[US_EXIT_RESOLVER][SYMBOL_ISOLATED][ERROR] symbol=%s reason=%s",
+                symbol, type(exc).__name__,
+            )
+            ep = dict(pos)
+            ep["pnl_input_ok"] = False
+            ep["entry_price_source"] = "resolver_exception"
+            ep["exit_resolution_failed"] = True
+            ep["exit_resolution_failure_reason"] = type(exc).__name__
         qty = ep.get("qty", 0)
 
         # qty <= 0 제외
