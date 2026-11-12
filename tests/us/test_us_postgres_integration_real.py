@@ -3389,8 +3389,8 @@ def test_pg_closed_latest_snapshot_never_resurrects_old_buy_parent(pg_engine, mo
 def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     pg_engine, monkeypatch,
 ):
-    """Real US position/order SQL -> exit resolver -> V2 exit engine -> real
-    order router in SIGNAL_ONLY mode. No KIS POST or claim/fill is asserted.
+    """Real PG -> exit resolver -> signed original V2/V3 -> actual order
+    router and fake broker ACK; neither a real KIS request nor a KIS fill.
     """
     import json
     from datetime import datetime, timezone
@@ -3405,6 +3405,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
     monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
+    monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setattr(
         "trader.us.protective_stop_obligation.record_confirmed_stop",
         lambda *_args, **_kw: None,
@@ -3417,12 +3418,27 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                 "ENTRY_PULLBACK", "ENTRY_MOMENTUM",
                 "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
             )[idx % 4]
+            # Alternate the existing V2 and approved practice-only V3
+            # contract builders at BUY-time, then keep both frozen while
+            # downstream engine/router run with the common runtime mode.
+            use_v3 = bool(idx % 2)
+            monkeypatch.setenv(
+                "US_SWING_EXIT_MODE",
+                "V3_ACTIVE_PRACTICE" if use_v3 else "LEGACY_V2",
+            )
+            monkeypatch.setenv(
+                "US_SWING_V3_DEPLOY_APPROVED", "1" if use_v3 else "0",
+            )
             signed = build_us_entry_exit_contract({
                 "symbol": sym, "strategy_owner": "US_STANDARD",
                 "position_action": "NEW_POSITION_BUY",
                 "entry_style_selected": selected_style,
                 "book": "SWING_BOOK", "horizon": "SWING_CARRY",
             })
+            assert signed["version"] == (
+                "us_entry_exit_contract_v3" if use_v3
+                else "us_entry_exit_contract_v2"
+            )
             meta = {
                 "strategy_owner": "US_STANDARD",
                 "sleeve_id": "US_STANDARD",
@@ -3459,6 +3475,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                     1,0,'KO-UNRESOLVED','ACK',false,:epoch,'{}'::jsonb)
         """), {"epoch": epoch})
 
+    # Deliberately change the runtime defaults after BUY creation. Decisions
+    # must continue to use each held position's signed original V2/V3.
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "LEGACY_V2")
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "0")
     positions = repos.load_us_positions_by_symbols(symbols, as_of="2026-11-12")
     assert set(positions) == set(symbols)
     assert should_skip_exit_due_to_pending_sell("KO", "2026-11-12")[0] is True
@@ -3569,6 +3589,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         """)).mappings().all()
     assert len(pg_sell_rows) == 8
     assert {r["symbol"] for r in pg_sell_rows} == set(found)
+    assert {
+        positions[row["symbol"]]["meta"]["entry_exit_contract"]["version"]
+        for row in pg_sell_rows
+    } == {"us_entry_exit_contract_v2", "us_entry_exit_contract_v3"}
     assert {
         positions[row["symbol"]]["meta"]["entry_exit_contract"]
         ["entry_strategy_detail"]["selected_style"]
