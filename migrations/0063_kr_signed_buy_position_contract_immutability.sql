@@ -32,7 +32,9 @@ BEGIN
                OR COALESCE(new_req ->> 'submitted_qty', '') !~ '^[0-9]+$'
                OR COALESCE((new_req ->> 'requested_qty')::integer, 0) <= 0
                OR COALESCE((new_req ->> 'submitted_qty')::integer, 0) <= 0
-               OR (new_req ->> 'requested_qty')::integer IS DISTINCT FROM NEW.qty
+               OR (new_req ->> 'submitted_qty')::integer IS DISTINCT FROM NEW.qty
+               OR (new_req ->> 'requested_qty')::integer <
+                  (new_req ->> 'submitted_qty')::integer
             THEN
                 RAISE EXCEPTION 'KR_SIGNED_BUY_INTENT_CONTRACT_INCOMPLETE';
             END IF;
