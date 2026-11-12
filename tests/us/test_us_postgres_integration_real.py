@@ -3441,7 +3441,10 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     from trader.us.pb1.us_exit_engine import generate_exit_intents, should_skip_exit_due_to_pending_sell
     from trader.us.runner.trade_tick_runner import route_exit_orders_immediately
 
-    epoch = "fixture-ten-symbol-exit-epoch"
+    epoch = (
+        "fixture-ten-symbol-exit-epoch-on"
+        if paper_profile else "fixture-ten-symbol-exit-epoch"
+    )
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
     monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
@@ -4061,7 +4064,7 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         _read_across_process = """
 import json, os
 from sqlalchemy import create_engine, text
-engine = create_engine(os.environ['PBCORE_TEST_POSTGRES_URL'], future=True)
+engine = create_engine(os.environ['US353_PG_TEST_URL'], future=True)
 with engine.connect() as conn:
     row = conn.execute(text('''
         SELECT i.position_cycle_id AS cycle,
@@ -4082,11 +4085,17 @@ with engine.connect() as conn:
 engine.dispose()
 """
         def _child_read(expected_qty):
+            child_env = _os.environ.copy()
+            child_env["US353_PG_TEST_URL"] = engine.url.render_as_string(
+                hide_password=False
+            )
             result = _subprocess.run(
                 [_sys.executable, "-c", _read_across_process],
-                env=_os.environ.copy(), capture_output=True, text=True,
-                timeout=15, check=True,
+                env=child_env, capture_output=True, text=True,
+                timeout=15,
             )
+            # Never expose DB URL, process environment, or full stderr.
+            assert result.returncode == 0, "US353_CHILD_PG_READ_FAILED"
             observed = _json.loads(result.stdout.strip())
             assert observed["cycle"] == cycle, observed
             assert observed["digest"] == signed["sha256"], observed
