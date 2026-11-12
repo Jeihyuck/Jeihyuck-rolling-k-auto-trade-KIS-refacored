@@ -879,3 +879,32 @@ def test_corrupt_qty_in_one_of_ten_is_diagnostic_only_and_peer_exits_continue(mo
     assert all(
         p["pnl_input_ok"] for p in enriched if p["symbol"] != "AMGN"
     )
+
+
+def test_prepared_exit_engine_never_uses_bad_resolver_contract(monkeypatch):
+    """Direct prepared-snapshot callers cannot bypass a failed resolver fence."""
+    from datetime import datetime, timezone
+    from trader.us.pb1.us_exit_engine import generate_exit_intents
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+    bad = {
+        "symbol": "AMGN", "qty": 4, "exchange": "NASDAQ",
+        "entry_price": 100, "orderable_qty": 4,
+        "resolved_current_price": 80,
+        "exit_resolution_failed": True,
+        "exit_resolution_failure_reason": "ORIGINAL_BUY_SCOPE_CONFLICT",
+        "strategy_owner": "US_STANDARD",
+        "position_lifecycle_id": "bad-cycle",
+        "entry_exit_contract": build_us_entry_exit_contract({
+            "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+            "position_action": "NEW_POSITION_BUY",
+            "entry_style_selected": "ENTRY_PULLBACK",
+        }),
+    }
+    # Even an otherwise triggerable hard stop must remain unsubmitted when
+    # its original scope has been explicitly quarantined by the resolver.
+    actual = generate_exit_intents(
+        [], prepared_snapshots=[bad],
+        now=datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc),
+        include_trend_time=False,
+    )
+    assert not [row for row in actual if row.get("side") == "SELL"]
