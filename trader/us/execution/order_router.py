@@ -1376,6 +1376,32 @@ def route_order(
                     "status": "BLOCKED", "reason": "US_ADD_PARENT_CONTRACT_MISSING",
                     "broker_submit": False, "intent": intent,
                 }
+            # Different entry strategies and signed exit contracts cannot
+            # share the existing cycle without a proven lot allocator.  Do
+            # not silently replace the requested signal with the incumbent
+            # contract and then pretend that the ADD belongs to that BUY.
+            from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+            incoming_contract = extract_us_entry_exit_contract(intent, meta)
+            incoming_style = str(
+                intent.get("entry_style_selected") or meta.get("entry_style_selected") or ""
+            ).strip()
+            original_style = str(
+                (parent_contract.get("entry_provenance") or {}).get("entry_style_selected")
+                or (parent_contract.get("entry_strategy_detail") or {}).get("selected_style")
+                or ""
+            ).strip()
+            if (
+                incoming_contract and incoming_contract.get("sha256") != parent_contract.get("sha256")
+            ) or (incoming_style and original_style and incoming_style != original_style):
+                logger.error(
+                    "[US_ORDER][ADD_PARENT_CONTRACT][BLOCK] symbol=%s reason=US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY",
+                    symbol_upper,
+                )
+                return {
+                    "status": "BLOCKED",
+                    "reason": "US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY_REQUIRES_LOT_POLICY",
+                    "broker_submit": False, "intent": intent,
+                }
             management = parent_contract.get("management") or {}
             meta["entry_exit_contract"] = parent_contract
             meta["entry_exit_contract_sha256"] = parent_contract.get("sha256")
