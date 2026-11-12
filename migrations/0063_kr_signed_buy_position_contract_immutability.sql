@@ -113,7 +113,7 @@ BEGIN
         'initial_risk_r', 'policy_source', 'policy_version'
     ] LOOP
         IF new_meta -> frozen_key IS DISTINCT FROM old_meta -> frozen_key THEN
-            RAISE EXCEPTION 'KR_SIGNED_POSITION_SOURCE_META_IMMUTABLE: %', frozen_key;
+            RAISE EXCEPTION USING MESSAGE = 'KR_SIGNED_POSITION_SOURCE_META_IMMUTABLE:' || frozen_key;
         END IF;
     END LOOP;
     RETURN NEW;
