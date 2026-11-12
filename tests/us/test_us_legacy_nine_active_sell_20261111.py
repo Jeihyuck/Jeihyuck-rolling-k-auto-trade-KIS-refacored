@@ -667,3 +667,49 @@ def test_all_nine_v2_exit_signals_are_broker_fenced_offline(
         intent, kis_client=client, proof=proof, qty=1,
     )
     assert recheck_ok is False
+
+
+def test_forward_tp_ack_uses_original_buy_cycle_and_is_not_a_fill(scenario, monkeypatch):
+    """Real runner ACK adapter: prospective SELL claim must not steal TP2."""
+    from trader.us.db import repos
+    from trader.us.runner.trade_tick_runner import persist_profit_capture_ack_from_route
+    db, client, intent = scenario
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    key = f"US_PC_2026-11-11_ABBV_{OLD_CYCLE}_TAKE_PROFIT_TP2"
+    intent["client_order_key"] = key
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    assert persist_profit_capture_ack_from_route(
+        intent, {"status": "ACK", "order_no": "0000099999"}, "2026-11-11",
+    ) is True
+    original = repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": OLD_CYCLE},
+    )["ABBV"]
+    prospective = repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": proof["prospective_cycle"]},
+    )["ABBV"]
+    assert original["tp2_pending"] is True
+    assert original["tp2_done"] is False
+    assert int(original["meta"].get("tp2_filled_qty") or 0) == 0
+    assert prospective["tp2_pending"] is False
+    assert prospective["tp2_done"] is False
+
+
+def test_forward_tp_ack_rejects_tampered_original_lineage(scenario, monkeypatch):
+    from trader.us.db import repos
+    from trader.us.runner.trade_tick_runner import persist_profit_capture_ack_from_route
+    db, client, intent = scenario
+    ok, reason, proof = _authorize(scenario)
+    assert ok, reason
+    intent["client_order_key"] = f"US_PC_2026-11-11_ABBV_{OLD_CYCLE}_TAKE_PROFIT_TP2"
+    intent["meta"]["source_original_runtime_lifecycle_id"] = "tampered-cycle"
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos.reset_memory_stores()
+    with pytest.raises(ValueError, match="US_LEGACY_TP_STAGE_SOURCE_ID_UNVERIFIED"):
+        persist_profit_capture_ack_from_route(
+            intent, {"status": "ACK", "order_no": "0000099999"}, "2026-11-11",
+        )
+    assert repos.load_us_profit_capture_state(
+        "2026-11-11", ["ABBV"], {"ABBV": OLD_CYCLE},
+    )["ABBV"]["tp2_done"] is False
