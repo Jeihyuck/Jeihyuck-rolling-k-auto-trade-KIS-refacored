@@ -17,11 +17,11 @@ BEGIN
     END IF;
     IF ROW(NEW.env, NEW.strategy, NEW.sid, NEW.mode, NEW.code, NEW.market,
            NEW.side, NEW.client_order_key, NEW.position_cycle_id,
-           NEW.portfolio_epoch_id, NEW.trading_epoch_id, NEW.kis_odno)
+           NEW.portfolio_epoch_id, NEW.trading_epoch_id)
        IS DISTINCT FROM
        ROW(OLD.env, OLD.strategy, OLD.sid, OLD.mode, OLD.code, OLD.market,
            OLD.side, OLD.client_order_key, OLD.position_cycle_id,
-           OLD.portfolio_epoch_id, OLD.trading_epoch_id, OLD.kis_odno)
+           OLD.portfolio_epoch_id, OLD.trading_epoch_id)
        OR NEW.request_json::jsonb -> 'entry_exit_plan'
           IS DISTINCT FROM OLD.request_json::jsonb -> 'entry_exit_plan'
        OR NEW.request_json::jsonb -> 'entry_contract_sha256'
@@ -125,5 +125,6 @@ CREATE TRIGGER kr_signed_position_guard_0063
 BEFORE UPDATE OR DELETE ON public.positions FOR EACH ROW
 EXECUTE FUNCTION public.kr_signed_position_guard_0063();
 
+-- Broker ACK fields such as kis_odno, response_json and order status remain mutable.
 -- No backfill, no old-row mutation, no role bypass and no KIS side effects.
 -- Rollback plan: DROP TRIGGER IF EXISTS kr_signed_*_0063; then DROP FUNCTION...
