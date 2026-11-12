@@ -1095,6 +1095,19 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
         policy_contract = _ensure_us_entry_policy_contract(intent_meta, intent)
         intent_meta.update(policy_contract)
         intent["meta"] = intent_meta
+        # The original BUY intent is the earliest durable, immutable source
+        # of the sell-management contract.  A digest string alone is not a
+        # contract and cannot later reconstruct v2/v3 thresholds.
+        from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+        frozen = intent_meta.get("entry_exit_contract")
+        if (
+            not isinstance(frozen, dict)
+            or not verify_us_entry_exit_contract(frozen)
+            or intent_meta.get("entry_exit_contract_sha256") != frozen.get("sha256")
+            or intent_meta.get("entry_exit_contract_version") != frozen.get("version")
+        ):
+            logger.critical("[US_INTENT][BUY_CONTRACT_NOT_DURABLE] key=%s", intent.get("client_order_key"))
+            return False
     engine = _get_engine_or_none()
     if engine is None:
         for existing in _MEM_INTENTS:
@@ -1105,8 +1118,9 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     if existing_meta.get("entry_policy_contract_sha256") != intent_meta.get("entry_policy_contract_sha256"):
                         logger.critical("[US_INTEGRITY][BUY_POLICY_CONTRACT_MISMATCH] key=%s", intent.get("client_order_key"))
                         return False
-                    if intent_meta.get("entry_exit_contract_sha256") and (
+                    if (
                         existing_meta.get("entry_exit_contract_sha256") != intent_meta.get("entry_exit_contract_sha256")
+                        or existing_meta.get("entry_exit_contract") != intent_meta.get("entry_exit_contract")
                     ):
                         logger.critical("[US_INTEGRITY][BUY_ENTRY_EXIT_CONTRACT_MISMATCH] key=%s", intent.get("client_order_key"))
                         return False
@@ -1220,10 +1234,17 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                 persisted_meta = _parse_json_meta((persisted or {}).get("meta"))
                 if persisted_meta.get("entry_policy_contract_sha256") != intent_meta.get("entry_policy_contract_sha256"):
                     raise ValueError("US_BUY_POLICY_CONTRACT_PERSISTENCE_MISMATCH")
-                if intent_meta.get("entry_exit_contract_sha256") and (
+                if (
                     persisted_meta.get("entry_exit_contract_sha256") != intent_meta.get("entry_exit_contract_sha256")
+                    or persisted_meta.get("entry_exit_contract_version") != intent_meta.get("entry_exit_contract_version")
+                    or persisted_meta.get("entry_exit_contract") != intent_meta.get("entry_exit_contract")
+                    or not verify_us_entry_exit_contract(persisted_meta.get("entry_exit_contract"))
                 ):
                     raise ValueError("US_BUY_ENTRY_EXIT_CONTRACT_PERSISTENCE_MISMATCH")
+                for attr in ("strategy_owner", "strategy_name", "strategy_version", "sleeve_id"):
+                    original = intent_meta_to_store.get(attr)
+                    if original not in (None, "") and persisted_meta.get(attr) != original:
+                        raise ValueError("US_BUY_STRATEGY_ATTRIBUTION_PERSISTENCE_MISMATCH")
         return True
     except Exception as exc:
         logger.error("[US_INTENT][SAVE][ERROR] %s", exc)
