@@ -3045,6 +3045,18 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
         def __init__(self):
             self.posts = []
 
+        def get_us_price(self, symbol, exchange):
+            # Native-shaped *offline* quote; strict age/source/threshold gates
+            # remain active. This is never authenticated KIS price evidence.
+            import time
+            assert symbol == "AMGN" and exchange == "NASDAQ"
+            return {
+                "_quote_quality": "FRESH",
+                "_quote_source": "KIS_LIVE",
+                "_quote_asof_epoch": time.time(),
+                "output": {"last": 490.0},
+            }
+
         def get_balance(self, **_kw):
             return {"positions": [{
                 "symbol": "AMGN", "exchange": "NASDAQ",
@@ -3061,6 +3073,14 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
 
     broker = TP2TestBroker()
     tp2_intent = next_tp[0]
+    # The future-session 2026-11-13 scenario runs on today's real CI wall
+    # clock. At its *simulated pre-HTTP tick* refresh the decision timestamp,
+    # not the frozen contract, TP quantity, or TP threshold; keep the strict
+    # 30-second pre-HTTP freshness fence exercised by the actual router.
+    from datetime import datetime as _wall_datetime, timezone as _wall_timezone
+    tp2_intent.setdefault("meta", {})["last_profit_capture_at"] = (
+        _wall_datetime.now(_wall_timezone.utc).isoformat()
+    )
     tp2_intent["trade_date"] = "2026-11-13"
     tp2_intent.setdefault("strategy_owner", "US_STANDARD")
     tp2_intent.setdefault("sleeve_id", "US_STANDARD")
