@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 
-from scripts.kr_buy_sell_contract_audit import _sha, audit_buy
+from scripts.kr_buy_sell_contract_audit import _sha, audit_buy, _select_execution_fills
 from trader.db.repos import _kr_buy_entry_contract_hash, KR_BUY_ENTRY_CONTRACT_VERSION
 from trader.kr.order_execution_evidence import summarize_native_order
 from trader.db.migrate import (
@@ -412,3 +412,115 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
         with admin.begin() as conn:
             conn.execute(sa.text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         admin.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("PBCORE_TEST_POSTGRES_URL"),
+    reason="requires isolated PostgreSQL CI database",
+)
+def test_postgres_physical_raw_json_sql_to_real_audit_verdict():
+    """Prevent a unit fixture from masking a missing real SELECT column.
+
+    Executes the very same production _select_execution_fills() SQL against an
+    isolated PostgreSQL schema with Supabase's physical column types:
+    raw_json TEXT, fill_meta_json JSONB, created_at TEXT and filled_at TIMESTAMPTZ.
+    No live account, KIS request, or trading database is used.
+    """
+    schema = "kr_audit_" + uuid.uuid4().hex[:12]
+    engine = sa.create_engine(os.environ["PBCORE_TEST_POSTGRES_URL"], future=True)
+    order, position, buy_fill, sell, sell_fill = _fixture_case()
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(f"CREATE SCHEMA {schema}")
+            conn.exec_driver_sql(f"""
+                CREATE TABLE {schema}.fills (
+                  order_id text, env text, code text, market text, side text,
+                  qty integer, price real, raw_json text, fill_meta_json jsonb,
+                  kis_odno text, position_cycle_id text, portfolio_epoch_id text,
+                  trading_epoch_id text, broker_fill_id text, trade_id text,
+                  filled_at timestamptz, created_at text
+                )
+            """)
+            insert = sa.text(f"""
+                INSERT INTO {schema}.fills
+                  (order_id,env,code,market,side,qty,price,raw_json,
+                   fill_meta_json,kis_odno,position_cycle_id,portfolio_epoch_id,
+                   trading_epoch_id,broker_fill_id,trade_id,filled_at,created_at)
+                VALUES
+                  (:order_id,:env,:code,:market,:side,:qty,:price,:raw,
+                   CAST(:meta AS jsonb),:kis_odno,:cycle,:portfolio,:epoch,
+                   :broker_fill_id,:trade_id,:filled_at,:created_at)
+            """)
+            for row in (buy_fill, sell_fill):
+                conn.execute(insert, {
+                    "order_id": row["order_id"], "env": row["env"],
+                    "code": row["code"], "market": row["market"],
+                    "side": row["side"], "qty": row["qty"],
+                    "price": row["price"], "raw": json.dumps(row["raw_json"]),
+                    "meta": json.dumps(row["fill_meta_json"]),
+                    "kis_odno": row["kis_odno"], "cycle": row["position_cycle_id"],
+                    "portfolio": row["portfolio_epoch_id"],
+                    "epoch": row["trading_epoch_id"],
+                    "broker_fill_id": row["broker_fill_id"], "trade_id": None,
+                    "filled_at": row["filled_at"],
+                    "created_at": "2026-11-06T00:09:00+00:00",
+                })
+            # A foreign epoch with a deceptively identical broker fill ID
+            # cannot enter the active-epoch audit input.
+            conn.execute(insert, {
+                "order_id": buy_fill["order_id"], "env": "practice",
+                "code": buy_fill["code"], "market": buy_fill["market"],
+                "side": "BUY", "qty": 999,
+                "price": buy_fill["price"],
+                "raw": json.dumps({"kis_response": {
+                    "tot_ccld_qty": "999", "tot_ccld_amt": "1998000"
+                }}),
+                "meta": json.dumps(buy_fill["fill_meta_json"]),
+                "kis_odno": buy_fill["kis_odno"], "cycle": buy_fill["position_cycle_id"],
+                "portfolio": buy_fill["portfolio_epoch_id"],
+                "epoch": "foreign_epoch",
+                "broker_fill_id": buy_fill["broker_fill_id"],
+                "trade_id": None, "filled_at": buy_fill["filled_at"],
+                "created_at": "2026-11-06T00:09:00+00:00",
+            })
+            rows = _select_execution_fills(
+                conn, {"env": "practice", "epoch": "epoch1"},
+                schema_name=schema,
+            )
+            assert len(rows) == 2
+            assert all(isinstance(row["raw_json"], str) for row in rows)
+            assert all(isinstance(row["fill_meta_json"], dict) for row in rows)
+            result = audit_buy(
+                order, positions=[position],
+                fills=[row for row in rows if row["side"] == "BUY"],
+                sells=[sell],
+                sell_fills=[row for row in rows if row["side"] == "SELL"],
+                names={"035760": "CJ ENM"},
+            )
+            assert result["proven_buy_fill_qty"] == 10
+            assert result["sell_proven_filled_qty_same_cycle"] == 4
+            assert result["status"] == "EXPECTED"
+            # Remove the *physical* KIS raw response, keep the other columns
+            # unchanged: the same real SQL must now refuse economic proof.
+            conn.execute(sa.text(f"""
+                UPDATE {schema}.fills
+                SET raw_json=:blank WHERE side='BUY' AND trading_epoch_id='epoch1'
+            """), {"blank": "{}"})
+            rows = _select_execution_fills(
+                conn, {"env": "practice", "epoch": "epoch1"},
+                schema_name=schema,
+            )
+            unproven = audit_buy(
+                order, positions=[position],
+                fills=[row for row in rows if row["side"] == "BUY"],
+                sells=[sell],
+                sell_fills=[row for row in rows if row["side"] == "SELL"],
+                names={"035760": "CJ ENM"},
+            )
+            assert unproven["proven_buy_fill_qty"] is None
+            assert unproven["status"] == "FILL_EVIDENCE_MISSING"
+            assert "ORIGINAL_PRICED_BUY_FILL_UNPROVEN" in unproven["issues"]
+    finally:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        engine.dispose()
