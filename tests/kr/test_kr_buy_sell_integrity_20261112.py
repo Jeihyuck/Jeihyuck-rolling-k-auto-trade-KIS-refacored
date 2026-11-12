@@ -14,6 +14,8 @@ import pytest
 import sqlalchemy as sa
 
 from scripts.kr_buy_sell_contract_audit import _sha, audit_buy
+from trader.db.repos import _kr_buy_entry_contract_hash, KR_BUY_ENTRY_CONTRACT_VERSION
+from trader.kr.order_execution_evidence import summarize_native_order
 from trader.db.migrate import (
     assert_no_migration_transaction_control, split_postgres_sql,
 )
@@ -29,38 +31,71 @@ def _fixture_case():
         "exit_policy_family": "SWING_STAGED_EXIT",
         "profit_plan": {"tp1_sell_pct": 0.33, "tp1_profit_pct": 12.0},
     }
-    order = {
-        "order_id": "order1", "strategy": "pb1_pullback_close", "code": "035760",
-        "market": "KOSDAQ", "position_cycle_id": "cycle1",
+    request = {
+        "enforce_entry_contract": True, "entry_exit_plan": plan,
+        "entry_contract_version": KR_BUY_ENTRY_CONTRACT_VERSION,
+        "pre_order_holding_qty": 0, "requested_qty": 10, "submitted_qty": 10,
+        "client_order_key": "client1", "position_cycle_id": "cycle1",
         "portfolio_epoch_id": "portfolio1", "trading_epoch_id": "epoch1",
-        "qty": 10, "request_json": {
-            "entry_exit_plan": plan, "entry_contract_sha256": "a" * 64,
-        },
+    }
+    request["entry_contract_sha256"] = _kr_buy_entry_contract_hash(request)
+    order = {
+        "order_id": "order1", "env": "practice", "strategy": "pb1_pullback_close",
+        "code": "035760", "market": "KOSDAQ", "side": "BUY", "kis_odno": "0000011759",
+        "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
+        "trading_epoch_id": "epoch1", "qty": 10, "request_json": request,
+        "response_json": {"_kr_buy_entry_contract": {
+            "entry_contract_sha256": request["entry_contract_sha256"],
+        }},
     }
     position = {
-        "code": "035760", "strategy": "pb1_pullback_close",
-        "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
-        "trading_epoch_id": "epoch1", "qty": 6, "status": "OPEN",
-        "position_origin": "SYSTEM", "entry_style_selected": "ENTRY_PULLBACK",
-        "exit_policy_family": "SWING_STAGED_EXIT", "entry_exit_plan_json": plan,
+        "env": "practice", "market": "KOSDAQ", "code": "035760",
+        "strategy": "pb1_pullback_close", "position_cycle_id": "cycle1",
+        "portfolio_epoch_id": "portfolio1", "trading_epoch_id": "epoch1",
+        "qty": 6, "status": "OPEN", "position_origin": "SYSTEM",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+        "entry_exit_plan_json": plan,
+        "last_exit_eval_json": {
+            "entry_exit_plan": plan, "entry_exit_plan_status": "OK",
+        },
         "entry_meta_json": {
-            "entry_contract_sha256": "a" * 64,
-            "entry_exit_plan_sha256": _sha(plan),
-            "source_buy_order_id": "order1",
+            "entry_contract_sha256": request["entry_contract_sha256"],
+            "entry_exit_plan_sha256": _sha(plan), "source_buy_order_id": "order1",
         },
     }
     fill = {
-        "order_id": "order1", "qty": 10, "price": 2000.0,
-        "fill_meta_json": {"evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION"},
+        "order_id": "order1", "env": "practice", "market": "KOSDAQ",
+        "code": "035760", "side": "BUY", "kis_odno": "0000011759",
+        "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
+        "trading_epoch_id": "epoch1",
+        "qty": 10, "price": 2000.0, "broker_fill_id": "KR_KIS_CUM:proof1",
+        "filled_at": "2026-11-02T09:31:59+09:00",
+        "fill_meta_json": {
+            "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+            "filled_at_source": "KIS_EXECUTION_TIMESTAMP",
+        },
     }
     sell = {
-        "order_id": "sell1", "code": "035760", "strategy": "pb1_pullback_close",
-        "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
+        "order_id": "sell1", "env": "practice", "market": "KOSDAQ",
+        "side": "SELL", "kis_odno": "0000005003", "code": "035760",
+        "strategy": "pb1_pullback_close", "position_cycle_id": "cycle1",
+        "portfolio_epoch_id": "portfolio1", "trading_epoch_id": "epoch1",
         "qty": 4, "status": "FILLED",
     }
-    sell_fill = {"order_id": "sell1", "qty": 4, "price": 2100.0}
+    sell_fill = {
+        "order_id": "sell1", "env": "practice", "market": "KOSDAQ",
+        "side": "SELL", "kis_odno": "0000005003", "code": "035760",
+        "position_cycle_id": "cycle1", "portfolio_epoch_id": "portfolio1",
+        "trading_epoch_id": "epoch1", "qty": 4, "price": 2100.0,
+        "broker_fill_id": "KR_KIS_CUM:proof2",
+        "filled_at": "2026-11-06T09:06:36+09:00",
+        "fill_meta_json": {
+            "evidence_kind": "KIS_ORDER_CUMULATIVE_EXECUTION",
+            "filled_at_source": "KIS_EXECUTION_TIMESTAMP",
+        },
+    }
     return order, position, fill, sell, sell_fill
-
 
 def test_exact_signed_cycle_and_partial_sell_audits_expected():
     order, position, fill, sell, sell_fill = _fixture_case()
@@ -70,7 +105,7 @@ def test_exact_signed_cycle_and_partial_sell_audits_expected():
     )
     assert result["status"] == "EXPECTED"
     assert result["remaining_qty"] == 6
-    assert result["sell_filled_qty_same_cycle"] == 4
+    assert result["sell_proven_filled_qty_same_cycle"] == 4
 
 
 def test_reconcile_imported_cycle_is_not_silently_rebound():
@@ -101,6 +136,91 @@ def test_missing_original_same_cycle_sell_is_not_expected():
                        sell_fills=[], names={})
     assert report["status"] == "CYCLE_DISCONNECTED"
     assert "CLOSED_WITHOUT_ORIGINAL_CYCLE_SELL" in report["issues"]
+
+
+@pytest.mark.parametrize("field,bad_value", [
+    ("env", "real"), ("code", "293490"), ("market", "KOSPI"),
+    ("position_cycle_id", "other_cycle"),
+    ("portfolio_epoch_id", "foreign_portfolio"),
+    ("trading_epoch_id", "foreign_epoch"),
+    ("kis_odno", "0000012888"), ("side", "SELL"),
+])
+def test_broker_fill_foreign_scope_is_never_accepted(field, bad_value):
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    fill[field] = bad_value
+    report = summarize_native_order(order, [fill])
+    assert report["evidence_status"] in ("UNPROVEN", "CONFLICT")
+    assert report["proven_filled_qty"] in (None, 0)
+    assert any("FILL_IDENTITY_INVALID" in s for s in report["issues"])
+
+
+def test_broker_fill_missing_identity_and_empty_order_number_review():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    order["kis_odno"] = ""
+    fill["kis_odno"] = ""
+    report = summarize_native_order(order, [fill])
+    assert report["proven_filled_qty"] is None
+    assert any("ORDER_SCOPE_INCOMPLETE" in s for s in report["issues"])
+
+
+def test_sell_partial_fill_after_cancel_uses_priced_execution_not_order_qty():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    sell["qty"], sell["status"] = 8, "CANCELLED"
+    pos["qty"] = 7
+    sell_fill["qty"] = 3
+    result = audit_buy(
+        order, positions=[pos], fills=[fill], sells=[sell],
+        sell_fills=[sell_fill], names={},
+    )
+    assert result["sell_submitted_qty_same_cycle"] == 8
+    assert result["sell_proven_filled_qty_same_cycle"] == 3
+    assert "POSITION_ECONOMIC_QUANTITY_CHAIN_MISMATCH" not in result["issues"]
+
+
+def test_duplicate_cumulative_watermark_is_counted_once():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    one = copy.deepcopy(fill)
+    two = copy.deepcopy(fill)
+    one["qty"] = 3
+    two["qty"] = 10
+    one["created_at"], two["created_at"] = "2026-11-02T00:31:59Z", "2026-11-02T00:32:00Z"
+    report = summarize_native_order(order, [one, two])
+    assert report["proven_filled_qty"] == 10
+    assert report["cumulative_watermark"] == 10
+
+
+def test_mixed_native_cumulative_and_individual_is_unproven():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    duplicate = copy.deepcopy(fill)
+    duplicate["broker_fill_id"] = "native-trade-1"
+    duplicate["qty"] = 1
+    duplicate["fill_meta_json"]["evidence_kind"] = "KIS_INDIVIDUAL_EXECUTION"
+    report = summarize_native_order(order, [fill, duplicate])
+    assert report["evidence_status"] == "CONFLICT"
+    assert report["proven_filled_qty"] is None
+
+
+def test_same_cycle_second_buy_never_reallocates_sells_per_buy():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    extra = copy.deepcopy(order)
+    extra["order_id"] = "second_order"
+    extra["kis_odno"] = "0000011760"
+    result = audit_buy(
+        order, positions=[pos], fills=[fill], sells=[sell],
+        sell_fills=[sell_fill], names={}, cycle_buy_orders=[order, extra],
+    )
+    assert result["same_cycle_buy_orders"] == 2
+    assert "MULTIPLE_BUYS_SAME_CYCLE_ALLOCATION_UNPROVEN" in result["issues"]
+    assert "POSITION_ECONOMIC_QUANTITY_CHAIN_MISMATCH" not in result["issues"]
+
+
+def test_execution_proxy_time_is_not_declared_full_evidence():
+    order, pos, fill, sell, sell_fill = _fixture_case()
+    fill["fill_meta_json"]["filled_at_source"] = "ORDER_TIME_PROXY"
+    result = audit_buy(order, positions=[pos], fills=[fill], sells=[sell],
+                       sell_fills=[sell_fill], names={})
+    assert result["status"] == "REVIEW_REQUIRED"
+    assert result["buy_time_quality"] == "ORDER_TIME_PROXY_OR_UNKNOWN"
 
 
 def test_migration_parser_and_no_manual_transaction_control():
@@ -153,7 +273,8 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
             original = MIGRATION.read_text(encoding="utf-8")
             # Exercise the exact production function bodies on a disposable schema.
             for statement in split_postgres_sql(original.replace("public.", schema + ".")):
-                conn.exec_driver_sql(statement)
+                if statement.strip() and not statement.lstrip().startswith("-- Broker ACK fields"):
+                    conn.exec_driver_sql(statement)
             conn.execute(sa.text(f"""
                 INSERT INTO {schema}.orders
                  (env,strategy,side,code,request_json,status)
