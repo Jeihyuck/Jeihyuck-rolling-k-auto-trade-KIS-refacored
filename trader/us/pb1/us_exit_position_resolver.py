@@ -448,7 +448,30 @@ def _enrich_single_position(
     """
     symbol = _normalize_symbol(pos.get("symbol", ""))
     exchange = str(pos.get("exchange") or "NASDAQ").strip() or "NASDAQ"
-    qty = _safe_int(pos.get("qty"))
+    raw_qty = pos.get("qty")
+    qty = _safe_int(raw_qty)
+    # Validate BEFORE the qty<=0 fast return. Otherwise a corrupt broker
+    # holding such as "corrupt" becomes zero, disappears from the exit set,
+    # and the outer per-symbol isolation never sees the evidence gap.
+    if (
+        isinstance(raw_qty, bool)
+        or (
+            raw_qty is not None
+            and str(raw_qty).strip()
+            and str(raw_qty).strip() != str(qty)
+        )
+    ):
+        logger.error(
+            "[US_EXIT_RESOLVER][SYMBOL_ISOLATED][INVALID_QTY] symbol=%s raw_qty=%r",
+            symbol, raw_qty,
+        )
+        return {
+            **pos, "symbol": symbol, "exchange": exchange,
+            "pnl_input_ok": False,
+            "entry_price_source": "invalid_position_qty",
+            "exit_resolution_failed": True,
+            "exit_resolution_failure_reason": "INVALID_POSITION_QTY",
+        }
     identity = _position_identity(pos, env=env)
     # Identity authority depends on account/env/trading epoch, not the
     # individual symbol or position lifecycle. Only cache this immutable
