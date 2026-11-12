@@ -72,12 +72,18 @@ class FakeReadOnlyConn:
             return FakeSQLResult([{
                 "trade_date": date(2026, 11, 10),
                 "account_id": HASH, "portfolio_epoch_id": PORTFOLIO,
-                "position_cycle_id": CYCLE, "order_meta": meta,
+                "position_cycle_id": CYCLE,
+                "intent_account_id": HASH, "intent_portfolio_epoch_id": PORTFOLIO,
+                "intent_position_cycle_id": CYCLE,
+                "fill_account_id": HASH, "fill_portfolio_epoch_id": PORTFOLIO,
+                "fill_position_cycle_id": CYCLE,
+                "order_meta": meta,
                 "intent_meta": {
                     **meta, "entry_exit_contract": self.contract,
                 },
                 "fill_meta": {
                     **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    "cumulative_filled_qty": 6,
                     "is_synthetic": False,
                 },
                 "filled_shares": 6, "fill_order": "fixture-ord-1",
