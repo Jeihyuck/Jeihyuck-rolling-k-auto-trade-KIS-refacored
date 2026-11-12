@@ -129,6 +129,16 @@ def verify_us_entry_exit_contract(contract: Any) -> bool:
         and digest == _sha(data)
     ):
         return False
+    detail = data.get("entry_strategy_detail")
+    if detail is not None:
+        if (
+            not isinstance(detail, dict)
+            or not isinstance(detail.get("selected_style"), str)
+            or not detail["selected_style"].strip()
+            or any(not isinstance(detail.get(field, ""), str)
+                   for field in ("entry_component", "execution_strategy", "strategy_version"))
+        ):
+            return False
     if version == US_SWING_V3_CONTRACT_VERSION:
         from trader.us.pb1.swing_runner_exit_v3 import V3_RUNNER_POLICY
         tp = (management.get("profit_capture") or {}).get("stages") or []
@@ -304,6 +314,18 @@ def build_us_entry_exit_contract(*sources: Any) -> dict:
         "entry_provenance": provenance,
         "management": management,
     }
+    # Record the *selected* signal family separately from the PB1 execution
+    # engine name.  Pullback/Momentum/Breakout/Minervini must not collapse to
+    # the generic 'us_pb1' when the original contract is used for future SELL.
+    # No symbol-based reconstruction or guessed version is permitted.
+    chosen_style = str(merged.get("entry_style_selected") or "").strip()
+    if chosen_style:
+        payload["entry_strategy_detail"] = {
+            "selected_style": chosen_style,
+            "entry_component": str(merged.get("entry_component") or ""),
+            "execution_strategy": str(merged.get("strategy") or merged.get("entry_strategy") or ""),
+            "strategy_version": str(merged.get("strategy_version") or ""),
+        }
     payload["sha256"] = _sha(payload)
     return payload
 
