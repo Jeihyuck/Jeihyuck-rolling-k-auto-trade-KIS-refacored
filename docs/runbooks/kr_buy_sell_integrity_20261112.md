@@ -139,3 +139,50 @@ No automatic merge, deploy, historical Supabase mutation or KIS order.
 - Current KR Infinite adaptive policy remains unchanged; the read-only audit
   enumerates intent and owner state but has not proven all historic evaluations.
 - No account changes, no KIS order, no operator DB migration, no deployment.
+
+## Real KR execution path and owner-of-record (6.1 review)
+
+| Boundary | PB1 Pullback/Momentum/Breakout/Swing | KR Infinite 122630 | Preservation rule |
+| --- | --- | --- | --- |
+| Session owner | `trader/kr/runner/trade_session_runner.py::run_session` → `trader/pb1_runner.py::run_once` | `trader/kr/infinite/runner.py::run_kr_infinite_sleeve_tick` | Intraday owner is not the selected entry style |
+| Entry policy | Final30 selected entry style → `trader/trade_plan.py::build_entry_exit_plan` | `trader/kr/infinite/strategy.py` + `InfiniteConfig` | Preserve each owner's policy mathematics |
+| Durable intent | `trader/db/repos.py::OrdersRepo`, canonical `_assert_kr_buy_entry_contract` | `trader/kr/infinite/repository.py` dedicated idempotency intent | DB intent before any KIS POST, account/epoch/cycle scoped |
+| Broker submit | `trader/kis_wrapper.py` through PB1 risk/submit gates | `trader/kr/infinite/executor.py::submit` | ACK never equals economic fill |
+| Broker execution | `trader/reconcile_kis.py::reconcile_today`, `FillsRepo.upsert_fill` | Infinite repository + `trader/kr/infinite/reconciliation.py` | KIS native qty/amount/order/time evidence, same owner |
+| Position | `trader/db/repos.py::PositionsRepo.apply_fill` | `kr_infinite_state` per cycle | PB1 root plan freezes; Infinite evaluation state adapts |
+| Exit evaluation | `trader/exit_policy/router.py::resolve_exit_policy_for_position`, `trader/kr/us_standard_profit_parity.py` | `trader/kr/infinite/runner.py::evaluate_exit_only` | Preserve original BUY and approved ACTIVE overlay separately |
+| SELL and reconciliation | PB1 durable SELL stage, KIS ACK, `reconcile_today` fill and PnL | Dedicated Infinite SELL intent/executor/reconciliation | Avoid duplicate order and double profit attribution |
+| Boundary uncertainty | `trader/settlement/kr_cutover.py::load_kr_runtime_release_for_scope` guarded release | Independent Infinite claim and broker observation | The guarded atomic writer is NOT assumed active |
+
+### Native proof and timeline classification
+
+The native practice KIS `daily_ccld` evidence shown in the active
+2026-11-12 DB records includes:
+- `tot_ccld_qty` and `tot_ccld_amt`, with `KIS_ORDER_CUMULATIVE_EXECUTION`
+  and stable `KR_KIS_CUM` watermark identity;
+- `filled_at_source=ORDER_TIME_PROXY`, which is **not** the time of any
+  particular native trade execution. This limits exact time proof even
+  when order cumulative economics are consistent;
+- recorded `orders.qty` is requested quantity, NOT reliably filled quantity.
+
+Thus an actual cumulative economic fill may be verified while
+`audit.status=REVIEW_REQUIRED` for missing independent execution time
+and historical evaluation snapshots. That is not by itself an
+IMPLEMENTATION BUG in the active execution path.
+
+### Six-case dry run
+
+Run only on the credentialed local **practice** environment:
+
+```bash
+NO_TRADE=1 DRY_RUN=1 DISABLE_REAL_TRADING=1 \
+PYTHONPATH=. python -m scripts.kr_buy_sell_historical_recovery_plan_20261112 \
+  --env practice --epoch 09772c87-27ab-412d-b1c7-0a4a55196462
+```
+
+The six-case plan **does not** use KIS or mutate the DB. All cases remain
+`NONE_PROOF_REQUIRED` until exact original-date all-page KIS evidence,
+authoritative account, order, amount, time, and current broker holdings
+are independently acquired and reviewed. The existing exact KIS proof
+utility should be used from the same verified account for that separate
+step, but **never** as permission to backfill synthetic fills.
