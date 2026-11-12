@@ -2888,6 +2888,16 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     # An actual PostgreSQL / repo-reconciled partial SELL in the SAME scoped
     # cycle must not orphan the original BUY V2/V3 on the next KIS balance day.
     # This is an offline native-evidence fixture; never a real KIS HTTP call.
+    # The original V2 TP1 stage is reserved on the BUY cycle before SELL HTTP.
+    tp1_key = "partial-sell-amgn-ci"
+    repos.mark_us_profit_capture_stage(
+        "2026-11-12", "AMGN", "tp1", position_lifecycle_id=cycle,
+        order_key=tp1_key, qty=2, status="PENDING",
+    )
+    pending = repos.load_us_profit_capture_state(
+        "2026-11-12", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert pending["tp1_pending"] is True and pending["tp1_done"] is False
     with pg_engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO us_position_risk_state(trading_epoch_id,trade_date,symbol,state)
@@ -2905,7 +2915,8 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
                     CAST(:meta AS jsonb))
         """), {"epoch": epoch, "account": broker_hash,
                  "portfolio": portfolio, "cycle": cycle,
-                 "meta": json.dumps({**meta, "pre_order_holding_qty": 6})})
+                 "meta": json.dumps({**meta, "pre_order_holding_qty": 6,
+                                      "profit_capture_stage": "tp1"})})
 
     actual_sell = repos.mark_order_filled_by_reconcile(
         order_no="0000039785", client_order_key="partial-sell-amgn-ci",
@@ -2917,6 +2928,26 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
               "cumulative_filled_qty": 2},
     )
     assert actual_sell["status"] == "OK", actual_sell
+    tp1 = repos.load_us_profit_capture_state(
+        "2026-11-12", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert tp1["tp1_done"] is True and tp1["tp1_pending"] is False
+    assert int(tp1["meta"]["tp1_filled_qty"]) == 2
+    assert tp1["tp2_done"] is False
+    # Replaying the same cumulative KIS order evidence must not count 4 SOLD.
+    again = repos.mark_order_filled_by_reconcile(
+        order_no="0000039785", client_order_key=tp1_key,
+        symbol="AMGN", side="SELL", filled_qty=2, requested_qty=2,
+        cumulative_filled_qty=2, avg_price_usd=475.0,
+        trade_date="2026-11-12", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**meta, "profit_capture_stage": "tp1"},
+    )
+    assert again["status"] == "OK", again
+    replay = repos.load_us_profit_capture_state(
+        "2026-11-13", ["AMGN"], {"AMGN": cycle},
+    )["AMGN"]
+    assert replay["tp1_done"] is True and int(replay["meta"]["tp1_filled_qty"]) == 2
 
     with pg_engine.connect() as conn:
         sell = conn.execute(text("""
@@ -2954,6 +2985,33 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert carried["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
     assert carried["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert carried["meta"]["lineage_verified_partial_sell_shares"] == 2
+
+    # TP1 is already DONE: only the original signed TP2 may emit another
+    # intent. This is the actual policy builder + PG stage ledger, with a
+    # simulated fresh authoritative KIS average (not an authenticated GET).
+    from trader.us.market_state_overlay import build_profit_capture_intents
+    stage_inputs = {
+        "symbol": "AMGN", "qty": 4, "orderable_qty": 4,
+        "current_price": 490.0, "position_lifecycle_id": cycle,
+        "entry_exit_contract": contract,
+        "broker_avg_price": 461.8, "broker_avg_price_currency": "USD",
+        "broker_avg_price_source": "kis_pchs_avg_pric",
+        "broker_avg_price_asof": "2026-11-13T16:00:00+00:00",
+        "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+        "meta": {**carried["meta"], "entry_exit_contract": contract},
+    }
+    from datetime import datetime as dt, timezone as tz
+    next_tp = build_profit_capture_intents(
+        [stage_inputs], {"profit_capture_enabled": True, "market_state": "NORMAL"},
+        now=dt(2026, 11, 13, 16, tzinfo=tz.utc), trade_date="2026-11-13",
+    )
+    assert len(next_tp) == 1, next_tp
+    assert next_tp[0]["reason"] == "TAKE_PROFIT_TP2"
+    assert next_tp[0]["meta"]["source_entry_contract_sha256"] == contract["sha256"]
+    assert next_tp[0]["position_lifecycle_id"] == cycle
+    assert not any(t.get("reason") == "TAKE_PROFIT_TP1" for t in next_tp)
+
 
 
 def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
