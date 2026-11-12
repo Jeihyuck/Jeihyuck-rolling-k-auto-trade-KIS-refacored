@@ -6,6 +6,7 @@ isolated schema. NEVER point the test URL to an operator/production database.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import uuid
 from pathlib import Path
@@ -251,7 +252,7 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
                     env text, strategy text, sid integer, mode integer,
                     code text, market text, side text, client_order_key text,
                     position_cycle_id text, portfolio_epoch_id text, trading_epoch_id text,
-                    kis_odno text, request_json jsonb, response_json jsonb, status text
+                    kis_odno text, request_json jsonb, response_json jsonb, status text, qty integer
                 )
             """))
             conn.execute(sa.text(f"""
@@ -275,20 +276,24 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
             for statement in split_postgres_sql(original.replace("public.", schema + ".")):
                 if statement.strip() and not statement.lstrip().startswith("-- Broker ACK fields"):
                     conn.exec_driver_sql(statement)
+            order, pos, fill, sell, sell_fill = _fixture_case()
             conn.execute(sa.text(f"""
                 INSERT INTO {schema}.orders
-                 (env,strategy,side,code,request_json,status)
-                VALUES ('practice','pb1_pullback_close','BUY','035760',
-                  CAST(:request AS jsonb), 'INTENT')
-            """), {"request": '{"entry_exit_plan":{"profit_plan":{"tp1":12}},'
-                             '"entry_contract_sha256":"' + 'a' * 64 + '"}'})
+                 (env,strategy,side,market,code,request_json,status,qty,
+                  position_cycle_id,portfolio_epoch_id,trading_epoch_id,client_order_key)
+                VALUES ('practice','pb1_pullback_close','BUY','KOSDAQ','035760',
+                  CAST(:request AS jsonb), 'INTENT',10,
+                  'cycle1','portfolio1','epoch1','client1')
+            """), {"request": json.dumps(order["request_json"])})
             conn.execute(sa.text(f"""
                 INSERT INTO {schema}.positions
-                 (env,strategy,code,entry_exit_plan_json,entry_meta_json,qty,status)
-                VALUES ('practice','pb1_pullback_close','035760',
-                  CAST(:plan AS jsonb), CAST(:meta AS jsonb), 10, 'OPEN')
-            """), {"plan": '{"profit_plan":{"tp1":12}}',
-                   "meta": '{"entry_contract_sha256":"' + 'a' * 64 + '"}'})
+                 (env,strategy,market,code,entry_exit_plan_json,entry_meta_json,
+                  qty,status,position_cycle_id,portfolio_epoch_id,trading_epoch_id)
+                VALUES ('practice','pb1_pullback_close','KOSDAQ','035760',
+                  CAST(:plan AS jsonb), CAST(:meta AS jsonb), 10,'OPEN',
+                  'cycle1','portfolio1','epoch1')
+            """), {"plan": json.dumps(pos["entry_exit_plan_json"]),
+                   "meta": json.dumps(pos["entry_meta_json"])})
             # Capture errors in SAVEPOINTs so test stays usable afterwards.
             with pytest.raises(sa.exc.DBAPIError):
                 with conn.begin_nested():
@@ -304,6 +309,16 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
                       SET entry_exit_plan_json='{{"profit_plan":{{"tp1":99}}}}'::jsonb
                     """))
             # Dynamic state and ACK are expected to keep changing.
+            with pytest.raises(sa.exc.DBAPIError):
+                with conn.begin_nested():
+                    conn.execute(sa.text(f"""
+                        UPDATE {schema}.orders SET request_json='{{}}'::jsonb
+                    """))
+            with pytest.raises(sa.exc.DBAPIError):
+                with conn.begin_nested():
+                    conn.execute(sa.text(f"""
+                        DELETE FROM {schema}.positions
+                    """))
             conn.execute(sa.text(f"UPDATE {schema}.orders SET kis_odno='0000011759',status='FILLED'"))
             conn.execute(sa.text(f"UPDATE {schema}.positions SET qty=6,position_meta=CAST(:metadata AS jsonb)"), {"metadata": '{"tp1_done":true}'})
             assert conn.execute(sa.text(f"SELECT qty FROM {schema}.positions")).scalar_one() == 6
