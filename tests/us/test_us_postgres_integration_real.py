@@ -2178,7 +2178,7 @@ def test_claim_reservation_outbox_triplet_rolls_back_as_one(pg_engine, owner, sy
         action="BUY", trade_date=date(2026, 10, 20),
     )
     key = f"{owner}:stage123-cycle:2026-10-20:BUY"
-    attempt = "stage123-reserved-attempt"
+    attempt = "stage123-reserved-attempt:" + owner
     event = {
         "event_id": str(uuid4()), "trade_date": "2026-10-20",
         "event_type": "BROKER_CLAIM_PREPARED",
