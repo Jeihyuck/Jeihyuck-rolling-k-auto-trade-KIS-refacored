@@ -384,7 +384,12 @@ def verified_carried_us_snapshot_identity(
         return None
     cycle = str(prior.get("position_cycle_id") or "")
     portfolio = str(prior.get("portfolio_epoch_id") or "")
-    broker_hash = str(prior.get("account_id") or "")
+    # Older 0062 snapshots can have a complete signed source in meta and
+    # risk-state while the separately-added hash column is NULL.  A NULL
+    # *copy* is not proof that the original BUY identity was lost.
+    # Never use this fallback unless all the original contract, active epoch,
+    # account hash, cycle, lifecycle and intervening-trade checks below pass.
+    broker_hash = str(prior.get("account_id") or prior_meta.get("broker_account_hash") or "")
     contract = prior_meta.get("entry_exit_contract")
     if not (
         cycle and portfolio and broker_hash
