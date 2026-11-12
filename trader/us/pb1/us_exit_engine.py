@@ -1476,7 +1476,27 @@ def _evaluate_exit_intents_from_snapshots(
         if current_price <= 0:
             continue
 
-        intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now, include_trend_time=include_trend_time)
+        try:
+            intent = route_exit_by_book_horizon(
+                position=pos, current_price=current_price, now=now,
+                include_trend_time=include_trend_time,
+            )
+        except Exception as exc:
+            # A corrupt/missing lifecycle or an individual strategy-evaluator
+            # failure is scoped to this symbol. It must not suppress unrelated
+            # symbols' already-proven protective SELL signals. Do not substitute
+            # a default V2/V3 contract or invent an exit for this position.
+            position_meta = pos.get("meta") if isinstance(pos.get("meta"), dict) else {}
+            logger.exception(
+                "[US_EXIT][SYMBOL_ISOLATED][EVALUATION_ERROR] "
+                "symbol=%s cycle=%s contract_sha=%s error_type=%s action=SKIP_THIS_SYMBOL",
+                symbol,
+                pos.get("position_cycle_id") or position_meta.get("position_cycle_id")
+                or pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id"),
+                pos.get("entry_exit_contract_sha256") or position_meta.get("entry_exit_contract_sha256"),
+                type(exc).__name__,
+            )
+            continue
         if intent is not None and intent.get("exit_type") == "soft_stop_loss":
             allowed, repeat_reason = soft_stop_repeat_allowed(pos, intraday_market_overlay=str(pos.get("intraday_market_overlay") or "NORMAL"), close_session=bool(pos.get("close_session")))
             if not allowed:
