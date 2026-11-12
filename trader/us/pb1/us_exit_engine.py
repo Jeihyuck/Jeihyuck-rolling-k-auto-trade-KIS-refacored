@@ -1467,6 +1467,18 @@ def _evaluate_exit_intents_from_snapshots(
     hold_count = 0
     from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
     for pos in snapshots or []:
+        # Public callers may provide already-prepared snapshots and bypass
+        # prepare_exit_position_snapshots(). Preserve the same per-symbol
+        # original-contract/quantity failure fence at this final decision edge.
+        # A corrupt BUY/cycle must never be repaired by generic runtime policy.
+        if pos.get("exit_resolution_failed"):
+            logger.error(
+                "[US_EXIT][SYMBOL_ISOLATED][RESOLVER_FAILURE] symbol=%s "
+                "reason=%s action=SKIP_THIS_SYMBOL",
+                pos.get("symbol"),
+                pos.get("exit_resolution_failure_reason") or "UNKNOWN",
+            )
+            continue
         # The original BUY-time V2 policy was already verified by DB and
         # is restored ONLY for the in-memory exit decision. Router still
         # needs independent authenticated KIS proof to issue the SELL.
