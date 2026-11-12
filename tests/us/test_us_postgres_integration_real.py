@@ -3666,6 +3666,10 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
     monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
     monkeypatch.setenv("US_RECONCILE_WORKER_MODE", "LEGACY")
+    # The shared CI suite intentionally applies a $100 test risk cap for
+    # unrelated rejection cases. Restore the repository production DEFAULT
+    # $2,500 maximum within this one 6x$100 BUY scenario; do not disable risk.
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
     monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
     monkeypatch.setattr(
         repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch,
