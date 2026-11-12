@@ -1274,6 +1274,13 @@ class KisUSClient:
         )
         all_rows: list[dict] = []
         seen_cursors: set[tuple[str, str]] = set()
+        # Query-specific evidence: only a completed cursor walk may be certified.
+        # This is read-only metadata, not proof that historic broker orders exist.
+        self._last_us_fills_query_evidence = {
+            "complete": False, "us_trade_date": requested_us_date,
+            "broker_kst_start": broker_start_date,
+            "broker_kst_end": broker_end_date, "pages": 0,
+        }
         max_pages = 10
 
         for page_index in range(max_pages):
@@ -1320,9 +1327,18 @@ class KisUSClient:
                     len(all_rows),
                     page_index + 1,
                 )
-                return self._filter_broker_rows_for_us_trade_date(
+                filtered = self._filter_broker_rows_for_us_trade_date(
                     all_rows, requested_us_date
                 )
+                # Emit only counts/dates; no account details or raw KIS pages.
+                self._last_us_fills_query_evidence = {
+                    "complete": True, "us_trade_date": requested_us_date,
+                    "broker_kst_start": broker_start_date,
+                    "broker_kst_end": broker_end_date,
+                    "pages": page_index + 1, "raw_rows": len(all_rows),
+                    "filtered_rows": len(filtered),
+                }
+                return filtered
 
             # M/F explicitly means continuation. If KIS omits the response
             # header but still supplies a cursor, follow the cursor rather than
