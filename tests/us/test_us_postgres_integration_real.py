@@ -3146,3 +3146,47 @@ def test_pg_risk_cash_resized_buy_intent_finalization_atomic(pg_engine, monkeypa
         """), {"key": initial["client_order_key"]}).mappings().one()
     assert persisted["qty"] == 4
     assert persisted["meta"]["entry_exit_contract"] == signed
+
+
+def test_pg_closed_latest_snapshot_never_resurrects_old_buy_parent(pg_engine, monkeypatch):
+    """Real PG: a later zero-share balance disqualifies the old ADD parent."""
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    epoch = "fixture-closed-cycle-epoch"
+    monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None: epoch)
+    frozen = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+    })
+    with pg_engine.begin() as conn:
+        for dt, qty, cycle in (
+            ("2026-11-10", 6, "original-closed-cycle"),
+            ("2026-11-11", 0, "original-closed-cycle"),
+        ):
+            meta = {
+                "strategy_owner": "US_STANDARD",
+                "position_lifecycle_id": cycle,
+                "position_cycle_id": cycle,
+                "entry_exit_contract": frozen,
+                "entry_exit_contract_sha256": frozen["sha256"],
+            }
+            conn.execute(text("""
+                INSERT INTO us_positions
+                    (as_of,symbol,exchange,qty,avg_cost,trading_epoch_id,
+                     account_id,portfolio_epoch_id,position_cycle_id,meta)
+                VALUES (:dt,'AMGN','NASDAQ',:qty,100,:epoch,'hash-account',
+                        'portfolio-old',:cycle,CAST(:meta AS jsonb))
+            """), {"dt":dt,"qty":qty,"epoch":epoch,"cycle":cycle,
+                   "meta":json.dumps(meta)})
+    prior = repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-10")
+    assert prior["AMGN"]["position_cycle_id"] == "original-closed-cycle"
+    assert prior["AMGN"]["meta"]["entry_exit_contract_sha256"] == frozen["sha256"]
+    # Reading 11/11 or later may not 'revive' a 11/10 positive holding.
+    assert repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-11") == {}
+    assert repos.load_us_positions_by_symbols(["AMGN"], as_of="2026-11-12") == {}
+    assert repos.load_us_positions_by_symbols(["AMGN"]) == {}
