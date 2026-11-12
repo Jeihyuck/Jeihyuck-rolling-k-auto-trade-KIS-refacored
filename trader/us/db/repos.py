@@ -5051,20 +5051,29 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                         and balance_parse_status == "OK" and trading_epoch_id
                         and int(p.get("qty") or 0) > 0):
                     try:
-                        from trader.us.original_buy_lineage import verified_new_buy_snapshot_identity
-                        verified_identity = verified_new_buy_snapshot_identity(
-                            conn=conn, trade_date=str(td), position=p,
-                            trading_epoch_id=trading_epoch_id,
-                        )
-                        if not verified_identity:
-                            from trader.us.original_buy_lineage import verified_carried_us_snapshot_identity
-                            verified_identity = verified_carried_us_snapshot_identity(
+                        # Original-proof lookup is optional for persisting the
+                        # broker's authoritative quantity, NOT an optional
+                        # identity to guess. A missing risk-state table or a
+                        # failed read aborts PostgreSQL's transaction; contain
+                        # that read in a SAVEPOINT so the balance can still be
+                        # saved as UNVERIFIED, without granting SELL authority.
+                        with conn.begin_nested():
+                            from trader.us.original_buy_lineage import verified_new_buy_snapshot_identity
+                            verified_identity = verified_new_buy_snapshot_identity(
                                 conn=conn, trade_date=str(td), position=p,
                                 trading_epoch_id=trading_epoch_id,
                             )
+                            if not verified_identity:
+                                from trader.us.original_buy_lineage import verified_carried_us_snapshot_identity
+                                verified_identity = verified_carried_us_snapshot_identity(
+                                    conn=conn, trade_date=str(td), position=p,
+                                    trading_epoch_id=trading_epoch_id,
+                                )
                     except Exception as exc:
+                        verified_identity = None
                         logger.warning(
-                            "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s",
+                            "[US_POSITIONS][ORIGINAL_SCOPE][UNAVAILABLE] symbol=%s error=%s "
+                            "action=SAVE_UNVERIFIED_BALANCE_ONLY",
                             p.get("symbol"), type(exc).__name__,
                         )
                 if verified_identity:
