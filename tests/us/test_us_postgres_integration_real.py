@@ -3390,11 +3390,17 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         lambda *_args, **_kw: None,
     )
     with pg_engine.begin() as conn:
-        for sym in symbols:
+        for idx, sym in enumerate(symbols):
+            # Four actual US_STANDARD entry selections retain distinct signed
+            # originals; they share the existing book/horizon exit philosophy.
+            selected_style = (
+                "ENTRY_PULLBACK", "ENTRY_MOMENTUM",
+                "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
+            )[idx % 4]
             signed = build_us_entry_exit_contract({
                 "symbol": sym, "strategy_owner": "US_STANDARD",
                 "position_action": "NEW_POSITION_BUY",
-                "entry_style_selected": "ENTRY_PULLBACK",
+                "entry_style_selected": selected_style,
                 "book": "SWING_BOOK", "horizon": "SWING_CARRY",
             })
             meta = {
@@ -3543,6 +3549,14 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         """)).mappings().all()
     assert len(pg_sell_rows) == 8
     assert {r["symbol"] for r in pg_sell_rows} == set(found)
+    assert {
+        positions[row["symbol"]]["meta"]["entry_exit_contract"]
+        ["entry_strategy_detail"]["selected_style"]
+        for row in pg_sell_rows
+    } == {
+        "ENTRY_PULLBACK", "ENTRY_MOMENTUM",
+        "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
+    }
     for record in pg_sell_rows:
         assert record["status"] == "ACK"
         # SELL carries the immutable BUY as a *source* lineage reference;
