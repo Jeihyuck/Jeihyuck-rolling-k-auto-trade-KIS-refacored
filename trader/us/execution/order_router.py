@@ -1711,6 +1711,9 @@ def route_order(
         }
 
     # 2. intent DB 저장
+    # The initial qty is durable now, but risk/orderable-cash checks below may
+    # safely reduce the eventual executable qty before any broker boundary.
+    originally_persisted_buy_qty = qty if side == "BUY" else None
     if not _persist_with_trade_date(save_order_intent, intent):
         return {"status": "INVALID_ORDER_IDENTITY", "reason": "intent_persistence_rejected", "broker_submit": False, "intent": intent}
 
@@ -2261,6 +2264,24 @@ def route_order(
     intent = annotate_execution_quantity_provenance(
         intent, strategy_requested_qty=strategy_requested_qty, final_qty=qty, price=price
     )
+
+    # NEW/ADD US BUY (and dedicated TQQQ BUY) can be resized by the canonical
+    # risk cap or fresh KIS cash. Without pre-I/O finalization the original
+    # us_order_intents.qty disagrees with actual us_orders.qty_requested and
+    # exact native fill evidence, creating an orphan position the next day.
+    # Never rewrite a POST-possible attempt or the signed V2/V3 contract.
+    if side == "BUY" and qty != originally_persisted_buy_qty:
+        from trader.us.db.repos import finalize_us_buy_intent_pre_submit
+        if not finalize_us_buy_intent_pre_submit(intent, trade_date=str(trade_date)):
+            logger.critical(
+                "[US_BUY][RESIZED_INTENT_FINALIZE_FAILED] symbol=%s initial_qty=%s final_qty=%s broker_submit=0",
+                symbol_upper, originally_persisted_buy_qty, qty,
+            )
+            return {
+                "status": "ORDER_DISABLED_BUY_INTENT_FINALIZATION",
+                "reason": "resized_original_buy_intent_unverified",
+                "broker_submit": False, "retry_order": False, "intent": intent,
+            }
 
     # Last possible fence and durable write occur immediately before the API.
     if context is not None and not context.broker_submit_allowed():
