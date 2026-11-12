@@ -300,3 +300,105 @@ def test_real_postgres_tqqq_cas_rejects_stale_ready_and_preserves_active(monkeyp
         with root.begin() as conn:
             conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         root.dispose()
+
+
+import pytest
+
+
+@pytest.mark.parametrize("style", [
+    "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_BREAKOUT", "ENTRY_MINERVINI",
+])
+def test_original_selected_strategy_and_version_survive_sell_contract(style, monkeypatch):
+    from trader.us.entry_exit_contract import (
+        build_us_entry_exit_contract, verify_us_entry_exit_contract,
+    )
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "LEGACY_V2")
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "0")
+    contract = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "sleeve_id": "US_STANDARD", "strategy": "us_pb1",
+        "strategy_version": "fixture-selection-v42",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": style,
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "entry_reason": "proven-original-selection",
+    })
+    assert verify_us_entry_exit_contract(contract)
+    assert contract["entry_strategy"] == "us_pb1"
+    assert contract["entry_strategy_detail"] == {
+        "selected_style": style,
+        "entry_component": "",
+        "execution_strategy": "us_pb1",
+        "strategy_version": "fixture-selection-v42",
+    }
+    # A later change to the runtime configuration may not mutate a holding's
+    # original V2/V3 policy or selected entry family.
+    monkeypatch.setenv("US_SWING_EXIT_MODE", "V3_ACTIVE_PRACTICE")
+    monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "1")
+    assert build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "ADD_TO_EXISTING_BUY",
+        "entry_exit_contract": contract,
+    }) == contract
+    assert build_us_entry_exit_contract({
+        "symbol": "TQQQ", "strategy_owner": "TQQQ_INFINITE",
+        "entry_exit_contract": contract,
+    }) == {}
+
+
+def test_unregistered_owner_rejected_before_any_database_or_kis_io():
+    from trader.us.execution.order_router import route_order
+
+    result = route_order({
+        "symbol": "AMGN", "side": "BUY",
+        "strategy_owner": "FUTURE_OWNER_WITHOUT_SELL_ADAPTER",
+        "sleeve_id": "FUTURE_OWNER_WITHOUT_SELL_ADAPTER",
+    })
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "US_OWNER_ADAPTER_NOT_REGISTERED"
+    assert result["broker_submit"] is False
+
+
+def test_immutable_signed_buy_contract_is_durable_in_original_intent(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "_MEM_INTENTS", [])
+    monkeypatch.setenv("KIS_ENV", "practice")
+    base = {
+        "symbol": "AMGN", "side": "BUY", "strategy_owner": "US_STANDARD",
+        "sleeve_id": "US_STANDARD", "strategy": "us_pb1",
+        "strategy_name": "us_pb1",
+        "strategy_version": "fixture-v42",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_MOMENTUM",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "client_order_key": "a" * 24, "qty": 2, "exchange": "NASDAQ",
+        "limit_price": 60, "notional_usd": 120,
+    }
+    contract = build_us_entry_exit_contract(base)
+    assert repos.save_order_intent({**base, "meta": {
+        "entry_exit_contract": contract,
+        "entry_exit_contract_sha256": contract["sha256"],
+        "entry_exit_contract_version": contract["version"],
+        "entry_style_selected": "ENTRY_MOMENTUM",
+    }}, trade_date="2026-11-12") is True
+    assert len(repos._MEM_INTENTS) == 1
+    recorded = repos._MEM_INTENTS[0]["meta"]
+    assert recorded["entry_exit_contract"] == contract
+    assert recorded["entry_exit_contract_sha256"] == contract["sha256"]
+
+    # Reusing the order key to change the entry strategy is not an ADD and
+    # must not silently overwrite the BUY's original management agreement.
+    different = build_us_entry_exit_contract({
+        **base, "entry_style_selected": "ENTRY_BREAKOUT",
+        "entry_exit_contract": None, "meta": {},
+    })
+    assert different["sha256"] != contract["sha256"]
+    assert repos.save_order_intent({**base, "meta": {
+        "entry_exit_contract": different,
+        "entry_exit_contract_sha256": different["sha256"],
+        "entry_exit_contract_version": different["version"],
+        "entry_style_selected": "ENTRY_BREAKOUT",
+    }}, trade_date="2026-11-12") is False
