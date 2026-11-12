@@ -97,6 +97,14 @@ def _safe_original_buy_count(rows: list[dict], *, account_hash: str, contract_sh
         im = _dict(r.get("intent_meta"))
         fm = _dict(r.get("fill_meta"))
         contract = _dict(im.get("entry_exit_contract"))
+        # Count the ORIGINAL zero-holding BUY only. A legitimate subsequent
+        # same-cycle ADD can have exactly the same signed policy and native
+        # evidence, but must never be counted as a *second* original cycle.
+        pre_shares = om.get("pre_order_holding_qty",
+                            om.get("pre_order_position_qty"))
+        if (isinstance(pre_shares, bool)
+                or pre_shares not in (0, "0")):
+            continue
         if not (verify_us_entry_exit_contract(contract)
                 and contract.get("sha256") == contract_sha
                 and all(str(r.get(col) or "") == account_hash
