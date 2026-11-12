@@ -2741,6 +2741,35 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     monkeypatch.setattr(repos, "_active_us_epoch", lambda conn=None: epoch)
     monkeypatch.setattr(repos, "_us_state_epoch_id", lambda conn=None: epoch)
 
+    # Native-shaped BUY partial fill must remain in the ORIGINAL order and
+    # cycle; a later cumulative fill cannot become a new position cycle.
+    partial_evidence = {
+        **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "cumulative_filled_qty": 2,
+    }
+    first_partial = repos.mark_order_filled_by_reconcile(
+        order_no=order_no, client_order_key=key, symbol="AMGN", side="BUY",
+        filled_qty=2, requested_qty=6, cumulative_filled_qty=2,
+        avg_price_usd=461.8, trade_date="2026-11-10",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no", meta=partial_evidence,
+    )
+    assert first_partial["status"] == "OK", first_partial
+    with pg_engine.connect() as conn:
+        before_late_fill = conn.execute(text("""
+            SELECT status,qty_filled,position_cycle_id
+              FROM us_orders WHERE order_no=:order_no
+        """), {"order_no": order_no}).mappings().one()
+        before_qty = conn.execute(text("""
+            SELECT qty FROM us_fills WHERE order_no=:order_no
+              AND side='BUY' AND symbol='AMGN'
+        """), {"order_no":order_no}).scalar_one()
+    assert (before_late_fill["status"],before_late_fill["qty_filled"],
+            before_late_fill["position_cycle_id"]) == (
+        "PARTIALLY_FILLED",2,cycle,
+    )
+    assert before_qty == 2
+
     evidence = {
         **meta, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
         "cumulative_filled_qty": 6,
