@@ -360,8 +360,8 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
                 with conn.begin_nested():
                     conn.execute(sa.text(f"""
                       UPDATE {schema}.positions
-                      SET entry_exit_plan_json='{{"profit_plan":{{"tp1":99}}}}'::jsonb
-                    """))
+                      SET entry_exit_plan_json=CAST(:changed_plan AS jsonb)
+                    """), {"changed_plan": json.dumps({"profit_plan": {"tp1": 99}})})
             # Dynamic state and ACK are expected to keep changing.
             with pytest.raises(sa.exc.DBAPIError):
                 with conn.begin_nested():
@@ -373,9 +373,41 @@ def test_postgres_direct_sql_cannot_rewrite_signed_buy_or_position():
                     conn.execute(sa.text(f"""
                         DELETE FROM {schema}.positions
                     """))
-            conn.execute(sa.text(f"UPDATE {schema}.orders SET kis_odno='0000011759',status='FILLED'"))
-            conn.execute(sa.text(f"UPDATE {schema}.positions SET qty=6,position_meta=CAST(:metadata AS jsonb)"), {"metadata": '{"tp1_done":true}'})
-            assert conn.execute(sa.text(f"SELECT qty FROM {schema}.positions")).scalar_one() == 6
+            # Broker ACK/order status must remain mutable; only signed BUY
+            # immutable identity/policy columns are fenced.
+            conn.execute(sa.text(f"""
+                UPDATE {schema}.orders
+                   SET kis_odno='0000011759',status='PARTIAL_FILLED',
+                       response_json=CAST(:response AS jsonb)
+            """), {"response": json.dumps({"rt_cd": "0", "msg1": "accepted"})})
+            conn.execute(sa.text(f"UPDATE {schema}.orders SET status='FILLED'"))
+            # Stage flags, peak/trail and remaining shares are dynamic state.
+            conn.execute(sa.text(f"""
+                UPDATE {schema}.positions
+                SET qty=6, position_meta=CAST(:metadata AS jsonb),
+                    entry_meta_json=jsonb_set(
+                       jsonb_set(entry_meta_json, '{{tp1_done}}', 'true'::jsonb),
+                       '{{last_trail_stop}}', '2025.5'::jsonb
+                    )
+            """), {"metadata": json.dumps({"tp1_done": True, "peak_price": 2500, "last_trail_stop": 2025.5})})
+            row = conn.execute(sa.text(f"""
+                SELECT qty, entry_meta_json, position_meta
+                FROM {schema}.positions
+            """)).mappings().one()
+            assert row["qty"] == 6
+            assert row["entry_meta_json"]["tp1_done"] is True
+            assert row["entry_meta_json"]["last_trail_stop"] == 2025.5
+            assert row["position_meta"]["peak_price"] == 2500
+            assert conn.execute(sa.text(f"SELECT status FROM {schema}.orders")).scalar_one() == "FILLED"
+            # No SQL bypass for source quantity or original entry policy.
+            with pytest.raises(sa.exc.DBAPIError):
+                with conn.begin_nested():
+                    conn.execute(sa.text(f"UPDATE {schema}.orders SET qty=11"))
+            with pytest.raises(sa.exc.DBAPIError):
+                with conn.begin_nested():
+                    conn.execute(sa.text(f"""
+                        UPDATE {schema}.positions SET entry_style_selected='ENTRY_MOMENTUM'
+                    """))
     finally:
         with admin.begin() as conn:
             conn.execute(sa.text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
