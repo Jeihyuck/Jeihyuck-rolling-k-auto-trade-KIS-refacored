@@ -402,3 +402,51 @@ def test_immutable_signed_buy_contract_is_durable_in_original_intent(monkeypatch
         "entry_exit_contract_version": different["version"],
         "entry_style_selected": "ENTRY_BREAKOUT",
     }}, trade_date="2026-11-12") is False
+
+
+def test_tqqq_state_version_cas_refuses_stale_writer_without_rollback(monkeypatch):
+    from trader.us.infinite.repository import InfiniteRepository, StateCorruptionError
+
+    class Tx:
+        def __init__(self, future_version):
+            self.future_version = future_version
+            self.statements = []
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def execute(self, query, params):
+            sql = str(query)
+            self.statements.append((sql, dict(params)))
+            assert "WHERE us_tqqq_infinite_state.version = EXCLUDED.version" in sql
+            assert "RETURNING version" in sql
+            assert "status='ACTIVE' AND EXCLUDED.status='READY'" in sql
+            class Result:
+                def __init__(self, version):
+                    self.version = version
+                def scalar_one_or_none(self):
+                    return self.version
+            return Result(self.future_version)
+    class Engine:
+        def __init__(self, tx):
+            self.tx = tx
+        def begin(self):
+            return self.tx
+
+    tx = Tx(710)
+    repository = InfiniteRepository(Engine(tx))
+    monkeypatch.setattr(repository, "_epoch_id", lambda _bind: EPOCH)
+    state = InfiniteState(
+        cycle_id="specific-tqqq-cycle", status=Status.ACTIVE,
+        cycle_start_date=date(2026, 11, 11), version=709,
+    )
+    repository.save_state(state)
+    assert state.version == 710
+    assert tx.statements[0][1]["version"] == 709
+    assert tx.statements[0][1]["cycle_id"] == "specific-tqqq-cycle"
+    tx.future_version = None
+    with pytest.raises(StateCorruptionError, match="STALE_VERSION_OR_CYCLE"):
+        repository.save_state(InfiniteState(
+            cycle_id="specific-tqqq-cycle", status=Status.READY,
+            cycle_start_date=date(2026, 11, 11), version=709,
+        ))
