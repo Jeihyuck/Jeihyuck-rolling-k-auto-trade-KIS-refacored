@@ -518,3 +518,33 @@ def test_buy_finalization_blocks_missing_original_or_foreign_strategy(monkeypatc
     assert not repos.finalize_us_buy_intent_pre_submit(
         {**base, "strategy_owner": "OTHER"}, trade_date="2026-11-12"
     )
+
+
+
+def test_same_contract_add_preserves_original_and_mixed_strategy_is_fenced():
+    from trader.us.execution.order_router import us_add_contract_requires_lot_policy
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    original = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_PULLBACK",
+    })
+    assert us_add_contract_requires_lot_policy({
+        "symbol": "AMGN", "side": "BUY",
+        "meta": {"entry_exit_contract": original,
+                 "entry_style_selected": "ENTRY_PULLBACK"},
+    }, original) is False
+    assert us_add_contract_requires_lot_policy({
+        "symbol": "AMGN", "side": "BUY",
+        "meta": {"entry_style_selected": "ENTRY_MOMENTUM"},
+    }, original) is True
+    different = build_us_entry_exit_contract({
+        "symbol": "AMGN", "strategy_owner": "US_STANDARD",
+        "position_action": "NEW_POSITION_BUY",
+        "entry_style_selected": "ENTRY_BREAKOUT",
+    })
+    assert us_add_contract_requires_lot_policy({
+        "symbol": "AMGN", "side": "BUY",
+        "meta": {"entry_exit_contract": different},
+    }, original) is True
