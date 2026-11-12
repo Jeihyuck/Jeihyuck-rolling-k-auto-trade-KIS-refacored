@@ -3351,3 +3351,85 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     assert len(routed["orders"]) == 8
     assert {order.get("symbol") for order in routed["orders"]} == set(found)
     assert all(order["status"] == "SIGNAL_ONLY" for order in routed["orders"])
+
+    # Continue the *same* real SQL-loaded resolver -> engine signals through
+    # the unmocked order router, durable PG intent/claim/ACK repositories, and
+    # a deterministic test broker HTTP boundary (NEVER authenticated KIS).
+    # SIGNAL_ONLY above is intentionally not credited as a submitted SELL.
+    from trader.us.execution import order_router
+    from trader.execution_claims import DurableExecutionClaimRepo
+    from trader.us.db.execution_claim_schema import (
+        us_execution_attempts, us_execution_claims,
+    )
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("WSL_RUN_MARKET", "")
+    monkeypatch.setenv("US_ATOMIC_CLAIM_OUTBOX_ENABLED", "0")
+    monkeypatch.setenv("US_ACCOUNT_RESERVATION_MODE", "OFF")
+    monkeypatch.setattr(order_router, "resolve_dry_run_for_us_order", lambda: False)
+    claim_repo = DurableExecutionClaimRepo(
+        pg_engine, us_execution_claims, us_execution_attempts,
+    )
+    monkeypatch.setattr(repos, "_execution_claim_repo", lambda: claim_repo)
+    monkeypatch.setattr(repos, "claim_execution_action", claim_repo.acquire)
+    monkeypatch.setattr(
+        repos, "record_execution_action_observation",
+        claim_repo.record_observation,
+    )
+    monkeypatch.setattr(
+        repos, "release_execution_action_before_submit",
+        claim_repo.release_before_submit,
+    )
+
+    class TestBroker:
+        def __init__(self):
+            self.sells = []
+
+        def get_balance(self, **_kwargs):
+            return {"positions": [
+                {"symbol": sym, "exchange": "NASDAQ",
+                 "qty": 4, "holding_qty": 4, "orderable_qty": 4,
+                 "avg_price": 100.0, "currency": "USD"}
+                for sym in symbols
+            ]}
+
+        def place_us_sell_order(self, symbol, exchange, qty, price):
+            assert symbol not in {"ABBV", "KO"}
+            assert exchange == "NASDAQ" and qty > 0
+            self.sells.append((symbol, qty, price))
+            return {"ok": True, "order_no": "CI-SELL-" + symbol}
+
+    broker = TestBroker()
+    for intent in signals:
+        intent["trade_date"] = "2026-11-12"
+        intent.setdefault("limit_price", 80.0)
+        intent.setdefault("strategy_owner", "US_STANDARD")
+        intent.setdefault("sleeve_id", "US_STANDARD")
+        intent.setdefault("holding_qty", 4)
+        intent.setdefault("orderable_qty", 4)
+        intent.setdefault("sellable_qty", 4)
+        intent.setdefault("available_qty", 4)
+    actual_routes = route_exit_orders_immediately(
+        signals, buy_daily_notional=0, position_count=10,
+        effective_budget=10000, signal_only=False, kis_order_allowed=True,
+        current_position_symbols=set(symbols), kis_client=broker,
+    )
+    # A broker HTTP adapter call proves actual router traversal. The DB claims
+    # and ACKs prove local write order, not live brokerage acceptance.
+    assert len(broker.sells) == 8, actual_routes
+    assert {sym for sym, *_ in broker.sells} == set(found)
+    assert all(row.get("status") == "ACK" for row in actual_routes["orders"]), actual_routes
+    with pg_engine.connect() as conn:
+        pg_sell_rows = conn.execute(text("""
+            SELECT symbol, status, client_order_key, order_no, meta
+            FROM us_orders
+            WHERE trade_date='2026-11-12' AND side='SELL'
+              AND order_no LIKE 'CI-SELL-%'
+        """)).mappings().all()
+    assert len(pg_sell_rows) == 8
+    assert {r["symbol"] for r in pg_sell_rows} == set(found)
+    for record in pg_sell_rows:
+        assert record["status"] == "ACK"
+        assert record["meta"]["entry_exit_contract_sha256"] == (
+            positions[record["symbol"]]["meta"]["entry_exit_contract_sha256"]
+        )
+
