@@ -1408,9 +1408,15 @@ def persist_profit_capture_ack_from_route(intent: dict, result: dict, trade_date
         or ack.get("ODNO") or ack.get("odno") or None
     )
     from trader.us.db.repos import mark_us_profit_capture_stage
+    from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+    # Forward-managed SELL execution claims may have a distinct runtime ID;
+    # the TP ledger belongs to the original, signed BUY lifecycle.
+    ledger_lifecycle = tp_stage_lifecycle_from_order_proof(
+        lifecycle, intent.get("meta"), client_order_key=order_key,
+    )
     mark_us_profit_capture_stage(
         trade_date, str(intent.get("symbol") or ""), stage,
-        order_key=order_key, position_lifecycle_id=lifecycle,
+        order_key=order_key, position_lifecycle_id=ledger_lifecycle,
         broker_order_no=broker_order_no,
         qty=int(intent.get("qty") or intent.get("quantity") or 0),
         notional_usd=float(intent.get("notional_usd") or 0.0),
@@ -1446,11 +1452,15 @@ def release_proven_tp_pre_submit_block(
         return False
     try:
         from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+        from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+        ledger_lifecycle = tp_stage_lifecycle_from_order_proof(
+            lifecycle, meta, client_order_key=key,
+        )
         released = release_us_profit_capture_pre_http_abort(
             trade_date=str(trade_date),
             symbol=str(intent.get("symbol") or ""),
             stage=stage,
-            position_lifecycle_id=lifecycle,
+            position_lifecycle_id=ledger_lifecycle,
             client_order_key=key,
         )
     except Exception as exc:
@@ -1676,6 +1686,7 @@ def route_exit_orders_immediately(
                         broker_order_no=result.get("order_no"), profit_capture_stage=stage,
                         order_status=mapped_status, evidence_type=None, filled_qty=0,
                         requested_qty=int(intent.get("qty") or 0),
+                        order_meta=meta,
                     )
             action = "ROUTED" if status in {"ACK", "DRY_RUN", "SIGNAL_ONLY"} else ("DEDUP" if "DUPLICATE" in status else "BLOCKED" if "BLOCK" in status else "SKIPPED")
             decision = {"symbol": str(intent.get("symbol") or "").upper(), "side": "SELL", "qty": int(intent.get("qty") or intent.get("quantity") or 0),
@@ -1722,6 +1733,7 @@ def route_exit_orders_immediately(
                     evidence_type=None,
                     filled_qty=0,
                     requested_qty=int(intent.get("qty") or 0),
+                    order_meta=meta,
                 )
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
     sent, ack, rejected, blocked = _routed_order_truth_counts(orders)
