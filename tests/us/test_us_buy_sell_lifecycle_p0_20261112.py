@@ -681,3 +681,73 @@ def test_add_with_missing_style_cannot_sneak_different_engine_version_or_parent(
     assert blocked({"parent_entry_contract_sha256": "foreign-cycle-contract"})
     assert not blocked({"entry_strategy": "us_pb1", "strategy_version": "2026.11",
                         "parent_entry_contract_sha256": parent["sha256"]})
+
+
+def test_ten_symbol_real_exit_evaluation_isolates_one_corrupt_and_one_pending(
+    monkeypatch, caplog,
+):
+    """8 independent hard stops remain evaluated when 1 data row raises and
+    another symbol has unresolved SELL. No strategy/exit math is mocked.
+    Broker POST is deliberately outside this test (not a live KIS test).
+    """
+    from datetime import datetime, timezone
+    from trader.us.pb1 import us_exit_engine as engine
+    from trader.us.protective_stop_obligation import record_confirmed_stop
+
+    symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
+               "KR", "MCK", "PFE", "PG", "TMO"]
+    now = datetime(2026, 11, 12, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(engine, "should_skip_exit_due_to_pending_sell",
+                        lambda sym, _day: (True, "UNRESOLVED_KIS_SELL", {})
+                        if sym == "KO" else (False, None, None))
+    # Stop logging is a database side effect, not exit policy selection.
+    monkeypatch.setattr(
+        "trader.us.protective_stop_obligation.record_confirmed_stop",
+        lambda *_args, **_kwargs: None,
+    )
+    snapshots = []
+    source_shas = {}
+    for sym in symbols:
+        contract = build_us_entry_exit_contract({
+            "symbol": sym, "strategy_owner": "US_STANDARD",
+            "position_action": "NEW_POSITION_BUY",
+            "entry_style_selected": "ENTRY_PULLBACK",
+            "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        })
+        source_shas[sym] = contract["sha256"]
+        cycle = f"cycle-{sym}"
+        snapshots.append({
+            "symbol": sym, "exchange": "NASDAQ",
+            "qty": 4 if sym != "ABBV" else "corrupted",
+            "holding_qty": 4, "orderable_qty": 4,
+            "entry_price": 100.0, "entry_price_source": "kis_avg_price_usd",
+            "resolved_current_price": 80.0,
+            "position_lifecycle_id": cycle,
+            "position_cycle_id": cycle,
+            "strategy_owner": "US_STANDARD",
+            "entry_time": "2026-11-10T16:00:00+00:00",
+            "entry_exit_contract": contract,
+            "meta": {
+                "strategy_owner": "US_STANDARD",
+                "position_lifecycle_id": cycle, "position_cycle_id": cycle,
+                "entry_exit_contract": contract,
+                "entry_exit_contract_sha256": contract["sha256"],
+            },
+        })
+    signals = engine.generate_exit_intents(
+        [], prepared_snapshots=snapshots, now=now,
+        include_trend_time=False,
+    )
+    actual = {row["symbol"]: row for row in signals if row.get("side") == "SELL"}
+    assert len(actual) == 8
+    assert "ABBV" not in actual and "KO" not in actual
+    assert all(actual[sym]["qty"] == 4 for sym in actual)
+    assert all(
+        actual[sym]["source_entry_contract_sha256"] == source_shas[sym]
+        and actual[sym]["position_lifecycle_id"] == f"cycle-{sym}"
+        for sym in actual
+    )
+    assert any(
+        "[US_EXIT][SYMBOL_ISOLATED][EVALUATION_ERROR]" in record.message
+        and "ABBV" in record.message for record in caplog.records
+    )
