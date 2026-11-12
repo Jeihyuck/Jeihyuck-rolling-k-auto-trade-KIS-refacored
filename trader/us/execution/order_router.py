@@ -75,6 +75,14 @@ def us_add_contract_requires_lot_policy(intent: dict, original_contract: dict) -
     prior_strategy = str(original_contract.get("entry_strategy") or "").strip()
     if incoming_strategy and prior_strategy and incoming_strategy != prior_strategy:
         return True
+    # Router builds entry_strategy from the frozen parent later in the ADD
+    # path. Reject an explicit *execution* strategy conflict before that
+    # reassignment, otherwise a different caller's strategy would be silently
+    # relabelled under the incumbent BUY. The generic strategy_name is not an
+    # execution-engine authority and must not be compared to entry_strategy.
+    requested_engine = str(intent.get("strategy") or meta.get("strategy") or "").strip()
+    if requested_engine and prior_strategy and requested_engine != prior_strategy:
+        return True
     incoming_version = str(
         intent.get("strategy_version") or meta.get("strategy_version") or ""
     ).strip()
