@@ -171,15 +171,29 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
     cycle_buys = [b for b in cycle_buy_orders if scope_ok and _same_scope(order, b)]
     if len(cycle_buys) > 1:
         issues.append("MULTIPLE_BUYS_SAME_CYCLE_ALLOCATION_UNPROVEN")
+    cycle_buy_reports = [summarize_native_order(b, fills) for b in cycle_buys]
+    cycle_qty = (
+        sum(int(b["proven_filled_qty"]) for b in cycle_buy_reports)
+        if cycle_buy_reports and all(b["proven_filled_qty"] is not None
+                                     and b["evidence_status"] not in ("CONFLICT", "UNPROVEN")
+                                     for b in cycle_buy_reports)
+        else None
+    )
     if pos and pos.get("status") == "CLOSED" and not related_sells:
         issues.append("CLOSED_WITHOUT_ORIGINAL_CYCLE_SELL")
-    if pos and len(cycle_buys) == 1:
-        buy_filled = buy_evidence["proven_filled_qty"]
-        if buy_filled is not None and sold is not None:
-            if buy_filled - sold != int(pos.get("qty") or 0):
+    if pos:
+        if cycle_qty is not None and sold is not None:
+            if cycle_qty - sold != int(pos.get("qty") or 0):
                 issues.append("POSITION_ECONOMIC_QUANTITY_CHAIN_MISMATCH")
         else:
             issues.append("POSITION_ECONOMIC_CHAIN_UNPROVEN")
+    # A cycle total does not authorize attributing an individual SELL to every
+    # BUY. Multiple root hashes or conflicting plans require separate review.
+    if len(cycle_buys) > 1:
+        hashes = {str(_obj(b.get("request_json")).get("entry_contract_sha256") or "")
+                  for b in cycle_buys}
+        if len(hashes) != 1:
+            issues.append("MULTIPLE_CONTRACTS_IN_SAME_CYCLE")
 
     if any(i in issues for i in (
         "ORIGINAL_PLAN_MISMATCH", "ORIGINAL_BUY_HASH_MISMATCH",
@@ -214,6 +228,10 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
         "position_status": pos.get("status"),
         "remaining_qty": pos.get("qty"),
         "same_cycle_buy_orders": len(cycle_buys),
+        "cycle_proven_buy_filled_qty": cycle_qty,
+        "cycle_proven_sell_filled_qty": sold,
+        "cycle_reconciliation_uses_native_executions": True,
+        "per_order_sell_allocation_proven": len(cycle_buys) == 1,
         "sell_submitted_qty_same_cycle": sell_order_qty,
         "sell_proven_filled_qty_same_cycle": sold,
         "sell_evidence": sell_reports,
