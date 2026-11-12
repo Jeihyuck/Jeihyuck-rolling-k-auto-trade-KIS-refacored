@@ -5004,7 +5004,28 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                                 avg_cost          =EXCLUDED.avg_cost,
                                 current_px        =EXCLUDED.current_px,
                                 unrealized_pnl_usd=EXCLUDED.unrealized_pnl_usd,
-                                meta              =COALESCE(us_positions.meta, '{}'::jsonb) || EXCLUDED.meta
+                                meta              =CASE
+                                  WHEN us_positions.qty>0
+                                   AND us_positions.position_cycle_id IS NOT NULL
+                                   AND NULLIF(us_positions.meta->>'entry_exit_contract_sha256','') IS NOT NULL
+                                  THEN COALESCE(us_positions.meta,'{}'::jsonb)
+                                     || (EXCLUDED.meta
+                                         - 'entry_exit_contract'
+                                         - 'entry_exit_contract_sha256'
+                                         - 'entry_exit_contract_version'
+                                         - 'entry_policy_contract_sha256'
+                                         - 'strategy_owner' - 'strategy_name'
+                                         - 'strategy_version' - 'sleeve_id'
+                                         - 'entry_strategy' - 'entry_style_selected'
+                                         - 'book' - 'horizon' - 'exit_policy'
+                                         - 'account_id' - 'broker_account_hash'
+                                         - 'portfolio_epoch_id' - 'position_cycle_id'
+                                         - 'position_lifecycle_id'
+                                         - 'opened_trade_date' - 'opened_at'
+                                         - 'opened_at_source' - 'lineage_resolution'
+                                         - 'lineage_identity_status')
+                                  ELSE COALESCE(us_positions.meta, '{}'::jsonb)
+                                       || EXCLUDED.meta END
                     """
                 else:
                     sql = """
