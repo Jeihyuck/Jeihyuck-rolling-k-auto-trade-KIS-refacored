@@ -347,7 +347,15 @@ for item in "${evidence_groups[@]}"; do collect_path REQUIRED_EVIDENCE_MISSING "
 # A missing report is DEGRADED evidence, NEVER a reason to suppress the mail.
 if [[ "$MARKET" == kr ]]; then
   KR_CONTRACT_AUDIT_PATH="runtime/health/kr-contract-audit-${TRADE_DATE}.json"
-  collect_path KR_CONTRACT_AUDIT_MISSING "$KR_CONTRACT_AUDIT_PATH"
+  # This proof is optional for historic/fixture log mail and never changes
+  # ordinary session completeness or SMTP delivery status. Missing is logged
+  # as audit debt, not silently represented as a successful audit.
+  if [[ -f "$KR_CONTRACT_AUDIT_PATH" ]]; then
+    record_expected KR_CONTRACT_AUDIT_AVAILABLE "$KR_CONTRACT_AUDIT_PATH"
+    record_included "$KR_CONTRACT_AUDIT_PATH"
+  else
+    echo "[KR_CONTRACT_AUDIT][MISSING] trade_date=$TRADE_DATE path=$KR_CONTRACT_AUDIT_PATH audit_status=NOT_VERIFIED" >&2
+  fi
 fi
 
 # Read exact same-day Stage4 child paths from each session's own logs.
