@@ -4071,7 +4071,12 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
         avg_price_usd=8.0, trade_date="2026-11-11",
         evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
         source="fills_by_order_no",
-        meta={**fill_meta,"cumulative_filled_qty":actual_sell_qty,
+        # SELL evidence references the immutable BUY contract, but does not
+        # impersonate the BUY's execution claim or submit attempt.
+        meta={**{
+            k: v for k, v in fill_meta.items()
+            if k not in ("execution_action_key", "submit_attempt_id")
+        }, "cumulative_filled_qty":actual_sell_qty,
               "source_entry_contract_sha256":signed["sha256"]},
     )
     assert confirmed_sell["status"] == "OK", confirmed_sell
