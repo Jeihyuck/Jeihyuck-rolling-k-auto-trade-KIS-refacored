@@ -6050,9 +6050,24 @@ def mark_order_filled_by_reconcile(
         cumulative = max(previous, min(observed_cumulative, requested))
         remaining = max(0, requested - cumulative)
         status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
+        # The broker reconciliation payload is evidence about execution,
+        # never authority to replace the submitted order's durable Claim.
+        # In particular, a SELL fill can reference an original BUY contract,
+        # but must NOT inherit that BUY's execution_action_key/attempt_id.
+        source_meta = _parse_json_meta(order.get("meta"))
+        incoming_meta = meta or {}
+        for immutable_key in ("execution_action_key", "submit_attempt_id"):
+            original_value = str(source_meta.get(immutable_key) or "")
+            incoming_value = str(incoming_meta.get(immutable_key) or "")
+            if incoming_value and incoming_value != original_value:
+                raise FillAccountingInvariantError({
+                    "status": "FILL_EXECUTION_CLAIM_IDENTITY_CONFLICT",
+                    "field": immutable_key, "retry_order": False,
+                    "entry_fence": True,
+                })
         merged = {
-            **_parse_json_meta(order.get("meta")),
-            **(meta or {}),
+            **source_meta,
+            **incoming_meta,
             "remaining_qty": remaining,
             "fill_evidence_type": evidence,
             "is_synthetic": synthetic,
