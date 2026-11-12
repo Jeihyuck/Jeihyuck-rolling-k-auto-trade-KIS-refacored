@@ -232,48 +232,56 @@ def audit_buy(order: dict, *, positions: list[dict], fills: list[dict],
 
 
 def collect(engine: sa.Engine, *, env: str) -> dict:
+    """Audit all current-epoch scopes and separate signed/unsigned owners."""
     account_key = get_account_key(env=env)
     epoch = str(active_trading_epoch_id(
         engine, env=env, account_id=account_key, required=True,
     ))
     if not epoch or epoch == "None":
         raise RuntimeError("KR_CONTRACT_AUDIT_ACTIVE_EPOCH_UNAVAILABLE")
-    params = {"env": env, "epoch": epoch}
+    params = {"env": env, "epoch": epoch, "account_id": account_key}
     with engine.connect() as conn:
+        bound = _records(conn, """
+            SELECT trading_epoch_id FROM public.trading_epochs
+            WHERE env=:env AND account_id=:account_id AND status='ACTIVE'
+                AND trading_epoch_id=:epoch
+        """, params)
+        if len(bound) != 1:
+            raise RuntimeError("KR_CONTRACT_AUDIT_ACCOUNT_EPOCH_NOT_UNIQUE")
+        portfolios = _records(conn, """
+            SELECT portfolio_epoch_id, account_id, env, strategy
+            FROM public.portfolio_epochs
+            WHERE env=:env
+        """, params)
+        portfolio_map = {str(x["portfolio_epoch_id"]): x for x in portfolios}
         buys = _records(conn, """
             SELECT order_id, env, strategy, code, market, side, status, qty,
                 created_at, kis_odno, position_cycle_id, portfolio_epoch_id,
                 trading_epoch_id, request_json, response_json
             FROM public.orders
-            WHERE env=:env AND trading_epoch_id=:epoch
-                AND strategy='pb1_pullback_close' AND side='BUY'
-                AND request_json::jsonb->>'enforce_entry_contract'='true'
+            WHERE env=:env AND trading_epoch_id=:epoch AND side='BUY'
+            ORDER BY created_at, order_id
+        """, params)
+        sells = _records(conn, """
+            SELECT order_id, env, strategy, market, code, status, side,
+                qty, kis_odno, position_cycle_id, portfolio_epoch_id,
+                trading_epoch_id, created_at, response_json
+            FROM public.orders
+            WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
             ORDER BY created_at, order_id
         """, params)
         positions = _records(conn, """
-            SELECT code, strategy, trading_epoch_id, portfolio_epoch_id,
-                position_cycle_id, status, position_origin, qty,
+            SELECT env, market, code, strategy, trading_epoch_id,
+                portfolio_epoch_id, position_cycle_id, status, position_origin, qty,
                 entry_style_selected, exit_policy_family, entry_exit_plan_json,
                 entry_meta_json, position_meta, last_exit_eval_json
             FROM public.positions WHERE env=:env AND trading_epoch_id=:epoch
         """, params)
-        fills = _records(conn, """
-            SELECT order_id, code, side, qty, price, fill_meta_json,
-                kis_odno, position_cycle_id, portfolio_epoch_id, trading_epoch_id
-            FROM public.fills
-            WHERE env=:env AND trading_epoch_id=:epoch AND side='BUY'
-        """, params)
-        sell_fills = _records(conn, """
-            SELECT order_id, code, side, qty, price, kis_odno, position_cycle_id,
-                portfolio_epoch_id, trading_epoch_id
-            FROM public.fills
-            WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
-        """, params)
-        sells = _records(conn, """
-            SELECT order_id, code, strategy, status, qty, kis_odno,
-                position_cycle_id, portfolio_epoch_id
-            FROM public.orders
-            WHERE env=:env AND trading_epoch_id=:epoch AND side='SELL'
+        all_fills = _records(conn, """
+            SELECT order_id, env, code, market, side, qty, price,
+                fill_meta_json, kis_odno, position_cycle_id, portfolio_epoch_id,
+                trading_epoch_id, broker_fill_id, trade_id, filled_at, created_at
+            FROM public.fills WHERE env=:env AND trading_epoch_id=:epoch
         """, params)
         names = {str(x["code"]): x["name"] for x in _records(conn, """
             SELECT stock_code AS code, MIN(name) AS name
@@ -281,47 +289,102 @@ def collect(engine: sa.Engine, *, env: str) -> dict:
         """, {})}
         infinite = _records(conn, """
             SELECT strategy_id, symbol, cycle_id, status, units_used,
-                last_buy_date, last_buy_price, metadata
+                last_buy_date, last_buy_price, policy_version, metadata
             FROM public.kr_infinite_state WHERE trading_epoch_id=:epoch
         """, params)
-    reports = [
-        audit_buy(b, positions=positions, fills=fills, sells=sells,
-                  sell_fills=sell_fills, names=names)
-        for b in buys
+        infinite_intents = _records(conn, """
+            SELECT strategy_id, symbol, cycle_id, trade_date, side, status,
+                requested_qty, filled_qty, requested_notional_krw,
+                filled_notional_krw, broker_order_id, metadata
+            FROM public.kr_infinite_order_intents
+            WHERE trading_epoch_id=:epoch
+        """, params)
+
+    signed = [
+        b for b in buys if b.get("strategy") == "pb1_pullback_close"
+        and _obj(b.get("request_json")).get("enforce_entry_contract") is True
     ]
-    statuses = Counter(row["status"] for row in reports)
+    reports = [audit_buy(b, positions=positions,
+                         fills=[f for f in all_fills if f.get("side") == "BUY"],
+                         sells=sells,
+                         sell_fills=[f for f in all_fills if f.get("side") == "SELL"],
+                         names=names, cycle_buy_orders=buys)
+               for b in signed]
+    for b, report in zip(signed, reports):
+        port = portfolio_map.get(str(b.get("portfolio_epoch_id") or ""))
+        if (not port or port.get("account_id") != account_key
+                or port.get("strategy") != b.get("strategy")):
+            report["issues"].append("PORTFOLIO_OWNER_ACCOUNT_MISMATCH_OR_UNKNOWN")
+            report["status"] = "REVIEW_REQUIRED"
+        report["issues"] = sorted(set(report["issues"]))
+
+    categories = Counter(x["status"] for x in reports)
+    unsigned = [
+        {"order_id": str(b.get("order_id") or ""), "code": b.get("code"),
+         "name": names.get(b.get("code"), "NAME_UNAVAILABLE"),
+         "strategy": b.get("strategy"), "status": "CONTRACT_NOT_SIGNED_OR_LEGACY"}
+        for b in buys if b not in signed
+    ]
     imported = [
         {"code": p["code"], "name": names.get(p["code"], "NAME_UNAVAILABLE"),
-         "position_cycle_id": p["position_cycle_id"], "qty": p["qty"],
-         "status": "IMPORTED_OR_UNPROVEN_NOT_AUTO_BOUND"}
-        for p in positions if p.get("position_origin") == "IMPORTED" and p.get("status") == "OPEN"
+         "strategy": p.get("strategy"), "position_cycle_id": p["position_cycle_id"],
+         "qty": p["qty"], "status": "IMPORTED_NOT_AUTOMATICALLY_BOUND"}
+        for p in positions if p.get("position_origin") == "IMPORTED"
     ]
     return {
-        "version": "KR_BUY_SELL_READONLY_AUDIT_V1",
+        "version": "KR_BUY_SELL_READONLY_AUDIT_V2",
         "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "env": env, "trading_epoch_id": epoch,
-        "account": "REDACTED",
+        "audit_run_id": os.environ.get("KR_CONTRACT_AUDIT_RUN_ID") or
+                        "MANUAL_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f"),
+        "trade_date_kst": datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat(),
+        "audit_status": "COMPLETED_WITH_EVIDENCE_GAPS" if (
+            unsigned or imported or any(x["status"] != "EXPECTED" for x in reports)
+        ) else "COMPLETED",
+        "env": env, "trading_epoch_id": epoch, "account": "REDACTED",
+        "population": {
+            "all_buy_orders": len(buys), "all_sell_orders": len(sells),
+            "signed_pb1_buy_orders": len(signed),
+            "unsigned_or_other_owner_buy_orders": len(unsigned),
+            "all_positions": len(positions), "imported_positions": len(imported),
+            "kr_infinite_order_intents": len(infinite_intents),
+            "all_fill_rows": len(all_fills),
+        },
         "signed_pb1_buy_count": len(reports),
         "original_contract_position_matched": sum(
             x["position_contract_sha256"] == x["original_contract_sha256"]
             and x["position_contract_sha256"] is not None
-            and not any(i in x["issues"] for i in
-                ("ORIGINAL_PLAN_MISMATCH", "STORED_PLAN_HASH_MISMATCH",
-                 "SOURCE_BUY_ORDER_UNBOUND", "TOP_LEVEL_POLICY_DRIFT",
-                 "SELL_EVALUATION_PLAN_DRIFT"))
-            for x in reports),
-        "categories": dict(statuses), "buys": reports,
-        "imported_open_positions": imported,
+            and not any(i in x["issues"] for i in (
+                "ORIGINAL_PLAN_MISMATCH", "STORED_PLAN_HASH_MISMATCH",
+                "SOURCE_BUY_ORDER_UNBOUND", "TOP_LEVEL_POLICY_DRIFT",
+                "SELL_EVALUATION_PLAN_DRIFT", "CYCLE_DISCONNECTED",
+                "POSITION_MISSING", "PORTFOLIO_OWNER_ACCOUNT_MISMATCH_OR_UNKNOWN"
+            )) for x in reports),
+        "categories": dict(categories), "buys": reports,
+        "unsigned_or_other_owner_buys": unsigned, "imported_positions": imported,
         "infinite_owner": [
             {"symbol": x["symbol"], "strategy_id": x["strategy_id"],
              "cycle": x["cycle_id"], "status": x["status"],
-             "units_used": x["units_used"],
-             "adaptive_exit_policy": "OWNER_KR_INFINITE_V1_UNCHANGED"}
+             "units_used": x["units_used"], "original_policy_version": x["policy_version"],
+             "adaptive_exit_policy": "OWNER_KR_INFINITE_V1_NOT_FULLY_AUDITED"}
             for x in infinite if x.get("strategy_id") == "KR_INFINITE_V1"
+        ],
+        "infinite_order_intents": [
+            {"symbol": x["symbol"], "cycle": x["cycle_id"],
+             "trade_date": str(x["trade_date"]), "side": x["side"],
+             "status": x["status"], "requested_qty": x["requested_qty"],
+             "recorded_filled_qty": x["filled_qty"],
+             "broker_order_no": x["broker_order_id"],
+             "broker_original_execution_proof": "NOT_CHECKED"}
+            for x in infinite_intents if x.get("strategy_id") == "KR_INFINITE_V1"
         ],
         "KIS_live_holdings": "NOT_CHECKED",
         "historical_fill_repair": "NONE_READ_ONLY",
-        "disclaimer": "Same-day DB evidence is not independent KIS original-order proof or a historical no-mutation timeline.",
+        "disclaimer": (
+            "Order-level filled quantity is not submitted quantity. A cumulative KIS "
+            "watermark proves economic quantity, not individual execution timestamps. "
+            "Only the latest saved evaluator snapshot is available, never a full "
+            "historical proof. No broker call or repair was performed."
+        ),
     }
 
 
@@ -337,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(report["categories"], ensure_ascii=False, sort_keys=True)))
         rc = 0
     except Exception as exc:
-        report = {"version": "KR_BUY_SELL_READONLY_AUDIT_V1",
+        report = {"version": "KR_BUY_SELL_READONLY_AUDIT_V2",
                   "generated_utc": datetime.now(timezone.utc).isoformat(),
                   "status": "AUDIT_FAILED", "error_type": type(exc).__name__,
                   "account": "REDACTED"}
