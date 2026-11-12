@@ -43,6 +43,10 @@ def collect(client, start, end, normalizer, account_key):
             and raw.get("balance_complete") is True
             and normalized.get("balance_parse_status") == "OK"):
         raise RuntimeError("KIS_BALANCE_NOT_COMPLETE")
+    # "complete" only covers queried exchanges; avoid certifying NASD-only
+    # snapshots as the entire practice account.
+    if set(raw.get("queried_exchanges") or []) != {"NASD", "NYSE", "AMEX"}:
+        raise RuntimeError("KIS_BALANCE_EXCHANGE_COVERAGE_INCOMPLETE")
     positions = [dict(symbol=p.get("symbol"), qty=p.get("qty"),
                       orderable_qty=p.get("orderable_qty"),
                       exchange=p.get("exchange"))
@@ -54,10 +58,25 @@ def collect(client, start, end, normalizer, account_key):
             rows = client.get_us_fills_today(trade_date=day.isoformat())
             if not isinstance(rows, list):
                 raise RuntimeError("KIS_ORDER_RESPONSE_UNVERIFIED")
-            orders.append(dict(us_trade_date=day.isoformat(), count=len(rows),
-                               cursor_validated_by_client=True,
-                               pages="NOT_EXPOSED",
-                               rows=[selected_row(x) for x in rows]))
+            page_evidence = getattr(client, "_last_us_fills_query_evidence", None)
+            # Do not claim pagination complete based merely on a list return.
+            if (not isinstance(page_evidence, dict)
+                    or page_evidence.get("complete") is not True
+                    or page_evidence.get("us_trade_date") != day.isoformat()
+                    or not isinstance(page_evidence.get("pages"), int)
+                    or page_evidence["pages"] < 1
+                    or page_evidence.get("filtered_rows") != len(rows)):
+                raise RuntimeError("KIS_ORDER_PAGINATION_UNVERIFIED")
+            orders.append(dict(
+                us_trade_date=day.isoformat(), count=len(rows),
+                cursor_validated_by_client=True,
+                pages=page_evidence["pages"],
+                broker_kst_start=page_evidence.get("broker_kst_start"),
+                broker_kst_end=page_evidence.get("broker_kst_end"),
+                raw_rows=page_evidence.get("raw_rows"),
+                order_status_verification="RAW_FIELDS_ONLY_NOT_TERMINAL_CERTIFICATION",
+                rows=[selected_row(x) for x in rows],
+            ))
         day += timedelta(days=1)
     return dict(status="READONLY_BROKER_GET_SUCCEEDED",
                 collected_utc=datetime.now(timezone.utc).isoformat(),
