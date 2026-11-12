@@ -2884,3 +2884,131 @@ def test_amgn_new_buy_original_scope_is_durable_through_fill_and_snapshot(
     assert tomorrow["meta"]["position_lifecycle_id"] == cycle
     assert tomorrow["meta"]["lineage_identity_status"] == "VERIFIED_CURRENT_EPOCH_CONTINUITY"
     assert tomorrow["meta"]["entry_exit_contract_sha256"] == contract["sha256"]
+
+
+
+def test_pg_original_signed_buy_contract_survives_raw_snapshot_upsert(pg_engine, monkeypatch):
+    """Actual PG UPSERT must preserve V2/V3 and cycle after unproven broker copy."""
+    import json
+    from sqlalchemy import text
+    from trader.us.db import repos
+    from trader.us.entry_exit_contract import build_us_entry_exit_contract
+
+    monkeypatch.setattr(repos, "_active_us_epoch",
+                        lambda bind=None, **_kw: "fixture-original-scope")
+    source = {
+        "symbol": "LIFE", "strategy_owner": "US_STANDARD",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "entry_strategy": "us_pb1", "strategy": "us_pb1",
+        "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+        "exit_policy": "US_SWING_DEFAULT",
+        "position_action": "NEW_POSITION_BUY",
+    }
+    frozen = build_us_entry_exit_contract(source)
+    changed = build_us_entry_exit_contract({
+        **source, "entry_style_selected": "ENTRY_BREAKOUT",
+    })
+    assert frozen["sha256"] != changed["sha256"]
+    original_meta = {
+        "strategy_owner": "US_STANDARD", "entry_style_selected": "ENTRY_PULLBACK",
+        "position_lifecycle_id": "cycle-original",
+        "position_cycle_id": "cycle-original",
+        "portfolio_epoch_id": "portfolio-fixture",
+        "entry_exit_contract": frozen,
+        "entry_exit_contract_sha256": frozen["sha256"],
+        "entry_exit_contract_version": frozen["version"],
+        "opened_trade_date": "2026-11-10",
+        "lineage_identity_status": "VERIFIED_ORIGINAL_KIS_BUY",
+    }
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_positions
+              (as_of,symbol,exchange,qty,avg_cost,current_px,unrealized_pnl_usd,
+               trading_epoch_id,account_id,portfolio_epoch_id,position_cycle_id,meta)
+            VALUES ('2026-11-11','LIFE','NASDAQ',6,60,62,12,
+                    'fixture-original-scope','account-fingerprint','portfolio-fixture',
+                    'cycle-original',CAST(:meta AS jsonb))
+        """), {"meta": json.dumps(original_meta)})
+    result = repos.save_position_snapshot([{
+        "symbol": "LIFE", "exchange": "NASDAQ", "qty": 6,
+        "avg_cost": 60, "current_px": 63,
+        "meta": {
+            "entry_style_selected": "ENTRY_BREAKOUT", "strategy_owner": "US_STANDARD",
+            "book": "SWING_BOOK", "horizon": "SWING_CARRY",
+            "exit_policy": "US_SWING_DEFAULT",
+            "entry_exit_contract": changed,
+            "entry_exit_contract_sha256": changed["sha256"],
+            "entry_exit_contract_version": changed["version"],
+        },
+    }], trade_date="2026-11-11", authoritative_positions=False)
+    assert result == 1
+    with pg_engine.connect() as conn:
+        row = conn.execute(text("""
+          SELECT qty,current_px,account_id,portfolio_epoch_id,position_cycle_id,meta
+          FROM us_positions WHERE symbol='LIFE' AND as_of='2026-11-11'
+          AND trading_epoch_id='fixture-original-scope'
+        """)).mappings().one()
+    assert row["qty"] == 6 and float(row["current_px"]) == 63
+    assert row["position_cycle_id"] == "cycle-original"
+    assert row["portfolio_epoch_id"] == "portfolio-fixture"
+    assert row["account_id"] == "account-fingerprint"
+    assert row["meta"]["entry_exit_contract"] == frozen
+    assert row["meta"]["entry_exit_contract_sha256"] == frozen["sha256"]
+    assert row["meta"]["entry_style_selected"] == "ENTRY_PULLBACK"
+    assert row["meta"]["lineage_identity_status"] == "VERIFIED_ORIGINAL_KIS_BUY"
+
+
+def test_pg_tqqq_cycle_version_cas_active_and_new_cycle(pg_engine, monkeypatch):
+    """Real PostgreSQL CAS: stale READY cannot overwrite an ACTIVE cycle."""
+    from dataclasses import replace
+    from datetime import date
+    from sqlalchemy import text
+    from trader.us.infinite.models import InfiniteState, Status
+    from trader.us.infinite.repository import InfiniteRepository, StateCorruptionError
+    from trader.us.infinite.policy_state import reserve_new_cycle
+
+    # Run the real pre-0052 TQQQ migration on a disposable CI schema; mirror
+    # the exact epoch composite PK implemented by the deployed 0052 migration.
+    with pg_engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE IF EXISTS us_tqqq_infinite_state CASCADE")
+        conn.exec_driver_sql(open("migrations/0048_add_us_tqqq_infinite_state.sql",
+                                  encoding="utf-8").read())
+        conn.exec_driver_sql(
+            "ALTER TABLE us_tqqq_infinite_state ADD COLUMN trading_epoch_id TEXT"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE us_tqqq_infinite_state "
+            "DROP CONSTRAINT us_tqqq_infinite_state_pkey"
+        )
+        conn.exec_driver_sql(
+            "ALTER TABLE us_tqqq_infinite_state "
+            "ADD PRIMARY KEY (trading_epoch_id,strategy_id,symbol)"
+        )
+    repo = InfiniteRepository(pg_engine)
+    monkeypatch.setattr(repo, "_epoch_id",
+                        lambda _conn, **_kw: "fixture-current-epoch")
+    ready = InfiniteState(
+        status=Status.READY, cycle_id="original-cycle",
+        cycle_start_date=date(2026, 11, 11), version=1,
+    )
+    repo.save_state(ready)
+    assert ready.version == 1
+    active = replace(ready, status=Status.ACTIVE)
+    repo.save_state(active)
+    assert active.version == 2
+    with pytest.raises(StateCorruptionError, match="STALE_VERSION_OR_CYCLE"):
+        repo.save_state(ready)
+    assert repo.load_state().status == Status.ACTIVE
+    pending = replace(active, status=Status.EXIT_PENDING)
+    repo.save_state(pending)
+    completed = replace(pending, status=Status.COMPLETE,
+                        cycle_complete_date=date(2026, 11, 12))
+    repo.save_state(completed)
+    next_ready = reserve_new_cycle(
+        completed, date(2026, 11, 13), cycle_id="distinct-next-cycle",
+    )
+    repo.save_state(next_ready)
+    current = repo.load_state()
+    assert current.status == Status.READY
+    assert current.cycle_id == "distinct-next-cycle"
+    assert current.version == 5
