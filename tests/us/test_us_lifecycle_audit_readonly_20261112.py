@@ -67,6 +67,7 @@ class FakeReadOnlyConn:
         if "FROM us_orders o" in statement:
             meta = {
                 "strategy_owner": "US_STANDARD",
+                "pre_order_holding_qty": 0,
                 "entry_exit_contract_sha256": self.contract["sha256"],
             }
             return FakeSQLResult([{
@@ -136,3 +137,38 @@ def test_readonly_cli_refuses_unarmed_order_capable_environment(monkeypatch, cap
     monkeypatch.setenv("NO_TRADE", "0")
     assert main() == 42
     assert "PRACTICE_US_READONLY_REQUIRED" in capsys.readouterr().out
+
+
+def test_audit_does_not_misclassify_same_contract_add_as_second_original():
+    class WithSameContractAdd(FakeReadOnlyConn):
+        def execute(self, sql, params=None):
+            result = super().execute(sql, params)
+            if "FROM us_orders o" not in str(sql):
+                return result
+            original = result.rows[0]
+            add = {
+                **original,
+                "order_meta": {**original["order_meta"], "pre_order_holding_qty": 6},
+                "fill_order": "fixture-add-ord-2",
+                "broker_order": "fixture-add-ord-2",
+                "filled_shares": 2, "qty_filled": 2,
+                "qty_requested": 2, "intended_shares": 2,
+                "fill_meta": {**original["fill_meta"], "cumulative_filled_qty": 2},
+            }
+            return FakeSQLResult([original, add])
+    audit = audit_all_positions(WithSameContractAdd(), as_of="2026-11-11")
+    assert audit["positions"][0]["original_db_buy_candidates"] == 1
+
+
+def test_am_close_hooks_do_not_run_in_trade_ticks_or_gate_sells():
+    from pathlib import Path
+    helper = Path("scripts/wsl/us-lifecycle-readonly-audit.sh").read_text()
+    am = Path("scripts/wsl/run-us-am.sh").read_text()
+    close = Path("scripts/wsl/run-us-close.sh").read_text()
+    tick = Path("trader/us/runner/trade_tick_runner.py").read_text()
+    assert 'nullim_us_lifecycle_readonly_audit "AM_START"' in am
+    assert 'nullim_us_lifecycle_readonly_audit "CLOSE"' in close
+    assert "nullim_us_lifecycle_readonly_audit" not in tick
+    assert "US_ORDER_ARMED=0" in helper
+    assert "NO_TRADE=1 DRY_RUN=1" in helper
+    assert "return 0" in helper
