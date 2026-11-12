@@ -280,21 +280,26 @@ def verified_new_buy_snapshot_identity(
 
 
 
-def _verified_actual_partial_sell_continuity(
-    rows: list[dict], *, sold_shares: int, epoch: str,
-    broker_hash: str, portfolio: str, cycle: str,
+def _verified_actual_cycle_fill_delta(
+    rows: list[dict], *, share_delta: int, epoch: str,
+    broker_hash: str, portfolio: str, cycle: str, contract_sha: str,
 ) -> bool:
-    """Allow a lower broker balance ONLY with exact native KIS SELL proof.
+    """Prove each intervening BUY/SELL against the ORIGINAL lifecycle.
 
-    The daily order window must be complete: one unique non-synthetic native
-    cumulative fill per terminal SELL, same immutable cycle and account.
-    This refuses re-BUY, unknown ACK, old-epoch, duplicated or synthetic fills.
-    An arbitrary quantity delta or a changed average price is never proof.
+    A same-contract ADD can increase shares without creating a second policy
+    or new position cycle; a partial SELL may decrease them. Every observed
+    order in the interval must have a *single* native KIS cumulative actual
+    fill in this exact account/portfolio/epoch/cycle. Unknown, still-open,
+    synthetic, partial-without-terminal-status, cross-lot and conflicting
+    strategy/contract evidence fail closed, including net-zero round trips.
+    This never recalculates a cost basis or certifies a fresh KIS balance.
     """
-    if not rows or len(rows) > 200 or sold_shares <= 0:
+    if not rows or len(rows) > 200 or not contract_sha:
         return False
+    from trader.us.entry_exit_contract import verify_us_entry_exit_contract
+
     seen: set[str] = set()
-    total_sold = 0
+    net_shares = 0
     for row in rows:
         if not isinstance(row, dict):
             return False
@@ -302,15 +307,40 @@ def _verified_actual_partial_sell_continuity(
         fill_meta = row.get("fill_meta") if isinstance(row.get("fill_meta"), dict) else {}
         key = str(row.get("client_order_key") or "")
         requested = _exact_positive_shares(row.get("qty_requested"))
-        sold = _exact_positive_shares(row.get("qty_filled"))
-        filled = _exact_positive_shares(row.get("fill_qty"))
-        if not key or key in seen or None in (requested, sold, filled):
+        filled_by_order = _exact_positive_shares(row.get("qty_filled"))
+        filled_by_kis = _exact_positive_shares(row.get("fill_qty"))
+        side = str(row.get("side") or "").upper()
+        status = str(row.get("status") or "").upper()
+        if (not key or key in seen or side not in {"BUY", "SELL"}
+                or None in (requested, filled_by_order, filled_by_kis)):
             return False
         seen.add(key)
+        # A later independently managed BUY cannot reuse this lifecycle.
+        # The ADD policy itself is checked *before* KIS POST in order_router.
+        if side == "BUY":
+            frozen = order_meta.get("entry_exit_contract")
+            if (
+                str(order_meta.get("parent_entry_contract_sha256") or "") != contract_sha
+                or not isinstance(frozen, dict)
+                or not verify_us_entry_exit_contract(frozen)
+                or frozen.get("sha256") != contract_sha
+                or str(fill_meta.get("entry_exit_contract_sha256") or "") != contract_sha
+            ):
+                return False
+        # Old SELL rows can lack a duplicate digest, but an explicit mismatch
+        # is forbidden. Their cycle/account/owner/native proof is mandatory.
+        if any(
+            str(meta.get("entry_exit_contract_sha256")) != contract_sha
+            for meta in (order_meta, fill_meta)
+            if meta.get("entry_exit_contract_sha256") not in (None, "")
+        ):
+            return False
         if not (
-            str(row.get("side") or "").upper() == "SELL"
-            and str(row.get("status") or "").upper() in {"FILLED", "CANCELLED"}
+            status in {"FILLED", "CANCELLED"}
             and str(row.get("order_no") or "")
+            and str(row.get("fill_order_no") or "") == str(row.get("order_no") or "")
+            and str(row.get("fill_side") or "").upper() == side
+            and str(row.get("fill_client_order_key") or "") == key
             and str(row.get("trading_epoch_id") or "") == epoch
             and str(row.get("order_account_id") or "") == broker_hash
             and str(row.get("fill_account_id") or "") == broker_hash
@@ -326,12 +356,23 @@ def _verified_actual_partial_sell_continuity(
             and str(fill_meta.get("broker_account_hash") or "") == broker_hash
             and str(fill_meta.get("fill_evidence_type") or "") == "KIS_ORDER_CUMULATIVE_ACTUAL"
             and fill_meta.get("is_synthetic") is not True
-            and sold == filled and sold <= requested
-            and (str(row.get("status")).upper() != "FILLED" or sold == requested)
+            and filled_by_order == filled_by_kis <= requested
+            and (status != "FILLED" or filled_by_kis == requested)
         ):
             return False
-        total_sold += sold
-    return total_sold == sold_shares
+        net_shares += filled_by_kis if side == "BUY" else -filled_by_kis
+    return net_shares == share_delta
+
+
+def _verified_actual_partial_sell_continuity(
+    rows: list[dict], *, sold_shares: int, epoch: str,
+    broker_hash: str, portfolio: str, cycle: str,
+) -> bool:
+    """Legacy direct helper: do not grant continuity without a frozen source.
+
+    Snapshot carry uses _verified_actual_cycle_fill_delta with contract SHA.
+    """
+    return False
 
 
 def verified_carried_us_snapshot_identity(
@@ -378,8 +419,8 @@ def verified_carried_us_snapshot_identity(
          ORDER BY as_of DESC LIMIT 1
     """), {"epoch":trading_epoch_id,"symbol":sym,"today":trade_date}).mappings().first()
     prior_qty = _exact_positive_shares((prior or {}).get("qty"))
-    if prior_qty is None or qty > prior_qty:
-        # Never revive an earlier zero-share cycle or ignore a later BUY.
+    if prior_qty is None:
+        # Never revive an earlier zero-share cycle.
         return None
 
     def _complete_source(row: dict) -> bool:
@@ -551,26 +592,26 @@ def verified_carried_us_snapshot_identity(
     if pending_previous is None or int(pending_previous) != 0:
         return None
 
-    sold_shares = prior_qty - qty
-    if observed_after_source and sold_shares != 0:
-        # Gap recovery cannot prove a changed quantity across an unverified
-        # intermediate snapshot. Require a separate original broker audit.
+    share_delta = qty - prior_qty
+    if observed_after_source and share_delta != 0:
+        # A missing-identity gap cannot prove share-changing trades across
+        # that gap. Only a direct contiguous verified source may do so.
         return None
-    if sold_shares == 0:
-        # No intervening order may be silently skipped just because the
-        # observed share balance did not change.
-        intervening = conn.execute(text("""
-            SELECT COUNT(*) FROM us_orders
-            WHERE trading_epoch_id=:epoch AND symbol=:symbol
-              AND trade_date>:previous_date AND trade_date<=:today
-        """), {"epoch":trading_epoch_id,"symbol":sym,
-               "previous_date":prior["as_of"],"today":trade_date}).scalar()
-        if intervening is None or int(intervening) != 0:
+    intervening = conn.execute(text("""
+        SELECT COUNT(*) FROM us_orders
+        WHERE trading_epoch_id=:epoch AND symbol=:symbol
+          AND trade_date>:previous_date AND trade_date<=:today
+    """), {"epoch":trading_epoch_id,"symbol":sym,
+           "previous_date":prior["as_of"],"today":trade_date}).scalar()
+    if intervening is None or int(intervening) > 200:
+        return None
+    if int(intervening) == 0:
+        if share_delta != 0:
             return None
     else:
-        # Do not use a ticker-only historical lookup: every order and fill
-        # must match this exact account/portfolio/cycle. The left join makes
-        # missing native KIS fill evidence a strict failure.
+        # Include ALL orders (both sides), not just matching terminal fills.
+        # LEFT JOIN ensures any unknown claim/ACK or missing fill rejects
+        # provenance; a duplicated fill row rejects uniqueness as well.
         rows = conn.execute(text("""
             SELECT o.trade_date, o.side, o.status, o.qty_requested,
                    o.qty_filled, o.client_order_key, o.order_no,
@@ -578,6 +619,8 @@ def verified_carried_us_snapshot_identity(
                    o.portfolio_epoch_id AS order_portfolio_epoch_id,
                    o.position_cycle_id AS order_position_cycle_id,
                    o.meta AS order_meta, f.qty AS fill_qty,
+                   f.order_no AS fill_order_no, f.side AS fill_side,
+                   f.client_order_key AS fill_client_order_key,
                    f.account_id AS fill_account_id,
                    f.portfolio_epoch_id AS fill_portfolio_epoch_id,
                    f.position_cycle_id AS fill_position_cycle_id,
@@ -585,19 +628,29 @@ def verified_carried_us_snapshot_identity(
             FROM us_orders o
             LEFT JOIN us_fills f
               ON f.trade_date=o.trade_date
+             AND f.symbol=o.symbol AND f.side=o.side
+             AND f.order_no=o.order_no
              AND f.client_order_key=o.client_order_key
              AND f.trading_epoch_id=o.trading_epoch_id
+             AND f.account_id=o.account_id
+             AND f.portfolio_epoch_id=o.portfolio_epoch_id
+             AND f.position_cycle_id=o.position_cycle_id
             WHERE o.trading_epoch_id=:epoch AND o.symbol=:symbol
               AND o.trade_date>:previous_date AND o.trade_date<=:today
             ORDER BY o.trade_date, o.client_order_key LIMIT 201
         """), {"epoch":trading_epoch_id,"symbol":sym,
                "previous_date":prior["as_of"],"today":trade_date}).mappings().all()
-        if not _verified_actual_partial_sell_continuity(
-            [dict(r) for r in rows], sold_shares=sold_shares,
-            epoch=trading_epoch_id, broker_hash=broker_hash,
-            portfolio=portfolio, cycle=cycle,
+        if (
+            len(rows) != int(intervening)
+            or not _verified_actual_cycle_fill_delta(
+                [dict(row) for row in rows], share_delta=share_delta,
+                epoch=trading_epoch_id, broker_hash=broker_hash,
+                portfolio=portfolio, cycle=cycle, contract_sha=contract["sha256"],
+            )
         ):
             return None
+    sold_shares = max(0, -share_delta)
+    added_shares = max(0, share_delta)
 
     return {
         # Preserve signed V2/V3 at every authoritative next-day balance;
@@ -622,4 +675,5 @@ def verified_carried_us_snapshot_identity(
         "holding_trade_days": life.get("holding_trade_days"),
         "lineage_resolution": "VERIFIED_CURRENT_EPOCH_CONTINUITY",
         "lineage_verified_partial_sell_shares": sold_shares,
+        "lineage_verified_net_add_shares": added_shares,
     }
