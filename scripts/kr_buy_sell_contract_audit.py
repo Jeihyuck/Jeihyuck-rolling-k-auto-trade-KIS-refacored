@@ -388,6 +388,53 @@ def collect(engine: sa.Engine, *, env: str) -> dict:
     }
 
 
+def classify_debt_against_previous(report: dict, prior_reports: list[dict]) -> dict:
+    """Same account epoch only. No DB mutation and no cross-account carryover."""
+    current = {(str(b.get("buy_order_id") or ""), str(issue))
+               for b in report.get("buys", [])
+               for issue in b.get("issues", [])}
+    previous = set()
+    for earlier in prior_reports:
+        if earlier.get("trading_epoch_id") != report.get("trading_epoch_id") or (
+            earlier.get("env") != report.get("env")
+        ):
+            continue
+        previous.update(
+            (str(b.get("buy_order_id") or ""), str(issue))
+            for b in earlier.get("buys", []) for issue in b.get("issues", [])
+        )
+    return {
+        "new_unresolved_issue_count": len(current - previous),
+        "existing_unresolved_issue_count": len(current & previous),
+        "resolved_since_last_snapshot_count": len(previous - current),
+        "new_unresolved": sorted([{"buy_order_id": a, "issue": b} for a, b in current - previous],
+                                 key=lambda x: (x["buy_order_id"], x["issue"])),
+        "existing_unresolved": sorted([{"buy_order_id": a, "issue": b} for a, b in current & previous],
+                                      key=lambda x: (x["buy_order_id"], x["issue"])),
+        "baseline_report_count": sum(
+            1 for earlier in prior_reports
+            if earlier.get("trading_epoch_id") == report.get("trading_epoch_id")
+            and earlier.get("env") == report.get("env")),
+    }
+
+
+def _load_previous_audit(report: dict) -> list[dict]:
+    root = Path("runtime/health")
+    current_day = report.get("trade_date_kst")
+    out = []
+    for path in sorted(root.glob("kr-contract-audit-????-??-??.json"))[-14:]:
+        if path.name == f"kr-contract-audit-{current_day}.json":
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if data.get("audit_status") not in ("COMPLETED", "COMPLETED_WITH_EVIDENCE_GAPS"):
+            continue
+        out.append(data)
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="practice", choices=["practice", "real"])
@@ -395,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         report = collect(get_engine(), env=args.env)
+        report["recurrence"] = classify_debt_against_previous(report, _load_previous_audit(report))
         print("[KR_CONTRACT_AUDIT][SUMMARY] signed=%s matched=%s categories=%s" % (
             report["signed_pb1_buy_count"], report["original_contract_position_matched"],
             json.dumps(report["categories"], ensure_ascii=False, sort_keys=True)))
