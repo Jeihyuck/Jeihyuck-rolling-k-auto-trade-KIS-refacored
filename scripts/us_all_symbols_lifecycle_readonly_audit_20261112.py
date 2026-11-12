@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -73,7 +74,7 @@ ORDER BY trade_date DESC LIMIT 101
 
 
 def _dict(value: Any) -> dict:
-    return value if isinstance(value, dict) else {}
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _safe_original_buy_count(rows: list[dict], *, account_hash: str, contract_sha: str,
