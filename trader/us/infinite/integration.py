@@ -863,7 +863,12 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                broker.qty, broker.orderable_qty, broker.average_price, state.cycle_id)
             else:
                 state = InfiniteState(symbol=config.symbol)
-        elif broker.qty > 0 and (not state.cycle_id or state.total_filled_notional <= 0):
+        elif broker.qty > 0 and (not state.cycle_id or state.total_filled_notional <= 0) and not (
+            state.status == Status.READY and state.cycle_id
+        ):
+            # READY with a reserved current cycle is NOT broker-proven ACTIVE.
+            # Only reconcile_metadata's cycle-bound native fill + matching
+            # broker balance may activate it; fallback cost is not a fill.
             recovered = recover_state_from_broker(
                 config=config, broker=broker, trading_date=trading_date,
                 cycle_id=state.cycle_id or (
