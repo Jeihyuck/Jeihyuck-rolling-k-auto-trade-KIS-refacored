@@ -196,7 +196,10 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
     fi
     audit_file="runtime/health/kr-contract-audit-${TODAY_KST}.json"
     mkdir -p runtime/health
-    export KR_CONTRACT_AUDIT_RUN_ID="KR-CLOSE-$(date -u +%Y%m%dT%H%M%S%N)-$"
+    export KR_CONTRACT_AUDIT_RUN_ID="KR-CLOSE-$(date -u +%Y%m%dT%H%M%S%N)-$BASHPID"
+    audit_marker="runtime/health/kr-contract-audit-run-${TODAY_KST}.json"
+    printf '{"audit_run_id":"%s","trade_date_kst":"%s","status":"STARTED"}\n' "$KR_CONTRACT_AUDIT_RUN_ID" "$TODAY_KST" > "${audit_marker}.tmp.$BASHPID"
+    mv -f -- "${audit_marker}.tmp.$BASHPID" "$audit_marker"
     # A retry must never email a prior success after today's timeout/crash.
     rm -f -- "$audit_file"
     echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_START] run_id=$KR_CONTRACT_AUDIT_RUN_ID timeout_sec=$KR_CONTRACT_AUDIT_TIMEOUT_SEC output=$audit_file"
@@ -206,7 +209,11 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
       python -m scripts.kr_buy_sell_contract_audit --env "$STRATEGY_ENV" --output "$audit_file"
     audit_rc=$?
     set -e
-    echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_DONE] rc=$audit_rc report=$audit_file"
+    if [[ "$audit_rc" -eq 0 && ! -s "$audit_file" ]]; then audit_rc=2; fi
+    if [[ "$audit_rc" -eq 0 ]]; then audit_marker_status="COMPLETED"; else audit_marker_status="FAILED"; fi
+    printf '{"audit_run_id":"%s","trade_date_kst":"%s","status":"%s"}\n' "$KR_CONTRACT_AUDIT_RUN_ID" "$TODAY_KST" "$audit_marker_status" > "${audit_marker}.tmp.$BASHPID"
+    mv -f -- "${audit_marker}.tmp.$BASHPID" "$audit_marker"
+    echo "[KR_CONTRACT_AUDIT][AFTER_CLOSE_DONE] run_id=$KR_CONTRACT_AUDIT_RUN_ID rc=$audit_rc status=$audit_marker_status report=$audit_file"
     if [[ "$audit_rc" -ne 0 ]]; then
       # The child may have been SIGKILLed before emitting a JSON report.
       # Persist a fresh, explicit failed status using an atomic file replace.
