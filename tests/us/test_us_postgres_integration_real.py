@@ -4062,6 +4062,27 @@ def test_pg_eight_families_actual_buy_route_to_overnight_protective_sell(
     assert sell_claim["persisted_claim_key"] == sell_claim["action_key"], sell_claim
     assert sell_claim["persisted_attempt_id"] == sell_claim["attempt_id"], sell_claim
     actual_sell_qty = int(broker.posts[-1][2])
+    # Reconciliation must reject a stale BUY attempt attached to a SELL
+    # fill without mutating the SELL ACK or creating an accounting fill.
+    wrong_claim = repos.mark_order_filled_by_reconcile(
+        order_no="CI-SELL-EIGHT",
+        client_order_key=route["intent"]["client_order_key"],
+        symbol=symbol, side="SELL", filled_qty=actual_sell_qty,
+        requested_qty=actual_sell_qty,
+        cumulative_filled_qty=actual_sell_qty,
+        avg_price_usd=8.0, trade_date="2026-11-11",
+        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+        meta={**fill_meta, "cumulative_filled_qty":actual_sell_qty},
+    )
+    assert wrong_claim["status"] == "FILL_EXECUTION_CLAIM_IDENTITY_CONFLICT", wrong_claim
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT status FROM us_orders WHERE order_no='CI-SELL-EIGHT'
+        """)).scalar_one() == "ACK"
+        assert conn.execute(text("""
+            SELECT COUNT(*) FROM us_fills WHERE order_no='CI-SELL-EIGHT'
+        """)).scalar_one() == 0
     confirmed_sell = repos.mark_order_filled_by_reconcile(
         order_no="CI-SELL-EIGHT",
         client_order_key=route["intent"]["client_order_key"],
