@@ -24,8 +24,15 @@ nullim_us_lifecycle_readonly_audit() {
   # Child-only scope, does not alter parent trade permission. The Python CLI
   # itself insists on PRACTICE+US+ORDER_ARMED=0+NO_TRADE=1+DRY_RUN=1,
   # then opens a PostgreSQL READ ONLY transaction.
+  # A slow database must never hang the AM/Close trading session. Enforce a
+  # hard, bounded diagnostic budget; timeout 124 is reported, not suppressed.
+  local budget="${US_LIFECYCLE_AUDIT_TIMEOUT_SECONDS:-15}"
+  if [[ ! "${budget}" =~ ^[1-9][0-9]?$ ]]; then
+    echo "[US_LIFECYCLE][READONLY][UNVERIFIED] phase=${phase} reason=INVALID_TIMEOUT no_order_block=1" >> "${dest}"
+    return 0
+  fi
   US_ORDER_ARMED=0 US_LIVE_TRADING_ENABLED=0 LIVE_TRADING_ENABLED=0 \
-  NO_TRADE=1 DRY_RUN=1 "${py}" \
+  NO_TRADE=1 DRY_RUN=1 timeout --kill-after=2s "${budget}s" "${py}" \
     scripts/us_all_symbols_lifecycle_readonly_audit_20261112.py \
     --as-of "${as_of}" --confirm-practice-readonly >> "${dest}" 2>&1 || audit_rc=$?
   if [[ "${audit_rc}" != "0" ]]; then
