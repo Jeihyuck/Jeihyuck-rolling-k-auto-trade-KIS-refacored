@@ -105,6 +105,15 @@ class InfiniteRepository:
                         material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
                         cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
                         metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+                    WHERE us_tqqq_infinite_state.version = EXCLUDED.version
+                      AND (
+                        us_tqqq_infinite_state.cycle_id IS NOT DISTINCT FROM EXCLUDED.cycle_id
+                        OR (us_tqqq_infinite_state.status='COMPLETE' AND EXCLUDED.status='READY')
+                      )
+                      AND NOT (
+                        us_tqqq_infinite_state.status='ACTIVE' AND EXCLUDED.status='READY'
+                      )
+                    RETURNING version
                 """
             else:
                 payload["metadata"] = json.dumps(state.metadata, default=str)
@@ -128,8 +137,23 @@ class InfiniteRepository:
                         material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
                         cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
                         metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+                    WHERE us_tqqq_infinite_state.version = EXCLUDED.version
+                      AND (
+                        us_tqqq_infinite_state.cycle_id IS NOT DISTINCT FROM EXCLUDED.cycle_id
+                        OR (us_tqqq_infinite_state.status='COMPLETE' AND EXCLUDED.status='READY')
+                      )
+                      AND NOT (
+                        us_tqqq_infinite_state.status='ACTIVE' AND EXCLUDED.status='READY'
+                      )
+                    RETURNING version
                 """
-            conn.execute(text(sql), payload)
+            saved_version = conn.execute(text(sql), payload).scalar_one_or_none()
+            if saved_version is None:
+                raise StateCorruptionError("TQQQ_INFINITE_STALE_VERSION_OR_CYCLE")
+            # The state object is the optimistic-concurrency token used by
+            # subsequent replace(state, ...) calls within this same tick.
+            # Commit the new version only after PostgreSQL confirms the write.
+        object.__setattr__(state, "version", int(saved_version))
 
     def pending_sides(self, trade_date: date, symbol: str = "TQQQ") -> tuple[bool, bool]:
         with self.engine.connect() as conn:
@@ -547,7 +571,38 @@ class InfiniteRepository:
                               for meta in metas if meta.get("desired_profit_stage") or meta.get("profit_stage")), "")
                 if stage:
                     last_profit_stage = stage.removesuffix("_SUBMITTED").removesuffix("_FILLED") + "_FILLED"
-        return {"total_buy_notional": summary[0], "daily_buy_notional": summary[1],
+        # READY is a pre-HTTP reservation, not an open position.  Only
+        # same-cycle KIS *actual* cumulative fills may activate it.  Broker
+        # average-price fallback, ACK and synthetic/retired accounting rows
+        # must never be interpreted as a matching fill.
+        actual_buy_shares = actual_sell_shares = 0
+        for row in rows:
+            if not self._belongs_to_cycle(row, state):
+                continue
+            meta = self._json_object(row.get("meta"))
+            if (
+                meta.get("fill_evidence_type") != "KIS_ORDER_CUMULATIVE_ACTUAL"
+                or meta.get("is_synthetic") is True
+                or meta.get("accounting_active") is False
+            ):
+                continue
+            raw = row.get("qty")
+            if isinstance(raw, bool):
+                continue
+            try:
+                shares = int(raw)
+                if shares <= 0 or float(raw) != shares:
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+            side = str(row.get("side") or "").upper()
+            if side == "BUY":
+                actual_buy_shares += shares
+            elif side == "SELL":
+                actual_sell_shares += shares
+        return {"confirmed_buy_shares": actual_buy_shares,
+                "confirmed_net_shares": actual_buy_shares - actual_sell_shares,
+                "total_buy_notional": summary[0], "daily_buy_notional": summary[1],
                 "total_sell_notional": summary[2], "last_buy_date": summary[3],
                 "first_fill_price": summary[4], "last_buy_fill_price": last_price,
                 "last_rebound_probe_fill_date": self._last_rebound_probe_fill_date(rows, state),
@@ -690,9 +745,19 @@ class InfiniteRepository:
                 remaining -= int(is_us_trading_day(cooldown_until))
             metadata.update(rebound_probe_date=probe_fill_date.isoformat(),
                             rebound_cooldown_until=cooldown_until.isoformat())
+        proven_ready_fill = (
+            state.status == Status.READY and bool(state.cycle_id)
+            and broker_qty > 0
+            and int(stats.get("confirmed_buy_shares") or 0) > 0
+            and int(stats.get("confirmed_net_shares") or -1) == broker_qty
+        )
+        if proven_ready_fill:
+            metadata["ready_activation_proof"] = "CURRENT_CYCLE_KIS_ACTUAL_FILL_AND_BROKER_BALANCE"
         status = (
-            Status.ACTIVE if state.status == Status.EXIT_PENDING and broker_qty > 0
-            and terminal_pending_profit else state.status
+            Status.ACTIVE if proven_ready_fill or (
+                state.status == Status.EXIT_PENDING and broker_qty > 0
+                and terminal_pending_profit
+            ) else state.status
         )
         return replace(state, core_filled_notional=core, reserve_filled_notional=reserve,
                        last_buy_date=last_buy or state.last_buy_date, anchor_price=anchor,
