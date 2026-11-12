@@ -41,6 +41,31 @@ logger = logging.getLogger(__name__)
 AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 
 
+def us_add_contract_requires_lot_policy(intent: dict, original_contract: dict) -> bool:
+    """Fail closed when ADD would silently replace an original BUY's strategy.
+
+    A same-contract ADD remains under the current management policy; a new
+    strategy or signed agreement needs an independently approved lot policy.
+    This is a pure pre-KIS check and never rewrites the original contract.
+    """
+    from trader.us.entry_exit_contract import extract_us_entry_exit_contract
+
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    incoming = extract_us_entry_exit_contract(intent, meta)
+    parent_sha = str(original_contract.get("sha256") or "")
+    if incoming and str(incoming.get("sha256") or "") != parent_sha:
+        return True
+    incoming_style = str(
+        intent.get("entry_style_selected") or meta.get("entry_style_selected") or ""
+    ).strip()
+    prior_style = str(
+        (original_contract.get("entry_provenance") or {}).get("entry_style_selected")
+        or (original_contract.get("entry_strategy_detail") or {}).get("selected_style")
+        or ""
+    ).strip()
+    return bool(incoming_style and prior_style and incoming_style != prior_style)
+
+
 def defensive_micro_first_buy_budget_error(intent: dict, *, qty: int, price: float) -> str | None:
     """Additional pre-ledger/HTTP budget fence for the new TQQQ-only probe.
 
@@ -1380,19 +1405,7 @@ def route_order(
             # share the existing cycle without a proven lot allocator.  Do
             # not silently replace the requested signal with the incumbent
             # contract and then pretend that the ADD belongs to that BUY.
-            from trader.us.entry_exit_contract import extract_us_entry_exit_contract
-            incoming_contract = extract_us_entry_exit_contract(intent, meta)
-            incoming_style = str(
-                intent.get("entry_style_selected") or meta.get("entry_style_selected") or ""
-            ).strip()
-            original_style = str(
-                (parent_contract.get("entry_provenance") or {}).get("entry_style_selected")
-                or (parent_contract.get("entry_strategy_detail") or {}).get("selected_style")
-                or ""
-            ).strip()
-            if (
-                incoming_contract and incoming_contract.get("sha256") != parent_contract.get("sha256")
-            ) or (incoming_style and original_style and incoming_style != original_style):
+            if us_add_contract_requires_lot_policy(intent, parent_contract):
                 logger.error(
                     "[US_ORDER][ADD_PARENT_CONTRACT][BLOCK] symbol=%s reason=US_ADD_DIFFERENT_CONTRACT_OR_STRATEGY",
                     symbol_upper,
