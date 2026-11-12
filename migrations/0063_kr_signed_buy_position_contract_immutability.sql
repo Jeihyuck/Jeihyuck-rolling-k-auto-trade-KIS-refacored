@@ -21,11 +21,17 @@ BEGIN
     END IF;
     IF ROW(NEW.env, NEW.strategy, NEW.sid, NEW.mode, NEW.code, NEW.market,
            NEW.side, NEW.client_order_key, NEW.position_cycle_id,
-           NEW.portfolio_epoch_id, NEW.trading_epoch_id)
+           NEW.portfolio_epoch_id, NEW.trading_epoch_id, NEW.qty,
+           NEW.ord_type, NEW.entry_reason, NEW.entry_style_selected,
+           NEW.entry_decision_family, NEW.entry_rule_version,
+           NEW.stop_price_at_entry, NEW.pivot_price_at_entry)
        IS DISTINCT FROM
        ROW(OLD.env, OLD.strategy, OLD.sid, OLD.mode, OLD.code, OLD.market,
            OLD.side, OLD.client_order_key, OLD.position_cycle_id,
-           OLD.portfolio_epoch_id, OLD.trading_epoch_id)
+           OLD.portfolio_epoch_id, OLD.trading_epoch_id, OLD.qty,
+           OLD.ord_type, OLD.entry_reason, OLD.entry_style_selected,
+           OLD.entry_decision_family, OLD.entry_rule_version,
+           OLD.stop_price_at_entry, OLD.pivot_price_at_entry)
        OR NEW.request_json::jsonb -> 'entry_exit_plan'
           IS DISTINCT FROM OLD.request_json::jsonb -> 'entry_exit_plan'
        OR NEW.request_json::jsonb -> 'entry_contract_sha256'
