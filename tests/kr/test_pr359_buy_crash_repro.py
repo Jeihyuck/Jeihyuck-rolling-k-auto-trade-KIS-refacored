@@ -1,7 +1,7 @@
 """Exercise the real signed PB1 BUY reconciliation crash/replay path."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
-from threading import Barrier
+from threading import Barrier, local
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -198,11 +198,16 @@ def test_concurrent_signed_buy_reconciliation_rejects_stale_watermark_and_applie
     row = _buy_row(code, odno)
     monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
     barrier = Barrier(2)
+    thread_state = local()
     original_lookup = OrdersRepo.get_order_by_kis_odno_scoped
 
     def synchronized_lookup(self, *args, **kwargs):
         result = original_lookup(self, *args, **kwargs)
-        if result and str(result.get("order_id") or "") == order_id:
+        if (
+            result and str(result.get("order_id") or "") == order_id
+            and not getattr(thread_state, "waited", False)
+        ):
+            thread_state.waited = True
             barrier.wait(timeout=15)
         return result
 
