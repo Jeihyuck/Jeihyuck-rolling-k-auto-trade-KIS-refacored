@@ -1850,6 +1850,10 @@ def run_trade_tick(
         now = datetime.fromisoformat(force_now).astimezone(NY_TZ)
     else:
         now = now_ny()
+    # Preserve the upstream session/PREP permission BEFORE the opening policy
+    # overwrites it. A simultaneous denied runtime gate must never be mislabeled
+    # as the normal 09:30-10:00 ET BUY opening restriction.
+    entry_permission_before_opening = bool(entry_can_proceed)
     opening_buy_blocked, opening_buy_start_et = _is_us_opening_buy_blocked(now)
     if opening_buy_blocked:
         entry_can_proceed = False
@@ -3693,7 +3697,8 @@ def run_trade_tick(
         # not execution/liveness failure. Every other failed guard remains
         # degraded until its own original evidence proves otherwise.
         opening_policy_only = bool(
-            opening_buy_blocked and not reconcile_entry_block
+            opening_buy_blocked and entry_permission_before_opening
+            and not reconcile_entry_block
             and session_entry_allowed is not False and bool(exit_can_proceed)
             and not recon.get("block_new_entry", False)
             and bool(balance_circuit.get("entry_can_proceed", False))
