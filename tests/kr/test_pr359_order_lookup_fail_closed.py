@@ -1,6 +1,5 @@
 """Order-state reads used by trading must never turn DB errors into empty sets."""
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import pytest
 import sqlalchemy as sa
@@ -63,9 +62,9 @@ def test_practice_order_lookups_fail_closed_even_if_global_fail_open_is_enabled(
             "practice", "client-key",
         ),
     }
-    for name, lookup in lookups.items():
+    for lookup in lookups.values():
         with pytest.raises(RuntimeError, match="INJECTED_ORDER_LOOKUP_DB_TIMEOUT"):
-            lookup(), name
+            lookup()
 
 
 def test_session_marker_lookup_does_not_fail_open_to_false(monkeypatch):
