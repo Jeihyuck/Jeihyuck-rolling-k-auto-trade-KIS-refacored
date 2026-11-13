@@ -66,6 +66,11 @@ def test_actual_time_itemconclusion_source_is_independently_observed(monkeypatch
 
     monkeypatch.setattr(kis_wrapper, "KisAPI", FakeKis)
     monkeypatch.setenv("KIS_ENV", "practice")
+    # main() intentionally forces process-wide NO_TRADE, which must not leak
+    # into later PB1 order-path regression tests in this pytest worker.
+    for key in ("NO_TRADE", "LIVE_TRADING_ENABLED",
+                "KR_LIVE_TRADING_ENABLED", "KR_ORDER_ARMED"):
+        monkeypatch.setenv(key, "0")
     monkeypatch.setattr(sys, "argv", ["probe", "--code", "219130", "--require-native-row"])
     probe.main()
     report = json.loads(capsys.readouterr().out)
@@ -101,6 +106,11 @@ def test_missing_native_trade_row_remains_not_attested_and_exits_nonzero(monkeyp
 
     monkeypatch.setattr(kis_wrapper, "KisAPI", NoNativeKis)
     monkeypatch.setenv("KIS_ENV", "practice")
+    # main() intentionally forces process-wide NO_TRADE, which must not leak
+    # into later PB1 order-path regression tests in this pytest worker.
+    for key in ("NO_TRADE", "LIVE_TRADING_ENABLED",
+                "KR_LIVE_TRADING_ENABLED", "KR_ORDER_ARMED"):
+        monkeypatch.setenv(key, "0")
     monkeypatch.setattr(sys, "argv", ["probe", "--code", "219130", "--require-native-row"])
     with pytest.raises(SystemExit) as exc:
         probe.main()
