@@ -2669,6 +2669,77 @@ def route_order(
                 "intent": intent,
             }
         intent.setdefault("meta", {})["execution_action_key"] = claim.action_key
+        if (
+            side == "SELL"
+            and str(intent.get("strategy_owner") or "").upper() == "US_STANDARD"
+            and (intent.get("meta") or {}).get("tp_pending_deferred_to_claim") is True
+        ):
+            # No PENDING reservation existed before this point: any failure
+            # before Claim acquisition leaves only an intent, never a stranded
+            # TP stage. A durable Claim plus an exact scoped stage are required
+            # before any broker-send event or HTTP access.
+            try:
+                from trader.us.db.repos import reserve_us_profit_capture_stage_after_claim
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _claim_tp_meta = intent.get("meta") or {}
+                _claim_tp_stage = str(_claim_tp_meta.get("profit_capture_stage") or "").lower()
+                _claim_tp_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or _claim_tp_meta.get("position_lifecycle_id") or ""),
+                    _claim_tp_meta, client_order_key=str(order_key or ""),
+                )
+                _claim_tp_reserved = reserve_us_profit_capture_stage_after_claim(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=_claim_tp_stage, position_lifecycle_id=_claim_tp_cycle,
+                    client_order_key=str(order_key or ""),
+                    attempt_id=str(intent.get("submit_attempt_id") or ""),
+                    action_key=claim.action_key,
+                    qty=int(qty), notional_usd=float(qty * price),
+                )
+            except Exception as _tp_reserve_exc:
+                _claim_tp_reserved = False
+                logger.error(
+                    "[US_PROFIT_CAPTURE][CLAIM_STAGE_RESERVE_FAILED] symbol=%s "
+                    "type=%s action=ABORT_BEFORE_HTTP",
+                    symbol_upper, type(_tp_reserve_exc).__name__,
+                )
+            if not _claim_tp_reserved:
+                # No TP is released here: the exact same attempt is finalized
+                # pre-HTTP, and the next eligible tick may rebuild a decision.
+                # A failed abort event or Claim release is UNKNOWN and fenced.
+                _tp_abort_ok = False
+                _tp_claim_released = False
+                try:
+                    from trader.us.execution.order_journal import append_order_event
+                    append_order_event(
+                        "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
+                        broker_status="TP_CLAIM_STAGE_RESERVATION_FAILED",
+                        require_db=_native_kis,
+                    )
+                    _tp_abort_ok = True
+                except Exception:
+                    logger.exception("[US_PROFIT_CAPTURE][CLAIM_RESERVE_ABORT_JOURNAL_UNAVAILABLE]")
+                try:
+                    from trader.us.db.repos import release_execution_action_before_submit
+                    release_execution_action_before_submit(
+                        claim_identity, attempt_id=intent["submit_attempt_id"],
+                    )
+                    _tp_claim_released = True
+                except Exception:
+                    logger.exception("[US_PROFIT_CAPTURE][CLAIM_RESERVE_RELEASE_FAILED]")
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason="tp_stage_claim_reservation_failed_before_http")
+                return {
+                    "status": "ORDER_DISABLED_TP_STAGE_RESERVATION_FAILED",
+                    "broker_submit": False, "retry_order": False,
+                    "requires_reconcile": not (_tp_abort_ok and _tp_claim_released),
+                    "intent": intent,
+                }
+            intent.setdefault("meta", {})["tp_claim_stage_reserved"] = True
+            logger.info(
+                "[US_PROFIT_CAPTURE][CLAIM_STAGE_RESERVED] symbol=%s stage=%s "
+                "key=%s action=ALLOW_PRE_HTTP_GUARDS",
+                symbol_upper, _claim_tp_stage, str(order_key or ""),
+            )
     except Exception as exc:
         logger.critical("[US_ORDER][EXECUTION_CLAIM][UNAVAILABLE] broker_submit=blocked err=%s", exc)
         return {
