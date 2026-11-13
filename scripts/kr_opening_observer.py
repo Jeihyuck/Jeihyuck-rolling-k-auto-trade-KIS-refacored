@@ -125,7 +125,9 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
         return {"state": "OUTSIDE_SESSION", "completed": 0, "unknown": len(codes)}
     scope = get_account_key(env="practice")
     done, unknown, coverage_ok, missing_vwap = 0, 0, 0, 0
+    symbol_scan_sec: list[float] = []
     for code in codes:
+        symbol_started = time.monotonic()
         if str(code).zfill(6) == "122630":
             # Separate owner: never collect KR_INFINITE by PB1 proof route.
             continue
@@ -157,7 +159,12 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             if not isinstance(quote, dict):
                 quote = {}
             raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
-            vwap = quote.get("wghn_avrg_stck_prc") or raw.get("wghn_avrg_stck_prc")
+            vwap = (
+                quote["wghn_avrg_stck_prc"]
+                if "wghn_avrg_stck_prc" in quote
+                else raw.get("wghn_avrg_stck_prc")
+            )  # Never silently replace an explicit invalid top-level source.
+            quote_origin = str(quote.get("source") or raw.get("source") or "UNKNOWN")
             # Native weighted-average price is evidence only when its quote
             # timestamp/date can be checked. A cached/WS value with no
             # native clock MUST NOT be labeled fresh by assumption.
@@ -190,10 +197,13 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             logger.info(
                 "[KR][OPENING_OBSERVER][COVERAGE] code=%s state=%s reason=%s "
                 "opening_count=%s post_open_count=%s bar_age_sec=%s "
-                "vwap_verified=%s read_only=1",
+                "vwap_verified=%s vwap_origin=%s day_present=%s "
+                "exchange_clock_present=%s read_only=1",
                 code, coverage["state"], coverage["reason"],
                 coverage["opening_count"], coverage["post_open_count"],
                 coverage["latest_bar_age_sec"], int(verified_vwap),
+                quote_origin, int(bool(quote_day)),
+                int(bool(quote.get("stck_cntg_hour") or raw.get("stck_cntg_hour"))),
             )
             if result["bars"] > 0:
                 done += 1
@@ -211,10 +221,26 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
                 "action=NO_TIMING_PROOF",
                 code, type(exc).__name__,
             )
+        finally:
+            elapsed_for_symbol = time.monotonic() - symbol_started
+            symbol_scan_sec.append(elapsed_for_symbol)
+            logger.info(
+                "[KR][OPENING_OBSERVER][SYMBOL_LATENCY] code=%s elapsed_sec=%.3f",
+                code, elapsed_for_symbol,
+            )
         # This independent collector is rate-limited and does not delay SELL.
         if sleep_between > 0:
             time.sleep(max(sleep_between, 0.0))
-    return {"state": "COMPLETE", "completed": done, "unknown": unknown, "coverage_ok": coverage_ok, "vwap_unverified": missing_vwap}
+    ordered_latencies = sorted(symbol_scan_sec)
+    p95 = (ordered_latencies[max(0, int((len(ordered_latencies) * 0.95 + 0.999999)) - 1)]
+           if ordered_latencies else None)
+    return {
+        "state": "COMPLETE", "completed": done, "unknown": unknown,
+        "coverage_ok": coverage_ok, "vwap_unverified": missing_vwap,
+        "symbol_scan_p95_sec": p95,
+        "symbol_scan_max_sec": ordered_latencies[-1] if ordered_latencies else None,
+        "native_quote_requests_added": 0,
+    }
 
 
 def main() -> None:
@@ -250,9 +276,11 @@ def main() -> None:
         elapsed = time.monotonic() - cycle_started
         logger.info(
             "[KR][OPENING_OBSERVER][PASS] completed=%s unknown=%s "
-            "coverage_ok=%s vwap_unverified=%s elapsed_sec=%.1f target_period_sec=%.1f",
+            "coverage_ok=%s vwap_unverified=%s symbol_p95_sec=%s "
+            "symbol_max_sec=%s elapsed_sec=%.1f target_period_sec=%.1f",
             result["completed"], result["unknown"], result["coverage_ok"],
-            result["vwap_unverified"], elapsed,
+            result["vwap_unverified"], result["symbol_scan_p95_sec"],
+            result["symbol_scan_max_sec"], elapsed,
             max(60.0, float(args.interval_sec)),
         )
         # Schedule from the *start* of the last 30-symbol scan, not from
