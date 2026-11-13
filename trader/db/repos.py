@@ -5357,8 +5357,11 @@ class FillsRepo:
         op_name: str,
         fail_open: bool | None = None,
     ) -> list[dict]:
-        if fail_open is None:
-            fail_open = _resolve_fill_fail_open()
+        if fail_open:
+            logger.error("[FILLS][LOOKUP_FAIL_OPEN_REJECTED] op=%s", op_name)
+        # A missing fill row is not equivalent to a failed fill read. Never
+        # let an outage erase broker execution evidence from the decision path.
+        fail_open = False
         self._last_read_fail_open_op = None
         try:
             rows, fail_open_triggered = safe_read_mappings(
@@ -5421,7 +5424,7 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == str(code).zfill(6))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
-        fail_open = _resolve_lookup_fail_open(env)
+        fail_open = False
         try:
             return self._read_mappings_with_guard(
                 stmt,
@@ -5488,7 +5491,7 @@ class FillsRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="fills.list_fills_in_window",
-            fail_open=_resolve_fill_fail_open(),
+            fail_open=False,
         )
 
     def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
@@ -5515,7 +5518,7 @@ class FillsRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="fills.list_latest_buy_fills_by_codes",
-            fail_open=_resolve_fill_fail_open(),
+            fail_open=False,
         )
         for row in rows:
             item = dict(row)
@@ -5576,7 +5579,7 @@ class FillsRepo:
         )
         latest: dict[str, dict] = {}
         for row in self._read_mappings_with_guard(stmt, op_name="fills.list_latest_buy_fills_by_cycles",
-                                                   fail_open=_resolve_fill_fail_open()):
+                                                   fail_open=False):
             item = dict(row)
             code = str(item.get("code") or "").zfill(6)
             if code not in latest:
@@ -5911,7 +5914,9 @@ class FillsRepo:
             .order_by(self._schema.fills.c.filled_at.desc(), self._schema.fills.c.created_at.desc())
             .limit(lookback_n)
         )
-        rows, _ = safe_read_mappings(self.engine, stmt, op_name="fills_latest_buy_entry_exit_plan", fail_open=True)
+        rows = self._read_mappings_with_guard(
+            stmt, op_name="fills_latest_buy_entry_exit_plan", fail_open=False,
+        )
         for row in rows or []:
             raw_json = (row or {}).get("raw_json") or {}
             if isinstance(raw_json, str):
