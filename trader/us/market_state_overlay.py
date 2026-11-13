@@ -1005,7 +1005,7 @@ def resolve_profit_capture_stage_quantity(
     return min(runner_capacity, stage_qty)
 
 
-def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None) -> list[dict]:
+def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None, *, defer_pending_until_claim: bool = False) -> list[dict]:
     from decimal import Decimal
     from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
     from trader.us.strategy_ownership import exclude_non_standard
@@ -1250,6 +1250,14 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                             pending_intent.setdefault("meta", {})[
                                 "legacy_nine_tp_pending_deferred"
                             ] = True
+                        elif defer_pending_until_claim:
+                            # Native US_STANDARD execution: decision is NOT a
+                            # submission. Only the one acquired Claim may
+                            # reserve this stage, immediately before broker
+                            # submission. Pre-Claim rejection cannot strand
+                            # a phantom PENDING TP. Legacy V2 KIS-proof-only
+                            # reservations retain their separate path.
+                            pending_intent["meta"]["tp_pending_deferred_to_claim"] = True
                         else:
                             try:
                                 from trader.us.db.repos import mark_us_profit_capture_stage
