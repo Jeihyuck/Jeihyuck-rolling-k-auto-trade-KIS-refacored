@@ -285,3 +285,68 @@ def test_tp_stage_journal_failure_keeps_broker_economics_and_retries_stage(monke
     assert position["qty"] == 7
     assert position["position_meta"]["kr_tp1_pending"] is False
     assert len(calls) == 2 and all(conn is not None for conn in calls)
+
+
+def test_unpriced_native_sell_quantity_and_order_watermark_share_transaction(monkeypatch, isolated_engine):
+    engine = isolated_engine
+    pos, order_id = _accepted_sell(
+        engine, code="251970", ordered_qty=17, pre_qty=17,
+        avg_price=68400.0, odno="0000040226", order_key="pr359-unpriced-sell",
+    )
+    row = {
+        "pdno": "251970", "sll_buy_dvsn_cd": "01", "ord_qty": "17",
+        "tot_ccld_qty": "10",
+        "odno": "0000040226", "ord_dt": "20261022", "ord_tmd": "151810",
+        "ord_stat_cd": "PARTIAL_FILLED", "market": "J", "cncl_yn": "N",
+    }
+    kis = KISDailyReplay(row)
+    ctx = RunContext(
+        run_id=None, env="practice", strategy="pb1_pullback_close",
+        started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+        dry_run=True,
+    )
+    schema = schema_for_engine(engine)
+    monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("INJECTED_UNPRICED_SELL_POSITION_FAILURE")
+
+    with monkeypatch.context() as failures:
+        failures.setattr(PositionsRepo, "reconcile_sell_execution", crash)
+        with pytest.raises(RuntimeError, match="INJECTED_UNPRICED_SELL_POSITION_FAILURE"):
+            rk.reconcile_today(
+                engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
+            )
+
+    with engine.connect() as conn:
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
+        )).mappings().one()
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        )).mappings().one()
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).all()
+    assert position["qty"] == 17
+    assert order["status"] == "ACKED"
+    assert _json_dict_for_test(order["response_json"]).get("confirmed_fill_qty") is None
+    assert fills == []
+
+    rk.reconcile_today(
+        engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
+    )
+    with engine.connect() as conn:
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
+        )).mappings().one()
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        )).mappings().one()
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).all()
+    assert position["qty"] == 7
+    assert order["status"] == "PARTIAL_FILLED"
+    assert int(_json_dict_for_test(order["response_json"])["confirmed_fill_qty"]) == 10
+    assert fills == [], "quantity-only KIS proof must not fabricate a priced fill"
