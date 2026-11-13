@@ -1216,10 +1216,24 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     if prior_order_keys and not (
                         last_stage == stage and (pre_http_abort or broker_terminal)
                     ):
+                        # No time-based auto-unfence or synthetic KIS terminal.
+                        # Surface the *exact* stage ledger evidence so AM/Close
+                        # read-only reconciliation can distinguish prior
+                        # intent-only attempts from possible broker submissions.
+                        # This is diagnostic only: unrelated symbol SELLs proceed.
                         logger.warning(
                             "[US_PROFIT_CAPTURE][RETRY_FENCED] symbol=%s stage=%s "
-                            "prior_attempts=%d reason=NO_PROVEN_PRE_HTTP_ABORT",
-                            sym, stage, len(prior_order_keys),
+                            "owner=US_STANDARD lifecycle=%s attempts=%d "
+                            "last_key=%s stage_key=%s broker_order_no=%s "
+                            "last_stage=%s last_status=%s last_evidence=%s "
+                            "reason=NO_PROVEN_PRE_HTTP_ABORT "
+                            "action=RECONCILE_REQUIRED scope=THIS_TP_STAGE "
+                            "next=VERIFY_ORIGINAL_KIS_AND_DURABLE_ATTEMPT_AT_AM_CLOSE",
+                            sym, stage, lifecycle, len(prior_order_keys),
+                            prior_order_keys[-1], durable_stage_key or "NONE",
+                            durable_broker_no or "NONE",
+                            last_stage or "NONE", last_status or "NONE",
+                            last_evidence or "NONE",
                         )
                         break
                     order_key = base_order_key if not prior_order_keys else f"{base_order_key}_R{len(prior_order_keys) + 1}"
