@@ -3689,9 +3689,33 @@ def run_trade_tick(
         entry_degraded_reason = "DAILY_NOTIONAL_UNAVAILABLE"
         logger.error("[US_ENTRY][BLOCK] reason=DAILY_NOTIONAL_UNAVAILABLE error=%s", daily_notional_load_error)
     elif reconcile_entry_block or not entry_can_proceed:
-        entry_degraded = True
-        entry_degraded_reason = str(ack_gate["reason"] or "entry_can_proceed_false") if reconcile_entry_block else "entry_can_proceed_false"
-        logger.info("[US_ENTRY][SKIP] session=%s tick=%s reason=%s", session, tick_index, entry_degraded_reason)
+        # Opening BUY suppression is intentional 09:30-10:00 ET policy,
+        # not execution/liveness failure. Every other failed guard remains
+        # degraded until its own original evidence proves otherwise.
+        opening_policy_only = bool(
+            opening_buy_blocked and not reconcile_entry_block
+            and not recon.get("block_new_entry", False)
+            and bool(balance_circuit.get("entry_can_proceed", False))
+            and bool(daily_notional_available)
+            and not fills_contract_error and not fills_temp_error
+            and not locals().get("_early_pilot_stream_incomplete", False)
+            and not entry_block_reason
+            and not locals().get("system_invariant_failure")
+        )
+        if opening_policy_only:
+            entry_degraded = False
+            entry_degraded_reason = ""
+            entry_policy_block_reason = "OPENING_30MIN_BUY_BLOCK"
+            logger.info("[US_ENTRY][POLICY_BLOCKED] session=%s tick=%s reason=%s liveness=OK",
+                        session, tick_index, entry_policy_block_reason)
+        else:
+            entry_degraded = True
+            entry_degraded_reason = (
+                str(ack_gate["reason"] or "reconcile_entry_block")
+                if reconcile_entry_block else str(entry_block_reason or "entry_can_proceed_false")
+            )
+            logger.warning("[US_ENTRY][DEGRADED_SKIP] session=%s tick=%s reason=%s",
+                           session, tick_index, entry_degraded_reason)
     elif after_cutoff:
         last_stage = "entry_cutoff_guard"
         logger.info(
@@ -5150,7 +5174,7 @@ def run_trade_tick(
         ),
         "exit_route_reconcile_required": exit_route_reconcile_required,
         "entry_can_proceed": entry_can_proceed,
-        "entry_block_reason": entry_block_reason,
+        "entry_block_reason": locals().get("entry_policy_block_reason") or entry_block_reason,
         "trade_block_reason": locals().get("trade_block_reason", ""),
         "entry_degraded": entry_degraded,
         "exit_route_liveness_failure": exit_route_liveness_failure,
