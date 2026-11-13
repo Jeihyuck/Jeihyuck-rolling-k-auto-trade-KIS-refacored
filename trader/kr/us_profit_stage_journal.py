@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
@@ -257,6 +258,7 @@ def observe_broker_stage(
     stage: str, client_order_key: str, broker_odno: str,
     cumulative_filled_qty: int, broker_order_accepted: bool,
     broker_fill_source: str, source_trade_date: date,
+    _conn: Any = None,
 ) -> StageJournalResult:
     """Idempotent cumulative KIS fill update for an exact claimed TP order.
 
@@ -282,7 +284,7 @@ def observe_broker_stage(
         return StageJournalResult(False, "BLOCK", str(exc))
     table = schema_for_engine(engine).job_checkpoints
     try:
-        with engine.begin() as conn:
+        with (nullcontext(_conn) if _conn is not None else engine.begin()) as conn:
             key = _key(contract, stage)
             raw = conn.execute(
                 sa.select(table.c.payload).where(table.c.job_key == key)
