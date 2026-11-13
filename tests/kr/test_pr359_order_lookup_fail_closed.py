@@ -29,6 +29,12 @@ def test_practice_order_lookups_fail_closed_even_if_global_fail_open_is_enabled(
     end = start + timedelta(hours=1)
     lookups = {
         "get_open_orders": lambda: repo.get_open_orders("practice"),
+        "get_open_orders_explicit_fail_open": lambda: repo.get_open_orders(
+            "practice", fail_open=True,
+        ),
+        "list_today_orders_explicit_fail_open": lambda: repo.list_today_orders(
+            "practice", fail_open=True,
+        ),
         "has_open_order_for_code": lambda: repo.has_open_order_for_code(
             "practice", "251970", "BUY", date(2026, 11, 13),
         ),
