@@ -334,3 +334,29 @@ def test_stale_approved_signal_cannot_be_refreshed_by_mutating_timestamp_or_orde
     assert pre_submit_timing_check(
         changed_mode, now_epoch=epoch + 3, fresh_ws_quote=quote,
     )[0] is False
+
+
+def test_stale_and_missing_opening_bars_report_native_evidence_without_relaxing_gate():
+    now = datetime(2026, 10, 28, 10, 9, tzinfo=NY)
+    bars = sample_bars()
+    stale = evaluate_price_opportunity(
+        style="ENTRY_PULLBACK", trade_date=DAY, now_et=now,
+        verified_bars=bars, quote=sample_quote(),
+    )
+    assert stale["state"] == "WAIT"
+    assert stale["reason"] == "recent_minute_bars_stale"
+    facts = stale["facts"]
+    assert facts["last_completed_bar"] == bars[-1]["time_et"]
+    assert facts["last_completed_bar_age_sec"] == 360.0
+    assert facts["opening"]["observed_1m"] == 30
+
+    sparse = evaluate_price_opportunity(
+        style="ENTRY_PULLBACK", trade_date=DAY,
+        now_et=datetime(2026, 10, 28, 10, 5, tzinfo=NY),
+        verified_bars=bars[::3], quote=sample_quote(),
+    )
+    assert sparse["state"] == "WAIT"
+    assert sparse["reason"] == "opening_minute_bars_insufficient"
+    assert sparse["facts"]["opening"]["observed_1m"] < 30
+    assert sparse["facts"]["last_completed_bar"] is not None
+    assert sparse["facts"]["last_completed_bar_age_sec"] is not None
