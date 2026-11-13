@@ -2077,6 +2077,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 preview_incremental_qty > 0
                 or (preview_qty and preview_price is not None
                     and (preview_id or cumulative_sell_evidence is not None))
+                or (
+                    preview_qty and request_json.get("kr_us_tp_contract")
+                    and request_json.get("kr_us_tp_stage")
+                )
             )
         )
         defer_signed_buy_order = bool(
@@ -2244,7 +2248,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         defer_native_sell_claim = bool(
             isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order
             and next_confirmed_qty > 0
-            and (incremental_daily_qty > 0 or (filled_qty and filled_price is not None))
+            and (
+                incremental_daily_qty > 0
+                or (filled_qty and filled_price is not None)
+                or (
+                    request_json.get("kr_us_tp_contract")
+                    and request_json.get("kr_us_tp_stage")
+                )
+            )
         )
         observation_error = None
         if not atomic_writer_active and not defer_priced_buy_claim and not defer_native_sell_claim:
