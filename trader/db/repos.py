@@ -3443,10 +3443,15 @@ class OrdersRepo:
         op_name: str,
         fail_open: bool | None = None,
     ) -> list[dict]:
-        if fail_open is None:
-            # OrdersRepo reads participate in idempotency and broker-state
-            # safety. An unavailable DB must never become an empty order set.
-            fail_open = False
+        if fail_open:
+            logger.error(
+                "[ORDERS][LOOKUP_FAIL_OPEN_REJECTED] op=%s",
+                op_name,
+            )
+        # Order state is part of the execution safety boundary. Never allow a
+        # caller or practice-mode environment flag to convert DB failure into
+        # an empty order set.
+        fail_open = False
 
         self._last_read_fail_open_op = None
         try:
