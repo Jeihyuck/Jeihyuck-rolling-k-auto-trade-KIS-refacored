@@ -1675,7 +1675,16 @@ def route_exit_orders_immediately(
                     "result=%s action=NO_TP_RESERVATION",
                     intent.get("symbol"), stage, result.get("status"),
                 )
-            if stage and not _deferred_without_stage:
+            if stage and result.get("tp_stage_released_pre_io") is True:
+                # The repository already wrote an exact aborted-before-HTTP
+                # certificate with row/claim locks. A second generic FAILED
+                # sync would erase that evidence and re-fence the next TP.
+                logger.info(
+                    "[US_PROFIT_CAPTURE][PROVEN_PRE_IO_RELEASE_PRESERVED] "
+                    "symbol=%s stage=%s action=REEVALUATE_NEXT_TICK",
+                    intent.get("symbol"), stage,
+                )
+            if stage and not _deferred_without_stage and result.get("tp_stage_released_pre_io") is not True:
                 from trader.us.profit_capture import sync_profit_capture_stage_from_order
                 # A generic BLOCKED is not proof that this stage has no
                 # broker-open attempt. Only a positively verified pre-submit
