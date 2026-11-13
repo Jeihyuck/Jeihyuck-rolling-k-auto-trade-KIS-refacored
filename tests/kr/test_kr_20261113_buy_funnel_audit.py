@@ -188,3 +188,35 @@ def test_provenance_summary_uses_actual_payload_without_claiming_live_broker_ver
     assert result["entry_style_occurrences"] == {"ENTRY_MOMENTUM": 1}
     assert result["volume_proof_category_occurrences"] == {"DATA_UNVERIFIED": 1}
     assert result["broker_holdings_verified"] is False
+
+
+def test_actual_pre_submit_timing_evidence_distinguishes_wait_and_no_evaluation():
+    evaluated = _skip("219130", "KR_ENTRY_TIMING_NOT_READY_OR_PRICE_TOO_HIGH")
+    evaluated["payload_json"] = {
+        "features": {
+            "entry_style_selected": "MOMENTUM",
+            "entry_timing_evidence": {
+                "evaluated_at_kst": "2026-11-13T12:30:52+09:00",
+                "mode": "ENFORCE", "state": "WAIT",
+                "reason": "NO_CONFIRMED_MOMENTUM_RECLAIM",
+                "is_order_authorization": False,
+            },
+        },
+    }
+    not_evaluated = _skip(
+        "251970", "KR_VOLUME_PROOF_KIS_EXCHANGE_QUOTE_TIME_MISSING",
+        run="different-run",
+    )
+    report = summarize_buy_skips(
+        [evaluated, not_evaluated], trade_date="2026-11-13",
+    )
+    assert report["event_count"] == 2
+    assert report["timing_evaluated_event_count"] == 1
+    assert report["timing_state_event_count"] == {
+        "NOT_EVALUATED_OR_NOT_RECORDED": 1, "WAIT": 1,
+    }
+    assert report["timing_mode_evaluated_event_count"] == {"ENFORCE": 1}
+    assert report["timing_reason_evaluated_event_count"] == {
+        "NO_CONFIRMED_MOMENTUM_RECLAIM": 1,
+    }
+    assert report["broker_holdings_verified"] is False
