@@ -2476,6 +2476,8 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
             ):
                 def _legacy_buy_apply():
+                    nonlocal buy_claim_applied
+
                     def _apply_buy_position(*, _conn=None):
                         kwargs = dict(
                             env=env,
@@ -2525,15 +2527,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                             fills_repo.upsert_fill(**native_fill_kwargs)
                         result = _apply_buy_position()
                         if defer_priced_buy_claim or atomic_writer_active:
-                            _record_execution_claim_observation(
+                            observation_error = _record_execution_claim_observation(
                                 orders_repo=orders_repo, source_order=source_order,
                                 broker_status=status, cumulative_filled_qty=claim_filled_qty,
                                 requested_qty=_to_int((source_order or {}).get("qty")) or qty,
                             )
+                            if observation_error:
+                                raise RuntimeError(
+                                    "KR_NATIVE_BUY_CLAIM_UPDATE_FAILED:" + observation_error
+                                )
+                            buy_claim_applied = True
                         _save_buy_order(None)
                         return result
 
-                    nonlocal buy_claim_applied
                     with fills_repo.engine.begin() as conn:
                         _lock_buy_order_watermark(conn)
                         if native_fill_kwargs is not None:
