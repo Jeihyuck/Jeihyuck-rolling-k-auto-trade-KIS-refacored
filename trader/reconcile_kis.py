@@ -2071,21 +2071,10 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         preview_previous_qty = max(
             0, _to_int(source_response.get("confirmed_fill_qty")) or 0
         )
-        preview_incremental_qty = (
-            max(0, preview_cumulative_qty - preview_previous_qty)
-            if preview_cumulative_qty is not None else int(preview_qty or 0)
-        )
         defer_sell_order = bool(
             isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order
-            and (
-                preview_incremental_qty > 0
-                or (preview_qty and preview_price is not None
-                    and (preview_id or cumulative_sell_evidence is not None))
-                or (
-                    preview_qty and request_json.get("kr_us_tp_contract")
-                    and request_json.get("kr_us_tp_stage")
-                )
-            )
+            and preview_qty and preview_price is not None
+            and (preview_id or cumulative_sell_evidence is not None)
         )
         preview_buy_applied_ids = set(source_response.get("applied_broker_fill_ids") or [])
         preview_buy_previous_notional = _to_float(
@@ -2270,15 +2259,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
         )
         defer_native_sell_claim = bool(
             isinstance(engine, sa.engine.Engine) and side == "SELL" and source_order
-            and next_confirmed_qty > 0
-            and (
-                incremental_daily_qty > 0
-                or (filled_qty and filled_price is not None)
-                or (
-                    request_json.get("kr_us_tp_contract")
-                    and request_json.get("kr_us_tp_stage")
-                )
-            )
+            and filled_qty and filled_price is not None and next_confirmed_qty > 0
         )
         observation_error = None
         if not atomic_writer_active and not defer_priced_buy_claim and not defer_native_sell_claim:
@@ -2298,7 +2279,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 )
         execution_meta_update = request_json.get("execution_meta_update")
         execution_action = str(request_json.get("semantic_action") or "").strip()
-        if side == "SELL" and source_order and execution_action and isinstance(execution_meta_update, dict) and not defer_native_sell_claim:
+        if (
+            side == "SELL" and source_order and execution_action
+            and isinstance(execution_meta_update, dict)
+            and not defer_native_sell_claim
+            and not (request_json.get("kr_us_tp_contract") and request_json.get("kr_us_tp_stage"))
+        ):
             try:
                 _project_pb1_exit_stage_truth(
                     orders_repo=orders_repo,
@@ -3149,6 +3135,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         "status=%s cumulative=%s order=%s",
                         code, tp_stage, tp_update.status, next_confirmed_qty, original_odno,
                     )
+                    if execution_action and isinstance(execution_meta_update, dict):
+                        _project_pb1_exit_stage_truth(
+                            orders_repo=orders_repo,
+                            positions_repo=positions_repo,
+                            env=env,
+                            code=code,
+                            strategy=str(source_order.get("strategy") or strategy),
+                            source_order=source_order,
+                            request_json=request_json,
+                        )
                 except Exception as tp_err:
                     logger.exception(
                         "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s "
