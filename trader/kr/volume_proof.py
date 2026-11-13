@@ -281,6 +281,11 @@ def build_kr_volume_proof(
         if info.get("vol_ok") is not True:
             return reject("breakout_volume_trigger_missing")
         proof["breakout_volume_confirmed"] = True
+    # Quote provenance is a necessary part of VERIFIED economic evidence.
+    # Legacy synthetic dictionaries may still exercise diagnostics above,
+    # but unknown transport cannot ever authorize an operational KR BUY.
+    if source == "UNKNOWN":
+        return reject("kis_quote_source_unverified")
     proof["confirmation_state"] = "VERIFIED"
     proof["failure_reason"] = None
     proof["failure_category"] = None
