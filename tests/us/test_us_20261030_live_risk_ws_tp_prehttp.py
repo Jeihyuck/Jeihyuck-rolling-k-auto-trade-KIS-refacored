@@ -1177,6 +1177,32 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
         trade_date=date.fromisoformat(retry_date),
     )
     assert retry_identity.action_key == identity.action_key
+    if repeat_partial and abort_retry_before_http and not retry_next_day:
+        # Two independent workers race to continue this exact economic TP.
+        # PostgreSQL Claim/CAS may grant one three-share attempt, never two.
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        barrier = Barrier(2)
+        def acquire_contender(suffix):
+            fresh_repo = DurableExecutionClaimRepo(
+                pg_engine, us_execution_claims, us_execution_attempts,
+            )
+            barrier.wait(timeout=10)
+            return fresh_repo.acquire(
+                retry_identity, attempt_id=retry_attempt + suffix,
+                requested_qty=3, fresh_validation=True,
+                client_order_key=retry_key + suffix,
+            )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(acquire_contender, ("_A", "_B")))
+        assert sum(result.acquired for result in outcomes) == 1
+        with pg_engine.connect() as conn:
+            active_count = conn.execute(text("""
+                SELECT COUNT(*) FROM us_execution_attempts
+                 WHERE action_key=:action AND attempt_state='CREATED'
+            """), {"action": identity.action_key}).scalar_one()
+        assert active_count == 1
+        return
     assert ledger.acquire(
         retry_identity, attempt_id=retry_attempt, requested_qty=3,
         fresh_validation=True, client_order_key=retry_key,
