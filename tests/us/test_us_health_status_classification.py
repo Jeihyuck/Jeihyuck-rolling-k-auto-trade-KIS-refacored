@@ -201,3 +201,22 @@ def test_opening_policy_close_ok_without_hiding_reconcile(tmp_path, monkeypatch)
         final_balance={"positions": []}, final_positions=[], kis_fills=[],
     )
     assert blocked["status"] == "FAILED_RECONCILE"
+
+
+def test_policy_block_never_masks_a_failed_protective_sell():
+    from trader.us.runner.status_contract import classify_runtime_integrity
+    base = {
+        "entry_can_proceed": False,
+        "entry_block_reason": "OPENING_30MIN_BUY_BLOCK",
+        "entry_degraded": False,
+    }
+    assert classify_runtime_integrity(base) == "POLICY_ENTRY_BLOCKED"
+    assert classify_runtime_integrity({
+        **base, "exit_route_liveness_failure": True,
+    }) == "LIVENESS_DEGRADED"
+    assert classify_runtime_integrity({
+        **base, "entry_degraded": True,
+    }) == "LIVENESS_DEGRADED"
+    assert classify_runtime_integrity({
+        **base, "exit_route_reconcile_required": True,
+    }) == "RECONCILE_REQUIRED"
