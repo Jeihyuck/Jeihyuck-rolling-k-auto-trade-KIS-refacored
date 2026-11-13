@@ -88,6 +88,16 @@ def test_attested_rest_request_binding_without_clock_still_fails_closed():
     assert proof["failure_reason"] == "kis_exchange_quote_time_missing"
 
 
+def test_unknown_source_even_with_valid_clock_never_authorizes_buy():
+    proof = _proof({
+        "acml_vol": 2000, "stck_cntg_hour": "122900",
+        "received_at": NOW.timestamp(),
+    })
+    assert proof["confirmation_state"] == "UNKNOWN"
+    assert proof["failure_reason"] == "kis_quote_source_unverified"
+    assert proof["quote_source"] == "UNKNOWN"
+
+
 def test_spoofed_rest_source_label_alone_does_not_authorize_buy():
     proof = _proof({
         "source": "KIS_REST_INQUIRE_PRICE", "acml_vol": 2000,
