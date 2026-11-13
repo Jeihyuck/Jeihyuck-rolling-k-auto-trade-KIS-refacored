@@ -46,7 +46,7 @@ def isolated_engine(request):
         admin.dispose()
 
 
-@pytest.mark.parametrize("failure_point", ["position", "claim", "order", "tp_stage"])
+@pytest.mark.parametrize("failure_point", ["position", "claim", "order"])
 def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, failure_point, isolated_engine):
     engine = isolated_engine
     pos, order_id = _accepted_sell(
@@ -61,25 +61,6 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
     }
     kis = KISDailyReplay(row)
     schema = schema_for_engine(engine)
-    if failure_point == "tp_stage":
-        with engine.begin() as conn:
-            source = conn.execute(sa.select(schema.orders).where(
-                schema.orders.c.order_id == order_id
-            )).mappings().one()
-            request = dict(source["request_json"] or {})
-            request.update({
-                "kr_us_tp_contract": {
-                    "activation_mode": "ACTIVE_PRACTICE",
-                    "position_cycle_id": str(pos["position_cycle_id"]),
-                    "trading_epoch_id": str(source["trading_epoch_id"]),
-                    "sha256": "test-contract",
-                },
-                "kr_us_tp_stage": "TP1",
-                "kr_us_tp_trade_date": "2026-10-22",
-            })
-            conn.execute(sa.update(schema.orders).where(
-                schema.orders.c.order_id == order_id
-            ).values(request_json=request))
     ctx = RunContext(run_id=None, env="practice", strategy="pb1_pullback_close",
                      started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")), dry_run=True)
     monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
@@ -92,16 +73,6 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
             failures.setattr(OrdersRepo, "record_execution_claim_for_order", crash)
         elif failure_point == "order":
             failures.setattr(OrdersRepo, "upsert_reconciled_order", crash)
-        else:
-            import trader.kr.us_profit_stage_journal as stage_journal
-            import trader.kr.us_standard_profit_parity as parity
-            failures.setattr(parity, "verified_contract", lambda *_a, **_k: True)
-            failures.setattr(
-                stage_journal, "observe_broker_stage",
-                lambda **_kwargs: SimpleNamespace(
-                    accepted=False, status="BLOCK", reason="INJECTED_FAILURE"
-                ),
-            )
         with pytest.raises(RuntimeError, match="INJECTED_FAILURE"):
             rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
     with engine.connect() as conn:
@@ -113,22 +84,8 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
     assert position["qty"] == 17
     assert fills == [], "native fill committed although position update failed"
     assert order["status"] == "ACKED", "order state advanced despite failed settlement"
-    if failure_point == "tp_stage":
-        import trader.kr.us_profit_stage_journal as stage_journal
-        import trader.kr.us_standard_profit_parity as parity
-        with monkeypatch.context() as replay:
-            replay.setattr(parity, "verified_contract", lambda *_a, **_k: True)
-            replay.setattr(
-                stage_journal, "observe_broker_stage",
-                lambda **_kwargs: SimpleNamespace(
-                    accepted=True, status="PARTIAL_FILLED", reason="REPLAY_ACCEPTED"
-                ),
-            )
-            for _ in range(2):
-                rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
-    else:
-        for _ in range(2):
-            rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
+    for _ in range(2):
+        rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
     with engine.connect() as conn:
         fills = conn.execute(sa.select(schema.fills).where(schema.fills.c.order_id == order_id)).all()
         position = conn.execute(sa.select(schema.positions).where(
@@ -226,3 +183,105 @@ def _json_dict_for_test(value):
         import json
         return json.loads(value)
     return {}
+
+
+def test_tp_stage_journal_failure_keeps_broker_economics_and_retries_stage(monkeypatch, isolated_engine):
+    engine = isolated_engine
+    pos, order_id = _accepted_sell(
+        engine, code="251970", ordered_qty=17, pre_qty=17,
+        avg_price=68400.0, odno="0000040226", order_key="pr359-tp-journal-retry",
+    )
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        source = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        )).mappings().one()
+        request = dict(source["request_json"] or {})
+        request.update({
+            "kr_us_tp_contract": {
+                "activation_mode": "ACTIVE_PRACTICE",
+                "position_cycle_id": str(pos["position_cycle_id"]),
+                "trading_epoch_id": str(source["trading_epoch_id"]),
+                "sha256": "test-contract",
+            },
+            "kr_us_tp_stage": "TP1",
+            "kr_us_tp_trade_date": "2026-10-22",
+            "profit_capture_stage": "tp1",
+        })
+        conn.execute(sa.update(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        ).values(request_json=request))
+        conn.execute(sa.update(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
+        ).values(position_meta={"kr_tp1_pending": True}))
+
+    row = {
+        "pdno": "251970", "sll_buy_dvsn_cd": "01", "ord_qty": "17",
+        "tot_ccld_qty": "10", "tot_ccld_amt": "685000", "avg_prvs": "68500",
+        "odno": "0000040226", "ord_dt": "20261022", "ord_tmd": "151810",
+        "ord_stat_cd": "PARTIAL_FILLED", "market": "J", "cncl_yn": "N",
+    }
+    kis = KISDailyReplay(row)
+    ctx = RunContext(
+        run_id=None, env="practice", strategy="pb1_pullback_close",
+        started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+        dry_run=True,
+    )
+    monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
+    import trader.kr.us_profit_stage_journal as stage_journal
+    import trader.kr.us_standard_profit_parity as parity
+    calls = []
+
+    def failed_stage(**kwargs):
+        calls.append(kwargs.get("_conn"))
+        return SimpleNamespace(
+            accepted=False, status="BLOCK", reason="INJECTED_STAGE_JOURNAL_FAILURE"
+        )
+
+    with monkeypatch.context() as failure:
+        failure.setattr(parity, "verified_contract", lambda *_a, **_k: True)
+        failure.setattr(stage_journal, "observe_broker_stage", failed_stage)
+        rk.reconcile_today(
+            engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
+        )
+
+    with engine.connect() as conn:
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).mappings().all()
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
+        )).mappings().one()
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        )).mappings().one()
+    assert len(fills) == 1, "TP journal outage must not discard broker-proven fill"
+    assert position["qty"] == 7
+    assert position["position_meta"]["kr_tp1_pending"] is True
+    assert _json_dict_for_test(order["response_json"])["confirmed_fill_qty"] == 10
+    assert calls and all(conn is not None for conn in calls)
+
+    def accepted_stage(**kwargs):
+        calls.append(kwargs.get("_conn"))
+        return SimpleNamespace(
+            accepted=True, status="PARTIAL_FILLED", reason="REPLAY_ACCEPTED"
+        )
+
+    with monkeypatch.context() as replay:
+        replay.setattr(parity, "verified_contract", lambda *_a, **_k: True)
+        replay.setattr(stage_journal, "observe_broker_stage", accepted_stage)
+        rk.reconcile_today(
+            engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
+        )
+
+    with engine.connect() as conn:
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).mappings().all()
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
+        )).mappings().one()
+    assert len(fills) == 1
+    assert position["qty"] == 7
+    assert position["position_meta"]["kr_tp1_pending"] is False
+    assert len(calls) == 2 and all(conn is not None for conn in calls)
