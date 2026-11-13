@@ -39,3 +39,13 @@
 5. Any future safe auto-retry must first atomically prove the exact durable attempt ABORT_PRE_IO or full/partial terminal KIS status, CAS-fence stale attempts, persist scoped fill/remaining TP, and demonstrate concurrency/restart/late-fill PG scenarios. This pass does not claim to have implemented that new live KIS reconciliation.
 
 **Decision**: PR remains DRAFT and MERGE/DEPLOY HOLD. No blanket SHADOW/OFF or trading-policy edits.
+
+
+## 2026-11-13 follow-up: proof precedence / router safety
+
+- GitHub PR #353 base remains `00f182ae9ff86a5615763f05f7a7e184a2e87277`; the PR branch is **not deployed**.
+- `trader/us/runner/status_contract.py`: policy BUY restrictions must not mask an independent failed protective SELL, actual entry fault, or reconciliation requirement. Regression tests cover policy+SELL, policy+unknown ACK, and policy+invariant failure. `trade_tick_runner.py` now preserves the session's inbound permission before applying opening hours, avoiding false EXPECTED classification of a denied upstream gate.
+- `trader/us/execution/order_router.py::_tp_unsubmitted_attempt_may_release_stage`: empty DB queries and a clean current broker balance are **not** evidence of no historical HTTP POST. A release candidate requires an explicit immutable same-key/same-attempt PRE_IO abort, no broker-possible contradictory attempt, and absence of unresolved active claims/other open SELL; the exact ledger row is independently CAS/locked on release. Regression includes empty event list, wrong attempt, unknown late event, actual ACK, and balance reserved by another SELL.
+- **Consequence / pending design step:** Before the router creates a submit attempt, it may be unable to certify a same-attempt PRE_IO abort. Such a fresh pre-submit rejection remains fenced until an atomic intent-only guard-abort lifecycle is implemented and verified. Do **not** count this stricter fail-closed behavior as completed safe automatic retries.
+- Read-only Supabase evidence for **KO/KR TP2** using the full original TP2 client-key pattern returned zero matching `us_order_events`, zero `us_execution_attempts`, and zero `us_orders` rows, despite original `us_profit_capture_lifecycle` TP2 attempt-key metadata. This is **missing evidence**, not an authenticated KIS denial or guaranteed pre-HTTP abort. No PostgreSQL status mutations or KIS GET/POST were performed.
+- GitHub US Harness includes full `tests/us` pytest plus real PostgreSQL integration and an offline KIS-HTTP prohibition check; use final commit workflow conclusions before any merge. Current tests are code-backed but KIS and WSL end-to-end execution remain NOT_VERIFIED.
