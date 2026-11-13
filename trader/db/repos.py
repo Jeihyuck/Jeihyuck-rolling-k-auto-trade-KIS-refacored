@@ -6910,7 +6910,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions._get_position_row",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
         return rows[0] if rows else None
 
@@ -6929,7 +6929,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.list_positions",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
 
     def list_active_positions_for_exit(self, env: str, strategy: str) -> list[dict]:
@@ -6984,7 +6984,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.get_position",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
         return rows[0] if rows else None
 
@@ -7141,7 +7141,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.list_positions_by_codes",
-            fail_open=_resolve_position_fail_open(),
+            fail_open=False,
         )
 
     def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:
