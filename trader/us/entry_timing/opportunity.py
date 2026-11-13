@@ -156,6 +156,18 @@ def evaluate_price_opportunity(
             _asof_bars.append(_bar)
     verified_bars = sorted(_asof_bars, key=lambda b: b["time_et"])
     facts["bar_count"] = len(verified_bars)
+    # Evidence only. Record the latest *completed* native minute and its
+    # observation age even when the entry is deliberately held for missing
+    # opening coverage or stale data. Do not change the strategy threshold.
+    if verified_bars:
+        latest_completed = datetime.fromisoformat(verified_bars[-1]["time_et"]).astimezone(NY)
+        facts["last_completed_bar"] = latest_completed.isoformat()
+        facts["last_completed_bar_age_sec"] = round(
+            (now_et - latest_completed).total_seconds(), 3,
+        )
+    else:
+        facts["last_completed_bar"] = None
+        facts["last_completed_bar_age_sec"] = None
     if now_et.date().isoformat() != trade_date:
         return _decision("WAIT", "trade_date_mismatch", style=style, facts=facts)
     if (now_et.hour, now_et.minute) < (10, 0):
