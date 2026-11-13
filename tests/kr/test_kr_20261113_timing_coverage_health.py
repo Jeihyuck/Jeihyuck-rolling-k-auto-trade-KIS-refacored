@@ -6,7 +6,7 @@ still required before declaring the live timing gate healthy.
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from trader.kr.opening_bar_contract import inspect_completed_bar_coverage
+from trader.kr.opening_bar_contract import inspect_completed_bar_coverage, evaluate_price_aware_entry
 
 KST = ZoneInfo("Asia/Seoul")
 NOW = datetime(2026, 11, 13, 9, 35, tzinfo=KST)
@@ -68,3 +68,32 @@ def test_future_incomplete_candle_is_excluded():
     decision = inspect_completed_bar_coverage(rows=rows, now=NOW)
     assert decision["state"] == "COVERED"
     assert decision["latest_bar_ts"].endswith("09:34:00+09:00")
+
+
+def _entry(rows, *, style="ENTRY_PULLBACK"):
+    return evaluate_price_aware_entry(
+        rows=rows, now=NOW, style=style, vwap=None, vwap_verified=False,
+        setup_ok=True, trigger_ok=False, order_price=100.0,
+    )
+
+
+def test_observer_and_actual_entry_gate_share_missing_opening_semantics():
+    proof = inspect_completed_bar_coverage(rows=bars(10), now=NOW)
+    decision = _entry(bars(10))
+    assert proof["reason"] == decision["reason"]
+    assert proof["state"] == decision["state"] == "UNKNOWN"
+
+
+def test_observer_and_actual_entry_gate_share_stale_minute_semantics():
+    proof = inspect_completed_bar_coverage(rows=bars(30), now=NOW)
+    decision = _entry(bars(30))
+    assert proof["state"] == decision["state"]
+    assert proof["reason"] == decision["reason"] == "COMPLETED_BAR_STALE"
+
+
+def test_coverage_does_not_fake_a_momentum_vwap_or_buy():
+    proof = inspect_completed_bar_coverage(rows=bars(35), now=NOW)
+    decision = _entry(bars(35), style="ENTRY_MOMENTUM")
+    assert proof["state"] == "COVERED"
+    assert decision["state"] == "UNKNOWN"
+    assert decision["reason"] == "NO_VERIFIED_INTRADAY_VWAP"
