@@ -75,6 +75,49 @@ def clean_completed_bars(rows: list[dict], now: datetime) -> list[dict]:
     return [observed[k] for k in sorted(observed)]
 
 
+
+def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
+    """Read-only structural health of the 1m evidence, NOT a BUY/READY signal.
+
+    Mirrors the existing coverage/freshness prerequisites of the price-aware
+    evaluator. The result can be logged for every Final30 symbol even when
+    that symbol never reaches the broker pre-submit gate.
+    """
+    now = now.astimezone(KST)
+    bars = clean_completed_bars(rows, now)
+    opening = [bar for bar in bars if dtime(9, 0) <=
+               datetime.fromisoformat(bar["timestamp"]).time() < dtime(9, 30)]
+    after_open = [bar for bar in bars if
+                  datetime.fromisoformat(bar["timestamp"]).time() >= dtime(9, 30)]
+    info = {
+        "bars": len(bars), "opening_count": len(opening),
+        "post_open_count": len(after_open),
+        "latest_bar_ts": bars[-1]["timestamp"] if bars else None,
+        "latest_bar_age_sec": (
+            round((now - datetime.fromisoformat(bars[-1]["timestamp"])).total_seconds(), 3)
+            if bars else None
+        ),
+    }
+    def outcome(state: str, reason: str) -> dict:
+        return {"state": state, "reason": reason, **info}
+    if now.time() < dtime(9, 30):
+        return outcome("WAIT", "OPENING_OBSERVATION")
+    if (len(opening) < 25
+            or datetime.fromisoformat(opening[0]["timestamp"]).time() > dtime(9, 3)
+            or datetime.fromisoformat(opening[-1]["timestamp"]).time() < dtime(9, 26)):
+        return outcome("UNKNOWN", "OPENING_BARS_MISSING_OR_INCOMPLETE")
+    if not bars:
+        return outcome("UNKNOWN", "NO_CURRENT_BAR")
+    if info["latest_bar_age_sec"] is not None and info["latest_bar_age_sec"] > 180:
+        return outcome("UNKNOWN", "COMPLETED_BAR_STALE")
+    if len(after_open) < 3:
+        return outcome("WAIT", "POST_OPENING_CONFIRMATION_PENDING")
+    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in after_open[-3:]]
+    if any((b - a).total_seconds() != 60 for a, b in zip(stamps, stamps[1:])):
+        return outcome("UNKNOWN", "RECENT_MINUTE_GAP")
+    return outcome("COVERED", "STRUCTURAL_1M_BARS_AVAILABLE")
+
+
 def _result(state: str, reason: str, **extra) -> dict:
     return {"version": VERSION, "state": state, "reason": reason,
             "not_order_authorization": True, **extra}
