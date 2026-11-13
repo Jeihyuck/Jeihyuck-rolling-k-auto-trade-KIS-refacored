@@ -250,6 +250,8 @@ def test_pyramid_add_preserves_original_signed_buy_provenance():
             "submitted_qty": 3,
             "balance_snapshot_id": "kr359-add-snapshot",
             "parent_entry_contract_sha256": root_sha,
+            "parent_position_cycle_id": cycle,
+            "parent_portfolio_epoch_id": portfolio,
             "entry_exit_plan": plan,
         }, status="CREATED", account_id=account,
         portfolio_epoch_id=portfolio, position_cycle_id=cycle,
