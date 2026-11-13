@@ -2793,7 +2793,7 @@ def route_order(
             append_order_event(
                 "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
                 broker_status="DURABLE_STARTED_JOURNAL_FAILED_BEFORE_HTTP",
-                require_db=side == "BUY" and _native_kis,
+                require_db=_require_native_submit_journal,
             )
             _journal_abort_saved = True
         except Exception:
