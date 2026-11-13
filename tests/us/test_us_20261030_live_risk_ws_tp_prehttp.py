@@ -107,7 +107,7 @@ def test_stale_or_missing_live_quotes_never_make_risk_look_normal():
     )
 
 
-def test_tp_pre_http_abort_releases_only_own_pending_intent(monkeypatch):
+def test_tp_pre_http_abort_without_postgres_claim_never_releases_pending_intent(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos.reset_memory_stores()
     args = {
@@ -125,15 +125,17 @@ def test_tp_pre_http_abort_releases_only_own_pending_intent(monkeypatch):
     assert not repos.release_us_profit_capture_pre_http_abort(
         **args, client_order_key="wrong-attempt",
     )
-    assert repos.release_us_profit_capture_pre_http_abort(
+    # An in-memory fixture has neither durable Claim release nor the exact
+    # PRE_IO event: it MUST stay fenced. Positive release is proven by the
+    # migrated-PostgreSQL Claim+event test below, never by this fixture.
+    assert not repos.release_us_profit_capture_pre_http_abort(
         **args, client_order_key="gild-tp1-exact",
     )
     current = repos.load_us_profit_capture_state(
         "2026-10-29", ["GILD"], {"GILD": "life-gild"},
     )["GILD"]
-    assert current["tp1_pending"] is False
+    assert current["tp1_pending"] is True
     assert current["tp1_done"] is False
-    assert current["meta"]["last_evidence_type"] == "BROKER_SUBMIT_ABORTED_PRE_IO"
 
 
 def test_tp_pre_http_abort_cannot_clear_acked_order(monkeypatch):
@@ -328,8 +330,10 @@ def test_gild_tp1_route_pre_http_fence_recovers_only_after_claim_release(
     assert client.http_calls == 0
     assert "BROKER_SUBMIT_ABORTED_PRE_IO" in events
     assert "CLAIM_RELEASE" in events
-    assert state["tp1_pending"] is (not claim_release_ok)
-    assert result["requires_reconcile"] is (not claim_release_ok)
+    # A mocked Claim release does not make an in-memory stage durable.
+    # Both routes must stay blocked despite a PRE_IO callback event.
+    assert state["tp1_pending"] is True
+    assert result["requires_reconcile"] is True
 
 
 # This production-migration fixture uses a disposable CI PostgreSQL database,
@@ -756,9 +760,9 @@ def test_pg_tp_claim_reservation_rearms_only_unsent_intent(pg_engine, monkeypatc
         }
     assert repos.append_us_order_event(event("BROKER_SUBMIT_STARTED", "started"))
     assert repos.verify_us_tp_claim_stage_at_http_boundary(**args)
-    assert not repos.verify_us_tp_claim_stage_at_http_boundary({
-        **args, "attempt_id": "different_attempt",
-    }), "another writer cannot submit against our stage/Claim"
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(
+        **{**args, "attempt_id": "different_attempt"},
+    ), "another writer cannot submit against our stage/Claim"
 
     # Actual broker-possible evidence must never authorize a second POST.
     assert repos.append_us_order_event(event("BROKER_SUBMIT_RESULT_UNKNOWN", "unknown"))
