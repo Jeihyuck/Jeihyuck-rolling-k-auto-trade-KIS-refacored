@@ -37,7 +37,7 @@ def test_trade_close_workflow_is_close_exit_only_contract():
     assert env["DB_STATEMENT_TIMEOUT_MS"] == "15000"
     assert env["DB_IDLE_IN_TX_SESSION_TIMEOUT_MS"] == "15000"
     assert env["DB_IDLE_IN_TX_TIMEOUT_MS"] == "15000"
-    assert env["PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT"] == "1"
+    assert env.get("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", "0") == "0"
     assert env["DRY_RUN"] == "0"
     assert env["DISABLE_LIVE_TRADING"] == "0"
     assert env["LIVE_TRADING_ENABLED"] == "1"
