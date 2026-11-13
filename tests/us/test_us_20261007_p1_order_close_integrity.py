@@ -93,11 +93,36 @@ def test_tp_pre_submit_fence_release_requires_all_sources_clean(monkeypatch):
     monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
     monkeypatch.setattr(order_journal, "load_order_events", lambda td: [])
     intent = _tp_intent()
+    # No journal events is UNKNOWN, never proof that no KIS order was sent.
+    assert not _tp_unsubmitted_attempt_may_release_stage(
+        intent, DATE, _broker_position(qty=2)
+    )
+    intent["submit_attempt_id"] = "attempt-1"
+    monkeypatch.setattr(order_journal, "load_order_events",
+                        lambda td: [{
+                            "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+                            "client_order_key": intent["client_order_key"],
+                            "submit_attempt_id": "attempt-1",
+                        }])
     assert _tp_unsubmitted_attempt_may_release_stage(
         intent, DATE, _broker_position(qty=2)
     )
     assert not _tp_unsubmitted_attempt_may_release_stage(
         intent, DATE, _broker_position(qty=2, orderable=1)
+    )
+    # An actual ACK/UNKNOWN for that same key always wins over the abort.
+    monkeypatch.setattr(order_journal, "load_order_events",
+                        lambda td: [{
+                            "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+                            "client_order_key": intent["client_order_key"],
+                            "submit_attempt_id": "attempt-1",
+                        }, {
+                            "event_type": "BROKER_ACK_RECEIVED",
+                            "client_order_key": intent["client_order_key"],
+                            "submit_attempt_id": "attempt-1",
+                        }])
+    assert not _tp_unsubmitted_attempt_may_release_stage(
+        intent, DATE, _broker_position(qty=2)
     )
     monkeypatch.setattr(repos, "load_pending_ack_orders_result",
                         lambda td: {"status": "DB_ERROR", "error": "database timeout", "orders": []})
@@ -315,3 +340,32 @@ def test_real_router_pre_submit_msft_tp2_does_not_call_kis_sell(monkeypatch):
     assert result["guard_reason"] == "fresh_tp_stage_quantity_or_runner_limit", result
     assert result["safe_to_release_tp_pending"] is False
     assert kis.sell_calls == []
+
+
+def test_tp_pre_submit_no_event_or_other_attempt_cannot_release(monkeypatch):
+    from trader.us.execution import order_journal
+    monkeypatch.setattr(repos, "load_pending_ack_orders_result",
+                        lambda td: {"status": "OK", "orders": []})
+    monkeypatch.setattr(repos, "load_active_execution_claim_attempts", lambda: [])
+    intent = _tp_intent()
+    intent["submit_attempt_id"] = "current"
+    for events in (
+        [],
+        [{"event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+          "client_order_key": intent["client_order_key"],
+          "submit_attempt_id": "old"}],
+        [{"event_type": "BROKER_SUBMIT_STARTED",
+          "client_order_key": intent["client_order_key"],
+          "submit_attempt_id": "current"}],
+        [{"event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+          "client_order_key": intent["client_order_key"],
+          "submit_attempt_id": "current"},
+         {"event_type": "BROKER_SUBMIT_RESULT_UNKNOWN",
+          "client_order_key": intent["client_order_key"],
+          "submit_attempt_id": "old"}],
+    ):
+        monkeypatch.setattr(order_journal, "load_order_events",
+                            lambda td, rows=events: rows)
+        assert not _tp_unsubmitted_attempt_may_release_stage(
+            intent, DATE, _broker_position(qty=2)
+        )
