@@ -26,29 +26,39 @@ def report_for_date(*, day: date, engine, limit: int = 10000) -> dict:
     start_kst = datetime.combine(day, time.min, tzinfo=KST)
     stop_kst = datetime.combine(day.fromordinal(day.toordinal() + 1), time.min, tzinfo=KST)
     stmt = sa.text("""
-        SELECT e.run_id, e.event_type, e.side, e.code,
-               e.stage, e.reasons, e.ts
+        SELECT e.ledger_event_id, e.run_id, e.event_type, e.side, e.code,
+               e.market, e.env, e.stage, e.reasons, e.ts, e.payload_json,
+               r.strategy AS run_strategy, r.started_at AS run_started_at,
+               r.git_sha AS run_git_sha
         FROM public.ledger_events e
-        INNER JOIN public.runs r ON r.run_id = e.run_id
+        INNER JOIN public.runs r ON r.run_id = e.run_id AND r.env = e.env
         WHERE r.env = 'practice'
           AND r.strategy = 'pb1_pullback_close'
-          AND r.started_at >= :start_at
-          AND r.started_at < :stop_at
+          AND e.market IN ('KOSPI', 'KOSDAQ')
+          -- ledger_events.ts is TEXT containing a TZ-aware broker/event
+          -- timestamp. Filter the EVENT day, not the parent run's start day.
+          AND e.ts::timestamptz >= :start_at
+          AND e.ts::timestamptz < :stop_at
           AND e.event_type = 'ORDER_SKIP'
           AND e.side = 'BUY'
-        ORDER BY r.started_at, e.ts, e.code
-        LIMIT :max_rows
+        ORDER BY e.ts::timestamptz, e.ledger_event_id
+        LIMIT :max_rows_plus_one
     """)
     with engine.connect() as conn:
         records = [dict(row) for row in conn.execute(stmt, {
             "start_at": start_kst.astimezone(timezone.utc),
             "stop_at": stop_kst.astimezone(timezone.utc),
-            "max_rows": limit,
+            "max_rows_plus_one": limit + 1,
         }).mappings()]
-    report = summarize_buy_skips(records, trade_date=day.isoformat(), max_rows=limit)
+    report = summarize_buy_skips(records[:limit], trade_date=day.isoformat())
+    report["truncated"] = len(records) > limit
+    report["truncated_after_events"] = limit if len(records) > limit else None
     report["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
     report["query_scope"] = {
-        "environment": "practice", "strategy_owner": "pb1_pullback_close",
+        "environment": "practice", "run_strategy": "pb1_pullback_close",
+        "event_markets": ["KOSPI", "KOSDAQ"],
+        "account_epoch": "NOT_ATTESTED_FROM_THIS_QUERY",
+        "date_basis": "ledger_event_ts_kst_not_run_started_at",
         "from_utc": start_kst.astimezone(timezone.utc).isoformat(),
         "to_utc_exclusive": stop_kst.astimezone(timezone.utc).isoformat(),
     }
