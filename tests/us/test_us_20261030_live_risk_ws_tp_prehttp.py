@@ -947,8 +947,10 @@ def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
 @pytest.mark.parametrize("claim_commit_failure", [False, True])
 @pytest.mark.parametrize("retry_next_day", [False, True])
 @pytest.mark.parametrize("abort_retry_before_http", [False, True])
+@pytest.mark.parametrize("repeat_partial", [False, True])
 def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together(
     pg_engine, monkeypatch, claim_commit_failure, retry_next_day, abort_retry_before_http,
+    repeat_partial,
 ):
     """Native KIS-shaped US_STANDARD SELL 5 -> fill 2 -> cancel remaining 3.
 
@@ -1182,9 +1184,56 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
             "idempotency_key": "us353-partial-retry-new-started",
         })
         assert repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
-    # A corrected late fill on the superseded original order fences HTTP.
-    ledger.record_observation(
-        retry_identity, attempt_id=attempt, state="CANCELLED",
-        cumulative_filled_qty=3, authoritative=True,
+    if not repeat_partial:
+        # A corrected late fill on the superseded original order fences HTTP.
+        ledger.record_observation(
+            retry_identity, attempt_id=attempt, state="CANCELLED",
+            cumulative_filled_qty=3, authoritative=True,
+        )
+        assert not repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+        return
+
+    # A second actual partial-cancel is summed by order, retaining target 5:
+    # 5 -> fill 2/cancel 3 -> fill 1/cancel 2 -> authorize exactly 2.
+    current_key, current_attempt = retry_args["client_order_key"], retry_args["attempt_id"]
+    current_meta = {**meta, "submit_attempt_id": current_attempt}
+    ledger.record_observation(retry_identity, attempt_id=current_attempt, state="UNRESOLVED",
+                              cumulative_filled_qty=None, authoritative=False)
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO us_orders(trade_date,client_order_key,symbol,exchange,side,
+                qty_requested,qty_filled,order_no,status,env,trading_epoch_id,meta)
+            VALUES (:td,:key,'GILD','NYSE','SELL',3,0,'0000039952','ACK',
+                    'practice',:epoch,CAST(:meta AS jsonb))
+        """), {"td": retry_date, "key": current_key, "epoch": epoch,
+                "meta": json.dumps(current_meta)})
+    second_cancel = {**broker_row, "order_no": "0000039952", "requested_qty": 3,
+                     "filled_qty": 1}
+    result = repos.apply_broker_order_observation(
+        trade_date=retry_date, client_order_key=current_key,
+        raw_order_no="0000039952", canonical_order_no="39952", symbol="GILD",
+        side="SELL", requested_qty=3, filled_qty=1, remaining_qty=2,
+        broker_status="CANCELLED", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        raw_row=second_cancel,
     )
-    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+    assert result["status"] == "OK", result
+    assert ledger.get(retry_identity).remaining_target_qty == 2
+    updated = repos.load_us_profit_capture_state(retry_date, ["GILD"], {"GILD": cycle})["GILD"]
+    assert int(updated["meta"]["tp1_filled_qty"]) == 3
+    assert int(updated["meta"]["tp1_qty"]) == 5
+    third_key, third_attempt = key + "_THIRD", attempt + "_THIRD"
+    third_meta = {**meta, "submit_attempt_id": third_attempt}
+    assert repos.save_order_intent({
+        "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+        "side": "SELL", "qty": 2, "limit_price": 102, "notional_usd": 204,
+        "strategy_owner": "US_STANDARD", "client_order_key": third_key,
+        "submit_attempt_id": third_attempt, "position_lifecycle_id": cycle,
+        "meta": third_meta,
+    }, trade_date=retry_date)
+    assert ledger.acquire(retry_identity, attempt_id=third_attempt, requested_qty=2,
+                          fresh_validation=True, client_order_key=third_key).acquired
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        trade_date=retry_date, symbol="GILD", stage="tp1", position_lifecycle_id=cycle,
+        client_order_key=third_key, attempt_id=third_attempt, action_key=identity.action_key,
+        qty=2, notional_usd=204, limit_price_usd=102, intent_meta=third_meta,
+    )
