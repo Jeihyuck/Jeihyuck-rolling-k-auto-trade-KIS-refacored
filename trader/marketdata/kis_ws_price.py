@@ -49,6 +49,8 @@ class RealtimeQuote:
     exchange: str | None = None
     acml_vol: float | None = None
     stck_cntg_hour: str | None = None
+    wghn_avrg_stck_prc: float | None = None
+    stck_bsop_date: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         age = max(0.0, time.time() - self.received_at)
@@ -77,6 +79,10 @@ class RealtimeQuote:
                 result["acml_vol"] = self.acml_vol
             if self.stck_cntg_hour:
                 result["stck_cntg_hour"] = self.stck_cntg_hour
+            if self.wghn_avrg_stck_prc is not None:
+                result["wghn_avrg_stck_prc"] = self.wghn_avrg_stck_prc
+            if self.stck_bsop_date:
+                result["stck_bsop_date"] = self.stck_bsop_date
         return result
 
 
@@ -274,6 +280,8 @@ class KisWebSocketPriceService:
         received_at: float | None = None,
         acml_vol: float | None = None,
         stck_cntg_hour: str | None = None,
+        wghn_avrg_stck_prc: float | None = None,
+        stck_bsop_date: str | None = None,
     ) -> None:
         if not last or float(last) <= 0:
             return
@@ -288,6 +296,15 @@ class KisWebSocketPriceService:
             exchange=exchange,
             acml_vol=float(acml_vol) if acml_vol is not None and float(acml_vol) > 0 else None,
             stck_cntg_hour=str(stck_cntg_hour) if stck_cntg_hour else None,
+            wghn_avrg_stck_prc=(
+                float(wghn_avrg_stck_prc)
+                if wghn_avrg_stck_prc is not None and float(wghn_avrg_stck_prc) > 0 else None
+            ),
+            stck_bsop_date=(
+                str(stck_bsop_date)
+                if stck_bsop_date and len(str(stck_bsop_date)) == 8
+                and str(stck_bsop_date).isdigit() else None
+            ),
         )
         with self._lock:
             self._quotes[(quote.market, quote.symbol)] = quote
@@ -667,7 +684,16 @@ class KisWebSocketPriceService:
             record_count = 1
         raw = parts[3]
         if tr_id == self.KR_TR_ID:
-            self._handle_trade_records(raw, record_count, fields_per_record=46, parser=self.parse_kr_trade)
+            # KIS added MARKET_CLS_CODE to the historic 46-field trade wire.
+            # Multiple bundled records may now have width 47; a hard-coded
+            # 46 silently shifts the next symbol and destroys source proof.
+            total_fields = len(str(raw or "").split("^"))
+            width = 46
+            if record_count > 1 and total_fields % record_count == 0:
+                candidate = total_fields // record_count
+                if candidate in {46, 47}:
+                    width = candidate
+            self._handle_trade_records(raw, record_count, fields_per_record=width, parser=self.parse_kr_trade)
         elif tr_id == self.US_TR_ID:
             total_fields = len(str(raw or "").split("^"))
             fields_per_record = 25
@@ -728,11 +754,18 @@ class KisWebSocketPriceService:
             "ask": cls._number(fields[10]),
             "bid": cls._number(fields[11]),
         }
-        # H0STCNT0: [1] exchange HHMMSS; [13] cumulative volume.
-        # Short legacy price-only records never synthesize volume proof.
+        # Official H0STCNT0 KRX feed positions: [1] native exchange time,
+        # [6] *native* weighted-average share price, [13] cumulative volume,
+        # [33] native trading day. These fields are from the SAME trade record.
+        # Short legacy price-only records never synthesize volume/VWAP/date.
         if len(fields) >= 14:
             parsed["stck_cntg_hour"] = str(fields[1])
             parsed["acml_vol"] = cls._number(fields[13])
+        if len(fields) >= 34:
+            parsed["wghn_avrg_stck_prc"] = cls._number(fields[6])
+            native_day = str(fields[33]).strip()
+            if len(native_day) == 8 and native_day.isdigit():
+                parsed["stck_bsop_date"] = native_day
         return parsed
 
     @classmethod
