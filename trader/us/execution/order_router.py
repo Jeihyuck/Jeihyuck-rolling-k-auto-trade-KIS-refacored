@@ -2769,9 +2769,16 @@ def route_order(
             return f"{type(exc).__name__}: {exc}"
 
     from trader.us.execution.order_journal import append_order_event
+    _native_tp_claimed = bool(
+        _native_kis and side == "SELL"
+        and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True
+    )
+    _require_native_submit_journal = bool(
+        _native_kis and (side == "BUY" or _native_tp_claimed)
+    )
     try:
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context,
-                           require_db=side == "BUY" and _native_kis)
+                           require_db=_require_native_submit_journal)
     except Exception as exc:
         try:
             from trader.us.db.repos import release_execution_action_before_submit
@@ -2790,7 +2797,7 @@ def route_order(
                 intent,
                 context=context,
                 broker_status="US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
-                require_db=side == "BUY" and _native_kis,
+                require_db=_require_native_submit_journal,
             )
         except Exception as exc:
             abort_journal_error = exc
@@ -3284,7 +3291,7 @@ def route_order(
                     "BROKER_SUBMIT_ABORTED_PRE_IO", intent, context=context,
                     broker_status=failure_code,
                     raw_response={"error_code": failure_code, "stage": "BEFORE_HTTP"},
-                    require_db=side == "BUY" and _native_kis,
+                    require_db=_require_native_submit_journal,
                 )
                 abort_journal_ok = True
             except Exception as journal_exc:
