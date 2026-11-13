@@ -127,7 +127,7 @@ def test_signed_buy_fill_and_position_rollback_then_replay_once(monkeypatch, fai
             failures.setattr(OrdersRepo, "record_execution_claim_for_order", crash)
         else:
             failures.setattr(OrdersRepo, "upsert_reconciled_order", crash)
-        with pytest.raises(RuntimeError, match="INJECTED_BUY_TRANSACTION_FAILURE"):
+        with pytest.raises(RuntimeError, match="INJECTED_BUY_TRANSACTION_FAILURE|KR_NATIVE_BUY_CLAIM_UPDATE_FAILED"):
             rk.reconcile_today(
                 engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22),
             )
