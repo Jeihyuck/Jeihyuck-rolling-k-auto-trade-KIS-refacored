@@ -2496,7 +2496,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         if native_fill_kwargs is not None:
                             fills_repo.upsert_fill(**native_fill_kwargs)
                         result = _apply_buy_position()
-                        if defer_priced_buy_claim:
+                        if defer_priced_buy_claim or atomic_writer_active:
                             _record_execution_claim_observation(
                                 orders_repo=orders_repo, source_order=source_order,
                                 broker_status=status, cumulative_filled_qty=claim_filled_qty,
@@ -2511,7 +2511,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         if native_fill_kwargs is not None:
                             fills_repo.upsert_fill(**native_fill_kwargs, _conn=conn)
                         result = _apply_buy_position(_conn=conn)
-                        if defer_priced_buy_claim:
+                        if defer_priced_buy_claim or atomic_writer_active:
                             observation_error = _record_execution_claim_observation(
                                 orders_repo=orders_repo,
                                 source_order=source_order,
