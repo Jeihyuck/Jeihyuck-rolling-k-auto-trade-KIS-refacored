@@ -3694,6 +3694,7 @@ def run_trade_tick(
         # degraded until its own original evidence proves otherwise.
         opening_policy_only = bool(
             opening_buy_blocked and not reconcile_entry_block
+            and session_entry_allowed is not False and bool(exit_can_proceed)
             and not recon.get("block_new_entry", False)
             and bool(balance_circuit.get("entry_can_proceed", False))
             and bool(daily_notional_available)
