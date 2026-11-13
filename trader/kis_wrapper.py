@@ -2609,7 +2609,7 @@ class KisAPI:
         
         raise RuntimeError(f"invalid last price 0 for {code}")
 
-    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None) -> dict:
+    def get_price_quote(self, code: str, *, diag_mode: bool = False, attempts: int = 2, retry_cap: int | None = None, native_rest_only: bool = False) -> dict:
         """
         inquire-price 래퍼: 현재가와 최우선 호가를 dict로 반환.
 
@@ -2621,27 +2621,29 @@ class KisAPI:
         if not c:
             return {}
 
-        # Primary market-data source: KIS WebSocket. Subscription is lazy and
-        # uses the existing App Key/Secret to obtain approval_key automatically.
-        ws_service = get_kis_ws_price_service()
-        ws_service.subscribe_kr(c)
-        ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
-        ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
-        ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
-        if ws_quote is None and ws_wait > 0:
-            ws_quote = ws_service.wait_for_fresh_quote(
-                "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
-            )
-        if ws_quote:
-            logger.debug(
-                "[KIS_WS][PRICE_HIT] market=KR code=%s age_sec=%.3f",
-                c, float(ws_quote.get("age_sec") or 0.0),
-            )
-            return ws_quote
+        # Normal trading remains WS-first. A manual read-only source probe
+        # must bypass BOTH WS and stale REST cache to inspect one genuine KIS
+        # inquire-price response. Never enable this in the BUY/SELL hot path.
+        if not native_rest_only:
+            ws_service = get_kis_ws_price_service()
+            ws_service.subscribe_kr(c)
+            ws_max_age = _env_float("KIS_WS_FRESH_MAX_AGE_SEC_KR", 5.0)
+            ws_wait = _env_float("KIS_WS_INITIAL_WAIT_SEC", 0.35)
+            ws_quote = ws_service.get_fresh_quote("KR", c, max_age_sec=ws_max_age)
+            if ws_quote is None and ws_wait > 0:
+                ws_quote = ws_service.wait_for_fresh_quote(
+                    "KR", c, max_age_sec=ws_max_age, wait_sec=ws_wait
+                )
+            if ws_quote:
+                logger.debug(
+                    "[KIS_WS][PRICE_HIT] market=KR code=%s age_sec=%.3f",
+                    c, float(ws_quote.get("age_sec") or 0.0),
+                )
+                return ws_quote
 
-        # REST/cache fallback.
+        # Never report a cached quote as an independent native REST result.
         cache_key = ("inquire-price", c)
-        cached = price_cache.get(cache_key)
+        cached = price_cache.get(cache_key) if not native_rest_only else None
         if cached:
             return cached
 
@@ -2771,9 +2773,24 @@ class KisAPI:
         quote.setdefault("stck_prpr", last_price)
         quote.setdefault("prpr", last_price)
         quote.update({"last": last_price, "bid": bid_price, "ask": ask_price, "raw": raw_output})
-        # 캐시 set
-        price_cache.set(cache_key, quote, PRICE_SNAPSHOT_TTL_SEC)
+        # A one-shot native REST probe must not modify normal WS/REST caches.
+        if not native_rest_only:
+            price_cache.set(cache_key, quote, PRICE_SNAPSHOT_TTL_SEC)
         return quote
+
+    def get_kr_native_quote_readonly(self, code: str) -> dict:
+        """One-shot native KR inquire-price GET for operator source diagnosis.
+
+        Never called from PB1 ticks, exits, BUY sizing or the minute observer.
+        This is an independent API response, NOT a license to merge fields from
+        incompatible quote times or bypass exchange-time/volume proof.
+        """
+        c = safe_strip(code).lstrip("A")
+        if len(c) != 6 or not c.isascii() or not c.isdigit():
+            raise ValueError("KR_READONLY_QUOTE_PROBE_INVALID_CODE")
+        return self.get_price_quote(
+            c, diag_mode=True, attempts=1, retry_cap=1, native_rest_only=True,
+        )
 
     def get_price_only(self, code: str, *, attempts: int = 2) -> dict:
         try:
