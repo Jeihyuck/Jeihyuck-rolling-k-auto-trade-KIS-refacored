@@ -3444,7 +3444,9 @@ class OrdersRepo:
         fail_open: bool | None = None,
     ) -> list[dict]:
         if fail_open is None:
-            fail_open = _resolve_lookup_fail_open()
+            # OrdersRepo reads participate in idempotency and broker-state
+            # safety. An unavailable DB must never become an empty order set.
+            fail_open = False
 
         self._last_read_fail_open_op = None
         try:
@@ -4114,10 +4116,15 @@ class OrdersRepo:
             conditions.append(self._schema.orders.c.created_at >= cutoff)
         
         stmt = select(self._schema.orders).where(and_(*conditions))
+        if fail_open:
+            logger.error(
+                "[ORDERS][LOOKUP_FAIL_OPEN_REJECTED] op=orders.get_open_orders env=%s",
+                env,
+            )
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
-            fail_open=(_resolve_lookup_fail_open(env) if fail_open is None else bool(fail_open)),
+            fail_open=False,
         )
 
     def has_open_order_for_code(
@@ -4146,6 +4153,7 @@ class OrdersRepo:
                 side=side,
                 trade_date=trade_date,
                 include_stale=False,
+                fail_open=False,
             )
         )
 
@@ -4209,7 +4217,7 @@ class OrdersRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_client_order_key",
-            fail_open=None,
+            fail_open=False,
         )
         return bool(rows)
 
@@ -4217,14 +4225,11 @@ class OrdersRepo:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
         )
-        rows = _safe_repo_read(
-            self.engine,
+        rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_order_by_client_order_key",
-            fail_open=_resolve_lookup_fail_open(),
+            fail_open=False,
         )
-        if not rows:
-            self._last_read_fail_open_op = "orders.get_order_by_client_order_key" if not rows else None
         return rows[0] if rows else None
 
     def list_orders_by_client_order_keys(
@@ -4432,7 +4437,7 @@ class OrdersRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_blocking_order_today",
-            fail_open=_resolve_lookup_fail_open(env),
+            fail_open=False,
         )
         if rows:
             return True, rows[0]
@@ -4506,10 +4511,15 @@ class OrdersRepo:
         if status_exclude:
             conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
         stmt = select(self._schema.orders).where(and_(*conditions))
+        if fail_open:
+            logger.error(
+                "[ORDERS][LOOKUP_FAIL_OPEN_REJECTED] op=orders.list_today_orders env=%s",
+                env,
+            )
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_orders",
-            fail_open=_resolve_lookup_fail_open(env) if fail_open is None else fail_open,
+            fail_open=False,
         )
 
     def list_today_buy_orders(
@@ -4542,7 +4552,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_buy_orders",
-            fail_open=None,
+            fail_open=False,
         )
 
     def has_today_buy_orders(
@@ -4595,7 +4605,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_sell_orders",
-            fail_open=None,
+            fail_open=False,
         )
 
     def has_today_sell_for_code(
@@ -4675,7 +4685,7 @@ class OrdersRepo:
         schema = schema_for_engine(self.engine)
         stmt = select(schema.job_checkpoints.c.payload).where(schema.job_checkpoints.c.job_key == job_key)
         self._last_read_fail_open_op = None
-        fail_open = _order_lookup_fail_open_default()
+        fail_open = False
         rows, read_fail_open = safe_read_mappings(
             self.engine,
             stmt,
@@ -4729,17 +4739,11 @@ class OrdersRepo:
             )
             return completed
         except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            fail_open = _order_lookup_fail_open_default()
             logger.exception(
-                "[DB][READ][FAIL] op=orders.has_today_session_marker fail_open=%s err_type=%s err=%s",
-                int(bool(fail_open)),
+                "[DB][READ][FAIL] op=orders.has_today_session_marker fail_open=0 err_type=%s err=%s",
                 type(exc).__name__,
                 exc,
             )
-            if fail_open:
-                self._last_read_fail_open_op = "orders.has_today_session_marker"
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_today_session_marker -> returning False")
-                return False
             raise
 
     def has_today_am_session_marker(self, env: str, trade_date: date | datetime | str | None = None) -> bool:
@@ -4786,7 +4790,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_orders_in_window",
-            fail_open=None,
+            fail_open=False,
         )
 
     def _kr_broker_trade_day_expr(self):
@@ -5285,7 +5289,7 @@ class OrdersRepo:
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(lookback_n)
         )
-        rows = self._read_mappings_with_guard(stmt, op_name="orders_latest_buy_entry_exit_plan", fail_open=True)
+        rows = self._read_mappings_with_guard(stmt, op_name="orders_latest_buy_entry_exit_plan", fail_open=False)
         for row in rows or []:
             request_json = (row or {}).get("request_json") or {}
             if isinstance(request_json, str):
