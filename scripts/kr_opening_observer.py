@@ -118,6 +118,74 @@ def final30_codes(*, trade_date: str, filename: str | None = None) -> list[str]:
         raise RuntimeError("KR_OPENING_OBSERVER_FINAL30_BAD_UNIVERSE")
     return sorted(codes)
 
+def verified_native_kr_vwap(quote: dict, *, code: str, observed_at: datetime) -> tuple[float | None, str]:
+    """A source-bound native KIS VWAP, never a guessed intraday average.
+
+    Provenance, symbol, native session date, exchange clock and receipt
+    freshness must all agree. A price-only WS quote cannot supply VWAP.
+    """
+    if not isinstance(quote, dict):
+        return None, "QUOTE_NOT_MAPPING"
+    raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
+    source = str(quote.get("source") or raw.get("source") or "").upper()
+    norm = str(code).zfill(6)
+    if source == "KIS_REST_INQUIRE_PRICE":
+        if (quote.get("source_identity") != "AUTHENTICATED_REST_REQUEST_BOUND"
+                or str(quote.get("requested_symbol") or "").lstrip("A").zfill(6) != norm):
+            return None, "REST_REQUEST_IDENTITY_UNVERIFIED"
+    elif source == "KIS_WEBSOCKET":
+        if str(quote.get("symbol") or "").lstrip("A").zfill(6) != norm:
+            return None, "WS_SUBSCRIPTION_IDENTITY_UNVERIFIED"
+    else:
+        return None, "QUOTE_SOURCE_UNVERIFIED"
+    def field(key: str):
+        # An explicit invalid top-level field is never repaired by a cache.
+        return quote[key] if key in quote else raw.get(key)
+    day = str(field("stck_bsop_date") or "").replace("-", "")
+    clock_value = field("stck_cntg_hour")
+    if not day or day != observed_at.astimezone(KST).strftime("%Y%m%d"):
+        return None, "NATIVE_QUOTE_DATE_UNVERIFIED"
+    if clock_value is None or not str(clock_value).strip():
+        return None, "NATIVE_QUOTE_CLOCK_MISSING"
+    clock = str(clock_value).strip()
+    if not clock.isdigit() or len(clock) > 6:
+        return None, "NATIVE_QUOTE_CLOCK_INVALID"
+    clock = clock.zfill(6)
+    if clock == "000000":
+        return None, "NATIVE_QUOTE_CLOCK_INVALID"
+    try:
+        native_at = datetime.strptime(day + clock, "%Y%m%d%H%M%S").replace(tzinfo=KST)
+    except ValueError:
+        return None, "NATIVE_QUOTE_CLOCK_INVALID"
+    age = (observed_at.astimezone(KST) - native_at).total_seconds()
+    if not -10 <= age <= 120:
+        return None, "NATIVE_QUOTE_STALE_OR_FUTURE"
+    received = quote.get("received_at")
+    if received is None:
+        return None, "QUOTE_RECEIPT_NOT_ATTESTED"
+    try:
+        if isinstance(received, (int, float)):
+            received_at = datetime.fromtimestamp(float(received), tz=KST)
+        elif isinstance(received, datetime):
+            received_at = received
+        else:
+            received_at = datetime.fromisoformat(str(received).replace("Z", "+00:00"))
+        if received_at.tzinfo is None:
+            return None, "QUOTE_RECEIPT_NOT_ATTESTED"
+        age = (observed_at.astimezone(KST) - received_at.astimezone(KST)).total_seconds()
+        if not -10 <= age <= 120:
+            return None, "QUOTE_RECEIPT_STALE_OR_FUTURE"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None, "QUOTE_RECEIPT_NOT_ATTESTED"
+    try:
+        value = float(field("wghn_avrg_stck_prc"))
+        if not (value > 0 and value < float("inf")):
+            raise ValueError("nonpositive-or-infinite")
+    except (TypeError, ValueError, OverflowError):
+        return None, "NATIVE_VWAP_MISSING_OR_INVALID"
+    return value, "VERIFIED_NATIVE_KIS_VWAP"
+
+
 def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: float = 0.8) -> dict:
     """No order methods are called; all I/O is read-only KIS and local proofs."""
     observed_at = observed_at.astimezone(KST)
@@ -159,30 +227,15 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             if not isinstance(quote, dict):
                 quote = {}
             raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
-            vwap = (
-                quote["wghn_avrg_stck_prc"]
-                if "wghn_avrg_stck_prc" in quote
-                else raw.get("wghn_avrg_stck_prc")
-            )  # Never silently replace an explicit invalid top-level source.
             quote_origin = str(quote.get("source") or raw.get("source") or "UNKNOWN")
-            # Native weighted-average price is evidence only when its quote
-            # timestamp/date can be checked. A cached/WS value with no
-            # native clock MUST NOT be labeled fresh by assumption.
-            from datetime import timedelta
-            quote_day = str(quote.get("stck_bsop_date") or raw.get("stck_bsop_date") or "").replace("-", "")
-            quote_clock = str(quote.get("stck_cntg_hour") or raw.get("stck_cntg_hour") or "").strip().zfill(6)
-            verified_vwap = False
-            if (quote_day == observed_at.strftime("%Y%m%d")
-                    and len(quote_clock) == 6 and quote_clock.isdigit()):
-                try:
-                    quote_time = datetime.strptime(
-                        quote_day + quote_clock, "%Y%m%d%H%M%S"
-                    ).replace(tzinfo=KST)
-                    age = (now_kst() - quote_time).total_seconds()
-                    verified_vwap = -10 <= age <= 120
-                except ValueError:
-                    verified_vwap = False
             proof_now = now_kst()
+            vwap, vwap_status = verified_native_kr_vwap(
+                quote, code=code, observed_at=proof_now,
+            )
+            verified_vwap = vwap_status == "VERIFIED_NATIVE_KIS_VWAP"
+            quote_day = str(quote["stck_bsop_date"] if "stck_bsop_date" in quote
+                            else raw.get("stck_bsop_date") or "").replace("-", "")
+            quote_clock = quote["stck_cntg_hour"] if "stck_cntg_hour" in quote else raw.get("stck_cntg_hour")
             coverage = inspect_completed_bar_coverage(rows=data, now=proof_now)
             result = save_opening_proof(
                 env="practice", account_scope=scope, code=code,
@@ -197,13 +250,13 @@ def run_once(*, kis, codes: list[str], observed_at: datetime, sleep_between: flo
             logger.info(
                 "[KR][OPENING_OBSERVER][COVERAGE] code=%s state=%s reason=%s "
                 "opening_count=%s post_open_count=%s bar_age_sec=%s "
-                "vwap_verified=%s vwap_origin=%s day_present=%s "
+                "vwap_verified=%s vwap_reason=%s vwap_origin=%s day_present=%s "
                 "exchange_clock_present=%s read_only=1",
                 code, coverage["state"], coverage["reason"],
                 coverage["opening_count"], coverage["post_open_count"],
                 coverage["latest_bar_age_sec"], int(verified_vwap),
-                quote_origin, int(bool(quote_day)),
-                int(bool(quote.get("stck_cntg_hour") or raw.get("stck_cntg_hour"))),
+                vwap_status, quote_origin, int(bool(quote_day)),
+                int(bool(quote_clock)),
             )
             if result["bars"] > 0:
                 done += 1
