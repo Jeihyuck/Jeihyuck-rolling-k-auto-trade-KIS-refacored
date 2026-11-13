@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
@@ -284,7 +283,12 @@ def observe_broker_stage(
         return StageJournalResult(False, "BLOCK", str(exc))
     table = schema_for_engine(engine).job_checkpoints
     try:
-        with (nullcontext(_conn) if _conn is not None else engine.begin()) as conn:
+        # When participating in a broker settlement transaction, isolate
+        # auxiliary stage-journal failures with a savepoint. A missing or
+        # temporarily unavailable stage row must not abort the outer transaction
+        # that persists broker-proven fills and position quantity.
+        transaction = _conn.begin_nested() if _conn is not None else engine.begin()
+        with transaction as conn:
             key = _key(contract, stage)
             raw = conn.execute(
                 sa.select(table.c.payload).where(table.c.job_key == key)
