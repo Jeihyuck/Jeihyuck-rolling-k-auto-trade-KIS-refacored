@@ -1122,15 +1122,27 @@ def _tp_unsubmitted_attempt_may_release_stage(
             if str(row.get("client_order_key") or "") == key:
                 return False
         events = load_order_events(trade_date)
-        for event in events:
-            if str(event.get("client_order_key") or "") != key:
-                continue
-            if str(event.get("event_type") or "") in {
-                "BROKER_SUBMIT_STARTED", "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED",
-                "ORDER_PARTIALLY_FILLED", "ORDER_FILLED", "ORDER_CANCELLED",
-            }:
-                return False
-        return True
+        from trader.us.execution.order_journal import (
+            proven_unsent_attempts, broker_submission_possible_for_client_key,
+        )
+        related = [
+            event for event in events
+            if str(event.get("client_order_key") or "") == key
+        ]
+        # Absence from a query is NOT durable evidence that an HTTP attempt
+        # never occurred. Authorize release only when this exact attempt has
+        # a persisted BEFORE_BOUNDARY/PRE_IO abort and no contradictory
+        # actual ACK/unknown/possible HTTP event. No time-based inference.
+        attempt_id = str(intent.get("submit_attempt_id") or "").strip()
+        if not related or not attempt_id:
+            return False
+        if broker_submission_possible_for_client_key(related, key):
+            return False
+        proven = proven_unsent_attempts(related)
+        return (key, attempt_id) in proven and all(
+            (key, str(event.get("submit_attempt_id") or "")) in proven
+            for event in related
+        )
     except Exception as exc:
         logger.error("[US_PROFIT_CAPTURE][TP_FENCE][UNKNOWN] symbol=%s key=%s err=%s",
                      symbol, key, exc)
