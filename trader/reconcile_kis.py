@@ -2411,7 +2411,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             def _lock_buy_order_watermark(conn):
                 table = schema_for_engine(engine).orders
                 current = conn.execute(
-                    sa.select(table.c.response_json).where(
+                    sa.select(table.c.status, table.c.response_json).where(
                         table.c.order_id == uuid_value_for_url(
                             str(engine.url), str(source_order.get("order_id") or "")
                         )
@@ -2419,9 +2419,13 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                 ).one_or_none()
                 if current is None:
                     raise RuntimeError("KR_NATIVE_BUY_SOURCE_ORDER_MISSING")
-                current_response = _json_dict(current[0])
+                current_status = str(current[0] or "").upper()
+                current_response = _json_dict(current[1])
                 fields = ("confirmed_fill_qty", "confirmed_fill_notional", "applied_broker_fill_ids")
-                if any(current_response.get(k) != source_response.get(k) for k in fields):
+                if (
+                    current_status != str(source_order.get("status") or "").upper()
+                    or any(current_response.get(k) != source_response.get(k) for k in fields)
+                ):
                     raise RuntimeError("KR_NATIVE_BUY_STALE_ORDER_RETRY")
 
             if not signed_native_buy and not defer_native_sell_claim and native_fill_kwargs is not None:
@@ -2773,15 +2777,19 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
             def _lock_sell_order_watermark(conn):
                 table = schema_for_engine(engine).orders
                 current = conn.execute(
-                    sa.select(table.c.response_json).where(
+                    sa.select(table.c.status, table.c.response_json).where(
                         table.c.order_id == uuid_value_for_url(str(engine.url), str(source_order.get("order_id") or ""))
                     ).with_for_update()
                 ).one_or_none()
                 if current is None:
                     raise RuntimeError("KR_NATIVE_SELL_SOURCE_ORDER_MISSING")
-                current_response = _json_dict(current[0])
+                current_status = str(current[0] or "").upper()
+                current_response = _json_dict(current[1])
                 fields = ("confirmed_fill_qty", "confirmed_fill_notional", "applied_broker_fill_ids")
-                if any(current_response.get(k) != source_response.get(k) for k in fields):
+                if (
+                    current_status != str(source_order.get("status") or "").upper()
+                    or any(current_response.get(k) != source_response.get(k) for k in fields)
+                ):
                     raise RuntimeError("KR_NATIVE_SELL_STALE_ORDER_RETRY")
             if side == "SELL" and source_order and (
                 incremental_daily_qty > 0 or verified_cumulative_sell_price is not None or defer_native_sell_claim
