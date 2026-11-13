@@ -341,7 +341,7 @@ from tests.us.test_us_postgres_integration_real import pg_engine  # noqa: E402,F
     not os.getenv("PBCORE_TEST_POSTGRES_URL"),
     reason="disposable PostgreSQL acceptance URL unavailable",
 )
-def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
+def test_pg_tp1_pre_http_abort_without_journal_or_claim_stays_fenced(pg_engine):
     from sqlalchemy import text
 
     repos.reset_memory_stores()
@@ -365,11 +365,11 @@ def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key="WRONG_KEY",
     )
-    assert repos.release_us_profit_capture_pre_http_abort(
+    # DB absence is not proof of an authorized ABORT_PRE_IO.
+    assert not repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key=key,
     )
-    # A duplicated abort callback must never release a new claim/order.
     assert not repos.release_us_profit_capture_pre_http_abort(
         trade_date=td, symbol="GILD", stage="tp1",
         position_lifecycle_id=lifecycle, client_order_key=key,
@@ -381,9 +381,9 @@ def test_pg_tp1_pre_http_abort_exact_row_lock_and_idempotent_release(pg_engine):
             WHERE trade_date=:td AND symbol='GILD'
             AND stage='tp1' AND position_lifecycle_id=:lifecycle
         """), {"td": td, "lifecycle": lifecycle}).mappings().one()
-    assert after["stage_status"] == "NOT_TRIGGERED"
+    assert after["stage_status"] == "PENDING"
     assert int(after["cumulative_filled_qty"]) == 0
-    assert after["state"]["tp1_pending"] is False
+    assert after["state"]["tp1_pending"] is True
     assert after["state"]["tp1_done"] is False
 
 
