@@ -173,14 +173,28 @@ def build_kr_volume_proof(
         if cumulative < previous:
             return reject("cumulative_volume_decreased", failed=True)
 
+    # Evidence is a broker exchange timestamp, never a synthesized local time.
+    # In particular, str(None or "").zfill(6) fabricated "000000" and
+    # misclassified a missing market clock as a stale midnight quote.
     trade_clock = (
         quote["stck_cntg_hour"] if "stck_cntg_hour" in quote
         else raw.get("stck_cntg_hour")
     )
+    proof["quote_source"] = str(quote.get("source") or raw.get("source") or "UNKNOWN")
     proof["exchange_time_raw"] = str(trade_clock) if trade_clock is not None else None
-    clock = str(trade_clock or "").zfill(6)
-    if len(clock) != 6 or not clock.isdigit():
+    if trade_clock is None or (
+        isinstance(trade_clock, str) and not trade_clock.strip()
+    ):
         return reject("kis_exchange_quote_time_missing")
+    # HHMMSS may arrive as a five-digit integer (e.g. 09:30:00 = 93000).
+    # Never zero-pad the *absence* of a clock or accept midnight for a
+    # regular-session KR PB1 BUY.
+    clock = str(trade_clock).strip()
+    if not clock.isdigit() or len(clock) > 6:
+        return reject("kis_exchange_quote_time_invalid", failed=True)
+    clock = clock.zfill(6)
+    if clock == "000000":
+        return reject("kis_exchange_quote_time_invalid", failed=True)
     try:
         exchange_ts = datetime.combine(
             session, datetime.strptime(clock, "%H%M%S").time(), tzinfo=KST
