@@ -3523,7 +3523,7 @@ def reserve_us_profit_capture_stage_after_claim(
         if (len(claim) != 1
                 or str(claim[0]["action_state"]) != "IN_FLIGHT"
                 or str(claim[0].get("active_attempt_id") or "") != attempt
-                or str(claim[0].get("attempt_state") or "") != "SUBMITTING"
+                or str(claim[0].get("attempt_state") or "") != "CREATED"
                 or str(claim[0].get("client_order_key") or "") != key
                 or int(claim[0].get("requested_qty") or 0) < int(qty)):
             return False
