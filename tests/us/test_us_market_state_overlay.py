@@ -494,6 +494,11 @@ def test_native_tp_decision_defers_pending_until_claim(monkeypatch):
         [pos], overlay, trade_date=td, defer_pending_until_claim=True,
     )
     assert len(next_tick) == 1
+    assert decisions[0]["strategy_owner"] == "US_STANDARD"
+    assert next_tick[0]["client_order_key"] != decisions[0]["client_order_key"]
+    assert next_tick[0]["submit_attempt_id"] != decisions[0]["submit_attempt_id"]
+    assert next_tick[0]["meta"]["submit_attempt_id"] == next_tick[0]["submit_attempt_id"]
+    assert "_A" in next_tick[0]["client_order_key"]
     assert not repos.load_us_profit_capture_state(
         td, ["TESTTP"], {"TESTTP": "life-TESTTP"},
     ).get("TESTTP", {}).get("tp1_pending")
