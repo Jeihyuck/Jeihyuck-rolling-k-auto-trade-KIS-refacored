@@ -1126,7 +1126,7 @@ def _promote_open_buy_orders_from_holdings(
             )
 
         if incremental_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
-            fills_repo.upsert_fill(
+            fill_kwargs = dict(
                 env=env,
                 run_id=ctx_run_id,
                 order_id=str(order.get("order_id") or "") or None,
@@ -1171,31 +1171,48 @@ def _promote_open_buy_orders_from_holdings(
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
             )
+
+            def _apply_promoted_buy_position(*, _conn=None):
+                    kwargs = dict(
+                        env=env,
+                        strategy=strategy,
+                        sid=int(order.get("sid") or 1),
+                        mode=int(order.get("mode") or 1),
+                        code=code,
+                        market=order.get("market"),
+                        side="BUY",
+                        qty=incremental_fill_qty,
+                        price=float(fill_price or 0.0),
+                        fee=0.0,
+                        tax=0.0,
+                        filled_at=tick_ts,
+                        entry_meta_json=request_json.get("entry_meta") or {},
+                        entry_exit_plan=request_json.get("entry_exit_plan") or {},
+                        portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
+                        position_cycle_id=str(order.get("position_cycle_id") or "") or None,
+                        order_id=str(order.get("order_id") or "") or None,
+                        buy_application_cumulative_qty=confirmed_fill_qty,
+                    )
+                    if _conn is not None:
+                        kwargs["_conn"] = _conn
+                    return positions_repo.apply_fill(**kwargs)
+            # Both records must commit or roll back together on the actual
+            # production repository path, never on a fake broker endpoint.
+            atomic_buy = bool(
+                side == "BUY" and positions_repo is not None
+                and getattr(fills_repo, "engine", None) is not None
+                and getattr(fills_repo, "engine", None) is getattr(positions_repo, "engine", None)
+                and getattr(fills_repo, "engine", None) is getattr(orders_repo, "engine", None)
+            )
+            if atomic_buy:
+                with fills_repo.engine.begin() as conn:
+                    fills_repo.upsert_fill(**fill_kwargs, _conn=conn)
+                    _apply_promoted_buy_position(_conn=conn)
+            else:
+                fills_repo.upsert_fill(**fill_kwargs)
+                if side == "BUY" and positions_repo is not None:
+                    _apply_promoted_buy_position()
             if side == "BUY" and positions_repo is not None:
-                # This is the production lifecycle bridge PR133 previously
-                # skipped in tests by calling PositionsRepo.apply_fill directly.
-                # Bind the broker-proven quantity to the exact BUY order lifecycle
-                # before restore_missing_from_holdings can create an IMPORTED cycle.
-                positions_repo.apply_fill(
-                    env=env,
-                    strategy=strategy,
-                    sid=int(order.get("sid") or 1),
-                    mode=int(order.get("mode") or 1),
-                    code=code,
-                    market=order.get("market"),
-                    side="BUY",
-                    qty=incremental_fill_qty,
-                    price=float(fill_price or 0.0),
-                    fee=0.0,
-                    tax=0.0,
-                    filled_at=tick_ts,
-                    entry_meta_json=request_json.get("entry_meta") or {},
-                    entry_exit_plan=request_json.get("entry_exit_plan") or {},
-                    portfolio_epoch_id=str(order.get("portfolio_epoch_id") or "") or None,
-                    position_cycle_id=str(order.get("position_cycle_id") or "") or None,
-                    order_id=str(order.get("order_id") or "") or None,
-                    buy_application_cumulative_qty=confirmed_fill_qty,
-                )
                 logger.warning(
                     "[RECONCILE][BUY_POSITION_APPLY] code=%s incremental_qty=%s cumulative_qty=%s cycle=%s epoch=%s source=kis_holdings_fallback",
                     code,
