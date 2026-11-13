@@ -5593,14 +5593,16 @@ class FillsRepo:
         position_cycle_id: str | None = None,
         portfolio_epoch_id: str | None = None,
         trading_epoch_id: str | None = None,
+        _conn: Any = None,
     ) -> str:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
         safe_raw_json = json_sanitize(raw_json or {})
         if run_id:
             self.ensure_run_exists(run_id)
+        from contextlib import nullcontext
         if order_id is not None:
-            with self.engine.begin() as conn:
+            with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
                 provenance = conn.execute(select(
                     self._schema.orders.c.position_cycle_id,
                     self._schema.orders.c.portfolio_epoch_id,
@@ -5621,14 +5623,15 @@ class FillsRepo:
                 portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
                 trading_epoch_id = trading_epoch_id or provenance.get("trading_epoch_id")
         active_epoch_id = active_trading_epoch_id(
-            self.engine, env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
+            _conn if _conn is not None else self.engine,
+            env=env, account_id=get_account_key(env=env), required=trading_epoch_enforced()
         )
         if trading_epoch_id is None:
             trading_epoch_id = active_epoch_id
         elif active_epoch_id is not None and str(trading_epoch_id or "") != str(active_epoch_id):
             raise RuntimeError("KR_FILL_TRADING_EPOCH_MISMATCH")
         if active_epoch_id is not None and portfolio_epoch_id is not None:
-            with self.engine.begin() as conn:
+            with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
                 _assert_portfolio_epoch_binding(
                     conn,
                     self._schema,
@@ -5725,7 +5728,7 @@ class FillsRepo:
             # allow only sub-won decimal/float rounding, NOT a 1-KRW change.
             if abs(supplied_notional - new_exact_amount) > Decimal("0.50"):
                 raise RuntimeError("KR_CUMULATIVE_FILL_SAME_QTY_NOTIONAL_CONFLICT")
-        with self.engine.begin() as conn:
+        with (nullcontext(_conn) if _conn is not None else self.engine.begin()) as conn:
             if active_epoch_id is not None:
                 collision_conditions = [
                     self._schema.fills.c[col] == payload[col]
