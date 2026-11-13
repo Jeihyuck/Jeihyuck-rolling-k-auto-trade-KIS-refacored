@@ -15,7 +15,7 @@ def _raw_qty(raw, names):
 
 
 def proven_partial_tp_remainder(*, claim, current_attempt, prior_attempts,
-                                prior_orders, stage, intent_meta, account,
+                                prior_orders, prior_events, stage, intent_meta, account,
                                 cycle, symbol, stage_name, qty):
     """Require every previous submitted attempt to have terminal KIS proof."""
     try:
@@ -38,18 +38,31 @@ def proven_partial_tp_remainder(*, claim, current_attempt, prior_attempts,
         used = set()
         for attempt in prior_attempts:
             key = str(attempt.get("client_order_key") or "")
-            if (not key or key in used or not attempt.get("authoritative")
-                    or attempt.get("attempt_state") != "CANCELLED_PARTIAL_FILL"):
+            if not key or key in used or not attempt.get("authoritative"):
                 return False
             used.add(key)
             order = orders.get(key)
+            if attempt.get("attempt_state") == "ABANDONED_PRE_SUBMIT":
+                events = [event for event in prior_events if event.get("client_order_key") == key]
+                allowed = {"BROKER_SUBMIT_ABORTED_PRE_IO", "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY",
+                           "BROKER_SUBMIT_STARTED", "BROKER_CLAIM_PREPARED"}
+                if (order or not events
+                        or not any(e.get("event_type") in {"BROKER_SUBMIT_ABORTED_PRE_IO",
+                                                          "BROKER_SUBMIT_ABORTED_BEFORE_BOUNDARY"} for e in events)
+                        or any(e.get("event_type") not in allowed
+                               or str(e.get("submit_attempt_id") or "") != str(attempt["attempt_id"])
+                               for e in events)):
+                    return False
+                continue
             if not order:
                 return False
             meta = order.get("meta") or {}
             raw = meta.get("broker_raw_row") or {}
             requested = int(attempt["requested_qty"])
             executed = int(attempt["cumulative_filled_qty"])
-            if (not 0 < executed < requested
+            if (attempt.get("attempt_state") not in {"CANCELLED_PARTIAL_FILL", "CANCELLED_ZERO_FILL"}
+                    or not 0 <= executed < requested
+                    or (attempt["attempt_state"] == "CANCELLED_ZERO_FILL") != (executed == 0)
                     or order.get("status") != "CANCELLED"
                     or str(order.get("symbol") or "").upper() != symbol
                     or str(order.get("side") or "").upper() != "SELL"
@@ -76,6 +89,6 @@ def proven_partial_tp_remainder(*, claim, current_attempt, prior_attempts,
                 if not value or str(meta.get(field) or "") != value:
                     return False
             total += executed
-        return len(orders) == len(used) and total == filled
+        return set(orders).issubset(used) and total == filled
     except (KeyError, TypeError, ValueError, OverflowError):
         return False

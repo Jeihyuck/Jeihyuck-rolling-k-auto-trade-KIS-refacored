@@ -114,6 +114,20 @@ def test_broker_confirmed_cancelled_partial_allows_only_remainder():
     mark.assert_called_once()
 
 
+def test_proven_abort_after_partial_keeps_original_remainder():
+    state = {
+        "tp1_broker_order_no": "original-cancelled-order",
+        "meta": {
+            "tp1_order_keys": ["original", "aborted"],
+            "tp1_qty": 5, "tp1_filled_qty": 2,
+            "last_stage": "tp1", "last_status": "FAILED",
+            "last_evidence_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+        },
+    }
+    out, _ = _evaluate(state)
+    assert len(out) == 1 and out[0]["qty"] == 3
+
+
 def test_unverified_cancelled_never_retries():
     state = {
         "meta": {

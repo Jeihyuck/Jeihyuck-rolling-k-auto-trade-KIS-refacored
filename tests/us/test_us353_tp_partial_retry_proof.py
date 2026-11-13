@@ -29,6 +29,7 @@ def proof():
         prior_orders=[{"client_order_key": "old-order", "symbol": "GILD", "side": "SELL",
                        "status": "CANCELLED", "order_no": "123", "qty_requested": 5,
                        "qty_filled": 2, "meta": order_meta}],
+        prior_events=[],
         stage={"requested_qty": 5, "cumulative_filled_qty": 2},
         intent_meta=meta, account="account", cycle="cycle", symbol="GILD",
         stage_name="tp1", qty=3,
@@ -39,6 +40,24 @@ def test_cancelled_five_share_order_authorizes_only_three_remaining():
     evidence = proof()
     assert proven_partial_tp_remainder(**evidence)
     evidence["qty"] = 4
+    assert not proven_partial_tp_remainder(**evidence)
+
+
+def test_retry_after_proven_abort_preserves_original_partial_fill():
+    evidence = proof()
+    evidence["prior_attempts"].append({
+        "client_order_key": "aborted-order", "attempt_id": "aborted-attempt",
+        "requested_qty": 3, "cumulative_filled_qty": None,
+        "attempt_state": "ABANDONED_PRE_SUBMIT", "authoritative": True,
+    })
+    assert not proven_partial_tp_remainder(**evidence)
+    evidence["prior_events"] = [{"client_order_key": "aborted-order",
+                                  "submit_attempt_id": "aborted-attempt",
+                                  "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO"}]
+    assert proven_partial_tp_remainder(**evidence)
+    evidence["prior_events"].append({"client_order_key": "aborted-order",
+                                     "submit_attempt_id": "aborted-attempt",
+                                     "event_type": "BROKER_SUBMIT_RESULT_UNKNOWN"})
     assert not proven_partial_tp_remainder(**evidence)
 
 

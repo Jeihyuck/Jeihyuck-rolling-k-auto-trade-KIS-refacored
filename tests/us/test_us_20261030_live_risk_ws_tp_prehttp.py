@@ -946,8 +946,9 @@ def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
 )
 @pytest.mark.parametrize("claim_commit_failure", [False, True])
 @pytest.mark.parametrize("retry_next_day", [False, True])
+@pytest.mark.parametrize("abort_retry_before_http", [False, True])
 def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together(
-    pg_engine, monkeypatch, claim_commit_failure, retry_next_day,
+    pg_engine, monkeypatch, claim_commit_failure, retry_next_day, abort_retry_before_http,
 ):
     """Native KIS-shaped US_STANDARD SELL 5 -> fill 2 -> cancel remaining 3.
 
@@ -1133,6 +1134,54 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
         "idempotency_key": "us353-partial-retry-started",
     })
     assert repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+    if abort_retry_before_http:
+        assert repos.append_us_order_event({
+            "event_id": str(uuid4()), "trade_date": retry_date,
+            "event_type": "BROKER_SUBMIT_ABORTED_PRE_IO",
+            "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "us353-retry", "tick_id": "retry",
+            "trading_epoch_id": epoch, "client_order_key": retry_key,
+            "submit_attempt_id": retry_attempt, "symbol": "GILD", "side": "SELL",
+            "requested_qty": 3, "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": "us353-partial-retry-aborted",
+        })
+        ledger.release_before_submit(retry_identity, attempt_id=retry_attempt)
+        assert repos.release_us_profit_capture_pre_http_abort(
+            trade_date=retry_date, symbol="GILD", stage="tp1",
+            position_lifecycle_id=cycle, client_order_key=retry_key,
+        )
+        assert ledger.get(retry_identity).remaining_target_qty == 3
+        next_key, next_attempt = retry_key + "_NEW", retry_attempt + "_NEW"
+        next_meta = {**retry_meta, "submit_attempt_id": next_attempt}
+        assert repos.save_order_intent({
+            "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+            "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
+            "strategy_owner": "US_STANDARD", "client_order_key": next_key,
+            "submit_attempt_id": next_attempt, "position_lifecycle_id": cycle,
+            "meta": next_meta,
+        }, trade_date=retry_date)
+        assert ledger.acquire(retry_identity, attempt_id=next_attempt, requested_qty=3,
+                              fresh_validation=True, client_order_key=next_key).acquired
+        retry_args = {**retry_args, "client_order_key": next_key, "attempt_id": next_attempt}
+        assert repos.reserve_us_profit_capture_stage_after_claim(
+            **retry_args, qty=3, notional_usd=306, limit_price_usd=102,
+            intent_meta=next_meta,
+        )
+        assert repos.append_us_order_event({
+            "event_id": str(uuid4()), "trade_date": retry_date,
+            "event_type": "BROKER_SUBMIT_STARTED",
+            "event_timestamp": datetime.now(timezone.utc).isoformat(),
+            "session": "am", "session_run_id": "us353-retry", "tick_id": "retry",
+            "trading_epoch_id": epoch, "client_order_key": next_key,
+            "submit_attempt_id": next_attempt, "symbol": "GILD", "side": "SELL",
+            "requested_qty": 3, "position_lifecycle_id": cycle,
+            "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+            "payload": {"strategy_owner": "US_STANDARD"},
+            "idempotency_key": "us353-partial-retry-new-started",
+        })
+        assert repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
     # A corrected late fill on the superseded original order fences HTTP.
     ledger.record_observation(
         retry_identity, attempt_id=attempt, state="CANCELLED",

@@ -3544,9 +3544,19 @@ def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
                 WHERE action_key=:action AND attempt_id<>:attempt
            )
     """), params).mappings().all()
+    events = conn.execute(text("""
+        SELECT client_order_key, submit_attempt_id, event_type
+          FROM us_order_events
+         WHERE trading_epoch_id=:epoch AND trade_date<=:td AND symbol=:sym
+           AND side='SELL' AND profit_capture_stage=:stage
+           AND client_order_key IN (
+               SELECT client_order_key FROM us_execution_attempts
+                WHERE action_key=:action AND attempt_id<>:attempt
+           )
+    """), params).mappings().all()
     return proven_partial_tp_remainder(
         claim=claim, current_attempt=claim, prior_attempts=attempts,
-        prior_orders=orders, stage=stage_row, intent_meta=intent_meta,
+        prior_orders=orders, prior_events=events, stage=stage_row, intent_meta=intent_meta,
         account=str(params["account"]), cycle=str(params["cycle"]),
         symbol=str(params["sym"]), stage_name=str(params["stage"]),
         qty=int(claim["requested_qty"]),
@@ -3875,14 +3885,13 @@ def release_us_profit_capture_pre_http_abort(
             params["epoch"] = epoch_id
             epoch_clause = " AND trading_epoch_id=:epoch"
         row = conn.execute(text("""
-            SELECT stage_status, cumulative_filled_qty
+            SELECT stage_status, cumulative_filled_qty, requested_qty
             FROM us_profit_capture_lifecycle
             WHERE trade_date=:td AND symbol=:sym
               AND position_lifecycle_id=:lifecycle AND stage=:stage
               AND client_order_key=:key
         """ + epoch_clause + " FOR UPDATE"), params).mappings().one_or_none()
-        if (not row or str(row["stage_status"]) != "PENDING"
-                or int(row.get("cumulative_filled_qty") or 0) != 0):
+        if not row or str(row["stage_status"]) != "PENDING":
             return False
         # The stage row alone is NOT proof of a never-submitted order. Check
         # durable journal and execution Claim in the SAME PG transaction
@@ -3922,8 +3931,9 @@ def release_us_profit_capture_pre_http_abort(
         ):
             return False
         attempt = conn.execute(text("""
-            SELECT a.attempt_state, a.authoritative,
-                   c.action_state, c.active_attempt_id
+            SELECT a.attempt_state, a.authoritative, a.requested_qty,
+                   c.action_key,c.action,c.target_qty,c.filled_qty_before_attempt,
+                   c.lifecycle_id,c.account_id,c.action_state,c.active_attempt_id
               FROM us_execution_attempts a
               JOIN us_execution_claims c ON c.action_key=a.action_key
              WHERE a.attempt_id=:attempt AND a.client_order_key=:key
@@ -3947,6 +3957,27 @@ def release_us_profit_capture_pre_http_abort(
                AND trading_epoch_id=:epoch LIMIT 1
         """), params).scalar_one_or_none() is not None:
             return False
+        partial_stage = int(row.get("cumulative_filled_qty") or 0) > 0
+        if partial_stage:
+            scope = _us_execution_claim_scope()
+            retry_intent = conn.execute(text("""
+                SELECT meta FROM us_order_intents WHERE trade_date=:td
+                  AND client_order_key=:key AND symbol=:sym AND side='SELL'
+                  AND trading_epoch_id=:epoch
+            """), params).scalar_one_or_none()
+            proof_params = {
+                **params, "cycle": lifecycle, "action": attempt[0]["action_key"],
+                "attempt": attempt_id, "account": scope.get("account_id"),
+            }
+            if (scope.get("env") != "practice"
+                    or str(scope.get("trading_epoch_id") or "") != str(epoch_id)
+                    or not scope.get("account_id")
+                    or str(attempt[0].get("account_id") or "") != str(scope["account_id"])
+                    or not retry_intent
+                    or not _proven_us_tp_partial_retry(
+                        conn, proof_params, row, attempt[0], _parse_json_meta(retry_intent),
+                    )):
+                return False
         current = load_us_profit_capture_state(
             trade_date, [sym], {sym: lifecycle}, _conn=conn,
         ).get(sym, {})
@@ -3954,7 +3985,7 @@ def release_us_profit_capture_pre_http_abort(
                 or not current.get(f"{stg}_pending")
                 or current.get(f"{stg}_done")
                 or str((current.get("meta") or {}).get("last_status") or "") not in {"PENDING", "SUBMITTED"}
-                or current.get(f"{stg}_broker_order_no")):
+                or (current.get(f"{stg}_broker_order_no") and not partial_stage)):
             return False
         mark_us_profit_capture_stage(
             trade_date, sym, stg, order_key=order_key,
