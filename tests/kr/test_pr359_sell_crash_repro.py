@@ -1,6 +1,9 @@
 """Reproduce a crash between native SELL fill and position application."""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 import os
+from threading import Barrier
+from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -43,19 +46,40 @@ def isolated_engine(request):
         admin.dispose()
 
 
-@pytest.mark.parametrize("failure_point", ["position", "claim"])
+@pytest.mark.parametrize("failure_point", ["position", "claim", "order", "tp_stage"])
 def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, failure_point, isolated_engine):
     engine = isolated_engine
     pos, order_id = _accepted_sell(
         engine, code="251970", ordered_qty=17, pre_qty=17,
         avg_price=68400.0, odno="0000040226", order_key="pr359-crash-repro",
     )
-    kis = KISDailyReplay({
+    row = {
         "pdno": "251970", "sll_buy_dvsn_cd": "01", "ord_qty": "17",
         "tot_ccld_qty": "10", "tot_ccld_amt": "685000", "avg_prvs": "68500",
         "odno": "0000040226", "ord_dt": "20261022", "ord_tmd": "151810",
-        "ord_stat_cd": "PARTIAL_FILLED", "market": "J",
-    })
+        "ord_stat_cd": "PARTIAL_FILLED", "market": "J", "cncl_yn": "N",
+    }
+    kis = KISDailyReplay(row)
+    schema = schema_for_engine(engine)
+    if failure_point == "tp_stage":
+        with engine.begin() as conn:
+            source = conn.execute(sa.select(schema.orders).where(
+                schema.orders.c.order_id == order_id
+            )).mappings().one()
+            request = dict(source["request_json"] or {})
+            request.update({
+                "kr_us_tp_contract": {
+                    "activation_mode": "ACTIVE_PRACTICE",
+                    "position_cycle_id": str(pos["position_cycle_id"]),
+                    "trading_epoch_id": str(source["trading_epoch_id"]),
+                    "sha256": "test-contract",
+                },
+                "kr_us_tp_stage": "TP1",
+                "kr_us_tp_trade_date": "2026-10-22",
+            })
+            conn.execute(sa.update(schema.orders).where(
+                schema.orders.c.order_id == order_id
+            ).values(request_json=request))
     ctx = RunContext(run_id=None, env="practice", strategy="pb1_pullback_close",
                      started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")), dry_run=True)
     monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
@@ -64,11 +88,22 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
     with monkeypatch.context() as failures:
         if failure_point == "position":
             failures.setattr(PositionsRepo, "reconcile_sell_execution", crash)
-        else:
+        elif failure_point == "claim":
             failures.setattr(OrdersRepo, "record_execution_claim_for_order", crash)
+        elif failure_point == "order":
+            failures.setattr(OrdersRepo, "upsert_reconciled_order", crash)
+        else:
+            import trader.kr.us_profit_stage_journal as stage_journal
+            import trader.kr.us_standard_profit_parity as parity
+            failures.setattr(parity, "verified_contract", lambda *_a, **_k: True)
+            failures.setattr(
+                stage_journal, "observe_broker_stage",
+                lambda **_kwargs: SimpleNamespace(
+                    accepted=False, status="BLOCK", reason="INJECTED_FAILURE"
+                ),
+            )
         with pytest.raises(RuntimeError, match="INJECTED_FAILURE"):
             rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
-    schema = schema_for_engine(engine)
     with engine.connect() as conn:
         fills = conn.execute(sa.select(schema.fills).where(schema.fills.c.order_id == order_id)).all()
         order = conn.execute(sa.select(schema.orders).where(
@@ -78,8 +113,22 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
     assert position["qty"] == 17
     assert fills == [], "native fill committed although position update failed"
     assert order["status"] == "ACKED", "order state advanced despite failed settlement"
-    for _ in range(2):
-        rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
+    if failure_point == "tp_stage":
+        import trader.kr.us_profit_stage_journal as stage_journal
+        import trader.kr.us_standard_profit_parity as parity
+        with monkeypatch.context() as replay:
+            replay.setattr(parity, "verified_contract", lambda *_a, **_k: True)
+            replay.setattr(
+                stage_journal, "observe_broker_stage",
+                lambda **_kwargs: SimpleNamespace(
+                    accepted=True, status="PARTIAL_FILLED", reason="REPLAY_ACCEPTED"
+                ),
+            )
+            for _ in range(2):
+                rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
+    else:
+        for _ in range(2):
+            rk.reconcile_today(engine=engine, kis=kis, ctx=ctx, trade_date=date(2026, 10, 22))
     with engine.connect() as conn:
         fills = conn.execute(sa.select(schema.fills).where(schema.fills.c.order_id == order_id)).all()
         position = conn.execute(sa.select(schema.positions).where(
@@ -87,3 +136,93 @@ def test_native_sell_failure_rolls_back_fill_then_replays_once(monkeypatch, fail
     assert len(fills) == 1
     assert position["qty"] == 7
     assert float(position["realized_pnl"]) == pytest.approx(1000)
+
+
+
+def test_concurrent_native_sell_reconciliation_rejects_stale_watermark_and_applies_once(
+    monkeypatch, isolated_engine,
+):
+    engine = isolated_engine
+    if engine.dialect.name != "postgresql":
+        pytest.skip("row-level FOR UPDATE concurrency is PostgreSQL-only")
+    pos, order_id = _accepted_sell(
+        engine, code="251970", ordered_qty=17, pre_qty=17,
+        avg_price=68400.0, odno="0000040226", order_key="pr359-concurrent-sell",
+    )
+    row = {
+        "pdno": "251970", "sll_buy_dvsn_cd": "01", "ord_qty": "17",
+        "tot_ccld_qty": "10", "tot_ccld_amt": "685000", "avg_prvs": "68500",
+        "odno": "0000040226", "ord_dt": "20261022", "ord_tmd": "151810",
+        "ord_stat_cd": "PARTIAL_FILLED", "market": "J",
+    }
+    monkeypatch.setattr(rk, "_execution_claim_integrity_reason", lambda *a, **k: None)
+    barrier = Barrier(2)
+    original_lookup = OrdersRepo.get_order_by_kis_odno_scoped
+
+    def synchronized_lookup(self, *args, **kwargs):
+        result = original_lookup(self, *args, **kwargs)
+        if result and str(result.get("order_id") or "") == order_id:
+            barrier.wait(timeout=15)
+        return result
+
+    monkeypatch.setattr(OrdersRepo, "get_order_by_kis_odno_scoped", synchronized_lookup)
+
+    def reconcile_once():
+        ctx = RunContext(
+            run_id=None, env="practice", strategy="pb1_pullback_close",
+            started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+            dry_run=True,
+        )
+        return rk.reconcile_today(
+            engine=engine, kis=KISDailyReplay(row), ctx=ctx,
+            trade_date=date(2026, 10, 22),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(reconcile_once) for _ in range(2)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(("ok", future.result(timeout=30)))
+            except Exception as exc:
+                outcomes.append(("error", str(exc)))
+    monkeypatch.setattr(OrdersRepo, "get_order_by_kis_odno_scoped", original_lookup)
+    assert sum(kind == "ok" for kind, _ in outcomes) == 1, outcomes
+    assert sum(
+        kind == "error" and "KR_NATIVE_SELL_STALE_ORDER_RETRY" in str(value)
+        for kind, value in outcomes
+    ) == 1, outcomes
+
+    ctx = RunContext(
+        run_id=None, env="practice", strategy="pb1_pullback_close",
+        started_at=datetime(2026, 10, 22, 15, 18, tzinfo=ZoneInfo("Asia/Seoul")),
+        dry_run=True,
+    )
+    rk.reconcile_today(
+        engine=engine, kis=KISDailyReplay(row), ctx=ctx,
+        trade_date=date(2026, 10, 22),
+    )
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        fills = conn.execute(sa.select(schema.fills).where(
+            schema.fills.c.order_id == order_id
+        )).mappings().all()
+        order = conn.execute(sa.select(schema.orders).where(
+            schema.orders.c.order_id == order_id
+        )).mappings().one()
+        position = conn.execute(sa.select(schema.positions).where(
+            schema.positions.c.position_cycle_id == str(pos["position_cycle_id"])
+        )).mappings().one()
+    assert len(fills) == 1
+    assert int(_json_dict_for_test(order["response_json"]).get("confirmed_fill_qty") or 0) == 10
+    assert position["qty"] == 7
+    assert float(position["realized_pnl"]) == pytest.approx(1000)
+
+
+def _json_dict_for_test(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        import json
+        return json.loads(value)
+    return {}
