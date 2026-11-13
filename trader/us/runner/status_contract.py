@@ -46,6 +46,7 @@ _POLICY_ENTRY_BLOCK_REASONS = {
     "allow_new_buy_false", "final30_empty", "final30_below_absolute_min",
     "final30_underfilled_regime_block", "score_contract_failed", "validation_failed",
     "volume_missing_provider_entry_block",
+    "opening_30min_buy_block",
 }
 
 
