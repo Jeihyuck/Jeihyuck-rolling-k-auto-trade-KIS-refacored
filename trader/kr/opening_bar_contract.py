@@ -76,20 +76,42 @@ def clean_completed_bars(rows: list[dict], now: datetime) -> list[dict]:
 
 
 
-def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
-    """Read-only structural health of the 1m evidence, NOT a BUY/READY signal.
+def _completed_bar_structure(bars: list[dict], now: datetime) -> tuple[str, str, list[dict], list[dict]]:
+    """One shared structural contract for observer health and BUY evaluator.
 
-    Mirrors the existing coverage/freshness prerequisites of the price-aware
-    evaluator. The result can be logged for every Final30 symbol even when
-    that symbol never reaches the broker pre-submit gate.
+    No volume/momentum/pullback/breakout thresholds are modified here.
     """
     now = now.astimezone(KST)
-    bars = clean_completed_bars(rows, now)
     opening = [bar for bar in bars if dtime(9, 0) <=
                datetime.fromisoformat(bar["timestamp"]).time() < dtime(9, 30)]
     after_open = [bar for bar in bars if
                   datetime.fromisoformat(bar["timestamp"]).time() >= dtime(9, 30)]
-    info = {
+    if now.time() < dtime(9, 30):
+        return "WAIT", "OPENING_OBSERVATION", opening, after_open
+    if (len(opening) < 25
+            or datetime.fromisoformat(opening[0]["timestamp"]).time() > dtime(9, 3)
+            or datetime.fromisoformat(opening[-1]["timestamp"]).time() < dtime(9, 26)):
+        return "UNKNOWN", "OPENING_BARS_MISSING_OR_INCOMPLETE", opening, after_open
+    if not bars:
+        return "UNKNOWN", "NO_CURRENT_BAR", opening, after_open
+    at = datetime.fromisoformat(bars[-1]["timestamp"])
+    if (now - at).total_seconds() > 180:
+        return "UNKNOWN", "COMPLETED_BAR_STALE", opening, after_open
+    if len(after_open) < 3:
+        return "WAIT", "POST_OPENING_CONFIRMATION_PENDING", opening, after_open
+    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in after_open[-3:]]
+    if any((b - a).total_seconds() != 60 for a, b in zip(stamps, stamps[1:])):
+        return "UNKNOWN", "RECENT_MINUTE_GAP", opening, after_open
+    return "COVERED", "STRUCTURAL_1M_BARS_AVAILABLE", opening, after_open
+
+
+def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
+    """Read-only structural proof; COVERED never grants BUY authorization."""
+    now = now.astimezone(KST)
+    bars = clean_completed_bars(rows, now)
+    state, reason, opening, after_open = _completed_bar_structure(bars, now)
+    return {
+        "state": state, "reason": reason,
         "bars": len(bars), "opening_count": len(opening),
         "post_open_count": len(after_open),
         "latest_bar_ts": bars[-1]["timestamp"] if bars else None,
@@ -98,24 +120,6 @@ def inspect_completed_bar_coverage(*, rows: list[dict], now: datetime) -> dict:
             if bars else None
         ),
     }
-    def outcome(state: str, reason: str) -> dict:
-        return {"state": state, "reason": reason, **info}
-    if now.time() < dtime(9, 30):
-        return outcome("WAIT", "OPENING_OBSERVATION")
-    if (len(opening) < 25
-            or datetime.fromisoformat(opening[0]["timestamp"]).time() > dtime(9, 3)
-            or datetime.fromisoformat(opening[-1]["timestamp"]).time() < dtime(9, 26)):
-        return outcome("UNKNOWN", "OPENING_BARS_MISSING_OR_INCOMPLETE")
-    if not bars:
-        return outcome("UNKNOWN", "NO_CURRENT_BAR")
-    if info["latest_bar_age_sec"] is not None and info["latest_bar_age_sec"] > 180:
-        return outcome("UNKNOWN", "COMPLETED_BAR_STALE")
-    if len(after_open) < 3:
-        return outcome("WAIT", "POST_OPENING_CONFIRMATION_PENDING")
-    stamps = [datetime.fromisoformat(bar["timestamp"]) for bar in after_open[-3:]]
-    if any((b - a).total_seconds() != 60 for a, b in zip(stamps, stamps[1:])):
-        return outcome("UNKNOWN", "RECENT_MINUTE_GAP")
-    return outcome("COVERED", "STRUCTURAL_1M_BARS_AVAILABLE")
 
 
 def _result(state: str, reason: str, **extra) -> dict:
@@ -141,30 +145,17 @@ def evaluate_price_aware_entry(
     if not setup_ok:
         return _result("INVALID", "ORIGINAL_SETUP_FAILED")
     bars = clean_completed_bars(rows, now)
-    opening = [b for b in bars if dtime(9, 0) <=
-               datetime.fromisoformat(b["timestamp"]).time() < dtime(9, 30)]
-    if (len(opening) < 25
-            or datetime.fromisoformat(opening[0]["timestamp"]).time() > dtime(9, 3)
-            or datetime.fromisoformat(opening[-1]["timestamp"]).time() < dtime(9, 26)):
-        return _result("UNKNOWN", "OPENING_BARS_MISSING_OR_INCOMPLETE",
-                       opening_count=len(opening))
+    structure_state, structure_reason, opening, after_open = _completed_bar_structure(bars, now)
+    if structure_state != "COVERED":
+        meta = {"opening_count": len(opening)}
+        if opening:
+            meta.update(opening_high=max(b["high"] for b in opening),
+                        opening_low=min(b["low"] for b in opening))
+        return _result(structure_state, structure_reason, **meta)
     high = max(b["high"] for b in opening)
     low = min(b["low"] for b in opening)
-    current = bars[-1] if bars else None
-    if current is None:
-        return _result("UNKNOWN", "NO_CURRENT_BAR")
-    at = datetime.fromisoformat(current["timestamp"])
-    if (now - at).total_seconds() > 180:
-        return _result("UNKNOWN", "COMPLETED_BAR_STALE",
-                       opening_high=high, opening_low=low)
-    after_open = [b for b in bars if datetime.fromisoformat(b["timestamp"]).time() >= dtime(9, 30)]
-    if len(after_open) < 3:
-        return _result("WAIT", "POST_OPENING_CONFIRMATION_PENDING",
-                       opening_high=high, opening_low=low)
+    current = bars[-1]
     recent = after_open[-3:]
-    stamps = [datetime.fromisoformat(b["timestamp"]) for b in recent]
-    if any((b-a).total_seconds() != 60 for a,b in zip(stamps, stamps[1:])):
-        return _result("UNKNOWN", "RECENT_MINUTE_GAP", opening_high=high, opening_low=low)
     close = current["close"]
     ordered_price = _positive(order_price) or close
     if ordered_price <= 0:
