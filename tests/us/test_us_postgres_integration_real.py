@@ -3426,8 +3426,9 @@ def test_pg_closed_latest_snapshot_never_resurrects_old_buy_parent(pg_engine, mo
 
 
 @pytest.mark.parametrize("paper_profile", [False, True], ids=["legacy-off", "paper-on-enforce"])
+@pytest.mark.parametrize("multiple_unresolved", [False, True], ids=["ko-only", "ko-kr-tmo"])
 def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
-    pg_engine, monkeypatch, paper_profile,
+    pg_engine, monkeypatch, paper_profile, multiple_unresolved,
 ):
     """Real PG -> exit resolver -> signed original V2/V3 -> actual order
     router and fake broker ACK; neither a real KIS request nor a KIS fill.
@@ -3447,6 +3448,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     )
     symbols = ["ABBV", "AMGN", "DHR", "HCA", "KO",
                "KR", "MCK", "PFE", "PG", "TMO"]
+    blocked = {"KO", "KR", "TMO"} if multiple_unresolved else {"KO"}
     monkeypatch.setattr(repos, "_active_us_epoch", lambda _conn=None, **_kw: epoch)
     monkeypatch.setenv("KIS_ENV", "practice")
     monkeypatch.setattr(
@@ -3510,13 +3512,16 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                 "epoch": epoch, "cycle": None if sym == "ABBV" else f"fixture-cycle-{sym}",
                 "meta": json.dumps(meta),
             })
-        conn.execute(text("""
+        for blocked_symbol in blocked:
+            conn.execute(text("""
             INSERT INTO us_orders(
                 trade_date,client_order_key,symbol,exchange,side,qty_requested,
                 qty_filled,order_no,status,dry_run,trading_epoch_id,meta)
-            VALUES ('2026-11-12','fixture-ko-unresolved','KO','NYSE','SELL',
-                    1,0,'KO-UNRESOLVED','ACK',false,:epoch,'{}'::jsonb)
-        """), {"epoch": epoch})
+            VALUES ('2026-11-12',:key,:sym,'NYSE','SELL',
+                    1,0,:order_no,'ACK',false,:epoch,'{}'::jsonb)
+        """), {"epoch": epoch, "sym": blocked_symbol,
+                "key": "fixture-" + blocked_symbol + "-unresolved",
+                "order_no": blocked_symbol + "-UNRESOLVED"})
 
     # Deliberately change the runtime defaults after BUY creation. Decisions
     # must continue to use each held position's signed original V2/V3.
@@ -3524,7 +3529,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     monkeypatch.setenv("US_SWING_V3_DEPLOY_APPROVED", "0")
     positions = repos.load_us_positions_by_symbols(symbols, as_of="2026-11-12")
     assert set(positions) == set(symbols)
-    assert should_skip_exit_due_to_pending_sell("KO", "2026-11-12")[0] is True
+    for blocked_symbol in blocked:
+        assert should_skip_exit_due_to_pending_sell(blocked_symbol, "2026-11-12")[0] is True
     resolved, resolution = enrich_us_positions_for_exit(
         list(positions.values()), trade_date="2026-11-12", env="practice",
     )
@@ -3549,8 +3555,8 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         [], prepared_snapshots=resolved, now=now, include_trend_time=False,
     )
     found = {intent["symbol"]: intent for intent in signals if intent.get("side") == "SELL"}
-    assert len(found) == 8, found
-    assert "KO" not in found and "ABBV" not in found
+    assert len(found) == len(symbols) - len(blocked) - 1, found
+    assert not (blocked | {"ABBV"}).intersection(found)
     for sym, intent in found.items():
         assert intent["position_lifecycle_id"] == f"fixture-cycle-{sym}"
         assert intent["source_entry_contract_sha256"] == (
@@ -3571,7 +3577,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
         effective_budget=10000, signal_only=True, kis_order_allowed=True,
         current_position_symbols=set(symbols),
     )
-    assert len(routed["orders"]) == 8
+    assert len(routed["orders"]) == len(found)
     assert {order.get("symbol") for order in routed["orders"]} == set(found)
     assert all(order["status"] == "SIGNAL_ONLY" for order in routed["orders"])
 
@@ -3642,7 +3648,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
             ]}
 
         def place_us_sell_order(self, symbol, exchange, qty, price):
-            assert symbol not in {"ABBV", "KO"}
+            assert symbol not in blocked | {"ABBV"}
             assert exchange == "NASDAQ" and qty > 0
             self.sells.append((symbol, qty, price))
             return {"ok": True, "order_no": "CI-SELL-" + symbol}
@@ -3666,7 +3672,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
     )
     # A broker HTTP adapter call proves actual router traversal. The DB claims
     # and ACKs prove local write order, not live brokerage acceptance.
-    assert len(broker.sells) == 8, actual_routes
+    assert len(broker.sells) == len(found), actual_routes
     assert {sym for sym, *_ in broker.sells} == set(found)
     assert all(row.get("status") == "ACK" for row in actual_routes["orders"]), actual_routes
     with pg_engine.connect() as conn:
@@ -3676,7 +3682,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
             WHERE trade_date='2026-11-12' AND side='SELL'
               AND order_no LIKE 'CI-SELL-%'
         """)).mappings().all()
-    assert len(pg_sell_rows) == 8
+    assert len(pg_sell_rows) == len(found)
     assert {r["symbol"] for r in pg_sell_rows} == set(found)
     if paper_profile:
         with pg_engine.connect() as conn:
@@ -3702,7 +3708,7 @@ def test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions(
                    for r in reservations)
         assert {r["symbol"] for r in outbox} == set(found)
         assert all(r["n"] == 1 for r in outbox)
-        assert attempts == 8
+        assert attempts == len(found)
     assert {
         positions[row["symbol"]]["meta"]["entry_exit_contract"]["version"]
         for row in pg_sell_rows
