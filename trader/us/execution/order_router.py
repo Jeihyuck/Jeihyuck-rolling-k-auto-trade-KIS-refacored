@@ -2807,6 +2807,30 @@ def route_order(
                 "[US_ORDER][EXECUTION_CLAIM][PRE_BOUNDARY_RELEASE_FAILED] action_key=%s",
                 claim.action_key,
             )
+        # A matching claimed TP stage is released only after the *actual*
+        # before-boundary abort is durable and the Claim has been released.
+        # If proof is missing, the original stage remains fenced.
+        _tp_boundary_released = False
+        if (side == "SELL" and not abort_journal_error and release_error is None
+                and (intent.get("meta") or {}).get("tp_claim_stage_reserved") is True):
+            try:
+                from trader.us.db.repos import release_us_profit_capture_pre_http_abort
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _tp_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or ""),
+                    intent.get("meta"), client_order_key=str(order_key or ""),
+                )
+                _tp_boundary_released = release_us_profit_capture_pre_http_abort(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=str((intent.get("meta") or {}).get("profit_capture_stage") or ""),
+                    position_lifecycle_id=_tp_cycle,
+                    client_order_key=str(order_key or ""),
+                )
+                if not _tp_boundary_released:
+                    release_error = RuntimeError("TP_BEFORE_BOUNDARY_RELEASE_UNVERIFIED")
+            except Exception as exc:
+                release_error = exc
+                logger.exception("[US_PROFIT_CAPTURE][PRE_BOUNDARY_RELEASE_FAILED]")
         # A release alone is not a terminal intent: the exact DB abort proof,
         # released claim, and lack of broker evidence must agree.
         if (side == "BUY" and _native_kis and not abort_journal_error
@@ -2838,6 +2862,7 @@ def route_order(
             "broker_submit": False,
             "retry_order": release_error is None,
             "requires_reconcile": release_error is not None,
+            "tp_stage_released_pre_io": _tp_boundary_released,
             "intent": intent,
         }
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
@@ -2896,6 +2921,29 @@ def route_order(
                 raise KisUSPreSubmitError(
                     "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP"
                 ) from _reservation_exc
+        if (side == "SELL"
+                and (intent.get("meta") or {}).get("tp_pending_deferred_to_claim") is True):
+            try:
+                from trader.us.db.repos import verify_us_tp_claim_stage_at_http_boundary
+                from trader.us.profit_capture import tp_stage_lifecycle_from_order_proof
+                _boundary_meta = intent.get("meta") or {}
+                _boundary_cycle = tp_stage_lifecycle_from_order_proof(
+                    str(intent.get("position_lifecycle_id") or ""),
+                    _boundary_meta, client_order_key=str(order_key or ""),
+                )
+                if not verify_us_tp_claim_stage_at_http_boundary(
+                    trade_date=str(trade_date), symbol=symbol_upper,
+                    stage=str(_boundary_meta.get("profit_capture_stage") or ""),
+                    position_lifecycle_id=_boundary_cycle,
+                    client_order_key=str(order_key or ""),
+                    attempt_id=str(intent.get("submit_attempt_id") or ""),
+                    action_key=claim.action_key,
+                ):
+                    raise RuntimeError("TP_STAGE_OR_CLAIM_STALE_BEFORE_HTTP")
+            except Exception as _boundary_stage_exc:
+                raise KisUSPreSubmitError(
+                    "US_TP_STAGE_CLAIM_FENCED_BEFORE_HTTP"
+                ) from _boundary_stage_exc
         # The tick may be cancelled while KIS's own rate limiter waits or
         # while a reservation/health query runs. Do not submit after its
         # absolute deadline or after durable session authority has changed.
@@ -3208,6 +3256,7 @@ def route_order(
                 "US_STAGE4_WRITER_FENCED_BEFORE_HTTP",
                 "US_TICK_AUTHORITY_EXPIRED_BEFORE_HTTP",
                 "US_ACCOUNT_RESERVATION_FENCED_BEFORE_HTTP",
+                "US_TP_STAGE_CLAIM_FENCED_BEFORE_HTTP",
                 "US_TP_DECISION_EXPIRED_BEFORE_HTTP",
                 "US_TP_DECISION_TIME_UNVERIFIED",
                 "US_TP_DECISION_AGE_CONFIG_INVALID",
