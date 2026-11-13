@@ -157,7 +157,7 @@ def build_kr_volume_proof(
         if not quoted_code:
             return reject("kis_quote_identity_unverified")
         proof["quote_identity_attestation"] = "KIS_WS_SUBSCRIPTION"
-    elif source == "KIS_REST_INQUIRE_PRICE":
+    elif source in {"KIS_REST_INQUIRE_PRICE", "KIS_REST_TIME_ITEMCONCLUSION"}:
         # KIS inquire-price may not repeat the requested code in output.
         # Authenticated wrapper request binding is not a native symbol field.
         requested = str(quote.get("requested_symbol") or "").strip().lstrip("A")
