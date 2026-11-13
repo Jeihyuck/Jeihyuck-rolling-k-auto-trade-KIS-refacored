@@ -3566,6 +3566,81 @@ def reserve_us_profit_capture_stage_after_claim(
         )
 
 
+def verify_us_tp_claim_stage_at_http_boundary(
+    *, trade_date: str, symbol: str, stage: str, position_lifecycle_id: str,
+    client_order_key: str, attempt_id: str, action_key: str,
+) -> bool:
+    """Before native KIS POST: scoped, locked TP+Claim authority still exists.
+
+    The stage cannot be released as intent-only while a matching Claim is
+    IN_FLIGHT. A raced pre-claim cancellation is caught by the stage lock
+    here; no broker HTTP is allowed from a stale/other attempt.
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        return False
+    epoch_params = dict(
+        td=str(trade_date or ""), sym=str(symbol or "").upper().strip(),
+        stage=str(stage or "").lower(), cycle=str(position_lifecycle_id or ""),
+        key=str(client_order_key or ""), attempt=str(attempt_id or ""),
+        action=str(action_key or ""),
+    )
+    if (not all(epoch_params.values())
+            or epoch_params["stage"] not in {"tp1", "tp2", "tp3"}):
+        return False
+    with engine.begin() as conn:
+        epoch = _active_us_epoch(conn, required=True)
+        scope = _us_execution_claim_scope()
+        if (scope.get("env") != "practice" or not epoch
+                or scope.get("trading_epoch_id") != str(epoch)
+                or not scope.get("account_id")):
+            return False
+        params = {**epoch_params, "epoch": str(epoch), "account": scope["account_id"]}
+        stage_row = conn.execute(text("""
+            SELECT stage_status, client_order_key, cumulative_filled_qty
+              FROM us_profit_capture_lifecycle WHERE trade_date=:td
+               AND symbol=:sym AND position_lifecycle_id=:cycle
+               AND stage=:stage AND trading_epoch_id=:epoch FOR UPDATE
+        """), params).mappings().one_or_none()
+        if (not stage_row or stage_row["stage_status"] != "PENDING"
+                or stage_row["client_order_key"] != params["key"]
+                or int(stage_row.get("cumulative_filled_qty") or 0) != 0):
+            return False
+        claim = conn.execute(text("""
+            SELECT c.action_state,c.active_attempt_id,a.attempt_state,
+                   a.client_order_key
+              FROM us_execution_claims c
+              JOIN us_execution_attempts a ON a.action_key=c.action_key
+             WHERE c.action_key=:action AND a.attempt_id=:attempt
+               AND c.trade_date=:td AND c.trading_epoch_id=:epoch
+               AND c.env='practice' AND c.account_id=:account
+               AND c.market='US' AND c.strategy_owner='US_STANDARD'
+             FOR UPDATE OF c
+        """), params).mappings().one_or_none()
+        if (not claim or claim["action_state"] != "IN_FLIGHT"
+                or str(claim["active_attempt_id"] or "") != params["attempt"]
+                or str(claim["client_order_key"] or "") != params["key"]
+                or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}):
+            return False
+        if conn.execute(text("""
+            SELECT 1 FROM us_orders WHERE trade_date=:td
+               AND client_order_key=:key AND trading_epoch_id=:epoch LIMIT 1
+        """), params).scalar_one_or_none() is not None:
+            return False
+        events = conn.execute(text("""
+            SELECT event_type,submit_attempt_id FROM us_order_events
+             WHERE trade_date=:td AND client_order_key=:key
+               AND trading_epoch_id=:epoch
+        """), params).mappings().all()
+        return all(
+            str(e.get("submit_attempt_id") or "") == params["attempt"]
+            and str(e.get("event_type") or "") in {
+                "BROKER_CLAIM_PREPARED", "BROKER_SUBMIT_STARTED",
+            }
+            for e in events
+        )
+
+
 def release_us_profit_capture_pre_http_abort(
     *, trade_date: str, symbol: str, stage: str,
     position_lifecycle_id: str, client_order_key: str,
