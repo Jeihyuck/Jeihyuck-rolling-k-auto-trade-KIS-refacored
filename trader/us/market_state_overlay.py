@@ -1251,6 +1251,24 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                         native_tp_attempt_id = str(uuid4())
                         order_key = f"{order_key}_A{native_tp_attempt_id.replace('-', '')[:16]}"
                     pending_intent = ({"symbol": sym, "side": "SELL", "strategy_owner": "US_STANDARD", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_sha is not None else {}), "meta": {"reason": reason, "profit_capture_stage": stage, "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "profit_capture_sell_fraction": str(sell_pct), "profit_capture_runner_min_remain_pct": str(local_runner_min), "profit_capture_stage_target_qty": stage_target_qty, "profit_capture_stage_filled_qty": stage_filled_qty, "profit_capture_decision_holding_qty": q, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat(), "source_entry_contract_sha256": contract_sha, "source_entry_contract_version": entry_contract.get("version") if contract_sha else None, "exit_rule_source": ("ENTRY_EXIT_CONTRACT_V3" if entry_contract.get("version") == "us_entry_exit_contract_v3" else "ENTRY_EXIT_CONTRACT_V2") if contract_sha else "LEGACY_GLOBAL_TP", "partial_exit_scope": "PROFIT_CAPTURE_STAGE" if contract_sha else "LEGACY_GLOBAL_TP", **({"partial_exit_allowed": contract_partial_exit_allowed} if contract_partial_exit_allowed is not None else {})}})
+                    # Preserve the already-resolved original BUY scope through
+                    # the TP intent and durable order. Never pick one side of
+                    # a conflicting top-level/metadata identity.
+                    position_meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+                    identity_conflict = False
+                    for scope_field in ("broker_account_hash", "trading_epoch_id",
+                                        "portfolio_epoch_id", "position_cycle_id"):
+                        direct, nested = p.get(scope_field), position_meta.get(scope_field)
+                        if direct not in (None, "") and nested not in (None, "") and str(direct) != str(nested):
+                            identity_conflict = True
+                            break
+                        value = direct if direct not in (None, "") else nested
+                        if value not in (None, ""):
+                            pending_intent[scope_field] = value
+                            pending_intent["meta"][scope_field] = value
+                    if identity_conflict:
+                        logger.error("[US_PROFIT_CAPTURE][SCOPE_CONFLICT] symbol=%s stage=%s", sym, stage)
+                        break
                     if native_tp_attempt_id:
                         pending_intent["submit_attempt_id"] = native_tp_attempt_id
                         pending_intent["meta"]["submit_attempt_id"] = native_tp_attempt_id

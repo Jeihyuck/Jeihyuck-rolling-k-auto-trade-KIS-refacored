@@ -945,8 +945,9 @@ def test_pg_us353_cross_day_open_tp_fences_new_claim_reservation(
     reason="disposable PostgreSQL acceptance URL unavailable",
 )
 @pytest.mark.parametrize("claim_commit_failure", [False, True])
+@pytest.mark.parametrize("retry_next_day", [False, True])
 def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together(
-    pg_engine, monkeypatch, claim_commit_failure,
+    pg_engine, monkeypatch, claim_commit_failure, retry_next_day,
 ):
     """Native KIS-shaped US_STANDARD SELL 5 -> fill 2 -> cancel remaining 3.
 
@@ -1002,6 +1003,8 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
         "profit_capture_stage": "tp1", "position_lifecycle_id": cycle,
         "tp_pending_deferred_to_claim": True,
         "broker_account_hash": account, "trading_epoch_id": epoch,
+        "source_entry_contract_sha256": "us353-original-signed-contract",
+        "portfolio_epoch_id": "us353-portfolio", "position_cycle_id": "us353-cycle",
     }
     with pg_engine.begin() as conn:
         conn.execute(text("""
@@ -1082,3 +1085,57 @@ def test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together
     assert order["qty_filled"] == 2
     assert int(order["meta"]["semantic_action_remaining_qty"]) == 3
     assert int(order["meta"]["broker_open_qty"]) == 0
+
+    # Real PostgreSQL continuation: the same economic Claim retains its
+    # original five-share target and creates a new three-share attempt.
+    retry_date = "2026-10-30" if retry_next_day else trade_date
+    retry_key = key + "_RETRY"
+    retry_attempt = attempt + "_RETRY"
+    retry_meta = {**meta, "submit_attempt_id": retry_attempt}
+    assert repos.save_order_intent({
+        "trade_date": retry_date, "symbol": "GILD", "exchange": "NYSE",
+        "side": "SELL", "qty": 3, "limit_price": 102, "notional_usd": 306,
+        "strategy_owner": "US_STANDARD", "client_order_key": retry_key,
+        "submit_attempt_id": retry_attempt, "position_lifecycle_id": cycle,
+        "meta": retry_meta,
+    }, trade_date=retry_date)
+    retry_identity = SemanticActionIdentity(
+        env="practice", account_id=account, market="US", trading_epoch_id=epoch,
+        strategy_owner="US_STANDARD", lifecycle_id=cycle, action="TP1",
+        trade_date=date.fromisoformat(retry_date),
+    )
+    assert retry_identity.action_key == identity.action_key
+    assert ledger.acquire(
+        retry_identity, attempt_id=retry_attempt, requested_qty=3,
+        fresh_validation=True, client_order_key=retry_key,
+    ).acquired
+    retry_args = dict(
+        trade_date=retry_date, symbol="GILD", stage="tp1",
+        position_lifecycle_id=cycle, client_order_key=retry_key,
+        attempt_id=retry_attempt, action_key=identity.action_key,
+    )
+    assert repos.reserve_us_profit_capture_stage_after_claim(
+        **retry_args, qty=3, notional_usd=306, limit_price_usd=102,
+        intent_meta=retry_meta,
+    )
+    from uuid import uuid4
+    from datetime import datetime, timezone
+    assert repos.append_us_order_event({
+        "event_id": str(uuid4()), "trade_date": retry_date,
+        "event_type": "BROKER_SUBMIT_STARTED",
+        "event_timestamp": datetime.now(timezone.utc).isoformat(),
+        "session": "am", "session_run_id": "us353-retry", "tick_id": "retry",
+        "trading_epoch_id": epoch, "client_order_key": retry_key,
+        "submit_attempt_id": retry_attempt, "symbol": "GILD", "side": "SELL",
+        "requested_qty": 3, "position_lifecycle_id": cycle,
+        "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+        "payload": {"strategy_owner": "US_STANDARD"},
+        "idempotency_key": "us353-partial-retry-started",
+    })
+    assert repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)
+    # A corrected late fill on the superseded original order fences HTTP.
+    ledger.record_observation(
+        retry_identity, attempt_id=attempt, state="CANCELLED",
+        cumulative_filled_qty=3, authoritative=True,
+    )
+    assert not repos.verify_us_tp_claim_stage_at_http_boundary(**retry_args)

@@ -43,6 +43,24 @@ def test_first_tp_with_persisted_stage_routes_once():
     mark.assert_called_once()
 
 
+def test_tp_intent_preserves_original_position_scope():
+    scope = {"broker_account_hash": "acct", "trading_epoch_id": "epoch",
+             "portfolio_epoch_id": "portfolio", "position_cycle_id": "cycle"}
+    with patch.dict(POSITION, scope):
+        out, _ = _evaluate({})
+    assert len(out) == 1
+    for field, value in scope.items():
+        assert out[0][field] == value
+        assert out[0]["meta"][field] == value
+
+
+def test_tp_intent_rejects_conflicting_original_position_scope():
+    with patch.dict(POSITION, {"portfolio_epoch_id": "one", "meta": {"portfolio_epoch_id": "two"}}):
+        out, mark = _evaluate({})
+    assert out == []
+    mark.assert_not_called()
+
+
 def test_db_stage_write_failure_does_not_route_broker_intent():
     out, mark = _evaluate({}, persist_side_effect=RuntimeError("db down"))
     assert out == []

@@ -2441,7 +2441,7 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                     _standard_tp_partial_cancel_proven = False
                     if _standard_tp_candidate:
                         _standard_tp_row = conn.execute(text("""
-                            SELECT stage_status, requested_qty, cumulative_filled_qty
+                            SELECT stage_status, requested_qty, cumulative_filled_qty, state
                               FROM us_profit_capture_lifecycle
                              WHERE trade_date=:td AND symbol=:sym AND stage=:stage
                                AND position_lifecycle_id=:cycle
@@ -2453,13 +2453,20 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                             "cycle": _standard_tp_cycle, "key": key,
                             "epoch": str(active_epoch_id),
                         }).mappings().one_or_none()
-                        _standard_tp_partial_cancel_proven = bool(
-                            _standard_tp_row
-                            and str(_standard_tp_row["stage_status"]) == "PENDING"
-                            and int(_standard_tp_row["requested_qty"] or 0) == int(requested_qty)
-                            and 0 <= int(_standard_tp_row["cumulative_filled_qty"] or 0)
-                            <= int(filled_qty_value)
-                        )
+                        if _standard_tp_row:
+                            _stage_state = _parse_json_meta(_standard_tp_row.get("state"))
+                            _stage_meta = _parse_json_meta(_stage_state.get("meta"))
+                            _fills = _stage_meta.get(f"{_standard_tp_stage}_fills_by_order_key") or {}
+                            _already_this_order = int(_fills.get(key) or 0) if isinstance(_fills, dict) else -1
+                            _stage_filled = int(_standard_tp_row["cumulative_filled_qty"] or 0)
+                            _before_this_order = _stage_filled - _already_this_order
+                            _standard_tp_partial_cancel_proven = bool(
+                                str(_standard_tp_row["stage_status"]) == "PENDING"
+                                and 0 <= _already_this_order <= int(filled_qty_value)
+                                and _before_this_order >= 0
+                                and _before_this_order + int(requested_qty)
+                                    == int(_standard_tp_row["requested_qty"] or 0)
+                            )
                     if (_cancel_zero_fill_proven or _tqqq_partial_cancel_proven
                             or _standard_tp_partial_cancel_proven):
                         _cancel_snapshot = record_execution_action_observation_by_key(
@@ -3516,6 +3523,36 @@ def mark_us_profit_capture_stage(
 
 
 
+def _proven_us_tp_partial_retry(conn, params, stage_row, claim, intent_meta):
+    """Re-read the complete previous attempts under the caller's claim lock."""
+    from trader.us.tp_partial_retry import proven_partial_tp_remainder
+
+    attempts = conn.execute(text("""
+        SELECT attempt_id, client_order_key, requested_qty, cumulative_filled_qty,
+               attempt_state, authoritative
+          FROM us_execution_attempts
+         WHERE action_key=:action AND attempt_id<>:attempt
+         ORDER BY attempt_no
+    """), params).mappings().all()
+    orders = conn.execute(text("""
+        SELECT o.client_order_key, o.symbol, o.side, o.status, o.order_no,
+               o.qty_requested, o.qty_filled, o.meta
+          FROM us_orders o
+         WHERE o.trading_epoch_id=:epoch AND o.trade_date<=:td
+           AND o.client_order_key IN (
+               SELECT client_order_key FROM us_execution_attempts
+                WHERE action_key=:action AND attempt_id<>:attempt
+           )
+    """), params).mappings().all()
+    return proven_partial_tp_remainder(
+        claim=claim, current_attempt=claim, prior_attempts=attempts,
+        prior_orders=orders, stage=stage_row, intent_meta=intent_meta,
+        account=str(params["account"]), cycle=str(params["cycle"]),
+        symbol=str(params["sym"]), stage_name=str(params["stage"]),
+        qty=int(claim["requested_qty"]),
+    )
+
+
 def reserve_us_profit_capture_stage_after_claim(
     *, trade_date: str, symbol: str, stage: str, position_lifecycle_id: str,
     client_order_key: str, attempt_id: str, action_key: str, qty: int,
@@ -3567,23 +3604,19 @@ def reserve_us_profit_capture_stage_after_claim(
             SELECT pg_advisory_xact_lock(hashtextextended(:identity,0))
         """), {"identity": "|".join((str(epoch), sym, cycle, stg))})
         historical = conn.execute(text("""
-            SELECT stage_status, cumulative_filled_qty
+            SELECT stage_status, cumulative_filled_qty, requested_qty
               FROM us_profit_capture_lifecycle
              WHERE trade_date < :td AND symbol=:sym AND stage=:stage
                AND position_lifecycle_id=:cycle AND trading_epoch_id=:epoch
-             FOR UPDATE
+             ORDER BY trade_date DESC FOR UPDATE
         """), params).mappings().all()
         if any(
             str(previous.get("stage_status") or "") in {"PENDING", "DONE"}
-            or int(previous.get("cumulative_filled_qty") or 0) > 0
             for previous in historical
         ):
-            # Do not infer that an overnight broker order has terminated.
-            # Certified partial-cancel remainders need a separate native-KIS
-            # order/Claim terminal proof and cannot bypass this safety fence.
             return False
         stage_row = conn.execute(text("""
-            SELECT stage_status, client_order_key, cumulative_filled_qty
+            SELECT stage_status, client_order_key, cumulative_filled_qty, requested_qty
               FROM us_profit_capture_lifecycle
              WHERE trade_date=:td AND symbol=:sym
                AND position_lifecycle_id=:cycle AND stage=:stage
@@ -3592,13 +3625,13 @@ def reserve_us_profit_capture_stage_after_claim(
         """), params).mappings().one_or_none()
         if stage_row and (
             str(stage_row["stage_status"]) in {"PENDING", "DONE"}
-            or int(stage_row.get("cumulative_filled_qty") or 0) > 0
         ):
             return False
         # A second attempt, an unknown ACK, or an unscoped claim cannot
         # replace the stage reservation.
         claim = conn.execute(text("""
-            SELECT c.action_state, c.active_attempt_id, c.lifecycle_id,
+            SELECT c.action_key, c.action, c.target_qty, c.filled_qty_before_attempt,
+                   c.action_state, c.active_attempt_id, c.lifecycle_id,
                    c.account_id, a.attempt_state, a.client_order_key,
                    a.requested_qty
               FROM us_execution_claims c
@@ -3614,7 +3647,21 @@ def reserve_us_profit_capture_stage_after_claim(
                 or str(claim[0].get("active_attempt_id") or "") != attempt
                 or str(claim[0].get("attempt_state") or "") != "CREATED"
                 or str(claim[0].get("client_order_key") or "") != key
+                or str(claim[0].get("lifecycle_id") or "") != cycle
                 or int(claim[0].get("requested_qty") or 0) < int(qty)):
+            return False
+        prior_stage = stage_row or (historical[0] if historical else None)
+        if int(claim[0].get("filled_qty_before_attempt") or 0) > 0 and (
+            not prior_stage or int(prior_stage.get("cumulative_filled_qty") or 0) <= 0
+        ):
+            return False
+        if prior_stage and int(prior_stage.get("cumulative_filled_qty") or 0) > 0:
+            if not _proven_us_tp_partial_retry(
+                conn, params, prior_stage, claim[0], dict(intent_meta or {}),
+            ):
+                return False
+        elif historical and any(int(row.get("cumulative_filled_qty") or 0) > 0 for row in historical):
+            # Never discard an older cumulative fill behind an inconsistent row.
             return False
         row = conn.execute(text("""
             SELECT status,meta,qty,limit_price_usd,notional_usd FROM us_order_intents
@@ -3732,18 +3779,18 @@ def verify_us_tp_claim_stage_at_http_boundary(
             return False
         params = {**epoch_params, "epoch": str(epoch), "account": scope["account_id"]}
         stage_row = conn.execute(text("""
-            SELECT stage_status, client_order_key, cumulative_filled_qty
+            SELECT stage_status, client_order_key, cumulative_filled_qty, requested_qty
               FROM us_profit_capture_lifecycle WHERE trade_date=:td
                AND symbol=:sym AND position_lifecycle_id=:cycle
                AND stage=:stage AND trading_epoch_id=:epoch FOR UPDATE
         """), params).mappings().one_or_none()
         if (not stage_row or stage_row["stage_status"] != "PENDING"
-                or stage_row["client_order_key"] != params["key"]
-                or int(stage_row.get("cumulative_filled_qty") or 0) != 0):
+                or stage_row["client_order_key"] != params["key"]):
             return False
         claim = conn.execute(text("""
-            SELECT c.action_state,c.active_attempt_id,a.attempt_state,
-                   a.client_order_key
+            SELECT c.action_key,c.action,c.target_qty,c.filled_qty_before_attempt,
+                   c.lifecycle_id,c.action_state,c.active_attempt_id,a.attempt_state,
+                   a.client_order_key,a.requested_qty
               FROM us_execution_claims c
               JOIN us_execution_attempts a ON a.action_key=c.action_key
              WHERE c.action_key=:action AND a.attempt_id=:attempt
@@ -3754,9 +3801,23 @@ def verify_us_tp_claim_stage_at_http_boundary(
         """), params).mappings().one_or_none()
         if (not claim or claim["action_state"] != "IN_FLIGHT"
                 or str(claim["active_attempt_id"] or "") != params["attempt"]
+                or str(claim["lifecycle_id"] or "") != params["cycle"]
                 or str(claim["client_order_key"] or "") != params["key"]
                 or str(claim["attempt_state"] or "") not in {"CREATED", "SUBMITTED"}):
             return False
+        if (int(claim.get("filled_qty_before_attempt") or 0) > 0
+                and int(stage_row.get("cumulative_filled_qty") or 0) <= 0):
+            return False
+        if int(stage_row.get("cumulative_filled_qty") or 0) > 0:
+            intent_meta = conn.execute(text("""
+                SELECT meta FROM us_order_intents
+                 WHERE trade_date=:td AND client_order_key=:key
+                   AND symbol=:sym AND side='SELL' AND trading_epoch_id=:epoch
+            """), params).scalar_one_or_none()
+            if not intent_meta or not _proven_us_tp_partial_retry(
+                conn, params, stage_row, claim, _parse_json_meta(intent_meta),
+            ):
+                return False
         if conn.execute(text("""
             SELECT 1 FROM us_orders WHERE trade_date=:td
                AND client_order_key=:key AND trading_epoch_id=:epoch LIMIT 1
