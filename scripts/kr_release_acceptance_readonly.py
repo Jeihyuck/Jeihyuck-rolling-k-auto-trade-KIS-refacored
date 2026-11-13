@@ -29,8 +29,6 @@ TRIGGERS = {
     "kr_signed_buy_order_guard_0063": "orders",
     "kr_signed_position_guard_0063": "positions",
 }
-CI_STATUS = "OFFLINE_CI_INDEPENDENTLY_VERIFIED"
-
 
 def evaluate_readiness(snapshot: dict[str, Any], expected_sha: str) -> dict[str, Any]:
     """Pure, evidence-aware result: NEVER return live PASS from database alone."""
