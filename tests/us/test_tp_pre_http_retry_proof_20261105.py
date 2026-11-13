@@ -481,7 +481,7 @@ def test_ko_kr_tp2_missing_pre_http_proof_is_stage_scoped_and_never_resubmits(ca
 def test_proven_pre_http_abort_remains_only_safe_tp_retry_evidence():
     """No blanket release of an attempt merely because a stage is marked failed."""
     for stg in ("tp1", "tp2", "tp3"):
-        stem = {"tp1_done": True, "tp2_done": True}
+        stem = {"tp1_done": stg != "tp1", "tp2_done": stg == "tp3"}
         state = {**stem, "meta": {
             f"{stg}_order_keys": ["durable-first-attempt"],
             "last_stage": stg, "last_status": "FAILED",
