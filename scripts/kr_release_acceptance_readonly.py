@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         day = date.fromisoformat(args.trade_date)
     except ValueError:
         parser.error("--trade-date must be YYYY-MM-DD")
-    if str(os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "practice").lower() != "practice":
+    if any(str(os.getenv(name) or "practice").lower() != "practice" for name in ("KIS_ENV", "STRATEGY_ENV")):
         raise RuntimeError("KR_RELEASE_ACCEPTANCE_PRACTICE_ONLY")
     from trader.account_state import get_account_key
     from trader.db.engine import get_engine
@@ -213,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
     report = evaluate_readiness(snapshot, args.expected_sha)
     report["trade_date"] = day.isoformat()
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if report["release_readiness"] == "OPERATOR_KIS_ATTESTATION_REQUIRED" else 2
+    # A SELECT-only audit must NEVER return a green exit code for a live-release
+    # gate; KIS originals, WSL observer and ACK/restart replay remain unproven.
+    return 3 if report["release_readiness"] == "OPERATOR_KIS_ATTESTATION_REQUIRED" else 2
 
 
 if __name__ == "__main__":
