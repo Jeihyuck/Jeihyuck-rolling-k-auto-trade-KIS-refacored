@@ -71,6 +71,16 @@ jobs:
             trader/us/runner/trade_close_runner.py \
             scripts/repair_us_trade_integrity.py
 
+      - name: Run US353 TP remainder and multi-symbol isolation acceptance
+        shell: bash
+        run: |
+          test -n "$PBCORE_TEST_POSTGRES_URL"
+          python -m pytest -q \
+            tests/us/test_us_20261030_live_risk_ws_tp_prehttp.py::test_pg_us353_standard_tp_native_partial_cancel_commits_claim_stage_together \
+            tests/us/test_us_postgres_integration_real.py::test_pg_ten_holdings_unresolved_peer_does_not_suppress_other_exit_decisions \
+            tests/us/test_us353_tp_partial_retry_proof.py \
+            tests/us/test_tp_pre_http_retry_proof_20261105.py
+
       - name: Run PostgreSQL broker recovery acceptance
         shell: bash
         run: |
