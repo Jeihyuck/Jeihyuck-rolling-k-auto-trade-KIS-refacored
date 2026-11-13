@@ -2856,16 +2856,16 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext, trade_date: date | 
                         )
                         return True
                     except Exception as exc:
-                    reason = "KR_TP_STAGE_OBSERVATION_FAILED:" + type(exc).__name__
-                    execution_claim_observation_failures.append({
-                        "client_order_key": str(source_order.get("client_order_key") or ""),
-                        "error": reason,
-                    })
-                    logger.exception(
-                        "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
-                        code, tp_stage, reason,
-                    )
-                    return False
+                        reason = "KR_TP_STAGE_OBSERVATION_FAILED:" + type(exc).__name__
+                        execution_claim_observation_failures.append({
+                            "client_order_key": str(source_order.get("client_order_key") or ""),
+                            "error": reason,
+                        })
+                        logger.exception(
+                            "[KR_PROFIT_PARITY][KIS_PROOF_FAIL_CLOSED] code=%s stage=%s reason=%s",
+                            code, tp_stage, reason,
+                        )
+                        return False
 
                 def _apply_sell_claim(conn):
                     # TP stage proof is part of the same transaction as native
