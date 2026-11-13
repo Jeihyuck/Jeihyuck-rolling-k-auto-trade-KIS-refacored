@@ -63,6 +63,10 @@ def summarize_buy_skips(records: list[dict[str, Any]], *,
     quote_sources = Counter()
     entry_styles = Counter()
     volume_evidence_categories = Counter()
+    timing_states = Counter()
+    timing_modes = Counter()
+    timing_reason_counts = Counter()
+    timing_evaluated = 0
     grouped = defaultdict(lambda: {"events": 0, "runs": set(), "reasons": Counter()})
     unique_evaluations = set()
     event_ids = set()
@@ -112,6 +116,16 @@ def summarize_buy_skips(records: list[dict[str, Any]], *,
         quote_sources[str(proof.get("quote_source") or "UNRECORDED")] += 1
         entry_styles[str(features.get("entry_style_selected") or "UNRECORDED")] += 1
         volume_evidence_categories[str(proof.get("failure_category") or "UNRECORDED")] += 1
+        timing = features.get("entry_timing_evidence")
+        if isinstance(timing, dict) and timing.get("state") and timing.get("mode"):
+            # This is an actual pre-submit evaluation from #356, NOT an
+            # implied READY for every Final30 or volume-proof rejection.
+            timing_evaluated += 1
+            timing_states[str(timing["state"])] += 1
+            timing_modes[str(timing["mode"])] += 1
+            timing_reason_counts[str(timing.get("reason") or "UNRECORDED")] += 1
+        else:
+            timing_states["NOT_EVALUATED_OR_NOT_RECORDED"] += 1
         for reason in reasons:
             category, label = classify_skip(reason, proof=proof)
             counts[(category, label, reason)] += 1
@@ -139,6 +153,11 @@ def summarize_buy_skips(records: list[dict[str, Any]], *,
         "quote_source_occurrences": dict(sorted(quote_sources.items())),
         "entry_style_occurrences": dict(sorted(entry_styles.items())),
         "volume_proof_category_occurrences": dict(sorted(volume_evidence_categories.items())),
+        "timing_evaluated_event_count": timing_evaluated,
+        "timing_state_event_count": dict(sorted(timing_states.items())),
+        "timing_mode_evaluated_event_count": dict(sorted(timing_modes.items())),
+        "timing_reason_evaluated_event_count": dict(sorted(timing_reason_counts.items())),
+        "timing_reporting_scope": "ONLY LEDGER EVENTS; no count of candidates without an event",
         "by_category_reason_occurrences": dict(sorted(categories.items())),
         "by_reason": [
             {"category": category, "group": label,
