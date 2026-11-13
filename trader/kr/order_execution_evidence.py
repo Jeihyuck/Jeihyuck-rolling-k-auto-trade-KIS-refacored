@@ -117,7 +117,10 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
             issues.add("FILL_NOTIONAL_INVALID")
             continue
         source = str(meta.get("filled_at_source") or meta.get("filled_at_confidence") or "")
-        observed_time_quality.add(
+        # Only a *validated* native economic fill may attest its timestamp.
+        # A broker ACK, malformed or rejected fill must never upgrade the
+        # time quality of an otherwise order-time-proxy-only execution.
+        time_source_quality = (
             "NATIVE_EXECUTION_TIMESTAMP" if source == "KIS_EXECUTION_TIMESTAMP"
             else "ORDER_TIME_PROXY_OR_UNKNOWN"
         )
@@ -140,6 +143,7 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
                 issues.add("CUMULATIVE_WATERMARK_KEY_MISSING")
                 continue
             cum.setdefault(proof_id, []).append(row)
+            observed_time_quality.add(time_source_quality)
         else:
             proof_id = str(row.get("broker_fill_id") or row.get("trade_id") or "")
             if not proof_id or proof_id.startswith("KR_KIS_CUM:"):
@@ -152,6 +156,7 @@ def summarize_native_order(order: Mapping[str, Any], rows: list[dict]) -> dict:
                 issues.add("CONFLICTING_BROKER_TRADE_ID")
                 continue
             indiv[proof_id] = row
+            observed_time_quality.add(time_source_quality)
     if "ORDER_TIME_PROXY_OR_UNKNOWN" in observed_time_quality:
         time_quality = "ORDER_TIME_PROXY_OR_UNKNOWN"
     elif "NATIVE_EXECUTION_TIMESTAMP" in observed_time_quality:
