@@ -23,7 +23,8 @@ def _proof(quote):
 
 @pytest.mark.parametrize("clock", [None, "", "   "])
 def test_missing_exchange_clock_never_fabricates_midnight(clock):
-    quote = {"acml_vol": 2000, "source": "KIS_WEBSOCKET"}
+    quote = {"acml_vol": 2000, "source": "KIS_WEBSOCKET", "symbol": "219130",
+             "received_at": NOW.timestamp()}
     if clock is not None:
         quote["stck_cntg_hour"] = clock
     proof = _proof(quote)
@@ -44,9 +45,12 @@ def test_explicit_invalid_exchange_clock_does_not_authorize_buy(clock):
 
 def test_fresh_native_exchange_clock_remains_verified():
     proof = _proof({"acml_vol": 2000, "stck_cntg_hour": "122900",
-                    "source": "KIS_REST", "stck_bsop_date": "20261113"})
+                    "source": "KIS_REST_INQUIRE_PRICE",
+                    "source_identity": "AUTHENTICATED_REST_REQUEST_BOUND",
+                    "requested_symbol": "219130", "received_at": NOW.timestamp(),
+                    "stck_bsop_date": "20261113"})
     assert proof["confirmation_state"] == "VERIFIED", proof
-    assert proof["quote_source"] == "KIS_REST"
+    assert proof["quote_source"] == "KIS_REST_INQUIRE_PRICE"
     assert proof["exchange_quote_age_seconds"] == 60
 
 
